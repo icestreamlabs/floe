@@ -1,0 +1,11 @@
+[package]
+name = "floe-executor"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+floe-core = { path = "../floe-core" }
+floe-storage = { path = "../floe-storage" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }

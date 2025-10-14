@@ -1,0 +1,15 @@
+[package]
+name = "floe-storage"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+floe-core = { path = "../floe-core" }
+anyhow = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+slatedb = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

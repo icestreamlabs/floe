@@ -1,0 +1,10 @@
+[package]
+name = "floe-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rkyv = { workspace = true }
+serde = { workspace = true }
+arrow-schema = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "floe-node"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+floe-core = { path = "../floe-core" }
+floe-executor = { path = "../floe-executor" }
+floe-storage = { path = "../floe-storage" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+pgwire = { workspace = true }
+sqlparser = { workspace = true }
+tokio = { workspace = true }
