@@ -22,6 +22,7 @@ use sqlparser::ast::{CreateTable, Insert, Query, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
+use tokio::signal;
 
 use crate::sql;
 
@@ -57,14 +58,31 @@ pub async fn run() -> Result<()> {
     println!("Floe pgwire endpoint listening on {address}");
 
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let handlers = factory.clone();
-        tokio::spawn(async move {
-            if let Err(err) = process_socket(socket, None, handlers).await {
-                eprintln!("connection {peer:?} terminated with error: {err}");
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (socket, peer) = accept_result?;
+                let handlers = factory.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = process_socket(socket, None, handlers).await {
+                        eprintln!("connection {peer:?} terminated with error: {err}");
+                    }
+                });
             }
-        });
+            signal = signal::ctrl_c() => {
+                match signal {
+                    Ok(()) => {
+                        println!("Shutdown signal received, closing pgwire listener");
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to listen for shutdown signal: {err}");
+                    }
+                }
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[derive(Clone)]

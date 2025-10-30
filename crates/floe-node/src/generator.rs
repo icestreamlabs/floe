@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use nexmark::config::NexmarkConfig;
 use nexmark::EventGenerator;
+use nexmark::config::NexmarkConfig;
 use nexmark::event::Event;
 use serde::Serialize;
 use serde_json::json;

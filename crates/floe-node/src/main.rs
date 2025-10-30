@@ -9,14 +9,16 @@ use clap::Parser;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
-    match cli.mode {
-        cli::Mode::Generator => {
-            let config = generator::Config {
-                events_per_second: cli.events_per_second,
-                max_events: cli.max_events,
-            };
-            generator::run(config).await
+    let generator_config = generator::Config {
+        events_per_second: cli.events_per_second,
+        max_events: cli.max_events,
+    };
+
+    tokio::spawn(async move {
+        if let Err(err) = generator::run(generator_config).await {
+            eprintln!("Nexmark generator failed: {err}");
         }
-        cli::Mode::Server => server::run().await,
-    }
+    });
+
+    server::run().await
 }
