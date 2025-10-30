@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use floe_core::catalog::{ColumnDefinition, TableDefinition};
 use sqlparser::ast::{
     ColumnOption, CreateTable, DataType, Expr, Ident, IndexColumn, Insert, ObjectName,
