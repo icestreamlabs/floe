@@ -5,6 +5,7 @@ members = [
     "crates/floe-executor",
     "crates/floe-storage",
     "crates/dbsp",
+    "crates/floe-sql-parser",
 ]
 default-members = ["crates/floe-node"]
 resolver = "3"
@@ -28,3 +29,4 @@ serde_json = "1.0"
 slatedb = { version = "0.8.2", default-features = false }
 sqlparser = "0.58"
 tokio = { version = "1.38", features = ["full"] }
+floe-sql-parser = { path = "crates/floe-sql-parser" }

@@ -10,4 +10,8 @@ pub struct Cli {
     /// Maximum number of events to emit before exiting the generator task.
     #[arg(long = "max-events")]
     pub max_events: Option<u64>,
+
+    /// SQL text for the materialized view definition.
+    #[arg(long = "mv-query")]
+    pub mv_query: Option<String>,
 }

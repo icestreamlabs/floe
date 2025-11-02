@@ -1723,6 +1723,7 @@ dependencies = [
  "arrow-schema",
  "rkyv 0.8.12",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1746,6 +1747,7 @@ dependencies = [
  "datafusion",
  "floe-core",
  "floe-executor",
+ "floe-sql-parser",
  "floe-storage",
  "futures",
  "nexmark",
@@ -1754,6 +1756,13 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tokio",
+]
+
+[[package]]
+name = "floe-sql-parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

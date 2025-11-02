@@ -1,0 +1,201 @@
+use std::collections::BTreeMap;
+
+use anyhow::{Result, ensure};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SourceDataType {
+    Int64,
+    Utf8,
+    TimestampMillis,
+}
+
+impl SourceDataType {
+    pub fn arrow_type(&self) -> DataType {
+        match self {
+            SourceDataType::Int64 => DataType::Int64,
+            SourceDataType::Utf8 => DataType::Utf8,
+            SourceDataType::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceColumn {
+    name: String,
+    data_type: SourceDataType,
+}
+
+impl SourceColumn {
+    pub fn new(name: impl Into<String>, data_type: SourceDataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &SourceDataType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceDefinition {
+    name: String,
+    columns: Vec<SourceColumn>,
+    properties: BTreeMap<String, String>,
+}
+
+impl SourceDefinition {
+    pub fn new(name: impl Into<String>, columns: Vec<SourceColumn>) -> Result<Self> {
+        let name = name.into();
+        ensure!(!name.trim().is_empty(), "source name cannot be empty");
+        ensure!(
+            !columns.is_empty(),
+            "source {} must declare at least one column",
+            name
+        );
+        Ok(Self {
+            name,
+            columns,
+            properties: BTreeMap::new(),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn columns(&self) -> &[SourceColumn] {
+        &self.columns
+    }
+
+    pub fn properties(&self) -> &BTreeMap<String, String> {
+        &self.properties
+    }
+
+    pub fn property(&self, key: &str) -> Option<&str> {
+        self.properties.get(key).map(|value| value.as_str())
+    }
+
+    pub fn to_arrow_schema(&self) -> SchemaRef {
+        let fields: Vec<Field> = self
+            .columns
+            .iter()
+            .map(|column| Field::new(column.name(), column.data_type().arrow_type(), true))
+            .collect();
+        SchemaRef::new(Schema::new(fields))
+    }
+
+    pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn set_property(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.properties.insert(key.into(), value.into());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceEvent {
+    source: String,
+    payload: Value,
+}
+
+impl SourceEvent {
+    pub fn new(source: impl Into<String>, payload: Value) -> Self {
+        Self {
+            source: source.into(),
+            payload,
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> Value {
+        self.payload
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "data": self.payload,
+        })
+    }
+
+    pub fn to_json_string(&self) -> serde_json::Result<String> {
+        serde_json::to_string(&self.to_json_value())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_definition_builds_arrow_schema() {
+        let definition = SourceDefinition::new(
+            "nexmark_person",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("name", SourceDataType::Utf8),
+                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
+            ],
+        )
+        .expect("valid definition");
+
+        let schema = definition.to_arrow_schema();
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    #[test]
+    fn properties_are_preserved() {
+        let definition = SourceDefinition::new(
+            "nexmark_person",
+            vec![SourceColumn::new("id", SourceDataType::Int64)],
+        )
+        .unwrap()
+        .with_property("connector", "nexmark")
+        .with_property("entity", "person");
+
+        assert_eq!(definition.property("connector"), Some("nexmark"));
+        assert_eq!(definition.property("entity"), Some("person"));
+        assert_eq!(definition.properties().len(), 2);
+    }
+
+    #[test]
+    fn source_event_serializes_to_json() {
+        let event = SourceEvent::new("nexmark_person", json!({"id": 42}));
+        let serialized = event.to_json_string().expect("json serialization");
+
+        assert!(serialized.contains("nexmark_person"));
+        assert!(serialized.contains("id"));
+        assert!(serialized.contains("42"));
+    }
+
+    #[test]
+    fn invalid_source_definition_is_rejected() {
+        let err = SourceDefinition::new("", Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("source name cannot be empty"));
+    }
+}
