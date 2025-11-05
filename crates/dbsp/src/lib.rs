@@ -2,7 +2,7 @@ pub mod algebra;
 pub mod collections;
 pub mod stream;
 
-mod storage;
+pub mod storage;
 
 pub use algebra::AbelianGroup;
 pub use collections::ZSet;

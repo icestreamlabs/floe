@@ -9,7 +9,11 @@ slatedb = { workspace = true }
 rkyv = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+lru = "0.12"
+snap = "1.1"
 
 [dev-dependencies]
 object_store = { workspace = true }
 tokio = { workspace = true }
+rand = "0.8"
