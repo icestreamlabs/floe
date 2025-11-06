@@ -9,3 +9,6 @@ floe-storage = { path = "../floe-storage" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+
+[dev-dependencies]
+arrow-schema = { workspace = true }

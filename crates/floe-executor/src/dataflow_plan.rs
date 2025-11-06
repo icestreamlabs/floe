@@ -98,3 +98,44 @@ impl DataflowPlan {
         self.operators.get_mut(id.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dataflow_plan_tracks_operators_and_root() {
+        let mut plan = DataflowPlan::new();
+        let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+        }));
+        assert_eq!(scan_id, OperatorId(0));
+
+        let map_id = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(scan_id, 0),
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+            expressions: vec![Expr::column(0)],
+        }));
+        assert_eq!(map_id, OperatorId(1));
+
+        plan.set_root(map_id);
+        assert_eq!(plan.root, map_id);
+
+        if let Some(OperatorNode::Map(map_node)) = plan.get_mut(map_id) {
+            map_node
+                .expressions
+                .push(Expr::literal(ScalarValue::from(1i64)));
+        } else {
+            panic!("map operator missing");
+        }
+
+        match plan.get(map_id) {
+            Some(OperatorNode::Map(map_node)) => {
+                assert_eq!(map_node.expressions.len(), 2);
+                assert!(matches!(map_node.expressions[0], Expr::Column(0)));
+            }
+            _ => panic!("unexpected operator kind"),
+        }
+    }
+}

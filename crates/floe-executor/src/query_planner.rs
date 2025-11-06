@@ -1,0 +1,363 @@
+use anyhow::{Context, Result, bail};
+use datafusion::common::DFSchemaRef;
+use datafusion::logical_expr::{
+    BinaryExpr, Expr as DFExpr, Filter, Join, JoinConstraint, JoinType, LogicalPlan,
+    Operator as DFOperator, Projection, TableScan,
+};
+
+use crate::dataflow_plan::{
+    DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
+};
+use crate::stream_types::{OperatorId, OutputPort};
+
+pub struct QueryPlanner;
+
+impl QueryPlanner {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        view_name: impl Into<String>,
+    ) -> Result<DataflowPlan> {
+        let mut builder = PlanBuilder::new();
+        let planned_stream = builder.plan_node(logical_plan)?;
+        let materialize_id = builder.add_materialize(planned_stream.output, view_name.into());
+        builder.plan.set_root(materialize_id);
+        Ok(builder.plan)
+    }
+}
+
+struct PlanBuilder {
+    plan: DataflowPlan,
+}
+
+struct PlannedStream {
+    output: OutputPort,
+    schema: DFSchemaRef,
+}
+
+impl PlanBuilder {
+    fn new() -> Self {
+        Self {
+            plan: DataflowPlan::new(),
+        }
+    }
+
+    fn plan_node(&mut self, plan: &LogicalPlan) -> Result<PlannedStream> {
+        match plan {
+            LogicalPlan::TableScan(scan) => self.plan_scan(scan),
+            LogicalPlan::Projection(projection) => self.plan_projection(projection),
+            LogicalPlan::Filter(filter) => self.plan_filter(filter),
+            LogicalPlan::Join(join) => self.plan_join(join),
+            LogicalPlan::SubqueryAlias(alias) => self.plan_node(alias.input.as_ref()),
+            other => bail!("Unsupported logical plan node: {}", other.display_indent()),
+        }
+    }
+
+    fn plan_scan(&mut self, scan: &TableScan) -> Result<PlannedStream> {
+        let node = OperatorNode::Scan(ScanNode {
+            source_name: scan.table_name.to_string(),
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+        });
+        let operator_id = self.plan.add_operator(node);
+        let output = self.assign_output(operator_id);
+        Ok(PlannedStream {
+            output,
+            schema: scan.projected_schema.clone(),
+        })
+    }
+
+    fn plan_projection(&mut self, projection: &Projection) -> Result<PlannedStream> {
+        let input = self.plan_node(projection.input.as_ref())?;
+        let mut expressions = Vec::with_capacity(projection.expr.len());
+        for expr in &projection.expr {
+            expressions.push(self.convert_expr(expr, &input.schema)?);
+        }
+
+        let node = OperatorNode::Map(MapNode {
+            input: input.output,
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+            expressions,
+        });
+        let operator_id = self.plan.add_operator(node);
+        let output = self.assign_output(operator_id);
+        Ok(PlannedStream {
+            output,
+            schema: projection.schema.clone(),
+        })
+    }
+
+    fn plan_filter(&mut self, filter: &Filter) -> Result<PlannedStream> {
+        let input = self.plan_node(filter.input.as_ref())?;
+        let predicate = self.convert_expr(&filter.predicate, &input.schema)?;
+        let node = OperatorNode::Filter(FilterNode {
+            input: input.output,
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+            predicate,
+        });
+        let operator_id = self.plan.add_operator(node);
+        let output = self.assign_output(operator_id);
+        Ok(PlannedStream {
+            output,
+            schema: input.schema,
+        })
+    }
+
+    fn plan_join(&mut self, join: &Join) -> Result<PlannedStream> {
+        if join.join_type != JoinType::Inner {
+            bail!("only inner joins are supported in phase 2");
+        }
+        if join.filter.is_some() {
+            bail!("non-equi join filters are not supported");
+        }
+        if join.join_constraint != JoinConstraint::On {
+            bail!("only ON joins are supported");
+        }
+
+        let left = self.plan_node(join.left.as_ref())?;
+        let right = self.plan_node(join.right.as_ref())?;
+        let on = self.build_join_keys(&join.on, &left.schema, &right.schema)?;
+        let projection =
+            self.identity_projection(left.schema.fields().len() + right.schema.fields().len());
+
+        let node = OperatorNode::Join(JoinNode {
+            left: left.output,
+            right: right.output,
+            output: OutputPort::new(OperatorId(usize::MAX), 0),
+            on,
+            projection,
+        });
+        let operator_id = self.plan.add_operator(node);
+        let output = self.assign_output(operator_id);
+        Ok(PlannedStream {
+            output,
+            schema: join.schema.clone(),
+        })
+    }
+
+    fn add_materialize(&mut self, input: OutputPort, view_name: String) -> OperatorId {
+        let node = OperatorNode::Materialize(MaterializeNode { input, view_name });
+        self.plan.add_operator(node)
+    }
+
+    fn assign_output(&mut self, operator_id: OperatorId) -> OutputPort {
+        let output = OutputPort::new(operator_id, 0);
+        match self.plan.get_mut(operator_id).expect("operator must exist") {
+            OperatorNode::Scan(node) => node.output = output,
+            OperatorNode::Map(node) => node.output = output,
+            OperatorNode::Filter(node) => node.output = output,
+            OperatorNode::Join(node) => node.output = output,
+            OperatorNode::Materialize(_) => {}
+        }
+        output
+    }
+
+    fn convert_expr(&self, expr: &DFExpr, schema: &DFSchemaRef) -> Result<Expr> {
+        match expr {
+            DFExpr::Alias(alias) => self.convert_expr(alias.expr.as_ref(), schema),
+            DFExpr::Column(column) => {
+                let index = schema
+                    .index_of_column(column)
+                    .with_context(|| format!("column {} not found", column.name))?;
+                Ok(Expr::Column(index))
+            }
+            DFExpr::Literal(value, _) => Ok(Expr::Literal(value.clone())),
+            DFExpr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let left_expr = self.convert_expr(left, schema)?;
+                let right_expr = self.convert_expr(right, schema)?;
+                match op {
+                    DFOperator::Eq => Ok(Expr::Eq(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::And => Ok(Expr::And(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Or => Ok(Expr::Or(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Plus => Ok(Expr::Add(Box::new(left_expr), Box::new(right_expr))),
+                    _ => bail!("unsupported binary operator: {op:?}"),
+                }
+            }
+            other => bail!("unsupported expression: {other:?}"),
+        }
+    }
+
+    fn build_join_keys(
+        &self,
+        on: &[(DFExpr, DFExpr)],
+        left_schema: &DFSchemaRef,
+        right_schema: &DFSchemaRef,
+    ) -> Result<Vec<(usize, usize)>> {
+        let mut keys = Vec::with_capacity(on.len());
+        for (left_expr, right_expr) in on {
+            let left_index = self.extract_column_index(left_expr, left_schema)?;
+            let right_index = self.extract_column_index(right_expr, right_schema)?;
+            keys.push((left_index, right_index));
+        }
+        Ok(keys)
+    }
+
+    fn extract_column_index(&self, expr: &DFExpr, schema: &DFSchemaRef) -> Result<usize> {
+        match expr {
+            DFExpr::Column(column) => schema
+                .index_of_column(column)
+                .with_context(|| format!("column {} not found in join input", column.name)),
+            _ => bail!("join keys must be column references"),
+        }
+    }
+
+    fn identity_projection(&self, field_count: usize) -> Vec<Expr> {
+        (0..field_count).map(Expr::Column).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::Column;
+    use datafusion::logical_expr::{col, lit, table_scan};
+    use datafusion::scalar::ScalarValue;
+
+    fn bid_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+        ])
+    }
+
+    fn auction_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("seller", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+        ])
+    }
+
+    fn person_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ])
+    }
+
+    #[test]
+    fn map_expression_eval() -> Result<()> {
+        let schema = bid_schema();
+        let logical_plan = table_scan(Some("bid"), &schema, None)?
+            .project(vec![
+                (col("auction") + lit(1i64)).alias("auction_plus_one"),
+                col("price"),
+            ])?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_map_test")?;
+
+        assert_eq!(dataflow.operators.len(), 3);
+        match &dataflow.operators[1] {
+            OperatorNode::Map(map_node) => {
+                assert_eq!(map_node.expressions.len(), 2);
+                match &map_node.expressions[0] {
+                    Expr::Add(lhs, rhs) => {
+                        assert!(matches!(**lhs, Expr::Column(0)));
+                        match rhs.as_ref() {
+                            Expr::Literal(value) => {
+                                assert_eq!(value, &ScalarValue::from(1i64));
+                            }
+                            other => panic!("expected literal, found {other:?}"),
+                        }
+                    }
+                    other => panic!("unexpected expression: {other:?}"),
+                }
+                assert!(matches!(map_node.expressions[1], Expr::Column(2)));
+            }
+            other => panic!("expected map operator, found {other:?}"),
+        }
+
+        match &dataflow.operators[2] {
+            OperatorNode::Materialize(node) => assert_eq!(node.view_name, "mv_map_test"),
+            _ => panic!("expected terminal materialize"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_predicate() -> Result<()> {
+        let schema = bid_schema();
+        let predicate = col("bidder")
+            .eq(lit(42i64))
+            .and(col("auction").eq(lit(7i64)));
+        let logical_plan = table_scan(Some("bid"), &schema, None)?
+            .filter(predicate)?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_filter_test")?;
+
+        match &dataflow.operators[1] {
+            OperatorNode::Filter(filter_node) => match &filter_node.predicate {
+                Expr::And(lhs, rhs) => {
+                    assert!(matches!(**lhs, Expr::Eq(_, _)));
+                    assert!(matches!(**rhs, Expr::Eq(_, _)));
+                }
+                other => panic!("unexpected predicate shape: {other:?}"),
+            },
+            _ => panic!("expected filter operator"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn plans_inner_join_graph() -> Result<()> {
+        let right_plan = table_scan(Some("person"), &person_schema(), None)?.build()?;
+        let logical_plan = table_scan(Some("auction"), &auction_schema(), None)?
+            .join(
+                right_plan,
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("seller")],
+                    vec![Column::from_name("id")],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_join_test")?;
+
+        assert_eq!(dataflow.operators.len(), 4);
+        let join_node = match &dataflow.operators[2] {
+            OperatorNode::Join(node) => node,
+            other => panic!("expected join operator, found {other:?}"),
+        };
+        assert_eq!(join_node.left.operator, OperatorId(0));
+        assert_eq!(join_node.right.operator, OperatorId(1));
+        assert_eq!(join_node.on, vec![(1, 0)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_inner_join() -> Result<()> {
+        let right_plan = table_scan(Some("person"), &person_schema(), None)?.build()?;
+        let logical_plan = table_scan(Some("auction"), &auction_schema(), None)?
+            .join(
+                right_plan,
+                JoinType::Left,
+                (
+                    vec![Column::from_name("seller")],
+                    vec![Column::from_name("id")],
+                ),
+                None,
+            )?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let err = planner.plan(&logical_plan, "mv_join_test").unwrap_err();
+        assert!(err.to_string().contains("only inner joins"));
+        Ok(())
+    }
+}
