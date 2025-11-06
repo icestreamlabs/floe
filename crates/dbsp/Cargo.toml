@@ -12,6 +12,10 @@ futures = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 lru = "0.12"
 snap = "1.1"
+once_cell = "1.19"
+datafusion = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion-common = { workspace = true }
 
 [dev-dependencies]
 object_store = { workspace = true }

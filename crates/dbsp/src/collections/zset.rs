@@ -12,6 +12,7 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::config::ScanOptions;
 use slatedb::{Db, WriteBatch};
 
+use crate::handles::ZSetHandle;
 use crate::storage::dictionary::{Dictionary, KeyIntern};
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::{KeyValueTable, SlateTable};
@@ -70,6 +71,13 @@ pub struct ZSetVersionManifest {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct VersionWritePlan {
+    pub(crate) version: u64,
+    pub(crate) manifest: ZSetVersionManifest,
+}
+
+#[allow(dead_code)]
 pub struct VersionedZSet<K>
 where
     K: Archive
@@ -84,6 +92,7 @@ where
 {
     dict: Arc<Dictionary<K>>,
     table: Arc<dyn KeyValueTable>,
+    namespace: String,
     manifest_prefix: Vec<u8>,
     segment_prefix: Vec<u8>,
     current_version: u64,
@@ -111,8 +120,9 @@ where
     pub async fn new(
         dict: Arc<Dictionary<K>>,
         table: Arc<dyn KeyValueTable>,
-        namespace: String,
+        namespace: impl Into<String>,
     ) -> Result<Self> {
+        let namespace = namespace.into();
         let mut manifest_prefix = ZSET_PREFIX.as_bytes().to_vec();
         manifest_prefix.extend_from_slice(namespace.as_bytes());
         manifest_prefix.extend_from_slice(b"/manifest/");
@@ -127,6 +137,7 @@ where
         let mut versioned = Self {
             dict,
             table,
+            namespace,
             manifest_prefix,
             segment_prefix,
             current_version: 0,
@@ -137,6 +148,28 @@ where
 
         versioned.refresh_state().await?;
         Ok(versioned)
+    }
+
+    pub async fn open_for_handle(
+        dict: Arc<Dictionary<K>>,
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        version: u64,
+    ) -> Result<Self> {
+        let namespace = namespace.into();
+        let instance = Self::new(dict, table, namespace.clone()).await?;
+        if version != 0 {
+            instance
+                .load_manifest_record(version)
+                .await
+                .with_context(|| {
+                    anyhow!(
+                        "manifest version {version} not found for namespace {}",
+                        namespace
+                    )
+                })?;
+        }
+        Ok(instance)
     }
 
     fn manifest_key(&self, version: u64) -> Vec<u8> {
@@ -182,9 +215,8 @@ where
             }
 
             let mut version_bytes = [0u8; 8];
-            version_bytes.copy_from_slice(
-                &key[self.manifest_prefix.len()..self.manifest_prefix.len() + 8],
-            );
+            version_bytes
+                .copy_from_slice(&key[self.manifest_prefix.len()..self.manifest_prefix.len() + 8]);
             let version = u64::from_be_bytes(version_bytes);
             let manifest = decode_manifest(&bytes)?;
 
@@ -216,51 +248,10 @@ where
         segments: Vec<SegmentRecord>,
         base: Option<u64>,
     ) -> Result<u64> {
-        if segments.is_empty() {
-            return Err(anyhow!("segments cannot be empty when creating a version"));
-        }
-
         let mut batch = WriteBatch::new();
-        batch.put(self.intent_key.clone(), vec![1]);
-
-        let mut buckets = BTreeMap::new();
-        for mut record in segments {
-            record.deltas.retain(|(_, delta)| *delta != 0);
-            if record.deltas.is_empty() {
-                continue;
-            }
-
-            let key = self.segment_key(record.bucket, record.id);
-            let encoded = encoding::encode(&record).context("encode versioned segment")?;
-            batch.put(key, encoded);
-            buckets
-                .entry(record.bucket)
-                .or_insert_with(Vec::new)
-                .push(record.id);
-
-            self.next_segment_id = self.next_segment_id.max(record.id.saturating_add(1));
-        }
-
-        if buckets.is_empty() {
-            return Err(anyhow!("no deltas to persist in version"));
-        }
-
-        if let Some(base_version) = base {
-            let mut base_manifest = self.load_manifest_record(base_version).await?;
-            base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
-            let base_bytes = encode_manifest(&base_manifest)?;
-            batch.put(self.manifest_key(base_version), base_bytes);
-        }
-
-        let next_version = self.current_version.saturating_add(1);
-        let manifest = ZSetVersionManifest {
-            base,
-            buckets,
-            reference_count: 1,
-        };
-
-        let manifest_bytes = encode_manifest(&manifest)?;
-        batch.put(self.manifest_key(next_version), manifest_bytes);
+        let plan = self
+            .enqueue_version_with_base(segments, base, 0, &mut batch)
+            .await?;
 
         self.table
             .write_batch(batch)
@@ -274,20 +265,124 @@ where
             .await
             .context("clear versioned intent")?;
 
-        self.current_version = next_version;
-        self.manifest = Some(manifest);
+        self.apply_version_plan(&plan);
 
-        Ok(self.current_version)
+        Ok(plan.version)
+    }
+
+    pub(crate) async fn enqueue_version_with_base(
+        &mut self,
+        segments: Vec<SegmentRecord>,
+        base: Option<u64>,
+        additional_references: u64,
+        batch: &mut WriteBatch,
+    ) -> Result<VersionWritePlan> {
+        let mut processed = Vec::new();
+        for mut record in segments {
+            record.deltas.retain(|(_, delta)| *delta != 0);
+            if record.deltas.is_empty() {
+                continue;
+            }
+
+            if record.id == 0 {
+                record.id = self.allocate_segment_id();
+            } else {
+                self.next_segment_id = self.next_segment_id.max(record.id.saturating_add(1));
+            }
+            record.deltas.sort_by_key(|(id, _)| *id);
+            processed.push(record);
+        }
+
+        if processed.is_empty() {
+            return Err(anyhow!("no deltas to persist in version"));
+        }
+
+        batch.put(self.intent_key.clone(), vec![1]);
+
+        let mut buckets = BTreeMap::new();
+        for record in &processed {
+            let key = self.segment_key(record.bucket, record.id);
+            let encoded = encoding::encode(record).context("encode versioned segment")?;
+            batch.put(key, encoded);
+            buckets
+                .entry(record.bucket)
+                .or_insert_with(Vec::new)
+                .push(record.id);
+        }
+
+        for ids in buckets.values_mut() {
+            ids.sort_unstable();
+        }
+
+        if let Some(base_version) = base {
+            let mut base_manifest = self.load_manifest_record(base_version).await?;
+            base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
+            let base_bytes = encode_manifest(&base_manifest)?;
+            batch.put(self.manifest_key(base_version), base_bytes);
+        }
+
+        let next_version = self.current_version.saturating_add(1);
+        let manifest = ZSetVersionManifest {
+            base,
+            buckets,
+            reference_count: 1 + additional_references,
+        };
+
+        let manifest_bytes = encode_manifest(&manifest)?;
+        batch.put(self.manifest_key(next_version), manifest_bytes);
+
+        let highest_id = processed.iter().map(|record| record.id).max().unwrap_or(0);
+        self.next_segment_id = self
+            .next_segment_id
+            .max(highest_id.saturating_add(1))
+            .max(1);
+
+        Ok(VersionWritePlan {
+            version: next_version,
+            manifest,
+        })
+    }
+
+    pub(crate) fn apply_version_plan(&mut self, plan: &VersionWritePlan) {
+        self.current_version = plan.version;
+        self.manifest = Some(plan.manifest.clone());
     }
 
     pub fn manifest(&self) -> Option<&ZSetVersionManifest> {
         self.manifest.as_ref()
     }
 
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn dictionary(&self) -> Arc<Dictionary<K>> {
+        self.dict.clone()
+    }
+
+    pub(crate) fn table(&self) -> Arc<dyn KeyValueTable> {
+        self.table.clone()
+    }
+
+    pub fn handle_for_version(&self, version: u64) -> ZSetHandle {
+        ZSetHandle {
+            ns: self.namespace.clone(),
+            version,
+        }
+    }
+
+    pub fn current_handle(&self) -> Option<ZSetHandle> {
+        if self.current_version == 0 {
+            None
+        } else {
+            Some(self.handle_for_version(self.current_version))
+        }
+    }
+
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
         let mut aggregate = if let Some(base_version) = self.manifest.as_ref().and_then(|m| m.base)
         {
-            self.load_version(base_version).await?
+            self.load_version_chain(base_version).await?
         } else {
             HashMap::new()
         };
@@ -312,7 +407,14 @@ where
         Ok(aggregate)
     }
 
-    async fn load_version(&self, version: u64) -> Result<HashMap<K, i64>> {
+    pub async fn load_existing_version(&self, version: u64) -> Result<HashMap<K, i64>> {
+        if version == 0 {
+            return Ok(HashMap::new());
+        }
+        self.load_version_chain(version).await
+    }
+
+    async fn load_version_chain(&self, version: u64) -> Result<HashMap<K, i64>> {
         let mut chain = Vec::new();
         let mut manifests = Vec::new();
         let mut current = Some(version);
@@ -389,7 +491,11 @@ where
     }
 
     #[cfg(test)]
-    fn intent_key_bytes(&self) -> &[u8] {
+    pub(crate) async fn manifest_record(&self, version: u64) -> Result<ZSetVersionManifest> {
+        self.load_manifest_record(version).await
+    }
+
+    pub(crate) fn intent_key_bytes(&self) -> &[u8] {
         &self.intent_key
     }
 
@@ -1172,14 +1278,12 @@ mod tests {
                 .expect("build dictionary"),
         );
 
-        let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_release".to_string())
-            .await
-            .expect("create versioned zset");
+        let mut versioned =
+            VersionedZSet::new(dict.clone(), table.clone(), "vz_release".to_string())
+                .await
+                .expect("create versioned zset");
 
-        let id = dict
-            .intern(&"x".to_string())
-            .await
-            .expect("intern key");
+        let id = dict.intern(&"x".to_string()).await.expect("intern key");
         let version = versioned
             .create_version(vec![SegmentRecord {
                 id: 1,
@@ -1195,13 +1299,19 @@ mod tests {
             .expect("release version");
 
         let segments = table
-            .scan_range(prefix_bounds(versioned.segment_prefix_bytes()), &ScanOptions::default())
+            .scan_range(
+                prefix_bounds(versioned.segment_prefix_bytes()),
+                &ScanOptions::default(),
+            )
             .await
             .expect("scan segments");
         assert!(segments.is_empty());
 
         let manifests = table
-            .scan_range(prefix_bounds(versioned.manifest_prefix_bytes()), &ScanOptions::default())
+            .scan_range(
+                prefix_bounds(versioned.manifest_prefix_bytes()),
+                &ScanOptions::default(),
+            )
             .await
             .expect("scan manifests");
         assert!(manifests.is_empty());
@@ -1220,10 +1330,9 @@ mod tests {
                 .expect("build dictionary"),
         );
 
-        let mut versioned =
-            VersionedZSet::new(dict.clone(), table.clone(), "vz_refs".to_string())
-                .await
-                .expect("create versioned zset");
+        let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_refs".to_string())
+            .await
+            .expect("create versioned zset");
 
         let base_id = dict
             .intern(&"base".to_string())
@@ -1291,14 +1400,12 @@ mod tests {
                 .expect("build dictionary"),
         );
 
-        let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_intent".to_string())
-            .await
-            .expect("create versioned zset");
+        let mut versioned =
+            VersionedZSet::new(dict.clone(), table.clone(), "vz_intent".to_string())
+                .await
+                .expect("create versioned zset");
 
-        let id = dict
-            .intern(&"y".to_string())
-            .await
-            .expect("intern key");
+        let id = dict.intern(&"y".to_string()).await.expect("intern key");
         versioned
             .create_version(vec![SegmentRecord {
                 id: 1,
