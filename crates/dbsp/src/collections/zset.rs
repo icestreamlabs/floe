@@ -21,10 +21,12 @@ const ZSET_PREFIX: &str = "zset/";
 const SELECT_PREFIX: &str = "zset_select/";
 const PROJECT_PREFIX: &str = "zset_project/";
 const JOIN_PREFIX: &str = "zset_join/";
+const H_PREFIX: &str = "zset_h/";
 
 static SELECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static JOIN_COUNTER: AtomicU64 = AtomicU64::new(0);
+static H_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct ZSet<K>
 where
@@ -1008,6 +1010,40 @@ where
     Ok(result)
 }
 
+pub async fn h<K>(diff: &ZSet<K>, integrated_state: &ZSet<K>) -> Result<ZSet<K>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let diff_entries = collect_entries(diff).await?;
+    let integrated_entries = collect_entries(integrated_state).await?;
+
+    let namespace = derived_namespace(H_PREFIX, &H_COUNTER);
+    let mut result = ZSet::with_table(diff.table.clone(), namespace)
+        .await
+        .context("build derived ZSet for H operator")?;
+
+    for (key, diff_weight) in diff_entries {
+        let state_weight = integrated_entries.get(&key).copied().unwrap_or(0);
+        let coalesced = diff_weight + state_weight;
+
+        if state_weight > 0 && coalesced <= 0 {
+            result.set_weight(key, -1);
+        } else if state_weight <= 0 && coalesced > 0 {
+            result.set_weight(key, 1);
+        }
+    }
+
+    Ok(result)
+}
+
 async fn collect_entries<K>(zset: &ZSet<K>) -> Result<HashMap<K, i64>>
 where
     K: Archive
@@ -1092,6 +1128,37 @@ mod tests {
         reload.add_weight("key".to_string(), -3).await.unwrap();
         reload.flush().await.unwrap();
         assert!(reload.is_identity().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn h_distincts_differences() {
+        let db = build_db().await;
+        let mut diff = ZSet::new(db.clone(), "h_diff")
+            .await
+            .expect("create diff zset");
+        let mut state = ZSet::new(db.clone(), "h_state")
+            .await
+            .expect("create state zset");
+
+        diff.set_weight("enter".to_string(), 2);
+        diff.set_weight("leave".to_string(), -3);
+        diff.set_weight("stay".to_string(), -1);
+
+        state.set_weight("leave".to_string(), 3);
+        state.set_weight("stay".to_string(), 1);
+
+        let mut result = h(&diff, &state).await.expect("compute h");
+        let mut entries = result.items().await.expect("materialize result");
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        assert_eq!(
+            entries,
+            vec![
+                ("enter".to_string(), 1),
+                ("leave".to_string(), -1),
+                ("stay".to_string(), -1)
+            ]
+        );
     }
 
     #[tokio::test]

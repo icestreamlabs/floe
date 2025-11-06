@@ -1,5 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::convert::TryFrom;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -501,6 +503,263 @@ where
     clone.to_vec().await
 }
 
+static DERIVED_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LIFTED_ZSET_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const LIFTED_SELECT_ZSET_PREFIX: &str = "zset_lifted_select/";
+const LIFTED_PROJECT_ZSET_PREFIX: &str = "zset_lifted_project/";
+const LIFTED_JOIN_ZSET_PREFIX: &str = "zset_lifted_join/";
+const LIFTED_H_ZSET_PREFIX: &str = "zset_lifted_h/";
+const LIFTED_SELECT_STREAM_PREFIX: &str = "stream_lifted_select/";
+const LIFTED_PROJECT_STREAM_PREFIX: &str = "stream_lifted_project/";
+const LIFTED_JOIN_STREAM_PREFIX: &str = "stream_lifted_join/";
+const LIFTED_H_STREAM_PREFIX: &str = "stream_lifted_h/";
+const ZSET_SUM_PREFIX: &str = "zset_sum/";
+const ZSET_INTEGRAL_PREFIX: &str = "zset_integral/";
+const ZSET_INTEGRAL_STREAM_PREFIX: &str = "stream_zset_integral/";
+const DELTA_LIFTED_JOIN_STREAM_PREFIX: &str = "stream_delta_lifted_join/";
+
+fn next_derived_namespace(prefix: &str) -> String {
+    let id = DERIVED_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}{}", prefix, id)
+}
+
+fn next_lifted_zset_namespace(prefix: &str) -> String {
+    let id = LIFTED_ZSET_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}{id}")
+}
+
+async fn build_derived_stream<T>(
+    table: Arc<dyn KeyValueTable>,
+    group: Arc<dyn AbelianGroup<T>>,
+    prefix: &str,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let namespace = next_derived_namespace(prefix);
+    Stream::with_table(table, namespace, group).await
+}
+
+async fn apply_on_resolved_handles<T, Fut>(
+    input: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+    namespace_prefix: &str,
+    mut op: impl FnMut(Stream<T>) -> Fut,
+) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    Fut: Future<Output = Result<Stream<T>>>,
+{
+    let handles = collect_values(input, input.timestamp).await?;
+    let mut derived_handles = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let inner = input
+            .resolve_handle(&handle, inner_group.clone())
+            .await
+            .context("resolve handle for lifted operator")?;
+        let mut derived = op(inner).await?;
+        derived.flush().await?;
+        derived_handles.push(derived.handle());
+    }
+
+    let default_handle = derived_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| input.default.clone());
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result =
+        build_derived_stream(input.table.clone(), handle_group, namespace_prefix).await?;
+
+    if derived_handles.is_empty() {
+        set_default_in_place(&mut result, default_handle);
+    } else {
+        set_default_in_place(&mut result, derived_handles[0].clone());
+        for handle in derived_handles.iter().skip(1) {
+            push_value_in_place(&mut result, handle.clone());
+        }
+        if let Some(last) = derived_handles.last() {
+            set_default_in_place(&mut result, last.clone());
+        }
+    }
+
+    result.flush().await?;
+    Ok(result)
+}
+
+async fn resolve_apply_handle_op<T, Fut>(
+    outer: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+    mut op: impl FnMut(Stream<T>) -> Fut,
+    out_prefix: &str,
+) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    Fut: Future<Output = Result<Stream<T>>>,
+{
+    apply_on_resolved_handles(outer, inner_group, out_prefix, |inner| op(inner)).await
+}
+
+async fn materialize_zset_handle<K>(
+    table: Arc<dyn KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    handle: &ZSetHandle,
+) -> Result<HashMap<K, i64>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let dict = if let Some(existing) = cache.get(&handle.ns) {
+        existing.clone()
+    } else {
+        let dictionary = Arc::new(
+            Dictionary::with_table(table.clone(), handle.ns.clone(), None)
+                .await
+                .context("open dictionary for ZSet handle")?,
+        );
+        cache.insert(handle.ns.clone(), dictionary.clone());
+        dictionary
+    };
+
+    let view = ZSetHandleView::new(dict, table, handle.ns.clone(), handle.version);
+    let mut map = view
+        .materialize()
+        .await
+        .context("materialize ZSet handle")?;
+    map.retain(|_, weight| *weight != 0);
+    Ok(map)
+}
+
+async fn integrate_zset_handle_stream<K>(stream: &Stream<ZSetHandle>) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let handles = collect_values(stream, stream.timestamp).await?;
+    let table = stream.table.clone();
+    let namespace = next_lifted_zset_namespace(ZSET_INTEGRAL_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for integrated zset stream")?,
+    );
+    let mut aggregator = ZSetStream::new(dict, table.clone(), namespace, StreamRetention::None)
+        .await
+        .context("create aggregator for integrated zset stream")?;
+
+    let mut caches: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous_state: HashMap<K, i64> = HashMap::new();
+    let mut integral_state: HashMap<K, i64> = HashMap::new();
+    let mut last_integral_state: HashMap<K, i64> = HashMap::new();
+    let mut result_handles = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let state = materialize_zset_handle::<K>(table.clone(), &mut caches, &handle)
+            .await
+            .context("materialize zset state for integration")?;
+        let deltas = compute_delta(&previous_state, &state);
+        previous_state = state;
+
+        for (key, weight) in deltas {
+            let entry = integral_state.entry(key).or_insert(0);
+            *entry = (*entry).saturating_add(weight);
+        }
+        integral_state.retain(|_, weight| *weight != 0);
+
+        let integral_delta = compute_delta(&last_integral_state, &integral_state);
+        aggregator.add_deltas(integral_delta);
+        let handle = aggregator
+            .flush()
+            .await
+            .context("flush integrated zset stream")?;
+        result_handles.push(handle);
+        last_integral_state = integral_state.clone();
+    }
+
+    let default_handle = result_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| aggregator.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table, handle_group, ZSET_INTEGRAL_STREAM_PREFIX).await?;
+
+    if result_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, result_handles[0].clone());
+        for handle in result_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = result_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+fn compute_delta<K>(previous: &HashMap<K, i64>, next: &HashMap<K, i64>) -> Vec<(K, i64)>
+where
+    K: Eq + Hash + Clone,
+{
+    let mut deltas = Vec::new();
+
+    for (key, &next_weight) in next {
+        let prev_weight = previous.get(key).copied().unwrap_or(0);
+        if next_weight != prev_weight {
+            deltas.push((key.clone(), next_weight - prev_weight));
+        }
+    }
+
+    for (key, &prev_weight) in previous {
+        if !next.contains_key(key) && prev_weight != 0 {
+            deltas.push((key.clone(), -prev_weight));
+        }
+    }
+
+    deltas.retain(|(_, delta)| *delta != 0);
+    deltas
+}
+
 fn set_default_in_place<T>(stream: &mut Stream<T>, value: T)
 where
     T: Archive
@@ -536,6 +795,1356 @@ where
     }
     stream.timestamp = next_timestamp;
     stream.pending_state = true;
+}
+
+pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let values = collect_values(input, input.timestamp).await?;
+    let mut result =
+        build_derived_stream(input.table.clone(), input.group.clone(), "stream_delay/").await?;
+
+    let mut last_output = None;
+    for t in 1..=input.timestamp {
+        let value = values[(t - 1) as usize].clone();
+        push_value_in_place(&mut result, value.clone());
+        last_output = Some(value);
+    }
+
+    if let Some(last) = last_output {
+        set_default_in_place(&mut result, last);
+    }
+
+    Ok(result)
+}
+
+pub async fn differentiate<T>(input: &Stream<T>) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let values = collect_values(input, input.timestamp).await?;
+    let group = input.group.clone();
+    let mut result =
+        build_derived_stream(input.table.clone(), group.clone(), "stream_diff/").await?;
+
+    if let Some(first) = values.first() {
+        let mut last_output = first.clone();
+        set_default_in_place(&mut result, first.clone());
+
+        for t in 1..=input.timestamp {
+            let current = &values[t as usize];
+            let previous = &values[(t - 1) as usize];
+            let neg_prev = group.neg(previous).await;
+            let diff = group.add(current, &neg_prev).await;
+            last_output = diff.clone();
+            push_value_in_place(&mut result, diff);
+        }
+
+        set_default_in_place(&mut result, last_output);
+    }
+
+    Ok(result)
+}
+
+pub async fn integrate<T>(input: &Stream<T>) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let values = collect_values(input, input.timestamp).await?;
+    let group = input.group.clone();
+    let mut result =
+        build_derived_stream(input.table.clone(), group.clone(), "stream_integrate/").await?;
+
+    if let Some(first) = values.first() {
+        let mut acc = first.clone();
+        set_default_in_place(&mut result, acc.clone());
+
+        for t in 1..=input.timestamp {
+            let current = &values[t as usize];
+            acc = group.add(&acc, current).await;
+            push_value_in_place(&mut result, acc.clone());
+        }
+
+        set_default_in_place(&mut result, acc);
+    }
+
+    Ok(result)
+}
+
+pub async fn lift1<I, O, F>(
+    input: &Stream<I>,
+    output_group: Arc<dyn AbelianGroup<O>>,
+    function: F,
+) -> Result<Stream<O>>
+where
+    I: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    I::Archived: RkyvDeserialize<I, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&I) -> O + Send + Sync,
+{
+    let values = collect_values(input, input.timestamp).await?;
+    let mut result =
+        build_derived_stream(input.table.clone(), output_group.clone(), "stream_lift1/").await?;
+
+    if let Some(first) = values.first() {
+        let mut last = function(first);
+        set_default_in_place(&mut result, last.clone());
+
+        for t in 1..=input.timestamp {
+            let value = function(&values[t as usize]);
+            last = value.clone();
+            push_value_in_place(&mut result, value);
+        }
+
+        set_default_in_place(&mut result, last);
+    }
+
+    Ok(result)
+}
+
+pub async fn lift2<L, R, O, F>(
+    left: &Stream<L>,
+    right: &Stream<R>,
+    output_group: Arc<dyn AbelianGroup<O>>,
+    function: F,
+) -> Result<Stream<O>>
+where
+    L: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&L, &R) -> O + Send + Sync,
+{
+    let frontier = left.timestamp.max(right.timestamp);
+    let left_values = collect_values(left, frontier).await?;
+    let right_values = collect_values(right, frontier).await?;
+    let mut result =
+        build_derived_stream(left.table.clone(), output_group.clone(), "stream_lift2/").await?;
+
+    if let Some((first_left, first_right)) = left_values.first().zip(right_values.first()) {
+        let mut last = function(first_left, first_right);
+        set_default_in_place(&mut result, last.clone());
+
+        for t in 1..=frontier {
+            let value = function(&left_values[t as usize], &right_values[t as usize]);
+            last = value.clone();
+            push_value_in_place(&mut result, value);
+        }
+
+        set_default_in_place(&mut result, last);
+    }
+
+    Ok(result)
+}
+
+pub async fn incrementalize2<T, R, O, F>(
+    left: &Stream<T>,
+    right: &Stream<R>,
+    output_group: Arc<dyn AbelianGroup<O>>,
+    function: F,
+) -> Result<Stream<O>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&T, &R) -> O + Send + Sync + Clone + 'static,
+{
+    let integrated_left = integrate(left).await?;
+    let delayed_integrated_left = delay(&integrated_left).await?;
+
+    let integrated_right = integrate(right).await?;
+    let delayed_integrated_right = delay(&integrated_right).await?;
+
+    let f_ab = lift2(left, right, output_group.clone(), function.clone()).await?;
+    let f_a_delayed_b = lift2(
+        left,
+        &delayed_integrated_right,
+        output_group.clone(),
+        function.clone(),
+    )
+    .await?;
+    let f_delayed_a_b = lift2(
+        &delayed_integrated_left,
+        right,
+        output_group.clone(),
+        function,
+    )
+    .await?;
+
+    let addition = StreamAddition::from_stream(&f_ab);
+    let partial = addition.add(&f_ab, &f_a_delayed_b).await;
+    let summed = addition.add(&partial, &f_delayed_a_b).await;
+    Ok(summed)
+}
+
+pub async fn stream_introduction<T>(
+    table: Arc<dyn KeyValueTable>,
+    group: Arc<dyn AbelianGroup<T>>,
+    value: T,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let mut stream = build_derived_stream(table, group.clone(), "stream_intro/").await?;
+    set_default_in_place(&mut stream, value);
+    stream.flush().await?;
+    Ok(stream)
+}
+
+pub async fn stream_elimination<T>(stream: &Stream<T>) -> Result<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let values = collect_values(stream, stream.timestamp).await?;
+    let group = stream.group();
+    let mut acc = group.identity().await;
+    for value in values {
+        acc = group.add(&acc, &value).await;
+    }
+    Ok(acc)
+}
+
+pub async fn lifted_delay<T>(
+    stream: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    resolve_apply_handle_op(
+        stream,
+        inner_group,
+        |inner| async move { delay(&inner).await },
+        "stream_lift_delay/",
+    )
+    .await
+}
+
+pub async fn lifted_integrate<T>(
+    stream: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    resolve_apply_handle_op(
+        stream,
+        inner_group,
+        |inner| async move { integrate(&inner).await },
+        "stream_lift_integrate/",
+    )
+    .await
+}
+
+pub async fn lifted_integrate_zset<K>(
+    stream: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<ZSetHandle>>,
+) -> Result<Stream<StreamHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    resolve_apply_handle_op(
+        stream,
+        inner_group,
+        |inner| async move { integrate_zset_handle_stream::<K>(&inner).await },
+        "stream_lift_integrate/",
+    )
+    .await
+}
+
+pub async fn lifted_differentiate<T>(
+    stream: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    resolve_apply_handle_op(
+        stream,
+        inner_group,
+        |inner| async move { differentiate(&inner).await },
+        "stream_lift_differentiate/",
+    )
+    .await
+}
+
+pub async fn lifted_stream_introduction<T>(stream: &Stream<T>) -> Result<Stream<StreamHandle>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let values = collect_values(stream, stream.timestamp).await?;
+    let group = stream.group();
+    let table = stream.table.clone();
+
+    let mut outputs = Vec::with_capacity(values.len());
+    for value in &values {
+        let mut introduced =
+            stream_introduction(table.clone(), group.clone(), value.clone()).await?;
+        introduced.flush().await?;
+        outputs.push(introduced.handle());
+    }
+
+    let default_handle = if let Some(first) = outputs.first() {
+        first.clone()
+    } else {
+        let identity = group.identity().await;
+        let mut identity_stream =
+            stream_introduction(table.clone(), group.clone(), identity).await?;
+        identity_stream.flush().await?;
+        identity_stream.handle()
+    };
+
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result = build_derived_stream(table, handle_group, "stream_lift_intro/").await?;
+
+    if outputs.is_empty() {
+        set_default_in_place(&mut result, default_handle);
+    } else {
+        set_default_in_place(&mut result, outputs[0].clone());
+        for handle in outputs.iter().skip(1) {
+            push_value_in_place(&mut result, handle.clone());
+        }
+        if let Some(last) = outputs.last() {
+            set_default_in_place(&mut result, last.clone());
+        }
+    }
+
+    Ok(result)
+}
+
+pub async fn lifted_stream_elimination<T>(
+    stream: &Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let handles = collect_values(stream, stream.timestamp).await?;
+    let mut outputs = Vec::with_capacity(handles.len());
+    for handle in &handles {
+        let inner = stream
+            .resolve_handle(handle, inner_group.clone())
+            .await
+            .context("resolve handle for lifted stream elimination")?;
+        outputs.push(stream_elimination(&inner).await?);
+    }
+
+    let default_value = if let Some(first) = outputs.first() {
+        first.clone()
+    } else {
+        inner_group.identity().await
+    };
+
+    let mut result = build_derived_stream(
+        stream.table.clone(),
+        inner_group.clone(),
+        "stream_lift_elim/",
+    )
+    .await?;
+
+    if outputs.is_empty() {
+        set_default_in_place(&mut result, default_value);
+    } else {
+        set_default_in_place(&mut result, outputs[0].clone());
+        for value in outputs.iter().skip(1) {
+            push_value_in_place(&mut result, value.clone());
+        }
+        if let Some(last) = outputs.last() {
+            set_default_in_place(&mut result, last.clone());
+        }
+    }
+
+    Ok(result)
+}
+
+pub async fn lifted_select_zset_stream<K, P>(
+    input: &Stream<ZSetHandle>,
+    predicate: P,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&K) -> bool + Send + Sync + Clone,
+{
+    let handles = collect_values(input, input.timestamp).await?;
+    let table = input.table.clone();
+    let namespace = next_lifted_zset_namespace(LIFTED_SELECT_ZSET_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for lifted select")?,
+    );
+    let mut zset_stream = ZSetStream::new(dict, table.clone(), namespace, StreamRetention::None)
+        .await
+        .context("create ZSet stream for lifted select")?;
+
+    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous: HashMap<K, i64> = HashMap::new();
+    let mut output_handles = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let materialized =
+            materialize_zset_handle::<K>(table.clone(), &mut dict_cache, &handle).await?;
+
+        let mut filtered = HashMap::new();
+        for (key, weight) in materialized {
+            if predicate(&key) && weight != 0 {
+                filtered.insert(key, weight);
+            }
+        }
+
+        let deltas = compute_delta(&previous, &filtered);
+        zset_stream.add_deltas(deltas);
+        let handle = zset_stream
+            .flush()
+            .await
+            .context("flush lifted select result")?;
+        output_handles.push(handle);
+        previous = filtered;
+    }
+
+    let default_handle = output_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| zset_stream.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, LIFTED_SELECT_STREAM_PREFIX).await?;
+
+    if output_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, output_handles[0].clone());
+        for handle in output_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = output_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_project_zset_stream<K, R, F>(
+    input: &Stream<ZSetHandle>,
+    projector: F,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&K) -> R + Send + Sync + Clone,
+{
+    let handles = collect_values(input, input.timestamp).await?;
+    let table = input.table.clone();
+    let namespace = next_lifted_zset_namespace(LIFTED_PROJECT_ZSET_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for lifted project")?,
+    );
+    let mut zset_stream = ZSetStream::new(dict, table.clone(), namespace, StreamRetention::None)
+        .await
+        .context("create ZSet stream for lifted project")?;
+
+    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous: HashMap<R, i64> = HashMap::new();
+    let mut output_handles = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let materialized =
+            materialize_zset_handle::<K>(table.clone(), &mut dict_cache, &handle).await?;
+
+        let mut projected: HashMap<R, i64> = HashMap::new();
+        for (key, weight) in materialized {
+            if weight == 0 {
+                continue;
+            }
+            let result_key = projector(&key);
+            *projected.entry(result_key).or_insert(0) += weight;
+        }
+        projected.retain(|_, weight| *weight != 0);
+
+        let deltas = compute_delta(&previous, &projected);
+        zset_stream.add_deltas(deltas);
+        let handle = zset_stream
+            .flush()
+            .await
+            .context("flush lifted project result")?;
+        output_handles.push(handle);
+        previous = projected;
+    }
+
+    let default_handle = output_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| zset_stream.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, LIFTED_PROJECT_STREAM_PREFIX).await?;
+
+    if output_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, output_handles[0].clone());
+        for handle in output_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = output_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_join_zset_stream<L, R, O, P, F>(
+    left: &Stream<ZSetHandle>,
+    right: &Stream<ZSetHandle>,
+    predicate: P,
+    projector: F,
+) -> Result<Stream<ZSetHandle>>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+{
+    let left_handles = collect_values(left, left.timestamp).await?;
+    let right_handles = collect_values(right, right.timestamp).await?;
+    let total = left_handles.len().min(right_handles.len());
+    let table = left.table.clone();
+    let namespace = next_lifted_zset_namespace(LIFTED_JOIN_ZSET_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for lifted join")?,
+    );
+    let mut zset_stream = ZSetStream::new(dict, table.clone(), namespace, StreamRetention::None)
+        .await
+        .context("create ZSet stream for lifted join")?;
+
+    let mut left_cache: HashMap<String, Arc<Dictionary<L>>> = HashMap::new();
+    let mut right_cache: HashMap<String, Arc<Dictionary<R>>> = HashMap::new();
+    let mut previous: HashMap<O, i64> = HashMap::new();
+    let mut output_handles = Vec::with_capacity(total);
+
+    for t in 0..total {
+        let left_map =
+            materialize_zset_handle::<L>(table.clone(), &mut left_cache, &left_handles[t]).await?;
+        let right_map =
+            materialize_zset_handle::<R>(table.clone(), &mut right_cache, &right_handles[t])
+                .await?;
+
+        let mut joined: HashMap<O, i64> = HashMap::new();
+        for (left_key, &left_weight) in &left_map {
+            if left_weight == 0 {
+                continue;
+            }
+            for (right_key, &right_weight) in &right_map {
+                if right_weight == 0 {
+                    continue;
+                }
+                if predicate(left_key, right_key) {
+                    let projected = projector(left_key, right_key);
+                    *joined.entry(projected).or_insert(0) += left_weight * right_weight;
+                }
+            }
+        }
+        joined.retain(|_, weight| *weight != 0);
+
+        let deltas = compute_delta(&previous, &joined);
+        zset_stream.add_deltas(deltas);
+        let handle = zset_stream
+            .flush()
+            .await
+            .context("flush lifted join result")?;
+        output_handles.push(handle);
+        previous = joined;
+    }
+
+    let default_handle = output_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| zset_stream.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
+
+    if output_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, output_handles[0].clone());
+        for handle in output_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = output_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_h_zset_stream<K>(
+    diff_stream: &Stream<ZSetHandle>,
+    integrated_stream: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let diff_handles = collect_values(diff_stream, diff_stream.timestamp).await?;
+    let state_handles = collect_values(integrated_stream, integrated_stream.timestamp).await?;
+    let total = diff_handles.len().min(state_handles.len());
+    let table = diff_stream.table.clone();
+    let namespace = next_lifted_zset_namespace(LIFTED_H_ZSET_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for lifted H")?,
+    );
+    let mut zset_stream = ZSetStream::new(dict, table.clone(), namespace, StreamRetention::None)
+        .await
+        .context("create ZSet stream for lifted H")?;
+
+    let mut diff_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut state_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous: HashMap<K, i64> = HashMap::new();
+    let mut output_handles = Vec::with_capacity(total);
+
+    for t in 0..total {
+        let diff_map =
+            materialize_zset_handle::<K>(table.clone(), &mut diff_cache, &diff_handles[t]).await?;
+        let state_map =
+            materialize_zset_handle::<K>(table.clone(), &mut state_cache, &state_handles[t])
+                .await?;
+
+        let mut distincted = HashMap::new();
+        for (key, &diff_weight) in &diff_map {
+            let state_weight = state_map.get(key).copied().unwrap_or(0);
+            let coalesced = diff_weight + state_weight;
+            if state_weight > 0 && coalesced <= 0 {
+                distincted.insert(key.clone(), -1);
+                continue;
+            }
+            if state_weight <= 0 && coalesced > 0 {
+                distincted.insert(key.clone(), 1);
+                continue;
+            }
+            if state_weight == 0 && diff_weight > 0 {
+                distincted.insert(key.clone(), 1);
+            }
+        }
+
+        let deltas = compute_delta(&previous, &distincted);
+        zset_stream.add_deltas(deltas);
+        let handle = zset_stream.flush().await.context("flush lifted H result")?;
+        output_handles.push(handle);
+        previous = distincted;
+    }
+
+    let default_handle = output_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| zset_stream.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, LIFTED_H_STREAM_PREFIX).await?;
+
+    if output_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, output_handles[0].clone());
+        for handle in output_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = output_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_lifted_select_zset_stream<K, P>(
+    input: &Stream<StreamHandle>,
+    predicate: P,
+) -> Result<Stream<StreamHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&K) -> bool + Send + Sync + Clone,
+{
+    let handles = collect_values(input, input.timestamp).await?;
+    let mut output_handles = Vec::with_capacity(handles.len());
+
+    for handle in &handles {
+        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: handle.ns.clone(),
+                version: 0,
+            }));
+        let inner_stream = input
+            .resolve_handle(handle, inner_group.clone())
+            .await
+            .context("resolve inner stream for lifted-lifted select")?;
+        let mut result_stream =
+            lifted_select_zset_stream::<K, _>(&inner_stream, predicate.clone()).await?;
+        result_stream.flush().await?;
+        output_handles.push(result_stream.handle());
+    }
+
+    if output_handles.is_empty() {
+        return Err(anyhow!(
+            "lifted_lifted_select_zset_stream produced no output"
+        ));
+    }
+    let default_handle = output_handles[0].clone();
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream = build_derived_stream(
+        input.table.clone(),
+        handle_group,
+        LIFTED_SELECT_STREAM_PREFIX,
+    )
+    .await?;
+
+    set_default_in_place(&mut result_stream, default_handle.clone());
+    for handle in output_handles.iter().skip(1) {
+        push_value_in_place(&mut result_stream, handle.clone());
+    }
+    if let Some(latest) = output_handles.last() {
+        set_default_in_place(&mut result_stream, latest.clone());
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_lifted_project_zset_stream<K, R, F>(
+    input: &Stream<StreamHandle>,
+    projector: F,
+) -> Result<Stream<StreamHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&K) -> R + Send + Sync + Clone,
+{
+    let handles = collect_values(input, input.timestamp).await?;
+    let mut output_handles = Vec::with_capacity(handles.len());
+
+    for handle in &handles {
+        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: handle.ns.clone(),
+                version: 0,
+            }));
+        let inner_stream = input
+            .resolve_handle(handle, inner_group.clone())
+            .await
+            .context("resolve inner stream for lifted-lifted project")?;
+        let mut result_stream =
+            lifted_project_zset_stream::<K, R, _>(&inner_stream, projector.clone()).await?;
+        result_stream.flush().await?;
+        output_handles.push(result_stream.handle());
+    }
+
+    if output_handles.is_empty() {
+        return Err(anyhow!(
+            "lifted_lifted_project_zset_stream produced no output"
+        ));
+    }
+    let default_handle = output_handles[0].clone();
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream = build_derived_stream(
+        input.table.clone(),
+        handle_group,
+        LIFTED_PROJECT_STREAM_PREFIX,
+    )
+    .await?;
+
+    set_default_in_place(&mut result_stream, default_handle.clone());
+    for handle in output_handles.iter().skip(1) {
+        push_value_in_place(&mut result_stream, handle.clone());
+    }
+    if let Some(latest) = output_handles.last() {
+        set_default_in_place(&mut result_stream, latest.clone());
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_lifted_join_zset_stream<L, R, O, P, F>(
+    left: &Stream<StreamHandle>,
+    right: &Stream<StreamHandle>,
+    predicate: P,
+    projector: F,
+) -> Result<Stream<StreamHandle>>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+{
+    let left_handles = collect_values(left, left.timestamp).await?;
+    let right_handles = collect_values(right, right.timestamp).await?;
+    let total = left_handles.len().min(right_handles.len());
+    let mut output_handles = Vec::with_capacity(total);
+
+    for t in 0..total {
+        let left_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: left_handles[t].ns.clone(),
+                version: 0,
+            }));
+        let right_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: right_handles[t].ns.clone(),
+                version: 0,
+            }));
+
+        let left_stream = left
+            .resolve_handle(&left_handles[t], left_inner_group.clone())
+            .await
+            .context("resolve left stream for lifted-lifted join")?;
+        let right_stream = right
+            .resolve_handle(&right_handles[t], right_inner_group.clone())
+            .await
+            .context("resolve right stream for lifted-lifted join")?;
+
+        let mut result_stream = lifted_join_zset_stream::<L, R, O, _, _>(
+            &left_stream,
+            &right_stream,
+            predicate.clone(),
+            projector.clone(),
+        )
+        .await?;
+        result_stream.flush().await?;
+        output_handles.push(result_stream.handle());
+    }
+
+    if output_handles.is_empty() {
+        return Err(anyhow!("lifted_lifted_join_zset_stream produced no output"));
+    }
+    let default_handle = output_handles[0].clone();
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(left.table.clone(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
+
+    set_default_in_place(&mut result_stream, default_handle.clone());
+    for handle in output_handles.iter().skip(1) {
+        push_value_in_place(&mut result_stream, handle.clone());
+    }
+    if let Some(latest) = output_handles.last() {
+        set_default_in_place(&mut result_stream, latest.clone());
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn lifted_lifted_h_zset_stream<K>(
+    diff_stream: &Stream<StreamHandle>,
+    integrated_stream: &Stream<StreamHandle>,
+) -> Result<Stream<StreamHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let diff_handles = collect_values(diff_stream, diff_stream.timestamp).await?;
+    let state_handles = collect_values(integrated_stream, integrated_stream.timestamp).await?;
+    let total = diff_handles.len().min(state_handles.len());
+    let mut output_handles = Vec::with_capacity(total);
+
+    for t in 0..total {
+        let diff_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: diff_handles[t].ns.clone(),
+                version: 0,
+            }));
+        let state_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: state_handles[t].ns.clone(),
+                version: 0,
+            }));
+
+        let diff_inner = diff_stream
+            .resolve_handle(&diff_handles[t], diff_group.clone())
+            .await
+            .context("resolve diff stream for lifted-lifted H")?;
+        let state_inner = integrated_stream
+            .resolve_handle(&state_handles[t], state_group.clone())
+            .await
+            .context("resolve integrated stream for lifted-lifted H")?;
+
+        let mut result_stream = lifted_h_zset_stream::<K>(&diff_inner, &state_inner).await?;
+        result_stream.flush().await?;
+        output_handles.push(result_stream.handle());
+    }
+
+    if output_handles.is_empty() {
+        return Err(anyhow!("lifted_lifted_h_zset_stream produced no output"));
+    }
+    let default_handle = output_handles[0].clone();
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream = build_derived_stream(
+        diff_stream.table.clone(),
+        handle_group,
+        LIFTED_H_STREAM_PREFIX,
+    )
+    .await?;
+
+    set_default_in_place(&mut result_stream, default_handle.clone());
+    for handle in output_handles.iter().skip(1) {
+        push_value_in_place(&mut result_stream, handle.clone());
+    }
+    if let Some(latest) = output_handles.last() {
+        set_default_in_place(&mut result_stream, latest.clone());
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
+}
+
+pub async fn delta_lifted_delta_lifted_join<L, R, O, P, F>(
+    left: &Stream<StreamHandle>,
+    right: &Stream<StreamHandle>,
+    predicate: P,
+    projector: F,
+) -> Result<Stream<StreamHandle>>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+{
+    let left_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(ZSetHandle {
+            ns: left.default.ns.clone(),
+            version: 0,
+        }));
+    let right_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(ZSetHandle {
+            ns: right.default.ns.clone(),
+            version: 0,
+        }));
+
+    let int_l = lifted_integrate_zset::<L>(left, left_inner_group.clone()).await?;
+    let d_int_l = lifted_delay(&int_l, left_inner_group.clone()).await?;
+    let i_int_l = lifted_integrate_zset::<L>(&int_l, left_inner_group.clone()).await?;
+
+    let int_r = lifted_integrate_zset::<R>(right, right_inner_group.clone()).await?;
+    let d_int_r = lifted_delay(&int_r, right_inner_group.clone()).await?;
+    let i_int_r = lifted_integrate_zset::<R>(&int_r, right_inner_group.clone()).await?;
+    let d_i_int_r = lifted_delay(&i_int_r, right_inner_group.clone()).await?;
+
+    let join1 = lifted_lifted_join_zset_stream::<L, R, O, _, _>(
+        &d_int_l,
+        &d_int_r,
+        predicate.clone(),
+        projector.clone(),
+    )
+    .await?;
+
+    let join2 = lifted_lifted_join_zset_stream::<L, R, O, _, _>(
+        &i_int_l,
+        right,
+        predicate.clone(),
+        projector.clone(),
+    )
+    .await?;
+
+    let join3 = lifted_lifted_join_zset_stream::<L, R, O, _, _>(
+        &int_l,
+        &d_int_r,
+        predicate.clone(),
+        projector.clone(),
+    )
+    .await?;
+
+    let join4 =
+        lifted_lifted_join_zset_stream::<L, R, O, _, _>(left, &d_i_int_r, predicate, projector)
+            .await?;
+
+    let mut total_ts = join1
+        .timestamp
+        .min(join2.timestamp)
+        .min(join3.timestamp)
+        .min(join4.timestamp);
+    if total_ts < 0 {
+        total_ts = 0;
+    }
+
+    let table = left.table.clone();
+
+    let mut components = [join1, join2, join3, join4];
+    let mut caches: Vec<HashMap<String, Arc<Dictionary<O>>>> =
+        vec![HashMap::new(); components.len()];
+
+    let ns = next_lifted_zset_namespace(ZSET_SUM_PREFIX);
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), ns.clone(), None)
+            .await
+            .context("build dictionary for delta lifted join")?,
+    );
+    let mut aggregator = ZSetStream::new(dict, table.clone(), ns, StreamRetention::None)
+        .await
+        .context("create aggregator stream for delta lifted join")?;
+
+    let mut previous: HashMap<O, i64> = HashMap::new();
+    let capacity = usize::try_from(total_ts.saturating_add(1)).unwrap_or(usize::MAX);
+    let mut aggregated_handles = Vec::with_capacity(capacity);
+
+    // Align strictly across components by stopping at the shortest timeline.
+    for t in 0..=total_ts {
+        let mut combined: HashMap<O, i64> = HashMap::new();
+
+        for (idx, component) in components.iter_mut().enumerate() {
+            let handle = component
+                .get(t)
+                .await
+                .context("read component handle for delta lifted join")?;
+            let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+                Arc::new(HandleGroup::new(ZSetHandle {
+                    ns: handle.ns.clone(),
+                    version: 0,
+                }));
+            let mut resolved = component
+                .resolve_handle(&handle, inner_group)
+                .await
+                .context("resolve component inner stream")?;
+            let zset_handle = resolved
+                .latest()
+                .await
+                .context("read component zset handle")?;
+            let map = materialize_zset_handle::<O>(table.clone(), &mut caches[idx], &zset_handle)
+                .await
+                .context("materialize component zset")?;
+
+            for (key, weight) in map {
+                let entry = combined.entry(key).or_insert(0);
+                *entry = (*entry).saturating_add(weight);
+            }
+        }
+
+        combined.retain(|_, weight| *weight != 0);
+        let deltas = compute_delta(&previous, &combined);
+        aggregator.add_deltas(deltas);
+        aggregator
+            .flush()
+            .await
+            .context("flush aggregated zset stream")?;
+        previous = combined;
+
+        aggregated_handles.push(aggregator.stream.handle());
+    }
+
+    let fallback_handle = aggregator.stream.handle();
+    let default_handle = aggregated_handles
+        .first()
+        .cloned()
+        .unwrap_or(fallback_handle);
+    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, DELTA_LIFTED_JOIN_STREAM_PREFIX).await?;
+
+    if aggregated_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, aggregated_handles[0].clone());
+        for handle in aggregated_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = aggregated_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
 }
 
 #[derive(Clone)]
@@ -1342,6 +2951,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delay_shifts_stream_values() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut source = Stream::new(db.clone(), "delay_input", group.clone())
+            .await
+            .expect("create stream");
+        source.send(5).await.expect("send t1");
+        source.send(10).await.expect("send t2");
+        source.send(15).await.expect("send t3");
+
+        let mut delayed = delay(&source).await.expect("apply delay");
+        assert_eq!(delayed.get(0).await.expect("t0"), 0);
+        assert_eq!(delayed.get(1).await.expect("t1"), 0);
+        assert_eq!(delayed.get(2).await.expect("t2"), 5);
+        assert_eq!(delayed.get(3).await.expect("t3"), 10);
+        assert_eq!(delayed.get(4).await.expect("t4"), 10);
+    }
+
+    #[tokio::test]
+    async fn differentiate_computes_deltas() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut source = Stream::new(db.clone(), "differentiate_input", group.clone())
+            .await
+            .expect("create stream");
+        source.send(2).await.expect("send t1");
+        source.send(6).await.expect("send t2");
+        source.send(9).await.expect("send t3");
+
+        let mut diff = differentiate(&source).await.expect("apply diff");
+        assert_eq!(diff.get(0).await.expect("t0"), 0);
+        assert_eq!(diff.get(1).await.expect("t1"), 2);
+        assert_eq!(diff.get(2).await.expect("t2"), 4);
+        assert_eq!(diff.get(3).await.expect("t3"), 3);
+        assert_eq!(diff.get(4).await.expect("t4"), 3);
+    }
+
+    #[tokio::test]
+    async fn integrate_accumulates_stream() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut source = Stream::new(db.clone(), "integrate_input", group.clone())
+            .await
+            .expect("create stream");
+        source.send(1).await.expect("send t1");
+        source.send(2).await.expect("send t2");
+        source.send(3).await.expect("send t3");
+
+        let mut integrated = integrate(&source).await.expect("apply integrate");
+        assert_eq!(integrated.get(0).await.expect("t0"), 0);
+        assert_eq!(integrated.get(1).await.expect("t1"), 1);
+        assert_eq!(integrated.get(2).await.expect("t2"), 3);
+        assert_eq!(integrated.get(3).await.expect("t3"), 6);
+        assert_eq!(integrated.get(4).await.expect("t4"), 6);
+    }
+
+    #[tokio::test]
+    async fn lift1_applies_function_to_stream() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut source = Stream::new(db.clone(), "lift1_input", group.clone())
+            .await
+            .expect("create stream");
+        source.send(3).await.expect("send t1");
+        source.send(5).await.expect("send t2");
+
+        let mut lifted = lift1(&source, group.clone(), |value: &i64| value * 2)
+            .await
+            .expect("apply lift1");
+        assert_eq!(lifted.get(0).await.expect("t0"), 0);
+        assert_eq!(lifted.get(1).await.expect("t1"), 6);
+        assert_eq!(lifted.get(2).await.expect("t2"), 10);
+        assert_eq!(lifted.get(3).await.expect("t3"), 10);
+    }
+
+    #[tokio::test]
+    async fn lift2_combines_two_streams() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut left = Stream::new(db.clone(), "lift2_left", group.clone())
+            .await
+            .expect("create left");
+        left.send(1).await.expect("left t1");
+        left.send(3).await.expect("left t2");
+
+        let mut right = Stream::new(db.clone(), "lift2_right", group.clone())
+            .await
+            .expect("create right");
+        right.set_default(5).await.expect("set right default");
+        right.send(5).await.expect("right t1");
+        right.send(7).await.expect("right t2");
+
+        let mut combined = lift2(&left, &right, group.clone(), |l: &i64, r: &i64| l + r)
+            .await
+            .expect("apply lift2");
+        assert_eq!(combined.get(0).await.expect("t0"), 5);
+        assert_eq!(combined.get(1).await.expect("t1"), 6);
+        assert_eq!(combined.get(2).await.expect("t2"), 10);
+        assert_eq!(combined.get(3).await.expect("t3"), 10);
+    }
+
+    #[tokio::test]
+    async fn stream_introduction_and_elimination_round_trip() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let introduced = stream_introduction(table.clone(), group.clone(), 5)
+            .await
+            .expect("introduce value");
+        let eliminated = stream_elimination(&introduced)
+            .await
+            .expect("eliminate introduced stream");
+        assert_eq!(eliminated, 5);
+
+        let mut aggregate = Stream::with_table(table, "stream_elimination", group.clone())
+            .await
+            .expect("create aggregate stream");
+        aggregate.send(2).await.expect("send first");
+        aggregate.send(3).await.expect("send second");
+        let summed = stream_elimination(&aggregate)
+            .await
+            .expect("eliminate aggregate stream");
+        assert_eq!(summed, 5);
+    }
+
+    #[tokio::test]
+    async fn lifted_delay_operates_on_stream_handles() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut inner_a = Stream::new(db.clone(), "lifted_delay_inner_a", group.clone())
+            .await
+            .expect("create inner stream a");
+        inner_a.send(1).await.expect("inner a t1");
+        inner_a.send(2).await.expect("inner a t2");
+        inner_a.flush().await.expect("flush inner a");
+
+        let mut inner_b = Stream::new(db.clone(), "lifted_delay_inner_b", group.clone())
+            .await
+            .expect("create inner stream b");
+        inner_b.send(5).await.expect("inner b t1");
+        inner_b.send(6).await.expect("inner b t2");
+        inner_b.flush().await.expect("flush inner b");
+
+        let handle_a = inner_a.handle();
+        let handle_b = inner_b.handle();
+        let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(handle_a.clone()));
+
+        let mut outer = Stream::new(db.clone(), "lifted_delay_outer", handle_group)
+            .await
+            .expect("create outer stream");
+        outer.send(handle_a.clone()).await.expect("outer t1");
+        outer.send(handle_b.clone()).await.expect("outer t2");
+
+        let mut delayed = lifted_delay(&outer, group.clone())
+            .await
+            .expect("apply lifted delay");
+
+        let mut handles = Vec::new();
+        for t in 0..=delayed.current_time() {
+            handles.push(
+                delayed
+                    .get(t)
+                    .await
+                    .expect("read delayed handle for timeline"),
+            );
+        }
+
+        let mut resolved_first = delayed
+            .resolve_handle(&handles[0], group.clone())
+            .await
+            .expect("resolve first delayed stream");
+        assert_eq!(resolved_first.get(0).await.expect("first t0"), 0);
+        assert_eq!(resolved_first.get(1).await.expect("first t1"), 0);
+        assert_eq!(resolved_first.get(2).await.expect("first t2"), 1);
+
+        let mut resolved_second = delayed
+            .resolve_handle(handles.last().expect("last delayed handle"), group.clone())
+            .await
+            .expect("resolve second delayed stream");
+        assert_eq!(resolved_second.get(1).await.expect("second t1"), 0);
+        assert_eq!(resolved_second.get(2).await.expect("second t2"), 5);
+    }
+
+    #[tokio::test]
+    async fn lifted_stream_introduction_and_elimination_round_trip() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut base = Stream::new(db.clone(), "lifted_intro_base", group.clone())
+            .await
+            .expect("create base stream");
+        base.send(1).await.expect("base t1");
+        base.send(3).await.expect("base t2");
+
+        let introduced = lifted_stream_introduction(&base)
+            .await
+            .expect("apply lifted stream introduction");
+        let mut eliminated = lifted_stream_elimination(&introduced, group.clone())
+            .await
+            .expect("apply lifted stream elimination");
+
+        for t in 0..=base.current_time() {
+            assert_eq!(
+                eliminated.get(t).await.expect("eliminated value"),
+                base.get(t).await.expect("base value")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn lifted_select_applies_predicate() {
         let db = build_db().await;
         let mut zset = ZSet::new(db, "lifted_select").await.expect("create zset");
@@ -1398,6 +3225,596 @@ mod tests {
         let items: HashMap<_, _> = result.items().await.expect("items").into_iter().collect();
         assert_eq!(items.get("a-a"), Some(&6));
         assert_eq!(items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn incrementalize2_matches_manual_construction() {
+        let db = build_db().await;
+        let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+        let mut left = Stream::new(db.clone(), "inc2_left", group.clone())
+            .await
+            .expect("create left stream");
+        left.send(1).await.expect("left t1");
+        left.send(3).await.expect("left t2");
+
+        let mut right = Stream::new(db.clone(), "inc2_right", group.clone())
+            .await
+            .expect("create right stream");
+        right.send(2).await.expect("right t1");
+        right.send(4).await.expect("right t2");
+
+        let result = incrementalize2(&left, &right, group.clone(), |a, b| a + b)
+            .await
+            .expect("compute incrementalize2");
+
+        let integrated_left = integrate(&left).await.expect("integrate left");
+        let delayed_integrated_left = delay(&integrated_left)
+            .await
+            .expect("delay integrated left");
+
+        let integrated_right = integrate(&right).await.expect("integrate right");
+        let delayed_integrated_right = delay(&integrated_right)
+            .await
+            .expect("delay integrated right");
+
+        let f_ab = lift2(&left, &right, group.clone(), |a, b| a + b)
+            .await
+            .expect("lift2 a,b");
+        let f_a_delayed_b = lift2(&left, &delayed_integrated_right, group.clone(), |a, b| {
+            a + b
+        })
+        .await
+        .expect("lift2 a, delayed b");
+        let f_delayed_a_b = lift2(&delayed_integrated_left, &right, group.clone(), |a, b| {
+            a + b
+        })
+        .await
+        .expect("lift2 delayed a, b");
+
+        let addition = StreamAddition::from_stream(&f_ab);
+        let partial = addition.add(&f_ab, &f_a_delayed_b).await;
+        let manual = addition.add(&partial, &f_delayed_a_b).await;
+
+        let result_values = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect incrementalize2 values");
+        let manual_values = collect_values(&manual, manual.timestamp)
+            .await
+            .expect("collect manual values");
+
+        assert_eq!(result_values, manual_values);
+    }
+
+    #[tokio::test]
+    async fn lifted_select_zset_stream_filters_elements() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+        let dict = Arc::new(
+            Dictionary::with_table(table.clone(), "lifted_select_input", None)
+                .await
+                .expect("build dictionary"),
+        );
+
+        let mut zset_stream = ZSetStream::new(
+            dict,
+            table.clone(),
+            "lifted_select_input",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create zset stream");
+
+        zset_stream.add_delta("keep".to_string(), 1);
+        let handle0 = zset_stream.flush().await.expect("flush first");
+
+        zset_stream.add_delta("keep".to_string(), -1);
+        zset_stream.add_delta("drop".to_string(), 1);
+        let handle1 = zset_stream.flush().await.expect("flush second");
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(handle0.clone()));
+        let mut input_stream =
+            Stream::with_table(table.clone(), "lifted_select_stream", handle_group)
+                .await
+                .expect("create stream of handles");
+        set_default_in_place(&mut input_stream, handle0.clone());
+        push_value_in_place(&mut input_stream, handle1.clone());
+        input_stream.flush().await.expect("flush input stream");
+
+        let mut result = lifted_select_zset_stream::<String, _>(&input_stream, |value: &String| {
+            value.starts_with('k')
+        })
+        .await
+        .expect("apply lifted select stream");
+        result.flush().await.expect("flush result stream");
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect handles");
+        let mut cache = HashMap::new();
+
+        let first = materialize_zset_handle::<String>(table.clone(), &mut cache, &handles[0])
+            .await
+            .expect("materialize first handle");
+        assert_eq!(first.get("keep"), Some(&1));
+        assert!(first.get("drop").is_none());
+
+        let second = materialize_zset_handle::<String>(table.clone(), &mut cache, &handles[1])
+            .await
+            .expect("materialize second handle");
+        assert!(
+            second.get("keep").is_none(),
+            "unexpected keep weight {:?}",
+            second.get("keep")
+        );
+        assert!(second.get("drop").is_none());
+    }
+
+    #[tokio::test]
+    async fn lifted_select_zset_stream_produces_empty_handles_when_filtered_out() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+        let dict = Arc::new(
+            Dictionary::with_table(table.clone(), "lifted_select_empty", None)
+                .await
+                .expect("build dictionary for empty select"),
+        );
+
+        let mut zset_stream = ZSetStream::new(
+            dict,
+            table.clone(),
+            "lifted_select_empty",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create zset stream");
+
+        zset_stream.add_delta("drop".to_string(), 2);
+        let handle0 = zset_stream.flush().await.expect("flush first handle");
+        zset_stream.add_delta("drop".to_string(), -2);
+        zset_stream.add_delta("drop".to_string(), 3);
+        let handle1 = zset_stream.flush().await.expect("flush second handle");
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(handle0.clone()));
+        let mut input_stream =
+            Stream::with_table(table.clone(), "lifted_select_empty_stream", handle_group)
+                .await
+                .expect("create stream of handles");
+        set_default_in_place(&mut input_stream, handle0.clone());
+        push_value_in_place(&mut input_stream, handle1.clone());
+        input_stream
+            .flush()
+            .await
+            .expect("flush lifted select input stream");
+
+        let mut result =
+            lifted_select_zset_stream::<String, _>(&input_stream, |_value: &String| false)
+                .await
+                .expect("apply lifted select with no matches");
+        result.flush().await.expect("flush empty select result");
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect empty select handles");
+        assert!(
+            !handles.is_empty(),
+            "expected neutral handle for empty lifted select"
+        );
+
+        let mut cache = HashMap::new();
+        for handle in handles {
+            let materialized =
+                materialize_zset_handle::<String>(table.clone(), &mut cache, &handle)
+                    .await
+                    .expect("materialize empty select handle");
+            assert!(
+                materialized.is_empty(),
+                "expected empty zset, got {:?}",
+                materialized
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifted_h_zset_stream_detects_transitions() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+        let diff_dict = Arc::new(
+            Dictionary::with_table(table.clone(), "lifted_h_diff", None)
+                .await
+                .expect("diff dictionary"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::with_table(table.clone(), "lifted_h_state", None)
+                .await
+                .expect("state dictionary"),
+        );
+
+        let mut diff_stream = ZSetStream::new(
+            diff_dict,
+            table.clone(),
+            "lifted_h_diff",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create diff stream");
+        let mut state_stream = ZSetStream::new(
+            state_dict,
+            table.clone(),
+            "lifted_h_state",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create state stream");
+
+        diff_stream.add_delta("a".to_string(), 1);
+        let diff_handle0 = diff_stream.flush().await.expect("flush diff0");
+
+        let state_handle0 = state_stream.flush().await.expect("flush state0");
+        state_stream.add_delta("a".to_string(), 1);
+        let state_handle1 = state_stream.flush().await.expect("flush state1");
+
+        diff_stream.add_delta("a".to_string(), -2);
+        let diff_handle1 = diff_stream.flush().await.expect("flush diff1");
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(diff_handle0.clone()));
+        let mut diff_handle_stream =
+            Stream::with_table(table.clone(), "lifted_h_diff_handles", handle_group.clone())
+                .await
+                .expect("create diff handle stream");
+        set_default_in_place(&mut diff_handle_stream, diff_handle0.clone());
+        push_value_in_place(&mut diff_handle_stream, diff_handle1.clone());
+        diff_handle_stream
+            .flush()
+            .await
+            .expect("flush diff handles");
+
+        let mut state_handle_stream =
+            Stream::with_table(table.clone(), "lifted_h_state_handles", handle_group)
+                .await
+                .expect("create state handle stream");
+        set_default_in_place(&mut state_handle_stream, state_handle0.clone());
+        push_value_in_place(&mut state_handle_stream, state_handle1.clone());
+        state_handle_stream
+            .flush()
+            .await
+            .expect("flush state handles");
+
+        let mut debug_cache = HashMap::new();
+        let diff_second =
+            materialize_zset_handle::<String>(table.clone(), &mut debug_cache, &diff_handle1)
+                .await
+                .expect("materialize diff second");
+        let state_second =
+            materialize_zset_handle::<String>(table.clone(), &mut debug_cache, &state_handle1)
+                .await
+                .expect("materialize state second");
+        assert_eq!(diff_second.get("a"), Some(&-1));
+        assert_eq!(state_second.get("a"), Some(&1));
+
+        let mut result = lifted_h_zset_stream::<String>(&diff_handle_stream, &state_handle_stream)
+            .await
+            .expect("apply lifted H stream");
+        result.flush().await.expect("flush lifted H result");
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect H handles");
+        let mut cache = HashMap::new();
+
+        let first = materialize_zset_handle::<String>(table.clone(), &mut cache, &handles[0])
+            .await
+            .expect("materialize first H result");
+        assert_eq!(first.get("a"), Some(&1));
+
+        let second = materialize_zset_handle::<String>(table.clone(), &mut cache, &handles[1])
+            .await
+            .expect("materialize second H result");
+        assert_eq!(second.get("a"), Some(&-1), "second H map: {:?}", second);
+    }
+
+    #[tokio::test]
+    async fn lifted_lifted_select_zset_stream_operates_on_nested_streams() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+        let dict = Arc::new(
+            Dictionary::with_table(table.clone(), "lifted_lifted_select", None)
+                .await
+                .expect("dictionary"),
+        );
+
+        let mut zset_stream = ZSetStream::new(
+            dict,
+            table.clone(),
+            "lifted_lifted_select",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create zset stream");
+
+        zset_stream.add_delta("keep".to_string(), 2);
+        let handle0 = zset_stream.flush().await.expect("flush handle0");
+
+        zset_stream.add_delta("drop".to_string(), 3);
+        let handle1 = zset_stream.flush().await.expect("flush handle1");
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(handle0.clone()));
+        let mut inner_stream =
+            Stream::with_table(table.clone(), "lifted_lifted_select_inner", handle_group)
+                .await
+                .expect("create inner stream");
+        set_default_in_place(&mut inner_stream, handle0.clone());
+        push_value_in_place(&mut inner_stream, handle1.clone());
+        inner_stream.flush().await.expect("flush inner stream");
+
+        let mut selected =
+            lifted_select_zset_stream::<String, _>(&inner_stream, |value: &String| value == "keep")
+                .await
+                .expect("apply inner lifted select");
+        selected.flush().await.expect("flush selected");
+        let selected_handle = selected.handle();
+
+        let stream_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(selected_handle.clone()));
+        let mut outer_stream =
+            Stream::with_table(table.clone(), "lifted_lifted_select_outer", stream_group)
+                .await
+                .expect("create outer stream");
+        set_default_in_place(&mut outer_stream, selected_handle.clone());
+        outer_stream.flush().await.expect("flush outer stream");
+
+        let mut result =
+            lifted_lifted_select_zset_stream::<String, _>(&outer_stream, |value: &String| {
+                value == "keep"
+            })
+            .await
+            .expect("apply lifted-lifted select");
+        result.flush().await.expect("flush lifted-lifted result");
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect outer handles");
+        let resolved_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(handle0.clone()));
+        let mut resolved = result
+            .resolve_handle(&handles[0], resolved_group)
+            .await
+            .expect("resolve nested stream");
+        resolved.flush().await.expect("flush resolved stream");
+
+        let resolved_handles = collect_values(&resolved, resolved.timestamp)
+            .await
+            .expect("collect resolved handles");
+        let mut cache = HashMap::new();
+        let first =
+            materialize_zset_handle::<String>(table.clone(), &mut cache, &resolved_handles[0])
+                .await
+                .expect("materialize resolved first");
+        assert_eq!(first.get("keep"), Some(&2));
+        assert!(first.get("drop").is_none());
+    }
+
+    #[tokio::test]
+    async fn delta_lifted_delta_lifted_join_produces_handles() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+
+        let dict_a = Arc::new(
+            Dictionary::with_table(table.clone(), "delta_join_a", None)
+                .await
+                .expect("dictionary a"),
+        );
+        let mut stream_a =
+            ZSetStream::new(dict_a, table.clone(), "delta_join_a", StreamRetention::None)
+                .await
+                .expect("create zset stream a");
+
+        stream_a.add_delta((0_i32, 1_i32), 1);
+        stream_a.flush().await.expect("flush a t0");
+        stream_a.add_delta((1, 2), 1);
+        stream_a.flush().await.expect("flush a t1");
+
+        let dict_b = Arc::new(
+            Dictionary::with_table(table.clone(), "delta_join_b", None)
+                .await
+                .expect("dictionary b"),
+        );
+        let mut stream_b =
+            ZSetStream::new(dict_b, table.clone(), "delta_join_b", StreamRetention::None)
+                .await
+                .expect("create zset stream b");
+
+        stream_b.add_delta((1_i32, 3_i32), 1);
+        stream_b.flush().await.expect("flush b t0");
+        stream_b.add_delta((2, 4), 1);
+        stream_b.flush().await.expect("flush b t1");
+
+        let a_handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(stream_a.stream.handle()));
+        let b_handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(stream_b.stream.handle()));
+
+        let mut outer_a =
+            Stream::with_table(table.clone(), "delta_join_outer_a", a_handle_group.clone())
+                .await
+                .expect("create outer stream a");
+        let handle_a0 = stream_a.stream.handle();
+        set_default_in_place(&mut outer_a, handle_a0.clone());
+        let handle_a1 = stream_a.stream.handle();
+        push_value_in_place(&mut outer_a, handle_a1.clone());
+        outer_a.flush().await.expect("flush outer a");
+
+        let mut outer_b =
+            Stream::with_table(table.clone(), "delta_join_outer_b", b_handle_group.clone())
+                .await
+                .expect("create outer stream b");
+        let handle_b0 = stream_b.stream.handle();
+        set_default_in_place(&mut outer_b, handle_b0.clone());
+        let handle_b1 = stream_b.stream.handle();
+        push_value_in_place(&mut outer_b, handle_b1.clone());
+        outer_b.flush().await.expect("flush outer b");
+
+        let mut result = delta_lifted_delta_lifted_join(
+            &outer_a,
+            &outer_b,
+            |left: &(i32, i32), right: &(i32, i32)| left.1 == right.0,
+            |left: &(i32, i32), right: &(i32, i32)| (left.0, right.1),
+        )
+        .await
+        .expect("compute delta lifted join");
+        result
+            .flush()
+            .await
+            .expect("flush delta lifted join output");
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect delta lifted join handles");
+        assert!(!handles.is_empty());
+
+        let mut cache = HashMap::new();
+        for handle in handles {
+            let group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(ZSetHandle {
+                ns: handle.ns.clone(),
+                version: 0,
+            }));
+            let mut resolved = result
+                .resolve_handle(&handle, group.clone())
+                .await
+                .expect("resolve nested join stream");
+            let zset_handle = resolved.latest().await.expect("load nested handle");
+            let map =
+                materialize_zset_handle::<(i32, i32)>(table.clone(), &mut cache, &zset_handle)
+                    .await
+                    .expect("materialize nested zset");
+            if handle.frontier > 0 {
+                assert!(
+                    !map.is_empty(),
+                    "expected non-empty map at frontier {}, map {:?}",
+                    handle.frontier,
+                    map
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_lifted_delta_lifted_join_aligns_to_shortest_stream() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+
+        let dict_left = Arc::new(
+            Dictionary::with_table(table.clone(), "delta_join_align_left", None)
+                .await
+                .expect("dictionary left"),
+        );
+        let mut stream_left = ZSetStream::new(
+            dict_left,
+            table.clone(),
+            "delta_join_align_left",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create left zset stream");
+
+        stream_left.add_delta((0_i32, 1_i32), 1);
+        stream_left.flush().await.expect("flush left t0");
+        stream_left.add_delta((1_i32, 2_i32), 1);
+        stream_left.flush().await.expect("flush left t1");
+
+        let dict_right = Arc::new(
+            Dictionary::with_table(table.clone(), "delta_join_align_right", None)
+                .await
+                .expect("dictionary right"),
+        );
+        let mut stream_right = ZSetStream::new(
+            dict_right,
+            table.clone(),
+            "delta_join_align_right",
+            StreamRetention::None,
+        )
+        .await
+        .expect("create right zset stream");
+
+        stream_right.add_delta((1_i32, 3_i32), 1);
+        stream_right.flush().await.expect("flush right t0");
+
+        let left_handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(stream_left.stream.handle()));
+        let mut outer_left = Stream::with_table(
+            table.clone(),
+            "delta_join_align_outer_left",
+            left_handle_group,
+        )
+        .await
+        .expect("create outer left stream");
+        let left_default = stream_left.stream.handle();
+        set_default_in_place(&mut outer_left, left_default.clone());
+        let left_latest = stream_left.stream.handle();
+        push_value_in_place(&mut outer_left, left_latest.clone());
+        outer_left.flush().await.expect("flush outer left stream");
+
+        let right_handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
+            Arc::new(HandleGroup::new(stream_right.stream.handle()));
+        let mut outer_right = Stream::with_table(
+            table.clone(),
+            "delta_join_align_outer_right",
+            right_handle_group,
+        )
+        .await
+        .expect("create outer right stream");
+        let right_default = stream_right.stream.handle();
+        set_default_in_place(&mut outer_right, right_default.clone());
+        outer_right.flush().await.expect("flush outer right stream");
+
+        let mut result = delta_lifted_delta_lifted_join(
+            &outer_left,
+            &outer_right,
+            |left: &(i32, i32), right: &(i32, i32)| left.1 == right.0,
+            |left: &(i32, i32), right: &(i32, i32)| (left.0, right.1),
+        )
+        .await
+        .expect("compute aligned delta lifted join");
+        result
+            .flush()
+            .await
+            .expect("flush aligned delta lifted join output");
+
+        assert_eq!(
+            result.timestamp, outer_right.timestamp,
+            "aggregator should stop at shortest timeline"
+        );
+
+        let handles = collect_values(&result, result.timestamp)
+            .await
+            .expect("collect aligned result handles");
+        assert_eq!(
+            handles.len(),
+            usize::try_from(outer_right.timestamp.saturating_add(1))
+                .expect("convert timestamp to length"),
+            "expected handles only up to shortest stream frontier"
+        );
+
+        let mut cache = HashMap::new();
+        if let Some(handle) = handles.first() {
+            let group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(ZSetHandle {
+                ns: handle.ns.clone(),
+                version: 0,
+            }));
+            let mut resolved = result
+                .resolve_handle(handle, group)
+                .await
+                .expect("resolve aggregated handle");
+            let zset_handle = resolved.latest().await.expect("latest aggregated zset");
+            let _materialized =
+                materialize_zset_handle::<(i32, i32)>(table.clone(), &mut cache, &zset_handle)
+                    .await
+                    .expect("materialize aligned aggregated zset");
+        }
     }
 
     #[tokio::test]

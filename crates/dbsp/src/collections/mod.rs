@@ -1,3 +1,3 @@
 pub mod zset;
 
-pub use zset::ZSet;
+pub use zset::{ZSet, h};
