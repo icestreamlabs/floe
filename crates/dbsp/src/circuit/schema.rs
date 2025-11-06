@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion_common::{DFSchema, DFSchemaRef};
+use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError};
 
 use crate::circuit::types::{DbspScalarType, ScalarValue};
 
@@ -97,14 +97,20 @@ impl RowSchema {
         Ok(())
     }
 
-    pub fn to_dfschema(&self) -> Result<DFSchemaRef> {
-        let arrow_fields: Vec<ArrowField> = self
+    pub fn to_arrow_schema(&self) -> Arc<ArrowSchema> {
+        let fields: Vec<ArrowField> = self
             .fields
             .iter()
             .map(|field| ArrowField::new(&field.name, field.data_type.to_arrow(), field.nullable))
             .collect();
-        let arrow_schema = ArrowSchema::new(arrow_fields);
-        Ok(Arc::new(DFSchema::try_from(arrow_schema)?))
+        Arc::new(ArrowSchema::new(fields))
+    }
+
+    pub fn to_dfschema(&self) -> Result<DFSchemaRef> {
+        let arrow_schema = self.to_arrow_schema();
+        let df_schema = DFSchema::try_from((*arrow_schema.as_ref()).clone())
+            .map_err(|err: DataFusionError| anyhow!(err.to_string()))?;
+        Ok(Arc::new(df_schema))
     }
 }
 
