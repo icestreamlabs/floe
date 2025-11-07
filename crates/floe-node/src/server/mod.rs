@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
-use floe_executor::FloeQueryContext;
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry};
 use floe_storage::SlateCatalog;
 use futures::Sink;
 use futures::stream;
@@ -29,26 +29,27 @@ use crate::sql;
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
 
-pub async fn run() -> Result<()> {
-    let storage = match std::env::var(DATA_ENV) {
+pub async fn init_storage() -> Result<Arc<SlateCatalog>> {
+    match std::env::var(DATA_ENV) {
         Ok(dir) => {
             let path = PathBuf::from(dir);
             SlateCatalog::with_filesystem(path)
                 .await
-                .context("failed to initialise SlateDB filesystem catalog")?
+                .map(Arc::new)
+                .context("failed to initialise SlateDB filesystem catalog")
         }
         Err(_) => SlateCatalog::in_memory()
             .await
-            .context("failed to initialise SlateDB in-memory catalog")?,
-    };
+            .map(Arc::new)
+            .context("failed to initialise SlateDB in-memory catalog"),
+    }
+}
 
-    let query = FloeQueryContext::new(Arc::new(storage));
-    query
-        .preload_tables()
-        .await
-        .context("failed to register tables with DataFusion")?;
-
-    let state = Arc::new(FloeServerState::new(query));
+pub async fn run(
+    query: FloeQueryContext,
+    materialized_views: Arc<MaterializedViewRegistry>,
+) -> Result<()> {
+    let state = Arc::new(FloeServerState::new(query, materialized_views));
     let factory = Arc::new(FloeServerFactory::new(state));
 
     let address = std::env::var(LISTEN_ENV).unwrap_or_else(|_| "127.0.0.1:6432".to_string());
@@ -88,11 +89,15 @@ pub async fn run() -> Result<()> {
 #[derive(Clone)]
 struct FloeServerState {
     query: FloeQueryContext,
+    materialized_views: Arc<MaterializedViewRegistry>,
 }
 
 impl FloeServerState {
-    fn new(query: FloeQueryContext) -> Self {
-        Self { query }
+    fn new(query: FloeQueryContext, materialized_views: Arc<MaterializedViewRegistry>) -> Self {
+        Self {
+            query,
+            materialized_views,
+        }
     }
 }
 
@@ -167,6 +172,7 @@ impl FloeQueryHandler {
     }
 
     async fn handle_select(&self, query: &Query) -> PgWireResult<Response> {
+        let _views = Arc::clone(&self.state.materialized_views);
         self.execute_sql(&query.to_string()).await
     }
 

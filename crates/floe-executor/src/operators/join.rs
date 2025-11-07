@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
@@ -14,38 +15,38 @@ struct StoredRow {
     multiplicity: Diff,
 }
 
-pub struct JoinOperator<S: RowSink> {
+pub struct JoinOperator {
     left_input: InputPort,
     right_input: InputPort,
     join_keys: Vec<(usize, usize)>,
     projection: Vec<Expr>,
-    sink: S,
+    sink: Box<dyn RowSink>,
     left_state: HashMap<Vec<ScalarValue>, Vec<StoredRow>>,
     right_state: HashMap<Vec<ScalarValue>, Vec<StoredRow>>,
 }
 
-impl<S: RowSink> JoinOperator<S> {
+impl JoinOperator {
     pub fn new(
         left_input: InputPort,
         right_input: InputPort,
         join_keys: Vec<(usize, usize)>,
         projection: Vec<Expr>,
-        sink: S,
+        sink: impl RowSink,
     ) -> Self {
         Self {
             left_input,
             right_input,
             join_keys,
             projection,
-            sink,
+            sink: Box::new(sink),
             left_state: HashMap::new(),
             right_state: HashMap::new(),
         }
     }
 
     #[cfg(test)]
-    pub fn sink(&self) -> &S {
-        &self.sink
+    pub fn sink(&self) -> &dyn RowSink {
+        self.sink.as_ref()
     }
 
     fn handle_row(
@@ -98,7 +99,7 @@ impl<S: RowSink> JoinOperator<S> {
     }
 }
 
-impl<S: RowSink> StreamOperator for JoinOperator<S> {
+impl StreamOperator for JoinOperator {
     fn on_input(
         &mut self,
         input: InputPort,
@@ -117,6 +118,14 @@ impl<S: RowSink> StreamOperator for JoinOperator<S> {
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.sink.watermark(watermark)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -208,8 +217,9 @@ mod tests {
         )
         .expect("right insert");
 
-        assert_eq!(op.sink().rows.len(), 1);
-        assert_eq!(op.sink().rows[0].0[0], left_row[0]);
-        assert_eq!(op.sink().rows[0].0[1], right_row[1]);
+        let sink = op.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(sink.rows[0].0[0], left_row[0]);
+        assert_eq!(sink.rows[0].0[1], right_row[1]);
     }
 }

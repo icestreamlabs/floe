@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -6,21 +7,25 @@ use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry}
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
-pub struct MaterializeOperator<S: RowSink> {
+pub struct MaterializeOperator {
     input: InputPort,
-    sink: S,
+    sink: Box<dyn RowSink>,
     view: Arc<MaterializedViewHandle>,
 }
 
-impl<S: RowSink> MaterializeOperator<S> {
+impl MaterializeOperator {
     pub fn new(
         input: InputPort,
         view_name: impl Into<String>,
         registry: Arc<MaterializedViewRegistry>,
-        sink: S,
+        sink: impl RowSink,
     ) -> Self {
         let view = registry.register(view_name.into());
-        Self { input, sink, view }
+        Self {
+            input,
+            sink: Box::new(sink),
+            view,
+        }
     }
 
     pub fn view(&self) -> Arc<MaterializedViewHandle> {
@@ -28,12 +33,12 @@ impl<S: RowSink> MaterializeOperator<S> {
     }
 
     #[cfg(test)]
-    pub fn sink(&self) -> &S {
-        &self.sink
+    pub fn sink(&self) -> &dyn RowSink {
+        self.sink.as_ref()
     }
 }
 
-impl<S: RowSink> StreamOperator for MaterializeOperator<S> {
+impl StreamOperator for MaterializeOperator {
     fn on_input(
         &mut self,
         input: InputPort,
@@ -59,6 +64,14 @@ impl<S: RowSink> StreamOperator for MaterializeOperator<S> {
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.view.update_watermark(watermark);
         self.sink.watermark(watermark)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -96,6 +109,7 @@ mod tests {
 
         op.on_watermark(5).expect("watermark");
         assert_eq!(view.watermark(), Some(5));
-        assert_eq!(op.sink().watermarks, vec![5]);
+        let sink = op.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(sink.watermarks, vec![5]);
     }
 }

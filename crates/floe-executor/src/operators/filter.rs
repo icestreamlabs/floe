@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::{Result, bail};
 
 use crate::dataflow_plan::Expr;
@@ -5,28 +7,28 @@ use crate::expr_eval::evaluate_bool;
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
-pub struct FilterOperator<S: RowSink> {
+pub struct FilterOperator {
     input: InputPort,
     predicate: Expr,
-    sink: S,
+    sink: Box<dyn RowSink>,
 }
 
-impl<S: RowSink> FilterOperator<S> {
-    pub fn new(input: InputPort, predicate: Expr, sink: S) -> Self {
+impl FilterOperator {
+    pub fn new(input: InputPort, predicate: Expr, sink: impl RowSink) -> Self {
         Self {
             input,
             predicate,
-            sink,
+            sink: Box::new(sink),
         }
     }
 
     #[cfg(test)]
-    pub fn sink(&self) -> &S {
-        &self.sink
+    pub fn sink(&self) -> &dyn RowSink {
+        self.sink.as_ref()
     }
 }
 
-impl<S: RowSink> StreamOperator for FilterOperator<S> {
+impl StreamOperator for FilterOperator {
     fn on_input(
         &mut self,
         input: InputPort,
@@ -47,6 +49,14 @@ impl<S: RowSink> StreamOperator for FilterOperator<S> {
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.sink.watermark(watermark)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -73,13 +83,15 @@ mod tests {
         operator
             .on_input(InputPort::new(port.operator, 0), accepted.clone(), 1, 1)
             .expect("filter pass");
-        assert_eq!(operator.sink().rows.len(), 1);
+        let test_sink = operator.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(test_sink.rows.len(), 1);
 
         let rejected = vec![ScalarValue::Int64(Some(0))];
         operator
             .on_input(InputPort::new(port.operator, 0), rejected, 1, 1)
             .expect("filter drop");
-        assert_eq!(operator.sink().rows.len(), 1, "second row filtered out");
-        assert_eq!(operator.sink().rows[0].0, accepted);
+        let test_sink = operator.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(test_sink.rows.len(), 1, "second row filtered out");
+        assert_eq!(test_sink.rows[0].0, accepted);
     }
 }

@@ -15,7 +15,9 @@ pub use circuit_builder::{
 };
 pub use context::FloeQueryContext;
 pub use dataflow_plan::{DataflowPlan, Expr, OperatorNode};
-pub use execution_loop::{IngestedRow, ScanRuntime};
+pub use execution_loop::{
+    BuiltGraph, IngestedRow, ScanRuntime, TickLoop, build_graph, instantiate_tick_loop,
+};
 pub use materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use operators::{
     FilterOperator, JoinOperator, MapOperator, MaterializeOperator, RowSink, ScanOperator,

@@ -1,19 +1,21 @@
+use std::any::Any;
+
 use anyhow::{Result, bail};
 
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
 /// Scan operators serve as sources; they do not consume upstream input.
-pub struct ScanOperator<S: RowSink> {
+pub struct ScanOperator {
     source_name: String,
-    sink: S,
+    sink: Box<dyn RowSink>,
 }
 
-impl<S: RowSink> ScanOperator<S> {
-    pub fn new(source_name: impl Into<String>, sink: S) -> Self {
+impl ScanOperator {
+    pub fn new(source_name: impl Into<String>, sink: impl RowSink) -> Self {
         Self {
             source_name: source_name.into(),
-            sink,
+            sink: Box::new(sink),
         }
     }
 
@@ -26,12 +28,12 @@ impl<S: RowSink> ScanOperator<S> {
     }
 
     #[cfg(test)]
-    pub fn sink(&self) -> &S {
-        &self.sink
+    pub fn sink(&self) -> &dyn RowSink {
+        self.sink.as_ref()
     }
 }
 
-impl<S: RowSink> StreamOperator for ScanOperator<S> {
+impl StreamOperator for ScanOperator {
     fn on_input(
         &mut self,
         _input: InputPort,
@@ -48,6 +50,14 @@ impl<S: RowSink> StreamOperator for ScanOperator<S> {
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.sink.watermark(watermark)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -63,7 +73,8 @@ mod tests {
         let mut op = ScanOperator::new("bid", sink);
         let row = vec![ScalarValue::Int64(Some(1))];
         op.ingest(row.clone(), 1, 1).expect("ingest");
-        assert_eq!(op.sink().rows.len(), 1);
-        assert_eq!(op.sink().rows[0].0, row);
+        let sink = op.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(sink.rows[0].0, row);
     }
 }

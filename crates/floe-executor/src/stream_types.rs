@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
 
@@ -47,7 +49,7 @@ impl OutputPort {
 }
 
 /// Common interface implemented by runtime stream operators.
-pub trait StreamOperator {
+pub trait StreamOperator: Send {
     fn on_input(
         &mut self,
         input: InputPort,
@@ -57,4 +59,7 @@ pub trait StreamOperator {
     ) -> Result<()>;
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()>;
+
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

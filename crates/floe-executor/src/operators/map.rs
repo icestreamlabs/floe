@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::{Result, bail};
 
 use crate::dataflow_plan::Expr;
@@ -5,28 +7,28 @@ use crate::expr_eval::evaluate;
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
-pub struct MapOperator<S: RowSink> {
+pub struct MapOperator {
     input: InputPort,
     expressions: Vec<Expr>,
-    sink: S,
+    sink: Box<dyn RowSink>,
 }
 
-impl<S: RowSink> MapOperator<S> {
-    pub fn new(input: InputPort, expressions: Vec<Expr>, sink: S) -> Self {
+impl MapOperator {
+    pub fn new(input: InputPort, expressions: Vec<Expr>, sink: impl RowSink + 'static) -> Self {
         Self {
             input,
             expressions,
-            sink,
+            sink: Box::new(sink),
         }
     }
 
     #[cfg(test)]
-    pub fn sink(&self) -> &S {
-        &self.sink
+    pub fn sink(&self) -> &dyn RowSink {
+        self.sink.as_ref()
     }
 }
 
-impl<S: RowSink> StreamOperator for MapOperator<S> {
+impl StreamOperator for MapOperator {
     fn on_input(
         &mut self,
         input: InputPort,
@@ -50,6 +52,14 @@ impl<S: RowSink> StreamOperator for MapOperator<S> {
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.sink.watermark(watermark)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -82,8 +92,9 @@ mod tests {
         operator
             .on_input(InputPort::new(input.operator, 0), row.clone(), 1, 1)
             .expect("map input");
-        assert_eq!(operator.sink().rows.len(), 1);
-        assert_eq!(operator.sink().rows[0].0[0], row[0]);
-        assert_eq!(operator.sink().rows[0].0[1], ScalarValue::Int64(Some(6)));
+        let test_sink = operator.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(test_sink.rows.len(), 1);
+        assert_eq!(test_sink.rows[0].0[0], row[0]);
+        assert_eq!(test_sink.rows[0].0[1], ScalarValue::Int64(Some(6)));
     }
 }
