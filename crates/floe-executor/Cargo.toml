@@ -6,10 +6,12 @@ edition.workspace = true
 [dependencies]
 floe-core = { path = "../floe-core" }
 floe-storage = { path = "../floe-storage" }
+dbsp = { path = "../dbsp" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
 serde_json = { workspace = true }
+slatedb = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }

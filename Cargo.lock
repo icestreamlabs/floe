@@ -1742,9 +1742,11 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "dbsp",
  "floe-core",
  "floe-storage",
  "serde_json",
+ "slatedb",
 ]
 
 [[package]]

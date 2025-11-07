@@ -1,6 +1,8 @@
 pub mod circuit_builder;
 pub mod context;
 pub mod dataflow_plan;
+pub mod dbsp_bridge;
+pub mod encoding;
 pub mod execution_loop;
 pub mod expr_eval;
 pub mod materialized_view;
