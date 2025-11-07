@@ -25,4 +25,4 @@ pub use operators::{
 pub use query_planner::QueryPlanner;
 pub use source_decoder::SourceRowDecoder;
 pub use stream_types::{Diff, InputPort, OperatorId, OutputPort, Row, StreamOperator, Timestamp};
-pub use table_provider::SlateTableProvider;
+pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};

@@ -9,7 +9,7 @@ use crate::dataflow_plan::{
     DataflowPlan, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
 };
 use crate::source_decoder::SourceRowDecoder;
-use crate::stream_types::{Diff, OperatorId, OutputPort, Row};
+use crate::stream_types::{Diff, OperatorId, OutputPort, Row, Timestamp};
 
 /// Lightweight placeholder representing the DBSP circuit under construction.
 #[derive(Debug, Default)]
@@ -99,7 +99,7 @@ impl SourceRegistry {
         self.sources.get(name).map(|entry| &entry.decoder)
     }
 
-    pub fn decode_event(&self, event: &SourceEvent) -> Result<Row> {
+    pub fn decode_event(&self, event: &SourceEvent) -> Result<(Row, Option<Timestamp>)> {
         let decoder = self
             .decoder(event.source())
             .with_context(|| format!("source '{}' is not registered", event.source()))?;
@@ -357,7 +357,7 @@ mod tests {
             }),
         );
 
-        let row = registry.decode_event(&event).expect("decode");
+        let (row, _) = registry.decode_event(&event).expect("decode");
         assert_eq!(row.len(), 2);
         assert_eq!(row[0], ScalarValue::Int64(Some(1)));
         assert_eq!(row[1], ScalarValue::Int64(Some(2)));

@@ -10,9 +10,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use floe_executor::{FloeQueryContext, MaterializedViewRegistry, Timestamp};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::DFSchemaRef;
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
-use planner::plan_materialized_views;
+use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::task::JoinHandle;
 
 use crate::executor::{MaterializedExecutor, build_dataflows, build_executor_sources};
@@ -65,16 +67,11 @@ async fn main() -> anyhow::Result<()> {
     let mut maybe_rx = Some(event_rx);
     let executor_handle: Option<JoinHandle<()>> = if let Some(mut executor) = executor {
         Some(tokio::spawn(async move {
-            let mut timestamp: Timestamp = 0;
             let mut rx = maybe_rx.take().expect("receiver available");
             while let Some(event) = rx.recv().await {
-                timestamp = timestamp.saturating_add(1);
-                if let Err(err) = executor.ingest(event.clone(), timestamp) {
+                if let Err(err) = executor.ingest(event.clone()) {
                     eprintln!("executor ingestion failed: {err}");
                     continue;
-                }
-                if let Err(err) = executor.advance_source_watermark(event.source(), timestamp) {
-                    eprintln!("failed to update watermark for {}: {err}", event.source());
                 }
             }
         }))
@@ -96,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
         .preload_tables()
         .await
         .context("failed to register tables with DataFusion")?;
+    register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
+        .context("register materialized view tables")?;
 
     let server_result = server::run(query, Arc::clone(&mv_registry)).await;
 
@@ -123,4 +122,38 @@ async fn main() -> anyhow::Result<()> {
     let _ = planned_materialized_views;
 
     server_result
+}
+
+fn register_materialized_view_tables(
+    context: &FloeQueryContext,
+    planned: &[PlannedMaterializedView],
+    registry: &Arc<MaterializedViewRegistry>,
+) -> anyhow::Result<()> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+
+    let session = context.session();
+    for mv in planned {
+        let arrow_schema = df_schema_to_arrow(mv.logical_plan().schema())?;
+        let provider = MaterializedViewTableProvider::new(
+            Arc::clone(registry),
+            mv.definition().name().to_string(),
+            arrow_schema,
+        );
+        session
+            .register_table(mv.definition().name(), Arc::new(provider))
+            .context("register materialized view provider")?;
+    }
+
+    Ok(())
+}
+
+fn df_schema_to_arrow(schema: &DFSchemaRef) -> anyhow::Result<SchemaRef> {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
+        .collect();
+    Ok(Arc::new(Schema::new(fields)))
 }

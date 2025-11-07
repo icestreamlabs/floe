@@ -3,7 +3,7 @@ use datafusion::scalar::ScalarValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 use serde_json::Value;
 
-use crate::stream_types::Row;
+use crate::stream_types::{Row, Timestamp};
 
 #[derive(Debug, Clone)]
 pub struct SourceRowDecoder {
@@ -19,7 +19,7 @@ impl SourceRowDecoder {
         &self.definition
     }
 
-    pub fn decode(&self, event: &SourceEvent) -> Result<Row> {
+    pub fn decode(&self, event: &SourceEvent) -> Result<(Row, Option<Timestamp>)> {
         if event.source() != self.definition.name() {
             bail!(
                 "event source {} does not match definition {}",
@@ -32,13 +32,22 @@ impl SourceRowDecoder {
             .as_object()
             .context("source payload must be a JSON object")?;
         let mut row = Vec::with_capacity(self.definition.columns().len());
+        let mut event_ts = None;
         for column in self.definition.columns() {
             let value = object
                 .get(column.name())
                 .with_context(|| format!("missing field '{}' in source payload", column.name()))?;
-            row.push(convert_value(column.data_type(), value)?);
+            let scalar = convert_value(column.data_type(), value)?;
+            if event_ts.is_none() && matches!(column.data_type(), SourceDataType::TimestampMillis) {
+                if let ScalarValue::TimestampMillisecond(Some(ms), _) = scalar {
+                    if ms >= 0 {
+                        event_ts = Some(ms as u64);
+                    }
+                }
+            }
+            row.push(scalar);
         }
-        Ok(row)
+        Ok((row, event_ts))
     }
 }
 
@@ -101,7 +110,7 @@ mod tests {
             }),
         );
 
-        let row = decoder.decode(&event).expect("decode");
+        let (row, ts) = decoder.decode(&event).expect("decode");
         assert_eq!(row.len(), 7);
         assert_eq!(row[0], ScalarValue::Int64(Some(100)));
         assert_eq!(row[1], ScalarValue::Int64(Some(42)));
@@ -115,5 +124,6 @@ mod tests {
             row[5],
             ScalarValue::TimestampMillisecond(Some(1_600_000_000), None)
         );
+        assert_eq!(ts, Some(1_600_000_000_u64));
     }
 }

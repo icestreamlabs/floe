@@ -26,6 +26,7 @@ pub fn build_dataflows(views: &[PlannedMaterializedView]) -> Result<Vec<Dataflow
 
 pub struct MaterializedExecutor {
     tick_loops: Vec<TickLoop>,
+    next_fallback_ts: Timestamp,
 }
 
 impl MaterializedExecutor {
@@ -40,25 +41,20 @@ impl MaterializedExecutor {
             tick_loops.push(tick);
         }
 
-        Ok(Self { tick_loops })
+        Ok(Self {
+            tick_loops,
+            next_fallback_ts: 0,
+        })
     }
 
-    pub fn ingest(&mut self, event: SourceEvent, timestamp: Timestamp) -> Result<()> {
+    pub fn ingest(&mut self, event: SourceEvent) -> Result<()> {
         if self.tick_loops.is_empty() {
             return Ok(());
         }
+        self.next_fallback_ts = self.next_fallback_ts.saturating_add(1);
+        let fallback_ts = self.next_fallback_ts;
         for tick in self.tick_loops.iter_mut() {
-            tick.process_events(std::iter::once((event.clone(), timestamp)))?;
-        }
-        Ok(())
-    }
-
-    pub fn advance_source_watermark(&mut self, source: &str, watermark: Timestamp) -> Result<()> {
-        if self.tick_loops.is_empty() {
-            return Ok(());
-        }
-        for tick in self.tick_loops.iter_mut() {
-            tick.advance_source_watermark(source, watermark)?;
+            tick.process_events(std::iter::once((event.clone(), fallback_ts)))?;
         }
         Ok(())
     }

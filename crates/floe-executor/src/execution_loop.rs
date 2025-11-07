@@ -16,6 +16,7 @@ use crate::stream_types::{Diff, InputPort, OperatorId, Row, StreamOperator, Time
 /// Represents a decoded row ready to be inserted into a scan operator stream.
 #[derive(Debug, Clone)]
 pub struct IngestedRow {
+    pub source: String,
     pub handle: RowStreamHandle,
     pub row: Row,
     pub diff: Diff,
@@ -53,14 +54,21 @@ impl ScanRuntime {
         Ok(())
     }
 
-    pub fn ingest_event(&self, event: SourceEvent, timestamp: Timestamp) -> Result<IngestedRow> {
+    pub fn ingest_event(
+        &self,
+        event: SourceEvent,
+        fallback_timestamp: Timestamp,
+    ) -> Result<IngestedRow> {
+        let source_name = event.source().to_string();
         let handle = self
             .bindings
-            .get(event.source())
+            .get(&source_name)
             .copied()
-            .ok_or_else(|| anyhow!("no scan registered for source '{}'", event.source()))?;
-        let row = self.registry.decode_event(&event)?;
+            .ok_or_else(|| anyhow!("no scan registered for source '{source_name}'"))?;
+        let (row, event_timestamp) = self.registry.decode_event(&event)?;
+        let timestamp = event_timestamp.unwrap_or(fallback_timestamp);
         Ok(IngestedRow {
+            source: source_name,
             handle,
             row,
             diff: self.default_diff,
@@ -90,9 +98,9 @@ impl ExecutionRuntime {
     pub fn process_event(
         &mut self,
         event: SourceEvent,
-        timestamp: Timestamp,
+        fallback_timestamp: Timestamp,
     ) -> Result<IngestedRow> {
-        self.scan_runtime.ingest_event(event, timestamp)
+        self.scan_runtime.ingest_event(event, fallback_timestamp)
     }
 }
 
@@ -146,6 +154,7 @@ impl TickLoop {
                 ingested.diff,
                 ingested.timestamp,
             )?;
+            self.advance_source_watermark(&ingested.source, ingested.timestamp)?;
             self.drain_queue()?;
         }
         Ok(())
@@ -426,6 +435,7 @@ mod tests {
 
         let event = SourceEvent::new("bid", json!({"auction": 7, "bidder": 9}));
         let ingested = runtime.ingest_event(event, 42).expect("ingest");
+        assert_eq!(ingested.source, "bid");
         assert_eq!(ingested.handle, handle);
         assert_eq!(ingested.row[0], ScalarValue::Int64(Some(7)));
         assert_eq!(ingested.row[1], ScalarValue::Int64(Some(9)));
@@ -505,6 +515,7 @@ mod tests {
 
         let event = SourceEvent::new("bid", json!({"auction": 11, "bidder": 12}));
         let ingested = runtime.process_event(event, 7).expect("process event");
+        assert_eq!(ingested.source, "bid");
         assert_eq!(ingested.handle, bindings[0].1);
         assert_eq!(ingested.row[0], ScalarValue::Int64(Some(11)));
         assert_eq!(ingested.row[1], ScalarValue::Int64(Some(12)));
@@ -570,7 +581,7 @@ mod tests {
             .expect("scan operator");
         let sink = scan.sink().as_any().downcast_ref::<TestSink>().unwrap();
         assert_eq!(sink.rows.len(), 2);
-        assert_eq!(sink.watermarks, vec![5]);
+        assert_eq!(sink.watermarks, vec![1, 2, 5]);
     }
 
     #[test]
@@ -720,5 +731,56 @@ mod tests {
         tick.advance_source_watermark("person", 6)
             .expect("advance person again");
         assert_eq!(tick.current_watermark(), 6);
+    }
+
+    #[test]
+    fn derives_timestamp_from_source_payload() {
+        let definition = SourceDefinition::new(
+            "with_ts",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("ts", SourceDataType::TimestampMillis),
+            ],
+        )
+        .expect("definition");
+        let mut registry = SourceRegistry::new();
+        registry.register(definition);
+        let registry = Arc::new(registry);
+
+        let scan_handle = RowStreamHandle::new(0);
+        let scan_runtime = ScanRuntime::new(registry.clone());
+        let runtime = ExecutionRuntime::new(scan_runtime);
+        let bindings = vec![("with_ts".to_string(), scan_handle)];
+
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let sink = TestSink::default();
+        let scan = ScanOperator::new("with_ts", sink);
+        let ops: Vec<Box<dyn StreamOperator>> = vec![Box::new(scan)];
+        let mut scan_map = HashMap::new();
+        scan_map.insert(scan_handle, 0);
+
+        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map);
+        tick.register_bindings(&bindings).expect("register binding");
+
+        let events = vec![(
+            SourceEvent::new(
+                "with_ts",
+                json!({
+                    "id": 1,
+                    "ts": 5_000_i64,
+                }),
+            ),
+            1,
+        )];
+        tick.process_events(events).expect("process event");
+
+        let scan = tick.ops[0]
+            .as_any()
+            .downcast_ref::<ScanOperator>()
+            .expect("scan operator");
+        let operator_sink = scan.sink().as_any().downcast_ref::<TestSink>().unwrap();
+        assert_eq!(operator_sink.rows.len(), 1);
+        assert_eq!(operator_sink.rows[0].2, 5_000);
+        assert_eq!(operator_sink.watermarks, vec![5_000]);
     }
 }
