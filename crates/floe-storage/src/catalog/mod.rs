@@ -133,6 +133,10 @@ impl SlateCatalog {
             })
             .collect()
     }
+
+    pub fn db(&self) -> Arc<Db> {
+        self.db.clone()
+    }
 }
 
 async fn scan_prefix(db: &Db, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {

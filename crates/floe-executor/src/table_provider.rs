@@ -14,8 +14,12 @@ use datafusion::scalar::ScalarValue;
 use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
 
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::encoding::decode_projected_row_key;
+use crate::materialized_view::{
+    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
+};
 use crate::stream_types::{Diff, Row};
+use dbsp::handles::ZSetHandleView;
 
 pub struct SlateTableProvider {
     storage: Arc<SlateCatalog>,
@@ -134,7 +138,18 @@ impl MaterializedViewTableProvider {
         }
     }
 
-    fn snapshot_rows(&self) -> DFResult<Vec<Row>> {
+    async fn build_batches(&self) -> DFResult<Vec<RecordBatch>> {
+        let rows = self.load_rows().await?;
+        build_scalar_batches(rows, self.schema.clone())
+            .map_err(|err| DataFusionError::Execution(err.to_string()))
+    }
+
+    #[cfg(test)]
+    pub async fn build_batches_for_test(&self) -> DFResult<Vec<RecordBatch>> {
+        self.build_batches().await
+    }
+
+    async fn load_rows(&self) -> DFResult<Vec<Row>> {
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "materialized view '{}' is not registered",
@@ -142,18 +157,40 @@ impl MaterializedViewTableProvider {
             ))
         })?;
 
+        if let Some(state) = view.dbsp_state() {
+            self.materialize_dbsp_rows(state).await
+        } else {
+            Self::rows_from_snapshot(&view)
+        }
+    }
+
+    async fn materialize_dbsp_rows(&self, state: DbspPersistedState) -> DFResult<Vec<Row>> {
+        let handle_view = ZSetHandleView::new(
+            state.dictionary(),
+            state.table(),
+            state.namespace().to_string(),
+            state.version(),
+        );
+        let snapshot = handle_view
+            .materialize()
+            .await
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        let mut rows = Vec::new();
+        for (key, diff) in snapshot {
+            let decoded = decode_projected_row_key(&key)
+                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+            append_row_with_diff(&mut rows, decoded, diff)?;
+        }
+        Ok(rows)
+    }
+
+    fn rows_from_snapshot(view: &Arc<MaterializedViewHandle>) -> DFResult<Vec<Row>> {
         let snapshot = view.snapshot();
         let mut rows = Vec::new();
         for (row, diff) in snapshot {
             append_row_with_diff(&mut rows, row, diff)?;
         }
         Ok(rows)
-    }
-
-    fn build_batches(&self) -> DFResult<Vec<RecordBatch>> {
-        let rows = self.snapshot_rows()?;
-        build_scalar_batches(rows, self.schema.clone())
-            .map_err(|err| DataFusionError::Execution(err.to_string()))
     }
 }
 
@@ -186,7 +223,7 @@ impl TableProvider for MaterializedViewTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let batches = self.build_batches()?;
+        let batches = self.build_batches().await?;
         let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
         mem_table.scan(state, projection, filters, limit).await
     }
@@ -245,8 +282,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
 
-    #[test]
-    fn materialized_view_provider_emits_rows() {
+    #[tokio::test]
+    async fn materialized_view_provider_emits_rows() {
         let registry = Arc::new(MaterializedViewRegistry::new());
         let view = registry.register("mv_test");
         view.apply(
@@ -270,7 +307,7 @@ mod tests {
         ]));
 
         let provider = MaterializedViewTableProvider::new(registry.clone(), "mv_test", schema);
-        let batches = provider.build_batches().expect("build batches");
+        let batches = provider.build_batches().await.expect("build batches");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
         assert_eq!(batches[0].num_columns(), 2);

@@ -15,3 +15,5 @@ slatedb = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+object_store = { workspace = true }

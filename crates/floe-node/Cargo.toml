@@ -19,3 +19,4 @@ pgwire = { workspace = true }
 sqlparser = { workspace = true }
 tokio = { workspace = true }
 floe-sql-parser = { workspace = true }
+slatedb = { workspace = true }

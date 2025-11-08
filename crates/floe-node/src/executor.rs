@@ -6,6 +6,7 @@ use floe_executor::{
     DataflowPlan, MaterializedViewRegistry, QueryPlanner, SourceRegistry, TickLoop, Timestamp,
     instantiate_tick_loop,
 };
+use slatedb::Db;
 
 use crate::planner::PlannedMaterializedView;
 use crate::source;
@@ -30,14 +31,21 @@ pub struct MaterializedExecutor {
 }
 
 impl MaterializedExecutor {
-    pub fn new(
+    pub async fn new(
         plans: &[DataflowPlan],
         sources: Arc<SourceRegistry>,
         mv_registry: Arc<MaterializedViewRegistry>,
+        db: Option<Arc<Db>>,
     ) -> Result<Self> {
         let mut tick_loops = Vec::with_capacity(plans.len());
         for plan in plans {
-            let tick = instantiate_tick_loop(plan, Arc::clone(&sources), Arc::clone(&mv_registry))?;
+            let tick = instantiate_tick_loop(
+                plan,
+                Arc::clone(&sources),
+                Arc::clone(&mv_registry),
+                db.clone(),
+            )
+            .await?;
             tick_loops.push(tick);
         }
 
@@ -47,14 +55,15 @@ impl MaterializedExecutor {
         })
     }
 
-    pub fn ingest(&mut self, event: SourceEvent) -> Result<()> {
+    pub async fn ingest(&mut self, event: SourceEvent) -> Result<()> {
         if self.tick_loops.is_empty() {
             return Ok(());
         }
         self.next_fallback_ts = self.next_fallback_ts.saturating_add(1);
         let fallback_ts = self.next_fallback_ts;
         for tick in self.tick_loops.iter_mut() {
-            tick.process_events(std::iter::once((event.clone(), fallback_ts)))?;
+            tick.process_events(std::iter::once((event.clone(), fallback_ts)))
+                .await?;
         }
         Ok(())
     }

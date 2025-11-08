@@ -1745,8 +1745,10 @@ dependencies = [
  "dbsp",
  "floe-core",
  "floe-storage",
+ "object_store",
  "serde_json",
  "slatedb",
+ "tokio",
 ]
 
 [[package]]
@@ -1766,6 +1768,7 @@ dependencies = [
  "pgwire",
  "serde",
  "serde_json",
+ "slatedb",
  "sqlparser",
  "tokio",
 ]

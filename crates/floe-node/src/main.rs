@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(generator::definitions()?);
 
+    let storage = server::init_storage().await?;
+    let storage_db = storage.db();
+
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
     if let Some(sql) = cli.mv_query.as_deref() {
         materialized_views.push(parse_materialized_view(sql)?);
@@ -41,11 +44,15 @@ async fn main() -> anyhow::Result<()> {
     let executor = if dataflow_plans.is_empty() {
         None
     } else {
-        Some(MaterializedExecutor::new(
-            &dataflow_plans,
-            Arc::clone(&executor_sources),
-            Arc::clone(&mv_registry),
-        )?)
+        Some(
+            MaterializedExecutor::new(
+                &dataflow_plans,
+                Arc::clone(&executor_sources),
+                Arc::clone(&mv_registry),
+                Some(storage_db.clone()),
+            )
+            .await?,
+        )
     };
 
     let (event_tx, event_rx) = source::channel(1024);
@@ -69,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         Some(tokio::spawn(async move {
             let mut rx = maybe_rx.take().expect("receiver available");
             while let Some(event) = rx.recv().await {
-                if let Err(err) = executor.ingest(event.clone()) {
+                if let Err(err) = executor.ingest(event.clone()).await {
                     eprintln!("executor ingestion failed: {err}");
                     continue;
                 }
@@ -87,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
         }))
     };
 
-    let storage = server::init_storage().await?;
     let query = FloeQueryContext::new(storage);
     query
         .preload_tables()

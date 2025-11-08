@@ -3,7 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
+use crate::dbsp_bridge::DbspView;
+use crate::encoding::encode_projected_row_key;
+use crate::materialized_view::{
+    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
+};
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
@@ -11,6 +15,8 @@ pub struct MaterializeOperator {
     input: InputPort,
     sink: Box<dyn RowSink>,
     view: Arc<MaterializedViewHandle>,
+    dbsp: Option<DbspView>,
+    pending_flush: bool,
 }
 
 impl MaterializeOperator {
@@ -19,12 +25,21 @@ impl MaterializeOperator {
         view_name: impl Into<String>,
         registry: Arc<MaterializedViewRegistry>,
         sink: impl RowSink,
+        dbsp: Option<DbspView>,
     ) -> Self {
         let view = registry.register(view_name.into());
+        let dbsp = dbsp;
+        if let Some(ref dbsp_view) = dbsp {
+            let latest = dbsp_view.latest_handle_view();
+            let (dict, table, namespace, version) = latest.into_parts();
+            view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+        }
         Self {
             input,
             sink: Box::new(sink),
             view,
+            dbsp,
+            pending_flush: false,
         }
     }
 
@@ -35,6 +50,20 @@ impl MaterializeOperator {
     #[cfg(test)]
     pub fn sink(&self) -> &dyn RowSink {
         self.sink.as_ref()
+    }
+
+    pub async fn flush_dbsp_if_needed(&mut self) -> Result<()> {
+        if self.pending_flush {
+            if let Some(dbsp) = &mut self.dbsp {
+                dbsp.flush().await?;
+                let view = dbsp.latest_handle_view();
+                let (dict, table, namespace, version) = view.into_parts();
+                self.view
+                    .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+            }
+            self.pending_flush = false;
+        }
+        Ok(())
     }
 }
 
@@ -57,12 +86,26 @@ impl StreamOperator for MaterializeOperator {
             return Ok(());
         }
 
+        let encoded_key = if self.dbsp.is_some() {
+            Some(encode_projected_row_key(&row)?)
+        } else {
+            None
+        };
+
         self.view.apply(row.clone(), diff);
+
+        if let (Some(dbsp), Some(key)) = (self.dbsp.as_mut(), encoded_key) {
+            dbsp.add_delta(key, diff);
+        }
+
         self.sink.push(row, diff, timestamp)
     }
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.view.update_watermark(watermark);
+        if self.dbsp.is_some() {
+            self.pending_flush = true;
+        }
         self.sink.watermark(watermark)
     }
 
@@ -94,6 +137,7 @@ mod tests {
             "mv_q0",
             registry.clone(),
             sink,
+            None,
         );
 
         let row = vec![ScalarValue::Int64(Some(1))];

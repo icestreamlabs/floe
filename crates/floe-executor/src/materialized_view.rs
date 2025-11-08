@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::stream_types::{Diff, Row, Timestamp};
+use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -38,6 +40,7 @@ pub struct MaterializedViewHandle {
     name: String,
     state: RwLock<HashMap<Row, Diff>>,
     watermark: RwLock<Option<Timestamp>>,
+    dbsp_state: RwLock<Option<DbspPersistedState>>,
 }
 
 impl MaterializedViewHandle {
@@ -46,6 +49,7 @@ impl MaterializedViewHandle {
             name,
             state: RwLock::new(HashMap::new()),
             watermark: RwLock::new(None),
+            dbsp_state: RwLock::new(None),
         }
     }
 
@@ -76,6 +80,63 @@ impl MaterializedViewHandle {
 
     pub fn snapshot(&self) -> HashMap<Row, Diff> {
         self.state.read().expect("mutex poisoned").clone()
+    }
+
+    pub fn set_dbsp_state(&self, state: DbspPersistedState) {
+        *self.dbsp_state.write().expect("mutex poisoned") = Some(state);
+    }
+
+    pub fn dbsp_state(&self) -> Option<DbspPersistedState> {
+        self.dbsp_state.read().expect("mutex poisoned").clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct DbspPersistedState {
+    dictionary: Arc<Dictionary<Vec<u8>>>,
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    version: u64,
+}
+
+impl std::fmt::Debug for DbspPersistedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbspPersistedState")
+            .field("namespace", &self.namespace)
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
+impl DbspPersistedState {
+    pub fn new(
+        dictionary: Arc<Dictionary<Vec<u8>>>,
+        table: Arc<dyn KeyValueTable>,
+        namespace: String,
+        version: u64,
+    ) -> Self {
+        Self {
+            dictionary,
+            table,
+            namespace,
+            version,
+        }
+    }
+
+    pub fn dictionary(&self) -> Arc<Dictionary<Vec<u8>>> {
+        Arc::clone(&self.dictionary)
+    }
+
+    pub fn table(&self) -> Arc<dyn KeyValueTable> {
+        self.table.clone()
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
     }
 }
 

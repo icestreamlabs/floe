@@ -7,6 +7,9 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
     buf.extend_from_slice(&count.to_le_bytes());
     for value in columns {
+        if value.is_null() {
+            return Err(anyhow!("null values not supported in MV keys"));
+        }
         match value {
             ScalarValue::Int64(Some(v)) => {
                 buf.push(0x01);
@@ -28,11 +31,70 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
                 buf.push(0x04);
                 buf.push(if *flag { 1 } else { 0 });
             }
-            ScalarValue::Null => return Err(anyhow!("null values not supported in MV keys")),
             other => return Err(anyhow!("unsupported ScalarValue in MV key: {other:?}")),
         }
     }
     Ok(buf)
+}
+
+pub fn decode_projected_row_key(bytes: &[u8]) -> Result<Vec<ScalarValue>> {
+    if bytes.len() < 4 {
+        return Err(anyhow!("encoded key too short"));
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4;
+    let mut columns = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor >= bytes.len() {
+            return Err(anyhow!("unexpected end of key while decoding tag"));
+        }
+        let tag = bytes[cursor];
+        cursor += 1;
+        match tag {
+            0x01 => {
+                let end = cursor + 8;
+                let chunk = bytes
+                    .get(cursor..end)
+                    .ok_or_else(|| anyhow!("truncated int64"))?;
+                let value = i64::from_le_bytes(chunk.try_into().unwrap());
+                columns.push(ScalarValue::Int64(Some(value)));
+                cursor = end;
+            }
+            0x02 => {
+                let len_bytes = bytes
+                    .get(cursor..cursor + 4)
+                    .ok_or_else(|| anyhow!("truncated string length"))?;
+                let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                cursor += 4;
+                let end = cursor + len;
+                let chunk = bytes
+                    .get(cursor..end)
+                    .ok_or_else(|| anyhow!("truncated string payload"))?;
+                let text = std::str::from_utf8(chunk)
+                    .map_err(|err| anyhow!("utf8 decode error: {err}"))?;
+                columns.push(ScalarValue::Utf8(Some(text.to_string())));
+                cursor = end;
+            }
+            0x03 => {
+                let end = cursor + 8;
+                let chunk = bytes
+                    .get(cursor..end)
+                    .ok_or_else(|| anyhow!("truncated timestamp"))?;
+                let value = i64::from_le_bytes(chunk.try_into().unwrap());
+                columns.push(ScalarValue::TimestampMillisecond(Some(value), None));
+                cursor = end;
+            }
+            0x04 => {
+                let flag = *bytes
+                    .get(cursor)
+                    .ok_or_else(|| anyhow!("missing boolean payload"))?;
+                columns.push(ScalarValue::Boolean(Some(flag != 0)));
+                cursor += 1;
+            }
+            _ => return Err(anyhow!("unknown column tag {tag:#x} in MV key")),
+        }
+    }
+    Ok(columns)
 }
 
 #[cfg(test)]
@@ -55,5 +117,18 @@ mod tests {
         let row = vec![ScalarValue::Int64(None)];
         let err = encode_projected_row_key(&row).unwrap_err();
         assert!(err.to_string().contains("null"));
+    }
+
+    #[test]
+    fn round_trips_rows() {
+        let row = vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Utf8(Some("abc".into())),
+            ScalarValue::TimestampMillisecond(Some(1234), None),
+            ScalarValue::Boolean(Some(false)),
+        ];
+        let encoded = encode_projected_row_key(&row).expect("encode");
+        let decoded = decode_projected_row_key(&encoded).expect("decode");
+        assert_eq!(row, decoded);
     }
 }

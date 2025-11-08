@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use floe_core::source::SourceEvent;
+use slatedb::Db;
 
 use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceRegistry};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
+use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::operators::{
     DispatchEvent, DispatchSink, EventQueue, FilterOperator, JoinOperator, MapOperator,
@@ -138,7 +140,7 @@ impl TickLoop {
         Ok(())
     }
 
-    pub fn process_events<I>(&mut self, events: I) -> Result<()>
+    pub async fn process_events<I>(&mut self, events: I) -> Result<()>
     where
         I: IntoIterator<Item = (SourceEvent, Timestamp)>,
     {
@@ -154,7 +156,8 @@ impl TickLoop {
                 ingested.diff,
                 ingested.timestamp,
             )?;
-            self.advance_source_watermark(&ingested.source, ingested.timestamp)?;
+            self.advance_source_watermark(&ingested.source, ingested.timestamp)
+                .await?;
             self.drain_queue()?;
         }
         Ok(())
@@ -196,7 +199,7 @@ impl TickLoop {
         Ok(())
     }
 
-    pub fn advance_watermark(&mut self, watermark: Timestamp) -> Result<()> {
+    pub async fn advance_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         if watermark <= self.current_watermark {
             return Ok(());
         }
@@ -205,14 +208,18 @@ impl TickLoop {
         for operator in self.ops.iter_mut() {
             operator.on_watermark(watermark)?;
         }
-        Ok(())
+        self.flush_dbsp_views().await
     }
 
     pub fn current_watermark(&self) -> Timestamp {
         self.current_watermark
     }
 
-    pub fn advance_source_watermark(&mut self, source: &str, watermark: Timestamp) -> Result<()> {
+    pub async fn advance_source_watermark(
+        &mut self,
+        source: &str,
+        watermark: Timestamp,
+    ) -> Result<()> {
         let entry = self
             .source_watermarks
             .get_mut(source)
@@ -222,7 +229,7 @@ impl TickLoop {
         }
         *entry = watermark;
         let frontier = self.current_frontier();
-        self.advance_watermark(frontier)
+        self.advance_watermark(frontier).await
     }
 
     fn current_frontier(&self) -> Timestamp {
@@ -232,6 +239,15 @@ impl TickLoop {
             .min()
             .unwrap_or(self.current_watermark)
     }
+
+    async fn flush_dbsp_views(&mut self) -> Result<()> {
+        for operator in self.ops.iter_mut() {
+            if let Some(materialize) = operator.as_any_mut().downcast_mut::<MaterializeOperator>() {
+                materialize.flush_dbsp_if_needed().await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct BuiltGraph {
@@ -240,11 +256,12 @@ pub struct BuiltGraph {
     pub scan_operator_map: HashMap<RowStreamHandle, usize>,
 }
 
-pub fn build_graph(
-    ctx: &CircuitContext,
+pub async fn build_graph(
+    ctx: &CircuitContext<'_>,
     plan: &DataflowPlan,
     mv_registry: Arc<MaterializedViewRegistry>,
     queue: &EventQueue,
+    mut bridge: Option<&mut DbspBridge>,
 ) -> Result<BuiltGraph> {
     let mut downstreams: HashMap<OperatorId, Vec<(usize, InputPort)>> = HashMap::new();
     for (idx, _) in plan.operators.iter().enumerate() {
@@ -358,12 +375,25 @@ pub fn build_graph(
                     sink,
                 ))
             }
-            OperatorNode::Materialize(materialize) => Box::new(MaterializeOperator::new(
-                InputPort::new(materialize.input.operator, materialize.input.port_index),
-                materialize.view_name.clone(),
-                mv_registry.clone(),
-                NullSink::default(),
-            )),
+            OperatorNode::Materialize(materialize) => {
+                let dbsp_view = if let Some(bridge_ref) = bridge.as_mut() {
+                    Some(
+                        (*bridge_ref)
+                            .new_view(&materialize.view_name)
+                            .await
+                            .context("create DBSP view")?,
+                    )
+                } else {
+                    None
+                };
+                Box::new(MaterializeOperator::new(
+                    InputPort::new(materialize.input.operator, materialize.input.port_index),
+                    materialize.view_name.clone(),
+                    mv_registry.clone(),
+                    NullSink::default(),
+                    dbsp_view,
+                ))
+            }
         };
         built_ops.push(operator);
     }
@@ -375,10 +405,11 @@ pub fn build_graph(
     })
 }
 
-pub fn instantiate_tick_loop(
+pub async fn instantiate_tick_loop(
     plan: &DataflowPlan,
     sources: Arc<SourceRegistry>,
     mv_registry: Arc<MaterializedViewRegistry>,
+    db: Option<Arc<Db>>,
 ) -> Result<TickLoop> {
     let mut circuit = Circuit::new();
     let mut ctx = CircuitContext::new(&mut circuit, Arc::clone(&sources));
@@ -386,7 +417,22 @@ pub fn instantiate_tick_loop(
         .context("build circuit plan from dataflow")?;
 
     let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
-    let built = build_graph(&ctx, plan, Arc::clone(&mv_registry), &queue)?;
+    let mut bridge = match db {
+        Some(db) => Some(
+            DbspBridge::new(db)
+                .await
+                .context("initialize DBSP bridge")?,
+        ),
+        None => None,
+    };
+    let built = build_graph(
+        &ctx,
+        plan,
+        Arc::clone(&mv_registry),
+        &queue,
+        bridge.as_mut(),
+    )
+    .await?;
 
     let runtime = ExecutionRuntime::new(ScanRuntime::new(sources));
     let mut tick = TickLoop::with_graph(runtime, built.ops, queue, built.scan_operator_map);
@@ -396,9 +442,12 @@ pub fn instantiate_tick_loop(
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
+    use object_store::{ObjectStore, memory::InMemory};
     use serde_json::json;
+    use slatedb::Db;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -409,6 +458,7 @@ mod tests {
     };
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::operators::test_support::TestSink;
+    use crate::table_provider::MaterializedViewTableProvider;
     use crate::{OperatorId, OutputPort};
 
     fn bid_definition() -> SourceDefinition {
@@ -442,8 +492,8 @@ mod tests {
         assert_eq!(ingested.timestamp, 42);
     }
 
-    #[test]
-    fn runtime_processes_events_via_scan_operator() {
+    #[tokio::test]
+    async fn runtime_processes_events_via_scan_operator() {
         let mut registry = SourceRegistry::new();
         registry.register(bid_definition());
         let registry = Arc::new(registry);
@@ -467,7 +517,7 @@ mod tests {
             SourceEvent::new("bid", json!({"auction": 11, "bidder": 22})),
             100,
         )];
-        tick.process_events(events).expect("process event");
+        tick.process_events(events).await.expect("process event");
 
         let scan = tick.ops[0]
             .as_any()
@@ -522,8 +572,8 @@ mod tests {
         assert_eq!(ingested.timestamp, 7);
     }
 
-    #[test]
-    fn tick_loop_advances_watermark() {
+    #[tokio::test]
+    async fn tick_loop_advances_watermark() {
         let mut registry = SourceRegistry::new();
         registry.register(bid_definition());
         let registry = Arc::new(registry);
@@ -572,8 +622,8 @@ mod tests {
                 2,
             ),
         ];
-        tick_loop.process_events(events).expect("process");
-        tick_loop.advance_watermark(5).expect("watermark");
+        tick_loop.process_events(events).await.expect("process");
+        tick_loop.advance_watermark(5).await.expect("watermark");
         assert_eq!(tick_loop.current_watermark(), 5);
         let scan = tick_loop.ops[0]
             .as_any()
@@ -584,8 +634,8 @@ mod tests {
         assert_eq!(sink.watermarks, vec![1, 2, 5]);
     }
 
-    #[test]
-    fn build_graph_routes_rows_through_runtime() {
+    #[tokio::test]
+    async fn build_graph_routes_rows_through_runtime() {
         let mut registry = SourceRegistry::new();
         registry.register(bid_definition());
         let registry = Arc::new(registry);
@@ -612,7 +662,9 @@ mod tests {
 
         let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
-        let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue).expect("build graph");
+        let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None)
+            .await
+            .expect("build graph");
 
         let scan_runtime = ScanRuntime::new(registry.clone());
         let runtime = ExecutionRuntime::new(scan_runtime);
@@ -625,8 +677,8 @@ mod tests {
             SourceEvent::new("bid", json!({"auction": 10, "bidder": 20})),
             1,
         )];
-        tick.process_events(events).expect("process events");
-        tick.advance_watermark(5).expect("watermark");
+        tick.process_events(events).await.expect("process events");
+        tick.advance_watermark(5).await.expect("watermark");
 
         let view = mv_registry.get("mv_test").expect("view registered");
         let snapshot = view.snapshot();
@@ -635,8 +687,8 @@ mod tests {
         assert_eq!(view.watermark(), Some(5));
     }
 
-    #[test]
-    fn instantiate_tick_loop_executes_plan() {
+    #[tokio::test]
+    async fn instantiate_tick_loop_executes_plan() {
         let mut registry = SourceRegistry::new();
         registry.register(bid_definition());
         let registry = Arc::new(registry);
@@ -659,7 +711,8 @@ mod tests {
 
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
         let mut tick =
-            instantiate_tick_loop(&plan, Arc::clone(&registry), Arc::clone(&mv_registry))
+            instantiate_tick_loop(&plan, Arc::clone(&registry), Arc::clone(&mv_registry), None)
+                .await
                 .expect("instantiate tick loop");
 
         let events = vec![
@@ -672,8 +725,8 @@ mod tests {
                 2,
             ),
         ];
-        tick.process_events(events).expect("process events");
-        tick.advance_watermark(11).expect("watermark");
+        tick.process_events(events).await.expect("process events");
+        tick.advance_watermark(11).await.expect("watermark");
 
         let view = mv_registry.get("mv_exec").expect("view registered");
         let snapshot = view.snapshot();
@@ -684,8 +737,8 @@ mod tests {
         assert_eq!(view.watermark(), Some(11));
     }
 
-    #[test]
-    fn tracks_source_watermarks_and_frontier() {
+    #[tokio::test]
+    async fn tracks_source_watermarks_and_frontier() {
         let mut registry = SourceRegistry::new();
         registry.register(bid_definition());
         registry.register(
@@ -717,24 +770,28 @@ mod tests {
         .expect("register bindings");
 
         tick.advance_source_watermark("bid", 5)
+            .await
             .expect("advance bid watermark");
         assert_eq!(tick.current_watermark(), 0);
 
         tick.advance_source_watermark("person", 3)
+            .await
             .expect("advance person watermark");
         assert_eq!(tick.current_watermark(), 3);
 
         tick.advance_source_watermark("bid", 10)
+            .await
             .expect("advance bid again");
         assert_eq!(tick.current_watermark(), 3);
 
         tick.advance_source_watermark("person", 6)
+            .await
             .expect("advance person again");
         assert_eq!(tick.current_watermark(), 6);
     }
 
-    #[test]
-    fn derives_timestamp_from_source_payload() {
+    #[tokio::test]
+    async fn derives_timestamp_from_source_payload() {
         let definition = SourceDefinition::new(
             "with_ts",
             vec![
@@ -772,7 +829,7 @@ mod tests {
             ),
             1,
         )];
-        tick.process_events(events).expect("process event");
+        tick.process_events(events).await.expect("process event");
 
         let scan = tick.ops[0]
             .as_any()
@@ -782,5 +839,76 @@ mod tests {
         assert_eq!(operator_sink.rows.len(), 1);
         assert_eq!(operator_sink.rows[0].2, 5_000);
         assert_eq!(operator_sink.watermarks, vec![5_000]);
+    }
+
+    #[tokio::test]
+    async fn persisted_materialized_view_survives_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("mv_persist", store).await.expect("open SlateDB"));
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+
+        let plan = {
+            let mut plan = DataflowPlan::new();
+            let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
+                source_name: "bid".to_string(),
+                output: OutputPort::new(OperatorId(0), 0),
+            }));
+            let map_id = plan.add_operator(OperatorNode::Map(MapNode {
+                input: OutputPort::new(scan_id, 0),
+                output: OutputPort::new(OperatorId(1), 0),
+                expressions: vec![Expr::column(0), Expr::column(1)],
+            }));
+            let mat_id = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+                input: OutputPort::new(map_id, 0),
+                view_name: "mv_exec".to_string(),
+            }));
+            plan.set_root(mat_id);
+            plan
+        };
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        let events = vec![(
+            SourceEvent::new("bid", json!({"auction": 7, "bidder": 9})),
+            1,
+        )];
+        tick.process_events(events).await.expect("process events");
+        tick.advance_watermark(5).await.expect("watermark");
+
+        drop(tick);
+
+        let mv_registry_restart = Arc::new(MaterializedViewRegistry::new());
+        let _tick2 = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop restart");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+        ]));
+        let provider =
+            MaterializedViewTableProvider::new(Arc::clone(&mv_registry_restart), "mv_exec", schema);
+        let batches = provider
+            .build_batches_for_test()
+            .await
+            .expect("build batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
     }
 }
