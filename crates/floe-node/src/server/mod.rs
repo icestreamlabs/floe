@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
-use floe_executor::{FloeQueryContext, MaterializedViewRegistry};
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_storage::SlateCatalog;
 use futures::Sink;
 use futures::stream;
@@ -18,7 +18,7 @@ use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
-use sqlparser::ast::{CreateTable, Insert, Query, Statement};
+use sqlparser::ast::{CreateTable, Insert, Query, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
@@ -99,6 +99,35 @@ impl FloeServerState {
             materialized_views,
         }
     }
+
+    async fn ensure_materialized_view_registered(&self, name: &str) -> PgWireResult<()> {
+        if self.materialized_views.get(name).is_none() {
+            return Ok(());
+        }
+        let schema = match self.materialized_views.schema(name) {
+            Some(schema) => schema,
+            None => return Ok(()),
+        };
+
+        let session = self.query.session();
+        if session.table(name).await.is_ok() {
+            return Ok(());
+        }
+
+        let provider = MaterializedViewTableProvider::new(
+            Arc::clone(&self.materialized_views),
+            name.to_string(),
+            schema,
+        );
+        session
+            .register_table(name, Arc::new(provider))
+            .map_err(|err| {
+                user_error(format!(
+                    "failed to register materialized view {name}: {err}"
+                ))
+            })?;
+        Ok(())
+    }
 }
 
 struct FloeServerFactory {
@@ -177,6 +206,7 @@ impl FloeQueryHandler {
     }
 
     async fn execute_sql(&self, sql: &str) -> PgWireResult<Response> {
+        self.ensure_materialized_views_in_sql(sql).await?;
         let df = self
             .state
             .query
@@ -190,6 +220,20 @@ impl FloeQueryHandler {
             .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
         let response = build_query_response(batches)?;
         Ok(Response::Query(response))
+    }
+
+    async fn ensure_materialized_views_in_sql(&self, sql: &str) -> PgWireResult<()> {
+        let dialect = PostgreSqlDialect {};
+        if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
+            for statement in statements {
+                for table in extract_tables_from_statement(&statement) {
+                    self.state
+                        .ensure_materialized_view_registered(&table)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +352,77 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     }));
 
     Ok(QueryResponse::new(info, row_stream))
+}
+
+fn extract_tables_from_statement(statement: &Statement) -> Vec<String> {
+    let mut names = Vec::new();
+    match statement {
+        Statement::Query(query) => extract_tables_from_query(query, &mut names),
+        _ => {}
+    }
+    names
+}
+
+fn extract_tables_from_query(query: &Query, names: &mut Vec<String>) {
+    extract_tables_from_setexpr(&query.body, names);
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_tables_from_query(&cte.query, names);
+        }
+    }
+}
+
+fn extract_tables_from_setexpr(expr: &SetExpr, names: &mut Vec<String>) {
+    match expr {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                extract_tables_from_table_factor(&table.relation, names);
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            extract_tables_from_setexpr(left, names);
+            extract_tables_from_setexpr(right, names);
+        }
+        SetExpr::Query(query) => extract_tables_from_query(query, names),
+        _ => {}
+    }
+}
+
+fn extract_tables_from_table_factor(factor: &TableFactor, names: &mut Vec<String>) {
+    match factor {
+        TableFactor::Table { name, .. } => names.push(name.to_string()),
+        TableFactor::Derived { subquery, .. } => extract_tables_from_query(subquery, names),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use floe_executor::MaterializedViewRegistry;
+
+    #[tokio::test]
+    async fn registers_materialized_view_on_select() {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.register("mv_test");
+        registry.set_schema(
+            "mv_test",
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+        );
+
+        let state = Arc::new(FloeServerState::new(query.clone(), Arc::clone(&registry)));
+        let handler = FloeQueryHandler::new(state);
+
+        handler
+            .ensure_materialized_views_in_sql("SELECT * FROM mv_test")
+            .await
+            .expect("ensure mv");
+
+        assert!(query.session().table("mv_test").await.is_ok());
+    }
 }
 
 fn user_error(message: impl Into<String>) -> PgWireError {

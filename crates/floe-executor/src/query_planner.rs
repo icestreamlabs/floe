@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use datafusion::common::DFSchemaRef;
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{
     BinaryExpr, Expr as DFExpr, Filter, Join, JoinConstraint, JoinType, LogicalPlan,
     Operator as DFOperator, Projection, TableScan,
@@ -170,13 +171,47 @@ impl PlanBuilder {
                 let right_expr = self.convert_expr(right, schema)?;
                 match op {
                     DFOperator::Eq => Ok(Expr::Eq(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::NotEq => {
+                        Ok(Expr::NotEq(Box::new(left_expr), Box::new(right_expr)))
+                    }
+                    DFOperator::Lt => Ok(Expr::Lt(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::LtEq => Ok(Expr::LtEq(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Gt => Ok(Expr::Gt(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::GtEq => Ok(Expr::GtEq(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::And => Ok(Expr::And(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Or => Ok(Expr::Or(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Plus => Ok(Expr::Add(Box::new(left_expr), Box::new(right_expr))),
-                    _ => bail!("unsupported binary operator: {op:?}"),
+                    DFOperator::Minus => Ok(Expr::Sub(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Multiply => Ok(Expr::Mul(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Divide => Ok(Expr::Div(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Modulo => Ok(Expr::Mod(Box::new(left_expr), Box::new(right_expr))),
+                    _ => bail!("unsupported binary operator: {op:?} in expression {expr}"),
                 }
             }
-            other => bail!("unsupported expression: {other:?}"),
+            DFExpr::Negative(inner) => {
+                let child = self.convert_expr(inner, schema)?;
+                Ok(Expr::Neg(Box::new(child)))
+            }
+            DFExpr::InList(InList {
+                expr: needle,
+                list,
+                negated,
+            }) => {
+                if list.is_empty() {
+                    bail!("IN() list must contain at least one value: {expr}");
+                }
+                let converted_expr = self.convert_expr(needle, schema)?;
+                let mut converted_list = Vec::with_capacity(list.len());
+                for value in list {
+                    converted_list.push(self.convert_expr(value, schema)?);
+                }
+                Ok(Expr::InList {
+                    expr: Box::new(converted_expr),
+                    list: converted_list,
+                    negated: *negated,
+                })
+            }
+            other => bail!("unsupported expression in MVP: {other}"),
         }
     }
 
@@ -212,11 +247,23 @@ impl PlanBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Result, bail};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::logical_expr::{col, lit, table_scan};
     use datafusion::scalar::ScalarValue;
+
+    fn plan_filter_expr(schema: &Schema, predicate: DFExpr) -> Result<Expr> {
+        let logical_plan = table_scan(Some("auction"), schema, None)?
+            .filter(predicate)?
+            .build()?;
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_test")?;
+        match &dataflow.operators[1] {
+            OperatorNode::Filter(node) => Ok(node.predicate.clone()),
+            other => bail!("expected filter operator, found {other:?}"),
+        }
+    }
 
     fn bid_schema() -> Schema {
         Schema::new(vec![
@@ -284,6 +331,34 @@ mod tests {
     }
 
     #[test]
+    fn map_supports_extended_arithmetic() -> Result<()> {
+        let schema = bid_schema();
+        let logical_plan = table_scan(Some("bid"), &schema, None)?
+            .project(vec![
+                (col("price") - lit(1i64)).alias("price_minus_one"),
+                (col("price") * lit(2i64)).alias("price_times_two"),
+                (col("price") / lit(2i64)).alias("price_div_two"),
+                (col("price") % lit(2i64)).alias("price_mod_two"),
+                (-col("price")).alias("neg_price"),
+            ])?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_map_extended")?;
+        let map_node = match &dataflow.operators[1] {
+            OperatorNode::Map(node) => node,
+            other => bail!("expected map operator, found {other:?}"),
+        };
+        assert_eq!(map_node.expressions.len(), 5);
+        assert!(matches!(map_node.expressions[0], Expr::Sub(_, _)));
+        assert!(matches!(map_node.expressions[1], Expr::Mul(_, _)));
+        assert!(matches!(map_node.expressions[2], Expr::Div(_, _)));
+        assert!(matches!(map_node.expressions[3], Expr::Mod(_, _)));
+        assert!(matches!(map_node.expressions[4], Expr::Neg(_)));
+        Ok(())
+    }
+
+    #[test]
     fn filter_predicate() -> Result<()> {
         let schema = bid_schema();
         let predicate = col("bidder")
@@ -306,6 +381,49 @@ mod tests {
             },
             _ => panic!("expected filter operator"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn filter_supports_extended_predicates() -> Result<()> {
+        let schema = auction_schema();
+        let modulo_expr = plan_filter_expr(
+            &schema,
+            (col("category") % lit(123i64)).eq(lit(0i64)),
+        )?;
+        match modulo_expr {
+            Expr::Eq(lhs, rhs) => {
+                assert!(matches!(*lhs, Expr::Mod(_, _)));
+                assert!(matches!(*rhs, Expr::Literal(_)));
+            }
+            other => panic!("expected equality predicate, found {other:?}"),
+        }
+
+        let in_list_expr =
+            plan_filter_expr(&schema, col("category").in_list(vec![lit(10i64), lit(20i64)], false))?;
+        match in_list_expr {
+            Expr::InList { list, negated, .. } => {
+                assert_eq!(list.len(), 2);
+                assert!(!negated);
+            }
+            other => panic!("expected IN predicate, found {other:?}"),
+        }
+
+        let gt_expr = plan_filter_expr(&schema, col("category").gt(lit(10i64)))?;
+        assert!(matches!(gt_expr, Expr::Gt(_, _)));
+
+        let gte_expr = plan_filter_expr(&schema, col("category").gt_eq(lit(10i64)))?;
+        assert!(matches!(gte_expr, Expr::GtEq(_, _)));
+
+        let lt_expr = plan_filter_expr(&schema, col("category").lt(lit(10i64)))?;
+        assert!(matches!(lt_expr, Expr::Lt(_, _)));
+
+        let lte_expr = plan_filter_expr(&schema, col("category").lt_eq(lit(10i64)))?;
+        assert!(matches!(lte_expr, Expr::LtEq(_, _)));
+
+        let not_eq_expr = plan_filter_expr(&schema, col("category").not_eq(lit(10i64)))?;
+        assert!(matches!(not_eq_expr, Expr::NotEq(_, _)));
 
         Ok(())
     }

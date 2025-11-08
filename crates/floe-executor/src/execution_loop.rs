@@ -454,7 +454,7 @@ mod tests {
     use super::*;
     use crate::circuit_builder::{Circuit, CircuitContext};
     use crate::dataflow_plan::{
-        DataflowPlan, Expr, MapNode, MaterializeNode, OperatorNode, ScanNode,
+        DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
     };
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::operators::test_support::TestSink;
@@ -842,6 +842,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nexmark_q0_plan_runs() {
+        let snapshot = run_nexmark_plan(
+            build_q0_plan(),
+            vec![bid_full_definition()],
+            vec![
+                (
+                    SourceEvent::new(
+                        "bid",
+                        json!({"auction": 1, "bidder": 2, "price": 100, "date_time": 10, "extra": 1}),
+                    ),
+                    1,
+                ),
+                (
+                    SourceEvent::new(
+                        "bid",
+                        json!({"auction": 2, "bidder": 3, "price": 200, "date_time": 11, "extra": 2}),
+                    ),
+                    2,
+                ),
+            ],
+            "mv_q0",
+        )
+        .await;
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn nexmark_q1_plan_runs() {
+        let snapshot = run_nexmark_plan(
+            build_q1_plan(),
+            vec![bid_full_definition()],
+            vec![(
+                SourceEvent::new(
+                    "bid",
+                    json!({"auction": 1, "bidder": 2, "price": 50, "date_time": 10, "extra": 1}),
+                ),
+                1,
+            )],
+            "mv_q1",
+        )
+        .await;
+        let row = snapshot.keys().next().unwrap();
+        assert_eq!(row[0], ScalarValue::Int64(Some(1)));
+        assert_eq!(row[2], ScalarValue::Int64(Some(100)));
+    }
+
+    #[tokio::test]
+    async fn nexmark_q2_plan_runs() {
+        let snapshot = run_nexmark_plan(
+            build_q2_plan(),
+            vec![bid_full_definition()],
+            vec![
+                (
+                    SourceEvent::new(
+                        "bid",
+                        json!({"auction": 123, "bidder": 3, "price": 75, "date_time": 10, "extra": 1}),
+                    ),
+                    1,
+                ),
+                (
+                    SourceEvent::new(
+                        "bid",
+                        json!({"auction": 50, "bidder": 4, "price": 10, "date_time": 11, "extra": 2}),
+                    ),
+                    2,
+                ),
+            ],
+            "mv_q2",
+        )
+        .await;
+        assert_eq!(snapshot.len(), 1);
+        assert!(
+            snapshot
+                .keys()
+                .any(|row| row[0] == ScalarValue::Int64(Some(123)))
+        );
+    }
+
+    #[tokio::test]
+    async fn nexmark_q3_plan_runs() {
+        let snapshot = run_nexmark_plan(
+            build_q3_plan(),
+            vec![auction_definition(), person_definition()],
+            vec![
+                (
+                    SourceEvent::new("auction", json!({"id": 10, "seller": 1, "category": 10})),
+                    1,
+                ),
+                (
+                    SourceEvent::new(
+                        "person",
+                        json!({"id": 1, "name": "Alice", "city": "Portland", "state": "or"}),
+                    ),
+                    2,
+                ),
+            ],
+            "mv_q3",
+        )
+        .await;
+        assert!(
+            snapshot
+                .keys()
+                .any(|row| row[1] == ScalarValue::Utf8(Some("Alice".to_string())))
+        );
+    }
+
+    #[tokio::test]
     async fn persisted_materialized_view_survives_restart() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("mv_persist", store).await.expect("open SlateDB"));
@@ -910,5 +1017,205 @@ mod tests {
             .expect("build batches");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    async fn run_nexmark_plan(
+        plan: DataflowPlan,
+        sources: Vec<SourceDefinition>,
+        events: Vec<(SourceEvent, Timestamp)>,
+        view_name: &str,
+    ) -> HashMap<Row, Diff> {
+        let mut registry = SourceRegistry::new();
+        for definition in sources {
+            registry.register(definition);
+        }
+        let registry = Arc::new(registry);
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick =
+            instantiate_tick_loop(&plan, Arc::clone(&registry), Arc::clone(&mv_registry), None)
+                .await
+                .expect("instantiate plan");
+        tick.process_events(events).await.expect("process events");
+        tick.advance_watermark(20).await.expect("watermark");
+        mv_registry.get(view_name).expect("view").snapshot()
+    }
+
+    fn bid_full_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "bid",
+            vec![
+                SourceColumn::new("auction", SourceDataType::Int64),
+                SourceColumn::new("bidder", SourceDataType::Int64),
+                SourceColumn::new("price", SourceDataType::Int64),
+                SourceColumn::new("date_time", SourceDataType::Int64),
+                SourceColumn::new("extra", SourceDataType::Int64),
+            ],
+        )
+        .expect("definition")
+    }
+
+    fn auction_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "auction",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("seller", SourceDataType::Int64),
+                SourceColumn::new("category", SourceDataType::Int64),
+            ],
+        )
+        .expect("auction definition")
+    }
+
+    fn person_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "person",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("name", SourceDataType::Utf8),
+                SourceColumn::new("city", SourceDataType::Utf8),
+                SourceColumn::new("state", SourceDataType::Utf8),
+            ],
+        )
+        .expect("person definition")
+    }
+
+    fn build_q0_plan() -> DataflowPlan {
+        let mut plan = DataflowPlan::new();
+        let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(scan, 0),
+            output: OutputPort::new(OperatorId(1), 0),
+            expressions: vec![Expr::column(0), Expr::column(1), Expr::column(2)],
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(map, 0),
+            view_name: "mv_q0".to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
+    }
+
+    fn build_q1_plan() -> DataflowPlan {
+        let mut plan = DataflowPlan::new();
+        let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(scan, 0),
+            output: OutputPort::new(OperatorId(1), 0),
+            expressions: vec![
+                Expr::column(0),
+                Expr::column(1),
+                Expr::Add(Box::new(Expr::column(2)), Box::new(Expr::column(2))),
+            ],
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(map, 0),
+            view_name: "mv_q1".to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
+    }
+
+    fn build_q2_plan() -> DataflowPlan {
+        let mut plan = DataflowPlan::new();
+        let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let filter = plan.add_operator(OperatorNode::Filter(FilterNode {
+            input: OutputPort::new(scan, 0),
+            output: OutputPort::new(OperatorId(1), 0),
+            predicate: Expr::Eq(
+                Box::new(Expr::column(0)),
+                Box::new(Expr::Literal(ScalarValue::Int64(Some(123)))),
+            ),
+        }));
+        let map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(filter, 0),
+            output: OutputPort::new(OperatorId(2), 0),
+            expressions: vec![Expr::column(0), Expr::column(2)],
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(map, 0),
+            view_name: "mv_q2".to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
+    }
+
+    fn build_q3_plan() -> DataflowPlan {
+        let mut plan = DataflowPlan::new();
+        let auction_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "auction".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let auction_filter = plan.add_operator(OperatorNode::Filter(FilterNode {
+            input: OutputPort::new(auction_scan, 0),
+            output: OutputPort::new(OperatorId(1), 0),
+            predicate: Expr::Eq(
+                Box::new(Expr::column(2)),
+                Box::new(Expr::Literal(ScalarValue::Int64(Some(10)))),
+            ),
+        }));
+        let auction_map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(auction_filter, 0),
+            output: OutputPort::new(OperatorId(2), 0),
+            expressions: vec![Expr::column(0), Expr::column(1), Expr::column(2)],
+        }));
+
+        let person_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "person".to_string(),
+            output: OutputPort::new(OperatorId(3), 0),
+        }));
+        let person_filter = plan.add_operator(OperatorNode::Filter(FilterNode {
+            input: OutputPort::new(person_scan, 0),
+            output: OutputPort::new(OperatorId(4), 0),
+            predicate: Expr::Or(
+                Box::new(Expr::Eq(
+                    Box::new(Expr::column(3)),
+                    Box::new(Expr::Literal(ScalarValue::Utf8(Some("or".into())))),
+                )),
+                Box::new(Expr::Or(
+                    Box::new(Expr::Eq(
+                        Box::new(Expr::column(3)),
+                        Box::new(Expr::Literal(ScalarValue::Utf8(Some("id".into())))),
+                    )),
+                    Box::new(Expr::Eq(
+                        Box::new(Expr::column(3)),
+                        Box::new(Expr::Literal(ScalarValue::Utf8(Some("ca".into())))),
+                    )),
+                )),
+            ),
+        }));
+        let person_map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(person_filter, 0),
+            output: OutputPort::new(OperatorId(5), 0),
+            expressions: vec![
+                Expr::column(0),
+                Expr::column(1),
+                Expr::column(2),
+                Expr::column(3),
+            ],
+        }));
+
+        let join = plan.add_operator(OperatorNode::Join(JoinNode {
+            left: OutputPort::new(auction_map, 0),
+            right: OutputPort::new(person_map, 0),
+            output: OutputPort::new(OperatorId(6), 0),
+            on: vec![(1, 0)],
+            projection: vec![Expr::column(0), Expr::column(4)],
+        }));
+
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(join, 0),
+            view_name: "mv_q3".to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
     }
 }

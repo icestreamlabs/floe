@@ -20,3 +20,6 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 floe-sql-parser = { workspace = true }
 slatedb = { workspace = true }
+
+[dev-dependencies]
+arrow-schema = { workspace = true }

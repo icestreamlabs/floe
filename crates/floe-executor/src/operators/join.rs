@@ -153,7 +153,12 @@ fn apply_state_change(entries: &mut Vec<StoredRow>, row: &Row, diff: Diff) {
             multiplicity: diff,
         });
     } else {
-        let mut remaining = -diff;
+        let removal = -diff;
+        if entries.len() == 1 && entries[0].row == *row && entries[0].multiplicity == removal {
+            entries.clear();
+            return;
+        }
+        let mut remaining = removal;
         entries.retain_mut(|stored| {
             if stored.row == *row && remaining > 0 {
                 let to_remove = remaining.min(stored.multiplicity);
@@ -184,6 +189,17 @@ mod tests {
     use crate::dataflow_plan::Expr;
     use crate::operators::test_support::TestSink;
     use crate::stream_types::{InputPort, OperatorId, OutputPort};
+
+    #[test]
+    fn apply_state_change_removes_exact_match_fast() {
+        let row = vec![ScalarValue::Int64(Some(1))];
+        let mut entries = vec![StoredRow {
+            row: row.clone(),
+            multiplicity: 2,
+        }];
+        apply_state_change(&mut entries, &row, -2);
+        assert!(entries.is_empty());
+    }
 
     #[test]
     fn joins_on_single_key() {

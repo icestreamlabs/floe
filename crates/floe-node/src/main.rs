@@ -142,6 +142,7 @@ fn register_materialized_view_tables(
     let session = context.session();
     for mv in planned {
         let arrow_schema = df_schema_to_arrow(mv.logical_plan().schema())?;
+        registry.set_schema(mv.definition().name(), arrow_schema.clone());
         let provider = MaterializedViewTableProvider::new(
             Arc::clone(registry),
             mv.definition().name().to_string(),

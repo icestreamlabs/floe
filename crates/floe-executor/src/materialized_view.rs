@@ -2,18 +2,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::stream_types::{Diff, Row, Timestamp};
+use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
     views: RwLock<HashMap<String, Arc<MaterializedViewHandle>>>,
+    schemas: RwLock<HashMap<String, SchemaRef>>,
 }
 
 impl MaterializedViewRegistry {
     pub fn new() -> Self {
         Self {
             views: RwLock::new(HashMap::new()),
+            schemas: RwLock::new(HashMap::new()),
         }
     }
 
@@ -28,6 +31,21 @@ impl MaterializedViewRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<MaterializedViewHandle>> {
         self.views
+            .read()
+            .expect("mutex poisoned")
+            .get(name)
+            .cloned()
+    }
+
+    pub fn set_schema(&self, name: impl Into<String>, schema: SchemaRef) {
+        self.schemas
+            .write()
+            .expect("mutex poisoned")
+            .insert(name.into(), schema);
+    }
+
+    pub fn schema(&self, name: &str) -> Option<SchemaRef> {
+        self.schemas
             .read()
             .expect("mutex poisoned")
             .get(name)
