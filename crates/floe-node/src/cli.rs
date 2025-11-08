@@ -11,7 +11,7 @@ pub struct Cli {
     #[arg(long = "max-events")]
     pub max_events: Option<u64>,
 
-    /// SQL text for the materialized view definition.
-    #[arg(long = "mv-query")]
-    pub mv_query: Option<String>,
+    /// SQL text for a single materialized view definition (specify at most once).
+    #[arg(long = "mv-query", action = clap::ArgAction::Append)]
+    pub mv_query: Vec<String>,
 }

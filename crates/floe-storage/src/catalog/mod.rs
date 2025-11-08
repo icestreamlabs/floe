@@ -139,6 +139,10 @@ impl SlateCatalog {
     }
 }
 
+pub fn catalog_db(catalog: &SlateCatalog) -> Arc<Db> {
+    catalog.db()
+}
+
 async fn scan_prefix(db: &Db, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
     let range = prefix_bounds(prefix);
     let mut iter = db

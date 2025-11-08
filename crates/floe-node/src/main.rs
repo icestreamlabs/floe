@@ -14,6 +14,7 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
+use floe_storage::catalog::catalog_db;
 use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::task::JoinHandle;
 
@@ -24,14 +25,18 @@ use crate::source::SourceRegistry;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    if cli.mv_query.len() > 1 {
+        anyhow::bail!("--mv-query may only be provided once");
+    }
+
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(generator::definitions()?);
 
     let storage = server::init_storage().await?;
-    let storage_db = storage.db();
+    let storage_db = catalog_db(storage.as_ref());
 
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
-    if let Some(sql) = cli.mv_query.as_deref() {
+    if let Some(sql) = cli.mv_query.first() {
         materialized_views.push(parse_materialized_view(sql)?);
     }
 
