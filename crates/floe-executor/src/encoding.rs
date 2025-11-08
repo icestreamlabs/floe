@@ -8,7 +8,8 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     buf.extend_from_slice(&count.to_le_bytes());
     for value in columns {
         if value.is_null() {
-            return Err(anyhow!("null values not supported in MV keys"));
+            buf.push(0x00);
+            continue;
         }
         match value {
             ScalarValue::Int64(Some(v)) => {
@@ -51,6 +52,9 @@ pub fn decode_projected_row_key(bytes: &[u8]) -> Result<Vec<ScalarValue>> {
         let tag = bytes[cursor];
         cursor += 1;
         match tag {
+            0x00 => {
+                columns.push(ScalarValue::Null);
+            }
             0x01 => {
                 let end = cursor + 8;
                 let chunk = bytes
@@ -113,13 +117,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nulls() {
-        let row = vec![ScalarValue::Int64(None)];
-        let err = encode_projected_row_key(&row).unwrap_err();
-        assert!(err.to_string().contains("null"));
-    }
-
-    #[test]
     fn round_trips_rows() {
         let row = vec![
             ScalarValue::Int64(Some(10)),
@@ -130,5 +127,13 @@ mod tests {
         let encoded = encode_projected_row_key(&row).expect("encode");
         let decoded = decode_projected_row_key(&encoded).expect("decode");
         assert_eq!(row, decoded);
+    }
+
+    #[test]
+    fn encodes_null_values() {
+        let row = vec![ScalarValue::Null, ScalarValue::Int64(None)];
+        let encoded = encode_projected_row_key(&row).expect("encode");
+        let decoded = decode_projected_row_key(&encoded).expect("decode");
+        assert!(decoded.iter().all(|value| value.is_null()));
     }
 }

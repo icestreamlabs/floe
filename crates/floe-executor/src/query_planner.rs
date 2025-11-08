@@ -5,6 +5,7 @@ use datafusion::logical_expr::{
     BinaryExpr, Expr as DFExpr, Filter, Join, JoinConstraint, JoinType, LogicalPlan,
     Operator as DFOperator, Projection, TableScan,
 };
+use datafusion::scalar::ScalarValue;
 
 use crate::dataflow_plan::{
     DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
@@ -169,11 +170,10 @@ impl PlanBuilder {
             DFExpr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let left_expr = self.convert_expr(left, schema)?;
                 let right_expr = self.convert_expr(right, schema)?;
+                let (left_expr, right_expr) = coerce_numeric_literals(left_expr, right_expr);
                 match op {
                     DFOperator::Eq => Ok(Expr::Eq(Box::new(left_expr), Box::new(right_expr))),
-                    DFOperator::NotEq => {
-                        Ok(Expr::NotEq(Box::new(left_expr), Box::new(right_expr)))
-                    }
+                    DFOperator::NotEq => Ok(Expr::NotEq(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Lt => Ok(Expr::Lt(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::LtEq => Ok(Expr::LtEq(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Gt => Ok(Expr::Gt(Box::new(left_expr), Box::new(right_expr))),
@@ -182,7 +182,9 @@ impl PlanBuilder {
                     DFOperator::Or => Ok(Expr::Or(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Plus => Ok(Expr::Add(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Minus => Ok(Expr::Sub(Box::new(left_expr), Box::new(right_expr))),
-                    DFOperator::Multiply => Ok(Expr::Mul(Box::new(left_expr), Box::new(right_expr))),
+                    DFOperator::Multiply => {
+                        Ok(Expr::Mul(Box::new(left_expr), Box::new(right_expr)))
+                    }
                     DFOperator::Divide => Ok(Expr::Div(Box::new(left_expr), Box::new(right_expr))),
                     DFOperator::Modulo => Ok(Expr::Mod(Box::new(left_expr), Box::new(right_expr))),
                     _ => bail!("unsupported binary operator: {op:?} in expression {expr}"),
@@ -241,6 +243,29 @@ impl PlanBuilder {
 
     fn identity_projection(&self, field_count: usize) -> Vec<Expr> {
         (0..field_count).map(Expr::Column).collect()
+    }
+}
+
+fn coerce_numeric_literals(left: Expr, right: Expr) -> (Expr, Expr) {
+    if matches!(left, Expr::Literal(ScalarValue::Float64(_)))
+        && matches!(right, Expr::Literal(ScalarValue::Int64(_)))
+    {
+        return (left, int_literal_to_float(right));
+    }
+    if matches!(right, Expr::Literal(ScalarValue::Float64(_)))
+        && matches!(left, Expr::Literal(ScalarValue::Int64(_)))
+    {
+        return (int_literal_to_float(left), right);
+    }
+    (left, right)
+}
+
+fn int_literal_to_float(expr: Expr) -> Expr {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(value)) => {
+            Expr::Literal(ScalarValue::Float64(value.map(|v| v as f64)))
+        }
+        other => other,
     }
 }
 
@@ -388,10 +413,7 @@ mod tests {
     #[test]
     fn filter_supports_extended_predicates() -> Result<()> {
         let schema = auction_schema();
-        let modulo_expr = plan_filter_expr(
-            &schema,
-            (col("category") % lit(123i64)).eq(lit(0i64)),
-        )?;
+        let modulo_expr = plan_filter_expr(&schema, (col("category") % lit(123i64)).eq(lit(0i64)))?;
         match modulo_expr {
             Expr::Eq(lhs, rhs) => {
                 assert!(matches!(*lhs, Expr::Mod(_, _)));
@@ -400,8 +422,10 @@ mod tests {
             other => panic!("expected equality predicate, found {other:?}"),
         }
 
-        let in_list_expr =
-            plan_filter_expr(&schema, col("category").in_list(vec![lit(10i64), lit(20i64)], false))?;
+        let in_list_expr = plan_filter_expr(
+            &schema,
+            col("category").in_list(vec![lit(10i64), lit(20i64)], false),
+        )?;
         match in_list_expr {
             Expr::InList { list, negated, .. } => {
                 assert_eq!(list.len(), 2);
@@ -424,6 +448,41 @@ mod tests {
 
         let not_eq_expr = plan_filter_expr(&schema, col("category").not_eq(lit(10i64)))?;
         assert!(matches!(not_eq_expr, Expr::NotEq(_, _)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn coerces_int_literal_when_paired_with_float_literal() -> Result<()> {
+        let schema = bid_schema();
+        let logical_plan = table_scan(Some("bid"), &schema, None)?
+            .project(vec![
+                (lit(ScalarValue::Float64(Some(0.5))) + lit(ScalarValue::Int64(Some(2))))
+                    .alias("mixed_literal"),
+            ])?
+            .build()?;
+
+        let planner = QueryPlanner::new();
+        let dataflow = planner.plan(&logical_plan, "mv_literal_test")?;
+        let map_node = match &dataflow.operators[1] {
+            OperatorNode::Map(node) => node,
+            other => bail!("expected map operator, found {other:?}"),
+        };
+        match &map_node.expressions[0] {
+            Expr::Add(lhs, rhs) => {
+                assert!(matches!(
+                    **lhs,
+                    Expr::Literal(ScalarValue::Float64(Some(_)))
+                ));
+                match rhs.as_ref() {
+                    Expr::Literal(ScalarValue::Float64(Some(value))) => {
+                        assert_eq!(*value, 2.0);
+                    }
+                    other => panic!("expected coerced float literal, found {other:?}"),
+                }
+            }
+            other => panic!("expected addition expression, found {other:?}"),
+        }
 
         Ok(())
     }
