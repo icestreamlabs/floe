@@ -57,7 +57,10 @@ mod tests {
 
     #[test]
     fn builds_operator_namespace() {
-        assert_eq!(operator_state("planA", 2, "left").unwrap(), "op/planA/2/left");
+        assert_eq!(
+            operator_state("planA", 2, "left").unwrap(),
+            "op/planA/2/left"
+        );
     }
 
     #[test]

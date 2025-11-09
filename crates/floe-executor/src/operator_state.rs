@@ -122,7 +122,10 @@ mod tests {
         let mut bridge = DbspBridge::new(db).await.expect("bridge");
         let namespace = namespaces::operator_state("test", 0, name).expect("namespace");
         let stream = bridge
-            .new_stream(namespace.clone(), StreamRetention::KeepLast { keep_last: 1 })
+            .new_stream(
+                namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
             .await
             .expect("state stream");
         StateTable::new(name.to_string(), namespace, stream)

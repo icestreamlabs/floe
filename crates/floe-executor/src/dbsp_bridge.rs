@@ -51,7 +51,10 @@ impl DbspBridge {
     pub async fn new_view(&mut self, view_name: &str) -> Result<DbspView> {
         let namespace = namespaces::materialized_view(view_name)?;
         let zset = self
-            .new_stream(namespace.clone(), StreamRetention::KeepLast { keep_last: 1 })
+            .new_stream(
+                namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
             .await?;
         Ok(DbspView {
             name: view_name.to_string(),
