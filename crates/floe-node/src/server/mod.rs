@@ -1,10 +1,14 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
+use core::ops::ControlFlow;
 use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_storage::SlateCatalog;
@@ -12,13 +16,23 @@ use futures::Sink;
 use futures::stream;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor};
+use postgres_types::Type as PgType;
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor, Value,
+    ValueWithSpan, visit_expressions, visit_expressions_mut,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
@@ -125,25 +139,246 @@ impl FloeServerState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PreparedStatement {
+    statement: Statement,
+    result_fields: Arc<Vec<FieldInfo>>,
+    referenced_views: Vec<String>,
+    parameter_count: usize,
+    param_types: Vec<PgType>,
+}
+
+impl PreparedStatement {
+    fn result_fields(&self) -> Arc<Vec<FieldInfo>> {
+        Arc::clone(&self.result_fields)
+    }
+
+    fn referenced_views(&self) -> &[String] {
+        &self.referenced_views
+    }
+
+    fn parameter_count(&self) -> usize {
+        self.parameter_count
+    }
+
+    fn parameter_types(&self) -> Vec<PgType> {
+        self.param_types.clone()
+    }
+}
+
+struct FloeExtendedQueryParser {
+    state: Arc<FloeServerState>,
+    dialect: PostgreSqlDialect,
+}
+
+impl FloeExtendedQueryParser {
+    fn new(state: Arc<FloeServerState>) -> Self {
+        Self {
+            state,
+            dialect: PostgreSqlDialect {},
+        }
+    }
+
+    async fn prepare_statement(
+        &self,
+        sql: &str,
+        parameter_types: &[PgType],
+    ) -> PgWireResult<PreparedStatement> {
+        let mut statements = Parser::parse_sql(&self.dialect, sql)
+            .map_err(|err| user_error(format!("SQL parse error: {err}")))?;
+        if statements.len() != 1 {
+            return Err(user_error(
+                "extended protocol supports a single statement per Parse",
+            ));
+        }
+        let statement = statements.pop().expect("statement present");
+        ensure_select_statement(&statement)?;
+
+        let mut referenced = Vec::new();
+        if let Statement::Query(query) = &statement {
+            extract_tables_from_query(query, &mut referenced);
+        }
+        let mut deduped = Vec::new();
+        let mut seen = HashSet::new();
+        for name in referenced {
+            if seen.insert(name.clone()) {
+                deduped.push(name);
+            }
+        }
+
+        for view in &deduped {
+            self.state.ensure_materialized_view_registered(view).await?;
+        }
+
+        let dataframe = self
+            .state
+            .query
+            .session()
+            .sql(sql)
+            .await
+            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
+        let df_schema_ref = dataframe.schema();
+        let df_schema_owned = (*df_schema_ref).clone();
+        let arrow_schema: Schema = df_schema_owned.into();
+        let schema_ref: SchemaRef = Arc::new(arrow_schema);
+        let fields = Arc::new(arrow_schema_to_field_info(&schema_ref)?);
+
+        let placeholder_indices = collect_placeholder_indices(&statement)?;
+        let parameter_count = placeholder_indices.iter().copied().max().unwrap_or(0);
+        let mut bound_param_types = vec![PgType::UNKNOWN; parameter_count];
+        for (idx, ty) in parameter_types.iter().enumerate() {
+            if idx < bound_param_types.len() {
+                bound_param_types[idx] = ty.clone();
+            }
+        }
+
+        Ok(PreparedStatement {
+            statement,
+            result_fields: fields,
+            referenced_views: deduped,
+            parameter_count,
+            param_types: bound_param_types,
+        })
+    }
+}
+
+#[async_trait]
+impl QueryParser for FloeExtendedQueryParser {
+    type Statement = PreparedStatement;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        parameter_types: &[PgType],
+    ) -> PgWireResult<PreparedStatement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        self.prepare_statement(sql, parameter_types).await
+    }
+}
+
+struct FloeExtendedHandler {
+    state: Arc<FloeServerState>,
+    parser: Arc<FloeExtendedQueryParser>,
+}
+
+impl FloeExtendedHandler {
+    fn new(state: Arc<FloeServerState>) -> Self {
+        Self {
+            parser: Arc::new(FloeExtendedQueryParser::new(Arc::clone(&state))),
+            state,
+        }
+    }
+
+    fn render_portal_sql(&self, portal: &Portal<PreparedStatement>) -> PgWireResult<String> {
+        render_sql_with_params(&portal.statement.statement, portal)
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for FloeExtendedHandler {
+    type Statement = PreparedStatement;
+    type QueryParser = FloeExtendedQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::clone(&self.parser)
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let stmt = &target.statement;
+        Ok(DescribeStatementResponse::new(
+            stmt.parameter_types(),
+            stmt.result_fields().as_ref().clone(),
+        ))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Ok(DescribePortalResponse::new(
+            target.statement.statement.result_fields().as_ref().clone(),
+        ))
+    }
+
+    async fn do_query<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        for view in portal.statement.statement.referenced_views() {
+            self.state.ensure_materialized_view_registered(view).await?;
+        }
+
+        let sql = self.render_portal_sql(portal)?;
+        let dataframe = self
+            .state
+            .query
+            .session()
+            .sql(&sql)
+            .await
+            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
+        let response = build_query_response(batches)?;
+        Ok(Response::Query(response))
+    }
+}
+
 struct FloeServerFactory {
-    handler: Arc<FloeQueryHandler>,
+    simple_handler: Arc<FloeQueryHandler>,
+    extended_handler: Arc<FloeExtendedHandler>,
 }
 
 impl FloeServerFactory {
     fn new(state: Arc<FloeServerState>) -> Self {
+        let simple_state = Arc::clone(&state);
         Self {
-            handler: Arc::new(FloeQueryHandler::new(state)),
+            simple_handler: Arc::new(FloeQueryHandler::new(simple_state)),
+            extended_handler: Arc::new(FloeExtendedHandler::new(state)),
         }
     }
 }
 
 impl PgWireServerHandlers for FloeServerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.handler.clone()
+        self.simple_handler.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.extended_handler.clone()
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.handler.clone()
+        self.simple_handler.clone()
     }
 }
 
@@ -251,24 +486,7 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     }
 
     let schema = batches[0].schema();
-    let mut fields = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        if field.data_type() != &datafusion::arrow::datatypes::DataType::Int64 {
-            return Err(user_error(format!(
-                "unsupported column type {} in result set",
-                field.data_type()
-            )));
-        }
-        fields.push(FieldInfo::new(
-            field.name().clone(),
-            None,
-            None,
-            Type::INT8,
-            FieldFormat::Text,
-        ));
-    }
-
-    let info = Arc::new(fields);
+    let info = Arc::new(arrow_schema_to_field_info(&schema)?);
     let column_count = info.len();
 
     let mut row_buffer = Vec::new();
@@ -304,6 +522,165 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     }));
 
     Ok(QueryResponse::new(info, row_stream))
+}
+
+fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>> {
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if field.data_type() != &datafusion::arrow::datatypes::DataType::Int64 {
+            return Err(user_error(format!(
+                "unsupported column type {} in result set",
+                field.data_type()
+            )));
+        }
+        fields.push(FieldInfo::new(
+            field.name().clone(),
+            None,
+            None,
+            Type::INT8,
+            FieldFormat::Text,
+        ));
+    }
+    Ok(fields)
+}
+
+fn ensure_select_statement(statement: &Statement) -> PgWireResult<()> {
+    match statement {
+        Statement::Query(query) if is_select_expr(&query.body) => Ok(()),
+        _ => Err(user_error("only SELECT statements are supported")),
+    }
+}
+
+fn is_select_expr(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::Select(_) => true,
+        SetExpr::SetOperation { left, right, .. } => is_select_expr(left) && is_select_expr(right),
+        SetExpr::Query(query) => is_select_expr(&query.body),
+        _ => false,
+    }
+}
+
+fn collect_placeholder_indices(statement: &Statement) -> PgWireResult<Vec<usize>> {
+    let mut indices = Vec::new();
+    let result = visit_expressions(statement, |expr| {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(name),
+            ..
+        }) = expr
+        {
+            match parse_placeholder_index(name) {
+                Ok(idx) => indices.push(idx),
+                Err(err) => return ControlFlow::Break(err),
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    match result {
+        ControlFlow::Continue(_) => Ok(indices),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+fn parse_placeholder_index(name: &str) -> PgWireResult<usize> {
+    let trimmed = name.trim_start_matches(|c| c == '$' || c == '?');
+    if trimmed.is_empty() {
+        return Err(user_error(format!("invalid placeholder '{name}'")));
+    }
+    let idx = trimmed
+        .parse::<usize>()
+        .map_err(|_| user_error(format!("invalid placeholder '{name}'")))?;
+    if idx == 0 {
+        return Err(user_error(format!("invalid placeholder '{name}'")));
+    }
+    Ok(idx)
+}
+
+fn render_sql_with_params(
+    prepared: &PreparedStatement,
+    portal: &Portal<PreparedStatement>,
+) -> PgWireResult<String> {
+    let expected = prepared.parameter_count();
+    if portal.parameter_len() != expected {
+        return Err(user_error(format!(
+            "expected {expected} parameter(s) but received {}",
+            portal.parameter_len()
+        )));
+    }
+
+    let mut decoded = Vec::with_capacity(expected);
+    for idx in 0..expected {
+        let format = portal.parameter_format.format_for(idx);
+        if matches!(format, FieldFormat::Binary) {
+            return Err(user_error("binary parameters are not supported"));
+        }
+        let raw_value = portal
+            .parameters
+            .get(idx)
+            .ok_or_else(|| user_error("missing parameter value"))?;
+        let value = decode_parameter_value(raw_value.as_ref(), format)?;
+        decoded.push(value);
+    }
+
+    let mut statement = prepared.statement.clone();
+    substitute_placeholders(&mut statement, &decoded)?;
+    Ok(statement.to_string())
+}
+
+fn decode_parameter_value(
+    raw: Option<&Bytes>,
+    _format: FieldFormat,
+) -> PgWireResult<ValueWithSpan> {
+    match raw {
+        None => Ok(Value::Null.with_empty_span()),
+        Some(bytes) => {
+            let text = std::str::from_utf8(bytes.as_ref())
+                .map_err(|_| user_error("parameter values must be valid UTF-8"))?;
+            Ok(string_to_value(text).with_empty_span())
+        }
+    }
+}
+
+fn string_to_value(input: &str) -> Value {
+    if input.parse::<i64>().is_ok() {
+        Value::Number(input.to_string(), false)
+    } else if input.parse::<f64>().is_ok() {
+        Value::Number(input.to_string(), false)
+    } else if input.eq_ignore_ascii_case("true") {
+        Value::Boolean(true)
+    } else if input.eq_ignore_ascii_case("false") {
+        Value::Boolean(false)
+    } else {
+        Value::SingleQuotedString(input.to_string())
+    }
+}
+
+fn substitute_placeholders(
+    statement: &mut Statement,
+    values: &[ValueWithSpan],
+) -> PgWireResult<()> {
+    let result = visit_expressions_mut(statement, |expr| {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(name),
+            ..
+        }) = expr
+        {
+            let idx = match parse_placeholder_index(name) {
+                Ok(idx) => idx,
+                Err(err) => return ControlFlow::Break(err),
+            };
+            if idx == 0 || idx > values.len() {
+                return ControlFlow::Break(user_error(format!(
+                    "placeholder {name} has no bound value"
+                )));
+            }
+            *expr = Expr::Value(values[idx - 1].clone());
+        }
+        ControlFlow::Continue(())
+    });
+    match result {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(err) => Err(err),
+    }
 }
 
 fn extract_tables_from_query(query: &Query, names: &mut Vec<String>) {
@@ -355,8 +732,25 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use floe_executor::MaterializedViewRegistry;
+    use pgwire::messages::extendedquery::Bind;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+
+    async fn state_with_single_mv() -> Arc<FloeServerState> {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.register("mv_test");
+        registry.set_schema(
+            "mv_test",
+            Arc::new(Schema::new(vec![Field::new(
+                "auction",
+                DataType::Int64,
+                true,
+            )])),
+        );
+        Arc::new(FloeServerState::new(query, registry))
+    }
 
     #[tokio::test]
     async fn registers_materialized_view_on_select() {
@@ -449,6 +843,61 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("INSERT is not supported; materialized views are read-only")
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_parser_rejects_non_select() {
+        let state = state_with_single_mv().await;
+        let parser = FloeExtendedQueryParser::new(state);
+        let err = parser
+            .prepare_statement("INSERT INTO mv_test VALUES (1)", &[])
+            .await
+            .expect_err("expected rejection");
+        assert!(
+            err.to_string()
+                .contains("only SELECT statements are supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_parser_tracks_referenced_mvs_and_parameters() {
+        let state = state_with_single_mv().await;
+        let parser = FloeExtendedQueryParser::new(Arc::clone(&state));
+        let prepared = parser
+            .prepare_statement("SELECT * FROM mv_test WHERE auction > $1", &[])
+            .await
+            .expect("prepared");
+        assert_eq!(prepared.parameter_count(), 1);
+        assert_eq!(prepared.referenced_views(), &["mv_test"]);
+    }
+
+    #[tokio::test]
+    async fn extended_handler_renders_bound_sql() {
+        let state = state_with_single_mv().await;
+        let parser = FloeExtendedQueryParser::new(Arc::clone(&state));
+        let prepared = parser
+            .prepare_statement("SELECT auction FROM mv_test WHERE auction > $1", &[])
+            .await
+            .expect("prepared");
+        let stored = Arc::new(StoredStatement::new(
+            "stmt".into(),
+            prepared.clone(),
+            vec![PgType::INT8],
+        ));
+        let bind = Bind::new(
+            Some("portal".into()),
+            Some("stmt".into()),
+            vec![0],
+            vec![Some(Bytes::from("100"))],
+            vec![0],
+        );
+        let portal = Portal::try_new(&bind, Arc::clone(&stored)).expect("portal");
+        let handler = FloeExtendedHandler::new(state);
+        let sql = handler.render_portal_sql(&portal).expect("rendered SQL");
+        assert!(
+            sql.contains("WHERE auction > 100"),
+            "unexpected rendered SQL: {sql}"
         );
     }
 

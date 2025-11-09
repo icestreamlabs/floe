@@ -106,6 +106,7 @@ impl StateTable {
 mod tests {
     use super::*;
     use crate::dbsp_bridge::DbspBridge;
+    use crate::namespaces;
     use dbsp::StreamRetention;
     use object_store::memory::InMemory;
     use slatedb::Db;
@@ -119,14 +120,12 @@ mod tests {
                 .expect("open db"),
         );
         let mut bridge = DbspBridge::new(db).await.expect("bridge");
-        bridge
-            .new_state_table(
-                format!("op/test/{name}"),
-                name.to_string(),
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
+        let namespace = namespaces::operator_state("test", 0, name).expect("namespace");
+        let stream = bridge
+            .new_stream(namespace.clone(), StreamRetention::KeepLast { keep_last: 1 })
             .await
-            .expect("state table")
+            .expect("state stream");
+        StateTable::new(name.to_string(), namespace, stream)
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+pub mod barrier_clock;
 pub mod checkpoint;
 pub mod circuit_builder;
 pub mod context;
@@ -7,6 +8,7 @@ pub mod encoding;
 pub mod execution_loop;
 pub mod expr_eval;
 pub mod materialized_view;
+pub mod namespaces;
 pub mod operator_state;
 pub mod operators;
 pub mod query_planner;
@@ -14,6 +16,7 @@ pub mod source_decoder;
 pub mod stream_types;
 pub mod table_provider;
 
+pub use barrier_clock::{BarrierClock, StepId};
 pub use circuit_builder::{
     Circuit, CircuitContext, ConnectedDetail, ConnectedOperator, RowStreamHandle, SourceRegistry,
 };

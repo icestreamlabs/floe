@@ -9,7 +9,7 @@ use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{StreamRetention, ZSetStream};
 use slatedb::Db;
 
-use crate::operator_state::StateTable;
+use crate::namespaces;
 
 /// Shared bridge that provisions DBSP-backed views for materialization.
 pub struct DbspBridge {
@@ -37,16 +37,22 @@ impl DbspBridge {
         }
     }
 
-    pub async fn new_view(&mut self, view_name: &str) -> Result<DbspView> {
-        let namespace = format!("mv/{view_name}");
+    /// Provisions a new [`ZSetStream`] in the provided namespace with the supplied retention policy.
+    pub async fn new_stream(
+        &mut self,
+        namespace: impl Into<String>,
+        retention: StreamRetention,
+    ) -> Result<ZSetStream<Vec<u8>>> {
+        let namespace = namespace.into();
         let dict = self.dictionary_for(&namespace).await?;
-        let zset = ZSetStream::new(
-            dict,
-            self.table.clone(),
-            namespace.clone(),
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await?;
+        ZSetStream::new(dict, self.table.clone(), namespace, retention).await
+    }
+
+    pub async fn new_view(&mut self, view_name: &str) -> Result<DbspView> {
+        let namespace = namespaces::materialized_view(view_name)?;
+        let zset = self
+            .new_stream(namespace.clone(), StreamRetention::KeepLast { keep_last: 1 })
+            .await?;
         Ok(DbspView {
             name: view_name.to_string(),
             namespace,
@@ -56,19 +62,6 @@ impl DbspBridge {
 
     pub fn table(&self) -> Arc<dyn KeyValueTable> {
         self.table.clone()
-    }
-
-    pub async fn new_state_table(
-        &mut self,
-        namespace: impl Into<String>,
-        table_name: impl Into<String>,
-        retention: StreamRetention,
-    ) -> Result<StateTable> {
-        let namespace = namespace.into();
-        let dict = self.dictionary_for(&namespace).await?;
-        let stream =
-            ZSetStream::new(dict, self.table.clone(), namespace.clone(), retention).await?;
-        Ok(StateTable::new(table_name, namespace, stream))
     }
 
     pub async fn handle_view_for(

@@ -6,6 +6,7 @@ use dbsp::StreamRetention;
 use floe_core::source::SourceEvent;
 use slatedb::Db;
 
+use crate::barrier_clock::{BarrierClock, StepId};
 use crate::checkpoint::{
     CheckpointManager, CheckpointManifest, CheckpointStore, MaterializedViewCheckpointEntry,
     OperatorCheckpointEntry,
@@ -14,6 +15,8 @@ use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceReg
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::namespaces;
+use crate::operator_state::StateTable;
 use crate::operators::{
     DispatchEvent, DispatchSink, EventQueue, FilterOperator, JoinOperator, MapOperator,
     MaterializeOperator, NullSink, ScanOperator,
@@ -186,7 +189,7 @@ impl ExecutionRuntime {
 
 pub struct TickLoop {
     runtime: ExecutionRuntime,
-    current_watermark: Timestamp,
+    barrier_clock: BarrierClock,
     ops: Vec<Box<dyn StreamOperator>>,
     queue: EventQueue,
     scan_operators: HashMap<RowStreamHandle, usize>,
@@ -204,7 +207,7 @@ impl TickLoop {
     ) -> Self {
         Self {
             runtime,
-            current_watermark: 0,
+            barrier_clock: BarrierClock::new(),
             ops,
             queue,
             scan_operators,
@@ -288,14 +291,18 @@ impl TickLoop {
     }
 
     pub async fn advance_watermark(&mut self, watermark: Timestamp) -> Result<()> {
-        if watermark <= self.current_watermark {
+        if self.barrier_clock.advance(watermark).is_none() {
             return Ok(());
         }
-        self.current_watermark = watermark;
+        let step_id = self.barrier_clock.step();
         self.drain_queue()?;
         for operator in self.ops.iter_mut() {
             operator.on_watermark(watermark)?;
         }
+        self.seal_step(step_id, watermark).await
+    }
+
+    async fn seal_step(&mut self, _step_id: StepId, watermark: Timestamp) -> Result<()> {
         let operator_states = self.collect_operator_checkpoints().await?;
         run_barrier_hook(BarrierStage::AfterOperatorFlush)?;
         let materialized_views = self.collect_materialized_view_checkpoints().await?;
@@ -308,7 +315,7 @@ impl TickLoop {
     }
 
     pub fn current_watermark(&self) -> Timestamp {
-        self.current_watermark
+        self.barrier_clock.watermark()
     }
 
     pub async fn advance_source_watermark(
@@ -333,7 +340,7 @@ impl TickLoop {
             .values()
             .copied()
             .min()
-            .unwrap_or(self.current_watermark)
+            .unwrap_or(self.barrier_clock.watermark())
     }
 
     async fn collect_materialized_view_checkpoints(
@@ -528,24 +535,27 @@ pub async fn build_graph(
                 let (left_state, right_state) = if let Some(bridge_ref) = bridge.as_mut() {
                     let left_table_name = format!("join_left_{idx}");
                     let right_table_name = format!("join_right_{idx}");
-                    let left_namespace = format!("op/{}/{}/left", plan.graph_id, idx);
-                    let right_namespace = format!("op/{}/{}/right", plan.graph_id, idx);
-                    let left = bridge_ref
-                        .new_state_table(
-                            left_namespace,
-                            left_table_name.clone(),
+                    let left_namespace =
+                        namespaces::operator_state(&plan.graph_id, idx, "left")?;
+                    let right_namespace =
+                        namespaces::operator_state(&plan.graph_id, idx, "right")?;
+                    let left_stream = bridge_ref
+                        .new_stream(
+                            left_namespace.clone(),
                             StreamRetention::KeepLast { keep_last: 1 },
                         )
                         .await
-                        .context("initialize left join state")?;
-                    let right = bridge_ref
-                        .new_state_table(
-                            right_namespace,
-                            right_table_name.clone(),
+                        .context("initialize left join state stream")?;
+                    let right_stream = bridge_ref
+                        .new_stream(
+                            right_namespace.clone(),
                             StreamRetention::KeepLast { keep_last: 1 },
                         )
                         .await
-                        .context("initialize right join state")?;
+                        .context("initialize right join state stream")?;
+                    let left = StateTable::new(left_table_name.clone(), left_namespace.clone(), left_stream);
+                    let right =
+                        StateTable::new(right_table_name.clone(), right_namespace.clone(), right_stream);
                     if let Some(handles) = &checkpoint_handles {
                         for handle in handles {
                             let snapshot = bridge_ref
@@ -689,7 +699,7 @@ pub async fn instantiate_tick_loop(
     );
     if let Some(manager) = tick.checkpoint.as_ref() {
         if let Some(manifest) = manager.latest_manifest() {
-            tick.current_watermark = manifest.watermark;
+            tick.barrier_clock.bootstrap(manifest.watermark);
         }
     }
     tick.register_bindings(&built.scan_bindings)?;

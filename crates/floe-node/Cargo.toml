@@ -10,6 +10,7 @@ floe-storage = { path = "../floe-storage" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+datafusion-common = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 nexmark = { workspace = true }
@@ -20,6 +21,8 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 floe-sql-parser = { workspace = true }
 slatedb = { workspace = true }
+bytes = "1.6"
+postgres-types = "0.2"
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
