@@ -10,6 +10,7 @@ dbsp = { path = "../dbsp" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
 

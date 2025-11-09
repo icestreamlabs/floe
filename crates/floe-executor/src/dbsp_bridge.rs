@@ -9,6 +9,8 @@ use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{StreamRetention, ZSetStream};
 use slatedb::Db;
 
+use crate::operator_state::StateTable;
+
 /// Shared bridge that provisions DBSP-backed views for materialization.
 pub struct DbspBridge {
     table: Arc<dyn KeyValueTable>,
@@ -54,6 +56,33 @@ impl DbspBridge {
 
     pub fn table(&self) -> Arc<dyn KeyValueTable> {
         self.table.clone()
+    }
+
+    pub async fn new_state_table(
+        &mut self,
+        namespace: impl Into<String>,
+        table_name: impl Into<String>,
+        retention: StreamRetention,
+    ) -> Result<StateTable> {
+        let namespace = namespace.into();
+        let dict = self.dictionary_for(&namespace).await?;
+        let stream =
+            ZSetStream::new(dict, self.table.clone(), namespace.clone(), retention).await?;
+        Ok(StateTable::new(table_name, namespace, stream))
+    }
+
+    pub async fn handle_view_for(
+        &mut self,
+        namespace: &str,
+        version: u64,
+    ) -> Result<ZSetHandleView<Vec<u8>>> {
+        let dict = self.dictionary_for(namespace).await?;
+        Ok(ZSetHandleView::new(
+            dict,
+            self.table.clone(),
+            namespace.to_string(),
+            version,
+        ))
     }
 }
 

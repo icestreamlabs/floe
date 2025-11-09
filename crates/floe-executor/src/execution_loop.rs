@@ -2,9 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use dbsp::StreamRetention;
 use floe_core::source::SourceEvent;
 use slatedb::Db;
 
+use crate::checkpoint::{
+    CheckpointManager, CheckpointManifest, CheckpointStore, OperatorCheckpointEntry,
+};
 use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceRegistry};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
@@ -113,6 +117,7 @@ pub struct TickLoop {
     queue: EventQueue,
     scan_operators: HashMap<RowStreamHandle, usize>,
     source_watermarks: HashMap<String, Timestamp>,
+    checkpoint: Option<CheckpointManager>,
 }
 
 impl TickLoop {
@@ -121,6 +126,7 @@ impl TickLoop {
         ops: Vec<Box<dyn StreamOperator>>,
         queue: EventQueue,
         scan_operators: HashMap<RowStreamHandle, usize>,
+        checkpoint: Option<CheckpointManager>,
     ) -> Self {
         Self {
             runtime,
@@ -129,13 +135,20 @@ impl TickLoop {
             queue,
             scan_operators,
             source_watermarks: HashMap::new(),
+            checkpoint,
         }
     }
 
     pub fn register_bindings(&mut self, bindings: &[(String, RowStreamHandle)]) -> Result<()> {
         self.runtime.register_bindings(bindings)?;
         for (source, _) in bindings {
-            self.source_watermarks.entry(source.clone()).or_insert(0);
+            let initial = self
+                .checkpoint
+                .as_ref()
+                .and_then(|manager| manager.latest_offsets().get(source))
+                .copied()
+                .unwrap_or(0);
+            self.source_watermarks.insert(source.clone(), initial);
         }
         Ok(())
     }
@@ -156,6 +169,7 @@ impl TickLoop {
                 ingested.diff,
                 ingested.timestamp,
             )?;
+            self.record_source_offset(&ingested.source, ingested.timestamp);
             self.advance_source_watermark(&ingested.source, ingested.timestamp)
                 .await?;
             self.drain_queue()?;
@@ -208,7 +222,9 @@ impl TickLoop {
         for operator in self.ops.iter_mut() {
             operator.on_watermark(watermark)?;
         }
-        self.flush_dbsp_views().await
+        let operator_states = self.collect_operator_checkpoints().await?;
+        self.flush_dbsp_views().await?;
+        self.persist_checkpoint(watermark, operator_states).await
     }
 
     pub fn current_watermark(&self) -> Timestamp {
@@ -248,6 +264,38 @@ impl TickLoop {
         }
         Ok(())
     }
+
+    async fn collect_operator_checkpoints(&mut self) -> Result<Vec<OperatorCheckpointEntry>> {
+        let mut entries = Vec::new();
+        for (idx, operator) in self.ops.iter_mut().enumerate() {
+            if let Some(handles) = operator.checkpoint().await? {
+                if !handles.is_empty() {
+                    entries.push(OperatorCheckpointEntry {
+                        operator_index: idx,
+                        handles,
+                    });
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn persist_checkpoint(
+        &mut self,
+        watermark: Timestamp,
+        operator_states: Vec<OperatorCheckpointEntry>,
+    ) -> Result<()> {
+        if let Some(manager) = self.checkpoint.as_mut() {
+            manager.persist(watermark, operator_states).await?;
+        }
+        Ok(())
+    }
+
+    fn record_source_offset(&mut self, source: &str, offset: Timestamp) {
+        if let Some(manager) = self.checkpoint.as_mut() {
+            manager.update_offset(source, offset);
+        }
+    }
 }
 
 pub struct BuiltGraph {
@@ -261,6 +309,7 @@ pub async fn build_graph(
     plan: &DataflowPlan,
     mv_registry: Arc<MaterializedViewRegistry>,
     queue: &EventQueue,
+    checkpoint_manifest: Option<&CheckpointManifest>,
     mut bridge: Option<&mut DbspBridge>,
 ) -> Result<BuiltGraph> {
     let mut downstreams: HashMap<OperatorId, Vec<(usize, InputPort)>> = HashMap::new();
@@ -343,6 +392,14 @@ pub async fn build_graph(
     for (idx, node) in plan.operators.iter().enumerate() {
         let op_id = OperatorId(idx);
         let targets = downstreams.get(&op_id).cloned().unwrap_or_else(Vec::new);
+        let checkpoint_handles = checkpoint_manifest
+            .and_then(|manifest| {
+                manifest
+                    .operator_states
+                    .iter()
+                    .find(|entry| entry.operator_index == idx)
+            })
+            .map(|entry| entry.handles.clone());
 
         let operator: Box<dyn StreamOperator> = match node {
             OperatorNode::Scan(scan) => {
@@ -367,13 +424,64 @@ pub async fn build_graph(
             }
             OperatorNode::Join(join) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
-                Box::new(JoinOperator::new(
-                    InputPort::new(join.left.operator, join.left.port_index),
-                    InputPort::new(join.right.operator, join.right.port_index),
-                    join.on.clone(),
-                    join.projection.clone(),
-                    sink,
-                ))
+                let mut left_snapshot_data = None;
+                let mut right_snapshot_data = None;
+                let (left_state, right_state) = if let Some(bridge_ref) = bridge.as_mut() {
+                    let left_table_name = format!("join_left_{idx}");
+                    let right_table_name = format!("join_right_{idx}");
+                    let left_namespace = format!("op/{}/{}/left", plan.graph_id, idx);
+                    let right_namespace = format!("op/{}/{}/right", plan.graph_id, idx);
+                    let left = bridge_ref
+                        .new_state_table(
+                            left_namespace,
+                            left_table_name.clone(),
+                            StreamRetention::KeepLast { keep_last: 1 },
+                        )
+                        .await
+                        .context("initialize left join state")?;
+                    let right = bridge_ref
+                        .new_state_table(
+                            right_namespace,
+                            right_table_name.clone(),
+                            StreamRetention::KeepLast { keep_last: 1 },
+                        )
+                        .await
+                        .context("initialize right join state")?;
+                    if let Some(handles) = &checkpoint_handles {
+                        for handle in handles {
+                            let snapshot = bridge_ref
+                                .handle_view_for(&handle.namespace, handle.version)
+                                .await
+                                .context("open join checkpoint handle")?
+                                .materialize()
+                                .await
+                                .context("materialize join checkpoint")?;
+                            if handle.table == left_table_name {
+                                left_snapshot_data = Some(snapshot);
+                            } else if handle.table == right_table_name {
+                                right_snapshot_data = Some(snapshot);
+                            }
+                        }
+                    }
+                    (Some(left), Some(right))
+                } else {
+                    (None, None)
+                };
+                Box::new(
+                    JoinOperator::new(
+                        InputPort::new(join.left.operator, join.left.port_index),
+                        InputPort::new(join.right.operator, join.right.port_index),
+                        join.on.clone(),
+                        join.projection.clone(),
+                        sink,
+                        left_state,
+                        right_state,
+                        left_snapshot_data,
+                        right_snapshot_data,
+                    )
+                    .await
+                    .context("create join operator")?,
+                )
             }
             OperatorNode::Materialize(materialize) => {
                 let dbsp_view = if let Some(bridge_ref) = bridge.as_mut() {
@@ -425,17 +533,51 @@ pub async fn instantiate_tick_loop(
         ),
         None => None,
     };
+    let (checkpoint_table, checkpoint_manifest) = if let Some(bridge_ref) = bridge.as_ref() {
+        let table = bridge_ref.table();
+        let store = CheckpointStore::new(table.clone(), plan.graph_id.clone());
+        let manifest = store.load_latest().await?;
+        (Some(table), manifest)
+    } else {
+        (None, None)
+    };
     let built = build_graph(
         &ctx,
         plan,
         Arc::clone(&mv_registry),
         &queue,
+        checkpoint_manifest.as_ref(),
         bridge.as_mut(),
     )
     .await?;
 
+    let checkpoint = if let Some(table) = checkpoint_table {
+        Some(
+            CheckpointManager::new_with_manifest(
+                plan.graph_id.clone(),
+                table,
+                checkpoint_manifest.clone(),
+            )
+            .await
+            .context("initialize checkpoint manager")?,
+        )
+    } else {
+        None
+    };
+
     let runtime = ExecutionRuntime::new(ScanRuntime::new(sources));
-    let mut tick = TickLoop::with_graph(runtime, built.ops, queue, built.scan_operator_map);
+    let mut tick = TickLoop::with_graph(
+        runtime,
+        built.ops,
+        queue,
+        built.scan_operator_map,
+        checkpoint,
+    );
+    if let Some(manager) = tick.checkpoint.as_ref() {
+        if let Some(manifest) = manager.latest_manifest() {
+            tick.current_watermark = manifest.watermark;
+        }
+    }
     tick.register_bindings(&built.scan_bindings)?;
     Ok(tick)
 }
@@ -510,7 +652,7 @@ mod tests {
         let mut scan_map = HashMap::new();
         scan_map.insert(scan_handle, 0);
 
-        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map);
+        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
         tick.register_bindings(&bindings).expect("register binding");
 
         let events = vec![(
@@ -538,7 +680,7 @@ mod tests {
 
         let mut circuit = Circuit::new();
         let mut ctx = CircuitContext::new(&mut circuit, registry.clone());
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("bindings_test_plan");
         let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -580,7 +722,7 @@ mod tests {
 
         let mut circuit = Circuit::new();
         let mut ctx = CircuitContext::new(&mut circuit, registry.clone());
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("watermark_plan");
         let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -609,6 +751,7 @@ mod tests {
             ops,
             queue.clone(),
             scan_map,
+            None,
         );
         tick_loop.register_bindings(&bindings).expect("register");
 
@@ -640,7 +783,7 @@ mod tests {
         registry.register(bid_definition());
         let registry = Arc::new(registry);
 
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("build_graph_plan");
         let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -662,14 +805,19 @@ mod tests {
 
         let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
-        let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None)
+        let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None, None)
             .await
             .expect("build graph");
 
         let scan_runtime = ScanRuntime::new(registry.clone());
         let runtime = ExecutionRuntime::new(scan_runtime);
-        let mut tick =
-            TickLoop::with_graph(runtime, built.ops, queue.clone(), built.scan_operator_map);
+        let mut tick = TickLoop::with_graph(
+            runtime,
+            built.ops,
+            queue.clone(),
+            built.scan_operator_map,
+            None,
+        );
         tick.register_bindings(&built.scan_bindings)
             .expect("register bindings");
 
@@ -693,7 +841,7 @@ mod tests {
         registry.register(bid_definition());
         let registry = Arc::new(registry);
 
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("instantiate_plan");
         let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -762,7 +910,7 @@ mod tests {
         scan_map.insert(handle_b, 1);
 
         let runtime = ExecutionRuntime::new(ScanRuntime::new(registry.clone()));
-        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map);
+        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
         tick.register_bindings(&vec![
             ("bid".to_string(), handle_a),
             ("person".to_string(), handle_b),
@@ -816,7 +964,7 @@ mod tests {
         let mut scan_map = HashMap::new();
         scan_map.insert(scan_handle, 0);
 
-        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map);
+        let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
         tick.register_bindings(&bindings).expect("register binding");
 
         let events = vec![(
@@ -958,7 +1106,7 @@ mod tests {
         let source_registry = Arc::new(source_registry);
 
         let plan = {
-            let mut plan = DataflowPlan::new();
+            let mut plan = DataflowPlan::new("mv_persist_plan");
             let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
                 source_name: "bid".to_string(),
                 output: OutputPort::new(OperatorId(0), 0),
@@ -1017,6 +1165,93 @@ mod tests {
             .expect("build batches");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn join_state_restores_from_checkpoint() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("join_state_checkpoint", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut registry = SourceRegistry::new();
+        registry.register(bid_definition());
+        registry.register(person_definition());
+        let registry = Arc::new(registry);
+
+        let mut plan = DataflowPlan::new("join_persist");
+        let bid_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let person_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "person".to_string(),
+            output: OutputPort::new(OperatorId(1), 0),
+        }));
+        let projection = (0..6).map(Expr::column).collect();
+        let join = plan.add_operator(OperatorNode::Join(JoinNode {
+            left: OutputPort::new(bid_scan, 0),
+            right: OutputPort::new(person_scan, 0),
+            output: OutputPort::new(OperatorId(2), 0),
+            on: vec![(0, 0)],
+            projection,
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(join, 0),
+            view_name: "mv_join".to_string(),
+        }));
+        plan.set_root(materialize);
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        // First execution: ingest left side only and checkpoint.
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate first tick loop");
+        let left_event = vec![(
+            SourceEvent::new("bid", json!({"auction": 10, "bidder": 77})),
+            1,
+        )];
+        tick.process_events(left_event)
+            .await
+            .expect("process left side");
+        tick.advance_watermark(5).await.expect("watermark left");
+        drop(tick);
+
+        // Restart and ingest right side to complete the join using restored state.
+        let mut restarted = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate restart");
+        let right_event = vec![(
+            SourceEvent::new(
+                "person",
+                json!({"id": 10, "name": "Alice", "city": "Portland", "state": "or"}),
+            ),
+            6,
+        )];
+        restarted
+            .process_events(right_event)
+            .await
+            .expect("process right side");
+        restarted
+            .advance_watermark(10)
+            .await
+            .expect("watermark right");
+
+        let view = mv_registry.get("mv_join").expect("view registered");
+        let snapshot = view.snapshot();
+        assert_eq!(snapshot.len(), 1);
     }
 
     async fn run_nexmark_plan(
@@ -1080,7 +1315,7 @@ mod tests {
     }
 
     fn build_q0_plan() -> DataflowPlan {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("mv_q0");
         let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -1099,7 +1334,7 @@ mod tests {
     }
 
     fn build_q1_plan() -> DataflowPlan {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("mv_q1");
         let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -1122,7 +1357,7 @@ mod tests {
     }
 
     fn build_q2_plan() -> DataflowPlan {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("mv_q2");
         let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(0), 0),
@@ -1149,7 +1384,7 @@ mod tests {
     }
 
     fn build_q3_plan() -> DataflowPlan {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("mv_q3");
         let auction_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "auction".to_string(),
             output: OutputPort::new(OperatorId(0), 0),

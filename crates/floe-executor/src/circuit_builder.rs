@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn errors_on_missing_upstream_output() {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("missing_upstream");
         let map_id = plan.add_operator(OperatorNode::Map(MapNode {
             input: OutputPort::new(OperatorId(42), 0),
             output: OutputPort::new(OperatorId(usize::MAX), 0),

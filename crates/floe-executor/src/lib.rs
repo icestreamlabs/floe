@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod circuit_builder;
 pub mod context;
 pub mod dataflow_plan;
@@ -6,6 +7,7 @@ pub mod encoding;
 pub mod execution_loop;
 pub mod expr_eval;
 pub mod materialized_view;
+pub mod operator_state;
 pub mod operators;
 pub mod query_planner;
 pub mod source_decoder;
@@ -21,6 +23,7 @@ pub use execution_loop::{
     BuiltGraph, IngestedRow, ScanRuntime, TickLoop, build_graph, instantiate_tick_loop,
 };
 pub use materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
+pub use operator_state::{OperatorStateHandle, StateTable};
 pub use operators::{
     FilterOperator, JoinOperator, MapOperator, MaterializeOperator, RowSink, ScanOperator,
 };

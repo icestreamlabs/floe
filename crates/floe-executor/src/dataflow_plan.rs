@@ -85,13 +85,15 @@ pub struct MaterializeNode {
 pub struct DataflowPlan {
     pub operators: Vec<OperatorNode>,
     pub root: OperatorId,
+    pub graph_id: String,
 }
 
 impl DataflowPlan {
-    pub fn new() -> Self {
+    pub fn new(graph_id: impl Into<String>) -> Self {
         Self {
             operators: Vec::new(),
             root: OperatorId(0),
+            graph_id: graph_id.into(),
         }
     }
 
@@ -120,7 +122,7 @@ mod tests {
 
     #[test]
     fn dataflow_plan_tracks_operators_and_root() {
-        let mut plan = DataflowPlan::new();
+        let mut plan = DataflowPlan::new("test_plan");
         let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
             source_name: "bid".to_string(),
             output: OutputPort::new(OperatorId(usize::MAX), 0),

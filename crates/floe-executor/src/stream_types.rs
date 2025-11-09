@@ -1,7 +1,11 @@
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
+
+use crate::operator_state::OperatorStateHandle;
 
 /// Logical timestamp used to order stream events.
 pub type Timestamp = u64;
@@ -59,6 +63,12 @@ pub trait StreamOperator: Send {
     ) -> Result<()>;
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()>;
+
+    fn checkpoint<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;

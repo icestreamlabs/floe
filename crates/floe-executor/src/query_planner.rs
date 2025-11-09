@@ -24,9 +24,10 @@ impl QueryPlanner {
         logical_plan: &LogicalPlan,
         view_name: impl Into<String>,
     ) -> Result<DataflowPlan> {
-        let mut builder = PlanBuilder::new();
+        let view_name = view_name.into();
+        let mut builder = PlanBuilder::new(view_name.clone());
         let planned_stream = builder.plan_node(logical_plan)?;
-        let materialize_id = builder.add_materialize(planned_stream.output, view_name.into());
+        let materialize_id = builder.add_materialize(planned_stream.output, view_name);
         builder.plan.set_root(materialize_id);
         Ok(builder.plan)
     }
@@ -42,9 +43,9 @@ struct PlannedStream {
 }
 
 impl PlanBuilder {
-    fn new() -> Self {
+    fn new(graph_id: impl Into<String>) -> Self {
         Self {
-            plan: DataflowPlan::new(),
+            plan: DataflowPlan::new(graph_id),
         }
     }
 

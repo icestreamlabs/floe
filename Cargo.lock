@@ -1746,6 +1746,7 @@ dependencies = [
  "floe-core",
  "floe-storage",
  "object_store",
+ "serde",
  "serde_json",
  "slatedb",
  "tokio",
