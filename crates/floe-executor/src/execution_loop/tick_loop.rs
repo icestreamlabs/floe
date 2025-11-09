@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
+use datafusion::scalar::ScalarValue;
 use floe_core::source::SourceEvent;
 
 use crate::barrier_clock::{BarrierClock, StepId};
 use crate::checkpoint::{
     CheckpointManager, MaterializedViewCheckpointEntry, OperatorCheckpointEntry,
+    SourceStreamCheckpointEntry,
 };
 use crate::circuit_builder::RowStreamHandle;
 use crate::operators::{DispatchEvent, EventQueue, MaterializeOperator, ScanOperator};
+use crate::outer_stream::{OuterStreamHandle, OuterStreamRegistry};
 use crate::stream_types::{Diff, Row, StreamOperator, Timestamp};
 
 use super::barrier::{BarrierStage, run_barrier_hook};
@@ -21,6 +24,7 @@ pub struct TickLoop {
     pub(crate) queue: EventQueue,
     pub(crate) scan_operators: HashMap<RowStreamHandle, usize>,
     pub(crate) source_watermarks: HashMap<String, Timestamp>,
+    pub(crate) outer_streams: Option<OuterStreamRegistry>,
     pub(crate) checkpoint: Option<CheckpointManager>,
 }
 
@@ -30,6 +34,7 @@ impl TickLoop {
         ops: Vec<Box<dyn StreamOperator>>,
         queue: EventQueue,
         scan_operators: HashMap<RowStreamHandle, usize>,
+        outer_streams: Option<OuterStreamRegistry>,
         checkpoint: Option<CheckpointManager>,
     ) -> Self {
         Self {
@@ -39,6 +44,7 @@ impl TickLoop {
             queue,
             scan_operators,
             source_watermarks: HashMap::new(),
+            outer_streams,
             checkpoint,
         }
     }
@@ -53,6 +59,7 @@ impl TickLoop {
                 .copied()
                 .unwrap_or(0);
             self.source_watermarks.insert(source.clone(), initial);
+            self.record_source_offset(source, initial);
         }
         Ok(())
     }
@@ -63,19 +70,17 @@ impl TickLoop {
     {
         for (event, ts) in events {
             let ingested = self.runtime.process_event(event, ts)?;
+            self.write_outer_stream(&ingested.source, &ingested.row, ingested.diff)?;
             let operator_index = *self
                 .scan_operators
                 .get(&ingested.handle)
                 .ok_or_else(|| anyhow!("no scan operator for handle {:?}", ingested.handle))?;
-            self.ingest_into_scan(
-                operator_index,
-                ingested.row,
-                ingested.diff,
-                ingested.timestamp,
-            )?;
-            self.record_source_offset(&ingested.source, ingested.timestamp);
-            self.advance_source_watermark(&ingested.source, ingested.timestamp)
-                .await?;
+            let source = ingested.source.clone();
+            let diff = ingested.diff;
+            let timestamp = ingested.timestamp;
+            self.ingest_into_scan(operator_index, ingested.row, diff, timestamp)?;
+            self.record_source_offset(&source, timestamp);
+            self.advance_source_watermark(&source, timestamp).await?;
             self.drain_queue()?;
         }
         Ok(())
@@ -130,13 +135,19 @@ impl TickLoop {
     }
 
     async fn seal_step(&mut self, _step_id: StepId, watermark: Timestamp) -> Result<()> {
+        let source_handles = self.flush_outer_streams().await?;
         let operator_states = self.collect_operator_checkpoints().await?;
         run_barrier_hook(BarrierStage::AfterOperatorFlush)?;
         let materialized_views = self.collect_materialized_view_checkpoints().await?;
         run_barrier_hook(BarrierStage::AfterMaterializedViewFlush)?;
         run_barrier_hook(BarrierStage::BeforeManifestWrite)?;
-        self.persist_checkpoint(watermark, operator_states, materialized_views)
-            .await?;
+        self.persist_checkpoint(
+            watermark,
+            operator_states,
+            materialized_views,
+            source_handles,
+        )
+        .await?;
         run_barrier_hook(BarrierStage::AfterManifestWrite)?;
         Ok(())
     }
@@ -204,10 +215,12 @@ impl TickLoop {
         watermark: Timestamp,
         operator_states: Vec<OperatorCheckpointEntry>,
         materialized_views: Vec<MaterializedViewCheckpointEntry>,
+        source_handles: Vec<OuterStreamHandle>,
     ) -> Result<()> {
         if let Some(manager) = self.checkpoint.as_mut() {
+            let coupled = couple_handles_with_offsets(source_handles, manager.latest_offsets());
             manager
-                .persist(watermark, operator_states, materialized_views)
+                .persist(watermark, operator_states, materialized_views, coupled)
                 .await?;
         }
         Ok(())
@@ -218,4 +231,42 @@ impl TickLoop {
             manager.update_offset(source, offset);
         }
     }
+
+    fn write_outer_stream(&mut self, source: &str, row: &[ScalarValue], diff: Diff) -> Result<()> {
+        if let Some(registry) = self.outer_streams.as_mut() {
+            if let Some(writer) = registry.writer_mut(source) {
+                writer.append(row, diff)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_outer_streams(&mut self) -> Result<Vec<OuterStreamHandle>> {
+        if let Some(registry) = self.outer_streams.as_mut() {
+            registry.flush_all().await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn couple_handles_with_offsets(
+    handles: Vec<OuterStreamHandle>,
+    offsets: &HashMap<String, u64>,
+) -> Vec<SourceStreamCheckpointEntry> {
+    handles
+        .into_iter()
+        .filter_map(|handle| {
+            offsets
+                .get(&handle.source)
+                .copied()
+                .map(|offset| SourceStreamCheckpointEntry {
+                    source: handle.source,
+                    namespace: handle.namespace,
+                    version: handle.version,
+                    partition: 0,
+                    offset,
+                })
+        })
+        .collect()
 }

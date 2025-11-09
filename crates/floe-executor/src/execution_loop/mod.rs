@@ -10,6 +10,7 @@ use crate::dataflow_plan::DataflowPlan;
 use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::operators::EventQueue;
+use crate::outer_stream::OuterStreamRegistry;
 
 mod barrier;
 mod graph_builder;
@@ -78,11 +79,30 @@ pub async fn instantiate_tick_loop(
     };
 
     let runtime = ExecutionRuntime::new(ScanRuntime::new(sources));
+    let outer_streams = if let Some(bridge_ref) = bridge.as_mut() {
+        if !built.scan_bindings.is_empty() {
+            let sources: Vec<String> = built
+                .scan_bindings
+                .iter()
+                .map(|(src, _)| src.clone())
+                .collect();
+            Some(
+                OuterStreamRegistry::from_sources(sources, bridge_ref)
+                    .await
+                    .context("initialize outer stream registry")?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut tick = TickLoop::with_graph(
         runtime,
         built.ops,
         queue,
         built.scan_operator_map,
+        outer_streams,
         checkpoint,
     );
     if let Some(manager) = tick.checkpoint.as_ref() {

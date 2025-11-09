@@ -1,6 +1,7 @@
 pub mod barrier_clock;
 pub mod checkpoint;
 pub mod circuit_builder;
+pub mod codec;
 pub mod context;
 pub mod dataflow_plan;
 pub mod dbsp_bridge;
@@ -11,6 +12,7 @@ pub mod materialized_view;
 pub mod namespaces;
 pub mod operator_state;
 pub mod operators;
+pub mod outer_stream;
 pub mod query_planner;
 pub mod source_decoder;
 pub mod stream_types;

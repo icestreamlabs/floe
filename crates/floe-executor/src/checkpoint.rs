@@ -32,6 +32,15 @@ pub struct SourceOffset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceStreamCheckpointEntry {
+    pub source: String,
+    pub namespace: String,
+    pub version: u64,
+    pub partition: u32,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointManifest {
     pub id: u64,
     pub watermark: Timestamp,
@@ -41,6 +50,8 @@ pub struct CheckpointManifest {
     pub materialized_views: Vec<MaterializedViewCheckpointEntry>,
     #[serde(default)]
     pub source_offsets: Vec<SourceOffset>,
+    #[serde(default)]
+    pub outer_streams: Vec<SourceStreamCheckpointEntry>,
 }
 
 pub struct CheckpointStore {
@@ -181,6 +192,7 @@ impl CheckpointManager {
         watermark: Timestamp,
         operator_states: Vec<OperatorCheckpointEntry>,
         materialized_views: Vec<MaterializedViewCheckpointEntry>,
+        outer_streams: Vec<SourceStreamCheckpointEntry>,
     ) -> Result<()> {
         let source_offsets = self
             .offsets
@@ -198,6 +210,7 @@ impl CheckpointManager {
             operator_states,
             materialized_views,
             source_offsets,
+            outer_streams,
         };
         self.store.persist(&manifest).await?;
         self.next_id = self.next_id.saturating_add(1);

@@ -170,6 +170,10 @@ where
         self.handle_view(&self.current_handle)
     }
 
+    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
+        self.stream.clone()
+    }
+
     pub fn namespace(&self) -> &str {
         self.versioned.namespace()
     }

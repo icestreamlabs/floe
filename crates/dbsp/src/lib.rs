@@ -2,6 +2,7 @@ pub mod algebra;
 pub mod circuit;
 pub mod collections;
 pub mod handles;
+pub mod join;
 pub mod stream;
 
 pub mod storage;
@@ -18,6 +19,7 @@ pub use circuit::{
 };
 pub use collections::{ZSet, h};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
+pub use join::DbspJoin;
 pub use stream::{
     Stream, StreamRetention, ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate,
     incrementalize2, integrate, lift1, lift2, lifted_delay, lifted_differentiate,

@@ -8,14 +8,15 @@ use slatedb::Db;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use super::{BarrierStage, barrier_failpoints, *};
+use super::barrier::{BarrierStage, barrier_failpoints};
+use super::*;
 use crate::checkpoint::CheckpointStore;
 use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceRegistry};
 use crate::dataflow_plan::{
     DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
 };
 use crate::dbsp_bridge::DbspBridge;
-use crate::encoding::encode_projected_row_key;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::operators::test_support::TestSink;
 use crate::operators::{DispatchSink, EventQueue, ScanOperator};
@@ -72,7 +73,7 @@ async fn runtime_processes_events_via_scan_operator() {
     let mut scan_map = HashMap::new();
     scan_map.insert(scan_handle, 0);
 
-    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
+    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None, None);
     tick.register_bindings(&bindings).expect("register binding");
 
     let events = vec![(
@@ -172,6 +173,7 @@ async fn tick_loop_advances_watermark() {
         queue.clone(),
         scan_map,
         None,
+        None,
     );
     tick_loop.register_bindings(&bindings).expect("register");
 
@@ -236,6 +238,7 @@ async fn build_graph_routes_rows_through_runtime() {
         built.ops,
         queue.clone(),
         built.scan_operator_map,
+        None,
         None,
     );
     tick.register_bindings(&built.scan_bindings)
@@ -330,7 +333,7 @@ async fn tracks_source_watermarks_and_frontier() {
     scan_map.insert(handle_b, 1);
 
     let runtime = ExecutionRuntime::new(ScanRuntime::new(registry.clone()));
-    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
+    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None, None);
     tick.register_bindings(&vec![
         ("bid".to_string(), handle_a),
         ("person".to_string(), handle_b),
@@ -384,7 +387,7 @@ async fn derives_timestamp_from_source_payload() {
     let mut scan_map = HashMap::new();
     scan_map.insert(scan_handle, 0);
 
-    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None);
+    let mut tick = TickLoop::with_graph(runtime, ops, queue.clone(), scan_map, None, None);
     tick.register_bindings(&bindings).expect("register binding");
 
     let events = vec![(
@@ -929,7 +932,6 @@ async fn materialized_view_failpoint_discards_pending_flush() {
                 .contains("barrier failpoint triggered at AfterMaterializedViewFlush")
         );
     }
-
     drop(tick);
 
     let latest_version = {
@@ -969,6 +971,116 @@ async fn materialized_view_failpoint_discards_pending_flush() {
         .expect("materialize batches");
     let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(total_rows, 1);
+}
+
+#[tokio::test]
+async fn checkpoint_records_outer_stream_handles_with_offsets() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("outer_stream_handles", store)
+            .await
+            .expect("open SlateDB"),
+    );
+
+    let mut registry = SourceRegistry::new();
+    registry.register(bid_full_definition());
+    let registry = Arc::new(registry);
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let plan = build_simple_materialize_plan("outer_stream_graph", "mv_outer_stream");
+    let mut tick = instantiate_tick_loop(
+        &plan,
+        Arc::clone(&registry),
+        Arc::clone(&mv_registry),
+        Some(db.clone()),
+    )
+    .await
+    .expect("instantiate tick loop");
+
+    tick.process_events(vec![(
+        SourceEvent::new(
+            "bid",
+            json!({"auction": 1, "bidder": 2, "price": 3, "date_time": 4, "extra": 5}),
+        ),
+        1,
+    )])
+    .await
+    .expect("process event");
+    tick.advance_watermark(10).await.expect("seal checkpoint");
+
+    let manifest = tick
+        .checkpoint
+        .as_ref()
+        .expect("checkpoint manager")
+        .store()
+        .load_latest()
+        .await
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.outer_streams.len(), 1);
+    let entry = &manifest.outer_streams[0];
+    assert_eq!(entry.source, "bid");
+    assert_eq!(entry.namespace, "src/bid");
+    assert_eq!(entry.partition, 0);
+    assert_eq!(entry.offset, 1);
+    assert!(entry.version >= 1);
+}
+
+#[tokio::test]
+async fn source_replay_materializes_outer_stream_rows() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("outer_stream_replay", store)
+            .await
+            .expect("open SlateDB"),
+    );
+
+    let mut registry = SourceRegistry::new();
+    registry.register(bid_full_definition());
+    let registry = Arc::new(registry);
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let plan = build_simple_materialize_plan("outer_stream_replay_graph", "mv_outer_replay");
+    let mut tick = instantiate_tick_loop(
+        &plan,
+        Arc::clone(&registry),
+        Arc::clone(&mv_registry),
+        Some(db.clone()),
+    )
+    .await
+    .expect("instantiate tick loop");
+
+    let row = SourceEvent::new(
+        "bid",
+        json!({"auction": 9, "bidder": 10, "price": 11, "date_time": 12, "extra": 13}),
+    );
+    tick.process_events(vec![(row, 4)])
+        .await
+        .expect("process bid");
+    tick.advance_watermark(20).await.expect("checkpoint");
+
+    let manifest = tick
+        .checkpoint
+        .as_ref()
+        .expect("checkpoint manager")
+        .store()
+        .load_latest()
+        .await
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.outer_streams.len(), 1);
+    let entry = &manifest.outer_streams[0];
+
+    let mut bridge = DbspBridge::new(db.clone()).await.expect("bridge");
+    let view = bridge
+        .handle_view_for(&entry.namespace, entry.version)
+        .await
+        .expect("open outer stream handle");
+    let materialized = view.materialize().await.expect("materialize outer stream");
+    assert_eq!(materialized.len(), 1);
+    let (key, diff) = materialized.iter().next().expect("entry");
+    assert_eq!(*diff, 1);
+    let decoded = decode_projected_row_key(key).expect("decode row");
+    assert_eq!(decoded[0], ScalarValue::Int64(Some(9)));
+    assert_eq!(decoded[1], ScalarValue::Int64(Some(10)));
 }
 
 #[tokio::test(flavor = "current_thread")]
