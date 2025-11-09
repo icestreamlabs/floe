@@ -18,13 +18,11 @@ use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
-use sqlparser::ast::{CreateTable, Insert, Query, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 use tokio::signal;
-
-use crate::sql;
 
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
@@ -101,13 +99,10 @@ impl FloeServerState {
     }
 
     async fn ensure_materialized_view_registered(&self, name: &str) -> PgWireResult<()> {
-        if self.materialized_views.get(name).is_none() {
-            return Ok(());
-        }
-        let schema = match self.materialized_views.schema(name) {
-            Some(schema) => schema,
-            None => return Ok(()),
-        };
+        let schema = self
+            .materialized_views
+            .schema(name)
+            .ok_or_else(|| user_error(format!("materialized view '{name}' is not registered")))?;
 
         let session = self.query.session();
         if session.table(name).await.is_ok() {
@@ -161,52 +156,39 @@ impl FloeQueryHandler {
         Self { state }
     }
 
-    async fn handle_create_table(&self, create: &CreateTable) -> PgWireResult<Response> {
-        let definition = sql::build_table_definition(create)
-            .map_err(|err| user_error(format!("invalid CREATE TABLE: {err}")))?;
-        self.state
-            .query
-            .register_table(definition)
-            .await
-            .map_err(|err| user_error(err.to_string()))?;
-        Ok(Response::Execution(Tag::new("CREATE TABLE")))
-    }
-
-    async fn handle_insert(&self, insert: &Insert) -> PgWireResult<Response> {
-        let table_name = sql::table_name_from_object(&insert.table)
-            .map_err(|err| user_error(err.to_string()))?;
-        let definition = self
-            .state
-            .query
-            .storage()
-            .table(&table_name)
-            .await
-            .map_err(|err| user_error(err.to_string()))?
-            .ok_or_else(|| user_error(format!("unknown table {table_name}")))?;
-
-        let rows = sql::extract_insert_rows(&definition, insert)
-            .map_err(|err| user_error(format!("invalid INSERT: {err}")))?;
-        for row in &rows {
-            self.state
-                .query
-                .storage()
-                .insert_row(&definition, row)
-                .await
-                .map_err(|err| user_error(err.to_string()))?;
-        }
-
-        Ok(Response::Execution(
-            Tag::new("INSERT").with_rows(rows.len()),
-        ))
-    }
-
     async fn handle_select(&self, query: &Query) -> PgWireResult<Response> {
-        let _views = Arc::clone(&self.state.materialized_views);
+        self.ensure_materialized_views_in_query(query).await?;
         self.execute_sql(&query.to_string()).await
     }
 
+    async fn execute_statement(&self, statement: Statement) -> PgWireResult<Response> {
+        match statement {
+            Statement::CreateTable(_) => Err(user_error(
+                "CREATE TABLE is not supported via the Floe pgwire endpoint",
+            )),
+            Statement::Insert(_) => Err(user_error(
+                "INSERT is not supported; materialized views are read-only",
+            )),
+            Statement::Query(query) => self.handle_select(&query).await,
+            other => Err(user_error(format!(
+                "unsupported statement: {}",
+                other.to_string()
+            ))),
+        }
+    }
+
+    async fn ensure_materialized_views_in_query(&self, query: &Query) -> PgWireResult<()> {
+        let mut names = Vec::new();
+        extract_tables_from_query(query, &mut names);
+        for table in names {
+            self.state
+                .ensure_materialized_view_registered(&table)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn execute_sql(&self, sql: &str) -> PgWireResult<Response> {
-        self.ensure_materialized_views_in_sql(sql).await?;
         let df = self
             .state
             .query
@@ -220,20 +202,6 @@ impl FloeQueryHandler {
             .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
         let response = build_query_response(batches)?;
         Ok(Response::Query(response))
-    }
-
-    async fn ensure_materialized_views_in_sql(&self, sql: &str) -> PgWireResult<()> {
-        let dialect = PostgreSqlDialect {};
-        if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
-            for statement in statements {
-                for table in extract_tables_from_statement(&statement) {
-                    self.state
-                        .ensure_materialized_view_registered(&table)
-                        .await?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -265,23 +233,7 @@ impl SimpleQueryHandler for FloeQueryHandler {
 
         let mut responses = Vec::with_capacity(statements.len());
         for statement in statements {
-            match statement {
-                Statement::CreateTable(create) => {
-                    responses.push(self.handle_create_table(&create).await?);
-                }
-                Statement::Insert(insert) => {
-                    responses.push(self.handle_insert(&insert).await?);
-                }
-                Statement::Query(query) => {
-                    responses.push(self.handle_select(&query).await?);
-                }
-                other => {
-                    return Err(user_error(format!(
-                        "unsupported statement: {}",
-                        other.to_string()
-                    )));
-                }
-            }
+            responses.push(self.execute_statement(statement).await?);
         }
 
         if responses.is_empty() {
@@ -354,15 +306,6 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     Ok(QueryResponse::new(info, row_stream))
 }
 
-fn extract_tables_from_statement(statement: &Statement) -> Vec<String> {
-    let mut names = Vec::new();
-    match statement {
-        Statement::Query(query) => extract_tables_from_query(query, &mut names),
-        _ => {}
-    }
-    names
-}
-
 fn extract_tables_from_query(query: &Query, names: &mut Vec<String>) {
     extract_tables_from_setexpr(&query.body, names);
     if let Some(with) = &query.with {
@@ -390,10 +333,21 @@ fn extract_tables_from_setexpr(expr: &SetExpr, names: &mut Vec<String>) {
 
 fn extract_tables_from_table_factor(factor: &TableFactor, names: &mut Vec<String>) {
     match factor {
-        TableFactor::Table { name, .. } => names.push(name.to_string()),
+        TableFactor::Table { name, .. } => {
+            if let Some(table) = normalize_object_name(name) {
+                names.push(table);
+            }
+        }
         TableFactor::Derived { subquery, .. } => extract_tables_from_query(subquery, names),
         _ => {}
     }
+}
+
+fn normalize_object_name(name: &ObjectName) -> Option<String> {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|Ident { value, .. }| value.clone())
 }
 
 #[cfg(test)]
@@ -401,6 +355,8 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use floe_executor::MaterializedViewRegistry;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
 
     #[tokio::test]
     async fn registers_materialized_view_on_select() {
@@ -416,13 +372,88 @@ mod tests {
         let state = Arc::new(FloeServerState::new(query.clone(), Arc::clone(&registry)));
         let handler = FloeQueryHandler::new(state);
 
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT * FROM mv_test").expect("parse");
+        let Statement::Query(query_stmt) = &statements[0] else {
+            panic!("expected query");
+        };
         handler
-            .ensure_materialized_views_in_sql("SELECT * FROM mv_test")
+            .ensure_materialized_views_in_query(query_stmt)
             .await
             .expect("ensure mv");
 
         assert!(query.session().table("mv_test").await.is_ok());
     }
+
+    #[tokio::test]
+    async fn rejects_unknown_table_in_select() {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let state = Arc::new(FloeServerState::new(query, Arc::clone(&registry)));
+        let handler = FloeQueryHandler::new(state);
+
+        let dialect = PostgreSqlDialect {};
+        let statements =
+            Parser::parse_sql(&dialect, "SELECT * FROM missing_mv").expect("parse statement");
+        let Statement::Query(query_stmt) = &statements[0] else {
+            panic!("expected query");
+        };
+        let err = handler
+            .ensure_materialized_views_in_query(query_stmt)
+            .await
+            .expect_err("expected error");
+        assert!(
+            err.to_string()
+                .contains("materialized view 'missing_mv' is not registered")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_create_table_over_pgwire() {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let state = Arc::new(FloeServerState::new(query, registry));
+        let handler = FloeQueryHandler::new(state);
+
+        let dialect = PostgreSqlDialect {};
+        let mut statements = Parser::parse_sql(&dialect, "CREATE TABLE t (id INT)").expect("parse");
+        let statement = statements.pop().expect("statement");
+        let err = match handler.execute_statement(statement).await {
+            Ok(_) => panic!("expected CREATE TABLE to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("CREATE TABLE is not supported via the Floe pgwire endpoint")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_insert_over_pgwire() {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let state = Arc::new(FloeServerState::new(query, registry));
+        let handler = FloeQueryHandler::new(state);
+
+        let dialect = PostgreSqlDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, "INSERT INTO t VALUES (1)").expect("parse");
+        let statement = statements.pop().expect("statement");
+        let err = match handler.execute_statement(statement).await {
+            Ok(_) => panic!("expected INSERT to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("INSERT is not supported; materialized views are read-only")
+        );
+    }
+
+    // No client calls are required in tests as routing is validated directly
+    // against parsed statements.
 }
 
 fn user_error(message: impl Into<String>) -> PgWireError {

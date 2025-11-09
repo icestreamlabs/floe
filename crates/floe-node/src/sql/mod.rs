@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Result, anyhow};
 use floe_core::catalog::{ColumnDefinition, TableDefinition};
 use sqlparser::ast::{
