@@ -18,6 +18,13 @@ pub struct OperatorCheckpointEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedViewCheckpointEntry {
+    pub view: String,
+    pub namespace: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceOffset {
     pub source: String,
     pub partition: u32,
@@ -28,7 +35,11 @@ pub struct SourceOffset {
 pub struct CheckpointManifest {
     pub id: u64,
     pub watermark: Timestamp,
+    #[serde(default)]
     pub operator_states: Vec<OperatorCheckpointEntry>,
+    #[serde(default)]
+    pub materialized_views: Vec<MaterializedViewCheckpointEntry>,
+    #[serde(default)]
     pub source_offsets: Vec<SourceOffset>,
 }
 
@@ -169,6 +180,7 @@ impl CheckpointManager {
         &mut self,
         watermark: Timestamp,
         operator_states: Vec<OperatorCheckpointEntry>,
+        materialized_views: Vec<MaterializedViewCheckpointEntry>,
     ) -> Result<()> {
         let source_offsets = self
             .offsets
@@ -184,6 +196,7 @@ impl CheckpointManager {
             id: self.next_id,
             watermark,
             operator_states,
+            materialized_views,
             source_offsets,
         };
         self.store.persist(&manifest).await?;

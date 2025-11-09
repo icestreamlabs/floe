@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::checkpoint::MaterializedViewCheckpointEntry;
 use crate::dbsp_bridge::DbspView;
 use crate::encoding::encode_projected_row_key;
 use crate::materialized_view::{
@@ -26,10 +27,12 @@ impl MaterializeOperator {
         registry: Arc<MaterializedViewRegistry>,
         sink: impl RowSink,
         dbsp: Option<DbspView>,
+        checkpoint: Option<DbspPersistedState>,
     ) -> Self {
         let view = registry.register(view_name.into());
-        let dbsp = dbsp;
-        if let Some(ref dbsp_view) = dbsp {
+        if let Some(state) = checkpoint {
+            view.set_dbsp_state(state);
+        } else if let Some(ref dbsp_view) = dbsp {
             let latest = dbsp_view.latest_handle_view();
             let (dict, table, namespace, version) = latest.into_parts();
             view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
@@ -64,6 +67,22 @@ impl MaterializeOperator {
             self.pending_flush = false;
         }
         Ok(())
+    }
+
+    pub async fn checkpoint_state(&mut self) -> Result<Option<MaterializedViewCheckpointEntry>> {
+        self.flush_dbsp_if_needed().await?;
+        if self.dbsp.is_none() {
+            return Ok(None);
+        }
+        if let Some(state) = self.view.dbsp_state() {
+            Ok(Some(MaterializedViewCheckpointEntry {
+                view: self.view.name().to_string(),
+                namespace: state.namespace().to_string(),
+                version: state.version(),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -137,6 +156,7 @@ mod tests {
             "mv_q0",
             registry.clone(),
             sink,
+            None,
             None,
         );
 

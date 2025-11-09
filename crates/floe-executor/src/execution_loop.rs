@@ -7,17 +7,91 @@ use floe_core::source::SourceEvent;
 use slatedb::Db;
 
 use crate::checkpoint::{
-    CheckpointManager, CheckpointManifest, CheckpointStore, OperatorCheckpointEntry,
+    CheckpointManager, CheckpointManifest, CheckpointStore, MaterializedViewCheckpointEntry,
+    OperatorCheckpointEntry,
 };
 use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceRegistry};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operators::{
     DispatchEvent, DispatchSink, EventQueue, FilterOperator, JoinOperator, MapOperator,
     MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{Diff, InputPort, OperatorId, Row, StreamOperator, Timestamp};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierStage {
+    AfterOperatorFlush,
+    AfterMaterializedViewFlush,
+    BeforeManifestWrite,
+    AfterManifestWrite,
+}
+
+fn run_barrier_hook(stage: BarrierStage) -> Result<()> {
+    #[cfg(test)]
+    {
+        barrier_failpoints::maybe_trigger(stage)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = stage;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod barrier_failpoints {
+    use super::BarrierStage;
+    use anyhow::{Result, bail};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::ThreadId;
+
+    static FAILPOINTS: OnceLock<Mutex<HashMap<ThreadId, BarrierStage>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<ThreadId, BarrierStage>> {
+        FAILPOINTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub struct FailpointGuard {
+        thread: ThreadId,
+    }
+
+    impl FailpointGuard {
+        pub fn new(stage: BarrierStage) -> Self {
+            let thread = std::thread::current().id();
+            let mut guard = registry().lock().expect("failpoint registry lock");
+            guard.insert(thread, stage);
+            Self { thread }
+        }
+    }
+
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = registry().lock() {
+                guard.remove(&self.thread);
+            }
+        }
+    }
+
+    pub fn install_failpoint(stage: BarrierStage) -> FailpointGuard {
+        FailpointGuard::new(stage)
+    }
+
+    pub fn maybe_trigger(stage: BarrierStage) -> Result<()> {
+        let thread = std::thread::current().id();
+        if let Ok(mut guard) = registry().lock() {
+            if let Some(current) = guard.get(&thread).copied() {
+                if current == stage {
+                    guard.remove(&thread);
+                    bail!("barrier failpoint triggered at {:?}", stage);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Represents a decoded row ready to be inserted into a scan operator stream.
 #[derive(Debug, Clone)]
@@ -223,8 +297,14 @@ impl TickLoop {
             operator.on_watermark(watermark)?;
         }
         let operator_states = self.collect_operator_checkpoints().await?;
-        self.flush_dbsp_views().await?;
-        self.persist_checkpoint(watermark, operator_states).await
+        run_barrier_hook(BarrierStage::AfterOperatorFlush)?;
+        let materialized_views = self.collect_materialized_view_checkpoints().await?;
+        run_barrier_hook(BarrierStage::AfterMaterializedViewFlush)?;
+        run_barrier_hook(BarrierStage::BeforeManifestWrite)?;
+        self.persist_checkpoint(watermark, operator_states, materialized_views)
+            .await?;
+        run_barrier_hook(BarrierStage::AfterManifestWrite)?;
+        Ok(())
     }
 
     pub fn current_watermark(&self) -> Timestamp {
@@ -256,13 +336,18 @@ impl TickLoop {
             .unwrap_or(self.current_watermark)
     }
 
-    async fn flush_dbsp_views(&mut self) -> Result<()> {
+    async fn collect_materialized_view_checkpoints(
+        &mut self,
+    ) -> Result<Vec<MaterializedViewCheckpointEntry>> {
+        let mut entries = Vec::new();
         for operator in self.ops.iter_mut() {
             if let Some(materialize) = operator.as_any_mut().downcast_mut::<MaterializeOperator>() {
-                materialize.flush_dbsp_if_needed().await?;
+                if let Some(entry) = materialize.checkpoint_state().await? {
+                    entries.push(entry);
+                }
             }
         }
-        Ok(())
+        Ok(entries)
     }
 
     async fn collect_operator_checkpoints(&mut self) -> Result<Vec<OperatorCheckpointEntry>> {
@@ -284,9 +369,12 @@ impl TickLoop {
         &mut self,
         watermark: Timestamp,
         operator_states: Vec<OperatorCheckpointEntry>,
+        materialized_views: Vec<MaterializedViewCheckpointEntry>,
     ) -> Result<()> {
         if let Some(manager) = self.checkpoint.as_mut() {
-            manager.persist(watermark, operator_states).await?;
+            manager
+                .persist(watermark, operator_states, materialized_views)
+                .await?;
         }
         Ok(())
     }
@@ -388,6 +476,17 @@ pub async fn build_graph(
         }
     }
 
+    let view_checkpoint_map: HashMap<String, MaterializedViewCheckpointEntry> = checkpoint_manifest
+        .map(|manifest| {
+            manifest
+                .materialized_views
+                .iter()
+                .cloned()
+                .map(|entry| (entry.view.clone(), entry))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut built_ops: Vec<Box<dyn StreamOperator>> = Vec::with_capacity(plan.operators.len());
     for (idx, node) in plan.operators.iter().enumerate() {
         let op_id = OperatorId(idx);
@@ -484,6 +583,20 @@ pub async fn build_graph(
                 )
             }
             OperatorNode::Materialize(materialize) => {
+                let checkpoint_entry = view_checkpoint_map.get(&materialize.view_name).cloned();
+                let checkpoint_state = if let Some(entry) = checkpoint_entry {
+                    let bridge_ref = bridge
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("checkpoint manifest present without DB bridge"))?;
+                    let handle = bridge_ref
+                        .handle_view_for(&entry.namespace, entry.version)
+                        .await
+                        .context("open materialized view checkpoint handle")?;
+                    let (dict, table, namespace, version) = handle.into_parts();
+                    Some(DbspPersistedState::new(dict, table, namespace, version))
+                } else {
+                    None
+                };
                 let dbsp_view = if let Some(bridge_ref) = bridge.as_mut() {
                     Some(
                         (*bridge_ref)
@@ -500,6 +613,7 @@ pub async fn build_graph(
                     mv_registry.clone(),
                     NullSink::default(),
                     dbsp_view,
+                    checkpoint_state,
                 ))
             }
         };
@@ -586,6 +700,7 @@ pub async fn instantiate_tick_loop(
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
+    use dbsp::handles::ZSetHandleView;
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
     use object_store::{ObjectStore, memory::InMemory};
     use serde_json::json;
@@ -593,11 +708,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use super::*;
+    use super::{BarrierStage, barrier_failpoints, *};
+    use crate::checkpoint::CheckpointStore;
     use crate::circuit_builder::{Circuit, CircuitContext};
     use crate::dataflow_plan::{
         DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
     };
+    use crate::encoding::encode_projected_row_key;
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::operators::test_support::TestSink;
     use crate::table_provider::MaterializedViewTableProvider;
@@ -1168,6 +1285,577 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_manifest_restores_materialized_view_version() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("mv_manifest_restore", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+
+        let plan = {
+            let mut plan = DataflowPlan::new("mv_manifest_plan");
+            let scan_id = plan.add_operator(OperatorNode::Scan(ScanNode {
+                source_name: "bid".to_string(),
+                output: OutputPort::new(OperatorId(0), 0),
+            }));
+            let map_id = plan.add_operator(OperatorNode::Map(MapNode {
+                input: OutputPort::new(scan_id, 0),
+                output: OutputPort::new(OperatorId(1), 0),
+                expressions: vec![Expr::column(0), Expr::column(1)],
+            }));
+            let mat_id = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+                input: OutputPort::new(map_id, 0),
+                view_name: "mv_exec".to_string(),
+            }));
+            plan.set_root(mat_id);
+            plan
+        };
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        let row = vec![ScalarValue::Int64(Some(7)), ScalarValue::Int64(Some(9))];
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 7, "bidder": 9})),
+            0,
+        )])
+        .await
+        .expect("process events");
+        tick.advance_watermark(5).await.expect("watermark");
+        let original_key = encode_projected_row_key(&row).expect("encode original row");
+
+        let manifest_bridge = DbspBridge::new(db.clone()).await.expect("manifest bridge");
+        let checkpoint_store = CheckpointStore::new(manifest_bridge.table(), plan.graph_id.clone());
+        let manifest = checkpoint_store
+            .load_latest()
+            .await
+            .expect("load checkpoint")
+            .expect("manifest exists");
+        assert_eq!(manifest.materialized_views.len(), 1);
+        let view_entry = manifest.materialized_views[0].clone();
+
+        drop(tick);
+
+        let extra_row = vec![ScalarValue::Int64(Some(999)), ScalarValue::Int64(Some(111))];
+        let extra_key = encode_projected_row_key(&extra_row).expect("encode extra row");
+        let mut stray_bridge = DbspBridge::new(db.clone()).await.expect("stray bridge");
+        let mut stray_view = stray_bridge.new_view("mv_exec").await.expect("new view");
+        stray_view.add_delta(extra_key.clone(), 1);
+        stray_view.flush().await.expect("flush stray version");
+
+        let mv_registry_restart = Arc::new(MaterializedViewRegistry::new());
+        let tick_restart = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate restart");
+
+        let view_restart = mv_registry_restart.get("mv_exec").expect("view registered");
+        let dbsp_state = view_restart.dbsp_state().expect("dbsp state");
+        assert_eq!(dbsp_state.version(), view_entry.version);
+
+        let handle_view = ZSetHandleView::new(
+            dbsp_state.dictionary(),
+            dbsp_state.table(),
+            dbsp_state.namespace().to_string(),
+            dbsp_state.version(),
+        );
+        let snapshot = handle_view
+            .materialize()
+            .await
+            .expect("materialize snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.get(&original_key), Some(&1));
+        assert!(!snapshot.contains_key(&extra_key));
+
+        drop(tick_restart);
+    }
+
+    #[tokio::test]
+    async fn mid_tick_crash_discards_uncheckpointed_data() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("mid_tick_crash", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+        let plan = build_simple_materialize_plan("mid_tick_graph", "mv_mid_tick");
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 1, "bidder": 2})),
+            0,
+        )])
+        .await
+        .expect("process events");
+
+        drop(tick);
+
+        let mv_restart = Arc::new(MaterializedViewRegistry::new());
+        let _ = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("restart tick loop");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+        ]));
+        let provider =
+            MaterializedViewTableProvider::new(Arc::clone(&mv_restart), "mv_mid_tick", schema);
+        let batches = provider
+            .build_batches_for_test()
+            .await
+            .expect("materialize batches");
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0);
+
+        let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+        let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+        assert!(
+            checkpoint_store
+                .load_latest()
+                .await
+                .expect("load checkpoint")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_checkpoint_failpoint_discards_pending_state() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("operator_checkpoint_failpoint", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        source_registry.register(person_definition());
+        let source_registry = Arc::new(source_registry);
+        let plan = build_join_plan("join_failpoint_graph", "mv_join_failpoint");
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 10, "bidder": 1})),
+            0,
+        )])
+        .await
+        .expect("baseline left");
+        tick.advance_watermark(5)
+            .await
+            .expect("baseline checkpoint");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 20, "bidder": 2})),
+            0,
+        )])
+        .await
+        .expect("pending left");
+
+        {
+            let _guard = barrier_failpoints::install_failpoint(BarrierStage::AfterOperatorFlush);
+            let err = tick
+                .advance_watermark(10)
+                .await
+                .expect_err("failpoint error");
+            assert!(
+                err.to_string()
+                    .contains("barrier failpoint triggered at AfterOperatorFlush")
+            );
+        }
+
+        drop(tick);
+
+        let mv_restart = Arc::new(MaterializedViewRegistry::new());
+        let mut restarted = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("restart tick");
+
+        let right_events = vec![
+            (
+                SourceEvent::new(
+                    "person",
+                    json!({"id": 10, "name": "Alice", "city": "Portland", "state": "or"}),
+                ),
+                0,
+            ),
+            (
+                SourceEvent::new(
+                    "person",
+                    json!({"id": 20, "name": "Bob", "city": "Seattle", "state": "wa"}),
+                ),
+                0,
+            ),
+        ];
+        restarted
+            .process_events(right_events)
+            .await
+            .expect("ingest right side");
+        restarted
+            .advance_watermark(30)
+            .await
+            .expect("post-restart watermark");
+
+        let view = mv_restart
+            .get("mv_join_failpoint")
+            .expect("view registered");
+        let snapshot = view.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        let row = snapshot.keys().next().expect("row present");
+        assert_eq!(row[0], ScalarValue::Int64(Some(10)));
+        assert!(
+            snapshot
+                .keys()
+                .all(|r| r[0] != ScalarValue::Int64(Some(20))),
+            "uncommitted state should not be restored"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn materialized_view_failpoint_discards_pending_flush() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("mv_failpoint_flush", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+        let plan = build_simple_materialize_plan("mv_flush_graph", "mv_flush_failpoint");
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 7, "bidder": 9})),
+            1,
+        )])
+        .await
+        .expect("baseline event");
+        tick.advance_watermark(5)
+            .await
+            .expect("baseline checkpoint");
+
+        let baseline_version = {
+            let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+            let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+            checkpoint_store
+                .load_latest()
+                .await
+                .expect("load baseline manifest")
+                .expect("manifest present")
+                .materialized_views
+                .get(0)
+                .map(|entry| entry.version)
+                .expect("view entry")
+        };
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 8, "bidder": 10})),
+            0,
+        )])
+        .await
+        .expect("pending row");
+
+        {
+            let _guard =
+                barrier_failpoints::install_failpoint(BarrierStage::AfterMaterializedViewFlush);
+            let err = tick
+                .advance_watermark(10)
+                .await
+                .expect_err("failpoint error");
+            assert!(
+                err.to_string()
+                    .contains("barrier failpoint triggered at AfterMaterializedViewFlush")
+            );
+        }
+
+        drop(tick);
+
+        let latest_version = {
+            let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+            let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+            checkpoint_store
+                .load_latest()
+                .await
+                .expect("load manifest")
+                .expect("manifest present")
+                .materialized_views
+                .get(0)
+                .map(|entry| entry.version)
+                .expect("view entry")
+        };
+        assert_eq!(latest_version, baseline_version);
+
+        let mv_restart = Arc::new(MaterializedViewRegistry::new());
+        let _ = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("restart tick");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+        ]));
+        let provider = MaterializedViewTableProvider::new(
+            Arc::clone(&mv_restart),
+            "mv_flush_failpoint",
+            schema,
+        );
+        let batches = provider
+            .build_batches_for_test()
+            .await
+            .expect("materialize batches");
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offsets_failpoint_preserves_previous_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("offset_failpoint", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+        let plan = build_simple_materialize_plan("offset_graph", "mv_offset");
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 5, "bidder": 6})),
+            0,
+        )])
+        .await
+        .expect("baseline event");
+        tick.advance_watermark(5)
+            .await
+            .expect("baseline checkpoint");
+
+        let baseline_offset = {
+            let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+            let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+            let manifest = checkpoint_store
+                .load_latest()
+                .await
+                .expect("load baseline manifest")
+                .expect("manifest present");
+            manifest
+                .source_offsets
+                .iter()
+                .find(|offset| offset.source == "bid")
+                .map(|offset| offset.offset)
+                .expect("offset recorded")
+        };
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 9, "bidder": 10})),
+            0,
+        )])
+        .await
+        .expect("pending event");
+
+        {
+            let _guard = barrier_failpoints::install_failpoint(BarrierStage::BeforeManifestWrite);
+            let err = tick
+                .advance_watermark(10)
+                .await
+                .expect_err("failpoint error");
+            assert!(
+                err.to_string()
+                    .contains("barrier failpoint triggered at BeforeManifestWrite")
+            );
+        }
+
+        drop(tick);
+
+        let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+        let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+        let manifest = checkpoint_store
+            .load_latest()
+            .await
+            .expect("load manifest")
+            .expect("manifest present");
+        assert_eq!(manifest.source_offsets.len(), 1);
+        let offset = &manifest.source_offsets[0];
+        assert_eq!(offset.offset, baseline_offset);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_manifest_failpoint_preserves_commit() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("post_manifest_failpoint", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let mut source_registry = SourceRegistry::new();
+        source_registry.register(bid_definition());
+        let source_registry = Arc::new(source_registry);
+        let plan = build_simple_materialize_plan("post_manifest_graph", "mv_post_manifest");
+
+        let mv_registry = Arc::new(MaterializedViewRegistry::new());
+        let mut tick = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_registry),
+            Some(db.clone()),
+        )
+        .await
+        .expect("instantiate tick loop");
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 3, "bidder": 4})),
+            0,
+        )])
+        .await
+        .expect("baseline event");
+        tick.advance_watermark(5)
+            .await
+            .expect("baseline checkpoint");
+
+        let baseline_manifest_id = {
+            let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+            let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+            checkpoint_store
+                .load_latest()
+                .await
+                .expect("load baseline manifest")
+                .expect("manifest present")
+                .id
+        };
+
+        tick.process_events(vec![(
+            SourceEvent::new("bid", json!({"auction": 4, "bidder": 5})),
+            0,
+        )])
+        .await
+        .expect("second event");
+
+        {
+            let _guard = barrier_failpoints::install_failpoint(BarrierStage::AfterManifestWrite);
+            let err = tick
+                .advance_watermark(10)
+                .await
+                .expect_err("failpoint error");
+            assert!(
+                err.to_string()
+                    .contains("barrier failpoint triggered at AfterManifestWrite")
+            );
+        }
+
+        drop(tick);
+
+        let latest_manifest = {
+            let table = DbspBridge::new(db.clone()).await.expect("bridge").table();
+            let checkpoint_store = CheckpointStore::new(table, plan.graph_id.clone());
+            checkpoint_store
+                .load_latest()
+                .await
+                .expect("load manifest")
+                .expect("manifest present")
+        };
+        assert!(latest_manifest.id > baseline_manifest_id);
+
+        let mv_restart = Arc::new(MaterializedViewRegistry::new());
+        let _ = instantiate_tick_loop(
+            &plan,
+            Arc::clone(&source_registry),
+            Arc::clone(&mv_restart),
+            Some(db.clone()),
+        )
+        .await
+        .expect("restart tick");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+        ]));
+        let provider =
+            MaterializedViewTableProvider::new(Arc::clone(&mv_restart), "mv_post_manifest", schema);
+        let batches = provider
+            .build_batches_for_test()
+            .await
+            .expect("build batches");
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
     async fn join_state_restores_from_checkpoint() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(
@@ -1449,6 +2137,51 @@ mod tests {
         let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
             input: OutputPort::new(join, 0),
             view_name: "mv_q3".to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
+    }
+
+    fn build_simple_materialize_plan(graph_id: &str, view_name: &str) -> DataflowPlan {
+        let mut plan = DataflowPlan::new(graph_id);
+        let scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let map = plan.add_operator(OperatorNode::Map(MapNode {
+            input: OutputPort::new(scan, 0),
+            output: OutputPort::new(OperatorId(1), 0),
+            expressions: vec![Expr::column(0), Expr::column(1)],
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(map, 0),
+            view_name: view_name.to_string(),
+        }));
+        plan.set_root(materialize);
+        plan
+    }
+
+    fn build_join_plan(graph_id: &str, view_name: &str) -> DataflowPlan {
+        let mut plan = DataflowPlan::new(graph_id);
+        let bid_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "bid".to_string(),
+            output: OutputPort::new(OperatorId(0), 0),
+        }));
+        let person_scan = plan.add_operator(OperatorNode::Scan(ScanNode {
+            source_name: "person".to_string(),
+            output: OutputPort::new(OperatorId(1), 0),
+        }));
+        let projection = (0..6).map(Expr::column).collect();
+        let join = plan.add_operator(OperatorNode::Join(JoinNode {
+            left: OutputPort::new(bid_scan, 0),
+            right: OutputPort::new(person_scan, 0),
+            output: OutputPort::new(OperatorId(2), 0),
+            on: vec![(0, 0)],
+            projection,
+        }));
+        let materialize = plan.add_operator(OperatorNode::Materialize(MaterializeNode {
+            input: OutputPort::new(join, 0),
+            view_name: view_name.to_string(),
         }));
         plan.set_root(materialize);
         plan
