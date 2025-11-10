@@ -2,6 +2,7 @@ use std::any::Any;
 
 use anyhow::{Result, bail};
 use dbsp::handles::ZSetHandle;
+use dbsp::stream::Stream as DbspHandleStream;
 use dbsp::{StreamRetention, ZSetStream};
 
 use crate::dataflow_plan::Expr;
@@ -15,7 +16,8 @@ pub struct FilterOperator {
     input: InputPort,
     predicate: Expr,
     sink: Box<dyn RowSink>,
-    dbsp: Option<FilterDbspState>,
+    manual_state: Option<FilterDbspState>,
+    derived_state: Option<FilterDerivedState>,
 }
 
 impl FilterOperator {
@@ -23,13 +25,15 @@ impl FilterOperator {
         input: InputPort,
         predicate: Expr,
         sink: impl RowSink,
-        dbsp: Option<FilterDbspState>,
+        manual_state: Option<FilterDbspState>,
+        derived_state: Option<FilterDerivedState>,
     ) -> Self {
         Self {
             input,
             predicate,
             sink: Box::new(sink),
-            dbsp,
+            manual_state,
+            derived_state,
         }
     }
 
@@ -40,7 +44,13 @@ impl FilterOperator {
 
     #[cfg(test)]
     pub fn latest_handle(&self) -> Option<&ZSetHandle> {
-        self.dbsp.as_ref().and_then(|state| state.latest_handle())
+        if let Some(derived) = &self.derived_state {
+            derived.current_handle()
+        } else {
+            self.manual_state
+                .as_ref()
+                .and_then(|state| state.latest_handle())
+        }
     }
 }
 
@@ -57,7 +67,7 @@ impl StreamOperator for FilterOperator {
         }
 
         if evaluate_bool(&self.predicate, &row)? {
-            if let Some(dbsp) = self.dbsp.as_mut() {
+            if let Some(dbsp) = self.manual_state.as_mut() {
                 dbsp.record_row(&row, diff)?;
             }
             self.sink.push(row, diff, timestamp)
@@ -84,7 +94,11 @@ impl StreamOperator for FilterOperator {
         Box<dyn std::future::Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if let Some(state) = self.dbsp.as_mut() {
+            if let Some(derived) = self.derived_state.as_mut() {
+                let handle = derived.latest_handle().await?;
+                return Ok(Some(vec![handle]));
+            }
+            if let Some(state) = self.manual_state.as_mut() {
                 let handle = state.flush().await?;
                 return Ok(Some(vec![handle]));
             }
@@ -98,6 +112,41 @@ pub struct FilterDbspState {
     table: String,
     namespace: String,
     latest_handle: Option<ZSetHandle>,
+}
+
+pub struct FilterDerivedState {
+    stream: DbspHandleStream<ZSetHandle>,
+    table: String,
+    latest: Option<ZSetHandle>,
+}
+
+impl FilterDerivedState {
+    pub fn new(stream: DbspHandleStream<ZSetHandle>, table: impl Into<String>) -> Self {
+        Self {
+            stream,
+            table: table.into(),
+            latest: None,
+        }
+    }
+
+    pub fn handle_stream(&self) -> DbspHandleStream<ZSetHandle> {
+        self.stream.clone()
+    }
+
+    pub async fn latest_handle(&mut self) -> Result<OperatorStateHandle> {
+        let handle = self.stream.latest().await?;
+        self.latest = Some(handle.clone());
+        Ok(OperatorStateHandle::new(
+            self.table.clone(),
+            handle.ns.clone(),
+            handle.version,
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn current_handle(&self) -> Option<&ZSetHandle> {
+        self.latest.as_ref()
+    }
 }
 
 impl FilterDbspState {
@@ -134,6 +183,10 @@ impl FilterDbspState {
         ))
     }
 
+    pub fn handle_stream(&self) -> DbspHandleStream<ZSetHandle> {
+        self.stream.handle_stream()
+    }
+
     #[cfg(test)]
     fn latest_handle(&self) -> Option<&ZSetHandle> {
         self.latest_handle.as_ref()
@@ -146,7 +199,7 @@ mod tests {
     use object_store::{ObjectStore, memory::InMemory};
     use slatedb::Db;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::dataflow_plan::Expr;
@@ -163,8 +216,13 @@ mod tests {
             Box::new(Expr::column(0)),
             Box::new(Expr::literal(ScalarValue::Int64(Some(42)))),
         );
-        let mut operator =
-            FilterOperator::new(InputPort::new(port.operator, 0), predicate, sink, None);
+        let mut operator = FilterOperator::new(
+            InputPort::new(port.operator, 0),
+            predicate,
+            sink,
+            None,
+            None,
+        );
 
         let accepted = vec![ScalarValue::Int64(Some(42))];
         operator
@@ -243,7 +301,7 @@ mod tests {
 
         let port = OutputPort::new(OperatorId(0), 0);
         let input = InputPort::new(port.operator, 0);
-        let operator = FilterOperator::new(input, predicate, sink, Some(dbsp_state));
+        let operator = FilterOperator::new(input, predicate, sink, Some(dbsp_state), None);
         (operator, input, db, namespace)
     }
 
@@ -271,7 +329,7 @@ mod tests {
 
     #[derive(Default)]
     struct AccumulatingSink {
-        state: std::sync::Mutex<HashMap<Vec<u8>, Diff>>,
+        state: Mutex<HashMap<Vec<u8>, Diff>>,
     }
 
     impl AccumulatingSink {

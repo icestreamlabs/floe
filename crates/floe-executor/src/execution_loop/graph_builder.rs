@@ -2,18 +2,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use dbsp::StreamRetention;
+use dbsp::handles::ZSetHandle;
+use dbsp::{DbspFilter, Stream, StreamRetention};
 
 use crate::checkpoint::{CheckpointManifest, MaterializedViewCheckpointEntry};
 use crate::circuit_builder::{CircuitContext, RowStreamHandle};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
+use crate::encoding::decode_projected_row_key;
+use crate::expr_eval::evaluate_bool;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::operator_state::StateTable;
 use crate::operators::{
-    DispatchSink, EventQueue, FilterDbspState, FilterOperator, JoinOperator, MapOperator,
-    MaterializeOperator, NullSink, ScanOperator,
+    DispatchSink, EventQueue, FilterDbspState, FilterDerivedState, FilterOperator, JoinOperator,
+    MapOperator, MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{InputPort, OperatorId, StreamOperator};
 
@@ -92,6 +95,8 @@ pub async fn build_graph(
     }
 
     let mut operator_outputs: HashMap<OperatorId, RowStreamHandle> = HashMap::new();
+    let mut operator_handle_streams: Vec<Option<Stream<ZSetHandle>>> =
+        vec![None; plan.operators.len()];
     for connected in ctx.connected() {
         operator_outputs.insert(connected.operator_id(), connected.output());
     }
@@ -147,7 +152,31 @@ pub async fn build_graph(
             }
             OperatorNode::Filter(filter) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
-                let dbsp_state = {
+                let upstream_stream = operator_handle_streams
+                    .get(filter.input.operator.0)
+                    .and_then(|stream| stream.clone());
+                let mut manual_state = None;
+                let mut derived_state = None;
+                if let Some(upstream) = upstream_stream {
+                    let predicate_expr = std::sync::Arc::new(filter.predicate.clone());
+                    let derived_predicate = {
+                        let expr = std::sync::Arc::clone(&predicate_expr);
+                        move |key: &Vec<u8>| -> bool {
+                            let row =
+                                decode_projected_row_key(key).expect("decode row for dbsp filter");
+                            evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
+                        }
+                    };
+                    let dbsp_filter = DbspFilter::new::<Vec<u8>, _>(&upstream, derived_predicate)
+                        .await
+                        .context("build dbsp-derived filter stream")?;
+                    let derived_stream = dbsp_filter.stream();
+                    operator_handle_streams[idx] = Some(derived_stream.clone());
+                    derived_state = Some(FilterDerivedState::new(
+                        derived_stream,
+                        format!("filter_output_{idx}"),
+                    ));
+                } else {
                     let output_table_name = format!("filter_output_{idx}");
                     let output_namespace =
                         namespaces::operator_state(&plan.graph_id, idx, "output")?;
@@ -158,17 +187,19 @@ pub async fn build_graph(
                         )
                         .await
                         .context("initialize filter output stream")?;
-                    Some(FilterDbspState::new(
+                    operator_handle_streams[idx] = Some(output_stream.handle_stream());
+                    manual_state = Some(FilterDbspState::new(
                         output_stream,
                         output_table_name,
                         output_namespace,
-                    ))
-                };
+                    ));
+                }
                 Box::new(FilterOperator::new(
                     InputPort::new(filter.input.operator, filter.input.port_index),
                     filter.predicate.clone(),
                     sink,
-                    dbsp_state,
+                    manual_state,
+                    derived_state,
                 ))
             }
             OperatorNode::Join(join) => {
@@ -202,6 +233,7 @@ pub async fn build_graph(
                     )
                     .await
                     .context("initialize join output stream")?;
+                operator_handle_streams[idx] = Some(output_stream.handle_stream());
                 let left_state =
                     StateTable::new(left_table_name.clone(), left_namespace.clone(), left_stream);
                 let right_state = StateTable::new(

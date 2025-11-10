@@ -1,6 +1,7 @@
 pub mod algebra;
 pub mod circuit;
 pub mod collections;
+pub mod filter;
 pub mod handles;
 pub mod join;
 pub mod stream;
@@ -18,6 +19,7 @@ pub use circuit::{
     nexmark_bid_table, nexmark_person_table,
 };
 pub use collections::{ZSet, h};
+pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
 pub use stream::{
