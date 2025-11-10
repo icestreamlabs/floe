@@ -227,7 +227,14 @@ async fn build_graph_routes_rows_through_runtime() {
 
     let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None, None)
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("build-graph-runtime", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None, &mut bridge)
         .await
         .expect("build graph");
 

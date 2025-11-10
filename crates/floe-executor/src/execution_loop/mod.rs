@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use slatedb::Db;
 
 use crate::checkpoint::{CheckpointManager, CheckpointStore};
@@ -38,15 +40,26 @@ pub async fn instantiate_tick_loop(
         .context("build circuit plan from dataflow")?;
 
     let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
-    let mut bridge = match db {
-        Some(db) => Some(
-            DbspBridge::new(db)
-                .await
-                .context("initialize DBSP bridge")?,
-        ),
-        None => None,
+    let (active_db, persistence_enabled) = match db {
+        Some(db) => (db, true),
+        None => {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let name = format!("{}_ephemeral", plan.graph_id);
+            let db = Arc::new(
+                Db::open(name, store)
+                    .await
+                    .context("open ephemeral SlateDB")?,
+            );
+            (db, false)
+        }
     };
-    let (checkpoint_table, checkpoint_manifest) = if let Some(bridge_ref) = bridge.as_ref() {
+    let mut bridge = Some(
+        DbspBridge::new(Arc::clone(&active_db))
+            .await
+            .context("initialize DBSP bridge")?,
+    );
+    let (checkpoint_table, checkpoint_manifest) = if persistence_enabled {
+        let bridge_ref = bridge.as_ref().expect("dbsp bridge");
         let table = bridge_ref.table();
         let store = CheckpointStore::new(table.clone(), plan.graph_id.clone());
         let manifest = store.load_latest().await?;
@@ -54,15 +67,20 @@ pub async fn instantiate_tick_loop(
     } else {
         (None, None)
     };
-    let built = build_graph(
-        &ctx,
-        plan,
-        Arc::clone(&mv_registry),
-        &queue,
-        checkpoint_manifest.as_ref(),
-        bridge.as_mut(),
-    )
-    .await?;
+    let built = {
+        let bridge_ref = bridge
+            .as_mut()
+            .expect("dbsp bridge must be initialized before building graph");
+        build_graph(
+            &ctx,
+            plan,
+            Arc::clone(&mv_registry),
+            &queue,
+            checkpoint_manifest.as_ref(),
+            bridge_ref,
+        )
+        .await?
+    };
 
     let checkpoint = if let Some(table) = checkpoint_table {
         Some(

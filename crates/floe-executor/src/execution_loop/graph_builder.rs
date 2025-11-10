@@ -30,7 +30,7 @@ pub async fn build_graph(
     mv_registry: Arc<MaterializedViewRegistry>,
     queue: &EventQueue,
     checkpoint_manifest: Option<&CheckpointManifest>,
-    mut bridge: Option<&mut DbspBridge>,
+    bridge: &mut DbspBridge,
 ) -> Result<BuiltGraph> {
     let mut downstreams: HashMap<OperatorId, Vec<(usize, InputPort)>> = HashMap::new();
     for (idx, _) in plan.operators.iter().enumerate() {
@@ -157,55 +157,56 @@ pub async fn build_graph(
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
                 let mut left_snapshot_data = None;
                 let mut right_snapshot_data = None;
-                let (left_state, right_state) = if let Some(bridge_ref) = bridge.as_mut() {
-                    let left_table_name = format!("join_left_{idx}");
-                    let right_table_name = format!("join_right_{idx}");
-                    let left_namespace = namespaces::operator_state(&plan.graph_id, idx, "left")?;
-                    let right_namespace = namespaces::operator_state(&plan.graph_id, idx, "right")?;
-                    let left_stream = bridge_ref
-                        .new_stream(
-                            left_namespace.clone(),
-                            StreamRetention::KeepLast { keep_last: 1 },
-                        )
-                        .await
-                        .context("initialize left join state stream")?;
-                    let right_stream = bridge_ref
-                        .new_stream(
-                            right_namespace.clone(),
-                            StreamRetention::KeepLast { keep_last: 1 },
-                        )
-                        .await
-                        .context("initialize right join state stream")?;
-                    let left = StateTable::new(
-                        left_table_name.clone(),
+                let left_table_name = format!("join_left_{idx}");
+                let right_table_name = format!("join_right_{idx}");
+                let output_table_name = format!("join_output_{idx}");
+                let left_namespace = namespaces::operator_state(&plan.graph_id, idx, "left")?;
+                let right_namespace = namespaces::operator_state(&plan.graph_id, idx, "right")?;
+                let output_namespace = namespaces::operator_state(&plan.graph_id, idx, "output")?;
+                let left_stream = bridge
+                    .new_stream(
                         left_namespace.clone(),
-                        left_stream,
-                    );
-                    let right = StateTable::new(
-                        right_table_name.clone(),
+                        StreamRetention::KeepLast { keep_last: 1 },
+                    )
+                    .await
+                    .context("initialize left join state stream")?;
+                let right_stream = bridge
+                    .new_stream(
                         right_namespace.clone(),
-                        right_stream,
-                    );
-                    if let Some(handles) = &checkpoint_handles {
-                        for handle in handles {
-                            let snapshot = bridge_ref
-                                .handle_view_for(&handle.namespace, handle.version)
-                                .await
-                                .context("open join checkpoint handle")?
-                                .materialize()
-                                .await
-                                .context("materialize join checkpoint")?;
-                            if handle.table == left_table_name {
-                                left_snapshot_data = Some(snapshot);
-                            } else if handle.table == right_table_name {
-                                right_snapshot_data = Some(snapshot);
-                            }
+                        StreamRetention::KeepLast { keep_last: 1 },
+                    )
+                    .await
+                    .context("initialize right join state stream")?;
+                let output_stream = bridge
+                    .new_stream(
+                        output_namespace.clone(),
+                        StreamRetention::KeepLast { keep_last: 1 },
+                    )
+                    .await
+                    .context("initialize join output stream")?;
+                let left_state =
+                    StateTable::new(left_table_name.clone(), left_namespace.clone(), left_stream);
+                let right_state = StateTable::new(
+                    right_table_name.clone(),
+                    right_namespace.clone(),
+                    right_stream,
+                );
+                if let Some(handles) = &checkpoint_handles {
+                    for handle in handles {
+                        let snapshot = bridge
+                            .handle_view_for(&handle.namespace, handle.version)
+                            .await
+                            .context("open join checkpoint handle")?
+                            .materialize()
+                            .await
+                            .context("materialize join checkpoint")?;
+                        if handle.table == left_table_name {
+                            left_snapshot_data = Some(snapshot);
+                        } else if handle.table == right_table_name {
+                            right_snapshot_data = Some(snapshot);
                         }
                     }
-                    (Some(left), Some(right))
-                } else {
-                    (None, None)
-                };
+                }
                 Box::new(
                     JoinOperator::new(
                         InputPort::new(join.left.operator, join.left.port_index),
@@ -215,6 +216,9 @@ pub async fn build_graph(
                         sink,
                         left_state,
                         right_state,
+                        Some(output_stream),
+                        Some(output_table_name.clone()),
+                        Some(output_namespace.clone()),
                         left_snapshot_data,
                         right_snapshot_data,
                     )
@@ -225,10 +229,7 @@ pub async fn build_graph(
             OperatorNode::Materialize(materialize) => {
                 let checkpoint_entry = view_checkpoint_map.get(&materialize.view_name).cloned();
                 let checkpoint_state = if let Some(entry) = checkpoint_entry {
-                    let bridge_ref = bridge
-                        .as_mut()
-                        .ok_or_else(|| anyhow!("checkpoint manifest present without DB bridge"))?;
-                    let handle = bridge_ref
+                    let handle = bridge
                         .handle_view_for(&entry.namespace, entry.version)
                         .await
                         .context("open materialized view checkpoint handle")?;
@@ -237,16 +238,12 @@ pub async fn build_graph(
                 } else {
                     None
                 };
-                let dbsp_view = if let Some(bridge_ref) = bridge.as_mut() {
-                    Some(
-                        (*bridge_ref)
-                            .new_view(&materialize.view_name)
-                            .await
-                            .context("create DBSP view")?,
-                    )
-                } else {
-                    None
-                };
+                let dbsp_view = Some(
+                    bridge
+                        .new_view(&materialize.view_name)
+                        .await
+                        .context("create DBSP view")?,
+                );
                 Box::new(MaterializeOperator::new(
                     InputPort::new(materialize.input.operator, materialize.input.port_index),
                     materialize.view_name.clone(),
