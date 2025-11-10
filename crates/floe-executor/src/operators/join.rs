@@ -340,14 +340,19 @@ mod tests {
     use super::*;
     use crate::dataflow_plan::Expr;
     use crate::dbsp_bridge::DbspBridge;
+    use crate::encoding::encode_projected_row_key;
     use crate::namespaces;
     use crate::operators::test_support::TestSink;
-    use crate::stream_types::{InputPort, OperatorId, OutputPort};
+    use crate::stream_types::{Diff, InputPort, OperatorId, OutputPort, Timestamp};
+    use std::collections::HashMap;
 
-    async fn build_join_operator_fixture(db_label: &str) -> (JoinOperator, InputPort, InputPort) {
+    async fn build_join_operator_with_sink(
+        db_label: &str,
+        sink: impl RowSink,
+    ) -> (JoinOperator, InputPort, InputPort, Arc<Db>, String) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open(db_label, store).await.expect("open SlateDB"));
-        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
         let left_namespace =
             namespaces::operator_state("join_test", 0, "left").expect("left namespace");
         let right_namespace =
@@ -382,7 +387,6 @@ mod tests {
 
         let left_port = OutputPort::new(OperatorId(0), 0);
         let right_port = OutputPort::new(OperatorId(1), 0);
-        let sink = TestSink::default();
         let projection = vec![Expr::column(0), Expr::column(3)];
         let left_input = InputPort::new(left_port.operator, 0);
         let right_input = InputPort::new(right_port.operator, 0);
@@ -396,14 +400,20 @@ mod tests {
             right_state,
             Some(output_stream),
             Some("join_output".to_string()),
-            Some(output_namespace),
+            Some(output_namespace.clone()),
             None,
             None,
         )
         .await
         .expect("join operator");
 
-        (operator, left_input, right_input)
+        (operator, left_input, right_input, db, output_namespace)
+    }
+
+    async fn build_join_operator_fixture(
+        db_label: &str,
+    ) -> (JoinOperator, InputPort, InputPort, Arc<Db>, String) {
+        build_join_operator_with_sink(db_label, TestSink::default()).await
     }
 
     #[test]
@@ -419,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn joins_on_single_key() {
-        let (mut op, left_input, right_input) =
+        let (mut op, left_input, right_input, _, _) =
             build_join_operator_fixture("join-operator-single").await;
 
         let left_row = vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(100))];
@@ -438,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_emits_output_stream_handles() {
-        let (mut op, left_input, right_input) =
+        let (mut op, left_input, right_input, _, _) =
             build_join_operator_fixture("join-output-handles").await;
 
         let left_row = vec![ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(10))];
@@ -457,5 +467,123 @@ mod tests {
             .expect("output handle present");
         assert!(output.version >= 1);
         assert!(op.latest_output_handle().is_some());
+    }
+
+    #[tokio::test]
+    async fn dbsp_join_output_matches_sink_state() {
+        let sink = AccumulatingSink::default();
+        let (mut op, left_input, right_input, db, output_ns) =
+            build_join_operator_with_sink("join-output-equivalence", sink).await;
+
+        let steps = vec![
+            vec![InputEvent::new(left_input, row(&[1, 10, 100]), 1, 1)],
+            vec![InputEvent::new(right_input, row(&[1, 20, 200]), 1, 2)],
+            vec![
+                InputEvent::new(left_input, row(&[2, 30, 300]), 1, 3),
+                InputEvent::new(right_input, row(&[2, 40, 400]), 1, 4),
+                InputEvent::new(right_input, row(&[2, 50, 500]), 1, 5),
+            ],
+            vec![InputEvent::new(left_input, row(&[1, 10, 100]), -1, 6)],
+        ];
+
+        for (step_idx, events) in steps.into_iter().enumerate() {
+            for event in events {
+                op.on_input(event.port, event.row, event.diff, event.ts)
+                    .expect("process join input");
+            }
+            let handles = op.checkpoint().await.expect("checkpoint").expect("handles");
+            let output_handle = handles
+                .iter()
+                .find(|handle| handle.table == "join_output")
+                .expect("output handle present");
+            let db_state =
+                materialize_output_state(Arc::clone(&db), &output_ns, output_handle.version).await;
+            let sink_state = {
+                let sink = op
+                    .sink()
+                    .as_any()
+                    .downcast_ref::<AccumulatingSink>()
+                    .expect("accumulating sink");
+                sink.snapshot()
+            };
+            assert_eq!(db_state, sink_state, "mismatch after step {step_idx}");
+        }
+    }
+
+    fn row(values: &[i64]) -> Row {
+        values
+            .iter()
+            .map(|v| ScalarValue::Int64(Some(*v)))
+            .collect()
+    }
+
+    async fn materialize_output_state(
+        db: Arc<Db>,
+        namespace: &str,
+        version: u64,
+    ) -> HashMap<Vec<u8>, Diff> {
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let snapshot = bridge
+            .handle_view_for(namespace, version)
+            .await
+            .expect("handle view")
+            .materialize()
+            .await
+            .expect("materialize");
+        snapshot
+            .into_iter()
+            .filter(|(_, diff)| *diff != 0)
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct InputEvent {
+        port: InputPort,
+        row: Row,
+        diff: Diff,
+        ts: Timestamp,
+    }
+
+    impl InputEvent {
+        fn new(port: InputPort, row: Row, diff: Diff, ts: Timestamp) -> Self {
+            Self {
+                port,
+                row,
+                diff,
+                ts,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct AccumulatingSink {
+        state: HashMap<Vec<u8>, Diff>,
+    }
+
+    impl AccumulatingSink {
+        fn snapshot(&self) -> HashMap<Vec<u8>, Diff> {
+            self.state.clone()
+        }
+    }
+
+    impl RowSink for AccumulatingSink {
+        fn push(&mut self, row: Row, diff: Diff, _timestamp: Timestamp) -> Result<()> {
+            let key = encode_projected_row_key(&row)?;
+            let updated = self.state.get(&key).copied().unwrap_or(0) + diff;
+            if updated == 0 {
+                self.state.remove(&key);
+            } else {
+                self.state.insert(key, updated);
+            }
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
     }
 }

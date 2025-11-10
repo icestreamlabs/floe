@@ -12,8 +12,8 @@ use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::operator_state::StateTable;
 use crate::operators::{
-    DispatchSink, EventQueue, FilterOperator, JoinOperator, MapOperator, MaterializeOperator,
-    NullSink, ScanOperator,
+    DispatchSink, EventQueue, FilterDbspState, FilterOperator, JoinOperator, MapOperator,
+    MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{InputPort, OperatorId, StreamOperator};
 
@@ -147,10 +147,28 @@ pub async fn build_graph(
             }
             OperatorNode::Filter(filter) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
+                let dbsp_state = {
+                    let output_table_name = format!("filter_output_{idx}");
+                    let output_namespace =
+                        namespaces::operator_state(&plan.graph_id, idx, "output")?;
+                    let output_stream = bridge
+                        .new_stream(
+                            output_namespace.clone(),
+                            StreamRetention::KeepLast { keep_last: 1 },
+                        )
+                        .await
+                        .context("initialize filter output stream")?;
+                    Some(FilterDbspState::new(
+                        output_stream,
+                        output_table_name,
+                        output_namespace,
+                    ))
+                };
                 Box::new(FilterOperator::new(
                     InputPort::new(filter.input.operator, filter.input.port_index),
                     filter.predicate.clone(),
                     sink,
+                    dbsp_state,
                 ))
             }
             OperatorNode::Join(join) => {
