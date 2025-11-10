@@ -6,7 +6,7 @@ mod scan;
 
 pub use filter::{FilterDbspState, FilterDerivedState, FilterOperator};
 pub use join::JoinOperator;
-pub use map::MapOperator;
+pub use map::{MapDerivedState, MapOperator};
 pub use materialize::MaterializeOperator;
 pub use scan::ScanOperator;
 

@@ -3,20 +3,20 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use dbsp::handles::ZSetHandle;
-use dbsp::{DbspFilter, Stream, StreamRetention};
+use dbsp::{DbspFilter, DbspMap, Stream, StreamRetention};
 
 use crate::checkpoint::{CheckpointManifest, MaterializedViewCheckpointEntry};
 use crate::circuit_builder::{CircuitContext, RowStreamHandle};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
-use crate::encoding::decode_projected_row_key;
-use crate::expr_eval::evaluate_bool;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+use crate::expr_eval::{evaluate, evaluate_bool};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::operator_state::StateTable;
 use crate::operators::{
     DispatchSink, EventQueue, FilterDbspState, FilterDerivedState, FilterOperator, JoinOperator,
-    MapOperator, MaterializeOperator, NullSink, ScanOperator,
+    MapDerivedState, MapOperator, MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{InputPort, OperatorId, StreamOperator};
 
@@ -144,10 +144,44 @@ pub async fn build_graph(
             }
             OperatorNode::Map(map) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
+                let upstream_stream = operator_handle_streams
+                    .get(map.input.operator.0)
+                    .and_then(|stream| stream.clone());
+                let derived_state = if let Some(upstream) = upstream_stream {
+                    let exprs = std::sync::Arc::new(map.expressions.clone());
+                    let projector = {
+                        let exprs = std::sync::Arc::clone(&exprs);
+                        move |key: &Vec<u8>| -> Vec<u8> {
+                            let row =
+                                decode_projected_row_key(key).expect("decode row for dbsp map");
+                            let mut projected = Vec::with_capacity(exprs.len());
+                            for expr in exprs.iter() {
+                                projected.push(
+                                    evaluate(expr, &row).expect("evaluate expression for dbsp map"),
+                                );
+                            }
+                            encode_projected_row_key(&projected)
+                                .expect("encode projected row for dbsp map")
+                        }
+                    };
+                    let dbsp_map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector)
+                        .await
+                        .context("build dbsp-derived map stream")?;
+                    let derived_stream = dbsp_map.stream();
+                    operator_handle_streams[idx] = Some(derived_stream.clone());
+                    Some(MapDerivedState::new(
+                        derived_stream,
+                        format!("map_output_{idx}"),
+                    ))
+                } else {
+                    operator_handle_streams[idx] = None;
+                    None
+                };
                 Box::new(MapOperator::new(
                     InputPort::new(map.input.operator, map.input.port_index),
                     map.expressions.clone(),
                     sink,
+                    derived_state,
                 ))
             }
             OperatorNode::Filter(filter) => {

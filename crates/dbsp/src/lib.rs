@@ -4,6 +4,7 @@ pub mod collections;
 pub mod filter;
 pub mod handles;
 pub mod join;
+pub mod map;
 pub mod stream;
 
 pub mod storage;
@@ -22,6 +23,7 @@ pub use collections::{ZSet, h};
 pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
+pub use map::DbspMap;
 pub use stream::{
     Stream, StreamRetention, ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate,
     incrementalize2, integrate, lift1, lift2, lifted_delay, lifted_differentiate,
