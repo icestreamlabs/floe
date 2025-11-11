@@ -4,7 +4,7 @@ mod cursor;
 mod groups;
 pub mod operations;
 pub mod runtime;
-mod util;
+pub mod util;
 mod zset_stream;
 
 #[cfg(test)]

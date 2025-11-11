@@ -4,8 +4,9 @@ use anyhow::Result;
 pub(crate) enum BarrierStage {
     AfterOperatorFlush,
     AfterMaterializedViewFlush,
-    BeforeManifestWrite,
-    AfterManifestWrite,
+    AfterSealBeforeCommit,
+    AfterOffsetsBeforeCommit,
+    AfterCommit,
 }
 
 pub(crate) fn run_barrier_hook(stage: BarrierStage) -> Result<()> {

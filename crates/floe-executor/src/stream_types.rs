@@ -5,7 +5,7 @@ use std::pin::Pin;
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
 
-use crate::operator_state::OperatorStateHandle;
+use crate::checkpoint::DbspHandleRecord;
 
 /// Logical timestamp used to order stream events.
 pub type Timestamp = u64;
@@ -66,7 +66,7 @@ pub trait StreamOperator: Send {
 
     fn checkpoint<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<DbspHandleRecord>>>> + Send + 'a>> {
         Box::pin(async { Ok(None) })
     }
 

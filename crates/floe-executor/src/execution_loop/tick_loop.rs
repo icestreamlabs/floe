@@ -6,8 +6,7 @@ use floe_core::source::SourceEvent;
 
 use crate::barrier_clock::{BarrierClock, StepId};
 use crate::checkpoint::{
-    CheckpointManager, MaterializedViewCheckpointEntry, OperatorCheckpointEntry,
-    SourceStreamCheckpointEntry,
+    CheckpointManager, DbspHandleRecord, SourceOffset, handle_kinds, record_if_nonzero,
 };
 use crate::circuit_builder::RowStreamHandle;
 use crate::operators::{DispatchEvent, EventQueue, MaterializeOperator, ScanOperator};
@@ -135,20 +134,9 @@ impl TickLoop {
     }
 
     async fn seal_step(&mut self, _step_id: StepId, watermark: Timestamp) -> Result<()> {
-        let source_handles = self.flush_outer_streams().await?;
-        let operator_states = self.collect_operator_checkpoints().await?;
-        run_barrier_hook(BarrierStage::AfterOperatorFlush)?;
-        let materialized_views = self.collect_materialized_view_checkpoints().await?;
-        run_barrier_hook(BarrierStage::AfterMaterializedViewFlush)?;
-        run_barrier_hook(BarrierStage::BeforeManifestWrite)?;
-        self.persist_checkpoint(
-            watermark,
-            operator_states,
-            materialized_views,
-            source_handles,
-        )
-        .await?;
-        run_barrier_hook(BarrierStage::AfterManifestWrite)?;
+        let (dbsp_handles, source_offsets) = self.seal_checkpoint().await?;
+        self.commit_checkpoint(watermark, dbsp_handles, source_offsets)
+            .await?;
         Ok(())
     }
 
@@ -181,47 +169,61 @@ impl TickLoop {
             .unwrap_or(self.barrier_clock.watermark())
     }
 
-    async fn collect_materialized_view_checkpoints(
-        &mut self,
-    ) -> Result<Vec<MaterializedViewCheckpointEntry>> {
+    async fn collect_materialized_view_checkpoints(&mut self) -> Result<Vec<DbspHandleRecord>> {
         let mut entries = Vec::new();
         for operator in self.ops.iter_mut() {
             if let Some(materialize) = operator.as_any_mut().downcast_mut::<MaterializeOperator>() {
-                if let Some(entry) = materialize.checkpoint_state().await? {
-                    entries.push(entry);
+                if let Some(mut records) = materialize.checkpoint().await? {
+                    entries.append(&mut records);
                 }
             }
         }
         Ok(entries)
     }
 
-    async fn collect_operator_checkpoints(&mut self) -> Result<Vec<OperatorCheckpointEntry>> {
-        let mut entries = Vec::new();
-        for (idx, operator) in self.ops.iter_mut().enumerate() {
-            if let Some(handles) = operator.checkpoint().await? {
-                if !handles.is_empty() {
-                    entries.push(OperatorCheckpointEntry {
-                        operator_index: idx,
-                        handles,
-                    });
-                }
+    async fn collect_operator_checkpoints(&mut self) -> Result<Vec<DbspHandleRecord>> {
+        let mut handles = Vec::new();
+        for operator in self.ops.iter_mut() {
+            if let Some(mut entry) = operator.checkpoint().await? {
+                handles.append(&mut entry);
             }
         }
-        Ok(entries)
+        Ok(handles)
     }
 
-    async fn persist_checkpoint(
+    async fn seal_checkpoint(&mut self) -> Result<(Vec<DbspHandleRecord>, Vec<SourceOffset>)> {
+        let mut dbsp_handles = Vec::new();
+        dbsp_handles.extend(self.flush_outer_streams().await?);
+        let mut operator_handles = self.collect_operator_checkpoints().await?;
+        run_barrier_hook(BarrierStage::AfterOperatorFlush)?;
+        dbsp_handles.append(&mut operator_handles);
+        let mut materialized_views = self.collect_materialized_view_checkpoints().await?;
+        run_barrier_hook(BarrierStage::AfterMaterializedViewFlush)?;
+        dbsp_handles.append(&mut materialized_views);
+        run_barrier_hook(BarrierStage::AfterSealBeforeCommit)?;
+        let offsets = self.snapshot_source_offsets();
+        Ok((dbsp_handles, offsets))
+    }
+
+    fn snapshot_source_offsets(&self) -> Vec<SourceOffset> {
+        self.checkpoint
+            .as_ref()
+            .map(|manager| manager.snapshot_offsets())
+            .unwrap_or_default()
+    }
+
+    async fn commit_checkpoint(
         &mut self,
         watermark: Timestamp,
-        operator_states: Vec<OperatorCheckpointEntry>,
-        materialized_views: Vec<MaterializedViewCheckpointEntry>,
-        source_handles: Vec<OuterStreamHandle>,
+        dbsp_handles: Vec<DbspHandleRecord>,
+        source_offsets: Vec<SourceOffset>,
     ) -> Result<()> {
         if let Some(manager) = self.checkpoint.as_mut() {
-            let coupled = couple_handles_with_offsets(source_handles, manager.latest_offsets());
+            run_barrier_hook(BarrierStage::AfterOffsetsBeforeCommit)?;
             manager
-                .persist(watermark, operator_states, materialized_views, coupled)
+                .persist(watermark, dbsp_handles, source_offsets)
                 .await?;
+            run_barrier_hook(BarrierStage::AfterCommit)?;
         }
         Ok(())
     }
@@ -241,32 +243,26 @@ impl TickLoop {
         Ok(())
     }
 
-    async fn flush_outer_streams(&mut self) -> Result<Vec<OuterStreamHandle>> {
+    async fn flush_outer_streams(&mut self) -> Result<Vec<DbspHandleRecord>> {
         if let Some(registry) = self.outer_streams.as_mut() {
-            registry.flush_all().await
+            let handles = registry.flush_all().await?;
+            Ok(convert_source_handles(handles))
         } else {
             Ok(Vec::new())
         }
     }
 }
 
-fn couple_handles_with_offsets(
-    handles: Vec<OuterStreamHandle>,
-    offsets: &HashMap<String, u64>,
-) -> Vec<SourceStreamCheckpointEntry> {
+fn convert_source_handles(handles: Vec<OuterStreamHandle>) -> Vec<DbspHandleRecord> {
     handles
         .into_iter()
         .filter_map(|handle| {
-            offsets
-                .get(&handle.source)
-                .copied()
-                .map(|offset| SourceStreamCheckpointEntry {
-                    source: handle.source,
-                    namespace: handle.namespace,
-                    version: handle.version,
-                    partition: 0,
-                    offset,
-                })
+            record_if_nonzero(
+                handle_kinds::SOURCE,
+                &handle.source,
+                &handle.namespace,
+                handle.version,
+            )
         })
         .collect()
 }

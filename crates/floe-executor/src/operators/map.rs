@@ -1,10 +1,19 @@
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use dbsp::ZSetStream;
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::Stream as DbspHandleStream;
+use dbsp::stream::StreamCursor;
+use dbsp::stream::util::{compute_delta, materialize_zset_handle};
 
+use crate::checkpoint::{DbspHandleRecord, handle_kinds, record_if_nonzero};
 use crate::dataflow_plan::Expr;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::expr_eval::evaluate;
 use crate::operator_state::OperatorStateHandle;
 use crate::operators::RowSink;
@@ -15,6 +24,7 @@ pub struct MapOperator {
     expressions: Vec<Expr>,
     sink: Box<dyn RowSink>,
     derived_state: Option<MapDerivedState>,
+    live_state: Option<MapLiveState>,
 }
 
 impl MapOperator {
@@ -29,6 +39,27 @@ impl MapOperator {
             expressions,
             sink: Box::new(sink),
             derived_state,
+            live_state: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_live(
+        input: InputPort,
+        expressions: Vec<Expr>,
+        sink: impl RowSink + 'static,
+        upstream: DbspHandleStream<ZSetHandle>,
+        table: Arc<dyn KeyValueTable>,
+        out: ZSetStream<Vec<u8>>,
+        derived_state: Option<MapDerivedState>,
+    ) -> Self {
+        let cursor = StreamCursor::new(upstream.clone());
+        Self {
+            input,
+            expressions,
+            sink: Box::new(sink),
+            derived_state,
+            live_state: Some(MapLiveState::new(upstream, cursor, table, out)),
         }
     }
 
@@ -75,12 +106,26 @@ impl StreamOperator for MapOperator {
     fn checkpoint<'a>(
         &'a mut self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<Vec<DbspHandleRecord>>>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if let Some(state) = self.live_state.as_mut() {
+                state.publish_pending(&self.expressions).await?;
+            }
             if let Some(state) = self.derived_state.as_mut() {
                 let handle = state.latest_handle().await?;
-                Ok(Some(vec![handle]))
+                let OperatorStateHandle {
+                    table,
+                    namespace,
+                    version,
+                } = handle;
+                if let Some(record) =
+                    record_if_nonzero(handle_kinds::OPERATOR_STATE, &table, &namespace, version)
+                {
+                    Ok(Some(vec![record]))
+                } else {
+                    Ok(None)
+                }
             } else {
                 Ok(None)
             }
@@ -123,6 +168,69 @@ impl MapDerivedState {
     }
 }
 
+struct MapLiveState {
+    upstream: DbspHandleStream<ZSetHandle>,
+    cursor: StreamCursor<ZSetHandle>,
+    table: Arc<dyn KeyValueTable>,
+    out: ZSetStream<Vec<u8>>,
+    prev_snapshot: HashMap<Vec<u8>, Diff>,
+    dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+}
+
+impl MapLiveState {
+    fn new(
+        upstream: DbspHandleStream<ZSetHandle>,
+        cursor: StreamCursor<ZSetHandle>,
+        table: Arc<dyn KeyValueTable>,
+        out: ZSetStream<Vec<u8>>,
+    ) -> Self {
+        Self {
+            upstream,
+            cursor,
+            table,
+            out,
+            prev_snapshot: HashMap::new(),
+            dict_cache: HashMap::new(),
+        }
+    }
+
+    async fn publish_pending(&mut self, expressions: &[Expr]) -> Result<()> {
+        while self.upstream.current_time() > self.cursor.observed() {
+            let (_ts, handle) = self.cursor.next().await?;
+            let upstream_state = materialize_zset_handle::<Vec<u8>>(
+                self.table.clone(),
+                &mut self.dict_cache,
+                &handle,
+            )
+            .await?;
+
+            let mut projected: HashMap<Vec<u8>, Diff> = HashMap::new();
+            for (key, diff) in upstream_state {
+                if diff == 0 {
+                    continue;
+                }
+                let row = decode_projected_row_key(&key)?;
+                let mut mapped = Vec::with_capacity(expressions.len());
+                for expr in expressions {
+                    mapped.push(evaluate(expr, &row)?);
+                }
+                let encoded = encode_projected_row_key(&mapped)?;
+                *projected.entry(encoded).or_insert(0) += diff;
+            }
+            projected.retain(|_, diff| *diff != 0);
+            let deltas = compute_delta(&self.prev_snapshot, &projected);
+            if deltas.is_empty() {
+                self.prev_snapshot = projected;
+                continue;
+            }
+            self.out.add_deltas(deltas);
+            self.out.flush().await?;
+            self.prev_snapshot = projected;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
@@ -135,11 +243,10 @@ mod tests {
     use super::*;
     use crate::dataflow_plan::Expr;
     use crate::dbsp_bridge::DbspBridge;
-    use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+    use crate::encoding::encode_projected_row_key;
     use crate::namespaces;
     use crate::operators::test_support::TestSink;
     use crate::stream_types::{Diff, InputPort, OperatorId, OutputPort, Timestamp};
-    use dbsp::DbspMap;
 
     #[test]
     fn projects_rows() {
@@ -198,36 +305,35 @@ mod tests {
             (row(&[10, 1]), -1, 3),
         ];
 
-        for (row, diff, _) in &events {
-            upstream.add_delta(encode_projected_row_key(row).expect("encode"), *diff);
-            upstream.flush().await.expect("flush upstream");
-        }
-
         let upstream_stream = upstream.handle_stream();
-        let exprs = Arc::new(expressions.clone());
-        let projector = {
-            let exprs = Arc::clone(&exprs);
-            move |key: &Vec<u8>| -> Vec<u8> {
-                let row = decode_projected_row_key(key).expect("decode row for map projector");
-                let mut projected = Vec::with_capacity(exprs.len());
-                for expr in exprs.iter() {
-                    projected
-                        .push(evaluate(expr, &row).expect("evaluate expression for map projector"));
-                }
-                encode_projected_row_key(&projected).expect("encode projected row")
-            }
-        };
-        let dbsp_map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream_stream, projector)
+        let output_namespace =
+            namespaces::operator_state("map_test", 0, "output").expect("map output namespace");
+        let output_stream = bridge
+            .new_stream(
+                output_namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
             .await
-            .expect("dbsp map");
-        let derived_stream = dbsp_map.stream();
-        let derived_state = MapDerivedState::new(derived_stream, "map_output_test");
+            .expect("output stream");
+        let output_handle_stream = output_stream.handle_stream();
+        let derived_state = MapDerivedState::new(output_handle_stream.clone(), "map_output_test");
+        let table = bridge.table();
 
         let input = OutputPort::new(OperatorId(0), 0);
         let input_port = InputPort::new(input.operator, input.port_index);
-        let mut operator = MapOperator::new(input_port, expressions, sink, Some(derived_state));
+        let mut operator = MapOperator::new_live(
+            input_port,
+            expressions,
+            sink,
+            upstream_stream,
+            Arc::clone(&table),
+            output_stream,
+            Some(derived_state),
+        );
 
         for (row, diff, ts) in events.clone() {
+            upstream.add_delta(encode_projected_row_key(&row).expect("encode"), diff);
+            upstream.flush().await.expect("flush upstream");
             operator
                 .on_input(input_port, row, diff, ts)
                 .expect("map row");

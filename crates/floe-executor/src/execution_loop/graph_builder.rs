@@ -3,20 +3,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use dbsp::handles::ZSetHandle;
-use dbsp::{DbspFilter, DbspMap, Stream, StreamRetention};
+use dbsp::{Stream, StreamRetention};
 
-use crate::checkpoint::{CheckpointManifest, MaterializedViewCheckpointEntry};
+use crate::checkpoint::{CheckpointManifest, DbspHandleRecord, handle_kinds};
 use crate::circuit_builder::{CircuitContext, RowStreamHandle};
 use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
-use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
-use crate::expr_eval::{evaluate, evaluate_bool};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::operator_state::StateTable;
 use crate::operators::{
-    DispatchSink, EventQueue, FilterDerivedState, FilterOperator, JoinOperator, MapDerivedState,
-    MapOperator, MaterializeOperator, NullSink, ScanOperator,
+    DispatchSink, EventQueue, FilterOperator, JoinOperator, MapDerivedState, MapOperator,
+    MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{InputPort, OperatorId, StreamOperator};
 
@@ -114,13 +112,13 @@ pub async fn build_graph(
         }
     }
 
-    let view_checkpoint_map: HashMap<String, MaterializedViewCheckpointEntry> = checkpoint_manifest
+    let handle_lookup: HashMap<String, DbspHandleRecord> = checkpoint_manifest
         .map(|manifest| {
             manifest
-                .materialized_views
+                .dbsp_handles
                 .iter()
                 .cloned()
-                .map(|entry| (entry.view.clone(), entry))
+                .map(|handle| (handle_lookup_key(&handle.kind, &handle.name), handle))
                 .collect()
         })
         .unwrap_or_default();
@@ -129,14 +127,6 @@ pub async fn build_graph(
     for (idx, node) in plan.operators.iter().enumerate() {
         let op_id = OperatorId(idx);
         let targets = downstreams.get(&op_id).cloned().unwrap_or_else(Vec::new);
-        let checkpoint_handles = checkpoint_manifest
-            .and_then(|manifest| {
-                manifest
-                    .operator_states
-                    .iter()
-                    .find(|entry| entry.operator_index == idx)
-            })
-            .map(|entry| entry.handles.clone());
 
         let operator: Box<dyn StreamOperator> = match node {
             OperatorNode::Scan(scan) => {
@@ -157,34 +147,29 @@ pub async fn build_graph(
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
                 let upstream_stream =
                     require_handle_stream(&operator_handle_streams, map.input.operator)?;
-                let exprs = std::sync::Arc::new(map.expressions.clone());
-                let projector = {
-                    let exprs = std::sync::Arc::clone(&exprs);
-                    move |key: &Vec<u8>| -> Vec<u8> {
-                        let row = decode_projected_row_key(key).expect("decode row for dbsp map");
-                        let mut projected = Vec::with_capacity(exprs.len());
-                        for expr in exprs.iter() {
-                            projected.push(
-                                evaluate(expr, &row).expect("evaluate expression for dbsp map"),
-                            );
-                        }
-                        encode_projected_row_key(&projected)
-                            .expect("encode projected row for dbsp map")
-                    }
-                };
-                let dbsp_map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream_stream, projector)
+                let output_table_name = format!("map_output_{idx}");
+                let output_namespace = namespaces::operator_state(&plan.graph_id, idx, "output")?;
+                let output_stream = bridge
+                    .new_stream(
+                        output_namespace.clone(),
+                        StreamRetention::KeepLast { keep_last: 1 },
+                    )
                     .await
-                    .context("build dbsp-derived map stream")?;
-                let derived_stream = dbsp_map.stream();
-                operator_handle_streams[idx] = Some(derived_stream.clone());
+                    .context("initialize map output stream")?;
+                let output_handle_stream = output_stream.handle_stream();
+                operator_handle_streams[idx] = Some(output_handle_stream.clone());
                 let derived_state = Some(MapDerivedState::new(
-                    derived_stream,
-                    format!("map_output_{idx}"),
+                    output_handle_stream,
+                    output_table_name.clone(),
                 ));
-                Box::new(MapOperator::new(
+                let table = bridge.table();
+                Box::new(MapOperator::new_live(
                     InputPort::new(map.input.operator, map.input.port_index),
                     map.expressions.clone(),
                     sink,
+                    upstream_stream,
+                    table,
+                    output_stream,
                     derived_state,
                 ))
             }
@@ -192,30 +177,24 @@ pub async fn build_graph(
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
                 let upstream_stream =
                     require_handle_stream(&operator_handle_streams, filter.input.operator)?;
-                let predicate_expr = std::sync::Arc::new(filter.predicate.clone());
-                let derived_predicate = {
-                    let expr = std::sync::Arc::clone(&predicate_expr);
-                    move |key: &Vec<u8>| -> bool {
-                        let row =
-                            decode_projected_row_key(key).expect("decode row for dbsp filter");
-                        evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
-                    }
-                };
-                let dbsp_filter =
-                    DbspFilter::new::<Vec<u8>, _>(&upstream_stream, derived_predicate)
-                        .await
-                        .context("build dbsp-derived filter stream")?;
-                let derived_stream = dbsp_filter.stream();
-                operator_handle_streams[idx] = Some(derived_stream.clone());
-                let derived_state = Some(FilterDerivedState::new(
-                    derived_stream,
-                    format!("filter_output_{idx}"),
-                ));
-                Box::new(FilterOperator::new(
+                let filter_namespace = namespaces::operator_state(&plan.graph_id, idx, "filter")?;
+                let output_stream = bridge
+                    .new_stream(
+                        filter_namespace.clone(),
+                        StreamRetention::KeepLast { keep_last: 1 },
+                    )
+                    .await
+                    .context("initialize filter output stream")?;
+                let output_handle_stream = output_stream.handle_stream();
+                operator_handle_streams[idx] = Some(output_handle_stream);
+                let table = bridge.table();
+                Box::new(FilterOperator::new_live(
                     InputPort::new(filter.input.operator, filter.input.port_index),
                     filter.predicate.clone(),
                     sink,
-                    derived_state,
+                    upstream_stream,
+                    table,
+                    output_stream,
                 ))
             }
             OperatorNode::Join(join) => {
@@ -251,7 +230,13 @@ pub async fn build_graph(
                     )
                     .await
                     .context("initialize join output stream")?;
-                operator_handle_streams[idx] = Some(output_stream.handle_stream());
+                let output_handle_stream = output_stream.handle_stream();
+                operator_handle_streams[idx] = Some(output_handle_stream);
+                let output_state = StateTable::new(
+                    output_table_name.clone(),
+                    output_namespace.clone(),
+                    output_stream,
+                );
                 let left_state =
                     StateTable::new(left_table_name.clone(), left_namespace.clone(), left_stream);
                 let right_state = StateTable::new(
@@ -259,21 +244,35 @@ pub async fn build_graph(
                     right_namespace.clone(),
                     right_stream,
                 );
-                if let Some(handles) = &checkpoint_handles {
-                    for handle in handles {
-                        let snapshot = bridge
+                if let Some(handle) = lookup_handle(
+                    &handle_lookup,
+                    handle_kinds::OPERATOR_STATE,
+                    &left_table_name,
+                ) {
+                    left_snapshot_data = Some(
+                        bridge
                             .handle_view_for(&handle.namespace, handle.version)
                             .await
                             .context("open join checkpoint handle")?
                             .materialize()
                             .await
-                            .context("materialize join checkpoint")?;
-                        if handle.table == left_table_name {
-                            left_snapshot_data = Some(snapshot);
-                        } else if handle.table == right_table_name {
-                            right_snapshot_data = Some(snapshot);
-                        }
-                    }
+                            .context("materialize join checkpoint")?,
+                    );
+                }
+                if let Some(handle) = lookup_handle(
+                    &handle_lookup,
+                    handle_kinds::OPERATOR_STATE,
+                    &right_table_name,
+                ) {
+                    right_snapshot_data = Some(
+                        bridge
+                            .handle_view_for(&handle.namespace, handle.version)
+                            .await
+                            .context("open join checkpoint handle")?
+                            .materialize()
+                            .await
+                            .context("materialize join checkpoint")?,
+                    );
                 }
                 Box::new(
                     JoinOperator::new(
@@ -284,9 +283,7 @@ pub async fn build_graph(
                         sink,
                         left_state,
                         right_state,
-                        Some(output_stream),
-                        Some(output_table_name.clone()),
-                        Some(output_namespace.clone()),
+                        Some(output_state),
                         left_snapshot_data,
                         right_snapshot_data,
                     )
@@ -297,13 +294,16 @@ pub async fn build_graph(
             OperatorNode::Materialize(materialize) => {
                 let upstream_stream =
                     require_handle_stream(&operator_handle_streams, materialize.input.operator)?;
-                let checkpoint_entry = view_checkpoint_map.get(&materialize.view_name).cloned();
-                let checkpoint_state = if let Some(entry) = checkpoint_entry {
-                    let handle = bridge
-                        .handle_view_for(&entry.namespace, entry.version)
+                let checkpoint_state = if let Some(handle) = lookup_handle(
+                    &handle_lookup,
+                    handle_kinds::MATERIALIZED_VIEW,
+                    &materialize.view_name,
+                ) {
+                    let view_handle = bridge
+                        .handle_view_for(&handle.namespace, handle.version)
                         .await
                         .context("open materialized view checkpoint handle")?;
-                    let (dict, table, namespace, version) = handle.into_parts();
+                    let (dict, table, namespace, version) = view_handle.into_parts();
                     Some(DbspPersistedState::new(dict, table, namespace, version))
                 } else {
                     None
@@ -357,4 +357,16 @@ fn require_handle_stream(
                 operator
             )
         })
+}
+
+fn lookup_handle(
+    handles: &HashMap<String, DbspHandleRecord>,
+    kind: &str,
+    name: &str,
+) -> Option<DbspHandleRecord> {
+    handles.get(&handle_lookup_key(kind, name)).cloned()
+}
+
+fn handle_lookup_key(kind: &str, name: &str) -> String {
+    format!("{kind}:{name}")
 }

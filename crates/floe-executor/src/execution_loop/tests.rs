@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use super::barrier::{BarrierStage, barrier_failpoints};
 use super::*;
-use crate::checkpoint::CheckpointStore;
+use crate::checkpoint::{CheckpointStore, handle_kinds};
 use crate::circuit_builder::{Circuit, CircuitContext, RowStreamHandle, SourceRegistry};
 use crate::dataflow_plan::{
     DataflowPlan, Expr, FilterNode, JoinNode, MapNode, MaterializeNode, OperatorNode, ScanNode,
@@ -24,6 +24,26 @@ use crate::operators::{DispatchSink, EventQueue, ScanOperator};
 use crate::stream_types::{Diff, Row, StreamOperator, Timestamp};
 use crate::table_provider::MaterializedViewTableProvider;
 use crate::{OperatorId, OutputPort};
+
+async fn build_scan_handle_streams(
+    sources: &[&str],
+    bridge: &mut DbspBridge,
+) -> (
+    std::collections::HashMap<String, Stream<ZSetHandle>>,
+    OuterStreamRegistry,
+) {
+    use crate::outer_stream::OuterStreamRegistry;
+    let names = sources.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let registry = OuterStreamRegistry::from_sources(names.clone(), bridge)
+        .await
+        .expect("outer streams");
+    let mut map = std::collections::HashMap::new();
+    for name in names {
+        let stream = registry.handle_stream(&name).expect("handle stream");
+        map.insert(name, stream);
+    }
+    (map, registry)
+}
 
 fn bid_definition() -> SourceDefinition {
     SourceDefinition::new(
@@ -235,7 +255,7 @@ async fn build_graph_routes_rows_through_runtime() {
             .expect("open SlateDB"),
     );
     let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let scan_streams: HashMap<String, Stream<ZSetHandle>> = HashMap::new();
+    let (scan_streams, outer_registry) = build_scan_handle_streams(&["bid"], &mut bridge).await;
     let built = build_graph(
         &ctx,
         &plan,
@@ -255,7 +275,7 @@ async fn build_graph_routes_rows_through_runtime() {
         built.ops,
         queue.clone(),
         built.scan_operator_map,
-        None,
+        Some(outer_registry),
         None,
     );
     tick.register_bindings(&built.scan_bindings)
@@ -755,8 +775,12 @@ async fn checkpoint_manifest_restores_materialized_view_version() {
         .await
         .expect("load checkpoint")
         .expect("manifest exists");
-    assert_eq!(manifest.materialized_views.len(), 1);
-    let view_entry = manifest.materialized_views[0].clone();
+    let view_entry = manifest
+        .dbsp_handles
+        .iter()
+        .find(|entry| entry.kind == handle_kinds::MATERIALIZED_VIEW && entry.name == "mv_exec")
+        .cloned()
+        .expect("view entry");
 
     drop(tick);
 
@@ -1013,8 +1037,11 @@ async fn materialized_view_failpoint_discards_pending_flush() {
             .await
             .expect("load baseline manifest")
             .expect("manifest present")
-            .materialized_views
-            .get(0)
+            .dbsp_handles
+            .iter()
+            .find(|entry| {
+                entry.kind == handle_kinds::MATERIALIZED_VIEW && entry.name == "mv_flush_failpoint"
+            })
             .map(|entry| entry.version)
             .expect("view entry")
     };
@@ -1048,8 +1075,11 @@ async fn materialized_view_failpoint_discards_pending_flush() {
             .await
             .expect("load manifest")
             .expect("manifest present")
-            .materialized_views
-            .get(0)
+            .dbsp_handles
+            .iter()
+            .find(|entry| {
+                entry.kind == handle_kinds::MATERIALIZED_VIEW && entry.name == "mv_flush_failpoint"
+            })
             .map(|entry| entry.version)
             .expect("view entry")
     };
@@ -1122,13 +1152,20 @@ async fn checkpoint_records_outer_stream_handles_with_offsets() {
         .await
         .expect("load manifest")
         .expect("manifest present");
-    assert_eq!(manifest.outer_streams.len(), 1);
-    let entry = &manifest.outer_streams[0];
-    assert_eq!(entry.source, "bid");
-    assert_eq!(entry.namespace, "src/bid");
-    assert_eq!(entry.partition, 0);
-    assert_eq!(entry.offset, 1);
-    assert!(entry.version >= 1);
+    let source_handle = manifest
+        .dbsp_handles
+        .iter()
+        .find(|handle| handle.kind == handle_kinds::SOURCE && handle.name == "bid")
+        .expect("source handle");
+    assert_eq!(source_handle.namespace, "src/bid");
+    assert!(source_handle.version >= 1);
+    let offset = manifest
+        .source_offsets
+        .iter()
+        .find(|offset| offset.source == "bid")
+        .expect("offset recorded");
+    assert_eq!(offset.partition, 0);
+    assert_eq!(offset.offset, 1);
 }
 
 #[tokio::test]
@@ -1172,12 +1209,15 @@ async fn source_replay_materializes_outer_stream_rows() {
         .await
         .expect("load manifest")
         .expect("manifest present");
-    assert_eq!(manifest.outer_streams.len(), 1);
-    let entry = &manifest.outer_streams[0];
+    let source_handle = manifest
+        .dbsp_handles
+        .iter()
+        .find(|handle| handle.kind == handle_kinds::SOURCE && handle.name == "bid")
+        .expect("source handle");
 
     let mut bridge = DbspBridge::new(db.clone()).await.expect("bridge");
     let view = bridge
-        .handle_view_for(&entry.namespace, entry.version)
+        .handle_view_for(&source_handle.namespace, source_handle.version)
         .await
         .expect("open outer stream handle");
     let materialized = view.materialize().await.expect("materialize outer stream");
@@ -1247,14 +1287,14 @@ async fn offsets_failpoint_preserves_previous_manifest() {
     .expect("pending event");
 
     {
-        let _guard = barrier_failpoints::install_failpoint(BarrierStage::BeforeManifestWrite);
+        let _guard = barrier_failpoints::install_failpoint(BarrierStage::AfterOffsetsBeforeCommit);
         let err = tick
             .advance_watermark(10)
             .await
             .expect_err("failpoint error");
         assert!(
             err.to_string()
-                .contains("barrier failpoint triggered at BeforeManifestWrite")
+                .contains("barrier failpoint triggered at AfterOffsetsBeforeCommit")
         );
     }
 
@@ -1325,14 +1365,14 @@ async fn post_manifest_failpoint_preserves_commit() {
     .expect("second event");
 
     {
-        let _guard = barrier_failpoints::install_failpoint(BarrierStage::AfterManifestWrite);
+        let _guard = barrier_failpoints::install_failpoint(BarrierStage::AfterCommit);
         let err = tick
             .advance_watermark(10)
             .await
             .expect_err("failpoint error");
         assert!(
             err.to_string()
-                .contains("barrier failpoint triggered at AfterManifestWrite")
+                .contains("barrier failpoint triggered at AfterCommit")
         );
     }
 

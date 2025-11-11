@@ -102,6 +102,13 @@ impl DbspView {
         self.zset.add_delta(key, diff);
     }
 
+    pub fn add_deltas<I>(&mut self, deltas: I)
+    where
+        I: IntoIterator<Item = (Vec<u8>, i64)>,
+    {
+        self.zset.add_deltas(deltas);
+    }
+
     pub async fn flush(&mut self) -> Result<ZSetHandle> {
         self.zset.flush().await
     }

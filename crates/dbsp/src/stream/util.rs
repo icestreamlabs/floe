@@ -158,7 +158,7 @@ where
     apply_on_resolved_handles(outer, inner_group, out_prefix, |inner| op(inner)).await
 }
 
-pub(crate) async fn materialize_zset_handle<K>(
+pub async fn materialize_zset_handle<K>(
     table: Arc<dyn KeyValueTable>,
     cache: &mut HashMap<String, Arc<Dictionary<K>>>,
     handle: &ZSetHandle,
@@ -195,7 +195,7 @@ where
     Ok(map)
 }
 
-pub(crate) fn compute_delta<K>(previous: &HashMap<K, i64>, next: &HashMap<K, i64>) -> Vec<(K, i64)>
+pub fn compute_delta<K>(previous: &HashMap<K, i64>, next: &HashMap<K, i64>) -> Vec<(K, i64)>
 where
     K: Eq + Hash + Clone,
 {

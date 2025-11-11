@@ -1,14 +1,17 @@
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
-use dbsp::stream::Stream;
+use dbsp::stream::util::{compute_delta, materialize_zset_handle};
+use dbsp::stream::{Stream, StreamCursor};
 
-use crate::checkpoint::MaterializedViewCheckpointEntry;
+use crate::checkpoint::{DbspHandleRecord, handle_kinds, record_if_nonzero};
 use crate::dbsp_bridge::DbspView;
 use crate::encoding::decode_projected_row_key;
 use crate::materialized_view::{
@@ -21,12 +24,13 @@ pub struct MaterializeOperator {
     input: InputPort,
     sink: Box<dyn RowSink>,
     view: Arc<MaterializedViewHandle>,
-    dbsp: Option<DbspView>,
+    dbsp_view: Option<DbspView>,
     upstream: Stream<ZSetHandle>,
+    cursor: StreamCursor<ZSetHandle>,
     table: Arc<dyn KeyValueTable>,
     dictionary_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>>,
     prev_snapshot: HashMap<Vec<u8>, i64>,
-    last_published_ts: Option<i64>,
+    latest_persisted: Option<(String, u64)>,
 }
 
 impl MaterializeOperator {
@@ -38,36 +42,47 @@ impl MaterializeOperator {
         sink: impl RowSink,
         upstream: Stream<ZSetHandle>,
         table: Arc<dyn KeyValueTable>,
-        dbsp: Option<DbspView>,
+        dbsp_view: Option<DbspView>,
         checkpoint: Option<DbspPersistedState>,
     ) -> Result<Self> {
-        if dbsp.is_none() {
+        if dbsp_view.is_none() {
             return Err(anyhow!(
                 "materialize operator requires a DBSP view to publish handles"
             ));
         }
         let view = registry.register(view_name.into());
         let mut prev_snapshot = HashMap::new();
+        let mut latest_persisted = None;
         if let Some(state) = checkpoint {
             view.set_dbsp_state(state.clone());
             let snapshot = materialize_checkpoint(&state).await?;
             apply_snapshot_to_view(&view, &snapshot)?;
             prev_snapshot = snapshot;
-        } else if let Some(ref dbsp_view) = dbsp {
-            let latest = dbsp_view.latest_handle_view();
+            latest_persisted = Some((state.namespace().to_string(), state.version()));
+        } else if let Some(ref view_state) = dbsp_view {
+            let latest = view_state.latest_handle_view();
             let (dict, table, namespace, version) = latest.into_parts();
-            view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+            if version > 0 {
+                let state = DbspPersistedState::new(dict, table, namespace.clone(), version);
+                view.set_dbsp_state(state.clone());
+                let snapshot = materialize_checkpoint(&state).await?;
+                apply_snapshot_to_view(&view, &snapshot)?;
+                prev_snapshot = snapshot;
+                latest_persisted = Some((namespace, version));
+            }
         }
+        let cursor = StreamCursor::new(upstream.clone());
         Ok(Self {
             input,
             sink: Box::new(sink),
             view,
-            dbsp,
+            dbsp_view,
             upstream,
+            cursor,
             table,
             dictionary_cache: HashMap::new(),
             prev_snapshot,
-            last_published_ts: None,
+            latest_persisted,
         })
     }
 
@@ -80,67 +95,35 @@ impl MaterializeOperator {
         self.sink.as_ref()
     }
 
-    pub async fn checkpoint_state(&mut self) -> Result<Option<MaterializedViewCheckpointEntry>> {
-        self.publish_pending().await?;
-        if self.dbsp.is_none() {
-            return Ok(None);
-        }
-        if let Some(state) = self.view.dbsp_state() {
-            Ok(Some(MaterializedViewCheckpointEntry {
-                view: self.view.name().to_string(),
-                namespace: state.namespace().to_string(),
-                version: state.version(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn publish_pending(&mut self) -> Result<()> {
-        let mut next_ts = self.last_published_ts.unwrap_or(0) + 1;
-        let frontier = self.upstream.current_time();
-        while next_ts <= frontier {
-            let handle = self
-                .upstream
-                .get(next_ts)
-                .await
-                .with_context(|| format!("load upstream handle at ts {next_ts}"))?;
-            self.replicate_handle(next_ts, handle).await?;
-            self.last_published_ts = Some(next_ts);
-            next_ts += 1;
+        while self.upstream.current_time() > self.cursor.observed() {
+            let (_ts, handle) = self.cursor.next().await?;
+            self.replicate_handle(&handle).await?;
         }
         Ok(())
     }
 
-    async fn replicate_handle(&mut self, ts: i64, handle: ZSetHandle) -> Result<()> {
-        let snapshot = self
-            .materialize_upstream_handle(&handle)
-            .await
-            .with_context(|| {
-                format!(
-                    "materialize upstream handle {}@{}",
-                    handle.ns, handle.version
-                )
-            })?;
+    async fn replicate_handle(&mut self, handle: &ZSetHandle) -> Result<()> {
+        let snapshot = materialize_zset_handle::<Vec<u8>>(
+            self.table.clone(),
+            &mut self.dictionary_cache,
+            handle,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "materialize upstream handle {}@{}",
+                handle.ns, handle.version
+            )
+        })?;
         let deltas = compute_delta(&self.prev_snapshot, &snapshot);
-        self.apply_view_deltas(&deltas)?;
-        let dbsp_view = self
-            .dbsp
-            .as_mut()
-            .ok_or_else(|| anyhow!("materialize operator requires DBSP view for publishing"))?;
-        for (key, diff) in &deltas {
-            if *diff == 0 {
-                continue;
-            }
-            dbsp_view.add_delta(key.clone(), *diff);
+        if deltas.is_empty() {
+            self.prev_snapshot = snapshot;
+            return Ok(());
         }
-        dbsp_view.flush().await?;
-        let view_handle = dbsp_view.latest_handle_view();
-        let (dict, table, namespace, version) = view_handle.into_parts();
-        self.view
-            .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+        self.apply_view_deltas(&deltas)?;
+        self.persist_dbsp_state(deltas).await?;
         self.prev_snapshot = snapshot;
-        self.last_published_ts = Some(ts);
         Ok(())
     }
 
@@ -156,27 +139,28 @@ impl MaterializeOperator {
         Ok(())
     }
 
-    async fn materialize_upstream_handle(
-        &mut self,
-        handle: &ZSetHandle,
-    ) -> Result<HashMap<Vec<u8>, i64>> {
-        let dict = if let Some(existing) = self.dictionary_cache.get(&handle.ns) {
-            existing.clone()
-        } else {
-            let dictionary = Arc::new(
-                Dictionary::with_table(self.table.clone(), handle.ns.clone(), None).await?,
-            );
-            self.dictionary_cache
-                .insert(handle.ns.clone(), dictionary.clone());
-            dictionary
-        };
-        let view = ZSetHandleView::new(dict, self.table.clone(), handle.ns.clone(), handle.version);
-        let mut snapshot = view
-            .materialize()
-            .await
-            .context("materialize upstream handle contents")?;
-        snapshot.retain(|_, diff| *diff != 0);
-        Ok(snapshot)
+    async fn persist_dbsp_state(&mut self, deltas: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let dbsp_view = self
+            .dbsp_view
+            .as_mut()
+            .ok_or_else(|| anyhow!("materialize operator requires DBSP view for publishing"))?;
+        dbsp_view.add_deltas(deltas);
+        let mv_handle = dbsp_view.flush().await?;
+        if mv_handle.version > 0 {
+            let handle_view = dbsp_view.latest_handle_view();
+            let (dict, table, namespace, version) = handle_view.into_parts();
+            self.view.set_dbsp_state(DbspPersistedState::new(
+                dict,
+                table,
+                namespace.clone(),
+                version,
+            ));
+            self.latest_persisted = Some((namespace, version));
+        }
+        Ok(())
     }
 }
 
@@ -207,6 +191,25 @@ impl StreamOperator for MaterializeOperator {
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
         self.view.update_watermark(watermark);
         self.sink.watermark(watermark)
+    }
+
+    fn checkpoint<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<DbspHandleRecord>>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.publish_pending().await?;
+            if let Some((namespace, version)) = &self.latest_persisted {
+                if let Some(record) = record_if_nonzero(
+                    handle_kinds::MATERIALIZED_VIEW,
+                    self.view.name(),
+                    namespace,
+                    *version,
+                ) {
+                    return Ok(Some(vec![record]));
+                }
+            }
+            Ok(None)
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -244,26 +247,6 @@ fn apply_snapshot_to_view(
         view.apply(row, *diff);
     }
     Ok(())
-}
-
-fn compute_delta(
-    previous: &HashMap<Vec<u8>, i64>,
-    next: &HashMap<Vec<u8>, i64>,
-) -> Vec<(Vec<u8>, i64)> {
-    let mut deltas = Vec::new();
-    for (key, next_weight) in next {
-        let prev_weight = previous.get(key).copied().unwrap_or(0);
-        if *next_weight != prev_weight {
-            deltas.push((key.clone(), next_weight - prev_weight));
-        }
-    }
-    for (key, prev_weight) in previous {
-        if !next.contains_key(key) && *prev_weight != 0 {
-            deltas.push((key.clone(), -*prev_weight));
-        }
-    }
-    deltas.retain(|(_, delta)| *delta != 0);
-    deltas
 }
 
 #[cfg(test)]
@@ -321,7 +304,7 @@ mod tests {
         let first = row(&[1]);
         upstream.add_delta(encode_projected_row_key(&first).expect("encode first"), 1);
         upstream.flush().await.expect("flush first");
-        operator.checkpoint_state().await.expect("checkpoint state");
+        operator.checkpoint().await.expect("checkpoint state");
 
         let view = registry.get("mv_q0").expect("view registered");
         assert_eq!(view.snapshot().get(&first), Some(&1));
@@ -330,9 +313,45 @@ mod tests {
         let second = row(&[2]);
         upstream.add_delta(encode_projected_row_key(&second).expect("encode second"), 1);
         upstream.flush().await.expect("flush second");
-        operator.checkpoint_state().await.expect("checkpoint state");
+        operator.checkpoint().await.expect("checkpoint state");
 
         assert!(view.snapshot().get(&first).is_none());
         assert_eq!(view.snapshot().get(&second), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn skips_zero_version_state_updates() {
+        let port = OutputPort::new(OperatorId(0), 0);
+        let sink = NullSink::default();
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("materialize-zero", store).await.expect("open db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let upstream_ns =
+            namespaces::operator_state("materialize_zero", 0, "upstream").expect("ns");
+        let upstream = bridge
+            .new_stream(upstream_ns, StreamRetention::KeepLast { keep_last: 1 })
+            .await
+            .expect("upstream stream");
+        let upstream_stream = upstream.handle_stream();
+        let table = bridge.table();
+        let dbsp_view = bridge.new_view("mv_zero").await.expect("mv view");
+        let mut operator = MaterializeOperator::new(
+            InputPort::new(port.operator, 0),
+            "mv_zero",
+            registry.clone(),
+            sink,
+            upstream_stream,
+            table,
+            Some(dbsp_view),
+            None,
+        )
+        .await
+        .expect("materialize operator");
+
+        let checkpoint = operator.checkpoint().await.expect("checkpoint state");
+        assert!(checkpoint.is_none(), "v0 handles must be skipped");
+        let view = registry.get("mv_zero").expect("view registered");
+        assert!(view.dbsp_state().is_none(), "registry should remain empty");
     }
 }

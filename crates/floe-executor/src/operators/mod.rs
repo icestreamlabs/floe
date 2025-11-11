@@ -4,7 +4,7 @@ mod map;
 mod materialize;
 mod scan;
 
-pub use filter::{FilterDerivedState, FilterOperator};
+pub use filter::FilterOperator;
 pub use join::JoinOperator;
 pub use map::{MapDerivedState, MapOperator};
 pub use materialize::MaterializeOperator;

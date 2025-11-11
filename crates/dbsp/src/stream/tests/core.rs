@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::algebra::AbelianGroup;
-use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::core::stream::Stream;
@@ -262,7 +261,7 @@ async fn stream_cursor_tracks_new_versions() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
     let dict = Arc::new(
-        Dictionary::with_table(table.clone(), "cursor_stream", None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "cursor_stream", None)
             .await
             .expect("dictionary"),
     );
@@ -300,7 +299,7 @@ async fn handle_stream_clones_observe_frontier_advances() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
     let dict = Arc::new(
-        Dictionary::with_table(table.clone(), "handle_clone_stream", None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "handle_clone_stream", None)
             .await
             .expect("dictionary"),
     );
@@ -355,7 +354,7 @@ async fn stream_reopens_at_persisted_frontier() {
     let namespace = "stream_restart_frontier";
     {
         let dict = Arc::new(
-            Dictionary::with_table(table.clone(), namespace, None)
+            Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
                 .await
                 .expect("dictionary"),
         );
@@ -374,7 +373,7 @@ async fn stream_reopens_at_persisted_frontier() {
     }
 
     let dict = Arc::new(
-        Dictionary::with_table(table.clone(), namespace, None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
             .await
             .expect("dictionary"),
     );
@@ -401,7 +400,7 @@ async fn concurrent_latest_and_get_observe_consistent_handles() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
     let dict = Arc::new(
-        Dictionary::with_table(table.clone(), "stream_concurrent_latest", None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "stream_concurrent_latest", None)
             .await
             .expect("dictionary"),
     );
@@ -435,12 +434,12 @@ async fn handle_operator_runtime_waits_for_alignment() {
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
 
     let dict_left = Arc::new(
-        Dictionary::with_table(table.clone(), "runtime_left", None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "runtime_left", None)
             .await
             .expect("left dict"),
     );
     let dict_right = Arc::new(
-        Dictionary::with_table(table.clone(), "runtime_right", None)
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "runtime_right", None)
             .await
             .expect("right dict"),
     );

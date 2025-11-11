@@ -1,12 +1,20 @@
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use dbsp::ZSetStream;
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::Stream as DbspHandleStream;
+use dbsp::stream::StreamCursor;
+use dbsp::stream::util::{compute_delta, materialize_zset_handle};
 
+use crate::checkpoint::DbspHandleRecord;
 use crate::dataflow_plan::Expr;
+use crate::encoding::decode_projected_row_key;
 use crate::expr_eval::evaluate_bool;
-use crate::operator_state::OperatorStateHandle;
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
@@ -14,34 +22,39 @@ pub struct FilterOperator {
     input: InputPort,
     predicate: Expr,
     sink: Box<dyn RowSink>,
-    derived_state: Option<FilterDerivedState>,
+    live_state: Option<FilterLiveState>,
 }
 
 impl FilterOperator {
-    pub fn new(
-        input: InputPort,
-        predicate: Expr,
-        sink: impl RowSink,
-        derived_state: Option<FilterDerivedState>,
-    ) -> Self {
+    pub fn new(input: InputPort, predicate: Expr, sink: impl RowSink) -> Self {
         Self {
             input,
             predicate,
             sink: Box::new(sink),
-            derived_state,
+            live_state: None,
+        }
+    }
+
+    pub fn new_live(
+        input: InputPort,
+        predicate: Expr,
+        sink: impl RowSink,
+        upstream: DbspHandleStream<ZSetHandle>,
+        table: Arc<dyn KeyValueTable>,
+        out: ZSetStream<Vec<u8>>,
+    ) -> Self {
+        let cursor = StreamCursor::new(upstream.clone());
+        Self {
+            input,
+            predicate,
+            sink: Box::new(sink),
+            live_state: Some(FilterLiveState::new(upstream, cursor, table, out)),
         }
     }
 
     #[cfg(test)]
     pub fn sink(&self) -> &dyn RowSink {
         self.sink.as_ref()
-    }
-
-    #[cfg(test)]
-    pub fn latest_handle(&self) -> Option<&ZSetHandle> {
-        self.derived_state
-            .as_ref()
-            .and_then(|derived| derived.current_handle())
     }
 }
 
@@ -57,11 +70,10 @@ impl StreamOperator for FilterOperator {
             bail!("filter received input from unexpected port: {:?}", input);
         }
 
-        if evaluate_bool(&self.predicate, &row)? {
-            self.sink.push(row, diff, timestamp)
-        } else {
-            Ok(())
+        if !evaluate_bool(&self.predicate, &row)? {
+            return Ok(());
         }
+        self.sink.push(row, diff, timestamp)
     }
 
     fn on_watermark(&mut self, watermark: Timestamp) -> Result<()> {
@@ -79,57 +91,81 @@ impl StreamOperator for FilterOperator {
     fn checkpoint<'a>(
         &'a mut self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<Vec<DbspHandleRecord>>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if let Some(derived) = self.derived_state.as_mut() {
-                let handle = derived.latest_handle().await?;
-                return Ok(Some(vec![handle]));
+            if let Some(state) = self.live_state.as_mut() {
+                state.publish_pending(&self.predicate).await?;
             }
             Ok(None)
         })
     }
 }
 
-pub struct FilterDerivedState {
-    stream: DbspHandleStream<ZSetHandle>,
-    table: String,
-    latest: Option<ZSetHandle>,
+struct FilterLiveState {
+    upstream: DbspHandleStream<ZSetHandle>,
+    cursor: StreamCursor<ZSetHandle>,
+    table: Arc<dyn KeyValueTable>,
+    out: ZSetStream<Vec<u8>>,
+    prev_snapshot: HashMap<Vec<u8>, Diff>,
+    dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>>,
 }
 
-impl FilterDerivedState {
-    pub fn new(stream: DbspHandleStream<ZSetHandle>, table: impl Into<String>) -> Self {
+impl FilterLiveState {
+    fn new(
+        upstream: DbspHandleStream<ZSetHandle>,
+        cursor: StreamCursor<ZSetHandle>,
+        table: Arc<dyn KeyValueTable>,
+        out: ZSetStream<Vec<u8>>,
+    ) -> Self {
         Self {
-            stream,
-            table: table.into(),
-            latest: None,
+            upstream,
+            cursor,
+            table,
+            out,
+            prev_snapshot: HashMap::new(),
+            dict_cache: HashMap::new(),
         }
     }
 
-    pub fn handle_stream(&self) -> DbspHandleStream<ZSetHandle> {
-        self.stream.clone()
-    }
+    async fn publish_pending(&mut self, predicate: &Expr) -> Result<()> {
+        while self.upstream.current_time() > self.cursor.observed() {
+            let (_ts, handle) = self.cursor.next().await?;
+            let upstream_state = materialize_zset_handle::<Vec<u8>>(
+                self.table.clone(),
+                &mut self.dict_cache,
+                &handle,
+            )
+            .await?;
 
-    pub async fn latest_handle(&mut self) -> Result<OperatorStateHandle> {
-        let handle = self.stream.latest().await?;
-        self.latest = Some(handle.clone());
-        Ok(OperatorStateHandle::new(
-            self.table.clone(),
-            handle.ns.clone(),
-            handle.version,
-        ))
-    }
-
-    #[cfg(test)]
-    pub fn current_handle(&self) -> Option<&ZSetHandle> {
-        self.latest.as_ref()
+            let mut filtered: HashMap<Vec<u8>, Diff> = HashMap::new();
+            for (key, diff) in upstream_state {
+                if diff == 0 {
+                    continue;
+                }
+                let row = decode_projected_row_key(&key)?;
+                if evaluate_bool(predicate, &row)? {
+                    filtered.insert(key, diff);
+                }
+            }
+            let deltas = compute_delta(&self.prev_snapshot, &filtered);
+            if deltas.is_empty() {
+                self.prev_snapshot = filtered;
+                continue;
+            }
+            self.out.add_deltas(deltas);
+            self.out.flush().await?;
+            self.prev_snapshot = filtered;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
-    use dbsp::{DbspFilter, StreamRetention};
+    use dbsp::StreamRetention;
+    use dbsp::stream::util::materialize_zset_handle;
     use object_store::{ObjectStore, memory::InMemory};
     use slatedb::Db;
     use std::collections::HashMap;
@@ -138,8 +174,7 @@ mod tests {
     use super::*;
     use crate::dataflow_plan::Expr;
     use crate::dbsp_bridge::DbspBridge;
-    use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
-    use crate::expr_eval::evaluate_bool;
+    use crate::encoding::encode_projected_row_key;
     use crate::namespaces;
     use crate::operators::test_support::TestSink;
     use crate::stream_types::{Diff, InputPort, OperatorId, OutputPort, Timestamp};
@@ -152,8 +187,7 @@ mod tests {
             Box::new(Expr::column(0)),
             Box::new(Expr::literal(ScalarValue::Int64(Some(42)))),
         );
-        let mut operator =
-            FilterOperator::new(InputPort::new(port.operator, 0), predicate, sink, None);
+        let mut operator = FilterOperator::new(InputPort::new(port.operator, 0), predicate, sink);
 
         let accepted = vec![ScalarValue::Int64(Some(42))];
         operator
@@ -172,7 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_dbsp_output_matches_sink_state() {
+    async fn filter_output_matches_sink_output() {
         let predicate = Expr::Eq(
             Box::new(Expr::column(0)),
             Box::new(Expr::literal(ScalarValue::Int64(Some(42)))),
@@ -180,7 +214,7 @@ mod tests {
         let sink = AccumulatingSink::default();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(
-            Db::open("filter-dbsp-equivalence", store)
+            Db::open("filter-live-equivalence", store)
                 .await
                 .expect("open db"),
         );
@@ -195,23 +229,28 @@ mod tests {
             .await
             .expect("upstream stream");
         let upstream_stream = upstream.handle_stream();
-        let predicate_expr = Arc::new(predicate.clone());
-        let derived_predicate = {
-            let expr = Arc::clone(&predicate_expr);
-            move |key: &Vec<u8>| -> bool {
-                let row = decode_projected_row_key(key).expect("decode row for dbsp filter");
-                evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
-            }
-        };
-        let dbsp_filter = DbspFilter::new::<Vec<u8>, _>(&upstream_stream, derived_predicate)
+        let output_namespace =
+            namespaces::operator_state("filter_test", 0, "output").expect("filter output ns");
+        let output_stream = bridge
+            .new_stream(
+                output_namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
             .await
-            .expect("build dbsp filter");
-        let derived_stream = dbsp_filter.stream();
-        let derived_state = FilterDerivedState::new(derived_stream, "filter_output_test");
+            .expect("filter state stream");
+        let mut output_handle_stream = output_stream.handle_stream();
+        let table = bridge.table();
 
         let port = OutputPort::new(OperatorId(0), 0);
         let input_port = InputPort::new(port.operator, 0);
-        let mut operator = FilterOperator::new(input_port, predicate, sink, Some(derived_state));
+        let mut operator = FilterOperator::new_live(
+            input_port,
+            predicate.clone(),
+            sink,
+            upstream_stream,
+            Arc::clone(&table),
+            output_stream,
+        );
 
         let events = vec![
             (row(&[42]), 1, 1),
@@ -221,10 +260,10 @@ mod tests {
         ];
         for (row, diff, _) in &events {
             upstream.add_delta(
-                encode_projected_row_key(row).expect("encode row for dbsp filter"),
+                encode_projected_row_key(row).expect("encode row for filter"),
                 *diff,
             );
-            upstream.flush().await.expect("flush upstream state");
+            upstream.flush().await.expect("flush upstream");
         }
         for (row, diff, ts) in events.clone() {
             operator
@@ -232,13 +271,16 @@ mod tests {
                 .expect("apply filter");
         }
 
-        let handles = operator
-            .checkpoint()
+        operator.checkpoint().await.expect("checkpoint");
+
+        let latest = output_handle_stream
+            .latest()
             .await
-            .expect("checkpoint")
-            .expect("handles");
-        assert_eq!(handles.len(), 1);
-        let db_state = materialize_output_state(Arc::clone(&db), &handles[0]).await;
+            .expect("latest filter handle");
+        let mut dict_cache = HashMap::new();
+        let db_state = materialize_zset_handle::<Vec<u8>>(table, &mut dict_cache, &latest)
+            .await
+            .expect("materialize filter output handle");
         let sink_state = operator
             .sink()
             .as_any()
@@ -246,21 +288,6 @@ mod tests {
             .expect("accumulating sink")
             .snapshot();
         assert_eq!(db_state, sink_state);
-        assert!(operator.latest_handle().is_some());
-    }
-
-    async fn materialize_output_state(
-        db: Arc<Db>,
-        handle: &OperatorStateHandle,
-    ) -> HashMap<Vec<u8>, Diff> {
-        let mut bridge = DbspBridge::new(db).await.expect("bridge");
-        bridge
-            .handle_view_for(&handle.namespace, handle.version)
-            .await
-            .expect("handle view")
-            .materialize()
-            .await
-            .expect("materialize")
     }
 
     fn row(values: &[i64]) -> Row {

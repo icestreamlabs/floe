@@ -182,6 +182,13 @@ impl MaterializedViewTableProvider {
             .materialize()
             .await
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        #[cfg(test)]
+        eprintln!(
+            "materialize_dbsp_rows view={} version {} snapshot len {}",
+            self.view_name,
+            target_version,
+            snapshot.len()
+        );
         let mut rows = Vec::new();
         for (key, diff) in snapshot {
             let decoded = decode_projected_row_key(&key)
@@ -325,7 +332,8 @@ mod tests {
     use crate::dbsp_bridge::DbspBridge;
     use crate::encoding::encode_projected_row_key;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::logical_expr::{Column, Expr, Operator};
+    use datafusion::common::Column;
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use datafusion::scalar::ScalarValue;
     use object_store::{ObjectStore, memory::InMemory};
     use slatedb::Db;
@@ -423,16 +431,16 @@ mod tests {
 
     #[test]
     fn mv_version_filter_is_extracted() {
-        let mv_filter = Expr::BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("__mv_version"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::UInt64(Some(7)), None)),
-        };
-        let other_filter = Expr::BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("auction"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
-        };
+        let mv_filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("__mv_version"))),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::UInt64(Some(7)), None)),
+        ));
+        let other_filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name("auction"))),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
+        ));
         let filters = vec![mv_filter.clone(), other_filter.clone()];
         let (version, retained) = super::extract_mv_version_filter(&filters);
         assert_eq!(version, Some(7));

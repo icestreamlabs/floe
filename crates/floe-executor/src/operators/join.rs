@@ -3,13 +3,14 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
 use datafusion::scalar::ScalarValue;
-use dbsp::ZSetStream;
+#[cfg(test)]
 use dbsp::handles::ZSetHandle;
 
+use crate::checkpoint::{DbspHandleRecord, handle_kinds, record_if_nonzero};
 use crate::dataflow_plan::Expr;
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::expr_eval::evaluate;
-use crate::operator_state::{OperatorStateHandle, StateTable};
+use crate::operator_state::StateTable;
 use crate::operators::RowSink;
 use crate::stream_types::{Diff, InputPort, Row, StreamOperator, Timestamp};
 
@@ -29,10 +30,7 @@ pub struct JoinOperator {
     right_store: StateTable,
     left_state: HashMap<Vec<ScalarValue>, Vec<StoredRow>>,
     right_state: HashMap<Vec<ScalarValue>, Vec<StoredRow>>,
-    output_stream: Option<ZSetStream<Vec<u8>>>,
-    output_table: Option<String>,
-    output_namespace: Option<String>,
-    latest_output_handle: Option<ZSetHandle>,
+    output_state: Option<StateTable>,
 }
 
 impl JoinOperator {
@@ -44,15 +42,10 @@ impl JoinOperator {
         sink: impl RowSink,
         left_store: StateTable,
         right_store: StateTable,
-        output_stream: Option<ZSetStream<Vec<u8>>>,
-        output_table: Option<String>,
-        output_namespace: Option<String>,
+        output_state: Option<StateTable>,
         left_snapshot: Option<HashMap<Vec<u8>, Diff>>,
         right_snapshot: Option<HashMap<Vec<u8>, Diff>>,
     ) -> Result<Self> {
-        let latest_output_handle = output_stream
-            .as_ref()
-            .map(|stream| stream.current_handle().clone());
         let mut operator = Self {
             left_input,
             right_input,
@@ -63,10 +56,7 @@ impl JoinOperator {
             right_store,
             left_state: HashMap::new(),
             right_state: HashMap::new(),
-            output_stream,
-            output_table,
-            output_namespace,
-            latest_output_handle,
+            output_state,
         };
         operator
             .restore_persisted_state(left_snapshot, right_snapshot)
@@ -80,8 +70,10 @@ impl JoinOperator {
     }
 
     #[cfg(test)]
-    pub fn latest_output_handle(&self) -> Option<&ZSetHandle> {
-        self.latest_output_handle.as_ref()
+    pub fn latest_output_handle(&self) -> Option<ZSetHandle> {
+        self.output_state
+            .as_ref()
+            .map(|state| state.current_handle())
     }
 
     async fn restore_persisted_state(
@@ -206,26 +198,22 @@ impl JoinOperator {
         if diff == 0 {
             return Ok(());
         }
-        if let Some(stream) = self.output_stream.as_mut() {
+        if let Some(state) = self.output_state.as_mut() {
             let encoded = encode_projected_row_key(row)?;
-            stream.add_delta(encoded, diff);
+            state.add_delta(encoded, diff);
         }
         Ok(())
     }
 
-    async fn flush_output_stream(&mut self) -> Result<Option<OperatorStateHandle>> {
-        if let Some(stream) = self.output_stream.as_mut() {
-            let handle = stream.flush().await?;
-            self.latest_output_handle = Some(handle.clone());
-            if let (Some(table), Some(namespace)) =
-                (self.output_table.as_ref(), self.output_namespace.as_ref())
-            {
-                return Ok(Some(OperatorStateHandle::new(
-                    table.clone(),
-                    namespace.clone(),
-                    handle.version,
-                )));
-            }
+    async fn flush_output_state(&mut self) -> Result<Option<DbspHandleRecord>> {
+        if let Some(state) = self.output_state.as_mut() {
+            let handle = state.flush().await?;
+            return Ok(record_if_nonzero(
+                handle_kinds::JOIN_OUTPUT,
+                &handle.table,
+                &handle.namespace,
+                handle.version,
+            ));
         }
         Ok(None)
     }
@@ -255,16 +243,36 @@ impl StreamOperator for JoinOperator {
     fn checkpoint<'a>(
         &'a mut self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Vec<OperatorStateHandle>>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<Vec<DbspHandleRecord>>>> + Send + 'a>,
     > {
         Box::pin(async move {
             let mut handles = Vec::new();
-            handles.push(self.left_store.flush().await?);
-            handles.push(self.right_store.flush().await?);
-            if let Some(handle) = self.flush_output_stream().await? {
+            let left = self.left_store.flush().await?;
+            if let Some(record) = record_if_nonzero(
+                handle_kinds::OPERATOR_STATE,
+                &left.table,
+                &left.namespace,
+                left.version,
+            ) {
+                handles.push(record);
+            }
+            let right = self.right_store.flush().await?;
+            if let Some(record) = record_if_nonzero(
+                handle_kinds::OPERATOR_STATE,
+                &right.table,
+                &right.namespace,
+                right.version,
+            ) {
+                handles.push(record);
+            }
+            if let Some(handle) = self.flush_output_state().await? {
                 handles.push(handle);
             }
-            Ok(Some(handles))
+            if handles.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(handles))
+            }
         })
     }
 
@@ -381,6 +389,11 @@ mod tests {
             )
             .await
             .expect("output stream");
+        let output_state = StateTable::new(
+            "join_output".to_string(),
+            output_namespace.clone(),
+            output_stream,
+        );
 
         let left_state = StateTable::new("join_left".to_string(), left_namespace, left_stream);
         let right_state = StateTable::new("join_right".to_string(), right_namespace, right_stream);
@@ -398,9 +411,7 @@ mod tests {
             sink,
             left_state,
             right_state,
-            Some(output_stream),
-            Some("join_output".to_string()),
-            Some(output_namespace.clone()),
+            Some(output_state),
             None,
             None,
         )
@@ -463,7 +474,7 @@ mod tests {
         assert_eq!(handles.len(), 3);
         let output = handles
             .iter()
-            .find(|handle| handle.table == "join_output")
+            .find(|handle| handle.name == "join_output")
             .expect("output handle present");
         assert!(output.version >= 1);
         assert!(op.latest_output_handle().is_some());
@@ -492,10 +503,10 @@ mod tests {
                     .expect("process join input");
             }
             let handles = op.checkpoint().await.expect("checkpoint").expect("handles");
-            let output_handle = handles
-                .iter()
-                .find(|handle| handle.table == "join_output")
-                .expect("output handle present");
+            let Some(output_handle) = handles.iter().find(|handle| handle.name == "join_output")
+            else {
+                continue;
+            };
             let db_state =
                 materialize_output_state(Arc::clone(&db), &output_ns, output_handle.version).await;
             let sink_state = {
