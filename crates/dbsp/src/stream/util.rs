@@ -47,10 +47,10 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let mut clone = stream.clone();
-    if up_to > clone.timestamp {
+    if up_to > clone.current_time() {
         clone.get(up_to).await?;
     } else {
-        clone.get(clone.timestamp).await?;
+        clone.get(clone.current_time()).await?;
     }
     clone.to_vec().await
 }
@@ -101,7 +101,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     Fut: Future<Output = Result<Stream<T>>>,
 {
-    let handles = collect_values(input, input.timestamp).await?;
+    let handles = collect_values(input, input.current_time()).await?;
     let mut derived_handles = Vec::with_capacity(handles.len());
 
     for handle in handles {
@@ -117,11 +117,10 @@ where
     let default_handle = derived_handles
         .first()
         .cloned()
-        .unwrap_or_else(|| input.default.clone());
+        .unwrap_or_else(|| input.default_value());
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result =
-        build_derived_stream(input.table.clone(), handle_group, namespace_prefix).await?;
+    let mut result = build_derived_stream(input.table(), handle_group, namespace_prefix).await?;
 
     if derived_handles.is_empty() {
         set_default_in_place(&mut result, default_handle);
@@ -230,9 +229,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    stream.default = value.clone();
-    stream.pending_defaults.insert(stream.timestamp, value);
-    stream.pending_state = true;
+    stream.set_default_in_place(value);
 }
 
 pub(crate) fn push_value_in_place<T>(stream: &mut Stream<T>, value: T)
@@ -246,12 +243,5 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let next_timestamp = stream.timestamp + 1;
-    if value != stream.default {
-        stream.pending_data.insert(next_timestamp, value.clone());
-        stream.data_cache.insert(next_timestamp, value);
-        stream.identity = false;
-    }
-    stream.timestamp = next_timestamp;
-    stream.pending_state = true;
+    stream.push_value_in_place(value);
 }

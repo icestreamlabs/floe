@@ -27,12 +27,11 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(input, input.timestamp).await?;
-    let mut result =
-        build_derived_stream(input.table.clone(), input.group.clone(), "stream_delay/").await?;
+    let values = collect_values(input, input.current_time()).await?;
+    let mut result = build_derived_stream(input.table(), input.group(), "stream_delay/").await?;
 
     let mut last_output = None;
-    for t in 1..=input.timestamp {
+    for t in 1..=input.current_time() {
         let value = values[(t - 1) as usize].clone();
         push_value_in_place(&mut result, value.clone());
         last_output = Some(value);
@@ -56,16 +55,15 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(input, input.timestamp).await?;
-    let group = input.group.clone();
-    let mut result =
-        build_derived_stream(input.table.clone(), group.clone(), "stream_diff/").await?;
+    let values = collect_values(input, input.current_time()).await?;
+    let group = input.group();
+    let mut result = build_derived_stream(input.table(), group.clone(), "stream_diff/").await?;
 
     if let Some(first) = values.first() {
         let mut last_output = first.clone();
         set_default_in_place(&mut result, first.clone());
 
-        for t in 1..=input.timestamp {
+        for t in 1..=input.current_time() {
             let current = &values[t as usize];
             let previous = &values[(t - 1) as usize];
             let neg_prev = group.neg(previous).await;
@@ -91,16 +89,16 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(input, input.timestamp).await?;
-    let group = input.group.clone();
+    let values = collect_values(input, input.current_time()).await?;
+    let group = input.group();
     let mut result =
-        build_derived_stream(input.table.clone(), group.clone(), "stream_integrate/").await?;
+        build_derived_stream(input.table(), group.clone(), "stream_integrate/").await?;
 
     if let Some(first) = values.first() {
         let mut acc = first.clone();
         set_default_in_place(&mut result, acc.clone());
 
-        for t in 1..=input.timestamp {
+        for t in 1..=input.current_time() {
             let current = &values[t as usize];
             acc = group.add(&acc, current).await;
             push_value_in_place(&mut result, acc.clone());
@@ -136,15 +134,15 @@ where
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&I) -> O + Send + Sync,
 {
-    let values = collect_values(input, input.timestamp).await?;
+    let values = collect_values(input, input.current_time()).await?;
     let mut result =
-        build_derived_stream(input.table.clone(), output_group.clone(), "stream_lift1/").await?;
+        build_derived_stream(input.table(), output_group.clone(), "stream_lift1/").await?;
 
     if let Some(first) = values.first() {
         let mut last = function(first);
         set_default_in_place(&mut result, last.clone());
 
-        for t in 1..=input.timestamp {
+        for t in 1..=input.current_time() {
             let value = function(&values[t as usize]);
             last = value.clone();
             push_value_in_place(&mut result, value);
@@ -189,11 +187,11 @@ where
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&L, &R) -> O + Send + Sync,
 {
-    let frontier = left.timestamp.max(right.timestamp);
+    let frontier = left.current_time().max(right.current_time());
     let left_values = collect_values(left, frontier).await?;
     let right_values = collect_values(right, frontier).await?;
     let mut result =
-        build_derived_stream(left.table.clone(), output_group.clone(), "stream_lift2/").await?;
+        build_derived_stream(left.table(), output_group.clone(), "stream_lift2/").await?;
 
     if let Some((first_left, first_right)) = left_values.first().zip(right_values.first()) {
         let mut last = function(first_left, first_right);
@@ -304,7 +302,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(stream, stream.timestamp).await?;
+    let values = collect_values(stream, stream.current_time()).await?;
     let group = stream.group();
     let mut acc = group.identity().await;
     for value in values {

@@ -6,7 +6,7 @@ use anyhow::Result;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{StreamRetention, ZSetStream};
+use dbsp::{Stream, StreamRetention, ZSetStream};
 use slatedb::Db;
 
 use crate::namespaces;
@@ -108,5 +108,9 @@ impl DbspView {
 
     pub fn latest_handle_view(&self) -> ZSetHandleView<Vec<u8>> {
         self.zset.latest_view()
+    }
+
+    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
+        self.zset.handle_stream()
     }
 }

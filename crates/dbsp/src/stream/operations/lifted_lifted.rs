@@ -37,7 +37,7 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     P: Fn(&K) -> bool + Send + Sync + Clone,
 {
-    let handles = collect_values(input, input.timestamp).await?;
+    let handles = collect_values(input, input.current_time()).await?;
     let mut output_handles = Vec::with_capacity(handles.len());
 
     for handle in &handles {
@@ -64,12 +64,8 @@ where
     let default_handle = output_handles[0].clone();
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream = build_derived_stream(
-        input.table.clone(),
-        handle_group,
-        LIFTED_SELECT_STREAM_PREFIX,
-    )
-    .await?;
+    let mut result_stream =
+        build_derived_stream(input.table(), handle_group, LIFTED_SELECT_STREAM_PREFIX).await?;
 
     set_default_in_place(&mut result_stream, default_handle.clone());
     for handle in output_handles.iter().skip(1) {
@@ -108,7 +104,7 @@ where
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&K) -> R + Send + Sync + Clone,
 {
-    let handles = collect_values(input, input.timestamp).await?;
+    let handles = collect_values(input, input.current_time()).await?;
     let mut output_handles = Vec::with_capacity(handles.len());
 
     for handle in &handles {
@@ -135,12 +131,8 @@ where
     let default_handle = output_handles[0].clone();
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream = build_derived_stream(
-        input.table.clone(),
-        handle_group,
-        LIFTED_PROJECT_STREAM_PREFIX,
-    )
-    .await?;
+    let mut result_stream =
+        build_derived_stream(input.table(), handle_group, LIFTED_PROJECT_STREAM_PREFIX).await?;
 
     set_default_in_place(&mut result_stream, default_handle.clone());
     for handle in output_handles.iter().skip(1) {
@@ -191,8 +183,8 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + Clone,
     F: Fn(&L, &R) -> O + Send + Sync + Clone,
 {
-    let left_handles = collect_values(left, left.timestamp).await?;
-    let right_handles = collect_values(right, right.timestamp).await?;
+    let left_handles = collect_values(left, left.current_time()).await?;
+    let right_handles = collect_values(right, right.current_time()).await?;
     let total = left_handles.len().min(right_handles.len());
     let mut output_handles = Vec::with_capacity(total);
 
@@ -235,7 +227,7 @@ where
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
     let mut result_stream =
-        build_derived_stream(left.table.clone(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
+        build_derived_stream(left.table(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
 
     set_default_in_place(&mut result_stream, default_handle.clone());
     for handle in output_handles.iter().skip(1) {
@@ -264,8 +256,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let diff_handles = collect_values(diff_stream, diff_stream.timestamp).await?;
-    let state_handles = collect_values(integrated_stream, integrated_stream.timestamp).await?;
+    let diff_handles = collect_values(diff_stream, diff_stream.current_time()).await?;
+    let state_handles = collect_values(integrated_stream, integrated_stream.current_time()).await?;
     let total = diff_handles.len().min(state_handles.len());
     let mut output_handles = Vec::with_capacity(total);
 
@@ -304,12 +296,8 @@ where
     let default_handle = output_handles[0].clone();
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream = build_derived_stream(
-        diff_stream.table.clone(),
-        handle_group,
-        LIFTED_H_STREAM_PREFIX,
-    )
-    .await?;
+    let mut result_stream =
+        build_derived_stream(diff_stream.table(), handle_group, LIFTED_H_STREAM_PREFIX).await?;
 
     set_default_in_place(&mut result_stream, default_handle.clone());
     for handle in output_handles.iter().skip(1) {

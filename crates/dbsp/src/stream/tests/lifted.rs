@@ -119,7 +119,7 @@ async fn lifted_select_zset_stream_filters_elements() {
     .expect("apply lifted select stream");
     result.flush().await.expect("flush result stream");
 
-    let handles = collect_values(&result, result.timestamp)
+    let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect handles");
     let mut cache = HashMap::new();
@@ -220,7 +220,7 @@ async fn lifted_h_zset_stream_detects_transitions() {
         .expect("apply lifted H stream");
     result.flush().await.expect("flush lifted H result");
 
-    let handles = collect_values(&result, result.timestamp)
+    let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect H handles");
     let mut cache = HashMap::new();
@@ -295,7 +295,7 @@ async fn lifted_lifted_select_zset_stream_operates_on_nested_streams() {
         .expect("apply lifted-lifted select");
     result.flush().await.expect("flush lifted-lifted result");
 
-    let handles = collect_values(&result, result.timestamp)
+    let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect outer handles");
     let resolved_group: Arc<dyn AbelianGroup<ZSetHandle>> =
@@ -306,7 +306,7 @@ async fn lifted_lifted_select_zset_stream_operates_on_nested_streams() {
         .expect("resolve nested stream");
     resolved.flush().await.expect("flush resolved stream");
 
-    let resolved_handles = collect_values(&resolved, resolved.timestamp)
+    let resolved_handles = collect_values(&resolved, resolved.current_time())
         .await
         .expect("collect resolved handles");
     let mut cache = HashMap::new();
@@ -389,7 +389,7 @@ async fn delta_lifted_delta_lifted_join_produces_handles() {
         .await
         .expect("flush delta lifted join output");
 
-    let handles = collect_values(&result, result.timestamp)
+    let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect delta lifted join handles");
     assert!(!handles.is_empty());
@@ -502,16 +502,17 @@ async fn delta_lifted_delta_lifted_join_aligns_to_shortest_stream() {
         .expect("flush aligned delta lifted join output");
 
     assert_eq!(
-        result.timestamp, outer_right.timestamp,
+        result.current_time(),
+        outer_right.current_time(),
         "aggregator should stop at shortest timeline"
     );
 
-    let handles = collect_values(&result, result.timestamp)
+    let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect aligned result handles");
     assert_eq!(
         handles.len(),
-        usize::try_from(outer_right.timestamp.saturating_add(1))
+        usize::try_from(outer_right.current_time().saturating_add(1))
             .expect("convert timestamp to length"),
         "expected handles only up to shortest stream frontier"
     );
@@ -566,7 +567,7 @@ async fn lifted_join_covers_each_delta_term() {
             .await
             .unwrap();
     join_state.flush().await.unwrap();
-    let handles = collect_values(&join_state, join_state.timestamp)
+    let handles = collect_values(&join_state, join_state.current_time())
         .await
         .unwrap();
     assert!(
@@ -627,7 +628,7 @@ async fn lifted_join_covers_each_delta_term() {
             .await
             .unwrap();
     join_delta_s.flush().await.unwrap();
-    let handles = collect_values(&join_delta_s, join_delta_s.timestamp)
+    let handles = collect_values(&join_delta_s, join_delta_s.current_time())
         .await
         .unwrap();
     assert!(
@@ -688,7 +689,7 @@ async fn lifted_join_covers_each_delta_term() {
             .await
             .unwrap();
     join_both.flush().await.unwrap();
-    let handles = collect_values(&join_both, join_both.timestamp)
+    let handles = collect_values(&join_both, join_both.current_time())
         .await
         .unwrap();
     assert!(

@@ -57,7 +57,7 @@ where
     }
 
     pub fn from_stream(stream: &Stream<T>) -> Self {
-        Self::new(stream.group.clone(), stream.table.clone(), "stream_add/")
+        Self::new(stream.group(), stream.table(), "stream_add/")
     }
 
     fn next_namespace(&self) -> String {
@@ -84,7 +84,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     async fn add(&self, a: &Stream<T>, b: &Stream<T>) -> Stream<T> {
-        let max_ts = a.timestamp.max(b.timestamp);
+        let max_ts = a.current_time().max(b.current_time());
         let values_a = collect_values(a, max_ts)
             .await
             .expect("collect stream values for left operand");
@@ -113,7 +113,7 @@ where
     }
 
     async fn neg(&self, a: &Stream<T>) -> Stream<T> {
-        let max_ts = a.timestamp;
+        let max_ts = a.current_time();
         let values = collect_values(a, max_ts)
             .await
             .expect("collect stream values for negation");

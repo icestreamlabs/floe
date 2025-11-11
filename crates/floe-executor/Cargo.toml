@@ -13,8 +13,8 @@ datafusion = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
+object_store = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-object_store = { workspace = true }

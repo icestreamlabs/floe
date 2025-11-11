@@ -61,14 +61,16 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + Clone,
     F: Fn(&L, &R) -> O + Send + Sync + Clone,
 {
+    let left_default = left.default_value();
+    let right_default = right.default_value();
     let left_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(ZSetHandle {
-            ns: left.default.ns.clone(),
+            ns: left_default.ns.clone(),
             version: 0,
         }));
     let right_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(ZSetHandle {
-            ns: right.default.ns.clone(),
+            ns: right_default.ns.clone(),
             version: 0,
         }));
 
@@ -111,15 +113,15 @@ where
     .await?;
 
     let mut total_ts = join1
-        .timestamp
-        .min(join2.timestamp)
-        .min(join3.timestamp)
-        .min(join4.timestamp);
+        .current_time()
+        .min(join2.current_time())
+        .min(join3.current_time())
+        .min(join4.current_time());
     if total_ts < 0 {
         total_ts = 0;
     }
 
-    let table = left.table.clone();
+    let table = left.table();
 
     let mut components = [join1, join2, join3, join4];
     let mut caches: Vec<HashMap<String, Arc<Dictionary<O>>>> =

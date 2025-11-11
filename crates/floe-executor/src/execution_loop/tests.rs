@@ -1,6 +1,7 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::scalar::ScalarValue;
-use dbsp::handles::ZSetHandleView;
+use dbsp::Stream;
+use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceEvent};
 use object_store::{ObjectStore, memory::InMemory};
 use serde_json::json;
@@ -234,9 +235,18 @@ async fn build_graph_routes_rows_through_runtime() {
             .expect("open SlateDB"),
     );
     let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let built = build_graph(&ctx, &plan, mv_registry.clone(), &queue, None, &mut bridge)
-        .await
-        .expect("build graph");
+    let scan_streams: HashMap<String, Stream<ZSetHandle>> = HashMap::new();
+    let built = build_graph(
+        &ctx,
+        &plan,
+        mv_registry.clone(),
+        &queue,
+        None,
+        &mut bridge,
+        &scan_streams,
+    )
+    .await
+    .expect("build graph");
 
     let scan_runtime = ScanRuntime::new(registry.clone());
     let runtime = ExecutionRuntime::new(scan_runtime);
@@ -595,6 +605,95 @@ async fn persisted_materialized_view_survives_restart() {
         .expect("build batches");
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn materialize_round_trip_publishes_handles() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv_round_trip", store)
+            .await
+            .expect("open SlateDB"),
+    );
+
+    let mut source_registry = SourceRegistry::new();
+    source_registry.register(bid_definition());
+    let source_registry = Arc::new(source_registry);
+
+    let plan = build_simple_materialize_plan("mv_round_trip_plan", "mv_round_trip_view");
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut tick = instantiate_tick_loop(
+        &plan,
+        Arc::clone(&source_registry),
+        Arc::clone(&mv_registry),
+        Some(db.clone()),
+    )
+    .await
+    .expect("instantiate tick loop");
+
+    tick.process_events(vec![(
+        SourceEvent::new("bid", json!({"auction": 11, "bidder": 21})),
+        1,
+    )])
+    .await
+    .expect("process first event");
+    tick.advance_watermark(1).await.expect("watermark first");
+
+    tick.process_events(vec![(
+        SourceEvent::new("bid", json!({"auction": 12, "bidder": 22})),
+        2,
+    )])
+    .await
+    .expect("process second event");
+    tick.advance_watermark(2).await.expect("watermark second");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+    ]));
+    let provider = MaterializedViewTableProvider::new(
+        Arc::clone(&mv_registry),
+        "mv_round_trip_view",
+        schema.clone(),
+    );
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build latest batches");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+
+    let view = mv_registry
+        .get("mv_round_trip_view")
+        .expect("view registered");
+    assert!(
+        view.dbsp_state().is_some(),
+        "materialized view registry missing persisted state"
+    );
+
+    drop(tick);
+
+    let mv_registry_restart = Arc::new(MaterializedViewRegistry::new());
+    let _restart_tick = instantiate_tick_loop(
+        &plan,
+        Arc::clone(&source_registry),
+        Arc::clone(&mv_registry_restart),
+        Some(db.clone()),
+    )
+    .await
+    .expect("instantiate restart tick loop");
+
+    let provider_restart = MaterializedViewTableProvider::new(
+        Arc::clone(&mv_registry_restart),
+        "mv_round_trip_view",
+        schema,
+    );
+    let restart_batches = provider_restart
+        .build_batches_for_test()
+        .await
+        .expect("build restart batches");
+    assert_eq!(restart_batches.len(), 1);
+    assert_eq!(restart_batches[0].num_rows(), 2);
 }
 
 #[tokio::test]

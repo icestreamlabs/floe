@@ -98,9 +98,9 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(stream, stream.timestamp).await?;
+    let values = collect_values(stream, stream.current_time()).await?;
     let group = stream.group();
-    let table = stream.table.clone();
+    let table = stream.table();
 
     let mut outputs = Vec::with_capacity(values.len());
     for value in &values {
@@ -153,7 +153,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let handles = collect_values(stream, stream.timestamp).await?;
+    let handles = collect_values(stream, stream.current_time()).await?;
     let mut outputs = Vec::with_capacity(handles.len());
     for handle in &handles {
         let inner = stream
@@ -169,12 +169,8 @@ where
         inner_group.identity().await
     };
 
-    let mut result = build_derived_stream(
-        stream.table.clone(),
-        inner_group.clone(),
-        "stream_lift_elim/",
-    )
-    .await?;
+    let mut result =
+        build_derived_stream(stream.table(), inner_group.clone(), "stream_lift_elim/").await?;
 
     if outputs.is_empty() {
         set_default_in_place(&mut result, default_value);

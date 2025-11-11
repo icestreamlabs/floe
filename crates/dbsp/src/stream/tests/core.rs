@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use crate::algebra::AbelianGroup;
+use crate::handles::ZSetHandle;
+use crate::storage::dictionary::Dictionary;
+use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::core::stream::Stream;
 use crate::stream::operations::basic::{delay, differentiate, integrate, lift1, lift2};
+use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::tests::common::{IntegerGroup, build_db};
+use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
 use slatedb::WriteBatch;
 
 #[tokio::test]
@@ -75,7 +80,7 @@ async fn remembers_last_default_ts() {
         .await
         .expect("reopen stream");
 
-    assert_eq!(reopened.last_default_ts, 1);
+    assert_eq!(reopened.last_default_ts(), 1);
     assert_eq!(reopened.get(1).await.expect("get value"), 7);
     assert_eq!(reopened.get(2).await.expect("get value"), 7);
 }
@@ -96,7 +101,7 @@ async fn clears_intent_on_restart() {
     let mut batch = WriteBatch::new();
     batch.put(intent_key.clone(), vec![1]);
     stream
-        .table
+        .table()
         .write_batch(batch)
         .await
         .expect("write leftover intent");
@@ -107,7 +112,7 @@ async fn clears_intent_on_restart() {
 
     assert!(
         recovered
-            .table
+            .table()
             .get(&intent_key)
             .await
             .expect("get intent")
@@ -250,4 +255,163 @@ async fn lift2_combines_two_streams() {
     assert_eq!(combined.get(1).await.expect("t1"), 6);
     assert_eq!(combined.get(2).await.expect("t2"), 10);
     assert_eq!(combined.get(3).await.expect("t3"), 10);
+}
+
+#[tokio::test]
+async fn stream_cursor_tracks_new_versions() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "cursor_stream", None)
+            .await
+            .expect("dictionary"),
+    );
+    let mut zset = ZSetStream::new(
+        dict,
+        table,
+        "cursor_stream".to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("create zset stream");
+    let stream = zset.handle_stream();
+    let mut cursor = StreamCursor::new(stream);
+
+    let (ts0, handle0) = cursor.snapshot().await.expect("snapshot ts0");
+    assert_eq!(ts0, 0);
+    assert_eq!(handle0.version, 0);
+
+    zset.add_delta(vec![1], 1);
+    let h1 = zset.flush().await.expect("flush first version");
+    assert_eq!(h1.version, 1);
+    let (ts1, handle1) = cursor.next().await.expect("cursor ts1");
+    assert_eq!(ts1, 1);
+    assert_eq!(handle1.version, 1);
+
+    zset.add_delta(vec![2], 1);
+    zset.flush().await.expect("flush second version");
+    let (ts2, handle2) = cursor.next().await.expect("cursor ts2");
+    assert_eq!(ts2, 2);
+    assert_eq!(handle2.version, 2);
+}
+
+#[tokio::test]
+async fn handle_stream_clones_observe_frontier_advances() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "handle_clone_stream", None)
+            .await
+            .expect("dictionary"),
+    );
+    let mut zset = ZSetStream::new(
+        dict,
+        table,
+        "handle_clone_stream".to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("create stream");
+    let stream = zset.handle_stream();
+    let mut clone_a = stream.clone();
+    let mut clone_b = stream.clone();
+
+    let (ts0, handle0) = clone_a
+        .latest_with_ts()
+        .await
+        .expect("initial latest handle");
+    assert_eq!(ts0, 0);
+    assert_eq!(handle0.version, 0);
+
+    zset.add_delta(vec![1], 1);
+    zset.flush().await.expect("flush first version");
+
+    let (ts1, handle1) = clone_b
+        .latest_with_ts()
+        .await
+        .expect("latest after first flush");
+    assert_eq!(ts1, 1);
+    assert_eq!(handle1.version, 1);
+
+    zset.add_delta(vec![2], 1);
+    zset.flush().await.expect("flush second version");
+
+    let (ts2, handle2) = clone_a
+        .latest_with_ts()
+        .await
+        .expect("latest after second flush");
+    assert_eq!(ts2, 2);
+    assert_eq!(handle2.version, 2);
+
+    let (ts3, handle3) = clone_b.latest_with_ts().await.expect("latest repeat check");
+    assert_eq!(ts3, 2);
+    assert_eq!(handle3.version, 2);
+}
+
+#[tokio::test]
+async fn handle_operator_runtime_waits_for_alignment() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+
+    let dict_left = Arc::new(
+        Dictionary::with_table(table.clone(), "runtime_left", None)
+            .await
+            .expect("left dict"),
+    );
+    let dict_right = Arc::new(
+        Dictionary::with_table(table.clone(), "runtime_right", None)
+            .await
+            .expect("right dict"),
+    );
+
+    let mut left = ZSetStream::new(
+        dict_left,
+        table.clone(),
+        "runtime_left".to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("left stream");
+    let mut right = ZSetStream::new(
+        dict_right,
+        table.clone(),
+        "runtime_right".to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("right stream");
+
+    let records: Arc<tokio::sync::Mutex<Vec<(i64, u64, u64)>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let records_clone = Arc::clone(&records);
+
+    let mut runtime = HandleOperatorRuntime::new(
+        vec![left.handle_stream(), right.handle_stream()],
+        move |ts, handles| {
+            let records = Arc::clone(&records_clone);
+            let snapshot = handles.to_vec();
+            async move {
+                let mut guard = records.lock().await;
+                guard.push((ts, snapshot[0].version, snapshot[1].version));
+                Ok(())
+            }
+        },
+    );
+
+    left.add_delta(vec![1], 1);
+    left.flush().await.expect("flush left t1");
+    right.add_delta(vec![2], 1);
+    right.flush().await.expect("flush right t1");
+    runtime.step().await.expect("process t1");
+
+    left.add_delta(vec![3], 1);
+    left.flush().await.expect("flush left t2");
+    right.add_delta(vec![4], 1);
+    right.flush().await.expect("flush right t2");
+    runtime.step().await.expect("process t2");
+
+    let collected = records.lock().await;
+    assert_eq!(collected.len(), 2);
+    assert_eq!(collected[0], (1, 1, 1));
+    assert_eq!(collected[1], (2, 2, 2));
 }

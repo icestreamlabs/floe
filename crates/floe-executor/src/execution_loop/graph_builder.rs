@@ -15,8 +15,8 @@ use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::operator_state::StateTable;
 use crate::operators::{
-    DispatchSink, EventQueue, FilterDbspState, FilterDerivedState, FilterOperator, JoinOperator,
-    MapDerivedState, MapOperator, MaterializeOperator, NullSink, ScanOperator,
+    DispatchSink, EventQueue, FilterDerivedState, FilterOperator, JoinOperator, MapDerivedState,
+    MapOperator, MaterializeOperator, NullSink, ScanOperator,
 };
 use crate::stream_types::{InputPort, OperatorId, StreamOperator};
 
@@ -34,6 +34,7 @@ pub async fn build_graph(
     queue: &EventQueue,
     checkpoint_manifest: Option<&CheckpointManifest>,
     bridge: &mut DbspBridge,
+    scan_handle_streams: &HashMap<String, Stream<ZSetHandle>>,
 ) -> Result<BuiltGraph> {
     let mut downstreams: HashMap<OperatorId, Vec<(usize, InputPort)>> = HashMap::new();
     for (idx, _) in plan.operators.iter().enumerate() {
@@ -140,43 +141,46 @@ pub async fn build_graph(
         let operator: Box<dyn StreamOperator> = match node {
             OperatorNode::Scan(scan) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
+                let handle_stream = scan_handle_streams
+                    .get(&scan.source_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "source '{}' does not expose a handle stream; handles are required",
+                            scan.source_name
+                        )
+                    })?;
+                operator_handle_streams[idx] = Some(handle_stream.clone());
                 Box::new(ScanOperator::new(scan.source_name.clone(), sink))
             }
             OperatorNode::Map(map) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
-                let upstream_stream = operator_handle_streams
-                    .get(map.input.operator.0)
-                    .and_then(|stream| stream.clone());
-                let derived_state = if let Some(upstream) = upstream_stream {
-                    let exprs = std::sync::Arc::new(map.expressions.clone());
-                    let projector = {
-                        let exprs = std::sync::Arc::clone(&exprs);
-                        move |key: &Vec<u8>| -> Vec<u8> {
-                            let row =
-                                decode_projected_row_key(key).expect("decode row for dbsp map");
-                            let mut projected = Vec::with_capacity(exprs.len());
-                            for expr in exprs.iter() {
-                                projected.push(
-                                    evaluate(expr, &row).expect("evaluate expression for dbsp map"),
-                                );
-                            }
-                            encode_projected_row_key(&projected)
-                                .expect("encode projected row for dbsp map")
+                let upstream_stream =
+                    require_handle_stream(&operator_handle_streams, map.input.operator)?;
+                let exprs = std::sync::Arc::new(map.expressions.clone());
+                let projector = {
+                    let exprs = std::sync::Arc::clone(&exprs);
+                    move |key: &Vec<u8>| -> Vec<u8> {
+                        let row = decode_projected_row_key(key).expect("decode row for dbsp map");
+                        let mut projected = Vec::with_capacity(exprs.len());
+                        for expr in exprs.iter() {
+                            projected.push(
+                                evaluate(expr, &row).expect("evaluate expression for dbsp map"),
+                            );
                         }
-                    };
-                    let dbsp_map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector)
-                        .await
-                        .context("build dbsp-derived map stream")?;
-                    let derived_stream = dbsp_map.stream();
-                    operator_handle_streams[idx] = Some(derived_stream.clone());
-                    Some(MapDerivedState::new(
-                        derived_stream,
-                        format!("map_output_{idx}"),
-                    ))
-                } else {
-                    operator_handle_streams[idx] = None;
-                    None
+                        encode_projected_row_key(&projected)
+                            .expect("encode projected row for dbsp map")
+                    }
                 };
+                let dbsp_map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream_stream, projector)
+                    .await
+                    .context("build dbsp-derived map stream")?;
+                let derived_stream = dbsp_map.stream();
+                operator_handle_streams[idx] = Some(derived_stream.clone());
+                let derived_state = Some(MapDerivedState::new(
+                    derived_stream,
+                    format!("map_output_{idx}"),
+                ));
                 Box::new(MapOperator::new(
                     InputPort::new(map.input.operator, map.input.port_index),
                     map.expressions.clone(),
@@ -186,57 +190,37 @@ pub async fn build_graph(
             }
             OperatorNode::Filter(filter) => {
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
-                let upstream_stream = operator_handle_streams
-                    .get(filter.input.operator.0)
-                    .and_then(|stream| stream.clone());
-                let mut manual_state = None;
-                let mut derived_state = None;
-                if let Some(upstream) = upstream_stream {
-                    let predicate_expr = std::sync::Arc::new(filter.predicate.clone());
-                    let derived_predicate = {
-                        let expr = std::sync::Arc::clone(&predicate_expr);
-                        move |key: &Vec<u8>| -> bool {
-                            let row =
-                                decode_projected_row_key(key).expect("decode row for dbsp filter");
-                            evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
-                        }
-                    };
-                    let dbsp_filter = DbspFilter::new::<Vec<u8>, _>(&upstream, derived_predicate)
+                let upstream_stream =
+                    require_handle_stream(&operator_handle_streams, filter.input.operator)?;
+                let predicate_expr = std::sync::Arc::new(filter.predicate.clone());
+                let derived_predicate = {
+                    let expr = std::sync::Arc::clone(&predicate_expr);
+                    move |key: &Vec<u8>| -> bool {
+                        let row =
+                            decode_projected_row_key(key).expect("decode row for dbsp filter");
+                        evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
+                    }
+                };
+                let dbsp_filter =
+                    DbspFilter::new::<Vec<u8>, _>(&upstream_stream, derived_predicate)
                         .await
                         .context("build dbsp-derived filter stream")?;
-                    let derived_stream = dbsp_filter.stream();
-                    operator_handle_streams[idx] = Some(derived_stream.clone());
-                    derived_state = Some(FilterDerivedState::new(
-                        derived_stream,
-                        format!("filter_output_{idx}"),
-                    ));
-                } else {
-                    let output_table_name = format!("filter_output_{idx}");
-                    let output_namespace =
-                        namespaces::operator_state(&plan.graph_id, idx, "output")?;
-                    let output_stream = bridge
-                        .new_stream(
-                            output_namespace.clone(),
-                            StreamRetention::KeepLast { keep_last: 1 },
-                        )
-                        .await
-                        .context("initialize filter output stream")?;
-                    operator_handle_streams[idx] = Some(output_stream.handle_stream());
-                    manual_state = Some(FilterDbspState::new(
-                        output_stream,
-                        output_table_name,
-                        output_namespace,
-                    ));
-                }
+                let derived_stream = dbsp_filter.stream();
+                operator_handle_streams[idx] = Some(derived_stream.clone());
+                let derived_state = Some(FilterDerivedState::new(
+                    derived_stream,
+                    format!("filter_output_{idx}"),
+                ));
                 Box::new(FilterOperator::new(
                     InputPort::new(filter.input.operator, filter.input.port_index),
                     filter.predicate.clone(),
                     sink,
-                    manual_state,
                     derived_state,
                 ))
             }
             OperatorNode::Join(join) => {
+                let _ = require_handle_stream(&operator_handle_streams, join.left.operator)?;
+                let _ = require_handle_stream(&operator_handle_streams, join.right.operator)?;
                 let sink = DispatchSink::new(targets, Arc::clone(queue));
                 let mut left_snapshot_data = None;
                 let mut right_snapshot_data = None;
@@ -311,6 +295,8 @@ pub async fn build_graph(
                 )
             }
             OperatorNode::Materialize(materialize) => {
+                let upstream_stream =
+                    require_handle_stream(&operator_handle_streams, materialize.input.operator)?;
                 let checkpoint_entry = view_checkpoint_map.get(&materialize.view_name).cloned();
                 let checkpoint_state = if let Some(entry) = checkpoint_entry {
                     let handle = bridge
@@ -328,14 +314,24 @@ pub async fn build_graph(
                         .await
                         .context("create DBSP view")?,
                 );
-                Box::new(MaterializeOperator::new(
-                    InputPort::new(materialize.input.operator, materialize.input.port_index),
-                    materialize.view_name.clone(),
-                    mv_registry.clone(),
-                    NullSink::default(),
-                    dbsp_view,
-                    checkpoint_state,
-                ))
+                if let Some(view) = dbsp_view.as_ref() {
+                    operator_handle_streams[idx] = Some(view.handle_stream());
+                }
+                let table = bridge.table();
+                Box::new(
+                    MaterializeOperator::new(
+                        InputPort::new(materialize.input.operator, materialize.input.port_index),
+                        materialize.view_name.clone(),
+                        mv_registry.clone(),
+                        NullSink::default(),
+                        upstream_stream,
+                        table,
+                        dbsp_view,
+                        checkpoint_state,
+                    )
+                    .await
+                    .context("construct materialize operator")?,
+                )
             }
         };
         built_ops.push(operator);
@@ -346,4 +342,19 @@ pub async fn build_graph(
         scan_bindings: ctx.scan_bindings(),
         scan_operator_map,
     })
+}
+
+fn require_handle_stream(
+    streams: &[Option<Stream<ZSetHandle>>],
+    operator: OperatorId,
+) -> Result<Stream<ZSetHandle>> {
+    streams
+        .get(operator.0)
+        .and_then(|entry| entry.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "operator {:?} requires upstream handle stream; delta fallback removed for MVP",
+                operator
+            )
+        })
 }

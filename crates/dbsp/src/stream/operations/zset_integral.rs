@@ -38,10 +38,10 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let diff_handles = collect_values(diff_stream, diff_stream.timestamp).await?;
-    let state_handles = collect_values(integrated_stream, integrated_stream.timestamp).await?;
+    let diff_handles = collect_values(diff_stream, diff_stream.current_time()).await?;
+    let state_handles = collect_values(integrated_stream, integrated_stream.current_time()).await?;
     let total = diff_handles.len().min(state_handles.len());
-    let table = diff_stream.table.clone();
+    let table = diff_stream.table();
     let namespace = next_lifted_zset_namespace(LIFTED_H_ZSET_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)
@@ -149,8 +149,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let handles = collect_values(stream, stream.timestamp).await?;
-    let table = stream.table.clone();
+    let handles = collect_values(stream, stream.current_time()).await?;
+    let table = stream.table();
     let namespace = next_lifted_zset_namespace(ZSET_INTEGRAL_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)

@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
-use dbsp::{StreamRetention, ZSetStream};
+use dbsp::handles::ZSetHandle;
+use dbsp::{Stream, StreamRetention, ZSetStream};
 
 use crate::codec::ensure_outer_stream_codec;
 use crate::dbsp_bridge::DbspBridge;
@@ -44,6 +45,10 @@ impl OuterStreamWriter {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
+        self.stream.handle_stream()
     }
 
     pub fn append(&mut self, row: &[ScalarValue], diff: Diff) -> Result<()> {
@@ -103,6 +108,12 @@ impl OuterStreamRegistry {
 
     pub fn writer_mut(&mut self, source: &str) -> Option<&mut OuterStreamWriter> {
         self.writers.get_mut(source)
+    }
+
+    pub fn handle_stream(&self, source: &str) -> Option<Stream<ZSetHandle>> {
+        self.writers
+            .get(source)
+            .map(|writer| writer.handle_stream())
     }
 
     pub async fn flush_all(&mut self) -> Result<Vec<OuterStreamHandle>> {

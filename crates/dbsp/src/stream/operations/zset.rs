@@ -39,8 +39,8 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     P: Fn(&K) -> bool + Send + Sync + Clone,
 {
-    let handles = collect_values(input, input.timestamp).await?;
-    let table = input.table.clone();
+    let handles = collect_values(input, input.current_time()).await?;
+    let table = input.table();
     let namespace = next_lifted_zset_namespace(LIFTED_SELECT_ZSET_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)
@@ -126,8 +126,8 @@ where
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&K) -> R + Send + Sync + Clone,
 {
-    let handles = collect_values(input, input.timestamp).await?;
-    let table = input.table.clone();
+    let handles = collect_values(input, input.current_time()).await?;
+    let table = input.table();
     let namespace = next_lifted_zset_namespace(LIFTED_PROJECT_ZSET_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)
@@ -228,10 +228,10 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + Clone,
     F: Fn(&L, &R) -> O + Send + Sync + Clone,
 {
-    let left_handles = collect_values(left, left.timestamp).await?;
-    let right_handles = collect_values(right, right.timestamp).await?;
+    let left_handles = collect_values(left, left.current_time()).await?;
+    let right_handles = collect_values(right, right.current_time()).await?;
     let total = left_handles.len().min(right_handles.len());
-    let table = left.table.clone();
+    let table = left.table();
     let namespace = next_lifted_zset_namespace(LIFTED_JOIN_ZSET_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)

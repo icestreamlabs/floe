@@ -3,10 +3,8 @@ use std::any::Any;
 use anyhow::{Result, bail};
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::Stream as DbspHandleStream;
-use dbsp::{StreamRetention, ZSetStream};
 
 use crate::dataflow_plan::Expr;
-use crate::encoding::encode_projected_row_key;
 use crate::expr_eval::evaluate_bool;
 use crate::operator_state::OperatorStateHandle;
 use crate::operators::RowSink;
@@ -16,7 +14,6 @@ pub struct FilterOperator {
     input: InputPort,
     predicate: Expr,
     sink: Box<dyn RowSink>,
-    manual_state: Option<FilterDbspState>,
     derived_state: Option<FilterDerivedState>,
 }
 
@@ -25,14 +22,12 @@ impl FilterOperator {
         input: InputPort,
         predicate: Expr,
         sink: impl RowSink,
-        manual_state: Option<FilterDbspState>,
         derived_state: Option<FilterDerivedState>,
     ) -> Self {
         Self {
             input,
             predicate,
             sink: Box::new(sink),
-            manual_state,
             derived_state,
         }
     }
@@ -44,13 +39,9 @@ impl FilterOperator {
 
     #[cfg(test)]
     pub fn latest_handle(&self) -> Option<&ZSetHandle> {
-        if let Some(derived) = &self.derived_state {
-            derived.current_handle()
-        } else {
-            self.manual_state
-                .as_ref()
-                .and_then(|state| state.latest_handle())
-        }
+        self.derived_state
+            .as_ref()
+            .and_then(|derived| derived.current_handle())
     }
 }
 
@@ -67,9 +58,6 @@ impl StreamOperator for FilterOperator {
         }
 
         if evaluate_bool(&self.predicate, &row)? {
-            if let Some(dbsp) = self.manual_state.as_mut() {
-                dbsp.record_row(&row, diff)?;
-            }
             self.sink.push(row, diff, timestamp)
         } else {
             Ok(())
@@ -98,20 +86,9 @@ impl StreamOperator for FilterOperator {
                 let handle = derived.latest_handle().await?;
                 return Ok(Some(vec![handle]));
             }
-            if let Some(state) = self.manual_state.as_mut() {
-                let handle = state.flush().await?;
-                return Ok(Some(vec![handle]));
-            }
             Ok(None)
         })
     }
-}
-
-pub struct FilterDbspState {
-    stream: ZSetStream<Vec<u8>>,
-    table: String,
-    namespace: String,
-    latest_handle: Option<ZSetHandle>,
 }
 
 pub struct FilterDerivedState {
@@ -149,53 +126,10 @@ impl FilterDerivedState {
     }
 }
 
-impl FilterDbspState {
-    pub fn new(
-        stream: ZSetStream<Vec<u8>>,
-        table: impl Into<String>,
-        namespace: impl Into<String>,
-    ) -> Self {
-        let latest_handle = Some(stream.current_handle().clone());
-        Self {
-            stream,
-            table: table.into(),
-            namespace: namespace.into(),
-            latest_handle,
-        }
-    }
-
-    fn record_row(&mut self, row: &Row, diff: Diff) -> Result<()> {
-        if diff == 0 {
-            return Ok(());
-        }
-        let key = encode_projected_row_key(row)?;
-        self.stream.add_delta(key, diff);
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<OperatorStateHandle> {
-        let handle = self.stream.flush().await?;
-        self.latest_handle = Some(handle.clone());
-        Ok(OperatorStateHandle::new(
-            self.table.clone(),
-            self.namespace.clone(),
-            handle.version,
-        ))
-    }
-
-    pub fn handle_stream(&self) -> DbspHandleStream<ZSetHandle> {
-        self.stream.handle_stream()
-    }
-
-    #[cfg(test)]
-    fn latest_handle(&self) -> Option<&ZSetHandle> {
-        self.latest_handle.as_ref()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
+    use dbsp::{DbspFilter, StreamRetention};
     use object_store::{ObjectStore, memory::InMemory};
     use slatedb::Db;
     use std::collections::HashMap;
@@ -204,6 +138,8 @@ mod tests {
     use super::*;
     use crate::dataflow_plan::Expr;
     use crate::dbsp_bridge::DbspBridge;
+    use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+    use crate::expr_eval::evaluate_bool;
     use crate::namespaces;
     use crate::operators::test_support::TestSink;
     use crate::stream_types::{Diff, InputPort, OperatorId, OutputPort, Timestamp};
@@ -216,13 +152,8 @@ mod tests {
             Box::new(Expr::column(0)),
             Box::new(Expr::literal(ScalarValue::Int64(Some(42)))),
         );
-        let mut operator = FilterOperator::new(
-            InputPort::new(port.operator, 0),
-            predicate,
-            sink,
-            None,
-            None,
-        );
+        let mut operator =
+            FilterOperator::new(InputPort::new(port.operator, 0), predicate, sink, None);
 
         let accepted = vec![ScalarValue::Int64(Some(42))];
         operator
@@ -247,16 +178,55 @@ mod tests {
             Box::new(Expr::literal(ScalarValue::Int64(Some(42)))),
         );
         let sink = AccumulatingSink::default();
-        let (mut operator, input_port, db, namespace) =
-            build_filter_with_dbsp("filter-dbsp-equivalence", predicate, sink).await;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("filter-dbsp-equivalence", store)
+                .await
+                .expect("open db"),
+        );
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let namespace =
+            namespaces::operator_state("filter_test", 0, "input").expect("filter namespace");
+        let mut upstream = bridge
+            .new_stream(
+                namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("upstream stream");
+        let upstream_stream = upstream.handle_stream();
+        let predicate_expr = Arc::new(predicate.clone());
+        let derived_predicate = {
+            let expr = Arc::clone(&predicate_expr);
+            move |key: &Vec<u8>| -> bool {
+                let row = decode_projected_row_key(key).expect("decode row for dbsp filter");
+                evaluate_bool(&expr, &row).expect("evaluate predicate for dbsp filter")
+            }
+        };
+        let dbsp_filter = DbspFilter::new::<Vec<u8>, _>(&upstream_stream, derived_predicate)
+            .await
+            .expect("build dbsp filter");
+        let derived_stream = dbsp_filter.stream();
+        let derived_state = FilterDerivedState::new(derived_stream, "filter_output_test");
 
-        let to_process = vec![
+        let port = OutputPort::new(OperatorId(0), 0);
+        let input_port = InputPort::new(port.operator, 0);
+        let mut operator = FilterOperator::new(input_port, predicate, sink, Some(derived_state));
+
+        let events = vec![
             (row(&[42]), 1, 1),
             (row(&[7]), 1, 2),
             (row(&[42]), 1, 3),
             (row(&[42]), -1, 4),
         ];
-        for (row, diff, ts) in to_process {
+        for (row, diff, _) in &events {
+            upstream.add_delta(
+                encode_projected_row_key(row).expect("encode row for dbsp filter"),
+                *diff,
+            );
+            upstream.flush().await.expect("flush upstream state");
+        }
+        for (row, diff, ts) in events.clone() {
             operator
                 .on_input(input_port, row, diff, ts)
                 .expect("apply filter");
@@ -268,8 +238,7 @@ mod tests {
             .expect("checkpoint")
             .expect("handles");
         assert_eq!(handles.len(), 1);
-        let db_state =
-            materialize_output_state(Arc::clone(&db), &namespace, handles[0].version).await;
+        let db_state = materialize_output_state(Arc::clone(&db), &handles[0]).await;
         let sink_state = operator
             .sink()
             .as_any()
@@ -280,39 +249,13 @@ mod tests {
         assert!(operator.latest_handle().is_some());
     }
 
-    async fn build_filter_with_dbsp(
-        db_label: &str,
-        predicate: Expr,
-        sink: impl RowSink,
-    ) -> (FilterOperator, InputPort, Arc<Db>, String) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open(db_label, store).await.expect("open SlateDB"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-        let namespace =
-            namespaces::operator_state("filter_test", 0, "output").expect("filter namespace");
-        let stream = bridge
-            .new_stream(
-                namespace.clone(),
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await
-            .expect("filter stream");
-        let dbsp_state = FilterDbspState::new(stream, "filter_output", namespace.clone());
-
-        let port = OutputPort::new(OperatorId(0), 0);
-        let input = InputPort::new(port.operator, 0);
-        let operator = FilterOperator::new(input, predicate, sink, Some(dbsp_state), None);
-        (operator, input, db, namespace)
-    }
-
     async fn materialize_output_state(
         db: Arc<Db>,
-        namespace: &str,
-        version: u64,
+        handle: &OperatorStateHandle,
     ) -> HashMap<Vec<u8>, Diff> {
         let mut bridge = DbspBridge::new(db).await.expect("bridge");
         bridge
-            .handle_view_for(namespace, version)
+            .handle_view_for(&handle.namespace, handle.version)
             .await
             .expect("handle view")
             .materialize()

@@ -8,16 +8,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::memory::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, Operator, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
 
 use crate::encoding::decode_projected_row_key;
-use crate::materialized_view::{
-    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
-};
+use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::stream_types::{Diff, Row};
 use dbsp::handles::ZSetHandleView;
 
@@ -138,18 +136,23 @@ impl MaterializedViewTableProvider {
         }
     }
 
-    async fn build_batches(&self) -> DFResult<Vec<RecordBatch>> {
-        let rows = self.load_rows().await?;
+    async fn build_batches(&self, as_of_version: Option<u64>) -> DFResult<Vec<RecordBatch>> {
+        let rows = self.load_rows(as_of_version).await?;
         build_scalar_batches(rows, self.schema.clone())
             .map_err(|err| DataFusionError::Execution(err.to_string()))
     }
 
     #[cfg(test)]
     pub async fn build_batches_for_test(&self) -> DFResult<Vec<RecordBatch>> {
-        self.build_batches().await
+        self.build_batches(None).await
     }
 
-    async fn load_rows(&self) -> DFResult<Vec<Row>> {
+    #[cfg(test)]
+    pub async fn build_batches_at_version(&self, version: u64) -> DFResult<Vec<RecordBatch>> {
+        self.build_batches(Some(version)).await
+    }
+
+    async fn load_rows(&self, as_of_version: Option<u64>) -> DFResult<Vec<Row>> {
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "materialized view '{}' is not registered",
@@ -157,19 +160,23 @@ impl MaterializedViewTableProvider {
             ))
         })?;
 
-        if let Some(state) = view.dbsp_state() {
-            self.materialize_dbsp_rows(state).await
-        } else {
-            Self::rows_from_snapshot(&view)
-        }
+        let Some(state) = view.dbsp_state() else {
+            return Ok(Vec::new());
+        };
+        self.materialize_dbsp_rows(state, as_of_version).await
     }
 
-    async fn materialize_dbsp_rows(&self, state: DbspPersistedState) -> DFResult<Vec<Row>> {
+    async fn materialize_dbsp_rows(
+        &self,
+        state: DbspPersistedState,
+        as_of_version: Option<u64>,
+    ) -> DFResult<Vec<Row>> {
+        let target_version = as_of_version.unwrap_or(state.version());
         let handle_view = ZSetHandleView::new(
             state.dictionary(),
             state.table(),
             state.namespace().to_string(),
-            state.version(),
+            target_version,
         );
         let snapshot = handle_view
             .materialize()
@@ -180,15 +187,6 @@ impl MaterializedViewTableProvider {
             let decoded = decode_projected_row_key(&key)
                 .map_err(|err| DataFusionError::Execution(err.to_string()))?;
             append_row_with_diff(&mut rows, decoded, diff)?;
-        }
-        Ok(rows)
-    }
-
-    fn rows_from_snapshot(view: &Arc<MaterializedViewHandle>) -> DFResult<Vec<Row>> {
-        let snapshot = view.snapshot();
-        let mut rows = Vec::new();
-        for (row, diff) in snapshot {
-            append_row_with_diff(&mut rows, row, diff)?;
         }
         Ok(rows)
     }
@@ -223,9 +221,54 @@ impl TableProvider for MaterializedViewTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let batches = self.build_batches().await?;
+        let (as_of_version, passthrough_filters) = extract_mv_version_filter(filters);
+        let batches = self.build_batches(as_of_version).await?;
         let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
-        mem_table.scan(state, projection, filters, limit).await
+        mem_table
+            .scan(state, projection, &passthrough_filters, limit)
+            .await
+    }
+}
+
+fn extract_mv_version_filter(filters: &[Expr]) -> (Option<u64>, Vec<Expr>) {
+    let mut as_of_version = None;
+    let mut retained = Vec::with_capacity(filters.len());
+    for expr in filters {
+        if let Some(version) = parse_mv_version_expr(expr) {
+            if as_of_version.is_none() {
+                as_of_version = Some(version);
+            }
+            continue;
+        }
+        retained.push(expr.clone());
+    }
+    (as_of_version, retained)
+}
+
+fn parse_mv_version_expr(expr: &Expr) -> Option<u64> {
+    if let Expr::BinaryExpr(binary) = expr {
+        if binary.op != Operator::Eq {
+            return None;
+        }
+        if is_mv_version_column(binary.left.as_ref()) {
+            return literal_to_u64(binary.right.as_ref());
+        }
+        if is_mv_version_column(binary.right.as_ref()) {
+            return literal_to_u64(binary.left.as_ref());
+        }
+    }
+    None
+}
+
+fn is_mv_version_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(col) if col.name == "__mv_version")
+}
+
+fn literal_to_u64(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Literal(ScalarValue::UInt64(Some(value)), _) => Some(*value),
+        Expr::Literal(ScalarValue::Int64(Some(value)), _) if *value >= 0 => Some(*value as u64),
+        _ => None,
     }
 }
 
@@ -279,27 +322,41 @@ fn build_scalar_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbsp_bridge::DbspBridge;
+    use crate::encoding::encode_projected_row_key;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
+    use object_store::{ObjectStore, memory::InMemory};
+    use slatedb::Db;
 
     #[tokio::test]
     async fn materialized_view_provider_emits_rows() {
         let registry = Arc::new(MaterializedViewRegistry::new());
         let view = registry.register("mv_test");
-        view.apply(
-            vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Utf8(Some("one".into())),
-            ],
-            2,
-        );
-        view.apply(
-            vec![
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Utf8(Some("two".into())),
-            ],
-            1,
-        );
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("mv-provider", store).await.expect("open SlateDB"));
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let mut dbsp_view = bridge.new_view("mv_test").await.expect("dbsp view");
+        let row_one = vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Utf8(Some("one".into())),
+        ];
+        dbsp_view.add_delta(encode_projected_row_key(&row_one).expect("encode"), 1);
+        let version_one = dbsp_view
+            .flush()
+            .await
+            .expect("flush first version")
+            .version;
+        let row_two = vec![
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Utf8(Some("two".into())),
+        ];
+        dbsp_view.add_delta(encode_projected_row_key(&row_two).expect("encode"), 1);
+        dbsp_view.flush().await.expect("flush second version");
+        let handle_view = dbsp_view.latest_handle_view();
+        let (dict, table, namespace, version) = handle_view.into_parts();
+        view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -307,9 +364,19 @@ mod tests {
         ]));
 
         let provider = MaterializedViewTableProvider::new(registry.clone(), "mv_test", schema);
-        let batches = provider.build_batches().await.expect("build batches");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 3);
-        assert_eq!(batches[0].num_columns(), 2);
+        let latest = provider
+            .build_batches_for_test()
+            .await
+            .expect("build latest");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].num_rows(), 2);
+        assert_eq!(latest[0].num_columns(), 2);
+
+        let as_of = provider
+            .build_batches_at_version(version_one)
+            .await
+            .expect("build as of version");
+        assert_eq!(as_of.len(), 1);
+        assert_eq!(as_of[0].num_rows(), 1);
     }
 }

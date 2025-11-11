@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -8,11 +8,13 @@ use slatedb::Db;
 
 use crate::checkpoint::{CheckpointManager, CheckpointStore};
 use crate::circuit_builder::{Circuit, CircuitContext, SourceRegistry};
-use crate::dataflow_plan::DataflowPlan;
+use crate::dataflow_plan::{DataflowPlan, OperatorNode};
 use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::operators::EventQueue;
 use crate::outer_stream::OuterStreamRegistry;
+use dbsp::Stream;
+use dbsp::handles::ZSetHandle;
 
 mod barrier;
 mod graph_builder;
@@ -67,6 +69,34 @@ pub async fn instantiate_tick_loop(
     } else {
         (None, None)
     };
+    let scan_sources: Vec<String> = plan
+        .operators
+        .iter()
+        .filter_map(|node| match node {
+            OperatorNode::Scan(scan) => Some(scan.source_name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut scan_handle_streams: HashMap<String, Stream<ZSetHandle>> = HashMap::new();
+    let mut outer_stream_registry = if !scan_sources.is_empty() {
+        if let Some(bridge_ref) = bridge.as_mut() {
+            let registry = OuterStreamRegistry::from_sources(scan_sources.clone(), bridge_ref)
+                .await
+                .context("initialize outer stream registry")?;
+            for source in &scan_sources {
+                if let Some(stream) = registry.handle_stream(source) {
+                    scan_handle_streams.insert(source.clone(), stream);
+                }
+            }
+            Some(registry)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let built = {
         let bridge_ref = bridge
             .as_mut()
@@ -78,6 +108,7 @@ pub async fn instantiate_tick_loop(
             &queue,
             checkpoint_manifest.as_ref(),
             bridge_ref,
+            &scan_handle_streams,
         )
         .await?
     };
@@ -97,23 +128,10 @@ pub async fn instantiate_tick_loop(
     };
 
     let runtime = ExecutionRuntime::new(ScanRuntime::new(sources));
-    let outer_streams = if let Some(bridge_ref) = bridge.as_mut() {
-        if !built.scan_bindings.is_empty() {
-            let sources: Vec<String> = built
-                .scan_bindings
-                .iter()
-                .map(|(src, _)| src.clone())
-                .collect();
-            Some(
-                OuterStreamRegistry::from_sources(sources, bridge_ref)
-                    .await
-                    .context("initialize outer stream registry")?,
-            )
-        } else {
-            None
-        }
-    } else {
+    let outer_streams = if built.scan_bindings.is_empty() {
         None
+    } else {
+        outer_stream_registry.take()
     };
     let mut tick = TickLoop::with_graph(
         runtime,

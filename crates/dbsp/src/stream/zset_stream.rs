@@ -86,7 +86,7 @@ where
         };
         let group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(default_hint));
         let stream = Stream::with_table(table, namespace.clone(), group).await?;
-        let default_handle = stream.default.clone();
+        let default_handle = stream.default_value();
 
         let history = collect_values(&stream, stream.current_time()).await?;
         let current_handle = history.last().cloned().unwrap_or(default_handle.clone());
