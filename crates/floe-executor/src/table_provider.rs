@@ -325,6 +325,7 @@ mod tests {
     use crate::dbsp_bridge::DbspBridge;
     use crate::encoding::encode_projected_row_key;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::logical_expr::{Column, Expr, Operator};
     use datafusion::scalar::ScalarValue;
     use object_store::{ObjectStore, memory::InMemory};
     use slatedb::Db;
@@ -378,5 +379,71 @@ mod tests {
             .expect("build as of version");
         assert_eq!(as_of.len(), 1);
         assert_eq!(as_of[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn materialized_view_provider_empty_then_populated() {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.register("mv_empty");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::Int64,
+            true,
+        )]));
+        let provider =
+            MaterializedViewTableProvider::new(Arc::clone(&registry), "mv_empty", schema.clone());
+        let batches = provider
+            .build_batches_for_test()
+            .await
+            .expect("build empty batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 0);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("mv-empty", store).await.expect("open SlateDB"));
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let mut dbsp_view = bridge.new_view("mv_empty").await.expect("view");
+        let row = vec![ScalarValue::Int64(Some(5))];
+        dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+        dbsp_view.flush().await.expect("flush view");
+        let handle_view = dbsp_view.latest_handle_view();
+        let (dict, table, namespace, version) = handle_view.into_parts();
+        registry
+            .get("mv_empty")
+            .expect("view registered")
+            .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+
+        let populated = provider
+            .build_batches_for_test()
+            .await
+            .expect("build populated batches");
+        assert_eq!(populated.len(), 1);
+        assert_eq!(populated[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn mv_version_filter_is_extracted() {
+        let mv_filter = Expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("__mv_version"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::UInt64(Some(7)), None)),
+        };
+        let other_filter = Expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("auction"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
+        };
+        let filters = vec![mv_filter.clone(), other_filter.clone()];
+        let (version, retained) = super::extract_mv_version_filter(&filters);
+        assert_eq!(version, Some(7));
+        assert_eq!(retained, vec![other_filter.clone()]);
+
+        let (none_version, unchanged) = super::extract_mv_version_filter(&[other_filter.clone()]);
+        assert!(none_version.is_none());
+        assert_eq!(unchanged, vec![other_filter.clone()]);
+
+        let (first_version, _) =
+            super::extract_mv_version_filter(&[mv_filter.clone(), mv_filter.clone()]);
+        assert_eq!(first_version, Some(7));
     }
 }
