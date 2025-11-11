@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, bail};
 use datafusion::common::DFSchemaRef;
 use datafusion::logical_expr::expr::InList;

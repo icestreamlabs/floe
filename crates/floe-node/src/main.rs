@@ -14,11 +14,10 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
-use floe_storage::catalog::catalog_db;
 use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::task::JoinHandle;
 
-use crate::executor::{MaterializedExecutor, build_dataflows, build_executor_sources};
+use crate::executor::build_dataflows;
 use crate::source::SourceRegistry;
 
 #[tokio::main]
@@ -33,8 +32,6 @@ async fn main() -> anyhow::Result<()> {
     source_registry.extend(generator::definitions()?);
 
     let storage = server::init_storage().await?;
-    let storage_db = catalog_db(storage.as_ref());
-
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
     if let Some(sql) = cli.mv_query.first() {
         materialized_views.push(parse_materialized_view(sql)?);
@@ -42,23 +39,23 @@ async fn main() -> anyhow::Result<()> {
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
-    let dataflow_plans = build_dataflows(&planned_materialized_views)?;
-
-    let executor_sources = Arc::new(build_executor_sources(&source_registry));
-    let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let executor = if dataflow_plans.is_empty() {
-        None
+    let circuit_plans = build_dataflows(&planned_materialized_views)?;
+    if circuit_plans.is_empty() {
+        eprintln!("DBSP planning produced no circuit plans.");
     } else {
-        Some(
-            MaterializedExecutor::new(
-                &dataflow_plans,
-                Arc::clone(&executor_sources),
-                Arc::clone(&mv_registry),
-                Some(storage_db.clone()),
-            )
-            .await?,
-        )
-    };
+        eprintln!(
+            "DBSP planning produced {} circuit plan(s):",
+            circuit_plans.len()
+        );
+        for plan in &circuit_plans {
+            eprintln!("  • CircuitPlan root node id = {}", plan.root);
+        }
+        eprintln!(
+            "DBSP planning-only mode enabled (Phase 7 / Task 1). Execution is temporarily disabled."
+        );
+    }
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
 
     let (event_tx, event_rx) = source::channel(1024);
 
@@ -76,28 +73,15 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    let mut maybe_rx = Some(event_rx);
-    let executor_handle: Option<JoinHandle<()>> = if let Some(mut executor) = executor {
-        Some(tokio::spawn(async move {
-            let mut rx = maybe_rx.take().expect("receiver available");
-            while let Some(event) = rx.recv().await {
-                if let Err(err) = executor.ingest(event.clone()).await {
-                    eprintln!("executor ingestion failed: {err}");
-                    continue;
-                }
+    let executor_handle: JoinHandle<()> = tokio::spawn(async move {
+        let mut rx = event_rx;
+        while let Some(event) = rx.recv().await {
+            match event.to_json_string() {
+                Ok(line) => println!("{line}"),
+                Err(err) => eprintln!("failed to encode source event: {err}"),
             }
-        }))
-    } else {
-        Some(tokio::spawn(async move {
-            let mut rx = maybe_rx.take().expect("receiver available");
-            while let Some(event) = rx.recv().await {
-                match event.to_json_string() {
-                    Ok(line) => println!("{line}"),
-                    Err(err) => eprintln!("failed to encode source event: {err}"),
-                }
-            }
-        }))
-    };
+        }
+    });
 
     let query = FloeQueryContext::new(storage);
     query
@@ -111,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
     drop(event_tx);
     generator_handle.abort();
-    if let Some(handle) = &executor_handle {
-        handle.abort();
-    }
+    executor_handle.abort();
 
     if let Err(err) = generator_handle.await {
         if !err.is_cancelled() {
@@ -121,11 +103,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(handle) = executor_handle {
-        if let Err(err) = handle.await {
-            if !err.is_cancelled() {
-                eprintln!("executor task joined with error: {err}");
-            }
+    if let Err(err) = executor_handle.await {
+        if !err.is_cancelled() {
+            eprintln!("executor task joined with error: {err}");
         }
     }
 

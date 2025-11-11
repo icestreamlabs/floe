@@ -1,7 +1,7 @@
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use datafusion::common::Column;
-use datafusion::logical_expr::{col, lit, table_scan, JoinType};
+use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, TableDescriptor,
@@ -10,9 +10,13 @@ use floe_executor::dbsp_plan::{
 
 #[test]
 fn plans_scan_then_project() -> Result<()> {
-    let logical_plan = table_scan(Some(nexmark_person_table().name), &schema_for(nexmark_person_table()), None)?
-        .project(vec![col("id"), col("name")])?
-        .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_person_table().name),
+        &schema_for(nexmark_person_table()),
+        None,
+    )?
+    .project(vec![col("id"), col("name")])?
+    .build()?;
 
     let plan = planner().build(&logical_plan)?;
     let root = root_node(&plan);
@@ -51,20 +55,27 @@ fn plans_scan_then_filter() -> Result<()> {
 
 #[test]
 fn plans_join_with_single_key() -> Result<()> {
-    let right_plan =
-        table_scan(Some(nexmark_person_table().name), &schema_for(nexmark_person_table()), None)?
-            .build()?;
-    let logical_plan = table_scan(Some(nexmark_auction_table().name), &schema_for(nexmark_auction_table()), None)?
-        .join(
-            right_plan,
-            JoinType::Inner,
-            (
-                vec![Column::from_name("seller")],
-                vec![Column::from_name("id")],
-            ),
-            None,
-        )?
-        .build()?;
+    let right_plan = table_scan(
+        Some(nexmark_person_table().name),
+        &schema_for(nexmark_person_table()),
+        None,
+    )?
+    .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_auction_table().name),
+        &schema_for(nexmark_auction_table()),
+        None,
+    )?
+    .join(
+        right_plan,
+        JoinType::Inner,
+        (
+            vec![Column::from_name("seller")],
+            vec![Column::from_name("id")],
+        ),
+        None,
+    )?
+    .build()?;
 
     let plan = planner().build(&logical_plan)?;
     let root = root_node(&plan);

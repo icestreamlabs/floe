@@ -41,6 +41,10 @@ impl PlannerConfig {
         self.tables.insert(table.name.to_string(), table);
     }
 
+    pub fn register_alias(&mut self, alias: &str, table: &'static TableDescriptor) {
+        self.tables.insert(alias.to_string(), table);
+    }
+
     fn table(&self, name: &TableReference) -> Option<&'static TableDescriptor> {
         self.tables
             .get(name.table())
