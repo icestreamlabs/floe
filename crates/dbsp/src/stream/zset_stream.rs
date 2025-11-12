@@ -174,6 +174,18 @@ where
         self.stream.clone()
     }
 
+    /// Publishes an externally produced [`ZSetHandle`] into this stream
+    /// without mutating the underlying [`VersionedZSet`].
+    pub async fn publish_handle(&mut self, handle: ZSetHandle) -> Result<()> {
+        self.current_handle = handle.clone();
+        self.stream
+            .send(handle.clone())
+            .await
+            .context("publish handle to stream")?;
+        self.stream.flush().await.context("flush handle stream")?;
+        Ok(())
+    }
+
     pub fn namespace(&self) -> &str {
         self.versioned.namespace()
     }

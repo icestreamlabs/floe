@@ -5,6 +5,7 @@ pub mod codec;
 pub mod context;
 pub(crate) mod dataflow_plan;
 pub mod dbsp_bridge;
+pub mod dbsp_graph_builder;
 pub mod dbsp_plan;
 pub mod encoding;
 pub mod execution_loop;
@@ -25,6 +26,7 @@ pub use circuit_builder::{
     Circuit, CircuitContext, ConnectedDetail, ConnectedOperator, RowStreamHandle, SourceRegistry,
 };
 pub use context::FloeQueryContext;
+pub use dbsp_graph_builder::{BuildInputs, BuildOutputs, DbspGraphBuilder};
 pub use dbsp_plan::{DbspPlanBuilder, nexmark_config};
 pub use execution_loop::{
     BuiltGraph, IngestedRow, ScanRuntime, TickLoop, build_graph, instantiate_tick_loop,

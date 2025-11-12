@@ -463,6 +463,14 @@ impl DbspJoinKey {
     pub fn data_type(&self) -> &DbspScalarType {
         &self.left.data_type
     }
+
+    pub fn left_expression(&self) -> &DbspExpression {
+        &self.left
+    }
+
+    pub fn right_expression(&self) -> &DbspExpression {
+        &self.right
+    }
 }
 
 #[derive(Clone, Debug)]
