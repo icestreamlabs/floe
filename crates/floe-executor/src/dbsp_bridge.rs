@@ -80,6 +80,18 @@ impl DbspBridge {
             version,
         ))
     }
+
+    pub async fn latest_view_handle(&mut self, namespace: &str) -> Result<ZSetHandle> {
+        let dict = self.dictionary_for(namespace).await?;
+        let mut stream = ZSetStream::new(
+            dict,
+            self.table.clone(),
+            namespace.to_string(),
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await?;
+        stream.latest_handle().await
+    }
 }
 
 /// Mutable writer for a specific materialized view.

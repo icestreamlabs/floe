@@ -17,7 +17,7 @@ use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
 use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::task::JoinHandle;
 
-use crate::executor::build_dataflows;
+use crate::executor::{available_sources_from_registry, build_dataflows};
 use crate::source::SourceRegistry;
 
 #[tokio::main]
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(generator::definitions()?);
+    let available_sources = available_sources_from_registry(&source_registry);
 
     let storage = server::init_storage().await?;
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
@@ -39,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
-    let circuit_plans = build_dataflows(&planned_materialized_views)?;
+    let circuit_plans = build_dataflows(&planned_materialized_views, &available_sources)?;
     if circuit_plans.is_empty() {
         eprintln!("DBSP planning produced no circuit plans.");
     } else {

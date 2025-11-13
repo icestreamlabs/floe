@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
@@ -10,7 +10,8 @@ use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
-    DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config, nexmark_person_table,
+    DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
+    nexmark_person_table, validate_dbsp_plan,
 };
 use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
@@ -25,21 +26,8 @@ fn arrow_schema(fields: Vec<Field>) -> Arc<Schema> {
 #[tokio::test]
 async fn filter_and_projection_materializes_mv() {
     let db = test_db("filter-projection").await;
+    let view_name = "mv_price";
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut registry =
-        OuterStreamRegistry::from_sources(vec!["nexmark_bid".to_string()], &mut ingestion_bridge)
-            .await
-            .expect("outer streams");
-
-    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
-    bid_writer
-        .append(&bid_row(1, 42, 99), 1)
-        .expect("append bidder 42");
-    bid_writer.flush().await.expect("flush first step");
-    bid_writer
-        .append(&bid_row(2, 7, 50), 1)
-        .expect("append bidder 7");
-    bid_writer.flush().await.expect("flush second step");
 
     let plan = {
         let schema = nexmark_bid_schema();
@@ -55,15 +43,38 @@ async fn filter_and_projection_materializes_mv() {
         planner.build(&logical).expect("circuit plan")
     };
 
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append(&bid_row(1, 42, 99), 1)
+        .expect("append bidder 42");
+    bid_writer.flush().await.expect("flush first step");
+    bid_writer
+        .append(&bid_row(2, 7, 50), 1)
+        .expect("append bidder 7");
+    bid_writer.flush().await.expect("flush second step");
+
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let view_name = "mv_price";
     mv_registry.register(view_name);
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
-    let handle_streams = gather_handle_streams(&registry, &["nexmark_bid"]);
-    builder
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let outputs = builder
         .build(BuildInputs {
             graph_id: view_name,
             view_name,
@@ -74,6 +85,8 @@ async fn filter_and_projection_materializes_mv() {
         .await
         .expect("build graph");
 
+    assert_eq!(outputs.required_sources, required_sources);
+
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
 }
@@ -81,29 +94,8 @@ async fn filter_and_projection_materializes_mv() {
 #[tokio::test]
 async fn inner_join_materializes_mv() {
     let db = test_db("inner-join").await;
+    let view_name = "mv_join";
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut registry = OuterStreamRegistry::from_sources(
-        vec!["nexmark_person".to_string(), "nexmark_auction".to_string()],
-        &mut ingestion_bridge,
-    )
-    .await
-    .expect("outer streams");
-
-    let person_writer = registry
-        .writer_mut("nexmark_person")
-        .expect("person writer");
-    person_writer
-        .append(&person_row(100, "alice"), 1)
-        .expect("append alice");
-    person_writer.flush().await.expect("flush person");
-
-    let auction_writer = registry
-        .writer_mut("nexmark_auction")
-        .expect("auction writer");
-    auction_writer
-        .append(&auction_row(10, 100), 1)
-        .expect("append auction");
-    auction_writer.flush().await.expect("flush auction");
 
     let plan = {
         let person_schema = nexmark_person_schema();
@@ -132,8 +124,36 @@ async fn inner_join_materializes_mv() {
         planner.build(&logical).expect("circuit plan")
     };
 
+    let available_sources = ["nexmark_person", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let person_writer = registry
+        .writer_mut("nexmark_person")
+        .expect("person writer");
+    person_writer
+        .append(&person_row(100, "alice"), 1)
+        .expect("append alice");
+    person_writer.flush().await.expect("flush person");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append(&auction_row(10, 100), 1)
+        .expect("append auction");
+    auction_writer.flush().await.expect("flush auction");
+
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let view_name = "mv_join";
     mv_registry.register(view_name);
     let arrow_schema = arrow_schema(vec![
         Field::new("id", DataType::Int64, true),
@@ -142,8 +162,9 @@ async fn inner_join_materializes_mv() {
     mv_registry.set_schema(view_name, arrow_schema);
 
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
-    let handle_streams = gather_handle_streams(&registry, &["nexmark_person", "nexmark_auction"]);
-    builder
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let outputs = builder
         .build(BuildInputs {
             graph_id: view_name,
             view_name,
@@ -153,6 +174,8 @@ async fn inner_join_materializes_mv() {
         })
         .await
         .expect("build join graph");
+
+    assert_eq!(outputs.required_sources, required_sources);
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(
@@ -167,19 +190,8 @@ async fn inner_join_materializes_mv() {
 #[tokio::test]
 async fn rebuild_recovers_materialized_view_without_reingest() {
     let db = test_db("rebuild").await;
+    let view_name = "mv_rebuild";
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut registry =
-        OuterStreamRegistry::from_sources(vec!["nexmark_bid".to_string()], &mut ingestion_bridge)
-            .await
-            .expect("outer streams");
-
-    let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
-    writer.append(&bid_row(1, 42, 80), 1).expect("append row");
-    writer.flush().await.expect("flush one");
-    writer
-        .append(&bid_row(2, 42, 81), 1)
-        .expect("append second");
-    writer.flush().await.expect("flush two");
 
     let plan = {
         let schema = nexmark_bid_schema();
@@ -193,19 +205,40 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
         planner.build(&logical).expect("circuit plan")
     };
 
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    writer.append(&bid_row(1, 42, 80), 1).expect("append row");
+    writer.flush().await.expect("flush one");
+    writer
+        .append(&bid_row(2, 42, 81), 1)
+        .expect("append second");
+    writer.flush().await.expect("flush two");
+
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let view_name = "mv_rebuild";
     mv_registry.register(view_name);
     let arrow_schema = arrow_schema(vec![Field::new("auction", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let handle_streams = gather_handle_streams(&registry, &["nexmark_bid"]);
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
 
     {
         let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
             .await
             .expect("builder");
-        builder
+        let outputs = builder
             .build(BuildInputs {
                 graph_id: view_name,
                 view_name,
@@ -215,12 +248,13 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             })
             .await
             .expect("initial build");
+        assert_eq!(outputs.required_sources, required_sources.clone());
     }
 
     materialized_rows(&mv_registry, view_name).await;
 
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
-    builder
+    let outputs = builder
         .build(BuildInputs {
             graph_id: view_name,
             view_name,
@@ -230,6 +264,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
         })
         .await
         .expect("rebuild");
+
+    assert_eq!(outputs.required_sources, required_sources);
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows.len(), 2);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
@@ -106,6 +106,13 @@ impl OuterStreamRegistry {
         Ok(Self { writers })
     }
 
+    pub async fn from_validated_sources(
+        validated: &BTreeSet<String>,
+        bridge: &mut DbspBridge,
+    ) -> Result<Self> {
+        Self::from_sources(validated.iter().cloned(), bridge).await
+    }
+
     pub fn writer_mut(&mut self, source: &str) -> Option<&mut OuterStreamWriter> {
         self.writers.get_mut(source)
     }
@@ -177,5 +184,26 @@ mod tests {
         .await
         .expect("registry");
         assert_eq!(registry.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn registry_builds_from_validated_sources() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("outer-registry-validated", store)
+                .await
+                .expect("db"),
+        );
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let mut validated = BTreeSet::new();
+        validated.insert("bid".to_string());
+        validated.insert("bid".to_string());
+        validated.insert("auction".to_string());
+        let mut registry = OuterStreamRegistry::from_validated_sources(&validated, &mut bridge)
+            .await
+            .expect("registry");
+        assert_eq!(registry.len(), validated.len());
+        assert!(registry.writer_mut("bid").is_some());
+        assert!(registry.writer_mut("auction").is_some());
     }
 }

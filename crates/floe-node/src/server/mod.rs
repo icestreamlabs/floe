@@ -10,7 +10,8 @@ use core::ops::ControlFlow;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
+use floe_executor::dbsp_bridge::DbspBridge;
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry, load_or_register_mv};
 use floe_storage::SlateCatalog;
 use futures::Sink;
 use futures::stream;
@@ -37,6 +38,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::Mutex;
 
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
@@ -61,7 +63,9 @@ pub async fn run(
     query: FloeQueryContext,
     materialized_views: Arc<MaterializedViewRegistry>,
 ) -> Result<()> {
-    let state = Arc::new(FloeServerState::new(query, materialized_views));
+    let db = query.storage().db();
+    let bridge = DbspBridge::new(db).await?;
+    let state = Arc::new(FloeServerState::new(query, materialized_views, bridge));
     let factory = Arc::new(FloeServerFactory::new(state));
 
     let address = std::env::var(LISTEN_ENV).unwrap_or_else(|_| "127.0.0.1:6432".to_string());
@@ -102,39 +106,43 @@ pub async fn run(
 struct FloeServerState {
     query: FloeQueryContext,
     materialized_views: Arc<MaterializedViewRegistry>,
+    bridge: Arc<Mutex<DbspBridge>>,
 }
 
 impl FloeServerState {
-    fn new(query: FloeQueryContext, materialized_views: Arc<MaterializedViewRegistry>) -> Self {
+    fn new(
+        query: FloeQueryContext,
+        materialized_views: Arc<MaterializedViewRegistry>,
+        bridge: DbspBridge,
+    ) -> Self {
         Self {
             query,
             materialized_views,
+            bridge: Arc::new(Mutex::new(bridge)),
         }
     }
 
     async fn ensure_materialized_view_registered(&self, name: &str) -> PgWireResult<()> {
-        let schema = self
-            .materialized_views
-            .schema(name)
-            .ok_or_else(|| user_error(format!("materialized view '{name}' is not registered")))?;
-
         let session = self.query.session();
-        if session.table(name).await.is_ok() {
-            return Ok(());
-        }
-
-        let provider = MaterializedViewTableProvider::new(
+        let mut bridge = self.bridge.lock().await;
+        load_or_register_mv(
+            &session,
             Arc::clone(&self.materialized_views),
-            name.to_string(),
-            schema,
-        );
-        session
-            .register_table(name, Arc::new(provider))
-            .map_err(|err| {
-                user_error(format!(
-                    "failed to register materialized view {name}: {err}"
-                ))
-            })?;
+            &mut bridge,
+            name,
+        )
+        .await
+        .map_err(|err| {
+            user_error(format!(
+                "materialized view '{name}' is not available: {err}"
+            ))
+        })
+    }
+
+    async fn ensure_materialized_views_in_sql(&self, sql: &str) -> PgWireResult<()> {
+        for view in mv_identifiers_in_sql(sql) {
+            self.ensure_materialized_view_registered(&view).await?;
+        }
         Ok(())
     }
 }
@@ -210,6 +218,7 @@ impl FloeExtendedQueryParser {
             self.state.ensure_materialized_view_registered(view).await?;
         }
 
+        self.state.ensure_materialized_views_in_sql(sql).await?;
         let dataframe = self
             .state
             .query
@@ -337,6 +346,7 @@ impl ExtendedQueryHandler for FloeExtendedHandler {
         }
 
         let sql = self.render_portal_sql(portal)?;
+        self.state.ensure_materialized_views_in_sql(&sql).await?;
         let dataframe = self
             .state
             .query
@@ -424,6 +434,7 @@ impl FloeQueryHandler {
     }
 
     async fn execute_sql(&self, sql: &str) -> PgWireResult<Response> {
+        self.state.ensure_materialized_views_in_sql(sql).await?;
         let df = self
             .state
             .query
@@ -727,6 +738,40 @@ fn normalize_object_name(name: &ObjectName) -> Option<String> {
         .map(|Ident { value, .. }| value.clone())
 }
 
+fn mv_identifiers_in_sql(sql: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '"')) {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(name) = normalize_identifier(raw) {
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn normalize_identifier(raw: &str) -> Option<String> {
+    let quoted = raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2;
+    let inner = if quoted { &raw[1..raw.len() - 1] } else { raw };
+    if inner.is_empty() {
+        return None;
+    }
+    let normalized = if quoted {
+        inner.to_string()
+    } else {
+        inner.to_ascii_lowercase()
+    };
+    if normalized.starts_with("mv_") {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,7 +794,8 @@ mod tests {
                 true,
             )])),
         );
-        Arc::new(FloeServerState::new(query, registry))
+        let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+        Arc::new(FloeServerState::new(query, registry, bridge))
     }
 
     #[tokio::test]
@@ -763,7 +809,12 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
         );
 
-        let state = Arc::new(FloeServerState::new(query.clone(), Arc::clone(&registry)));
+        let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+        let state = Arc::new(FloeServerState::new(
+            query.clone(),
+            Arc::clone(&registry),
+            bridge,
+        ));
         let handler = FloeQueryHandler::new(state);
 
         let dialect = PostgreSqlDialect {};
@@ -784,7 +835,8 @@ mod tests {
         let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
         let query = FloeQueryContext::new(Arc::clone(&catalog));
         let registry = Arc::new(MaterializedViewRegistry::new());
-        let state = Arc::new(FloeServerState::new(query, Arc::clone(&registry)));
+        let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+        let state = Arc::new(FloeServerState::new(query, Arc::clone(&registry), bridge));
         let handler = FloeQueryHandler::new(state);
 
         let dialect = PostgreSqlDialect {};
@@ -799,7 +851,7 @@ mod tests {
             .expect_err("expected error");
         assert!(
             err.to_string()
-                .contains("materialized view 'missing_mv' is not registered")
+                .contains("materialized view 'missing_mv' is not available")
         );
     }
 
@@ -808,7 +860,8 @@ mod tests {
         let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
         let query = FloeQueryContext::new(Arc::clone(&catalog));
         let registry = Arc::new(MaterializedViewRegistry::new());
-        let state = Arc::new(FloeServerState::new(query, registry));
+        let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+        let state = Arc::new(FloeServerState::new(query, registry, bridge));
         let handler = FloeQueryHandler::new(state);
 
         let dialect = PostgreSqlDialect {};
@@ -829,7 +882,8 @@ mod tests {
         let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
         let query = FloeQueryContext::new(Arc::clone(&catalog));
         let registry = Arc::new(MaterializedViewRegistry::new());
-        let state = Arc::new(FloeServerState::new(query, registry));
+        let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+        let state = Arc::new(FloeServerState::new(query, registry, bridge));
         let handler = FloeQueryHandler::new(state);
 
         let dialect = PostgreSqlDialect {};
@@ -899,6 +953,16 @@ mod tests {
             sql.contains("WHERE auction > 100"),
             "unexpected rendered SQL: {sql}"
         );
+    }
+
+    #[test]
+    fn detects_mv_identifiers_in_sql() {
+        let sql = r#"SELECT * FROM mv_orders JOIN "mv_Sales" ON mv_orders.id = "mv_Sales".id"#;
+        let mut names = mv_identifiers_in_sql(sql);
+        names.sort();
+        let mut expected = vec!["mv_orders".to_string(), "mv_Sales".to_string()];
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     // No client calls are required in tests as routing is validated directly

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,6 +15,7 @@ use dbsp::{
 };
 
 use crate::dbsp_bridge::DbspBridge;
+use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
@@ -35,6 +36,12 @@ impl DbspGraphBuilder {
 
     pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {
         self.ns.set_graph_id(inputs.graph_id);
+        let available_sources: BTreeSet<String> =
+            inputs.outer_handle_streams.keys().cloned().collect();
+        let ValidatedPlan {
+            required_sources, ..
+        } = validate_dbsp_plan(inputs.plan, &available_sources, inputs.view_name)
+            .context("validating query plan before DBSP graph build")?;
         let mut built = HashMap::new();
         let mut mv_latest = HashMap::new();
         let root_stream = self
@@ -49,8 +56,13 @@ impl DbspGraphBuilder {
             .await?;
 
         if !mv_latest.contains_key(inputs.view_name) {
+            let root_node = inputs.plan.node(inputs.plan.root).with_context(|| {
+                anyhow!("root node {} missing from circuit plan", inputs.plan.root)
+            })?;
+            let root_schema = Arc::clone(&root_node.output_schema);
             self.materialize_view(
                 inputs.view_name,
+                root_schema,
                 &root_stream,
                 &inputs.mv_registry,
                 &mut mv_latest,
@@ -61,6 +73,7 @@ impl DbspGraphBuilder {
         Ok(BuildOutputs {
             node_streams: built,
             mv_latest,
+            required_sources,
         })
     }
 
@@ -142,8 +155,14 @@ impl DbspGraphBuilder {
                         mv_latest,
                     )
                     .await?;
-                self.materialize_view(&sink.name, &upstream, mv_registry, mv_latest)
-                    .await?
+                self.materialize_view(
+                    &sink.name,
+                    Arc::clone(sink.input_schema()),
+                    &upstream,
+                    mv_registry,
+                    mv_latest,
+                )
+                .await?
             }
             DbspNodeKind::Aggregate(_)
             | DbspNodeKind::WindowAggregate(_)
@@ -264,6 +283,7 @@ impl DbspGraphBuilder {
     async fn materialize_view(
         &mut self,
         view_name: &str,
+        schema: Arc<RowSchema>,
         upstream: &Stream<ZSetHandle>,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
@@ -292,6 +312,7 @@ impl DbspGraphBuilder {
         let (dict, table, namespace, version) = handle_view.into_parts();
         let state = DbspPersistedState::new(dict, table, namespace, version);
         let registry_handle = mv_registry.register(view_name.to_string());
+        mv_registry.set_schema(view_name.to_string(), schema.to_arrow_schema());
         registry_handle.set_dbsp_state(state);
         mv_latest.insert(view_name.to_string(), (ts, handle));
 
@@ -335,6 +356,7 @@ pub struct BuildInputs<'a> {
 pub struct BuildOutputs {
     pub node_streams: HashMap<usize, Stream<ZSetHandle>>,
     pub mv_latest: HashMap<String, (i64, ZSetHandle)>,
+    pub required_sources: BTreeSet<String>,
 }
 
 fn first_input(node: &CircuitNode, label: &str) -> Result<usize> {

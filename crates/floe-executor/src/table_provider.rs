@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use datafusion::arrow::array::{ArrayRef, Int64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::memory::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, Operator, TableType};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use floe_core::catalog::TableDefinition;
@@ -18,6 +19,8 @@ use crate::encoding::decode_projected_row_key;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::stream_types::{Diff, Row};
 use dbsp::handles::ZSetHandleView;
+
+const MV_VERSION_COLUMN: &str = "__mv_version";
 
 pub struct SlateTableProvider {
     storage: Arc<SlateCatalog>,
@@ -56,6 +59,22 @@ impl TableProvider for SlateTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if parse_mv_version_expr(expr).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -121,6 +140,7 @@ pub struct MaterializedViewTableProvider {
     registry: Arc<MaterializedViewRegistry>,
     view_name: String,
     schema: datafusion::arrow::datatypes::SchemaRef,
+    include_mv_version: bool,
 }
 
 impl MaterializedViewTableProvider {
@@ -129,15 +149,26 @@ impl MaterializedViewTableProvider {
         view_name: impl Into<String>,
         schema: datafusion::arrow::datatypes::SchemaRef,
     ) -> Self {
+        let include_mv_version = !schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == MV_VERSION_COLUMN);
+        let schema_with_meta = if include_mv_version {
+            append_mv_version_field(&schema)
+        } else {
+            Arc::clone(&schema)
+        };
         Self {
             registry,
             view_name: view_name.into(),
-            schema,
+            schema: schema_with_meta,
+            include_mv_version,
         }
     }
 
     async fn build_batches(&self, as_of_version: Option<u64>) -> DFResult<Vec<RecordBatch>> {
-        let rows = self.load_rows(as_of_version).await?;
+        let (rows, version) = self.load_rows(as_of_version).await?;
+        let rows = self.attach_version_column(rows, version);
         build_scalar_batches(rows, self.schema.clone())
             .map_err(|err| DataFusionError::Execution(err.to_string()))
     }
@@ -152,7 +183,7 @@ impl MaterializedViewTableProvider {
         self.build_batches(Some(version)).await
     }
 
-    async fn load_rows(&self, as_of_version: Option<u64>) -> DFResult<Vec<Row>> {
+    async fn load_rows(&self, as_of_version: Option<u64>) -> DFResult<(Vec<Row>, u64)> {
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "materialized view '{}' is not registered",
@@ -161,9 +192,13 @@ impl MaterializedViewTableProvider {
         })?;
 
         let Some(state) = view.dbsp_state() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
-        self.materialize_dbsp_rows(state, as_of_version).await
+        let target_version = as_of_version.unwrap_or(state.version());
+        let rows = self
+            .materialize_dbsp_rows(state, Some(target_version))
+            .await?;
+        Ok((rows, target_version))
     }
 
     async fn materialize_dbsp_rows(
@@ -197,6 +232,18 @@ impl MaterializedViewTableProvider {
         }
         Ok(rows)
     }
+
+    fn attach_version_column(&self, rows: Vec<Row>, version: u64) -> Vec<Row> {
+        if !self.include_mv_version {
+            return rows;
+        }
+        rows.into_iter()
+            .map(|mut row| {
+                row.push(ScalarValue::UInt64(Some(version)));
+                row
+            })
+            .collect()
+    }
 }
 
 impl fmt::Debug for MaterializedViewTableProvider {
@@ -218,7 +265,23 @@ impl TableProvider for MaterializedViewTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::View
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if parse_mv_version_expr(expr).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -268,7 +331,7 @@ fn parse_mv_version_expr(expr: &Expr) -> Option<u64> {
 }
 
 fn is_mv_version_column(expr: &Expr) -> bool {
-    matches!(expr, Expr::Column(col) if col.name == "__mv_version")
+    matches!(expr, Expr::Column(col) if col.name == MV_VERSION_COLUMN)
 }
 
 fn literal_to_u64(expr: &Expr) -> Option<u64> {
@@ -326,6 +389,16 @@ fn build_scalar_batches(
     Ok(vec![batch])
 }
 
+fn append_mv_version_field(schema: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| (**field).clone())
+        .collect();
+    fields.push(Field::new(MV_VERSION_COLUMN, DataType::UInt64, false));
+    Arc::new(Schema::new(fields))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,7 +452,7 @@ mod tests {
             .expect("build latest");
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].num_rows(), 2);
-        assert_eq!(latest[0].num_columns(), 2);
+        assert_eq!(latest[0].num_columns(), 3);
 
         let as_of = provider
             .build_batches_at_version(version_one)
@@ -432,7 +505,7 @@ mod tests {
     #[test]
     fn mv_version_filter_is_extracted() {
         let mv_filter = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(Column::from_name("__mv_version"))),
+            Box::new(Expr::Column(Column::from_name(MV_VERSION_COLUMN))),
             Operator::Eq,
             Box::new(Expr::Literal(ScalarValue::UInt64(Some(7)), None)),
         ));
