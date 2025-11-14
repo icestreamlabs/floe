@@ -1750,18 +1750,27 @@ name = "floe-executor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-ipc",
  "arrow-schema",
  "async-recursion",
  "async-trait",
+ "bytes",
+ "chrono",
  "datafusion",
  "dbsp",
+ "fallible-iterator",
  "floe-core",
  "floe-storage",
+ "futures",
  "object_store",
+ "postgres-protocol",
+ "postgres-types",
  "serde",
  "serde_json",
  "slatedb",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -106,6 +106,23 @@ fn detects_join_fan_in_mismatch() -> Result<()> {
     let first_input = *join_node.inputs.first().expect("join input");
     join_node.inputs = vec![first_input];
 
+    plan.root = join_id;
+
+    fn collect_reachable(plan: &CircuitPlan, id: usize, seen: &mut BTreeSet<usize>) {
+        if !seen.insert(id) {
+            return;
+        }
+        if let Some(node) = plan.node(id) {
+            for input in &node.inputs {
+                collect_reachable(plan, *input, seen);
+            }
+        }
+    }
+
+    let mut reachable = BTreeSet::new();
+    collect_reachable(&plan, join_id, &mut reachable);
+    plan.nodes.retain(|node| reachable.contains(&node.id));
+
     let err = validate_dbsp_plan(&plan, &sources, "mv_join").unwrap_err();
     let expected = format!("node {join_id} → Join expects ≥2 inputs (found 1)");
     assert!(err.to_string().contains(&expected));

@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Cursor;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
@@ -10,6 +14,8 @@ use dbsp::{Stream, StreamRetention, ZSetStream};
 use slatedb::Db;
 
 use crate::namespaces;
+
+const MV_SCHEMA_SUFFIX: &str = "/meta/schema.json";
 
 /// Shared bridge that provisions DBSP-backed views for materialization.
 pub struct DbspBridge {
@@ -65,6 +71,41 @@ impl DbspBridge {
 
     pub fn table(&self) -> Arc<dyn KeyValueTable> {
         self.table.clone()
+    }
+
+    pub async fn save_mv_schema(&self, view_name: &str, schema: SchemaRef) -> Result<()> {
+        let key = Self::mv_schema_key(view_name)?;
+        let mut payload = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut payload, schema.as_ref())
+                .context("encode materialized view schema via Arrow IPC")?;
+            writer.finish().context("finalize schema IPC stream")?;
+        }
+        self.table
+            .put(&key, &payload)
+            .await
+            .with_context(|| format!("persist schema for materialized view '{view_name}'"))
+    }
+
+    pub async fn load_mv_schema(&self, view_name: &str) -> Result<Option<SchemaRef>> {
+        let key = Self::mv_schema_key(view_name)?;
+        let bytes =
+            match self.table.get(&key).await.with_context(|| {
+                format!("load schema metadata for materialized view '{view_name}'")
+            })? {
+                Some(bytes) => bytes,
+                None => return Ok(None),
+            };
+        let cursor = Cursor::new(bytes);
+        let reader = StreamReader::try_new(cursor, None).with_context(|| {
+            format!("decode persisted schema for materialized view '{view_name}'")
+        })?;
+        Ok(Some(reader.schema()))
+    }
+
+    fn mv_schema_key(view_name: &str) -> Result<Vec<u8>> {
+        let namespace = namespaces::materialized_view(view_name)?;
+        Ok(format!("{namespace}{MV_SCHEMA_SUFFIX}").into_bytes())
     }
 
     pub async fn handle_view_for(

@@ -102,6 +102,8 @@ async fn inner_join_materializes_mv() {
         let auction_schema = nexmark_auction_schema();
         let right = table_scan(Some("nexmark_person"), &person_schema, None)
             .expect("person scan")
+            .project(vec![col("id").alias("person_id"), col("name")])
+            .expect("person project")
             .build()
             .expect("person plan");
         let logical = table_scan(Some("nexmark_auction"), &auction_schema, None)
@@ -111,7 +113,7 @@ async fn inner_join_materializes_mv() {
                 JoinType::Inner,
                 (
                     vec![Column::from_name("seller")],
-                    vec![Column::from_name("id")],
+                    vec![Column::from_name("person_id")],
                 ),
                 None,
             )

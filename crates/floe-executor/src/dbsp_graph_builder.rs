@@ -312,7 +312,12 @@ impl DbspGraphBuilder {
         let (dict, table, namespace, version) = handle_view.into_parts();
         let state = DbspPersistedState::new(dict, table, namespace, version);
         let registry_handle = mv_registry.register(view_name.to_string());
-        mv_registry.set_schema(view_name.to_string(), schema.to_arrow_schema());
+        let arrow_schema = schema.to_arrow_schema();
+        mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
+        self.bridge
+            .save_mv_schema(view_name, Arc::clone(&arrow_schema))
+            .await
+            .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
         registry_handle.set_dbsp_state(state);
         mv_latest.insert(view_name.to_string(), (ts, handle));
 

@@ -7,16 +7,25 @@ edition.workspace = true
 floe-core = { path = "../floe-core" }
 floe-storage = { path = "../floe-storage" }
 dbsp = { path = "../dbsp" }
+arrow-ipc = "56.2.0"
 anyhow = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
+postgres-protocol = { workspace = true }
+postgres-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
 object_store = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+fallible-iterator = "0.2"

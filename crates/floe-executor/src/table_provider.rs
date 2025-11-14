@@ -140,7 +140,6 @@ pub struct MaterializedViewTableProvider {
     registry: Arc<MaterializedViewRegistry>,
     view_name: String,
     schema: datafusion::arrow::datatypes::SchemaRef,
-    include_mv_version: bool,
 }
 
 impl MaterializedViewTableProvider {
@@ -162,7 +161,6 @@ impl MaterializedViewTableProvider {
             registry,
             view_name: view_name.into(),
             schema: schema_with_meta,
-            include_mv_version,
         }
     }
 
@@ -234,7 +232,12 @@ impl MaterializedViewTableProvider {
     }
 
     fn attach_version_column(&self, rows: Vec<Row>, version: u64) -> Vec<Row> {
-        if !self.include_mv_version {
+        let schema_has_mv_version = self
+            .schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == MV_VERSION_COLUMN);
+        if !schema_has_mv_version {
             return rows;
         }
         rows.into_iter()
@@ -294,6 +297,7 @@ impl TableProvider for MaterializedViewTableProvider {
         let (as_of_version, passthrough_filters) = extract_mv_version_filter(filters);
         let batches = self.build_batches(as_of_version).await?;
         let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
+        // Always expose full schema (including __mv_version) regardless of projection pushdown.
         mem_table
             .scan(state, projection, &passthrough_filters, limit)
             .await

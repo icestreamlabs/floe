@@ -13,7 +13,8 @@ use crate::handles::ZSetHandle;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::Stream;
 use crate::stream::operations::{
-    delta_lifted_delta_lifted_join, lifted_stream_elimination, lifted_stream_introduction,
+    delta_lifted_delta_lifted_join, lifted_integrate_zset, lifted_stream_elimination,
+    lifted_stream_introduction,
 };
 
 /// Convenience wrapper around the dbsp lifted join pipeline.
@@ -76,7 +77,8 @@ impl DbspJoin {
                 ns: String::new(),
                 version: 0,
             }));
-        let mut stream = lifted_stream_elimination(&nested, inner_group).await?;
+        let integrated = lifted_integrate_zset::<O>(&nested, inner_group.clone()).await?;
+        let mut stream = lifted_stream_elimination(&integrated, inner_group).await?;
         stream.flush().await?;
         Ok(Self { stream })
     }

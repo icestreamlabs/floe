@@ -157,6 +157,10 @@ impl<'cfg> PlannerContext<'cfg> {
         self.nodes
     }
 
+    fn node_by_id(&self, id: usize) -> Option<&CircuitNode> {
+        self.nodes.iter().find(|node| node.id == id)
+    }
+
     fn plan_node(&mut self, plan: &LogicalPlan) -> Result<PlannedNode, PlannerError> {
         match plan {
             LogicalPlan::TableScan(scan) => {
@@ -184,33 +188,38 @@ impl<'cfg> PlannerContext<'cfg> {
             }
             LogicalPlan::Projection(projection) => {
                 let input = self.plan_node(&projection.input)?;
-                let items = projection
-                    .expr
-                    .iter()
-                    .map(|expr| {
-                        let (expression, alias) = extract_alias(expr.clone())?;
-                        Ok(ProjectItem {
-                            expr: expression,
-                            alias,
-                        })
-                    })
-                    .collect::<Result<Vec<ProjectItem>, PlannerError>>()?;
-                let project = DbspProjectNode::try_new(input.schema.clone(), items)?;
-                let output_schema = project.output_schema().clone();
-                let id = self.add_node(
-                    vec![input.id],
-                    DbspNodeKind::Project(project),
-                    output_schema.clone(),
-                );
-                Ok(PlannedNode {
-                    id,
-                    schema: output_schema,
-                })
+                self.build_projection_node(input, projection)
             }
             LogicalPlan::Filter(filter) => {
+                if let LogicalPlan::Projection(projection) = filter.input.as_ref() {
+                    let base = self.plan_node(&projection.input)?;
+                    let select = DbspSelectNode::try_new(
+                        base.schema.clone(),
+                        normalize_expr(filter.predicate.clone())?,
+                    )?;
+                    let filter_id = self.add_node(
+                        vec![base.id],
+                        DbspNodeKind::Select(select),
+                        base.schema.clone(),
+                    );
+                    let filtered = PlannedNode {
+                        id: filter_id,
+                        schema: base.schema.clone(),
+                    };
+                    return self.build_projection_node(filtered, projection);
+                }
+
                 let input = self.plan_node(&filter.input)?;
+                let mut predicate_schema = input.schema.clone();
+                if matches!(filter.input.as_ref(), LogicalPlan::Projection(_)) {
+                    if let Some(node) = self.node_by_id(input.id) {
+                        if let DbspNodeKind::Project(project) = &node.kind {
+                            predicate_schema = Arc::clone(project.input_schema());
+                        }
+                    }
+                }
                 let select = DbspSelectNode::try_new(
-                    input.schema.clone(),
+                    predicate_schema,
                     normalize_expr(filter.predicate.clone())?,
                 )?;
                 let id = self.add_node(
@@ -274,6 +283,35 @@ impl<'cfg> PlannerContext<'cfg> {
                 PlannerError::UnsupportedPlan("plan type is not supported".to_string()),
             ),
         }
+    }
+
+    fn build_projection_node(
+        &mut self,
+        input: PlannedNode,
+        projection: &datafusion::logical_expr::logical_plan::Projection,
+    ) -> Result<PlannedNode, PlannerError> {
+        let items = projection
+            .expr
+            .iter()
+            .map(|expr| {
+                let (expression, alias) = extract_alias(expr.clone())?;
+                Ok(ProjectItem {
+                    expr: expression,
+                    alias,
+                })
+            })
+            .collect::<Result<Vec<ProjectItem>, PlannerError>>()?;
+        let project = DbspProjectNode::try_new(input.schema.clone(), items)?;
+        let output_schema = project.output_schema().clone();
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::Project(project),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
     }
 
     fn plan_join(

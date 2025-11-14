@@ -146,7 +146,6 @@ async fn mv_loader_recovers_after_registry_restart() {
     assert_eq!(int_rows(&batches), vec![vec![1, 2, 100], vec![2, 3, 140]]);
 }
 
-
 async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> BuiltViewFixture {
     let db = test_db(test_name).await;
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");

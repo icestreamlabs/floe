@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::ops::ControlFlow;
-use datafusion::arrow::array::{Array, Int64Array};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::array::{Array, Int64Array, UInt64Array};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::{FloeQueryContext, MaterializedViewRegistry, load_or_register_mv};
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry, load_or_register_mv, namespaces};
 use floe_storage::SlateCatalog;
 use futures::Sink;
 use futures::stream;
@@ -506,18 +506,37 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
             let mut row = Vec::with_capacity(column_count);
             for col_idx in 0..column_count {
                 let array = batch.column(col_idx);
-                let int_array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    user_error(format!(
-                        "expected INT8 column at position {} but found {}",
-                        col_idx,
-                        array.data_type()
-                    ))
-                })?;
-                row.push(if int_array.is_null(row_idx) {
-                    None
-                } else {
-                    Some(int_array.value(row_idx))
-                });
+                let value = match array.data_type() {
+                    DataType::Int64 => {
+                        let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                        if int_array.is_null(row_idx) {
+                            None
+                        } else {
+                            Some(int_array.value(row_idx))
+                        }
+                    }
+                    DataType::UInt64 => {
+                        let uint_array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        if uint_array.is_null(row_idx) {
+                            None
+                        } else {
+                            let raw = uint_array.value(row_idx);
+                            let signed = i64::try_from(raw).map_err(|_| {
+                                user_error(format!(
+                                    "version value {raw} exceeds INT8 range"
+                                ))
+                            })?;
+                            Some(signed)
+                        }
+                    }
+                    other => {
+                        return Err(user_error(format!(
+                            "expected INT8-compatible column at position {} but found {}",
+                            col_idx, other
+                        )));
+                    }
+                };
+                row.push(value);
             }
             row_buffer.push(row);
         }
@@ -538,11 +557,14 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
 fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>> {
     let mut fields = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        if field.data_type() != &datafusion::arrow::datatypes::DataType::Int64 {
-            return Err(user_error(format!(
-                "unsupported column type {} in result set",
-                field.data_type()
-            )));
+        match field.data_type() {
+            DataType::Int64 | DataType::UInt64 => {}
+            other => {
+                return Err(user_error(format!(
+                    "unsupported column type {} in result set",
+                    other
+                )));
+            }
         }
         fields.push(FieldInfo::new(
             field.name().clone(),
@@ -765,7 +787,7 @@ fn normalize_identifier(raw: &str) -> Option<String> {
     } else {
         inner.to_ascii_lowercase()
     };
-    if normalized.starts_with("mv_") {
+    if normalized.starts_with("mv_") && namespaces::materialized_view(&normalized).is_ok() {
         Some(normalized)
     } else {
         None

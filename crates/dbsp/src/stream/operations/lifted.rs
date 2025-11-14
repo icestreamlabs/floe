@@ -16,7 +16,7 @@ use super::super::util::{
     build_derived_stream, collect_values, push_value_in_place, resolve_apply_handle_op,
     set_default_in_place,
 };
-use super::basic::{delay, differentiate, integrate, stream_elimination, stream_introduction};
+use super::basic::{delay, differentiate, integrate, stream_introduction};
 
 pub async fn lifted_delay<T>(
     stream: &Stream<StreamHandle>,
@@ -160,7 +160,12 @@ where
             .resolve_handle(handle, inner_group.clone())
             .await
             .context("resolve handle for lifted stream elimination")?;
-        outputs.push(stream_elimination(&inner).await?);
+        let mut resolved = inner;
+        let latest = resolved
+            .latest()
+            .await
+            .context("load latest handle for lifted stream elimination")?;
+        outputs.push(latest);
     }
 
     let default_value = if let Some(first) = outputs.first() {
