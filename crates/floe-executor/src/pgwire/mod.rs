@@ -287,8 +287,30 @@ impl PgwireConnection {
                     }
                 }
                 Err(err) => {
-                    self.send_error_response(&err).await?;
-                    self.send_ready_for_query(b'E').await?;
+                    if is_disconnect_error(&err) {
+                        info!(%self.peer_addr, "pgwire client disconnected during request");
+                        break;
+                    }
+                    if let Err(send_err) = self.send_error_response(&err).await {
+                        if is_disconnect_error(&send_err) {
+                            info!(
+                                %self.peer_addr,
+                                "pgwire client disconnected before error response could be sent"
+                            );
+                            break;
+                        }
+                        return Err(send_err);
+                    }
+                    if let Err(send_err) = self.send_ready_for_query(b'E').await {
+                        if is_disconnect_error(&send_err) {
+                            info!(
+                                %self.peer_addr,
+                                "pgwire client disconnected before ReadyForQuery could be sent"
+                            );
+                            break;
+                        }
+                        return Err(send_err);
+                    }
                 }
             }
         }
@@ -943,6 +965,23 @@ fn push_command_complete(buf: &mut BytesMut, rows: usize) {
     let len = 4 + tag.len() + 1;
     buf.put_i32(len as i32);
     put_cstr(buf, &tag);
+}
+
+fn is_disconnect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::NotConnected
+                        | ErrorKind::UnexpectedEof
+                )
+            })
+    })
 }
 
 fn push_parse_complete(buf: &mut BytesMut) {

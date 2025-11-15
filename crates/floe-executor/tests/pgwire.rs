@@ -24,6 +24,7 @@ use slatedb::Db;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 
 const VIEW_NAME: &str = "mv_pgwire_test";
 
@@ -137,6 +138,131 @@ async fn pgwire_errors_on_parameter_mismatch() -> Result<()> {
         "unexpected error fields: {error:?}"
     );
     client.expect_ready_with_status(b'E').await?;
+
+    client.terminate().await?;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pgwire_handles_client_drop_mid_stream() -> Result<()> {
+    let rows: Vec<i64> = (0..5000).collect();
+    let fixture = PgwireFixture::start("pgwire-client-drop", &rows).await?;
+
+    let mut client = PgwireClient::connect(fixture.addr).await?;
+    client
+        .parse("all", "SELECT value FROM mv_pgwire_test ORDER BY value")
+        .await?;
+    client.expect_parse_complete().await?;
+    client.describe_statement("all").await?;
+    client.expect_parameter_description(0).await?;
+    client.expect_row_description().await?;
+    client.bind("portal_all", "all", &[]).await?;
+    client.expect_bind_complete().await?;
+    client.execute("portal_all", 0).await?;
+    client.expect_row_description().await?;
+    let first_row = client.read_single_data_row().await?;
+    assert_eq!(first_row[0], Some("0".into()));
+
+    drop(client);
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pgwire_streams_rows_incrementally() -> Result<()> {
+    let rows: Vec<i64> = (0..2000).collect();
+    let fixture = PgwireFixture::start("pgwire-stream-incremental", &rows).await?;
+
+    let mut client = PgwireClient::connect(fixture.addr).await?;
+    client
+        .parse(
+            "stream_all",
+            "SELECT value FROM mv_pgwire_test ORDER BY value",
+        )
+        .await?;
+    client.expect_parse_complete().await?;
+    client.describe_statement("stream_all").await?;
+    client.expect_parameter_description(0).await?;
+    client.expect_row_description().await?;
+    client.bind("portal_stream", "stream_all", &[]).await?;
+    client.expect_bind_complete().await?;
+    client.execute("portal_stream", 0).await?;
+    client.expect_row_description().await?;
+
+    let first_row = timeout(Duration::from_secs(1), client.read_single_data_row())
+        .await
+        .context("timeout waiting for first streamed row")??;
+    assert_eq!(first_row[0], Some("0".into()));
+
+    let mut streamed_rows = vec![first_row];
+    streamed_rows.extend(client.consume_data_rows().await?);
+    assert_eq!(streamed_rows.len(), rows.len());
+    for (idx, row) in streamed_rows.iter().enumerate() {
+        assert_eq!(row[0], Some(rows[idx].to_string()));
+    }
+
+    client.terminate().await?;
+    fixture.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pgwire_streaming_respects_version_snapshots() -> Result<()> {
+    let rows = vec![5, 15];
+    let fixture = PgwireFixture::start("pgwire-stream-versioned", &rows).await?;
+    let version_old = fixture.versions[0];
+    let version_latest = *fixture.versions.last().unwrap();
+
+    let mut client = PgwireClient::connect(fixture.addr).await?;
+
+    client
+        .parse(
+            "by_version",
+            "SELECT value, __mv_version FROM mv_pgwire_test \
+             WHERE __mv_version = $1 ORDER BY value",
+        )
+        .await?;
+    client.expect_parse_complete().await?;
+    client.describe_statement("by_version").await?;
+    client.expect_parameter_description(1).await?;
+    client.expect_row_description().await?;
+    client
+        .bind("portal_version", "by_version", &[&version_old.to_string()])
+        .await?;
+    client.expect_bind_complete().await?;
+    client.execute("portal_version", 0).await?;
+    client.expect_row_description().await?;
+    let filtered_rows = client.consume_data_rows().await?;
+    assert_eq!(filtered_rows.len(), 1);
+    assert_eq!(filtered_rows[0][0], Some("5".into()));
+    assert_eq!(
+        filtered_rows[0][1],
+        Some(version_old.to_string()),
+        "expected only rows from requested version"
+    );
+
+    client
+        .parse(
+            "latest",
+            "SELECT value, __mv_version FROM mv_pgwire_test ORDER BY value",
+        )
+        .await?;
+    client.expect_parse_complete().await?;
+    client.describe_statement("latest").await?;
+    client.expect_parameter_description(0).await?;
+    client.expect_row_description().await?;
+    client.bind("portal_latest", "latest", &[]).await?;
+    client.expect_bind_complete().await?;
+    client.execute("portal_latest", 0).await?;
+    client.expect_row_description().await?;
+    let latest_rows = client.consume_data_rows().await?;
+    assert_eq!(latest_rows.len(), 2);
+    assert_eq!(latest_rows[0][0], Some("5".into()));
+    assert_eq!(latest_rows[1][0], Some("15".into()));
+    for row in latest_rows {
+        assert_eq!(row[1], Some(version_latest.to_string()));
+    }
 
     client.terminate().await?;
     fixture.shutdown().await;
@@ -309,6 +435,13 @@ impl PgwireClient {
             }
         }
         Ok(rows)
+    }
+
+    async fn read_single_data_row(&mut self) -> Result<Vec<Option<String>>> {
+        match read_message(&mut self.stream).await? {
+            Message::DataRow(body) => extract_data_row(&body),
+            other => bail!("expected DataRow, got {}", describe_message(&other)),
+        }
     }
 
     async fn expect_error(&mut self) -> Result<HashMap<char, String>> {

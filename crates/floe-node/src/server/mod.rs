@@ -7,14 +7,16 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::ops::ControlFlow;
-use datafusion::arrow::array::{Array, Int64Array, UInt64Array};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::dataframe::DataFrame;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, load_or_register_mv, namespaces};
 use floe_storage::SlateCatalog;
 use futures::Sink;
-use futures::stream;
+use futures::{StreamExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::portal::Portal;
@@ -27,6 +29,7 @@ use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use postgres_types::Type as PgType;
@@ -403,7 +406,7 @@ impl FloeQueryHandler {
 
     async fn handle_select(&self, query: &Query) -> PgWireResult<Response> {
         self.ensure_materialized_views_in_query(query).await?;
-        self.execute_sql(&query.to_string()).await
+        self.execute_sql_streaming(&query.to_string()).await
     }
 
     async fn execute_statement(&self, statement: Statement) -> PgWireResult<Response> {
@@ -433,20 +436,35 @@ impl FloeQueryHandler {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn execute_sql(&self, sql: &str) -> PgWireResult<Response> {
         self.state.ensure_materialized_views_in_sql(sql).await?;
-        let df = self
-            .state
-            .query
-            .session()
-            .sql(sql)
-            .await
-            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
+        let df = self.plan_sql(sql).await?;
         let batches = df
             .collect()
             .await
             .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
         let response = build_query_response(batches)?;
+        Ok(Response::Query(response))
+    }
+
+    async fn plan_sql(&self, sql: &str) -> PgWireResult<DataFrame> {
+        self.state
+            .query
+            .session()
+            .sql(sql)
+            .await
+            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))
+    }
+
+    async fn execute_sql_streaming(&self, sql: &str) -> PgWireResult<Response> {
+        self.state.ensure_materialized_views_in_sql(sql).await?;
+        let df = self.plan_sql(sql).await?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
+        let response = build_query_response_stream(stream).await?;
         Ok(Response::Query(response))
     }
 }
@@ -506,36 +524,7 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
             let mut row = Vec::with_capacity(column_count);
             for col_idx in 0..column_count {
                 let array = batch.column(col_idx);
-                let value = match array.data_type() {
-                    DataType::Int64 => {
-                        let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                        if int_array.is_null(row_idx) {
-                            None
-                        } else {
-                            Some(int_array.value(row_idx))
-                        }
-                    }
-                    DataType::UInt64 => {
-                        let uint_array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-                        if uint_array.is_null(row_idx) {
-                            None
-                        } else {
-                            let raw = uint_array.value(row_idx);
-                            let signed = i64::try_from(raw).map_err(|_| {
-                                user_error(format!(
-                                    "version value {raw} exceeds INT8 range"
-                                ))
-                            })?;
-                            Some(signed)
-                        }
-                    }
-                    other => {
-                        return Err(user_error(format!(
-                            "expected INT8-compatible column at position {} but found {}",
-                            col_idx, other
-                        )));
-                    }
-                };
+                let value = read_numeric_field(array.as_ref(), row_idx, col_idx)?;
                 row.push(value);
             }
             row_buffer.push(row);
@@ -552,6 +541,112 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     }));
 
     Ok(QueryResponse::new(info, row_stream))
+}
+
+async fn build_query_response_stream(
+    mut batch_stream: SendableRecordBatchStream,
+) -> PgWireResult<QueryResponse> {
+    let Some(first_batch_result) = batch_stream.next().await else {
+        let schema = Arc::new(Vec::new());
+        let rows = stream::iter(Vec::<PgWireResult<_>>::new());
+        return Ok(QueryResponse::new(schema, rows));
+    };
+    let first_batch = first_batch_result
+        .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
+    let info = Arc::new(arrow_schema_to_field_info(&first_batch.schema())?);
+    let row_schema = Arc::clone(&info);
+
+    struct StreamState {
+        stream: SendableRecordBatchStream,
+        current_batch: Option<RecordBatch>,
+        next_row: usize,
+        schema: Arc<Vec<FieldInfo>>,
+    }
+
+    let initial_state = StreamState {
+        stream: batch_stream,
+        current_batch: Some(first_batch),
+        next_row: 0,
+        schema: row_schema,
+    };
+
+    let rows = stream::try_unfold(initial_state, move |mut state| async move {
+        loop {
+            if let Some(batch) = state.current_batch.as_ref() {
+                if state.next_row < batch.num_rows() {
+                    let schema = Arc::clone(&state.schema);
+                    let row = encode_stream_row(batch, state.next_row, schema)?;
+                    state.next_row += 1;
+                    return Ok(Some((row, state)));
+                }
+                state.current_batch = None;
+                state.next_row = 0;
+            }
+
+            match state.stream.next().await {
+                Some(Ok(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    state.current_batch = Some(batch);
+                    state.next_row = 0;
+                }
+                Some(Err(err)) => {
+                    return Err(user_error(format!("DataFusion execution error: {err}")));
+                }
+                None => return Ok(None),
+            }
+        }
+    });
+
+    Ok(QueryResponse::new(info, rows))
+}
+
+fn encode_stream_row(
+    batch: &RecordBatch,
+    row_idx: usize,
+    schema: Arc<Vec<FieldInfo>>,
+) -> PgWireResult<DataRow> {
+    let column_count = schema.len();
+    let mut encoder = DataRowEncoder::new(schema);
+    for col_idx in 0..column_count {
+        let array = batch.column(col_idx);
+        let value = read_numeric_field(array.as_ref(), row_idx, col_idx)?;
+        encoder.encode_field(&value)?;
+    }
+    encoder.finish()
+}
+
+fn read_numeric_field(
+    array: &dyn Array,
+    row_idx: usize,
+    column_index: usize,
+) -> PgWireResult<Option<i64>> {
+    match array.data_type() {
+        DataType::Int64 => {
+            let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            if int_array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(int_array.value(row_idx)))
+            }
+        }
+        DataType::UInt64 => {
+            let uint_array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            if uint_array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                let raw = uint_array.value(row_idx);
+                let signed = i64::try_from(raw)
+                    .map_err(|_| user_error(format!("version value {raw} exceeds INT8 range")))?;
+                Ok(Some(signed))
+            }
+        }
+        other => Err(user_error(format!(
+            "expected INT8-compatible column at position {} but found {}",
+            column_index, other
+        ))),
+    }
 }
 
 fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>> {
@@ -797,11 +892,23 @@ fn normalize_identifier(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field, Schema};
-    use floe_executor::MaterializedViewRegistry;
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use bytes::Buf;
+    use datafusion::physical_plan::RecordBatchStream;
+    use datafusion::scalar::ScalarValue;
+    use floe_executor::encoding::encode_projected_row_key;
+    use floe_executor::materialized_view::DbspPersistedState;
+    use floe_executor::{
+        FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
+    };
+    use futures::Stream;
     use pgwire::messages::extendedquery::Bind;
+    use slatedb::Db;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
     async fn state_with_single_mv() -> Arc<FloeServerState> {
         let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
@@ -985,6 +1092,217 @@ mod tests {
         let mut expected = vec!["mv_orders".to_string(), "mv_Sales".to_string()];
         expected.sort();
         assert_eq!(names, expected);
+    }
+
+    #[tokio::test]
+    async fn streaming_execute_respects_mv_version_filter() {
+        let (state, versions) = streaming_state_with_rows(&[10, 20]).await;
+        let handler = FloeQueryHandler::new(state);
+        let version_literal = versions[0];
+        let sql = format!(
+            "SELECT value, __mv_version FROM {view} WHERE __mv_version = {version} ORDER BY value",
+            view = STREAM_VIEW_NAME,
+            version = version_literal
+        );
+        let response = handler
+            .execute_sql_streaming(&sql)
+            .await
+            .expect("streaming query");
+        let Response::Query(mut query) = response else {
+            panic!("expected query response");
+        };
+
+        let schema = query.row_schema();
+        let field_names: Vec<_> = schema
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
+        assert_eq!(
+            field_names,
+            vec!["value".to_string(), "__mv_version".to_string()]
+        );
+
+        let rows_stream = query.data_rows();
+        let mut rows = Vec::new();
+        while let Some(row) = rows_stream.next().await {
+            let row = row.expect("data row");
+            rows.push(decode_text_row(row));
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the requested version should be streamed"
+        );
+        assert_eq!(rows[0][0].as_deref(), Some("10"));
+        assert_eq!(
+            rows[0][1].as_deref(),
+            Some(version_literal.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn build_query_response_stream_yields_batches_incrementally() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch_one = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("record batch");
+        let batch_two = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![3])) as ArrayRef],
+        )
+        .expect("record batch");
+        let poll_counter = Arc::new(AtomicUsize::new(0));
+        let stream: SendableRecordBatchStream = Box::pin(TestBatchStream::new(
+            vec![batch_one, batch_two],
+            poll_counter.clone(),
+        ));
+
+        let mut response = build_query_response_stream(stream)
+            .await
+            .expect("stream response");
+        let schema = response.row_schema();
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].name(), "value");
+
+        let rows = response.data_rows();
+        rows.next().await.expect("row").expect("ok row");
+        assert_eq!(poll_counter.load(Ordering::SeqCst), 1);
+
+        rows.next().await.expect("row").expect("ok row");
+        assert_eq!(
+            poll_counter.load(Ordering::SeqCst),
+            1,
+            "second batch should not be polled yet"
+        );
+
+        rows.next().await.expect("row").expect("ok row");
+        assert_eq!(
+            poll_counter.load(Ordering::SeqCst),
+            2,
+            "second batch should be polled after draining the first"
+        );
+        assert!(rows.next().await.is_none());
+    }
+
+    struct TestBatchStream {
+        batches: Vec<RecordBatch>,
+        next_index: usize,
+        polled: Arc<AtomicUsize>,
+    }
+
+    impl TestBatchStream {
+        fn new(batches: Vec<RecordBatch>, polled: Arc<AtomicUsize>) -> Self {
+            Self {
+                batches,
+                next_index: 0,
+                polled,
+            }
+        }
+    }
+
+    impl Stream for TestBatchStream {
+        type Item = datafusion::error::Result<RecordBatch>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.next_index >= this.batches.len() {
+                return Poll::Ready(None);
+            }
+            let batch = this.batches[this.next_index].clone();
+            this.next_index += 1;
+            this.polled.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(batch)))
+        }
+    }
+
+    impl RecordBatchStream for TestBatchStream {
+        fn schema(&self) -> SchemaRef {
+            self.batches
+                .first()
+                .map(|batch| batch.schema())
+                .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())))
+        }
+    }
+
+    const STREAM_VIEW_NAME: &str = "mv_stream_filter";
+
+    async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u64>) {
+        let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+        let query = FloeQueryContext::new(Arc::clone(&catalog));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let db = catalog.db();
+        let (dbsp_state, versions) =
+            seed_mv_state(Arc::clone(&db), rows, Arc::clone(&schema)).await;
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema(STREAM_VIEW_NAME.to_string(), Arc::clone(&schema));
+        let handle = registry.register(STREAM_VIEW_NAME.to_string());
+        handle.set_dbsp_state(dbsp_state);
+        let provider = MaterializedViewTableProvider::new(
+            Arc::clone(&registry),
+            STREAM_VIEW_NAME.to_string(),
+            schema,
+        );
+        query
+            .session()
+            .register_table(STREAM_VIEW_NAME, Arc::new(provider))
+            .expect("register mv provider");
+        let bridge = DbspBridge::new(db).await.expect("bridge");
+        let state = FloeServerState::new(query, registry, bridge);
+        (Arc::new(state), versions)
+    }
+
+    async fn seed_mv_state(
+        db: Arc<Db>,
+        rows: &[i64],
+        schema: SchemaRef,
+    ) -> (DbspPersistedState, Vec<u64>) {
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let mut view = bridge
+            .new_view(STREAM_VIEW_NAME)
+            .await
+            .expect("create view");
+        let mut versions = Vec::new();
+        for value in rows {
+            let key = encode_projected_row_key(&[ScalarValue::Int64(Some(*value))])
+                .expect("encode row key");
+            view.add_delta(key, 1);
+            let handle = view.flush().await.expect("flush view");
+            versions.push(handle.version);
+        }
+        bridge
+            .save_mv_schema(STREAM_VIEW_NAME, Arc::clone(&schema))
+            .await
+            .expect("persist schema");
+        let handle_view = view.latest_handle_view();
+        let (dict, table, namespace, version) = handle_view.into_parts();
+        (
+            DbspPersistedState::new(dict, table, namespace, version),
+            versions,
+        )
+    }
+
+    fn decode_text_row(mut row: DataRow) -> Vec<Option<String>> {
+        let mut values = Vec::with_capacity(row.field_count as usize);
+        for _ in 0..row.field_count {
+            let len = row.data.get_i32();
+            if len < 0 {
+                values.push(None);
+            } else {
+                let bytes = row.data.split_to(len as usize);
+                values.push(Some(String::from_utf8(bytes.to_vec()).expect("utf8 value")));
+            }
+        }
+        values
     }
 
     // No client calls are required in tests as routing is validated directly
