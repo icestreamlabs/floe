@@ -14,7 +14,9 @@ pub async fn load_or_register_mv(
     bridge: &mut DbspBridge,
     view_name: &str,
 ) -> Result<()> {
+    eprintln!("load_or_register_mv invoked for '{view_name}'");
     if session.table(view_name).await.is_ok() {
+        eprintln!("materialized view '{view_name}' already registered in session");
         return Ok(());
     }
 
@@ -38,6 +40,7 @@ pub async fn load_or_register_mv(
 
     let handle = registry.register(view_name.to_string());
     if handle.dbsp_state().is_none() {
+        eprintln!("materialized view '{view_name}' missing DBSP state, loading from SlateDB");
         let namespace = namespaces::materialized_view(view_name)
             .context("derive namespace for materialized view")?;
         let latest_handle = bridge
@@ -71,6 +74,7 @@ pub async fn load_or_register_mv(
     session
         .register_table(view_name, Arc::new(provider))
         .with_context(|| format!("register materialized view '{view_name}'"))?;
+    eprintln!("materialized view '{view_name}' registered with DataFusion session");
     Ok(())
 }
 

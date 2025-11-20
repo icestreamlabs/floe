@@ -7,6 +7,7 @@ edition.workspace = true
 floe-core = { path = "../floe-core" }
 floe-storage = { path = "../floe-storage" }
 dbsp = { path = "../dbsp" }
+floe-sql-parser = { path = "../floe-sql-parser" }
 arrow-ipc = "56.2.0"
 anyhow = { workspace = true }
 async-recursion = { workspace = true }
@@ -24,6 +25,7 @@ object_store = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+nexmark = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }

@@ -7,11 +7,10 @@ use bytes::BytesMut;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::scalar::ScalarValue;
 use fallible_iterator::FallibleIterator;
-use floe_executor::FloeQueryContext;
-use floe_executor::PgwireServer;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use floe_executor::{FloeQueryContext, PgwireServer, PgwireServerConfig};
 use floe_storage::SlateCatalog;
 use futures::FutureExt;
 use object_store::memory::InMemory;
@@ -146,8 +145,13 @@ async fn pgwire_errors_on_parameter_mismatch() -> Result<()> {
 
 #[tokio::test]
 async fn pgwire_handles_client_drop_mid_stream() -> Result<()> {
-    let rows: Vec<i64> = (0..5000).collect();
-    let fixture = PgwireFixture::start("pgwire-client-drop", &rows).await?;
+    let rows: Vec<i64> = (0..40).collect();
+    let fixture = PgwireFixture::start_with_server_config(
+        "pgwire-client-drop",
+        &rows,
+        PgwireServerConfig::default().with_data_row_flush_limit(4),
+    )
+    .await?;
 
     let mut client = PgwireClient::connect(fixture.addr).await?;
     client
@@ -171,8 +175,13 @@ async fn pgwire_handles_client_drop_mid_stream() -> Result<()> {
 
 #[tokio::test]
 async fn pgwire_streams_rows_incrementally() -> Result<()> {
-    let rows: Vec<i64> = (0..2000).collect();
-    let fixture = PgwireFixture::start("pgwire-stream-incremental", &rows).await?;
+    let rows: Vec<i64> = (0..40).collect();
+    let fixture = PgwireFixture::start_with_server_config(
+        "pgwire-stream-incremental",
+        &rows,
+        PgwireServerConfig::default().with_data_row_flush_limit(4),
+    )
+    .await?;
 
     let mut client = PgwireClient::connect(fixture.addr).await?;
     client
@@ -277,6 +286,14 @@ struct PgwireFixture {
 
 impl PgwireFixture {
     async fn start(test_name: &str, rows: &[i64]) -> Result<Self> {
+        Self::start_with_server_config(test_name, rows, PgwireServerConfig::default()).await
+    }
+
+    async fn start_with_server_config(
+        test_name: &str,
+        rows: &[i64],
+        config: PgwireServerConfig,
+    ) -> Result<Self> {
         let db = test_db(test_name).await;
         let schema = test_schema();
         let (state, versions) = seed_view_state(Arc::clone(&db), rows, Arc::clone(&schema)).await?;
@@ -290,7 +307,12 @@ impl PgwireFixture {
         let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
         let ctx = FloeQueryContext::new(Arc::clone(&catalog));
         let bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let server = Arc::new(PgwireServer::new(ctx, Arc::clone(&registry), bridge));
+        let server = Arc::new(PgwireServer::with_config(
+            ctx,
+            Arc::clone(&registry),
+            bridge,
+            config,
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;

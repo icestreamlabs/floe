@@ -7,6 +7,7 @@ edition.workspace = true
 floe-core = { path = "../floe-core" }
 floe-executor = { path = "../floe-executor" }
 floe-storage = { path = "../floe-storage" }
+dbsp = { path = "../dbsp" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
@@ -19,6 +20,7 @@ serde_json = { workspace = true }
 pgwire = { workspace = true }
 sqlparser = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 floe-sql-parser = { workspace = true }
 slatedb = { workspace = true }
 bytes = "1.6"
@@ -26,3 +28,5 @@ postgres-types = "0.2"
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
+tempfile = "3.10"
+tokio-postgres = { version = "0.7", features = ["runtime"] }

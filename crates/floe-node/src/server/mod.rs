@@ -1,22 +1,29 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::ops::ControlFlow;
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt64Array};
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray, UInt16Array, UInt32Array,
+    UInt64Array,
+};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use floe_executor::dbsp_bridge::DbspBridge;
+use floe_executor::pgwire::tail::{
+    TailBatch, TailStream, execute_tail, parse_tail_sql, tail_output_schema,
+};
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, load_or_register_mv, namespaces};
 use floe_storage::SlateCatalog;
-use futures::Sink;
-use futures::{StreamExt, stream};
+use futures::{Sink, Stream, StreamExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::portal::Portal;
@@ -42,9 +49,15 @@ use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use datafusion::arrow::array::ArrayRef;
 
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
+const TAIL_META_COLUMNS: usize = 3;
+const TAIL_OP_VALUE: i16 = 1;
 
 pub async fn init_storage() -> Result<Arc<SlateCatalog>> {
     match std::env::var(DATA_ENV) {
@@ -425,6 +438,29 @@ impl FloeQueryHandler {
         }
     }
 
+    async fn execute_tail_statement(&self, sql: &str) -> PgWireResult<Response> {
+        let params =
+            parse_tail_sql(sql).map_err(|err| user_error(format!("TAIL parse error: {err}")))?;
+        self.state
+            .ensure_materialized_view_registered(&params.mv_name)
+            .await?;
+        let schema = tail_output_schema(self.state.materialized_views.as_ref(), &params.mv_name)
+            .map_err(|err| user_error(format!("TAIL schema error: {err}")))?;
+        let fields = Arc::new(arrow_schema_to_field_info(&schema)?);
+        let cancel = CancellationToken::new();
+        let session = self.state.query.session();
+        let tail_stream = execute_tail(
+            &session,
+            self.state.materialized_views.as_ref(),
+            params,
+            cancel.clone(),
+        )
+        .await
+        .map_err(|err| user_error(format!("TAIL execution error: {err}")))?;
+        let rows = TailResponseStream::new(fields.clone(), tail_stream, cancel);
+        Ok(Response::Query(QueryResponse::new(fields, rows)))
+    }
+
     async fn ensure_materialized_views_in_query(&self, query: &Query) -> PgWireResult<()> {
         let mut names = Vec::new();
         extract_tables_from_query(query, &mut names);
@@ -491,6 +527,11 @@ impl SimpleQueryHandler for FloeQueryHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        if let Some(tail_sql) = detect_single_tail_statement(query) {
+            let response = self.execute_tail_statement(tail_sql).await?;
+            return Ok(vec![response]);
+        }
+
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, query)
             .map_err(|err| user_error(format!("SQL parse error: {err}")))?;
@@ -602,6 +643,68 @@ async fn build_query_response_stream(
     Ok(QueryResponse::new(info, rows))
 }
 
+struct TailResponseStream {
+    schema: Arc<Vec<FieldInfo>>,
+    stream: TailStream,
+    cancel: CancellationToken,
+    current_batch: Option<TailBatch>,
+    next_row: usize,
+}
+
+impl TailResponseStream {
+    fn new(schema: Arc<Vec<FieldInfo>>, stream: TailStream, cancel: CancellationToken) -> Self {
+        Self {
+            schema,
+            stream,
+            cancel,
+            current_batch: None,
+            next_row: 0,
+        }
+    }
+}
+
+impl Drop for TailResponseStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Stream for TailResponseStream {
+    type Item = PgWireResult<DataRow>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if let Some(batch) = self.current_batch.as_ref() {
+                if self.next_row < batch.batch.num_rows() {
+                    let schema = Arc::clone(&self.schema);
+                    let row = encode_tail_row(schema, batch.version, &batch.batch, self.next_row);
+                    self.next_row += 1;
+                    return Poll::Ready(Some(row));
+                }
+                self.current_batch = None;
+                self.next_row = 0;
+            }
+
+            match Pin::new(&mut self.stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    if batch.batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.current_batch = Some(batch);
+                    self.next_row = 0;
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Some(Err(user_error(format!(
+                        "TAIL execution error: {err}"
+                    )))));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 fn encode_stream_row(
     batch: &RecordBatch,
     row_idx: usize,
@@ -617,12 +720,65 @@ fn encode_stream_row(
     encoder.finish()
 }
 
+fn encode_tail_row(
+    schema: Arc<Vec<FieldInfo>>,
+    version: i64,
+    batch: &RecordBatch,
+    row_idx: usize,
+) -> PgWireResult<DataRow> {
+    let mut encoder = DataRowEncoder::new(schema);
+    encoder.encode_field(&Some(version))?;
+    encoder.encode_field(&Some(i64::from(TAIL_OP_VALUE)))?;
+    encoder.encode_field(&Option::<i64>::None)?;
+    for col_idx in 0..batch.num_columns() {
+        let value = read_numeric_field(
+            batch.column(col_idx).as_ref(),
+            row_idx,
+            col_idx + TAIL_META_COLUMNS,
+        )?;
+        encoder.encode_field(&value)?;
+    }
+    encoder.finish()
+}
+
 fn read_numeric_field(
     array: &dyn Array,
     row_idx: usize,
     column_index: usize,
 ) -> PgWireResult<Option<i64>> {
     match array.data_type() {
+        DataType::Int16 => {
+            let array = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            if array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(array.value(row_idx) as i64))
+            }
+        }
+        DataType::UInt16 => {
+            let array = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            if array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(array.value(row_idx) as i64))
+            }
+        }
+        DataType::Int32 => {
+            let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            if array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(array.value(row_idx) as i64))
+            }
+        }
+        DataType::UInt32 => {
+            let array = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            if array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(array.value(row_idx) as i64))
+            }
+        }
         DataType::Int64 => {
             let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
             if int_array.is_null(row_idx) {
@@ -642,6 +798,17 @@ fn read_numeric_field(
                 Ok(Some(signed))
             }
         }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let ts_array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            if ts_array.is_null(row_idx) {
+                Ok(None)
+            } else {
+                Ok(Some(ts_array.value(row_idx)))
+            }
+        }
         other => Err(user_error(format!(
             "expected INT8-compatible column at position {} but found {}",
             column_index, other
@@ -653,7 +820,13 @@ fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>
     let mut fields = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         match field.data_type() {
-            DataType::Int64 | DataType::UInt64 => {}
+            DataType::Int16
+            | DataType::UInt16
+            | DataType::Int32
+            | DataType::UInt32
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Timestamp(TimeUnit::Microsecond, _) => {}
             other => {
                 return Err(user_error(format!(
                     "unsupported column type {} in result set",
@@ -889,6 +1062,39 @@ fn normalize_identifier(raw: &str) -> Option<String> {
     }
 }
 
+fn detect_single_tail_statement(query: &str) -> Option<&str> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let statement = trimmed.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    if statement.is_empty() {
+        return None;
+    }
+    if statement.contains(';') {
+        return None;
+    }
+    if is_tail_statement(statement) {
+        Some(statement)
+    } else {
+        None
+    }
+}
+
+fn is_tail_statement(sql: &str) -> bool {
+    let trimmed = sql.trim_start_matches(|c: char| c.is_ascii_control() || c.is_whitespace());
+    if trimmed.len() < 4 {
+        return false;
+    }
+    if !trimmed[..4].eq_ignore_ascii_case("TAIL") {
+        return false;
+    }
+    trimmed[4..]
+        .chars()
+        .next()
+        .map_or(false, |ch| ch.is_whitespace())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1298,17 @@ mod tests {
         let mut expected = vec!["mv_orders".to_string(), "mv_Sales".to_string()];
         expected.sort();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn detects_tail_statement_in_simple_query() {
+        let query = "  TAIL mv_orders WITH SNAPSHOT;;\n";
+        assert_eq!(
+            detect_single_tail_statement(query),
+            Some("TAIL mv_orders WITH SNAPSHOT")
+        );
+        assert!(detect_single_tail_statement("SELECT 1;").is_none());
+        assert!(detect_single_tail_statement("TAIL mv_orders; SELECT 1").is_none());
     }
 
     #[tokio::test]

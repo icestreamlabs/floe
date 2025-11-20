@@ -27,6 +27,13 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::load_or_register_mv;
 use crate::{FloeQueryContext, MaterializedViewRegistry, namespaces};
 
+pub mod encode;
+pub mod tail;
+use encode::encode_tail_batch;
+use tail::{
+    TailBatch, TailStream, execute_tail, is_tail_canceled_error, parse_tail_sql, tail_output_schema,
+};
+
 const SERVER_VERSION: &str = "16.0 (Floe)";
 const CLIENT_ENCODING: &str = "UTF8";
 const DATE_STYLE: &str = "ISO, MDY";
@@ -40,11 +47,36 @@ const FLOAT8_OID: u32 = 701;
 const TEXT_OID: u32 = 25;
 const BOOL_OID: u32 = 16;
 const TIMESTAMPTZ_OID: u32 = 1184;
-const DATA_ROW_FLUSH_LIMIT: usize = 1024;
+const DEFAULT_DATA_ROW_FLUSH_LIMIT: usize = 1024;
 const MV_VERSION_COLUMN: &str = "__mv_version";
 
 static PROCESS_ID_ALLOC: AtomicU32 = AtomicU32::new(10_000);
 static SECRET_KEY_ALLOC: AtomicU32 = AtomicU32::new(90_000);
+
+#[derive(Clone)]
+pub struct PgwireServerConfig {
+    data_row_flush_limit: usize,
+}
+
+impl PgwireServerConfig {
+    pub fn with_data_row_flush_limit(mut self, limit: usize) -> Self {
+        let limit = limit.max(1);
+        self.data_row_flush_limit = limit;
+        self
+    }
+
+    pub fn data_row_flush_limit(&self) -> usize {
+        self.data_row_flush_limit
+    }
+}
+
+impl Default for PgwireServerConfig {
+    fn default() -> Self {
+        Self {
+            data_row_flush_limit: DEFAULT_DATA_ROW_FLUSH_LIMIT,
+        }
+    }
+}
 
 pub struct QueryResult {
     pub schema: SchemaRef,
@@ -55,6 +87,7 @@ pub struct PgwireServer {
     ctx: FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     bridge: Arc<Mutex<DbspBridge>>,
+    config: PgwireServerConfig,
 }
 
 impl PgwireServer {
@@ -63,10 +96,20 @@ impl PgwireServer {
         registry: Arc<MaterializedViewRegistry>,
         bridge: DbspBridge,
     ) -> Self {
+        Self::with_config(ctx, registry, bridge, PgwireServerConfig::default())
+    }
+
+    pub fn with_config(
+        ctx: FloeQueryContext,
+        registry: Arc<MaterializedViewRegistry>,
+        bridge: DbspBridge,
+        config: PgwireServerConfig,
+    ) -> Self {
         Self {
             ctx,
             registry,
             bridge: Arc::new(Mutex::new(bridge)),
+            config,
         }
     }
 
@@ -82,6 +125,7 @@ impl PgwireServer {
             Arc::clone(&self.registry),
             Arc::clone(&self.bridge),
             addr,
+            self.config.clone(),
             CancellationToken::new(),
         )
         .serve()
@@ -160,6 +204,20 @@ fn normalize_identifier(raw: &str) -> Option<String> {
     }
 }
 
+fn is_tail_statement(sql: &str) -> bool {
+    let trimmed = sql.trim_start_matches(|c: char| c.is_ascii_control() || c.is_whitespace());
+    if !trimmed
+        .get(..4)
+        .map_or(false, |prefix| prefix.eq_ignore_ascii_case("TAIL"))
+    {
+        return false;
+    }
+    trimmed[4..]
+        .chars()
+        .next()
+        .map_or(true, |ch| ch.is_whitespace())
+}
+
 #[derive(Debug)]
 struct PreparedStmt {
     sql: String,
@@ -177,6 +235,36 @@ struct Portal {
     row_limit: Option<i32>,
     param_formats: Vec<i16>,
     result_formats: Vec<i16>,
+    tail_state: Option<TailPortalState>,
+}
+
+impl Portal {
+    fn clear_tail(&mut self) {
+        if let Some(state) = self.tail_state.take() {
+            state.cancel.cancel();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TailPortalState {
+    stream: TailStream,
+    schema: SchemaRef,
+    current_batch: Option<TailBatchCursor>,
+    finished: bool,
+    cancel: CancellationToken,
+}
+
+#[derive(Debug)]
+struct TailBatchCursor {
+    batch: TailBatch,
+    next_row: usize,
+}
+
+enum TailStreamOutcome {
+    Suspended { rows: usize },
+    Completed { rows: usize },
+    Canceled { rows: usize },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -225,6 +313,7 @@ struct PgwireConnection {
     peer_addr: SocketAddr,
     write_buf: BytesMut,
     read_buf: Vec<u8>,
+    config: PgwireServerConfig,
     shutdown: CancellationToken,
 }
 
@@ -235,6 +324,7 @@ impl PgwireConnection {
         registry: Arc<MaterializedViewRegistry>,
         bridge: Arc<Mutex<DbspBridge>>,
         peer_addr: SocketAddr,
+        config: PgwireServerConfig,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -245,6 +335,7 @@ impl PgwireConnection {
             peer_addr,
             write_buf: BytesMut::with_capacity(1024),
             read_buf: Vec::with_capacity(1024),
+            config,
             shutdown,
         }
     }
@@ -411,6 +502,22 @@ impl PgwireConnection {
         Ok(())
     }
 
+    async fn send_query_canceled(&mut self) -> Result<()> {
+        self.write_buf.clear();
+        push_error_response(
+            &mut self.write_buf,
+            "ERROR",
+            "57014",
+            "canceling statement due to user request",
+            "",
+        );
+        self.stream
+            .write_all(&self.write_buf)
+            .await
+            .context("send query canceled")?;
+        Ok(())
+    }
+
     async fn write_command_complete(&mut self, rows: usize) -> Result<()> {
         self.write_buf.clear();
         push_command_complete(&mut self.write_buf, rows);
@@ -550,7 +657,9 @@ impl PgwireConnection {
                 state.statements.remove(&name);
             }
             b'P' => {
-                state.portals.remove(&name);
+                if let Some(mut portal) = state.portals.remove(&name) {
+                    portal.clear_tail();
+                }
             }
             other => bail!("unsupported Close variant {other:?}"),
         }
@@ -662,6 +771,7 @@ impl PgwireConnection {
             row_limit: None,
             param_formats,
             result_formats,
+            tail_state: None,
         };
         state.portals.insert(portal_name, portal);
 
@@ -688,23 +798,29 @@ impl PgwireConnection {
                     .statements
                     .get_mut(&name)
                     .ok_or_else(|| anyhow!("statement '{name}' not found"))?;
-                self.ensure_statement_schema(stmt).await?;
                 let placeholder_count = count_placeholders(&stmt.sql);
                 if stmt.param_types.len() < placeholder_count {
                     stmt.param_types.resize(placeholder_count, 0);
                 }
                 self.write_buf.clear();
                 push_parameter_description(&mut self.write_buf, &stmt.param_types);
-                if let Some(schema) = &stmt.result_schema {
-                    let has_mv = !find_mv_names(&stmt.sql).is_empty();
-                    let schema = if has_mv {
-                        maybe_append_mv_version(schema, stmt.schema_includes_mv_version)
-                    } else {
-                        Arc::clone(schema)
-                    };
+                if is_tail_statement(&stmt.sql) {
+                    let tail_params = parse_tail_sql(&stmt.sql)?;
+                    let schema = tail_output_schema(self.registry.as_ref(), &tail_params.mv_name)?;
                     push_row_description(&mut self.write_buf, &schema);
                 } else {
-                    push_no_data(&mut self.write_buf);
+                    self.ensure_statement_schema(stmt).await?;
+                    if let Some(schema) = &stmt.result_schema {
+                        let has_mv = !find_mv_names(&stmt.sql).is_empty();
+                        let schema = if has_mv {
+                            maybe_append_mv_version(schema, stmt.schema_includes_mv_version)
+                        } else {
+                            Arc::clone(schema)
+                        };
+                        push_row_description(&mut self.write_buf, &schema);
+                    } else {
+                        push_no_data(&mut self.write_buf);
+                    }
                 }
                 self.stream
                     .write_all(&self.write_buf)
@@ -712,32 +828,45 @@ impl PgwireConnection {
                     .context("send Describe response")?;
             }
             b'P' => {
-                let stmt_name = {
+                let (stmt_name, portal_schema) = {
                     let portal = state
                         .portals
                         .get(&name)
                         .ok_or_else(|| anyhow!("portal '{name}' not found"))?;
-                    portal.stmt_name.clone()
+                    (
+                        portal.stmt_name.clone(),
+                        portal.tail_state.as_ref().map(|s| Arc::clone(&s.schema)),
+                    )
                 };
                 let stmt = state.statements.get_mut(&stmt_name).ok_or_else(|| {
                     anyhow!("statement '{stmt_name}' not found for portal '{name}'")
                 })?;
-                self.ensure_statement_schema(stmt).await?;
                 self.write_buf.clear();
-                let placeholder_count = count_placeholders(&stmt.sql);
-                if stmt.param_types.len() < placeholder_count {
-                    stmt.param_types.resize(placeholder_count, 0);
-                }
-                if let Some(schema) = &stmt.result_schema {
-                    let has_mv = !find_mv_names(&stmt.sql).is_empty();
-                    let schema = if has_mv {
-                        maybe_append_mv_version(schema, stmt.schema_includes_mv_version)
+                if is_tail_statement(&stmt.sql) {
+                    let schema = if let Some(schema) = portal_schema {
+                        schema
                     } else {
-                        Arc::clone(schema)
+                        let tail_params = parse_tail_sql(&stmt.sql)?;
+                        tail_output_schema(self.registry.as_ref(), &tail_params.mv_name)?
                     };
                     push_row_description(&mut self.write_buf, &schema);
                 } else {
-                    push_no_data(&mut self.write_buf);
+                    self.ensure_statement_schema(stmt).await?;
+                    let placeholder_count = count_placeholders(&stmt.sql);
+                    if stmt.param_types.len() < placeholder_count {
+                        stmt.param_types.resize(placeholder_count, 0);
+                    }
+                    if let Some(schema) = &stmt.result_schema {
+                        let has_mv = !find_mv_names(&stmt.sql).is_empty();
+                        let schema = if has_mv {
+                            maybe_append_mv_version(schema, stmt.schema_includes_mv_version)
+                        } else {
+                            Arc::clone(schema)
+                        };
+                        push_row_description(&mut self.write_buf, &schema);
+                    } else {
+                        push_no_data(&mut self.write_buf);
+                    }
                 }
                 self.stream
                     .write_all(&self.write_buf)
@@ -783,7 +912,9 @@ impl PgwireConnection {
                 .statements
                 .get_mut(&stmt_name)
                 .ok_or_else(|| anyhow!("statement '{stmt_name}' not found"))?;
-            self.ensure_statement_schema(stmt).await?;
+            if !is_tail_statement(&stmt.sql) {
+                self.ensure_statement_schema(stmt).await?;
+            }
         }
         let stmt = state
             .statements
@@ -794,6 +925,60 @@ impl PgwireConnection {
         } else {
             Some(max_rows as usize)
         };
+        if is_tail_statement(&stmt.sql) {
+            let outcome = {
+                let portal = state
+                    .portals
+                    .get_mut(&portal_name)
+                    .ok_or_else(|| anyhow!("portal '{portal_name}' not found"))?;
+                self.execute_tail_portal(stmt, portal, limit).await?
+            };
+            match outcome {
+                TailStreamOutcome::Suspended { rows } => {
+                    self.write_buf.clear();
+                    push_portal_suspended(&mut self.write_buf);
+                    self.stream
+                        .write_all(&self.write_buf)
+                        .await
+                        .context("send PortalSuspended")?;
+                    self.write_buf.clear();
+                    self.send_ready_for_query(b'I').await?;
+                    info!(
+                        %self.peer_addr,
+                        rows,
+                        statement = %stmt.sql,
+                        "TAIL portal suspended"
+                    );
+                }
+                TailStreamOutcome::Completed { rows } => {
+                    if let Some(mut portal) = state.portals.remove(&portal_name) {
+                        portal.clear_tail();
+                    }
+                    self.write_command_complete(rows).await?;
+                    self.send_ready_for_query(b'I').await?;
+                    info!(
+                        %self.peer_addr,
+                        rows,
+                        statement = %stmt.sql,
+                        "TAIL portal completed"
+                    );
+                }
+                TailStreamOutcome::Canceled { rows } => {
+                    if let Some(mut portal) = state.portals.remove(&portal_name) {
+                        portal.clear_tail();
+                    }
+                    self.send_query_canceled().await?;
+                    self.send_ready_for_query(b'I').await?;
+                    info!(
+                        %self.peer_addr,
+                        rows,
+                        statement = %stmt.sql,
+                        "TAIL portal canceled"
+                    );
+                }
+            }
+            return Ok(());
+        }
         let started = Instant::now();
         let rows = self
             .execute_statement(stmt, params.as_slice(), limit)
@@ -853,6 +1038,7 @@ impl PgwireConnection {
         self.write_buf.clear();
         let mut total_rows = 0usize;
         let mut buffered_rows = 0usize;
+        let flush_limit = self.config.data_row_flush_limit();
         'batch_loop: while let Some(batch) = stream.next().await {
             let batch = batch.context("fetch record batch")?;
             let num_rows = batch.num_rows();
@@ -866,7 +1052,7 @@ impl PgwireConnection {
                 .context("encode DataRow")?;
                 buffered_rows += 1;
                 total_rows += 1;
-                if buffered_rows >= DATA_ROW_FLUSH_LIMIT {
+                if buffered_rows >= flush_limit {
                     self.flush_row_buffer(&mut buffered_rows).await?;
                 }
                 if let Some(limit) = row_limit {
@@ -878,6 +1064,115 @@ impl PgwireConnection {
         }
         self.flush_row_buffer(&mut buffered_rows).await?;
         Ok(total_rows)
+    }
+
+    async fn execute_tail_portal(
+        &mut self,
+        stmt: &PreparedStmt,
+        portal: &mut Portal,
+        row_limit: Option<usize>,
+    ) -> Result<TailStreamOutcome> {
+        if !portal.params.is_empty() {
+            bail!("TAIL does not accept bound parameters");
+        }
+        if portal.tail_state.is_none() {
+            let params = parse_tail_sql(&stmt.sql)?;
+            let cancel = self.shutdown.child_token();
+            let stream = execute_tail(
+                &self.ctx.session(),
+                self.registry.as_ref(),
+                params,
+                cancel.clone(),
+            )
+            .await?;
+            let schema = stream.schema();
+            portal.tail_state = Some(TailPortalState {
+                stream,
+                schema,
+                current_batch: None,
+                finished: false,
+                cancel,
+            });
+        }
+
+        let state = portal.tail_state.as_mut().expect("tail state initialized");
+        self.write_buf.clear();
+        push_row_description(&mut self.write_buf, &state.schema);
+        self.stream
+            .write_all(&self.write_buf)
+            .await
+            .context("send tail RowDescription")?;
+        self.write_buf.clear();
+
+        self.stream_tail_rows(state, row_limit).await
+    }
+
+    async fn stream_tail_rows(
+        &mut self,
+        state: &mut TailPortalState,
+        row_limit: Option<usize>,
+    ) -> Result<TailStreamOutcome> {
+        let mut rows_sent = 0usize;
+        let mut buffered_rows = 0usize;
+        loop {
+            if let Some(limit) = row_limit {
+                if rows_sent >= limit {
+                    self.flush_row_buffer(&mut buffered_rows).await?;
+                    return Ok(TailStreamOutcome::Suspended { rows: rows_sent });
+                }
+            }
+            if state.finished && state.current_batch.is_none() {
+                self.flush_row_buffer(&mut buffered_rows).await?;
+                return Ok(TailStreamOutcome::Completed { rows: rows_sent });
+            }
+            if state.current_batch.is_none() {
+                match state.stream.next().await {
+                    Some(Ok(batch)) => {
+                        state.current_batch = Some(TailBatchCursor { batch, next_row: 0 });
+                    }
+                    Some(Err(err)) => {
+                        self.flush_row_buffer(&mut buffered_rows).await?;
+                        if is_tail_canceled_error(&err) {
+                            return Ok(TailStreamOutcome::Canceled { rows: rows_sent });
+                        }
+                        return Err(err);
+                    }
+                    None => {
+                        state.finished = true;
+                        continue;
+                    }
+                }
+            }
+            let cursor = state
+                .current_batch
+                .as_mut()
+                .expect("tail batch cursor must exist");
+            let total_rows = cursor.batch.batch.num_rows();
+            if cursor.next_row >= total_rows {
+                state.current_batch = None;
+                continue;
+            }
+            let available = total_rows - cursor.next_row;
+            let allowed = match row_limit {
+                Some(limit) => limit.saturating_sub(rows_sent).min(available),
+                None => available,
+            };
+            if allowed == 0 {
+                self.flush_row_buffer(&mut buffered_rows).await?;
+                return Ok(TailStreamOutcome::Suspended { rows: rows_sent });
+            }
+            let slice = cursor.batch.batch.slice(cursor.next_row, allowed);
+            encode_tail_batch(&mut self.write_buf, &slice, cursor.batch.version)?;
+            buffered_rows += allowed;
+            rows_sent += allowed;
+            cursor.next_row += allowed;
+            if cursor.next_row >= total_rows {
+                state.current_batch = None;
+            }
+            if buffered_rows >= self.config.data_row_flush_limit() {
+                self.flush_row_buffer(&mut buffered_rows).await?;
+            }
+        }
     }
 
     async fn ensure_statement_schema(&mut self, stmt: &mut PreparedStmt) -> Result<()> {
@@ -1031,6 +1326,11 @@ fn push_row_description(buf: &mut BytesMut, schema: &SchemaRef) {
 
 fn push_no_data(buf: &mut BytesMut) {
     buf.put_u8(b'n');
+    buf.put_i32(4);
+}
+
+fn push_portal_suspended(buf: &mut BytesMut) {
+    buf.put_u8(b's');
     buf.put_i32(4);
 }
 
@@ -1420,14 +1720,14 @@ fn pg_type_from_arrow(data_type: &DataType) -> (u32, i16) {
     }
 }
 
-fn start_message(buf: &mut BytesMut, tag: u8) -> usize {
+pub(super) fn start_message(buf: &mut BytesMut, tag: u8) -> usize {
     buf.put_u8(tag);
     let len_pos = buf.len();
     buf.put_i32(0);
     len_pos
 }
 
-fn finish_message(buf: &mut BytesMut, len_pos: usize) {
+pub(super) fn finish_message(buf: &mut BytesMut, len_pos: usize) {
     let len = (buf.len() - len_pos) as i32;
     buf[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
 }

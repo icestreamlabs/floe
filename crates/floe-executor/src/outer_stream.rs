@@ -62,6 +62,10 @@ impl OuterStreamWriter {
 
     pub async fn flush(&mut self) -> Result<OuterStreamHandle> {
         let handle = self.stream.flush().await?;
+        eprintln!(
+            "Outer stream '{}' flushed version {}",
+            self.source, handle.version
+        );
         Ok(OuterStreamHandle {
             source: self.source.clone(),
             namespace: self.namespace.clone(),

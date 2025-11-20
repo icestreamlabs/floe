@@ -8,10 +8,11 @@ use datafusion::logical_expr::{Case, Expr as DfExpr, Operator};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspJoinKey, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
+use dbsp::stream::StreamCursor;
 use dbsp::{
     CircuitNode, CircuitPlan, DbspExpression, DbspFilter, DbspJoin, DbspJoinNode, DbspMap,
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
-    Stream, StreamRetention,
+    Stream,
 };
 
 use crate::dbsp_bridge::DbspBridge;
@@ -19,17 +20,19 @@ use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
+use tokio::sync::Mutex;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
-    bridge: DbspBridge,
+    bridge: Arc<Mutex<DbspBridge>>,
     ns: GraphNamespace,
 }
 
 impl DbspGraphBuilder {
     pub async fn new(db: Arc<slatedb::Db>) -> Result<Self> {
+        let bridge = DbspBridge::new(db).await?;
         Ok(Self {
-            bridge: DbspBridge::new(db).await?,
+            bridge: Arc::new(Mutex::new(bridge)),
             ns: GraphNamespace::default(),
         })
     }
@@ -63,7 +66,7 @@ impl DbspGraphBuilder {
             self.materialize_view(
                 inputs.view_name,
                 root_schema,
-                &root_stream,
+                root_stream,
                 &inputs.mv_registry,
                 &mut mv_latest,
             )
@@ -158,7 +161,7 @@ impl DbspGraphBuilder {
                 self.materialize_view(
                     &sink.name,
                     Arc::clone(sink.input_schema()),
-                    &upstream,
+                    upstream,
                     mv_registry,
                     mv_latest,
                 )
@@ -182,6 +185,10 @@ impl DbspGraphBuilder {
         source: &DbspSourceNode,
         outer_streams: &HashMap<String, Stream<ZSetHandle>>,
     ) -> Result<Stream<ZSetHandle>> {
+        eprintln!(
+            "Attaching DBSP source node '{}' to outer stream",
+            source.table.name
+        );
         outer_streams
             .get(source.table.name)
             .cloned()
@@ -284,44 +291,95 @@ impl DbspGraphBuilder {
         &mut self,
         view_name: &str,
         schema: Arc<RowSchema>,
-        upstream: &Stream<ZSetHandle>,
+        upstream: Stream<ZSetHandle>,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
     ) -> Result<Stream<ZSetHandle>> {
-        let namespace = self.ns.for_view(view_name)?;
-        let mut sink_stream = self
-            .bridge
-            .new_stream(namespace, StreamRetention::KeepLast { keep_last: 1 })
-            .await
-            .context("initialize sink stream")?;
-
-        let mut reader = upstream.clone();
-        let (ts, handle) = reader
-            .latest_with_ts()
-            .await
-            .context("load latest upstream handle")?;
-        sink_stream
-            .publish_handle(handle.clone())
-            .await
-            .context("persist MV handle")?;
-
-        let handle_view = self
-            .bridge
-            .handle_view_for(&handle.ns, handle.version)
-            .await?;
-        let (dict, table, namespace, version) = handle_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, namespace, version);
+        let handle_stream = upstream.clone();
+        let mut cursor = StreamCursor::new(upstream);
         let registry_handle = mv_registry.register(view_name.to_string());
         let arrow_schema = schema.to_arrow_schema();
         mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
-        self.bridge
-            .save_mv_schema(view_name, Arc::clone(&arrow_schema))
-            .await
-            .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
-        registry_handle.set_dbsp_state(state);
-        mv_latest.insert(view_name.to_string(), (ts, handle));
+        {
+            let bridge = self.bridge.lock().await;
+            bridge
+                .save_mv_schema(view_name, Arc::clone(&arrow_schema))
+                .await
+                .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
+        }
 
-        Ok(sink_stream.handle_stream())
+        if let Ok((ts, handle)) = cursor.snapshot().await {
+            let handle_version = handle.version;
+            let state = self.state_from_handle(&handle).await?;
+            registry_handle.set_dbsp_state(state);
+            registry_handle.publish_version(ts, handle.clone());
+            mv_latest.insert(view_name.to_string(), (ts, handle.clone()));
+            eprintln!(
+                "materialized view '{view_name}' snapshot at version {ts} (handle {})",
+                handle_version
+            );
+        }
+
+        let registry_clone = registry_handle.clone();
+        let bridge_clone = Arc::clone(&self.bridge);
+        let view_label = view_name.to_string();
+        tokio::spawn(async move {
+            let mut cursor = cursor;
+            loop {
+                match cursor.next().await {
+                    Ok((ts, handle)) => {
+                        eprintln!(
+                            "Cursor for view '{view_label}' observed handle version {} at ts {}",
+                            handle.version, ts
+                        );
+                        let handle_clone = handle.clone();
+                        let handle_version = handle.version;
+                        match Self::state_from_handle_with_bridge(&bridge_clone, &handle_clone)
+                            .await
+                        {
+                            Ok(state) => {
+                                registry_clone.set_dbsp_state(state);
+                                registry_clone.publish_version(ts, handle_clone);
+                                eprintln!(
+                                    "materialized view '{view_label}' advanced to version {ts} (handle {})",
+                                    handle_version
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "failed to update materialized view '{view_label}': {err}"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "stream for materialized view '{view_label}' closed unexpectedly: {err}"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(handle_stream)
+    }
+
+    async fn state_from_handle(&self, handle: &ZSetHandle) -> Result<DbspPersistedState> {
+        Self::state_from_handle_with_bridge(&self.bridge, handle).await
+    }
+
+    async fn state_from_handle_with_bridge(
+        bridge: &Arc<Mutex<DbspBridge>>,
+        handle: &ZSetHandle,
+    ) -> Result<DbspPersistedState> {
+        let mut guard = bridge.lock().await;
+        let handle_view = guard
+            .handle_view_for(&handle.ns, handle.version)
+            .await
+            .context("open handle view for materialized view state")?;
+        let (dict, table, namespace, version) = handle_view.into_parts();
+        Ok(DbspPersistedState::new(dict, table, namespace, version))
     }
 }
 
@@ -333,10 +391,6 @@ struct GraphNamespace {
 impl GraphNamespace {
     fn set_graph_id(&mut self, graph_id: impl Into<String>) {
         self.graph_id = graph_id.into();
-    }
-
-    fn for_view(&self, view_name: &str) -> Result<String> {
-        namespaces::materialized_view(view_name)
     }
 
     #[allow(dead_code)]

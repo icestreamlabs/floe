@@ -190,12 +190,22 @@ impl MaterializedViewTableProvider {
         })?;
 
         let Some(state) = view.dbsp_state() else {
+            eprintln!(
+                "Materialized view '{}' has no DBSP state when loading rows",
+                self.view_name
+            );
             return Ok((Vec::new(), 0));
         };
         let target_version = as_of_version.unwrap_or(state.version());
         let rows = self
             .materialize_dbsp_rows(state, Some(target_version))
             .await?;
+        eprintln!(
+            "Materialized view '{}' loaded {} row(s) at version {}",
+            self.view_name,
+            rows.len(),
+            target_version
+        );
         Ok((rows, target_version))
     }
 

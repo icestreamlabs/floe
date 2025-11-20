@@ -6,15 +6,21 @@ mod server;
 mod source;
 mod sql;
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
-use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
+use floe_executor::{
+    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, MaterializedViewRegistry,
+    MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder, ValidatedPlan,
+    validate_dbsp_plan,
+};
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
 use planner::{PlannedMaterializedView, plan_materialized_views};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::executor::{available_sources_from_registry, build_dataflows};
@@ -33,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let available_sources = available_sources_from_registry(&source_registry);
 
     let storage = server::init_storage().await?;
+    let db = storage.db();
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
     if let Some(sql) = cli.mv_query.first() {
         materialized_views.push(parse_materialized_view(sql)?);
@@ -41,6 +48,27 @@ async fn main() -> anyhow::Result<()> {
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
     let circuit_plans = build_dataflows(&planned_materialized_views, &available_sources)?;
+    let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
+    let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
+    let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());
+    for (mv_idx, plan) in circuit_plans.iter().enumerate() {
+        let view_name = planned_materialized_views[mv_idx]
+            .definition()
+            .name()
+            .to_string();
+        let ValidatedPlan {
+            required_sources, ..
+        } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
+        all_required_sources.extend(required_sources.iter().cloned());
+        plan_required_sources.push(required_sources);
+    }
+    let outer_registry = {
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
+            .await
+            .context("initialize outer DBSP streams for sources")?
+    };
+    let outer_registry = Arc::new(Mutex::new(outer_registry));
     if circuit_plans.is_empty() {
         eprintln!("DBSP planning produced no circuit plans.");
     } else {
@@ -51,12 +79,48 @@ async fn main() -> anyhow::Result<()> {
         for plan in &circuit_plans {
             eprintln!("  • CircuitPlan root node id = {}", plan.root);
         }
-        eprintln!(
-            "DBSP planning-only mode enabled (Phase 7 / Task 1). Execution is temporarily disabled."
-        );
     }
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .context("initialize DBSP graph builder")?;
+    for (idx, plan) in circuit_plans.iter().enumerate() {
+        let mv_def = &planned_materialized_views[idx];
+        let view_name = mv_def.definition().name();
+        let required_sources = &plan_required_sources[idx];
+        let handle_streams = {
+            let registry_guard = outer_registry.lock().await;
+            gather_handle_streams(&registry_guard, required_sources)
+        };
+        eprintln!(
+            "building DBSP graph for view '{view_name}' with sources: {:?}",
+            handle_streams.keys()
+        );
+
+        graph_builder
+            .build(BuildInputs {
+                graph_id: view_name,
+                view_name,
+                plan,
+                mv_registry: Arc::clone(&mv_registry),
+                outer_handle_streams: &handle_streams,
+            })
+            .await
+            .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
+    }
+    let decoder_registry: HashMap<String, SourceRowDecoder> = source_registry
+        .definitions()
+        .iter()
+        .filter(|definition| all_required_sources.contains(definition.name()))
+        .map(|definition| {
+            (
+                definition.name().to_string(),
+                SourceRowDecoder::new(definition.clone()),
+            )
+        })
+        .collect();
+    let decoder_registry = Arc::new(decoder_registry);
 
     let (event_tx, event_rx) = source::channel(1024);
 
@@ -74,12 +138,37 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    let outer_for_task = Arc::clone(&outer_registry);
+    let decoder_for_task = Arc::clone(&decoder_registry);
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut rx = event_rx;
         while let Some(event) = rx.recv().await {
-            match event.to_json_string() {
-                Ok(line) => println!("{line}"),
-                Err(err) => eprintln!("failed to encode source event: {err}"),
+            let source_name = event.source().to_string();
+            let decoder = match decoder_for_task.get(&source_name) {
+                Some(decoder) => decoder,
+                None => continue,
+            };
+            let (row, _ts) = match decoder.decode(&event) {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!("failed to decode source event for {source_name}: {err}");
+                    continue;
+                }
+            };
+
+            let mut registry = outer_for_task.lock().await;
+            let Some(writer) = registry.writer_mut(&source_name) else {
+                eprintln!("no writer for source {source_name}, skipping row");
+                continue;
+            };
+            if let Err(err) = writer.append(&row, 1) {
+                eprintln!("failed to append row for '{source_name}': {err}");
+                continue;
+            }
+            if let Err(err) = writer.flush().await {
+                eprintln!("failed to flush outer stream for '{source_name}': {err}");
+            } else if source_name == generator::BID_SOURCE_NAME {
+                eprintln!("ingested bid row: {:?}", row);
             }
         }
     });
@@ -109,9 +198,6 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("executor task joined with error: {err}");
         }
     }
-
-    let _ = source_registry;
-    let _ = planned_materialized_views;
 
     server_result
 }
@@ -149,4 +235,17 @@ fn df_schema_to_arrow(schema: &DFSchemaRef) -> anyhow::Result<SchemaRef> {
         .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
         .collect();
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn gather_handle_streams(
+    registry: &OuterStreamRegistry,
+    sources: &BTreeSet<String>,
+) -> HashMap<String, dbsp::Stream<dbsp::handles::ZSetHandle>> {
+    let mut map = HashMap::new();
+    for source in sources {
+        if let Some(stream) = registry.handle_stream(source) {
+            map.insert(source.clone(), stream);
+        }
+    }
+    map
 }

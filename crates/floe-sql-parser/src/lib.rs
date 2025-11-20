@@ -1,6 +1,16 @@
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloeStatement {
+    CreateMaterializedView(MaterializedViewDefinition),
+    Tail {
+        mv_name: String,
+        with_snapshot: bool,
+        as_of: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedViewDefinition {
     name: String,
     query: String,
@@ -22,6 +32,18 @@ impl MaterializedViewDefinition {
     pub fn if_not_exists(&self) -> bool {
         self.if_not_exists
     }
+}
+
+pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
+    let normalized = normalize_sql(sql)?;
+    if starts_with_keyword(normalized, "CREATE") {
+        let definition = parse_materialized_view(sql)?;
+        return Ok(FloeStatement::CreateMaterializedView(definition));
+    }
+    if starts_with_keyword(normalized, "TAIL") {
+        return parse_tail_statement(normalized);
+    }
+    Err(anyhow!("unsupported SQL statement: {normalized}"))
 }
 
 pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> {
@@ -70,6 +92,48 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
         name,
         query: query.to_string(),
         if_not_exists,
+    })
+}
+
+fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
+    let mut rest = consume_keyword(sql, "TAIL")
+        .ok_or_else(|| anyhow!("expected TAIL at start of statement"))?;
+    let (next, mv_name) = parse_identifier(rest)?;
+    rest = next;
+
+    let mut with_snapshot = false;
+    if let Some(next) = consume_sequence(rest, &["WITH", "SNAPSHOT"]) {
+        with_snapshot = true;
+        rest = next;
+    }
+
+    let mut as_of = None;
+    rest = rest.trim_start();
+    if !rest.is_empty() {
+        let Some(after_as) = consume_keyword(rest, "AS") else {
+            return Err(anyhow!(
+                "unexpected tokens after TAIL statement: {}",
+                rest.trim()
+            ));
+        };
+        let after_of = consume_keyword(after_as, "OF")
+            .ok_or_else(|| anyhow!("expected OF after AS in TAIL statement"))?;
+        let (next, version) = parse_integer_literal(after_of)?;
+        as_of = Some(version);
+        rest = next;
+    }
+
+    if !rest.trim().is_empty() {
+        return Err(anyhow!(
+            "unexpected tokens after TAIL statement: {}",
+            rest.trim()
+        ));
+    }
+
+    Ok(FloeStatement::Tail {
+        mv_name,
+        with_snapshot,
+        as_of,
     })
 }
 
@@ -165,6 +229,43 @@ fn starts_with_keyword(input: &str, keyword: &str) -> bool {
     consume_keyword(input, keyword).is_some()
 }
 
+fn normalize_sql(sql: &str) -> Result<&str> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("SQL statement cannot be empty"));
+    }
+    let trimmed = trimmed.trim_start_matches(|c: char| c.is_ascii_control());
+    let trimmed = trimmed.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("SQL statement cannot be empty"));
+    }
+    Ok(trimmed)
+}
+
+fn parse_integer_literal(input: &str) -> Result<(&str, i64)> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return Err(anyhow!("expected integer literal"));
+    }
+    let bytes = trimmed.as_bytes();
+    let mut end = 0;
+    if matches!(bytes[0], b'+' | b'-') {
+        end += 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 || (end == 1 && matches!(bytes[0], b'+' | b'-')) {
+        return Err(anyhow!("expected integer literal"));
+    }
+    let literal = &trimmed[..end];
+    let value = literal
+        .parse::<i64>()
+        .map_err(|_| anyhow!("integer literal '{literal}' is out of range"))?;
+    Ok((&trimmed[end..], value))
+}
+
 fn trim_query(query: &str) -> Result<&str> {
     let trimmed = query.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
     if let Some(idx) = trimmed.rfind(';') {
@@ -234,5 +335,50 @@ mod tests {
         let sql = "CREATE MATERIALIZED VIEW \"MyView\" AS SELECT 1";
         let mv = parse_materialized_view(sql).expect("parse mv");
         assert_eq!(mv.name, "MyView");
+    }
+
+    #[test]
+    fn parse_tail_variants() {
+        let stmt = parse_floe_statement("TAIL mv_orders").expect("parse tail");
+        assert_eq!(
+            stmt,
+            FloeStatement::Tail {
+                mv_name: "mv_orders".to_string(),
+                with_snapshot: false,
+                as_of: None,
+            }
+        );
+
+        let stmt =
+            parse_floe_statement("TAIL mv_orders WITH SNAPSHOT").expect("parse tail snapshot");
+        assert_eq!(
+            stmt,
+            FloeStatement::Tail {
+                mv_name: "mv_orders".to_string(),
+                with_snapshot: true,
+                as_of: None,
+            }
+        );
+
+        let stmt = parse_floe_statement("TAIL mv_orders AS OF 42").expect("parse tail as of");
+        assert_eq!(
+            stmt,
+            FloeStatement::Tail {
+                mv_name: "mv_orders".to_string(),
+                with_snapshot: false,
+                as_of: Some(42),
+            }
+        );
+
+        let stmt = parse_floe_statement("TAIL mv_orders WITH SNAPSHOT AS OF 42")
+            .expect("parse tail snapshot as of");
+        assert_eq!(
+            stmt,
+            FloeStatement::Tail {
+                mv_name: "mv_orders".to_string(),
+                with_snapshot: true,
+                as_of: Some(42),
+            }
+        );
     }
 }
