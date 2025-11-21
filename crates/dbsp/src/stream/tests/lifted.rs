@@ -1,21 +1,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::{StreamHandle, ZSetHandle};
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
+use crate::stream::cursor::StreamCursor;
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::operations::{
     delta_lifted_delta_lifted_join, lifted_delay, lifted_h_zset_stream,
-    lifted_lifted_select_zset_stream, lifted_select_zset_stream, lifted_stream_introduction,
+    lifted_join_zset_stream, lifted_lifted_select_zset_stream, lifted_select_zset_stream,
+    lifted_stream_introduction,
 };
 use crate::stream::tests::common::{IntegerGroup, build_db};
 use crate::stream::util::{
     collect_values, materialize_zset_handle, push_value_in_place, set_default_in_place,
 };
 use crate::stream::zset_stream::{StreamRetention, ZSetStream};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn lifted_delay_operates_on_stream_handles() {
@@ -135,6 +139,122 @@ async fn lifted_select_zset_stream_filters_elements() {
         .expect("materialize second handle");
     assert!(second.get("keep").is_none());
     assert!(second.get("drop").is_none());
+}
+
+#[tokio::test]
+async fn lifted_select_zset_stream_emits_updates_after_build() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_select_live", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut source = ZSetStream::new(
+        dict,
+        table.clone(),
+        "lifted_select_live",
+        StreamRetention::KeepLast { keep_last: 2 },
+    )
+    .await
+    .expect("create zset stream");
+
+    let derived =
+        lifted_select_zset_stream::<String, _>(&source.handle_stream(), |value: &String| {
+            value.starts_with('k')
+        })
+        .await
+        .expect("build lifted select");
+
+    let mut cursor = StreamCursor::new(derived);
+    // Consume the initial snapshot to align the cursor with future handles.
+    let _ = cursor.snapshot().await.expect("initial snapshot");
+
+    source.add_delta("keep-me".to_string(), 1);
+    source.flush().await.expect("flush new delta");
+
+    let (_ts, handle) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("select update wait")
+        .expect("select update");
+
+    let mut cache = HashMap::new();
+    let materialized =
+        materialize_zset_handle::<String>(table.clone(), &mut cache, &handle).await.unwrap();
+    assert_eq!(materialized.get("keep-me"), Some(&1));
+}
+
+#[tokio::test]
+async fn lifted_join_zset_stream_emits_updates_after_build() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_join_left", None)
+            .await
+            .expect("build left dictionary"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_join_right", None)
+            .await
+            .expect("build right dictionary"),
+    );
+
+    let mut left = ZSetStream::new(
+        left_dict,
+        table.clone(),
+        "lifted_join_left",
+        StreamRetention::KeepLast { keep_last: 2 },
+    )
+    .await
+    .expect("create left stream");
+    let mut right = ZSetStream::new(
+        right_dict,
+        table.clone(),
+        "lifted_join_right",
+        StreamRetention::KeepLast { keep_last: 2 },
+    )
+    .await
+    .expect("create right stream");
+
+    let derived = lifted_join_zset_stream::<i64, i64, (i64, i64), _, _>(
+        &left.handle_stream(),
+        &right.handle_stream(),
+        |l, r| l == r,
+        |l, r| (*l, *r),
+    )
+    .await
+    .expect("build lifted join");
+
+    let mut cursor = StreamCursor::new(derived);
+    let _ = cursor.snapshot().await.expect("initial join snapshot");
+
+    left.add_delta(7_i64, 1);
+    left.flush().await.expect("flush left");
+    right.add_delta(7_i64, 1);
+    right.flush().await.expect("flush right");
+
+    // Ensure source handles materialize to catch upstream issues early.
+    let mut cache = HashMap::new();
+    let left_handle = left.current_handle().clone();
+    materialize_zset_handle::<i64>(table.clone(), &mut cache, &left_handle)
+        .await
+        .expect("materialize left handle");
+    let right_handle = right.current_handle().clone();
+    materialize_zset_handle::<i64>(table.clone(), &mut cache, &right_handle)
+        .await
+        .expect("materialize right handle");
+
+    let (_ts, handle) = timeout(Duration::from_secs(2), cursor.next())
+        .await
+        .expect("join update wait")
+        .expect("join update");
+    let mut cache = HashMap::new();
+    let materialized =
+        materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache, &handle)
+            .await
+            .unwrap();
+    assert_eq!(materialized.get(&(7, 7)), Some(&1));
 }
 
 #[tokio::test]

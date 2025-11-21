@@ -58,8 +58,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
-    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
 {
     let left_default = left.default_value();
     let right_default = right.default_value();

@@ -24,6 +24,7 @@ pub struct DbspTableEnvironment {
     pub auction: ZSetStream<Vec<u8>>,
     /// Stream backing `nexmark_bid`.
     pub bid: ZSetStream<Vec<u8>>,
+    table: Arc<dyn KeyValueTable>,
 }
 
 impl DbspTableEnvironment {
@@ -55,6 +56,7 @@ impl DbspTableEnvironment {
             person,
             auction,
             bid,
+            table,
         })
     }
 
@@ -136,6 +138,10 @@ impl DbspTableEnvironment {
             TableKind::Bid => Some(&self.bid),
         }
     }
+
+    pub fn table(&self) -> Arc<dyn KeyValueTable> {
+        self.table.clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,7 +204,7 @@ fn encode_person_row(person: &Person) -> Result<Vec<u8>> {
     encode_projected_row_key(&row)
 }
 
-fn encode_auction_row(auction: &Auction) -> Result<Vec<u8>> {
+pub fn encode_auction_row(auction: &Auction) -> Result<Vec<u8>> {
     let row = vec![
         ScalarValue::Int64(Some(auction.id as i64)),
         ScalarValue::Utf8(Some(auction.item_name.clone())),
@@ -214,7 +220,7 @@ fn encode_auction_row(auction: &Auction) -> Result<Vec<u8>> {
     encode_projected_row_key(&row)
 }
 
-fn encode_bid_row(bid: &Bid) -> Result<Vec<u8>> {
+pub fn encode_bid_row(bid: &Bid) -> Result<Vec<u8>> {
     let row = vec![
         ScalarValue::Int64(Some(bid.auction as i64)),
         ScalarValue::Int64(Some(bid.bidder as i64)),

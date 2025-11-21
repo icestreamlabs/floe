@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::hash::Hash;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -12,9 +13,14 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::super::addition::StreamAddition;
 use super::super::core::stream::Stream;
+use super::super::groups::HandleGroup;
 use super::super::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+    build_derived_stream, collect_values, compute_delta, materialize_zset_handle,
+    next_lifted_zset_namespace, push_value_in_place, set_default_in_place,
 };
+use crate::handles::ZSetHandle;
+use crate::storage::dictionary::Dictionary;
+use super::zset_integral::integrate_zset_handle_stream;
 
 pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
@@ -108,6 +114,101 @@ where
     }
 
     Ok(result)
+}
+
+/// Single-level helper: integrates a `Stream<ZSetHandle>` into cumulative state,
+/// returning another `Stream<ZSetHandle>` that carries integrated deltas only.
+pub async fn integrate_zset_stream<K>(
+    input: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    integrate_zset_handle_stream::<K>(input).await
+}
+
+/// Single-level helper: differentiates `Stream<ZSetHandle>` by emitting the
+/// per-step Z-set deltas in a new `Stream<ZSetHandle>`.
+pub async fn differentiate_zset_stream<K>(
+    input: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let handles = collect_values(input, input.current_time()).await?;
+    let table = input.table();
+    let namespace = next_lifted_zset_namespace("stream_diff_zset/");
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for differentiate_zset_stream")?,
+    );
+    let mut diff_zset = super::super::zset_stream::ZSetStream::new(
+        dict,
+        table.clone(),
+        namespace,
+        super::super::zset_stream::StreamRetention::None,
+    )
+    .await
+    .context("create diff zset stream")?;
+
+    let mut cache = std::collections::HashMap::new();
+    let mut previous = std::collections::HashMap::new();
+    let mut output_handles = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let current = materialize_zset_handle::<K>(table.clone(), &mut cache, &handle)
+            .await
+            .context("materialize zset handle for diff")?;
+        let deltas = compute_delta(&previous, &current);
+        diff_zset.add_deltas(deltas);
+        let out_handle = diff_zset
+            .flush()
+            .await
+            .context("flush diff zset stream")?;
+        output_handles.push(out_handle.clone());
+        previous = current;
+    }
+
+    let default_handle = output_handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| diff_zset.current_handle().clone());
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream =
+        build_derived_stream(table.clone(), handle_group, "stream_diff_zset_handles/").await?;
+
+    if output_handles.is_empty() {
+        set_default_in_place(&mut result_stream, default_handle);
+    } else {
+        set_default_in_place(&mut result_stream, output_handles[0].clone());
+        for handle in output_handles.iter().skip(1) {
+            push_value_in_place(&mut result_stream, handle.clone());
+        }
+        if let Some(last) = output_handles.last() {
+            set_default_in_place(&mut result_stream, last.clone());
+        }
+    }
+
+    result_stream.flush().await?;
+    Ok(result_stream)
 }
 
 pub async fn lift1<I, O, F>(

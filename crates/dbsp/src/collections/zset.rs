@@ -1077,6 +1077,7 @@ fn prefix_bounds(prefix: &[u8]) -> Range<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
@@ -1128,6 +1129,71 @@ mod tests {
         reload.add_weight("key".to_string(), -3).await.unwrap();
         reload.flush().await.unwrap();
         assert!(reload.is_identity().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn insert_then_negates_to_zero_removes_entry() {
+        let db = build_db().await;
+        let mut zset = ZSet::new(db, "zero_remove")
+            .await
+            .expect("create zset");
+
+        zset.add_weight("gone".to_string(), 1).await.unwrap();
+        zset.flush().await.unwrap();
+        zset.add_weight("gone".to_string(), -1).await.unwrap();
+        zset.flush().await.unwrap();
+
+        assert_eq!(
+            zset.contains(&"gone".to_string()).await.expect("contains check"),
+            false
+        );
+        assert!(zset.items().await.expect("items after cancel").is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequential_deltas_equivalent_to_aggregated_delta() {
+        let db = build_db().await;
+        let mut seq = ZSet::new(db.clone(), "seq").await.expect("seq zset");
+
+        let deltas = vec![
+            vec![("a".to_string(), 1), ("b".to_string(), 2)],
+            vec![("a".to_string(), -1), ("b".to_string(), 3)],
+        ];
+
+        for batch in &deltas {
+            for (key, delta) in batch {
+                seq.add_weight(key.clone(), *delta).await.unwrap();
+            }
+            seq.flush().await.unwrap();
+        }
+        let seq_items: HashMap<_, _> = seq
+            .items()
+            .await
+            .expect("seq items")
+            .into_iter()
+            .collect();
+
+        let mut aggregate_map: HashMap<String, i64> = HashMap::new();
+        for batch in &deltas {
+            for (key, delta) in batch {
+                let entry = aggregate_map.entry(key.clone()).or_insert(0);
+                *entry += *delta;
+                if *entry == 0 {
+                    aggregate_map.remove(key);
+                }
+            }
+        }
+
+        let mut agg = ZSet::new(db, "agg").await.expect("agg zset");
+        for (key, weight) in &aggregate_map {
+            agg.set_weight(key.clone(), *weight);
+        }
+        agg.flush().await.unwrap();
+        let agg_items: HashMap<_, _> = agg.items().await.expect("agg items").into_iter().collect();
+
+        assert_eq!(seq_items, agg_items);
+        assert_eq!(agg_items.get("a"), None);
+        assert_eq!(agg_items.get("b"), Some(&5));
     }
 
     #[tokio::test]

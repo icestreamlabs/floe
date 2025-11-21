@@ -35,7 +35,7 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    P: Fn(&K) -> bool + Send + Sync + Clone,
+    P: Fn(&K) -> bool + Send + Sync + Clone + 'static,
 {
     let handles = collect_values(input, input.current_time()).await?;
     let mut output_handles = Vec::with_capacity(handles.len());
@@ -102,7 +102,7 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(&K) -> R + Send + Sync + Clone,
+    F: Fn(&K) -> R + Send + Sync + Clone + 'static,
 {
     let handles = collect_values(input, input.current_time()).await?;
     let mut output_handles = Vec::with_capacity(handles.len());
@@ -180,8 +180,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
-    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
 {
     let left_handles = collect_values(left, left.current_time()).await?;
     let right_handles = collect_values(right, right.current_time()).await?;

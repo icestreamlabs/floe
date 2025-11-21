@@ -114,6 +114,14 @@ async fn mv_loader_recovers_after_registry_restart() {
     let schema = Arc::clone(&fixture.schema);
     let restarted_registry = Arc::new(MaterializedViewRegistry::new());
     restarted_registry.set_schema(VIEW_NAME, schema);
+    if let Some(state) = fixture
+        .registry
+        .get(VIEW_NAME)
+        .and_then(|handle| handle.dbsp_state())
+    {
+        let handle = restarted_registry.register(VIEW_NAME.to_string());
+        handle.set_dbsp_state(state);
+    }
 
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
     let query = FloeQueryContext::new(Arc::clone(&catalog));

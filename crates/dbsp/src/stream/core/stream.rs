@@ -12,12 +12,21 @@ use slatedb::{Db, WriteBatch};
 use tokio::sync::watch;
 
 use crate::algebra::AbelianGroup;
-use crate::handles::StreamHandle;
+use crate::handles::{StreamHandle, ZSetHandle};
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::keyspace::{self, namespace_prefix};
 use crate::storage::timestamps;
 use crate::storage::{KeyValueTable, SlateTable};
 
+/// Logical-time stream: at time `t`, this holds one value of type `T`.
+/// For Floe SQL:
+///   - `Stream<ZSetHandle>` represents the delta (Delta R_t) of a relation `R` at time `t`.
+pub type DeltaStream = Stream<ZSetHandle>;
+
+/// Logical-time stream keyed by a logical transaction index.
+/// - Time = logical transaction index.
+/// - For each relation `R`: `Stream<ZSetHandle>` represents the delta (Delta R_t) of `R` at time `t`.
+/// - `VersionedZSet<K>` is the integrated `R_t`.
 pub struct Stream<T>
 where
     T: Archive

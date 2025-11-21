@@ -3,7 +3,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tempfile::tempdir;
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -13,10 +12,11 @@ const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_bid_passthrough AS \
      SELECT auction, bidder, price FROM nexmark_bid";
 
 #[tokio::test]
+#[ignore = "requires TCP networking"]
 async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
     let port = find_unused_port()?;
     let addr = format!("127.0.0.1:{port}");
-    let data_dir = tempdir().context("create temp SlateDB directory")?;
+    // let data_dir = tempdir().context("create temp SlateDB directory")?;
 
     let binary = env!("CARGO_BIN_EXE_floe-node");
     let mut child = Command::new(binary)

@@ -1,20 +1,25 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::time::sleep;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
+use crate::storage::KeyValueTable;
 use super::super::core::stream::Stream;
+use super::super::cursor::StreamCursor;
 use super::super::groups::HandleGroup;
+use super::super::runtime::HandleOperatorRuntime;
 use super::super::util::{
     LIFTED_JOIN_STREAM_PREFIX, LIFTED_JOIN_ZSET_PREFIX, LIFTED_PROJECT_STREAM_PREFIX,
     LIFTED_PROJECT_ZSET_PREFIX, LIFTED_SELECT_STREAM_PREFIX, LIFTED_SELECT_ZSET_PREFIX,
@@ -37,9 +42,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    P: Fn(&K) -> bool + Send + Sync + Clone,
+    P: Fn(&K) -> bool + Send + Sync + Clone + 'static,
 {
-    let handles = collect_values(input, input.current_time()).await?;
     let table = input.table();
     let namespace = next_lifted_zset_namespace(LIFTED_SELECT_ZSET_PREFIX);
     let dict = Arc::new(
@@ -51,53 +55,78 @@ where
         .await
         .context("create ZSet stream for lifted select")?;
 
-    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
-    let mut previous: HashMap<K, i64> = HashMap::new();
-    let mut output_handles = Vec::with_capacity(handles.len());
-
-    for handle in handles {
-        let materialized =
-            materialize_zset_handle::<K>(table.clone(), &mut dict_cache, &handle).await?;
-
-        let mut filtered = HashMap::new();
-        for (key, weight) in materialized {
-            if predicate(&key) && weight != 0 {
-                filtered.insert(key, weight);
-            }
-        }
-
-        let deltas = compute_delta(&previous, &filtered);
-        zset_stream.add_deltas(deltas);
-        let handle = zset_stream
-            .flush()
-            .await
-            .context("flush lifted select result")?;
-        output_handles.push(handle);
-        previous = filtered;
-    }
-
-    let default_handle = output_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| zset_stream.current_handle().clone());
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
+        Arc::new(HandleGroup::new(zset_stream.current_handle().clone()));
     let mut result_stream =
         build_derived_stream(table.clone(), handle_group, LIFTED_SELECT_STREAM_PREFIX).await?;
 
-    if output_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, output_handles[0].clone());
-        for handle in output_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = output_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
+    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous: HashMap<K, i64> = HashMap::new();
+    let mut initialized = false;
+    let mut writer = result_stream.clone();
+    let predicate: Arc<P> = Arc::new(predicate);
+
+    let handles = collect_values(input, input.current_time()).await?;
+    for handle in handles {
+        let output_handle = select_handle(
+            table.clone(),
+            &predicate,
+            &mut dict_cache,
+            &mut previous,
+            &mut zset_stream,
+            &handle,
+        )
+        .await?;
+        publish_handle(&mut writer, output_handle, &mut initialized).await?;
     }
 
     result_stream.flush().await?;
+
+    let mut cursor = StreamCursor::new(input.clone());
+    tokio::spawn(async move {
+        let mut dict_cache = dict_cache;
+        let mut previous = previous;
+        let mut zset_stream = zset_stream;
+        let mut writer = writer;
+        let mut initialized = initialized;
+        loop {
+            match cursor.next().await {
+                Ok((_, handle)) => {
+                    match select_handle(
+                        table.clone(),
+                        &predicate,
+                        &mut dict_cache,
+                        &mut previous,
+                        &mut zset_stream,
+                        &handle,
+                    )
+                    .await
+                    {
+                        Ok(output_handle) => {
+                            if let Err(err) =
+                                publish_handle(&mut writer, output_handle, &mut initialized).await
+                            {
+                                eprintln!("failed to publish lifted select handle: {err}");
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "failed to compute lifted select handle for ns '{}': {err:#?}",
+                                handle.ns
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("select input stream closed unexpectedly: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
     Ok(result_stream)
 }
 
@@ -124,9 +153,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(&K) -> R + Send + Sync + Clone,
+    F: Fn(&K) -> R + Send + Sync + Clone + 'static,
 {
-    let handles = collect_values(input, input.current_time()).await?;
     let table = input.table();
     let namespace = next_lifted_zset_namespace(LIFTED_PROJECT_ZSET_PREFIX);
     let dict = Arc::new(
@@ -138,56 +166,78 @@ where
         .await
         .context("create ZSet stream for lifted project")?;
 
-    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
-    let mut previous: HashMap<R, i64> = HashMap::new();
-    let mut output_handles = Vec::with_capacity(handles.len());
-
-    for handle in handles {
-        let materialized =
-            materialize_zset_handle::<K>(table.clone(), &mut dict_cache, &handle).await?;
-
-        let mut projected: HashMap<R, i64> = HashMap::new();
-        for (key, weight) in materialized {
-            if weight == 0 {
-                continue;
-            }
-            let result_key = projector(&key);
-            *projected.entry(result_key).or_insert(0) += weight;
-        }
-        projected.retain(|_, weight| *weight != 0);
-
-        let deltas = compute_delta(&previous, &projected);
-        zset_stream.add_deltas(deltas);
-        let handle = zset_stream
-            .flush()
-            .await
-            .context("flush lifted project result")?;
-        output_handles.push(handle);
-        previous = projected;
-    }
-
-    let default_handle = output_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| zset_stream.current_handle().clone());
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
+        Arc::new(HandleGroup::new(zset_stream.current_handle().clone()));
     let mut result_stream =
         build_derived_stream(table.clone(), handle_group, LIFTED_PROJECT_STREAM_PREFIX).await?;
 
-    if output_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, output_handles[0].clone());
-        for handle in output_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = output_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
+    let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
+    let mut previous: HashMap<R, i64> = HashMap::new();
+    let mut initialized = false;
+    let mut writer = result_stream.clone();
+    let projector: Arc<F> = Arc::new(projector);
+
+    let handles = collect_values(input, input.current_time()).await?;
+    for handle in handles {
+        let output_handle = project_handle(
+            table.clone(),
+            &projector,
+            &mut dict_cache,
+            &mut previous,
+            &mut zset_stream,
+            &handle,
+        )
+        .await?;
+        publish_handle(&mut writer, output_handle, &mut initialized).await?;
     }
 
     result_stream.flush().await?;
+
+    let mut cursor = StreamCursor::new(input.clone());
+    tokio::spawn(async move {
+        let mut dict_cache = dict_cache;
+        let mut previous = previous;
+        let mut zset_stream = zset_stream;
+        let mut writer = writer;
+        let mut initialized = initialized;
+        loop {
+            match cursor.next().await {
+                Ok((_, handle)) => {
+                    match project_handle(
+                        table.clone(),
+                        &projector,
+                        &mut dict_cache,
+                        &mut previous,
+                        &mut zset_stream,
+                        &handle,
+                    )
+                    .await
+                    {
+                        Ok(output_handle) => {
+                            if let Err(err) =
+                                publish_handle(&mut writer, output_handle, &mut initialized).await
+                            {
+                                eprintln!("failed to publish lifted project handle: {err}");
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "failed to compute lifted project handle for ns '{}': {err:#?}",
+                                handle.ns
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("project input stream closed unexpectedly: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
     Ok(result_stream)
 }
 
@@ -225,8 +275,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    P: Fn(&L, &R) -> bool + Send + Sync + Clone,
-    F: Fn(&L, &R) -> O + Send + Sync + Clone,
+    P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+    F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
 {
     let left_handles = collect_values(left, left.current_time()).await?;
     let right_handles = collect_values(right, right.current_time()).await?;
@@ -242,66 +292,295 @@ where
         .await
         .context("create ZSet stream for lifted join")?;
 
-    let mut left_cache: HashMap<String, Arc<Dictionary<L>>> = HashMap::new();
-    let mut right_cache: HashMap<String, Arc<Dictionary<R>>> = HashMap::new();
-    let mut previous: HashMap<O, i64> = HashMap::new();
-    let mut output_handles = Vec::with_capacity(total);
-
-    for t in 0..total {
-        let left_map =
-            materialize_zset_handle::<L>(table.clone(), &mut left_cache, &left_handles[t]).await?;
-        let right_map =
-            materialize_zset_handle::<R>(table.clone(), &mut right_cache, &right_handles[t])
-                .await?;
-
-        let mut joined: HashMap<O, i64> = HashMap::new();
-        for (left_key, &left_weight) in &left_map {
-            if left_weight == 0 {
-                continue;
-            }
-            for (right_key, &right_weight) in &right_map {
-                if right_weight == 0 {
-                    continue;
-                }
-                if predicate(left_key, right_key) {
-                    let projected = projector(left_key, right_key);
-                    *joined.entry(projected).or_insert(0) += left_weight * right_weight;
-                }
-            }
-        }
-        joined.retain(|_, weight| *weight != 0);
-
-        let deltas = compute_delta(&previous, &joined);
-        zset_stream.add_deltas(deltas);
-        let handle = zset_stream
-            .flush()
-            .await
-            .context("flush lifted join result")?;
-        output_handles.push(handle);
-        previous = joined;
-    }
-
-    let default_handle = output_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| zset_stream.current_handle().clone());
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
+        Arc::new(HandleGroup::new(zset_stream.current_handle().clone()));
     let mut result_stream =
         build_derived_stream(table.clone(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
 
-    if output_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, output_handles[0].clone());
-        for handle in output_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = output_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
+    let mut left_cache: HashMap<String, Arc<Dictionary<L>>> = HashMap::new();
+    let mut right_cache: HashMap<String, Arc<Dictionary<R>>> = HashMap::new();
+    let mut previous: HashMap<O, i64> = HashMap::new();
+    let mut initialized = false;
+    let mut writer = result_stream.clone();
+    let predicate: Arc<P> = Arc::new(predicate);
+    let projector: Arc<F> = Arc::new(projector);
+
+    for t in 0..total {
+        let output_handle = join_handle(
+            table.clone(),
+            &predicate,
+            &projector,
+            &mut left_cache,
+            &mut right_cache,
+            &mut previous,
+            &mut zset_stream,
+            &left_handles[t],
+            &right_handles[t],
+        )
+        .await?;
+        publish_handle(&mut writer, output_handle, &mut initialized).await?;
     }
 
     result_stream.flush().await?;
+
+    let mut runtime = HandleOperatorRuntime::new(vec![left.clone(), right.clone()], |_, _| async {
+        Ok(())
+    });
+    tokio::spawn(async move {
+        let mut left_cache = left_cache;
+        let mut right_cache = right_cache;
+        let mut previous = previous;
+        let mut zset_stream = zset_stream;
+        let mut writer = writer;
+        let mut initialized = initialized;
+        loop {
+            match runtime.next_handles().await {
+                Ok((_, handles)) => {
+                    if handles.len() != 2 {
+                        eprintln!("join runtime produced unexpected handle count {}", handles.len());
+                        break;
+                    }
+                    match join_handle(
+                        table.clone(),
+                        &predicate,
+                        &projector,
+                        &mut left_cache,
+                        &mut right_cache,
+                        &mut previous,
+                        &mut zset_stream,
+                        &handles[0],
+                        &handles[1],
+                    )
+                    .await
+                    {
+                        Ok(output_handle) => {
+                            if let Err(err) =
+                                publish_handle(&mut writer, output_handle, &mut initialized).await
+                            {
+                                eprintln!("failed to publish lifted join handle: {err}");
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("failed to compute lifted join handle: {err:#?}");
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("join input streams closed unexpectedly: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
     Ok(result_stream)
+}
+
+async fn publish_handle(
+    stream: &mut Stream<ZSetHandle>,
+    handle: ZSetHandle,
+    initialized: &mut bool,
+) -> Result<()> {
+    if !*initialized {
+        set_default_in_place(stream, handle.clone());
+        *initialized = true;
+    } else {
+        push_value_in_place(stream, handle.clone());
+    }
+    set_default_in_place(stream, handle.clone());
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn select_handle<K, P>(
+    table: Arc<dyn KeyValueTable>,
+    predicate: &Arc<P>,
+    dict_cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    previous: &mut HashMap<K, i64>,
+    zset_stream: &mut ZSetStream<K>,
+    handle: &ZSetHandle,
+) -> Result<ZSetHandle>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&K) -> bool + Send + Sync + 'static,
+{
+    let materialized = materialize_zset_with_retry::<K>(table, dict_cache, handle).await?;
+
+    let mut filtered = HashMap::new();
+    for (key, weight) in materialized {
+        if predicate(&key) && weight != 0 {
+            filtered.insert(key, weight);
+        }
+    }
+
+    let deltas = compute_delta(previous, &filtered);
+    zset_stream.add_deltas(deltas);
+    let handle = zset_stream
+        .flush()
+        .await
+        .context("flush lifted select result")?;
+    *previous = filtered;
+    Ok(handle)
+}
+
+async fn project_handle<K, R, F>(
+    table: Arc<dyn KeyValueTable>,
+    projector: &Arc<F>,
+    dict_cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    previous: &mut HashMap<R, i64>,
+    zset_stream: &mut ZSetStream<R>,
+    handle: &ZSetHandle,
+) -> Result<ZSetHandle>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&K) -> R + Send + Sync + 'static,
+{
+    let materialized = materialize_zset_with_retry::<K>(table, dict_cache, handle).await?;
+
+    let mut projected: HashMap<R, i64> = HashMap::new();
+    for (key, weight) in materialized {
+        if weight == 0 {
+            continue;
+        }
+        let result_key = projector(&key);
+        *projected.entry(result_key).or_insert(0) += weight;
+    }
+    projected.retain(|_, weight| *weight != 0);
+
+    let deltas = compute_delta(previous, &projected);
+    zset_stream.add_deltas(deltas);
+    let handle = zset_stream
+        .flush()
+        .await
+        .context("flush lifted project result")?;
+    *previous = projected;
+    Ok(handle)
+}
+
+async fn join_handle<L, R, O, P, F>(
+    table: Arc<dyn KeyValueTable>,
+    predicate: &Arc<P>,
+    projector: &Arc<F>,
+    left_cache: &mut HashMap<String, Arc<Dictionary<L>>>,
+    right_cache: &mut HashMap<String, Arc<Dictionary<R>>>,
+    previous: &mut HashMap<O, i64>,
+    zset_stream: &mut ZSetStream<O>,
+    left_handle: &ZSetHandle,
+    right_handle: &ZSetHandle,
+) -> Result<ZSetHandle>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Fn(&L, &R) -> bool + Send + Sync + 'static,
+    F: Fn(&L, &R) -> O + Send + Sync + 'static,
+{
+    let left_map = materialize_zset_with_retry::<L>(table.clone(), left_cache, left_handle).await?;
+    let right_map = materialize_zset_with_retry::<R>(table, right_cache, right_handle).await?;
+
+    let mut joined: HashMap<O, i64> = HashMap::new();
+    for (left_key, &left_weight) in &left_map {
+        if left_weight == 0 {
+            continue;
+        }
+        for (right_key, &right_weight) in &right_map {
+            if right_weight == 0 {
+                continue;
+            }
+            if predicate(left_key, right_key) {
+                let projected = projector(left_key, right_key);
+                *joined.entry(projected).or_insert(0) += left_weight * right_weight;
+            }
+        }
+    }
+    joined.retain(|_, weight| *weight != 0);
+
+    let deltas = compute_delta(previous, &joined);
+    zset_stream.add_deltas(deltas);
+    let handle = zset_stream
+        .flush()
+        .await
+        .context("flush lifted join result")?;
+    *previous = joined;
+    Ok(handle)
+}
+
+async fn materialize_zset_with_retry<K>(
+    table: Arc<dyn KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    handle: &ZSetHandle,
+) -> Result<HashMap<K, i64>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let mut last_err = None;
+    for _ in 0..80 {
+        match materialize_zset_handle::<K>(table.clone(), cache, handle).await {
+            Ok(map) => return Ok(map),
+            Err(err) => {
+                last_err = Some(err);
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    Err(last_err.expect("at least one materialize attempt"))
 }

@@ -137,7 +137,9 @@ where
     .await
 }
 
-async fn integrate_zset_handle_stream<K>(stream: &Stream<ZSetHandle>) -> Result<Stream<ZSetHandle>>
+pub(crate) async fn integrate_zset_handle_stream<K>(
+    stream: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>>
 where
     K: Archive
         + Clone

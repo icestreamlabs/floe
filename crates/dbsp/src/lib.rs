@@ -5,6 +5,8 @@ pub mod filter;
 pub mod handles;
 pub mod join;
 pub mod map;
+pub mod relation_state;
+pub mod operators;
 pub mod stream;
 
 pub mod storage;
@@ -25,6 +27,11 @@ pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
 pub use map::DbspMap;
+pub use relation_state::RelationState;
+pub use operators::distinct::DistinctOp;
+pub use operators::filter::FilterOp;
+pub use operators::map::MapOp;
+pub use operators::join::JoinOp;
 pub use stream::{
     Stream, StreamRetention, ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate,
     incrementalize2, integrate, lift1, lift2, lifted_delay, lifted_differentiate,
