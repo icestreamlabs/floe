@@ -125,10 +125,10 @@ fn auction_columns() -> Vec<SourceColumn> {
         SourceColumn::new("description", SourceDataType::Utf8),
         SourceColumn::new("initial_bid", SourceDataType::Int64),
         SourceColumn::new("reserve", SourceDataType::Int64),
-        SourceColumn::new("date_time", SourceDataType::TimestampMillis),
-        SourceColumn::new("expires", SourceDataType::TimestampMillis),
         SourceColumn::new("seller", SourceDataType::Int64),
         SourceColumn::new("category", SourceDataType::Int64),
+        SourceColumn::new("expires", SourceDataType::TimestampMillis),
+        SourceColumn::new("date_time", SourceDataType::TimestampMillis),
         SourceColumn::new("extra", SourceDataType::Utf8),
     ]
 }

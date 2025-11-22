@@ -7,6 +7,8 @@ use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::dictionary::Dictionary;
+use crate::storage::KeyValueTable;
+use anyhow::Context;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -52,5 +54,27 @@ where
 
     pub fn dictionary(&self) -> Arc<Dictionary<K>> {
         self.integrated.dictionary()
+    }
+
+    pub async fn empty(
+        table: Arc<dyn KeyValueTable>,
+        namespace: String,
+    ) -> anyhow::Result<Self> {
+        let dict = Arc::new(
+            Dictionary::<K>::with_table(table.clone(), namespace.clone(), None)
+                .await
+                .context("create relation state dictionary")?,
+        );
+        let integrated = VersionedZSet::new(dict, table, namespace.clone())
+            .await
+            .context("create relation state zset")?;
+        let latest_handle = ZSetHandle {
+            ns: namespace,
+            version: 0,
+        };
+        Ok(RelationState {
+            integrated,
+            latest_handle,
+        })
     }
 }

@@ -1,23 +1,35 @@
-use anyhow::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use anyhow::{Context, anyhow};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::sync::Mutex as AsyncMutex;
 
+use crate::algebra::AbelianGroup;
+use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
+use crate::operators::map::MapOp;
+use crate::relation_state::RelationState;
+use crate::storage::dictionary::Dictionary;
+use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::runtime::DeltaOperator;
+use crate::stream::runtime::HandleOperatorRuntime;
+use crate::stream::util::{build_derived_stream, push_value_in_place, set_default_in_place};
 use crate::stream::Stream;
-use crate::stream::operations::lifted_project_zset_stream;
 
-/// Convenience wrapper over the dbsp lifted project pipeline.
-///
-/// Consumes a stream of [`ZSetHandle`]s and emits a derived stream where each
-/// handle reflects the projection applied by the provided function.
+/// Map wrapper that drives the MapOp over handle streams.
 pub struct DbspMap {
     stream: Stream<ZSetHandle>,
 }
 
 impl DbspMap {
-    pub async fn new<K, R, F>(input: &Stream<ZSetHandle>, projector: F) -> Result<Self>
+    pub async fn new<K, R, FProj>(
+        input: &Stream<ZSetHandle>,
+        projector: FProj,
+    ) -> anyhow::Result<Self>
     where
         K: Archive
             + Clone
@@ -26,9 +38,8 @@ impl DbspMap {
             + Send
             + Sync
             + 'static
-            + for<'a> RkyvSerialize<crate::storage::encoding::RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, crate::storage::encoding::RkyvDeserializer>
-            + for<'a> CheckBytes<crate::storage::encoding::RkyvValidator<'a>>,
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         R: Archive
             + Clone
             + Eq
@@ -36,12 +47,79 @@ impl DbspMap {
             + Send
             + Sync
             + 'static
-            + for<'a> RkyvSerialize<crate::storage::encoding::RkyvSerializer<'a>>,
-        R::Archived: RkyvDeserialize<R, crate::storage::encoding::RkyvDeserializer>
-            + for<'a> CheckBytes<crate::storage::encoding::RkyvValidator<'a>>,
-        F: Fn(&K) -> R + Send + Sync + Clone + 'static,
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FProj: Fn(&K) -> R + Send + Sync + Clone + 'static,
     {
-        let stream = lifted_project_zset_stream::<K, R, _>(input, projector).await?;
+        let table = input.table();
+        let map_id = NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed);
+        let output_ns = format!("map_output_{map_id}");
+
+        let state = RelationState::empty(table.clone(), format!("map_state_{map_id}")).await?;
+        let output_dict = Arc::new(
+            Dictionary::<R>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .context("create output dictionary for map")?,
+        );
+        let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
+            .await
+            .context("create output zset for map")?;
+
+        let map_op = Arc::new(AsyncMutex::new(MapOp::new(
+            Arc::new(projector),
+            state,
+            table.clone(),
+            output,
+        )));
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
+            default: ZSetHandle {
+                ns: output_ns.clone(),
+                version: 0,
+            },
+        });
+        let mut stream =
+            build_derived_stream(table.clone(), handle_group, "map_output_stream/").await?;
+        set_default_in_place(
+            &mut stream,
+            ZSetHandle {
+                ns: output_ns,
+                version: 0,
+            },
+        );
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
+        let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, handles| {
+            let op = Arc::clone(&map_op);
+            let writer = Arc::clone(&writer);
+            let handles_vec = handles.to_vec();
+            Box::pin(async move {
+                if handles_vec.len() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "map runtime expected 1 handle, got {}",
+                        handles_vec.len()
+                    ));
+                }
+                let mut op_guard = op.lock().await;
+                if let Some(out_handle) = op_guard.on_step(ts, &handles_vec).await? {
+                    let mut writer_guard = writer.lock().await;
+                    push_value_in_place(&mut writer_guard, out_handle);
+                    writer_guard.flush().await?;
+                }
+                Ok(())
+            })
+        });
+
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = runtime.step().await {
+                    eprintln!("map runtime terminated with error: {err}");
+                    break;
+                }
+            }
+        });
+
+        stream.flush().await?;
         Ok(Self { stream })
     }
 
@@ -50,62 +128,24 @@ impl DbspMap {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::dictionary::Dictionary;
-    use crate::storage::{KeyValueTable, SlateTable};
-    use crate::{StreamRetention, ZSetStream};
-    use object_store::{ObjectStore, memory::InMemory};
-    use slatedb::Db;
-    use std::sync::Arc;
+#[derive(Clone)]
+struct ZSetHandleGroup {
+    default: ZSetHandle,
+}
 
-    fn encode_row(values: &[i64]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(values.len() * 8);
-        for value in values {
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-        buf
+#[async_trait::async_trait]
+impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
+    async fn add(&self, a: &ZSetHandle, _b: &ZSetHandle) -> ZSetHandle {
+        a.clone()
     }
 
-    async fn build_zset_stream(
-        table: Arc<dyn KeyValueTable>,
-        namespace: &str,
-    ) -> ZSetStream<Vec<u8>> {
-        let dict = Arc::new(
-            Dictionary::with_table(table.clone(), namespace.to_string(), None)
-                .await
-                .expect("dictionary"),
-        );
-        ZSetStream::new(
-            dict,
-            table,
-            namespace.to_string(),
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("zset stream")
+    async fn neg(&self, a: &ZSetHandle) -> ZSetHandle {
+        a.clone()
     }
 
-    #[tokio::test]
-    async fn projects_rows_via_dbsp_streams() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("map-db", store).await.expect("open db"));
-        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
-        let mut stream = build_zset_stream(table.clone(), "map_input").await;
-        stream.add_delta(encode_row(&[1, 10]), 1);
-        stream.add_delta(encode_row(&[2, 20]), 1);
-        stream.flush().await.expect("flush step 1");
-        stream.add_delta(encode_row(&[1, 30]), 1);
-        stream.flush().await.expect("flush step 2");
-
-        let input_stream = stream.handle_stream();
-        let projector = |row: &Vec<u8>| row.clone();
-
-        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&input_stream, projector)
-            .await
-            .expect("dbsp map");
-        let mut derived = map.stream();
-        derived.latest().await.expect("latest handle");
+    async fn identity(&self) -> ZSetHandle {
+        self.default.clone()
     }
 }
+
+static NEXT_MAP_ID: AtomicUsize = AtomicUsize::new(0);

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
@@ -14,7 +15,6 @@ use dbsp::{
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
     Stream,
 };
-
 use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
@@ -245,6 +245,94 @@ impl DbspGraphBuilder {
         let residual = node.residual.clone();
         let output_schema = Arc::clone(&node.output_schema);
 
+        let match_log_limit = Arc::new(AtomicUsize::new(0));
+        let compare_log_limit = Arc::new(AtomicUsize::new(0));
+        let left_log_limit = Arc::new(AtomicUsize::new(3));
+        let right_log_limit = Arc::new(AtomicUsize::new(3));
+
+        let mut left_cursor = StreamCursor::new(left.clone());
+        let mut right_cursor = StreamCursor::new(right.clone());
+        if let Ok((ts, handle)) = left_cursor.snapshot().await {
+            if left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0 {
+                eprintln!(
+                    "join left snapshot version {ts}, handle {}, schema width {}",
+                    handle.version,
+                    left_schema.len()
+                );
+                log_handle_rows("left snapshot", &handle, &self.bridge).await?;
+            }
+        }
+        if let Ok((ts, handle)) = right_cursor.snapshot().await {
+            if right_log_limit.fetch_sub(1, Ordering::Relaxed) > 0 {
+                eprintln!(
+                    "join right snapshot version {ts}, handle {}, schema width {}",
+                    handle.version,
+                    right_schema.len()
+                );
+                log_handle_rows("right snapshot", &handle, &self.bridge).await?;
+            }
+        }
+        let left_log_limit_clone = Arc::clone(&left_log_limit);
+        let left_schema_clone = Arc::clone(&left_schema);
+        let bridge_clone = Arc::clone(&self.bridge);
+        tokio::spawn(async move {
+            let mut cursor = left_cursor;
+            while let Ok((ts, handle)) = cursor.next().await {
+                if left_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    eprintln!(
+                        "join left handle version {} at ts {} (schema width {})",
+                        handle.version,
+                        ts,
+                        left_schema_clone.len()
+                    );
+                    if let Err(err) = log_handle_rows("left handle", &handle, &bridge_clone).await {
+                        eprintln!("failed to log left handle rows: {err}");
+                    }
+                }
+            }
+        });
+        let right_log_limit_clone = Arc::clone(&right_log_limit);
+        let right_schema_clone = Arc::clone(&right_schema);
+        let bridge_clone = Arc::clone(&self.bridge);
+        tokio::spawn(async move {
+            let mut cursor = right_cursor;
+            while let Ok((ts, handle)) = cursor.next().await {
+                if right_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    eprintln!(
+                        "join right handle version {} at ts {} (schema width {})",
+                        handle.version,
+                        ts,
+                        right_schema_clone.len()
+                    );
+                    if let Err(err) = log_handle_rows("right handle", &handle, &bridge_clone).await
+                    {
+                        eprintln!("failed to log right handle rows: {err}");
+                    }
+                }
+            }
+        });
+
+        let key_indices: Vec<(usize, usize)> = keys
+            .iter()
+            .map(|k| {
+                let left_name = match k.left_expression().expr() {
+                    datafusion::logical_expr::Expr::Column(c) => c.name.clone(),
+                    other => panic!("unexpected left join key expression: {other:?}"),
+                };
+                let right_name = match k.right_expression().expr() {
+                    datafusion::logical_expr::Expr::Column(c) => c.name.clone(),
+                    other => panic!("unexpected right join key expression: {other:?}"),
+                };
+                let left_idx = left_schema
+                    .field_index(&left_name)
+                    .unwrap_or_else(|| panic!("left key column {left_name} must exist"));
+                let right_idx = right_schema
+                    .field_index(&right_name)
+                    .unwrap_or_else(|| panic!("right key column {right_name} must exist"));
+                (left_idx, right_idx)
+            })
+            .collect();
+
         let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
             let left_row = decode_projected_row_key(left_bytes)
                 .expect("encoded left row must decode for join");
@@ -258,8 +346,31 @@ impl DbspGraphBuilder {
                 right_schema.as_ref(),
             )
             .unwrap_or(false);
+            let seen_compare = compare_log_limit.fetch_add(1, Ordering::Relaxed);
+            if seen_compare < 5 {
+                let mut logged = Vec::new();
+                for (li, ri) in &key_indices {
+                    let left_key = left_row.get(*li).cloned();
+                    let right_key = right_row.get(*ri).cloned();
+                    logged.push((left_key, right_key));
+                }
+                eprintln!(
+                    "join key comparison #{seen_compare}: equal={keys_equal}, pairs={logged:?}"
+                );
+            } else if seen_compare < 10 && !keys_equal {
+                eprintln!(
+                    "join key comparison #{seen_compare}: no match for first key pair {:?}",
+                    key_indices
+                        .get(0)
+                        .and_then(|(li, ri)| Some((left_row.get(*li).cloned(), right_row.get(*ri).cloned())))
+                );
+            }
             if !keys_equal {
                 return false;
+            }
+            let seen = match_log_limit.fetch_add(1, Ordering::Relaxed);
+            if seen < 5 {
+                eprintln!("join predicate matched on keys");
             }
             if let Some(expr) = residual.as_ref() {
                 let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
@@ -284,6 +395,15 @@ impl DbspGraphBuilder {
             DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&left, &right, predicate, projector)
                 .await
                 .context("initialize DBSP join")?;
+        // Log the first output handle, if any, to verify join activity.
+        let mut join_cursor = StreamCursor::new(join.stream());
+        if let Ok((ts, handle)) = join_cursor.snapshot().await {
+            eprintln!(
+                "join output snapshot version {} at ts {}",
+                handle.version, ts
+            );
+            log_handle_rows("join output snapshot", &handle, &self.bridge).await?;
+        }
         Ok(join.stream())
     }
 
@@ -416,6 +536,27 @@ pub struct BuildOutputs {
     pub node_streams: HashMap<usize, Stream<ZSetHandle>>,
     pub mv_latest: HashMap<String, (i64, ZSetHandle)>,
     pub required_sources: BTreeSet<String>,
+}
+
+async fn log_handle_rows(
+    label: &str,
+    handle: &ZSetHandle,
+    bridge: &Arc<Mutex<DbspBridge>>,
+) -> Result<()> {
+    let mut guard = bridge.lock().await;
+    let handle_view = guard
+        .handle_view_for(&handle.ns, handle.version)
+        .await
+        .context("open handle view for logging")?;
+    let materialized = handle_view.materialize().await?;
+    let total = materialized.len();
+    let mut rows = Vec::new();
+    for (row, diff) in materialized.into_iter().take(3) {
+        let decoded = decode_projected_row_key(&row);
+        rows.push((decoded, diff));
+    }
+    eprintln!("{label}: row_count={}, first_rows={:?}", total, rows);
+    Ok(())
 }
 
 fn first_input(node: &CircuitNode, label: &str) -> Result<usize> {

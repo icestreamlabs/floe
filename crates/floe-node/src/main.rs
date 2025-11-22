@@ -94,7 +94,8 @@ async fn main() -> anyhow::Result<()> {
             gather_handle_streams(&registry_guard, required_sources)
         };
         eprintln!(
-            "building DBSP graph for view '{view_name}' with sources: {:?}",
+            "building DBSP graph for view '{view_name}' with required sources {:?} and handle streams {:?}",
+            required_sources,
             handle_streams.keys()
         );
 
@@ -142,7 +143,9 @@ async fn main() -> anyhow::Result<()> {
     let decoder_for_task = Arc::clone(&decoder_registry);
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut rx = event_rx;
+        let mut epoch: u64 = 0;
         while let Some(event) = rx.recv().await {
+            epoch = epoch.saturating_add(1);
             let source_name = event.source().to_string();
             let decoder = match decoder_for_task.get(&source_name) {
                 Some(decoder) => decoder,
@@ -169,6 +172,15 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("failed to flush outer stream for '{source_name}': {err}");
             } else if source_name == generator::BID_SOURCE_NAME {
                 eprintln!("ingested bid row: {:?}", row);
+            } else if source_name == generator::AUCTION_SOURCE_NAME {
+                eprintln!("ingested auction row: {:?}", row);
+            }
+
+            // Advance frontier for all sources this epoch, even if they had no rows.
+            if let Err(err) = registry.tick_all().await {
+                eprintln!("failed to tick outer streams at epoch {epoch}: {err}");
+            } else {
+                eprintln!("advanced all source frontiers to epoch {epoch}");
             }
         }
     });

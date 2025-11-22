@@ -6,7 +6,7 @@ use anyhow::Error as AnyError;
 use datafusion::common::TableReference;
 use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
+use datafusion::logical_expr::{BinaryExpr, Expr, JoinType, LogicalPlan, Operator};
 use datafusion_common::{
     Column,
     tree_node::{Transformed, TreeNode},
@@ -328,13 +328,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let left = self.plan_node(&join.left)?;
         let right = self.plan_node(&join.right)?;
 
-        if join.on.is_empty() {
-            return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key".to_string(),
-            ));
-        }
-
-        let key_pairs = join
+        let mut key_pairs = join
             .on
             .iter()
             .map(|(left_expr, right_expr)| {
@@ -349,10 +343,22 @@ impl<'cfg> PlannerContext<'cfg> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let residual = match &join.filter {
-            Some(expr) => Some(normalize_expr(expr.clone())?),
-            None => None,
-        };
+        let mut residuals: Vec<Expr> = Vec::new();
+        if let Some(filter_expr) = &join.filter {
+            let (filter_keys, filter_residual) = extract_join_keys_and_residual(filter_expr)?;
+            key_pairs.extend(filter_keys);
+            if let Some(expr) = filter_residual {
+                residuals.push(expr);
+            }
+        }
+
+        if key_pairs.is_empty() {
+            return Err(PlannerError::UnsupportedJoin(
+                "joins must have at least one equi-key".to_string(),
+            ));
+        }
+
+        let residual = combine_filters(residuals);
 
         let join_node = DbspJoinNode::try_new(
             DbspJoinType::Inner,
@@ -542,8 +548,53 @@ fn normalize_expr(expr: Expr) -> Result<Expr, PlannerError> {
         )),
         other => Ok(Transformed::no(other)),
     })
-    .map(|result| result.data)
-    .map_err(|err| PlannerError::AnalysisError(err.into()))
+        .map(|result| result.data)
+        .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+fn combine_filters(filters: Vec<Expr>) -> Option<Expr> {
+    let mut iter = filters.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, expr| {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(acc),
+            op: Operator::And,
+            right: Box::new(expr),
+        })
+    }))
+}
+
+fn extract_join_keys_and_residual(
+    expr: &Expr,
+) -> Result<(Vec<(Expr, Expr)>, Option<Expr>), PlannerError> {
+    let mut key_pairs = Vec::new();
+    let mut residuals = Vec::new();
+    accumulate_conjuncts(expr, &mut key_pairs, &mut residuals)?;
+    Ok((key_pairs, combine_filters(residuals)))
+}
+
+fn accumulate_conjuncts(
+    expr: &Expr,
+    key_pairs: &mut Vec<(Expr, Expr)>,
+    residuals: &mut Vec<Expr>,
+) -> Result<(), PlannerError> {
+    let normalized = normalize_expr(expr.clone())?;
+    match &normalized {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            accumulate_conjuncts(&binary.left, key_pairs, residuals)?;
+            accumulate_conjuncts(&binary.right, key_pairs, residuals)?;
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            match (&*binary.left, &*binary.right) {
+                (Expr::Column(_), Expr::Column(_)) => {
+                    key_pairs.push(((*binary.left).clone(), (*binary.right).clone()))
+                }
+                _ => residuals.push(normalized),
+            }
+        }
+        _ => residuals.push(normalized),
+    }
+    Ok(())
 }
 
 fn extract_alias(expr: Expr) -> Result<(Expr, Option<String>), PlannerError> {

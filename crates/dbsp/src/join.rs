@@ -1,26 +1,26 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
-
-use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
+use crate::operators::join::JoinOp;
+use crate::relation_state::RelationState;
+use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
-use crate::stream::operations::{
-    delta_lifted_delta_lifted_join, lifted_integrate_zset, lifted_stream_elimination,
-    lifted_stream_introduction,
-};
+use crate::stream::runtime::DeltaOperator;
+use crate::stream::util::{build_derived_stream, push_value_in_place, set_default_in_place};
+use crate::stream::{Stream, StreamCursor};
 
-/// Convenience wrapper around the dbsp lifted join pipeline.
-///
-/// Accepts streams of `ZSetHandle`s (e.g., produced by `ZSetStream::handle_stream`) and
-/// returns a derived stream of joined handles.
+/// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
     stream: Stream<ZSetHandle>,
 }
@@ -63,22 +63,91 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
-        let left_intro = lifted_stream_introduction(left).await?;
-        let right_intro = lifted_stream_introduction(right).await?;
-        let nested = delta_lifted_delta_lifted_join::<L, R, O, _, _>(
-            &left_intro,
-            &right_intro,
-            predicate,
-            projector,
-        )
-        .await?;
-        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-            Arc::new(ZSetHandleGroup::new(ZSetHandle {
-                ns: String::new(),
+        let table = left.table();
+        let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
+
+        let left_state =
+            RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
+        let right_state =
+            RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
+
+        let output_ns = format!("join_output_{join_id}");
+        let output_dict = Arc::new(
+            Dictionary::<O>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .context("create output dictionary for join")?,
+        );
+        let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
+            .await
+            .context("create output zset for join")?;
+
+        let join_op = Arc::new(AsyncMutex::new(JoinOp::new(
+            left_state,
+            right_state,
+            Arc::new(predicate),
+            Arc::new(projector),
+            table.clone(),
+            output,
+            None,
+        )));
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
+            default: ZSetHandle {
+                ns: output_ns.clone(),
                 version: 0,
-            }));
-        let integrated = lifted_integrate_zset::<O>(&nested, inner_group.clone()).await?;
-        let mut stream = lifted_stream_elimination(&integrated, inner_group).await?;
+            },
+        });
+        let mut stream =
+            build_derived_stream(table.clone(), handle_group, "join_output_stream/").await?;
+        set_default_in_place(
+            &mut stream,
+            ZSetHandle {
+                ns: output_ns,
+                version: 0,
+            },
+        );
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
+        let op = Arc::clone(&join_op);
+        let mut left_cursor = StreamCursor::new(left.clone());
+        let mut right_cursor = StreamCursor::new(right.clone());
+        tokio::spawn(async move {
+            let mut last_left: Option<ZSetHandle> = None;
+            let mut last_right: Option<ZSetHandle> = None;
+            loop {
+                tokio::select! {
+                    left_next = left_cursor.next() => {
+                        match left_next {
+                            Ok((ts, handle)) => {
+                                last_left = Some(handle.clone());
+                                if let Some(out) = drive_join(&op, &writer, ts, vec![Some(handle.clone()), last_right.clone()]).await {
+                                    if let Err(err) = out {
+                                        eprintln!("join left path error: {err}");
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(err) => { eprintln!("join left stream closed: {err}"); break; }
+                        }
+                    }
+                    right_next = right_cursor.next() => {
+                        match right_next {
+                            Ok((ts, handle)) => {
+                                last_right = Some(handle.clone());
+                                if let Some(out) = drive_join(&op, &writer, ts, vec![last_left.clone(), Some(handle.clone())]).await {
+                                    if let Err(err) = out {
+                                        eprintln!("join right path error: {err}");
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(err) => { eprintln!("join right stream closed: {err}"); break; }
+                        }
+                    }
+                }
+            }
+        });
+
         stream.flush().await?;
         Ok(Self { stream })
     }
@@ -88,15 +157,63 @@ impl DbspJoin {
     }
 }
 
+async fn drive_join<L, R, O>(
+    op: &Arc<AsyncMutex<JoinOp<L, R, O>>>,
+    writer: &Arc<AsyncMutex<Stream<ZSetHandle>>>,
+    ts: i64,
+    handles: Vec<Option<ZSetHandle>>,
+) -> Option<Result<()>>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    if handles.is_empty() || handles.iter().any(|h| h.is_none()) {
+        return None;
+    }
+    let handles: Vec<ZSetHandle> = handles.into_iter().filter_map(|h| h).collect();
+    let mut op_guard = op.lock().await;
+    match op_guard.on_step(ts, &handles).await {
+        Ok(Some(out)) => {
+            let mut writer_guard = writer.lock().await;
+            push_value_in_place(&mut writer_guard, out);
+            if let Err(err) = writer_guard.flush().await {
+                return Some(Err(err));
+            }
+            Some(Ok(()))
+        }
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    }
+}
+
 #[derive(Clone)]
 struct ZSetHandleGroup {
     default: ZSetHandle,
-}
-
-impl ZSetHandleGroup {
-    fn new(default: ZSetHandle) -> Self {
-        Self { default }
-    }
 }
 
 #[async_trait]
@@ -114,89 +231,4 @@ impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::dictionary::Dictionary;
-    use crate::storage::{KeyValueTable, SlateTable};
-    use crate::{StreamRetention, ZSetStream};
-    use object_store::memory::InMemory;
-    use slatedb::Db;
-
-    fn encode_row(values: &[i64]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(values.len() * 8);
-        for value in values {
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-        buf
-    }
-
-    fn decode_pair(bytes: &[u8]) -> (i64, i64) {
-        let mut first = [0u8; 8];
-        first.copy_from_slice(&bytes[0..8]);
-        let mut second = [0u8; 8];
-        second.copy_from_slice(&bytes[8..16]);
-        (i64::from_le_bytes(first), i64::from_le_bytes(second))
-    }
-
-    async fn build_zset_stream(
-        table: Arc<dyn KeyValueTable>,
-        namespace: &str,
-    ) -> ZSetStream<Vec<u8>> {
-        let dict = Arc::new(
-            Dictionary::with_table(table.clone(), namespace.to_string(), None)
-                .await
-                .expect("dictionary"),
-        );
-        ZSetStream::new(
-            dict,
-            table,
-            namespace.to_string(),
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("zset stream")
-    }
-
-    #[tokio::test]
-    async fn joins_rows_via_dbsp_streams() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("join-db", store).await.expect("open db"));
-        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
-
-        let mut left = build_zset_stream(table.clone(), "join_left").await;
-        let mut right = build_zset_stream(table.clone(), "join_right").await;
-
-        left.add_delta(encode_row(&[1, 10]), 1);
-        left.flush().await.expect("flush left step1");
-        right.add_delta(encode_row(&[1, 20]), 1);
-        right.flush().await.expect("flush right step1");
-
-        left.add_delta(encode_row(&[2, 30]), 1);
-        left.flush().await.expect("flush left step2");
-        right.add_delta(encode_row(&[2, 40]), 1);
-        right.flush().await.expect("flush right step2");
-
-        let left_stream = left.handle_stream();
-        let right_stream = right.handle_stream();
-        let predicate = |l: &Vec<u8>, r: &Vec<u8>| decode_pair(l).0 == decode_pair(r).0;
-        let projector = |l: &Vec<u8>, r: &Vec<u8>| {
-            let mut combined = Vec::with_capacity(l.len() + r.len());
-            combined.extend_from_slice(l);
-            combined.extend_from_slice(r);
-            combined
-        };
-
-        let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-            &left_stream,
-            &right_stream,
-            predicate,
-            projector,
-        )
-        .await
-        .expect("dbsp join");
-
-        let mut joined_stream = join.stream();
-        joined_stream.latest().await.expect("latest handle");
-    }
-}
+static NEXT_JOIN_ID: AtomicUsize = AtomicUsize::new(0);

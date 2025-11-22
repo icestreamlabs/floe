@@ -10,13 +10,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use core::ops::ControlFlow;
 use datafusion::arrow::array::{
-    Array, Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, Decimal128Array, Decimal256Array, Int16Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::pgwire::tail::{
     TailBatch, TailStream, execute_tail, parse_tail_sql, tail_output_schema,
@@ -56,7 +57,6 @@ use datafusion::arrow::array::ArrayRef;
 
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
-const TAIL_META_COLUMNS: usize = 3;
 const TAIL_OP_VALUE: i16 = 1;
 
 pub async fn init_storage() -> Result<Arc<SlateCatalog>> {
@@ -555,30 +555,13 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
         return Ok(QueryResponse::new(schema, rows));
     }
 
-    let schema = batches[0].schema();
-    let info = Arc::new(arrow_schema_to_field_info(&schema)?);
-    let column_count = info.len();
-
-    let mut row_buffer = Vec::new();
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::with_capacity(column_count);
-            for col_idx in 0..column_count {
-                let array = batch.column(col_idx);
-                let value = read_numeric_field(array.as_ref(), row_idx, col_idx)?;
-                row.push(value);
-            }
-            row_buffer.push(row);
-        }
-    }
-
+    let info = Arc::new(arrow_schema_to_field_info(&batches[0].schema())?);
     let schema_ref = info.clone();
-    let row_stream = stream::iter(row_buffer.into_iter().map(move |values| {
-        let mut encoder = DataRowEncoder::new(schema_ref.clone());
-        for value in values {
-            encoder.encode_field(&value)?;
-        }
-        encoder.finish()
+    let row_stream = stream::iter(batches.into_iter().flat_map(move |batch| {
+        let schema = Arc::clone(&schema_ref);
+        (0..batch.num_rows()).map(move |row_idx| {
+            encode_stream_row(&batch, row_idx, Arc::clone(&schema))
+        })
     }));
 
     Ok(QueryResponse::new(info, row_stream))
@@ -710,12 +693,11 @@ fn encode_stream_row(
     row_idx: usize,
     schema: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<DataRow> {
-    let column_count = schema.len();
     let mut encoder = DataRowEncoder::new(schema);
-    for col_idx in 0..column_count {
+    for col_idx in 0..batch.num_columns() {
         let array = batch.column(col_idx);
-        let value = read_numeric_field(array.as_ref(), row_idx, col_idx)?;
-        encoder.encode_field(&value)?;
+        let data_type = batch.schema().field(col_idx).data_type().clone();
+        encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
     }
     encoder.finish()
 }
@@ -731,89 +713,146 @@ fn encode_tail_row(
     encoder.encode_field(&Some(i64::from(TAIL_OP_VALUE)))?;
     encoder.encode_field(&Option::<i64>::None)?;
     for col_idx in 0..batch.num_columns() {
-        let value = read_numeric_field(
-            batch.column(col_idx).as_ref(),
-            row_idx,
-            col_idx + TAIL_META_COLUMNS,
-        )?;
-        encoder.encode_field(&value)?;
+        let array = batch.column(col_idx);
+        let data_type = batch.schema().field(col_idx).data_type().clone();
+        encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
     }
     encoder.finish()
 }
 
-fn read_numeric_field(
+fn encode_arrow_value(
     array: &dyn Array,
     row_idx: usize,
-    column_index: usize,
-) -> PgWireResult<Option<i64>> {
-    match array.data_type() {
+    data_type: &DataType,
+    encoder: &mut DataRowEncoder,
+) -> PgWireResult<()> {
+    match data_type {
         DataType::Int16 => {
             let array = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            if array.is_null(row_idx) {
-                Ok(None)
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                Ok(Some(array.value(row_idx) as i64))
-            }
+                Some(array.value(row_idx))
+            };
+            encoder.encode_field(&value)
         }
         DataType::UInt16 => {
             let array = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            if array.is_null(row_idx) {
-                Ok(None)
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                Ok(Some(array.value(row_idx) as i64))
-            }
+                Some(array.value(row_idx) as i64)
+            };
+            encoder.encode_field(&value)
         }
         DataType::Int32 => {
             let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            if array.is_null(row_idx) {
-                Ok(None)
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                Ok(Some(array.value(row_idx) as i64))
-            }
+                Some(array.value(row_idx))
+            };
+            encoder.encode_field(&value)
         }
         DataType::UInt32 => {
             let array = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            if array.is_null(row_idx) {
-                Ok(None)
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                Ok(Some(array.value(row_idx) as i64))
-            }
+                Some(array.value(row_idx) as i64)
+            };
+            encoder.encode_field(&value)
         }
         DataType::Int64 => {
-            let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            if int_array.is_null(row_idx) {
-                Ok(None)
+            let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                Ok(Some(int_array.value(row_idx)))
-            }
+                Some(array.value(row_idx))
+            };
+            encoder.encode_field(&value)
         }
         DataType::UInt64 => {
-            let uint_array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            if uint_array.is_null(row_idx) {
-                Ok(None)
+            let array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let value = if array.is_null(row_idx) {
+                None
             } else {
-                let raw = uint_array.value(row_idx);
-                let signed = i64::try_from(raw)
-                    .map_err(|_| user_error(format!("version value {raw} exceeds INT8 range")))?;
-                Ok(Some(signed))
-            }
+                Some(array.value(row_idx) as i64)
+            };
+            encoder.encode_field(&value)
         }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let ts_array = array
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let array = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            if ts_array.is_null(row_idx) {
-                Ok(None)
+            if array.is_null(row_idx) {
+                return encoder.encode_field::<Option<NaiveDateTime>>(&None);
+            }
+            let micros = array.value(row_idx);
+            let naive = micros_to_naive_datetime(micros)
+                .ok_or_else(|| user_error(format!("timestamp micros {micros} out of range")))?;
+            if tz.is_some() {
+                let utc: DateTime<Utc> = Utc.from_utc_datetime(&naive);
+                encoder.encode_field(&Some(utc))
             } else {
-                Ok(Some(ts_array.value(row_idx)))
+                encoder.encode_field(&Some(naive))
+            }
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            if array.is_null(row_idx) {
+                return encoder.encode_field::<Option<NaiveDateTime>>(&None);
+            }
+            let micros = array.value(row_idx).saturating_mul(1000);
+            let naive = micros_to_naive_datetime(micros)
+                .ok_or_else(|| user_error(format!("timestamp micros {micros} out of range")))?;
+            if tz.is_some() {
+                let utc: DateTime<Utc> = Utc.from_utc_datetime(&naive);
+                encoder.encode_field(&Some(utc))
+            } else {
+                encoder.encode_field(&Some(naive))
+            }
+        }
+        DataType::Utf8 => {
+            let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let value: Option<&str> = if array.is_null(row_idx) {
+                None
+            } else {
+                Some(array.value(row_idx))
+            };
+            encoder.encode_field(&value)
+        }
+        DataType::Decimal128(_, _) => {
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            if array.is_null(row_idx) {
+                encoder.encode_field::<Option<String>>(&None)
+            } else {
+                let value = array.value_as_string(row_idx);
+                encoder.encode_field(&Some(value))
+            }
+        }
+        DataType::Decimal256(_, _) => {
+            let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            if array.is_null(row_idx) {
+                encoder.encode_field::<Option<String>>(&None)
+            } else {
+                let value = array.value_as_string(row_idx);
+                encoder.encode_field(&Some(value))
             }
         }
         other => Err(user_error(format!(
-            "expected INT8-compatible column at position {} but found {}",
-            column_index, other
+            "unsupported column type {} in result set",
+            other
         ))),
     }
+}
+
+fn micros_to_naive_datetime(micros: i64) -> Option<NaiveDateTime> {
+    DateTime::<Utc>::from_timestamp_micros(micros).map(|dt| dt.naive_utc())
 }
 
 fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>> {
@@ -826,7 +865,11 @@ fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>
             | DataType::UInt32
             | DataType::Int64
             | DataType::UInt64
-            | DataType::Timestamp(TimeUnit::Microsecond, _) => {}
+            | DataType::Utf8
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+            | DataType::Timestamp(TimeUnit::Millisecond, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _) => {}
             other => {
                 return Err(user_error(format!(
                     "unsupported column type {} in result set",
@@ -834,11 +877,18 @@ fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec<FieldInfo>
                 )));
             }
         }
+        let pg_type = match field.data_type() {
+            DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
+            DataType::Timestamp(_, None) => Type::TIMESTAMP,
+            DataType::Utf8 => Type::TEXT,
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Type::NUMERIC,
+            _ => Type::INT8,
+        };
         fields.push(FieldInfo::new(
             field.name().clone(),
             None,
             None,
-            Type::INT8,
+            pg_type,
             FieldFormat::Text,
         ));
     }
@@ -1109,6 +1159,7 @@ mod tests {
     };
     use futures::Stream;
     use pgwire::messages::extendedquery::Bind;
+    use pgwire::messages::data::DataRow;
     use slatedb::Db;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -1223,7 +1274,7 @@ mod tests {
 
         let dialect = PostgreSqlDialect {};
         let mut statements =
-            Parser::parse_sql(&dialect, "INSERT INTO t VALUES (1)").expect("parse");
+        Parser::parse_sql(&dialect, "INSERT INTO t VALUES (1)").expect("parse");
         let statement = statements.pop().expect("statement");
         let err = match handler.execute_statement(statement).await {
             Ok(_) => panic!("expected INSERT to be rejected"),
@@ -1233,6 +1284,102 @@ mod tests {
             err.to_string()
                 .contains("INSERT is not supported; materialized views are read-only")
         );
+    }
+
+    #[test]
+    fn arrow_schema_maps_timestamp_types() {
+        let schema = SchemaRef::from(Schema::new(vec![
+            Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "ts_millis",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let fields = arrow_schema_to_field_info(&schema).expect("map schema");
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0].datatype(), &Type::TIMESTAMP);
+        assert_eq!(fields[1].datatype(), &Type::TIMESTAMPTZ);
+        assert_eq!(fields[2].datatype(), &Type::TEXT);
+        assert_eq!(fields[3].datatype(), &Type::NUMERIC);
+    }
+
+    #[test]
+    fn encode_timestamp_values() {
+        // 2024-01-01T00:00:01Z
+        let micros = 1_704_067_201_000_000i64;
+        let millis = micros / 1000;
+
+        let micros_array = TimestampMicrosecondArray::from(vec![Some(micros), None]);
+        let millis_array = {
+            use arrow_data::ArrayData;
+            use arrow_buffer::{Buffer, NullBuffer};
+
+            let values = Buffer::from_slice_ref(&[millis, 0]);
+            let nulls = NullBuffer::from(vec![true, false]);
+            let data = ArrayData::builder(DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into()),
+            ))
+            .len(2)
+            .add_buffer(values)
+            .null_bit_buffer(Some(nulls.into_inner().into_inner()))
+            .build()
+            .expect("array data");
+            TimestampMillisecondArray::from(data)
+        };
+        let utf8_array = StringArray::from(vec![Some("hello"), None]);
+        let decimal_array = Decimal128Array::from(vec![Some(12_345i128), None]).with_precision_and_scale(10, 2).expect("decimal array");
+
+        let schema = SchemaRef::from(Schema::new(vec![
+            Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "ts_millis",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(micros_array) as ArrayRef,
+                Arc::new(millis_array) as ArrayRef,
+                Arc::new(utf8_array) as ArrayRef,
+                Arc::new(decimal_array) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let field_info = Arc::new(arrow_schema_to_field_info(&batch.schema()).expect("schema"));
+        let row = encode_stream_row(&batch, 0, Arc::clone(&field_info)).expect("encode row");
+
+        // Decode the row buffer to confirm both fields are non-null and encoded.
+        let mut buf = row.data.clone();
+        let first_len = buf.get_i32();
+        assert!(first_len > 0);
+        let _ = buf.split_to(first_len as usize);
+        let second_len = buf.get_i32();
+        assert!(second_len > 0);
+        let _ = buf.split_to(second_len as usize);
+        let third_len = buf.get_i32();
+        assert!(third_len > 0);
+        let _ = buf.split_to(third_len as usize);
+        let fourth_len = buf.get_i32();
+        assert!(fourth_len > 0);
+
+        // Null row should encode null markers.
+        let null_row = encode_stream_row(&batch, 1, field_info).expect("encode null row");
+        let mut buf_null = null_row.data.clone();
+        assert_eq!(buf_null.get_i32(), -1);
+        assert_eq!(buf_null.get_i32(), -1);
+        assert_eq!(buf_null.get_i32(), -1);
+        assert_eq!(buf_null.get_i32(), -1);
     }
 
     #[tokio::test]

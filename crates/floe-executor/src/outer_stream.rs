@@ -60,6 +60,20 @@ impl OuterStreamWriter {
         Ok(())
     }
 
+    /// Advance the stream frontier even when no rows were appended.
+    pub async fn tick(&mut self) -> Result<OuterStreamHandle> {
+        let handle = self.stream.flush().await?;
+        eprintln!(
+            "Outer stream '{}' ticked version {}",
+            self.source, handle.version
+        );
+        Ok(OuterStreamHandle {
+            source: self.source.clone(),
+            namespace: self.namespace.clone(),
+            version: handle.version,
+        })
+    }
+
     pub async fn flush(&mut self) -> Result<OuterStreamHandle> {
         let handle = self.stream.flush().await?;
         eprintln!(
@@ -131,6 +145,14 @@ impl OuterStreamRegistry {
         let mut handles = Vec::with_capacity(self.writers.len());
         for writer in self.writers.values_mut() {
             handles.push(writer.flush().await?);
+        }
+        Ok(handles)
+    }
+
+    pub async fn tick_all(&mut self) -> Result<Vec<OuterStreamHandle>> {
+        let mut handles = Vec::with_capacity(self.writers.len());
+        for writer in self.writers.values_mut() {
+            handles.push(writer.tick().await?);
         }
         Ok(handles)
     }

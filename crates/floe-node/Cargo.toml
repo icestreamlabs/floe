@@ -24,9 +24,13 @@ tokio-util = { workspace = true }
 floe-sql-parser = { workspace = true }
 slatedb = { workspace = true }
 bytes = "1.6"
-postgres-types = "0.2"
+postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
+chrono = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
+arrow-array = "56.2.0"
+arrow-buffer = "56.2.0"
+arrow-data = "56.2.0"
 tempfile = "3.10"
 tokio-postgres = { version = "0.7", features = ["runtime"] }

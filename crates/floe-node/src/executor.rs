@@ -114,4 +114,30 @@ mod tests {
             "expected plan to contain a select node"
         );
     }
+
+    #[tokio::test]
+    async fn plans_simple_join_materialized_view() {
+        let mut sources = SourceRegistry::new();
+        sources.extend(generator::definitions().expect("generator definitions"));
+        let available_sources = available_sources_from_registry(&sources);
+
+        let definition = parse_materialized_view(
+            "CREATE MATERIALIZED VIEW mv AS SELECT b.auction, b.bidder, a.seller \
+             FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id",
+        )
+        .expect("parse mv");
+        let planned = plan_materialized_views(&sources, &[definition])
+            .await
+            .expect("plan mv");
+
+        let plans = build_dataflows(&planned, &available_sources).expect("build dbsp plan");
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert!(
+            plan.nodes()
+                .iter()
+                .any(|node| matches!(node.kind, DbspNodeKind::Join(_))),
+            "expected plan to contain a join node"
+        );
+    }
 }
