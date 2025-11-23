@@ -9,6 +9,7 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::time::{Duration, sleep};
 
 use crate::algebra::AbelianGroup;
 use crate::handles::{StreamHandle, ZSetHandle, ZSetHandleView};
@@ -187,10 +188,19 @@ where
     };
 
     let view = ZSetHandleView::new(dict, table, handle.ns.clone(), handle.version);
-    let mut map = view
-        .materialize()
-        .await
-        .context("materialize ZSet handle")?;
+    let mut attempts = 0;
+    let mut map = loop {
+        match view.materialize().await {
+            Ok(map) => break map,
+            Err(err) => {
+                attempts += 1;
+                if attempts > 3 || !err.to_string().contains("manifest version") {
+                    return Err(err).context("materialize ZSet handle");
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
     map.retain(|_, weight| *weight != 0);
     Ok(map)
 }

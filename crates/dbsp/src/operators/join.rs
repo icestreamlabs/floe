@@ -240,7 +240,7 @@ where
 {
     async fn on_step(
         &mut self,
-        _ts: i64,
+        ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
         let left_delta_handle = inputs
@@ -266,9 +266,6 @@ where
         )
         .await
         .context("materialize right delta for join")?;
-        let delta_left = left_delta.clone();
-        let delta_right = right_delta.clone();
-
         let left_integrated = self
             .left_state
             .integrated
@@ -281,6 +278,17 @@ where
             .materialize()
             .await
             .context("materialize right integrated for join")?;
+        eprintln!(
+            "join op t={ts} left_ver={} right_ver={} left_delta_len={} right_delta_len={} left_integrated_len={} right_integrated_len={}",
+            left_delta_handle.version,
+            right_delta_handle.version,
+            left_delta.len(),
+            right_delta.len(),
+            left_integrated.len(),
+            right_integrated.len()
+        );
+        let delta_left = left_delta.clone();
+        let delta_right = right_delta.clone();
 
         let mut delta_join: HashMap<O, i64> = HashMap::new();
         self.join_maps(&delta_left, &delta_right, &mut delta_join);

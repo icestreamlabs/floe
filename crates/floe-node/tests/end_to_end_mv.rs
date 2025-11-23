@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::scalar::ScalarValue;
@@ -16,6 +16,7 @@ use floe_node::planner::plan_materialized_views;
 use floe_node::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;
 use floe_storage::SlateCatalog;
+use tokio::time::{Duration, timeout};
 
 #[tokio::test]
 async fn materialized_view_ingests_and_queries() -> Result<()> {
@@ -40,16 +41,12 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
         required_sources, ..
     } = validate_dbsp_plan(&circuit_plans[0], &available_sources, "mv_q1")?;
 
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db)).await?;
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await?;
     let mut outer =
         OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
             .await?;
-    append_bid(&mut outer, 1, 42, 100).await?;
-    append_bid(&mut outer, 2, 10, 50).await?;
-    append_bid(&mut outer, 3, 42, 75).await?;
-
-    let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db)).await?;
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&outer, &source_refs);
     let _outputs = graph_builder
@@ -61,6 +58,19 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
             outer_handle_streams: &handle_streams,
         })
         .await?;
+
+    append_bid(&mut outer, &mut ingestion_bridge, 1, 42, 100).await?;
+    append_bid(&mut outer, &mut ingestion_bridge, 2, 10, 50).await?;
+    append_bid(&mut outer, &mut ingestion_bridge, 3, 42, 75).await?;
+    for version in 1..=3 {
+        assert_manifest_exists(
+            ingestion_bridge.table(),
+            "src/nexmark_bid",
+            version,
+        )
+        .await?;
+    }
+    wait_for_version(&mv_registry, "mv_q1", 2).await?;
 
     let query = FloeQueryContext::new(Arc::clone(&catalog));
     let session = query.session();
@@ -77,8 +87,25 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
     Ok(())
 }
 
+async fn assert_manifest_exists(
+    table: Arc<dyn dbsp::storage::KeyValueTable>,
+    namespace: &str,
+    version: u64,
+) -> Result<()> {
+    let mut key = format!("zset/{namespace}/manifest/").into_bytes();
+    key.extend_from_slice(&version.to_be_bytes());
+    let exists = table
+        .get(&key)
+        .await
+        .context("lookup manifest key")?
+        .is_some();
+    anyhow::ensure!(exists, "manifest {version} missing for namespace {namespace}");
+    Ok(())
+}
+
 async fn append_bid(
     outer: &mut OuterStreamRegistry,
+    bridge: &mut DbspBridge,
     auction: i64,
     bidder: i64,
     price: i64,
@@ -87,7 +114,44 @@ async fn append_bid(
         .writer_mut(BID_SOURCE_NAME)
         .expect("bid source writer must exist");
     writer.append(&bid_row(auction, bidder, price), 1)?;
-    writer.flush().await?;
+    let handles = outer.tick_all().await?;
+    let handle = handles
+        .into_iter()
+        .find(|h| h.source == BID_SOURCE_NAME)
+        .expect("bid handle present after tick");
+    // Ensure the manifest is readable to catch retention or persistence issues early.
+    let _ = bridge
+        .handle_view_for(&handle.namespace, handle.version)
+        .await
+        .context("load handle view after bid append")?;
+    Ok(())
+}
+
+async fn wait_for_version(
+    registry: &MaterializedViewRegistry,
+    view: &str,
+    target_version: i64,
+) -> Result<()> {
+    let handle = registry
+        .get(view)
+        .with_context(|| format!("materialized view handle for '{view}'"))?;
+    let mut rx = handle.version_watch();
+    let mut observed = *rx.borrow();
+    if observed.unwrap_or(-1) >= target_version {
+        return Ok(());
+    }
+    timeout(Duration::from_secs(2), async {
+        loop {
+            rx.changed().await.context("version watch closed")?;
+            observed = *rx.borrow();
+            if observed.unwrap_or(-1) >= target_version {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timeout waiting for mv version")??;
     Ok(())
 }
 

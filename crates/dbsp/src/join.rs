@@ -16,9 +16,9 @@ use crate::operators::join::JoinOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::runtime::DeltaOperator;
+use crate::stream::runtime::{DeltaOperator, HandleOperatorRuntime};
 use crate::stream::util::{build_derived_stream, push_value_in_place, set_default_in_place};
-use crate::stream::{Stream, StreamCursor};
+use crate::stream::Stream;
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
@@ -109,41 +109,26 @@ impl DbspJoin {
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
         let op = Arc::clone(&join_op);
-        let mut left_cursor = StreamCursor::new(left.clone());
-        let mut right_cursor = StreamCursor::new(right.clone());
+        let mut runtime = HandleOperatorRuntime::new(vec![left.clone(), right.clone()], move |ts, handles| {
+            let op = Arc::clone(&op);
+            let writer = Arc::clone(&writer);
+            let handles = handles.to_vec();
+            Box::pin(async move {
+                // If either side did not change at this ts, synthesize an empty delta
+                // handle in the corresponding namespace so downstream logic observes
+                // aligned timestamps with zero deltas.
+                if handles.len() != 2 {
+                    return Err(anyhow::anyhow!("join runtime expected 2 handles, got {}", handles.len()));
+                }
+                drive_join(&op, &writer, ts, handles).await
+            })
+        });
+
         tokio::spawn(async move {
-            let mut last_left: Option<ZSetHandle> = None;
-            let mut last_right: Option<ZSetHandle> = None;
             loop {
-                tokio::select! {
-                    left_next = left_cursor.next() => {
-                        match left_next {
-                            Ok((ts, handle)) => {
-                                last_left = Some(handle.clone());
-                                if let Some(out) = drive_join(&op, &writer, ts, vec![Some(handle.clone()), last_right.clone()]).await {
-                                    if let Err(err) = out {
-                                        eprintln!("join left path error: {err}");
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => { eprintln!("join left stream closed: {err}"); break; }
-                        }
-                    }
-                    right_next = right_cursor.next() => {
-                        match right_next {
-                            Ok((ts, handle)) => {
-                                last_right = Some(handle.clone());
-                                if let Some(out) = drive_join(&op, &writer, ts, vec![last_left.clone(), Some(handle.clone())]).await {
-                                    if let Err(err) = out {
-                                        eprintln!("join right path error: {err}");
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => { eprintln!("join right stream closed: {err}"); break; }
-                        }
-                    }
+                if let Err(err) = runtime.step().await {
+                    eprintln!("join runtime terminated with error: {err}");
+                    break;
                 }
             }
         });
@@ -161,8 +146,8 @@ async fn drive_join<L, R, O>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O>>>,
     writer: &Arc<AsyncMutex<Stream<ZSetHandle>>>,
     ts: i64,
-    handles: Vec<Option<ZSetHandle>>,
-) -> Option<Result<()>>
+    handles: Vec<ZSetHandle>,
+) -> Result<()>
 where
     L: Archive
         + Clone
@@ -192,23 +177,13 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    if handles.is_empty() || handles.iter().any(|h| h.is_none()) {
-        return None;
-    }
-    let handles: Vec<ZSetHandle> = handles.into_iter().filter_map(|h| h).collect();
     let mut op_guard = op.lock().await;
-    match op_guard.on_step(ts, &handles).await {
-        Ok(Some(out)) => {
-            let mut writer_guard = writer.lock().await;
-            push_value_in_place(&mut writer_guard, out);
-            if let Err(err) = writer_guard.flush().await {
-                return Some(Err(err));
-            }
-            Some(Ok(()))
-        }
-        Ok(None) => None,
-        Err(err) => Some(Err(err)),
+    if let Some(out) = op_guard.on_step(ts, &handles).await? {
+        let mut writer_guard = writer.lock().await;
+        push_value_in_place(&mut writer_guard, out);
+        writer_guard.flush().await?;
     }
+    Ok(())
 }
 
 #[derive(Clone)]

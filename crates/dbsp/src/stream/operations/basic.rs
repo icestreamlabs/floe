@@ -1,15 +1,19 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::sync::Mutex;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use slatedb::WriteBatch;
 
 use super::super::addition::StreamAddition;
 use super::super::core::stream::Stream;
@@ -20,6 +24,7 @@ use super::super::util::{
 };
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
+use crate::stream::runtime::HandleOperatorRuntime;
 use super::zset_integral::integrate_zset_handle_stream;
 
 pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
@@ -159,14 +164,9 @@ where
             .await
             .context("build dictionary for differentiate_zset_stream")?,
     );
-    let mut diff_zset = super::super::zset_stream::ZSetStream::new(
-        dict,
-        table.clone(),
-        namespace,
-        super::super::zset_stream::StreamRetention::None,
-    )
-    .await
-    .context("create diff zset stream")?;
+    let mut versioned = VersionedZSet::new(dict, table.clone(), namespace.clone())
+        .await
+        .context("create versioned zset for diff stream")?;
 
     let mut cache = std::collections::HashMap::new();
     let mut previous = std::collections::HashMap::new();
@@ -177,19 +177,72 @@ where
             .await
             .context("materialize zset handle for diff")?;
         let deltas = compute_delta(&previous, &current);
-        diff_zset.add_deltas(deltas);
-        let out_handle = diff_zset
-            .flush()
-            .await
-            .context("flush diff zset stream")?;
-        output_handles.push(out_handle.clone());
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let id = dict_batch
+                .intern(&key)
+                .await
+                .context("intern key while staging diff delta")?;
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
+        }
+        drop(dict_batch);
+
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.retain(|(_, delta)| *delta != 0);
+            if bucket_deltas.is_empty() {
+                continue;
+            }
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
+        }
+
+        let next_handle = if segments.is_empty() {
+            versioned
+                .current_handle()
+                .unwrap_or_else(|| versioned.handle_for_version(0))
+        } else {
+            let mut batch = WriteBatch::new();
+            let plan = versioned
+                .enqueue_version_with_base(segments, None, 0, &mut batch)
+                .await
+                .context("schedule diff zset version update")?;
+
+            versioned
+                .table()
+                .write_batch(batch)
+                .await
+                .context("write diff zset version update")?;
+
+            let mut cleanup = WriteBatch::new();
+            cleanup.delete(versioned.intent_key_bytes().to_vec());
+            versioned
+                .table()
+                .write_batch(cleanup)
+                .await
+                .context("clear diff zset intent")?;
+
+            versioned.apply_version_plan(&plan);
+            versioned.handle_for_version(plan.version)
+        };
+
+        output_handles.push(next_handle.clone());
         previous = current;
     }
 
     let default_handle = output_handles
         .first()
         .cloned()
-        .unwrap_or_else(|| diff_zset.current_handle().clone());
+        .unwrap_or_else(|| versioned.handle_for_version(0));
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
     let mut result_stream =
@@ -209,6 +262,217 @@ where
 
     result_stream.flush().await?;
     Ok(result_stream)
+}
+
+/// Live variant of `differentiate_zset_stream` that converts an incoming snapshot
+/// handle stream into a delta stream, driving a background runtime to process new
+/// handles as they arrive.
+pub async fn differentiate_zset_stream_live<K>(
+    input: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let table = input.table();
+    let namespace = next_lifted_zset_namespace("stream_live_diff/");
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), namespace.clone(), None)
+            .await
+            .context("build dictionary for live differentiate_zset_stream")?,
+    );
+    let versioned = VersionedZSet::new(dict, table.clone(), namespace.clone())
+        .await
+        .context("create versioned zset for live diff")?;
+    let state = Arc::new(Mutex::new(LiveDiffState {
+        versioned,
+        prev: std::collections::HashMap::new(),
+        materialize_cache: std::collections::HashMap::new(),
+    }));
+
+    let mut guard = state.lock().await;
+    let default_handle = guard.versioned.handle_for_version(0);
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut out_stream =
+        build_derived_stream(table.clone(), handle_group, "stream_live_diff_handles/").await?;
+    set_default_in_place(&mut out_stream, default_handle.clone());
+
+    // Drain history up to current time to seed the live diff stream.
+    let input_handles = collect_values(input, input.current_time()).await?;
+    let mut prev = std::collections::HashMap::new();
+    for handle in input_handles {
+        let current = materialize_zset_handle::<K>(
+            guard.versioned.table(),
+            &mut guard.materialize_cache,
+            &handle,
+        )
+        .await
+        .context("materialize input handle for live diff history")?;
+        let deltas = compute_delta(&prev, &current);
+        let out_handle = if deltas.is_empty() {
+            guard.versioned.handle_for_version(0)
+        } else {
+            apply_delta_version(&mut guard.versioned, deltas)
+                .await
+                .context("persist live diff history version")?
+        };
+        push_value_in_place(&mut out_stream, out_handle.clone());
+        prev = current;
+    }
+    // Keep the latest integrated state for incremental steps.
+    guard.prev = prev;
+    if let Some(last) = out_stream.to_vec().await?.last() {
+        set_default_in_place(&mut out_stream, last.clone());
+    }
+    out_stream.flush().await?;
+    drop(guard);
+
+    let writer = Arc::new(Mutex::new(out_stream.clone()));
+    let state_clone = Arc::clone(&state);
+    let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |_ts, handles| {
+        let state = Arc::clone(&state_clone);
+        let writer = Arc::clone(&writer);
+        let handle = handles[0].clone();
+        Box::pin(async move {
+            let mut guard = state.lock().await;
+            let current = materialize_zset_handle::<K>(
+                guard.versioned.table(),
+                &mut guard.materialize_cache,
+                &handle,
+            )
+            .await
+            .context("materialize input handle for live diff")?;
+            let deltas = compute_delta(&guard.prev, &current);
+            guard.prev = current;
+            let out_handle = if deltas.is_empty() {
+                guard.versioned.handle_for_version(0)
+            } else {
+                apply_delta_version(&mut guard.versioned, deltas)
+                    .await
+                    .context("persist live diff version")?
+            };
+
+            let mut writer_guard = writer.lock().await;
+            push_value_in_place(&mut writer_guard, out_handle);
+            writer_guard.flush().await?;
+            Ok(())
+        })
+    });
+
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = runtime.step().await {
+                eprintln!("live differentiate_zset_stream runtime terminated: {err}");
+                break;
+            }
+        }
+    });
+
+    Ok(out_stream)
+}
+
+struct LiveDiffState<K>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    versioned: VersionedZSet<K>,
+    prev: std::collections::HashMap<K, i64>,
+    materialize_cache: std::collections::HashMap<String, Arc<Dictionary<K>>>,
+}
+
+async fn apply_delta_version<K>(
+    versioned: &mut VersionedZSet<K>,
+    deltas: Vec<(K, i64)>,
+) -> Result<ZSetHandle>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+    let dict = versioned.dictionary();
+    let mut dict_batch = dict.batch();
+    for (key, delta) in deltas {
+        if delta == 0 {
+            continue;
+        }
+        let id = dict_batch
+            .intern(&key)
+            .await
+            .context("intern key while staging live diff delta")?;
+        buckets.entry(bucket_for(id)).or_default().push((id, delta));
+    }
+    drop(dict_batch);
+
+    let mut segments = Vec::new();
+    for (bucket, mut bucket_deltas) in buckets {
+        bucket_deltas.retain(|(_, delta)| *delta != 0);
+        if bucket_deltas.is_empty() {
+            continue;
+        }
+        bucket_deltas.sort_by_key(|(id, _)| *id);
+        segments.push(SegmentRecord {
+            id: 0,
+            bucket,
+            deltas: bucket_deltas,
+        });
+    }
+
+    if segments.is_empty() {
+        return Ok(
+            versioned
+                .current_handle()
+                .unwrap_or_else(|| versioned.handle_for_version(0)),
+        );
+    }
+
+    let mut batch = slatedb::WriteBatch::new();
+    let plan = versioned
+        .enqueue_version_with_base(segments, None, 0, &mut batch)
+        .await
+        .context("enqueue live diff version")?;
+    versioned
+        .table()
+        .write_batch(batch)
+        .await
+        .context("write live diff version")?;
+
+    let mut cleanup = slatedb::WriteBatch::new();
+    cleanup.delete(versioned.intent_key_bytes().to_vec());
+    versioned
+        .table()
+        .write_batch(cleanup)
+        .await
+        .context("clear live diff intent")?;
+
+    versioned.apply_version_plan(&plan);
+    Ok(versioned.handle_for_version(plan.version))
+}
+
+fn bucket_for(id: u64) -> u16 {
+    (id >> 48) as u16
 }
 
 pub async fn lift1<I, O, F>(

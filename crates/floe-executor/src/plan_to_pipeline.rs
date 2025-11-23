@@ -6,6 +6,7 @@ use dbsp::relation_state::RelationState;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::KeyValueTable;
 use dbsp::stream::runtime::{Pipeline, PipelineBuilder};
+use dbsp::stream::operations::basic::differentiate_zset_stream;
 use dbsp::collections::zset::VersionedZSet;
 use dbsp::{DistinctOp, MapOp};
 
@@ -21,16 +22,34 @@ pub struct PipelineFromCircuit<'a> {
 }
 
 impl<'a> PipelineFromCircuit<'a> {
+    // MV pipeline shape today (keep in sync with operator semantics):
+    //
+    // - `source_stream` is a `Stream<ZSetHandle>` that yields snapshots from the
+    //   base table handle (not incremental deltas).
+    // - `DistinctOp` runs DBSP-style distinct over a delta stream to drop repeated
+    //   records.
+    // - `MapOp` currently uses an identity projector over the row bytes.
+    // - `MvSinkOp` applies the incoming deltas to the MV's backing `VersionedZSet`.
+    //
+    // Note: although every operator implements `DeltaOperator` and expects deltas,
+    // the `source_stream` feed is snapshot-based today, so the pipeline processes
+    // full snapshots through delta-oriented operators.
     pub async fn build_mv_pipeline(&self, view_name: &str) -> Result<Pipeline> {
         let sink = self
             .find_sink(view_name)
             .context("unable to resolve sink in plan")?;
         let source_node = self.walk_to_source(sink)?;
 
-        let source_stream = self
+        let snapshot_stream = self
             .tables
             .handle_stream_for(source_node.table)
             .context("no handle stream for source table")?;
+
+        // Turn snapshot Stream<ZSetHandle> into per-step delta Stream<ZSetHandle>.
+        // Keys are encoded rows, so K = Vec<u8>.
+        let source_stream = differentiate_zset_stream::<Vec<u8>>(&snapshot_stream)
+            .await
+            .context("compute per-step deltas for source stream")?;
 
         let table = self.tables.table();
         let distinct_state = self.build_relation_state("distinct_state", table.clone()).await?;

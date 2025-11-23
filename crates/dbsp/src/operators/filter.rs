@@ -154,7 +154,6 @@ where
             .first()
             .cloned()
             .context("filter operator requires one input delta handle")?;
-
         let delta_map =
             materialize_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await

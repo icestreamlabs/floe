@@ -102,7 +102,7 @@ impl DbspFilter {
         tokio::spawn(async move {
             loop {
                 if let Err(err) = runtime.step().await {
-                    eprintln!("filter runtime terminated with error: {err}");
+                    eprintln!("filter runtime terminated with error: {err:?}");
                     break;
                 }
             }

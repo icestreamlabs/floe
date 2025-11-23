@@ -10,6 +10,7 @@ use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspJoinKey, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::StreamCursor;
+use dbsp::stream::operations::basic::differentiate_zset_stream_live;
 use dbsp::{
     CircuitNode, CircuitPlan, DbspExpression, DbspFilter, DbspJoin, DbspJoinNode, DbspMap,
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
@@ -36,7 +37,6 @@ impl DbspGraphBuilder {
             ns: GraphNamespace::default(),
         })
     }
-
     pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {
         self.ns.set_graph_id(inputs.graph_id);
         let available_sources: BTreeSet<String> =
@@ -100,6 +100,7 @@ impl DbspGraphBuilder {
         let stream = match &node.kind {
             DbspNodeKind::Source(source) => self
                 .compile_source(source, outer_streams)
+                .await
                 .with_context(|| anyhow!("source {}", source.table.name))?,
             DbspNodeKind::Select(select) => {
                 let input_idx = first_input(node, "select")?;
@@ -180,7 +181,7 @@ impl DbspGraphBuilder {
         Ok(stream)
     }
 
-    fn compile_source(
+    async fn compile_source(
         &self,
         source: &DbspSourceNode,
         outer_streams: &HashMap<String, Stream<ZSetHandle>>,
@@ -189,10 +190,13 @@ impl DbspGraphBuilder {
             "Attaching DBSP source node '{}' to outer stream",
             source.table.name
         );
-        outer_streams
+        let snapshot_stream = outer_streams
             .get(source.table.name)
             .cloned()
-            .with_context(|| anyhow!("source '{}' has no handle stream", source.table.name))
+            .with_context(|| anyhow!("source '{}' has no handle stream", source.table.name))?;
+        differentiate_zset_stream_live::<Vec<u8>>(&snapshot_stream)
+            .await
+            .context("build live delta stream for source")
     }
 
     async fn compile_filter(

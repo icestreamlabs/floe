@@ -109,7 +109,7 @@ impl OuterStreamRegistry {
             let stream = bridge
                 .new_stream(
                     namespace.clone(),
-                    StreamRetention::KeepLast { keep_last: 1 },
+                    StreamRetention::None,
                 )
                 .await
                 .with_context(|| format!("create outer stream for source '{source}'"))?;

@@ -168,9 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("failed to append row for '{source_name}': {err}");
                 continue;
             }
-            if let Err(err) = writer.flush().await {
-                eprintln!("failed to flush outer stream for '{source_name}': {err}");
-            } else if source_name == generator::BID_SOURCE_NAME {
+            if source_name == generator::BID_SOURCE_NAME {
                 eprintln!("ingested bid row: {:?}", row);
             } else if source_name == generator::AUCTION_SOURCE_NAME {
                 eprintln!("ingested auction row: {:?}", row);
