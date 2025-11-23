@@ -337,7 +337,7 @@ where
 
     let writer = Arc::new(Mutex::new(out_stream.clone()));
     let state_clone = Arc::clone(&state);
-    let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |_ts, handles| {
+    let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |_, handles| {
         let state = Arc::clone(&state_clone);
         let writer = Arc::clone(&writer);
         let handle = handles[0].clone();
