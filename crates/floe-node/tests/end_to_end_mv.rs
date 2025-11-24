@@ -190,10 +190,34 @@ async fn materialized_view_joins_auctions() -> Result<()> {
             "table",
         )
         .await?,
+        append_auction(
+            &mut harness.outer,
+            &mut harness.ingestion_bridge,
+            3,
+            102,
+            7,
+            1_600_030_000,
+            "lamp",
+        )
+        .await?,
+        append_auction(
+            &mut harness.outer,
+            &mut harness.ingestion_bridge,
+            4,
+            103,
+            8,
+            1_600_040_000,
+            "sofa",
+        )
+        .await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 7, 50).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 8, 60).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 3, 9, 70).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 10, 0).await?,
+        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 4, 11, 90).await?,
+        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 3, 12, 130).await?,
+        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 13, 0).await?,
+        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 14, 200).await?,
     ];
     for handle in &handles {
         assert_manifest_exists(
@@ -203,7 +227,68 @@ async fn materialized_view_joins_auctions() -> Result<()> {
         )
         .await?;
     }
-    wait_for_version(&harness.mv_registry, &harness.view_name, 2).await?;
+    let expected_rows = vec![
+        BidAuctionRow {
+            bidder: 7,
+            price: 50,
+            auction: 1,
+            seller: 100,
+            category: 5,
+            expires_ms: 1_600_010_000,
+            item_name: "chair".to_string(),
+        },
+        BidAuctionRow {
+            bidder: 8,
+            price: 60,
+            auction: 2,
+            seller: 101,
+            category: 6,
+            expires_ms: 1_600_020_000,
+            item_name: "table".to_string(),
+        },
+        BidAuctionRow {
+            bidder: 14,
+            price: 200,
+            auction: 2,
+            seller: 101,
+            category: 6,
+            expires_ms: 1_600_020_000,
+            item_name: "table".to_string(),
+        },
+        BidAuctionRow {
+            bidder: 9,
+            price: 70,
+            auction: 3,
+            seller: 102,
+            category: 7,
+            expires_ms: 1_600_030_000,
+            item_name: "lamp".to_string(),
+        },
+        BidAuctionRow {
+            bidder: 12,
+            price: 130,
+            auction: 3,
+            seller: 102,
+            category: 7,
+            expires_ms: 1_600_030_000,
+            item_name: "lamp".to_string(),
+        },
+        BidAuctionRow {
+            bidder: 11,
+            price: 90,
+            auction: 4,
+            seller: 103,
+            category: 8,
+            expires_ms: 1_600_040_000,
+            item_name: "sofa".to_string(),
+        },
+    ];
+    wait_for_version(
+        &harness.mv_registry,
+        &harness.view_name,
+        expected_rows.len() as i64,
+    )
+    .await?;
 
     let (session, _bridge) = harness.session_with_view().await?;
     let df = session
@@ -214,29 +299,7 @@ async fn materialized_view_joins_auctions() -> Result<()> {
         .await?;
     let batches = df.collect().await?;
     let rows = bid_auction_rows(&batches);
-    assert_eq!(
-        rows,
-        vec![
-            BidAuctionRow {
-                bidder: 7,
-                price: 50,
-                auction: 1,
-                seller: 100,
-                category: 5,
-                expires_ms: 1_600_010_000,
-                item_name: "chair".to_string(),
-            },
-            BidAuctionRow {
-                bidder: 8,
-                price: 60,
-                auction: 2,
-                seller: 101,
-                category: 6,
-                expires_ms: 1_600_020_000,
-                item_name: "table".to_string(),
-            },
-        ]
-    );
+    assert_eq!(rows, expected_rows);
 
     Ok(())
 }
