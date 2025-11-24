@@ -607,6 +607,11 @@ fn extract_alias(expr: Expr) -> Result<(Expr, Option<String>), PlannerError> {
     }
 }
 
+#[allow(deprecated)]
+fn is_wildcard_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Wildcard { .. })
+}
+
 fn map_aggregate_expr(
     expr: &Expr,
 ) -> Result<(DbspAggregateFunction, Option<Expr>, Option<String>), PlannerError> {
@@ -658,10 +663,11 @@ fn map_aggregate_expr(
                 ));
             }
 
-            let expression = func.params.args.first().and_then(|arg| match arg {
-                Expr::Wildcard { .. } => None,
-                _ => Some(arg.clone()),
-            });
+            let expression = func
+                .params
+                .args
+                .first()
+                .and_then(|arg| (!is_wildcard_expr(arg)).then(|| arg.clone()));
 
             let expression = match expression {
                 Some(expr) => Some(normalize_expr(expr)?),
@@ -680,6 +686,7 @@ fn map_aggregate_expr(
 mod tests {
     use super::*;
     use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
+    use datafusion::logical_expr::expr::WildcardOptions;
     use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
     use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, TableSource, col};
 
@@ -697,6 +704,22 @@ mod tests {
 
     fn qualified(table: &'static TableDescriptor, column: &str) -> String {
         format!("{}.{}", table.name, column)
+    }
+
+    #[test]
+    fn count_star_maps_to_untyped_count() {
+        #[allow(deprecated)]
+        let wildcard = Expr::Wildcard {
+            qualifier: None,
+            options: Box::<WildcardOptions>::default(),
+        };
+
+        let expr = count(wildcard);
+        let (function, arg, alias) = map_aggregate_expr(&expr).expect("map aggregate");
+
+        assert!(matches!(function, DbspAggregateFunction::Count));
+        assert!(arg.is_none());
+        assert!(alias.is_none());
     }
 
     #[test]

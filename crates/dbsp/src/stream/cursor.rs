@@ -69,15 +69,16 @@ where
     /// timestamp and returns the newly committed `(timestamp, value)` pair.
     pub async fn next(&mut self) -> Result<(i64, T)> {
         loop {
-            let ts = *self.frontier_rx.borrow();
-            if ts > self.observed_ts {
+            let frontier = *self.frontier_rx.borrow();
+            if frontier > self.observed_ts {
+                let next_ts = self.observed_ts + 1;
                 let value = self
                     .stream
-                    .get(ts)
+                    .get(next_ts)
                     .await
-                    .with_context(|| format!("load stream value at {ts}"))?;
-                self.observed_ts = ts;
-                return Ok((ts, value));
+                    .with_context(|| format!("load stream value at {next_ts}"))?;
+                self.observed_ts = next_ts;
+                return Ok((next_ts, value));
             }
             self.frontier_rx
                 .changed()

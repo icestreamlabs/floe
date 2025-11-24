@@ -194,9 +194,7 @@ impl DbspGraphBuilder {
             .get(source.table.name)
             .cloned()
             .with_context(|| anyhow!("source '{}' has no handle stream", source.table.name))?;
-        differentiate_zset_stream_live::<Vec<u8>>(&snapshot_stream)
-            .await
-            .context("build live delta stream for source")
+        Ok(snapshot_stream)
     }
 
     async fn compile_filter(
@@ -204,6 +202,10 @@ impl DbspGraphBuilder {
         node: &DbspSelectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
+        let delta_upstream =
+            differentiate_zset_stream_live::<Vec<u8>>(&upstream)
+                .await
+                .context("build live delta stream for filter input")?;
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
@@ -211,7 +213,7 @@ impl DbspGraphBuilder {
                 .expect("encoded row must decode for filter predicate");
             eval_predicate(&predicate, &row, schema.as_ref()).unwrap_or(false)
         };
-        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred)
+        let filter = DbspFilter::new::<Vec<u8>, _>(&delta_upstream, filter_pred)
             .await
             .context("initialize DBSP filter")?;
         Ok(filter.stream())
@@ -222,6 +224,10 @@ impl DbspGraphBuilder {
         node: &DbspProjectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
+        let delta_upstream =
+            differentiate_zset_stream_live::<Vec<u8>>(&upstream)
+                .await
+                .context("build live delta stream for project input")?;
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
@@ -231,7 +237,7 @@ impl DbspGraphBuilder {
                 .expect("projection evaluation must succeed");
             encode_projected_row_key(&projected).expect("projected row encoding must succeed")
         };
-        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector)
+        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&delta_upstream, projector)
             .await
             .context("initialize DBSP map")?;
         Ok(map.stream())
@@ -243,6 +249,14 @@ impl DbspGraphBuilder {
         left: Stream<ZSetHandle>,
         right: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
+        let delta_left =
+            differentiate_zset_stream_live::<Vec<u8>>(&left)
+                .await
+                .context("build live delta stream for join left input")?;
+        let delta_right =
+            differentiate_zset_stream_live::<Vec<u8>>(&right)
+                .await
+                .context("build live delta stream for join right input")?;
         let keys = Arc::new(node.keys.clone());
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
@@ -254,8 +268,8 @@ impl DbspGraphBuilder {
         let left_log_limit = Arc::new(AtomicUsize::new(3));
         let right_log_limit = Arc::new(AtomicUsize::new(3));
 
-        let mut left_cursor = StreamCursor::new(left.clone());
-        let mut right_cursor = StreamCursor::new(right.clone());
+        let mut left_cursor = StreamCursor::new(delta_left.clone());
+        let mut right_cursor = StreamCursor::new(delta_right.clone());
         if let Ok((ts, handle)) = left_cursor.snapshot().await {
             if left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0 {
                 eprintln!(
@@ -396,7 +410,7 @@ impl DbspGraphBuilder {
         };
 
         let join =
-            DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&left, &right, predicate, projector)
+            DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&delta_left, &delta_right, predicate, projector)
                 .await
                 .context("initialize DBSP join")?;
         // Log the first output handle, if any, to verify join activity.

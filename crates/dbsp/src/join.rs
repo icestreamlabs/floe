@@ -17,7 +17,9 @@ use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::{DeltaOperator, HandleOperatorRuntime};
-use crate::stream::util::{build_derived_stream, push_value_in_place, set_default_in_place};
+use crate::stream::util::{
+    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+};
 use crate::stream::Stream;
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
@@ -108,6 +110,27 @@ impl DbspJoin {
         );
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
+
+        // Rehydrate join state from any existing input handles before going live.
+        let left_history = collect_values(left, left.current_time()).await?;
+        let right_history = collect_values(right, right.current_time()).await?;
+        let left_default = left.default_value();
+        let right_default = right.default_value();
+        let replay_len = left_history.len().max(right_history.len());
+        for ts in 0..replay_len {
+            let handles = vec![
+                left_history
+                    .get(ts)
+                    .cloned()
+                    .unwrap_or_else(|| left_default.clone()),
+                right_history
+                    .get(ts)
+                    .cloned()
+                    .unwrap_or_else(|| right_default.clone()),
+            ];
+            drive_join(&join_op, &writer, ts as i64, handles).await?;
+        }
+
         let op = Arc::clone(&join_op);
         let mut runtime = HandleOperatorRuntime::new(vec![left.clone(), right.clone()], move |ts, handles| {
             let op = Arc::clone(&op);

@@ -17,7 +17,9 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::runtime::HandleOperatorRuntime;
-use crate::stream::util::{build_derived_stream, push_value_in_place, set_default_in_place};
+use crate::stream::util::{
+    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+};
 use crate::stream::Stream;
 
 /// Filter wrapper that drives the FilterOp over handle streams.
@@ -78,6 +80,23 @@ impl DbspFilter {
         );
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
+
+        // Seed the filter output with any handles that already exist on the input stream.
+        let history = collect_values(input, input.current_time()).await?;
+        for (ts, handle) in history.into_iter().enumerate() {
+            let out_handle = {
+                let mut op_guard = filter_op.lock().await;
+                op_guard
+                    .on_step(ts as i64, std::slice::from_ref(&handle))
+                    .await?
+            };
+            if let Some(out_handle) = out_handle {
+                let mut writer_guard = writer.lock().await;
+                push_value_in_place(&mut writer_guard, out_handle);
+                writer_guard.flush().await?;
+            }
+        }
+
         let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, handles| {
             let op = Arc::clone(&filter_op);
             let writer = Arc::clone(&writer);

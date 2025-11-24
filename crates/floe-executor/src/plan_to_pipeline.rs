@@ -6,7 +6,7 @@ use dbsp::relation_state::RelationState;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::KeyValueTable;
 use dbsp::stream::runtime::{Pipeline, PipelineBuilder};
-use dbsp::stream::operations::basic::differentiate_zset_stream;
+use dbsp::stream::operations::basic::differentiate_zset_stream_live;
 use dbsp::collections::zset::VersionedZSet;
 use dbsp::{DistinctOp, MapOp};
 
@@ -47,7 +47,7 @@ impl<'a> PipelineFromCircuit<'a> {
 
         // Turn snapshot Stream<ZSetHandle> into per-step delta Stream<ZSetHandle>.
         // Keys are encoded rows, so K = Vec<u8>.
-        let source_stream = differentiate_zset_stream::<Vec<u8>>(&snapshot_stream)
+        let source_stream = differentiate_zset_stream_live::<Vec<u8>>(&snapshot_stream)
             .await
             .context("compute per-step deltas for source stream")?;
 
