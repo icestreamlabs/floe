@@ -20,7 +20,6 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
-use crate::namespaces;
 use tokio::sync::Mutex;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
@@ -529,16 +528,6 @@ struct GraphNamespace {
 impl GraphNamespace {
     fn set_graph_id(&mut self, graph_id: impl Into<String>) {
         self.graph_id = graph_id.into();
-    }
-
-    #[allow(dead_code)]
-    fn for_source(&self, source_name: &str) -> Result<String> {
-        namespaces::source(source_name)
-    }
-
-    #[allow(dead_code)]
-    fn for_op_side(&self, operator_index: usize, side: &str) -> Result<String> {
-        namespaces::operator_state(&self.graph_id, operator_index, side)
     }
 }
 

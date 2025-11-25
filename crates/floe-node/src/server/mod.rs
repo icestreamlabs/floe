@@ -472,18 +472,6 @@ impl FloeQueryHandler {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn execute_sql(&self, sql: &str) -> PgWireResult<Response> {
-        self.state.ensure_materialized_views_in_sql(sql).await?;
-        let df = self.plan_sql(sql).await?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
-        let response = build_query_response(batches)?;
-        Ok(Response::Query(response))
-    }
-
     async fn plan_sql(&self, sql: &str) -> PgWireResult<DataFrame> {
         self.state
             .query

@@ -4,7 +4,6 @@ mod generator;
 mod planner;
 mod server;
 mod source;
-mod sql;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;

@@ -285,22 +285,13 @@ struct ConnState {
     statements: HashMap<String, PreparedStmt>,
     #[allow(dead_code)]
     portals: HashMap<String, Portal>,
-    #[allow(dead_code)]
-    client_parameters: HashMap<String, String>,
-    #[allow(dead_code)]
-    process_id: i32,
-    #[allow(dead_code)]
-    secret_key: i32,
 }
 
 impl ConnState {
-    fn new(process_id: i32, secret_key: i32, parameters: HashMap<String, String>) -> Self {
+    fn new() -> Self {
         Self {
             statements: HashMap::new(),
             portals: HashMap::new(),
-            client_parameters: parameters,
-            process_id,
-            secret_key,
         }
     }
 }
@@ -351,7 +342,8 @@ impl PgwireConnection {
         let startup = self.read_startup_message().await?;
         let (process_id, secret_key) = generate_backend_key();
         self.send_startup_responses(process_id, secret_key).await?;
-        Ok(ConnState::new(process_id, secret_key, startup.parameters))
+        let _ = startup.parameters;
+        Ok(ConnState::new())
     }
 
     async fn connection_loop(&mut self, state: &mut ConnState) -> Result<()> {

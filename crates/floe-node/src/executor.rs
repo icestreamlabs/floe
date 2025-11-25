@@ -2,18 +2,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use floe_executor::dbsp_plan::{CircuitPlan, validate_dbsp_plan};
-use floe_executor::{DbspPlanBuilder, SourceRegistry, nexmark_config};
+use floe_executor::{DbspPlanBuilder, nexmark_config};
 
 use crate::planner::PlannedMaterializedView;
-use crate::source;
-
-#[allow(dead_code)]
-pub fn build_executor_sources(sources: &source::SourceRegistry) -> SourceRegistry {
-    let mut registry = SourceRegistry::new();
-    registry.extend(sources.definitions().iter().cloned());
-    registry
-}
-
 pub fn available_sources_from_registry(
     registry: &crate::source::SourceRegistry,
 ) -> BTreeSet<String> {

@@ -24,8 +24,6 @@ pub mod source_registry;
 pub mod stream_types;
 pub mod table_provider;
 pub mod nexmark_sources;
-pub mod create_mv;
-pub mod plan_to_pipeline;
 
 pub use barrier_clock::{BarrierClock, StepId};
 pub use context::FloeQueryContext;
