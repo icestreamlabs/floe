@@ -131,13 +131,13 @@ async fn lifted_select_zset_stream_filters_elements() {
         .await
         .expect("materialize first handle");
     assert_eq!(first.get("keep"), Some(&1));
-    assert!(first.get("drop").is_none());
+    assert!(!first.contains_key("drop"));
 
     let second = materialize_zset_handle::<String>(table.clone(), &mut cache, &handles[1])
         .await
         .expect("materialize second handle");
-    assert!(second.get("keep").is_none());
-    assert!(second.get("drop").is_none());
+    assert!(!second.contains_key("keep"));
+    assert!(!second.contains_key("drop"));
 }
 
 #[tokio::test]
@@ -433,7 +433,7 @@ async fn lifted_lifted_select_zset_stream_operates_on_nested_streams() {
         .await
         .expect("materialize resolved first");
     assert_eq!(first.get("keep"), Some(&2));
-    assert!(first.get("drop").is_none());
+    assert!(!first.contains_key("drop"));
 }
 
 #[tokio::test]

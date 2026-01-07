@@ -63,9 +63,9 @@ pub fn validate_dbsp_plan(
     let topo = topo_order(plan)?;
 
     let sources = required_sources(plan);
-    for missing in sources
+    if let Some(missing) = sources
         .iter()
-        .filter(|name| !outer_streams_available.contains(*name))
+        .find(|name| !outer_streams_available.contains(*name))
     {
         bail!(
             "source '{missing}' not provided; available sources: {}",
@@ -145,7 +145,7 @@ pub fn validate_dbsp_plan(
     })
 }
 
-fn node<'a>(plan: &'a CircuitPlan, id: usize) -> Result<&'a CircuitNode> {
+fn node(plan: &CircuitPlan, id: usize) -> Result<&CircuitNode> {
     plan.node(id)
         .ok_or_else(|| anyhow!("node {id} not found in circuit plan"))
 }

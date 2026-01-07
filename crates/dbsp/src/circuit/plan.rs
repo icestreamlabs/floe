@@ -264,10 +264,8 @@ impl DbspExpression {
         if percent_count == 0 {
             return Ok(());
         }
-        if percent_count == 1 {
-            if pattern.starts_with('%') || pattern.ends_with('%') {
-                return Ok(());
-            }
+        if percent_count == 1 && (pattern.starts_with('%') || pattern.ends_with('%')) {
+            return Ok(());
         }
         bail!(
             "LIKE only supports prefix or suffix wildcards (pattern '{}')",

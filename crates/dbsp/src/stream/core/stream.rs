@@ -284,14 +284,11 @@ where
                 let mut state = stream.write_state();
                 state.default_changes = default_changes;
                 state.last_default_ts = state.default_changes.keys().copied().max().unwrap_or(0);
-                let missing_default = {
-                    state
-                        .default_changes
-                        .range(..=state.timestamp)
-                        .rev()
-                        .next()
-                        .is_none()
-                };
+                let missing_default = state
+                    .default_changes
+                    .range(..=state.timestamp)
+                    .next_back()
+                    .is_none();
                 if missing_default {
                     let default_value = state.default.clone();
                     state.default_changes.insert(0, default_value);

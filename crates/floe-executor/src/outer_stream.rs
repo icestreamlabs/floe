@@ -158,6 +158,11 @@ impl OuterStreamRegistry {
     pub fn len(&self) -> usize {
         self.writers.len()
     }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.writers.is_empty()
+    }
 }
 
 #[cfg(test)]

@@ -345,7 +345,7 @@ mod tests {
             let encoded = encode_projected_row_key(&row)?;
             view.add_delta(encoded, 1);
         }
-        Ok(view.flush().await?)
+        view.flush().await
     }
 
     #[tokio::test]

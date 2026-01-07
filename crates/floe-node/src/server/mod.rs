@@ -431,10 +431,7 @@ impl FloeQueryHandler {
                 "INSERT is not supported; materialized views are read-only",
             )),
             Statement::Query(query) => self.handle_select(&query).await,
-            other => Err(user_error(format!(
-                "unsupported statement: {}",
-                other.to_string()
-            ))),
+            other => Err(user_error(format!("unsupported statement: {other}"))),
         }
     }
 
@@ -920,7 +917,7 @@ fn collect_placeholder_indices(statement: &Statement) -> PgWireResult<Vec<usize>
 }
 
 fn parse_placeholder_index(name: &str) -> PgWireResult<usize> {
-    let trimmed = name.trim_start_matches(|c| c == '$' || c == '?');
+    let trimmed = name.trim_start_matches(['$', '?']);
     if trimmed.is_empty() {
         return Err(user_error(format!("invalid placeholder '{name}'")));
     }
@@ -979,9 +976,7 @@ fn decode_parameter_value(
 }
 
 fn string_to_value(input: &str) -> Value {
-    if input.parse::<i64>().is_ok() {
-        Value::Number(input.to_string(), false)
-    } else if input.parse::<f64>().is_ok() {
+    if input.parse::<i64>().is_ok() || input.parse::<f64>().is_ok() {
         Value::Number(input.to_string(), false)
     } else if input.eq_ignore_ascii_case("true") {
         Value::Boolean(true)
@@ -1072,10 +1067,10 @@ fn mv_identifiers_in_sql(sql: &str) -> Vec<String> {
         if raw.is_empty() {
             continue;
         }
-        if let Some(name) = normalize_identifier(raw) {
-            if seen.insert(name.clone()) {
-                names.push(name);
-            }
+        if let Some(name) = normalize_identifier(raw)
+            && seen.insert(name.clone())
+        {
+            names.push(name);
         }
     }
     names
@@ -1129,7 +1124,15 @@ fn is_tail_statement(sql: &str) -> bool {
     trimmed[4..]
         .chars()
         .next()
-        .map_or(false, |ch| ch.is_whitespace())
+        .is_some_and(|ch| ch.is_whitespace())
+}
+
+fn user_error(message: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "XX000".into(),
+        message.into(),
+    )))
 }
 
 #[cfg(test)]
@@ -1309,7 +1312,7 @@ mod tests {
             use arrow_buffer::{Buffer, NullBuffer};
             use arrow_data::ArrayData;
 
-            let values = Buffer::from_slice_ref(&[millis, 0]);
+            let values = Buffer::from_slice_ref([millis, 0]);
             let nulls = NullBuffer::from(vec![true, false]);
             let data = ArrayData::builder(DataType::Timestamp(
                 TimeUnit::Millisecond,
@@ -1668,12 +1671,4 @@ mod tests {
 
     // No client calls are required in tests as routing is validated directly
     // against parsed statements.
-}
-
-fn user_error(message: impl Into<String>) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".into(),
-        "XX000".into(),
-        message.into(),
-    )))
 }

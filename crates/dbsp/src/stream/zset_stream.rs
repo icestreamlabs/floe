@@ -190,11 +190,6 @@ where
         self.versioned.namespace()
     }
 
-    #[cfg(test)]
-    pub(crate) fn stream_intent_key(&self) -> Vec<u8> {
-        self.stream.encode_intent_key()
-    }
-
     async fn flush_without_version_update(&mut self) -> Result<ZSetHandle> {
         let handle = self.current_handle.clone();
         self.stream
@@ -333,18 +328,17 @@ where
                 return releases;
             }
 
-            if self.retention_window.len() >= limit {
-                if let Some(evicted) = self.retention_window.pop_front() {
-                    if let Some(count) = self.retention_counts.get_mut(&evicted.version) {
-                        if *count == 1 {
-                            self.retention_counts.remove(&evicted.version);
-                            if evicted.version != 0 {
-                                releases.push(evicted.version);
-                            }
-                        } else {
-                            *count -= 1;
-                        }
+            if self.retention_window.len() >= limit
+                && let Some(evicted) = self.retention_window.pop_front()
+                && let Some(count) = self.retention_counts.get_mut(&evicted.version)
+            {
+                if *count == 1 {
+                    self.retention_counts.remove(&evicted.version);
+                    if evicted.version != 0 {
+                        releases.push(evicted.version);
                     }
+                } else {
+                    *count -= 1;
                 }
             }
 
@@ -372,13 +366,13 @@ fn initialize_retention(
     let mut window_handles = VecDeque::new();
     let mut counts = HashMap::new();
 
-    if let Some(limit) = window {
-        if limit > 0 {
-            let skip = history.len().saturating_sub(limit);
-            for handle in history.iter().skip(skip).cloned() {
-                *counts.entry(handle.version).or_insert(0) += 1;
-                window_handles.push_back(handle);
-            }
+    if let Some(limit) = window
+        && limit > 0
+    {
+        let skip = history.len().saturating_sub(limit);
+        for handle in history.iter().skip(skip).cloned() {
+            *counts.entry(handle.version).or_insert(0) += 1;
+            window_handles.push_back(handle);
         }
     }
 

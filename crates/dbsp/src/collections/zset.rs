@@ -189,13 +189,13 @@ where
     }
 
     async fn refresh_state(&mut self) -> Result<()> {
-        if let Some(intent_bytes) = self.table.get(&self.intent_key).await? {
-            if !intent_bytes.is_empty() {
-                self.table
-                    .delete(&self.intent_key)
-                    .await
-                    .context("clear stale versioned intent")?;
-            }
+        if let Some(intent_bytes) = self.table.get(&self.intent_key).await?
+            && !intent_bytes.is_empty()
+        {
+            self.table
+                .delete(&self.intent_key)
+                .await
+                .context("clear stale versioned intent")?;
         }
 
         let entries = self
@@ -1108,9 +1108,9 @@ mod tests {
         let mut zset = ZSet::new(db, "merge").await.expect("create zset");
 
         zset.set_weight("item".to_string(), 3);
-        assert_eq!(zset.contains(&"item".to_string()).await.unwrap(), true);
+        assert!(zset.contains(&"item".to_string()).await.unwrap());
         zset.set_weight("item".to_string(), 0);
-        assert_eq!(zset.contains(&"item".to_string()).await.unwrap(), false);
+        assert!(!zset.contains(&"item".to_string()).await.unwrap());
         zset.flush().await.unwrap();
         assert!(zset.items().await.unwrap().is_empty());
     }
@@ -1141,11 +1141,11 @@ mod tests {
         zset.add_weight("gone".to_string(), -1).await.unwrap();
         zset.flush().await.unwrap();
 
-        assert_eq!(
-            zset.contains(&"gone".to_string())
+        assert!(
+            !zset
+                .contains(&"gone".to_string())
                 .await
-                .expect("contains check"),
-            false
+                .expect("contains check")
         );
         assert!(zset.items().await.expect("items after cancel").is_empty());
     }
@@ -1544,7 +1544,7 @@ mod tests {
             .expect("create version");
 
         let mut batch = WriteBatch::new();
-        batch.put(versioned.intent_key_bytes().to_vec(), vec![1]);
+        batch.put(versioned.intent_key_bytes(), vec![1]);
         table
             .write_batch(batch)
             .await

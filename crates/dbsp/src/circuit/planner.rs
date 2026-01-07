@@ -20,6 +20,8 @@ use crate::circuit::plan::{
 use crate::circuit::schema::RowSchema;
 use crate::circuit::tables::TableDescriptor;
 
+type JoinKeysAndResidual = (Vec<(Expr, Expr)>, Option<Expr>);
+
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
     tables: HashMap<String, &'static TableDescriptor>,
@@ -211,12 +213,11 @@ impl<'cfg> PlannerContext<'cfg> {
 
                 let input = self.plan_node(&filter.input)?;
                 let mut predicate_schema = input.schema.clone();
-                if matches!(filter.input.as_ref(), LogicalPlan::Projection(_)) {
-                    if let Some(node) = self.node_by_id(input.id) {
-                        if let DbspNodeKind::Project(project) = &node.kind {
-                            predicate_schema = Arc::clone(project.input_schema());
-                        }
-                    }
+                if matches!(filter.input.as_ref(), LogicalPlan::Projection(_))
+                    && let Some(node) = self.node_by_id(input.id)
+                    && let DbspNodeKind::Project(project) = &node.kind
+                {
+                    predicate_schema = Arc::clone(project.input_schema());
                 }
                 let select = DbspSelectNode::try_new(
                     predicate_schema,
@@ -400,7 +401,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let aggregates = aggregate
             .aggr_expr
             .iter()
-            .map(|expr| map_aggregate_expr(expr))
+            .map(map_aggregate_expr)
             .collect::<Result<Vec<_>, _>>()?;
 
         let agg_node = DbspAggregateNode::try_new(input.schema.clone(), group_keys, aggregates)?;
@@ -564,9 +565,7 @@ fn combine_filters(filters: Vec<Expr>) -> Option<Expr> {
     }))
 }
 
-fn extract_join_keys_and_residual(
-    expr: &Expr,
-) -> Result<(Vec<(Expr, Expr)>, Option<Expr>), PlannerError> {
+fn extract_join_keys_and_residual(expr: &Expr) -> Result<JoinKeysAndResidual, PlannerError> {
     let mut key_pairs = Vec::new();
     let mut residuals = Vec::new();
     accumulate_conjuncts(expr, &mut key_pairs, &mut residuals)?;

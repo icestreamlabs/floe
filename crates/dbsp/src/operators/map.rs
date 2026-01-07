@@ -141,7 +141,7 @@ where
             .context("write mapped version update")?;
 
         let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes().to_vec());
+        cleanup.delete(versioned.intent_key_bytes());
         versioned
             .table()
             .write_batch(cleanup)

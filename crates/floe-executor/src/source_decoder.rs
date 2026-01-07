@@ -38,12 +38,12 @@ impl SourceRowDecoder {
                 .get(column.name())
                 .with_context(|| format!("missing field '{}' in source payload", column.name()))?;
             let scalar = convert_value(column.data_type(), value)?;
-            if event_ts.is_none() && matches!(column.data_type(), SourceDataType::TimestampMillis) {
-                if let ScalarValue::TimestampMillisecond(Some(ms), _) = scalar {
-                    if ms >= 0 {
-                        event_ts = Some(ms as u64);
-                    }
-                }
+            if event_ts.is_none()
+                && matches!(column.data_type(), SourceDataType::TimestampMillis)
+                && let ScalarValue::TimestampMillisecond(Some(ms), _) = scalar
+                && ms >= 0
+            {
+                event_ts = Some(ms as u64);
             }
             row.push(scalar);
         }

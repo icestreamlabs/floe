@@ -153,19 +153,16 @@ enum TableKind {
 
 fn table_kind(table: &dbsp::TableDescriptor) -> Option<TableKind> {
     let ptr = table as *const dbsp::TableDescriptor;
-    if ptr == nexmark_person_table() as *const dbsp::TableDescriptor
-        || ptr == nexmark_person_alias_table() as *const dbsp::TableDescriptor
+    if std::ptr::eq(ptr, nexmark_person_table()) || std::ptr::eq(ptr, nexmark_person_alias_table())
     {
         return Some(TableKind::Person);
     }
-    if ptr == nexmark_auction_table() as *const dbsp::TableDescriptor
-        || ptr == nexmark_auction_alias_table() as *const dbsp::TableDescriptor
+    if std::ptr::eq(ptr, nexmark_auction_table())
+        || std::ptr::eq(ptr, nexmark_auction_alias_table())
     {
         return Some(TableKind::Auction);
     }
-    if ptr == nexmark_bid_table() as *const dbsp::TableDescriptor
-        || ptr == nexmark_bid_alias_table() as *const dbsp::TableDescriptor
-    {
+    if std::ptr::eq(ptr, nexmark_bid_table()) || std::ptr::eq(ptr, nexmark_bid_alias_table()) {
         return Some(TableKind::Bid);
     }
     None

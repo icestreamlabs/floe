@@ -19,6 +19,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::materialize_zset_handle;
 
+type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
+type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
+
 pub struct JoinOp<L, R, O>
 where
     L: Archive
@@ -51,8 +54,8 @@ where
 {
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
-    pub predicate: Arc<dyn Fn(&L, &R) -> bool + Send + Sync>,
-    pub projector: Arc<dyn Fn(&L, &R) -> O + Send + Sync>,
+    pub predicate: JoinPredicate<L, R>,
+    pub projector: JoinProjector<L, R, O>,
     pub table: Arc<dyn KeyValueTable>,
     pub integrated: Option<RelationState<O>>,
     output: VersionedZSet<O>,
@@ -93,8 +96,8 @@ where
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
-        predicate: Arc<dyn Fn(&L, &R) -> bool + Send + Sync>,
-        projector: Arc<dyn Fn(&L, &R) -> O + Send + Sync>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<O>,
         integrated: Option<RelationState<O>>,
@@ -198,7 +201,7 @@ where
             .context("write join version update")?;
 
         let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes().to_vec());
+        cleanup.delete(versioned.intent_key_bytes());
         versioned
             .table()
             .write_batch(cleanup)
@@ -247,7 +250,7 @@ where
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
         let left_delta_handle = inputs
-            .get(0)
+            .first()
             .cloned()
             .context("join operator requires left delta handle")?;
         let right_delta_handle = inputs

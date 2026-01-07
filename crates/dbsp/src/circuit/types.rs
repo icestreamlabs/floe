@@ -125,7 +125,7 @@ mod tests {
 
         for value in values {
             let ty = value.data_type();
-            assert_eq!(ty.name().len() > 0, true);
+            assert!(!ty.name().is_empty());
             if let ScalarValue::Null(_) = value {
                 assert!(value.is_null());
             } else {

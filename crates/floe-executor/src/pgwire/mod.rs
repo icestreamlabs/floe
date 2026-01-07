@@ -164,7 +164,7 @@ enum ConnAction {
 
 fn to_query_result(batches: Vec<RecordBatch>) -> QueryResult {
     let schema = batches
-        .get(0)
+        .first()
         .map(|batch| batch.schema())
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())));
     QueryResult { schema, batches }
@@ -177,10 +177,10 @@ fn find_mv_names(sql: &str) -> Vec<String> {
         if raw.is_empty() {
             continue;
         }
-        if let Some(name) = normalize_identifier(raw) {
-            if seen.insert(name.clone()) {
-                names.push(name);
-            }
+        if let Some(name) = normalize_identifier(raw)
+            && seen.insert(name.clone())
+        {
+            names.push(name);
         }
     }
     names
@@ -208,14 +208,14 @@ fn is_tail_statement(sql: &str) -> bool {
     let trimmed = sql.trim_start_matches(|c: char| c.is_ascii_control() || c.is_whitespace());
     if !trimmed
         .get(..4)
-        .map_or(false, |prefix| prefix.eq_ignore_ascii_case("TAIL"))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("TAIL"))
     {
         return false;
     }
     trimmed[4..]
         .chars()
         .next()
-        .map_or(true, |ch| ch.is_whitespace())
+        .is_none_or(|ch| ch.is_whitespace())
 }
 
 #[derive(Debug)]
@@ -1047,10 +1047,10 @@ impl PgwireConnection {
                 if buffered_rows >= flush_limit {
                     self.flush_row_buffer(&mut buffered_rows).await?;
                 }
-                if let Some(limit) = row_limit {
-                    if total_rows >= limit {
-                        break 'batch_loop;
-                    }
+                if let Some(limit) = row_limit
+                    && total_rows >= limit
+                {
+                    break 'batch_loop;
                 }
             }
         }
@@ -1107,11 +1107,11 @@ impl PgwireConnection {
         let mut rows_sent = 0usize;
         let mut buffered_rows = 0usize;
         loop {
-            if let Some(limit) = row_limit {
-                if rows_sent >= limit {
-                    self.flush_row_buffer(&mut buffered_rows).await?;
-                    return Ok(TailStreamOutcome::Suspended { rows: rows_sent });
-                }
+            if let Some(limit) = row_limit
+                && rows_sent >= limit
+            {
+                self.flush_row_buffer(&mut buffered_rows).await?;
+                return Ok(TailStreamOutcome::Suspended { rows: rows_sent });
             }
             if state.finished && state.current_batch.is_none() {
                 self.flush_row_buffer(&mut buffered_rows).await?;
@@ -1378,10 +1378,10 @@ fn count_placeholders(sql: &str) -> usize {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if j > i + 1 {
-                if let Ok(idx) = sql[i + 1..j].parse::<usize>() {
-                    max_idx = max_idx.max(idx);
-                }
+            if j > i + 1
+                && let Ok(idx) = sql[i + 1..j].parse::<usize>()
+            {
+                max_idx = max_idx.max(idx);
             }
             i = j;
         } else {
@@ -1520,14 +1520,13 @@ fn convert_text_param(value: &str, type_oid: u32) -> Result<(BoundParam, u32)> {
     }
     let trimmed = value.trim();
     let param = match type_oid {
-        oid if matches!(oid, _ if oid == Type::INT8.oid() || oid == Type::INT4.oid() || oid == Type::INT2.oid()) =>
-        {
+        oid if oid == Type::INT8.oid() || oid == Type::INT4.oid() || oid == Type::INT2.oid() => {
             let parsed = trimmed
                 .parse::<i64>()
                 .with_context(|| format!("parameter '{value}' is not a valid integer"))?;
             BoundParam::Int8(parsed)
         }
-        oid if matches!(oid, _ if oid == Type::FLOAT8.oid() || oid == Type::FLOAT4.oid()) => {
+        oid if oid == Type::FLOAT8.oid() || oid == Type::FLOAT4.oid() => {
             let parsed = trimmed
                 .parse::<f64>()
                 .with_context(|| format!("parameter '{value}' is not a valid float"))?;
@@ -1564,15 +1563,15 @@ fn convert_text_param(value: &str, type_oid: u32) -> Result<(BoundParam, u32)> {
 
 fn infer_bound_param(value: &str) -> (BoundParam, u32) {
     let trimmed = value.trim();
-    if is_integer_literal(trimmed) {
-        if let Ok(parsed) = trimmed.parse::<i64>() {
-            return (BoundParam::Int8(parsed), Type::INT8.oid());
-        }
+    if is_integer_literal(trimmed)
+        && let Ok(parsed) = trimmed.parse::<i64>()
+    {
+        return (BoundParam::Int8(parsed), Type::INT8.oid());
     }
-    if is_float_literal(trimmed) {
-        if let Ok(parsed) = trimmed.parse::<f64>() {
-            return (BoundParam::Float8(parsed), Type::FLOAT8.oid());
-        }
+    if is_float_literal(trimmed)
+        && let Ok(parsed) = trimmed.parse::<f64>()
+    {
+        return (BoundParam::Float8(parsed), Type::FLOAT8.oid());
     }
     if let Some(parsed) = parse_bool_literal(trimmed) {
         return (BoundParam::Bool(parsed), Type::BOOL.oid());
@@ -1795,7 +1794,7 @@ mod tests {
     fn detects_mv_names() {
         let sql = r#"SELECT * FROM mv_orders JOIN "mv_Sales" ON mv_orders.id = "mv_Sales".id"#;
         let mut names = find_mv_names(sql);
-        names.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        names.sort_by_key(|name| name.to_ascii_lowercase());
         assert_eq!(names, vec!["mv_orders", "mv_Sales"]);
     }
 

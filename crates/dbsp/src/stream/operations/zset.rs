@@ -306,18 +306,16 @@ where
     let projector: Arc<F> = Arc::new(projector);
 
     for t in 0..total {
-        let output_handle = join_handle(
-            table.clone(),
-            &predicate,
-            &projector,
-            &mut left_cache,
-            &mut right_cache,
-            &mut previous,
-            &mut zset_stream,
-            &left_handles[t],
-            &right_handles[t],
-        )
-        .await?;
+        let mut join_ctx = JoinHandleContext {
+            table: table.clone(),
+            predicate: &predicate,
+            projector: &projector,
+            left_cache: &mut left_cache,
+            right_cache: &mut right_cache,
+            previous: &mut previous,
+            zset_stream: &mut zset_stream,
+        };
+        let output_handle = join_handle(&mut join_ctx, &left_handles[t], &right_handles[t]).await?;
         publish_handle(&mut writer, output_handle, &mut initialized).await?;
     }
 
@@ -342,19 +340,16 @@ where
                         );
                         break;
                     }
-                    match join_handle(
-                        table.clone(),
-                        &predicate,
-                        &projector,
-                        &mut left_cache,
-                        &mut right_cache,
-                        &mut previous,
-                        &mut zset_stream,
-                        &handles[0],
-                        &handles[1],
-                    )
-                    .await
-                    {
+                    let mut join_ctx = JoinHandleContext {
+                        table: table.clone(),
+                        predicate: &predicate,
+                        projector: &projector,
+                        left_cache: &mut left_cache,
+                        right_cache: &mut right_cache,
+                        previous: &mut previous,
+                        zset_stream: &mut zset_stream,
+                    };
+                    match join_handle(&mut join_ctx, &handles[0], &handles[1]).await {
                         Ok(output_handle) => {
                             if let Err(err) =
                                 publish_handle(&mut writer, output_handle, &mut initialized).await
@@ -486,14 +481,47 @@ where
     Ok(handle)
 }
 
-async fn join_handle<L, R, O, P, F>(
+struct JoinHandleContext<'a, L, R, O, P, F>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'rk> CheckBytes<RkyvValidator<'rk>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'rk> CheckBytes<RkyvValidator<'rk>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'rk> CheckBytes<RkyvValidator<'rk>>,
+{
     table: Arc<dyn KeyValueTable>,
-    predicate: &Arc<P>,
-    projector: &Arc<F>,
-    left_cache: &mut HashMap<String, Arc<Dictionary<L>>>,
-    right_cache: &mut HashMap<String, Arc<Dictionary<R>>>,
-    previous: &mut HashMap<O, i64>,
-    zset_stream: &mut ZSetStream<O>,
+    predicate: &'a Arc<P>,
+    projector: &'a Arc<F>,
+    left_cache: &'a mut HashMap<String, Arc<Dictionary<L>>>,
+    right_cache: &'a mut HashMap<String, Arc<Dictionary<R>>>,
+    previous: &'a mut HashMap<O, i64>,
+    zset_stream: &'a mut ZSetStream<O>,
+}
+
+async fn join_handle<L, R, O, P, F>(
+    ctx: &mut JoinHandleContext<'_, L, R, O, P, F>,
     left_handle: &ZSetHandle,
     right_handle: &ZSetHandle,
 ) -> Result<ZSetHandle>
@@ -528,8 +556,10 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + 'static,
     F: Fn(&L, &R) -> O + Send + Sync + 'static,
 {
-    let left_map = materialize_zset_with_retry::<L>(table.clone(), left_cache, left_handle).await?;
-    let right_map = materialize_zset_with_retry::<R>(table, right_cache, right_handle).await?;
+    let left_map =
+        materialize_zset_with_retry::<L>(ctx.table.clone(), ctx.left_cache, left_handle).await?;
+    let right_map =
+        materialize_zset_with_retry::<R>(ctx.table.clone(), ctx.right_cache, right_handle).await?;
 
     let mut joined: HashMap<O, i64> = HashMap::new();
     for (left_key, &left_weight) in &left_map {
@@ -540,21 +570,22 @@ where
             if right_weight == 0 {
                 continue;
             }
-            if predicate(left_key, right_key) {
-                let projected = projector(left_key, right_key);
+            if (ctx.predicate)(left_key, right_key) {
+                let projected = (ctx.projector)(left_key, right_key);
                 *joined.entry(projected).or_insert(0) += left_weight * right_weight;
             }
         }
     }
     joined.retain(|_, weight| *weight != 0);
 
-    let deltas = compute_delta(previous, &joined);
-    zset_stream.add_deltas(deltas);
-    let handle = zset_stream
+    let deltas = compute_delta(ctx.previous, &joined);
+    ctx.zset_stream.add_deltas(deltas);
+    let handle = ctx
+        .zset_stream
         .flush()
         .await
         .context("flush lifted join result")?;
-    *previous = joined;
+    *ctx.previous = joined;
     Ok(handle)
 }
 

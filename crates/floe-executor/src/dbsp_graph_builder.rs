@@ -265,25 +265,25 @@ impl DbspGraphBuilder {
 
         let mut left_cursor = StreamCursor::new(delta_left.clone());
         let mut right_cursor = StreamCursor::new(delta_right.clone());
-        if let Ok((ts, handle)) = left_cursor.snapshot().await {
-            if left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0 {
-                eprintln!(
-                    "join left snapshot version {ts}, handle {}, schema width {}",
-                    handle.version,
-                    left_schema.len()
-                );
-                log_handle_rows("left snapshot", &handle, &self.bridge).await?;
-            }
+        if let Ok((ts, handle)) = left_cursor.snapshot().await
+            && left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
+        {
+            eprintln!(
+                "join left snapshot version {ts}, handle {}, schema width {}",
+                handle.version,
+                left_schema.len()
+            );
+            log_handle_rows("left snapshot", &handle, &self.bridge).await?;
         }
-        if let Ok((ts, handle)) = right_cursor.snapshot().await {
-            if right_log_limit.fetch_sub(1, Ordering::Relaxed) > 0 {
-                eprintln!(
-                    "join right snapshot version {ts}, handle {}, schema width {}",
-                    handle.version,
-                    right_schema.len()
-                );
-                log_handle_rows("right snapshot", &handle, &self.bridge).await?;
-            }
+        if let Ok((ts, handle)) = right_cursor.snapshot().await
+            && right_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
+        {
+            eprintln!(
+                "join right snapshot version {ts}, handle {}, schema width {}",
+                handle.version,
+                right_schema.len()
+            );
+            log_handle_rows("right snapshot", &handle, &self.bridge).await?;
         }
         let left_log_limit_clone = Arc::clone(&left_log_limit);
         let left_schema_clone = Arc::clone(&left_schema);
@@ -373,10 +373,9 @@ impl DbspGraphBuilder {
             } else if seen_compare < 10 && !keys_equal {
                 eprintln!(
                     "join key comparison #{seen_compare}: no match for first key pair {:?}",
-                    key_indices.get(0).and_then(|(li, ri)| Some((
-                        left_row.get(*li).cloned(),
-                        right_row.get(*ri).cloned()
-                    )))
+                    key_indices.first().map(|(li, ri)| {
+                        (left_row.get(*li).cloned(), right_row.get(*ri).cloned())
+                    })
                 );
             }
             if !keys_equal {
@@ -845,11 +844,11 @@ fn matches_like(value: &str, pattern: &str) -> bool {
     if !pattern.contains('%') {
         return value == pattern;
     }
-    if pattern.starts_with('%') {
-        return value.ends_with(&pattern[1..]);
+    if let Some(stripped) = pattern.strip_prefix('%') {
+        return value.ends_with(stripped);
     }
-    if pattern.ends_with('%') {
-        return value.starts_with(&pattern[..pattern.len() - 1]);
+    if let Some(stripped) = pattern.strip_suffix('%') {
+        return value.starts_with(stripped);
     }
     false
 }

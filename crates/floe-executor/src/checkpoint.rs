@@ -11,16 +11,11 @@ use crate::stream_types::Timestamp;
 
 const CHECKPOINT_PREFIX: &str = "checkpoint";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ManifestFormat {
+    #[default]
     V1,
     V2,
-}
-
-impl Default for ManifestFormat {
-    fn default() -> Self {
-        ManifestFormat::V1
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,7 +191,7 @@ impl CheckpointStore {
         batch.put(manifest_key, serialized);
 
         let latest_key = self.latest_key();
-        batch.put(latest_key, manifest.id.to_be_bytes().to_vec());
+        batch.put(latest_key, manifest.id.to_be_bytes());
 
         for offset in &manifest.source_offsets {
             let key = self.offset_key(&offset.source);

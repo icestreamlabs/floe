@@ -142,7 +142,7 @@ where
 pub(crate) async fn resolve_apply_handle_op<T, Fut>(
     outer: &Stream<StreamHandle>,
     inner_group: Arc<dyn AbelianGroup<T>>,
-    mut op: impl FnMut(Stream<T>) -> Fut,
+    op: impl FnMut(Stream<T>) -> Fut,
     out_prefix: &str,
 ) -> Result<Stream<StreamHandle>>
 where
@@ -156,7 +156,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     Fut: Future<Output = Result<Stream<T>>>,
 {
-    apply_on_resolved_handles(outer, inner_group, out_prefix, |inner| op(inner)).await
+    apply_on_resolved_handles(outer, inner_group, out_prefix, op).await
 }
 
 pub async fn materialize_zset_handle<K>(

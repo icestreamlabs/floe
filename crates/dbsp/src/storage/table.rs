@@ -26,13 +26,13 @@ pub trait KeyValueTable: Send + Sync {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
-        batch.put(key.to_vec(), value.to_vec());
+        batch.put(key, value);
         self.write_batch(batch).await
     }
 
     async fn delete(&self, key: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
-        batch.delete(key.to_vec());
+        batch.delete(key);
         self.write_batch(batch).await
     }
 
@@ -47,54 +47,6 @@ pub trait KeyValueTable: Send + Sync {
 
 pub struct SlateTable {
     db: Arc<Db>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::KeyValueTable;
-    use crate::storage::keyspace::namespace_prefix;
-    use crate::storage::timestamps;
-    use object_store::memory::InMemory;
-
-    async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
-        Arc::new(SlateTable::new(db))
-    }
-
-    #[tokio::test]
-    async fn scan_prefix_returns_chronological_order() {
-        let table = build_table("storage-ordering").await;
-
-        let mut base = namespace_prefix(crate::storage::keyspace::prefix::STREAM, "ordering");
-        base.extend_from_slice(b"data/");
-
-        let mut timestamps_to_insert = vec![5_i64, 1, 3, 2, 4];
-        for &ts in &timestamps_to_insert {
-            let key = timestamps::append(&base, ts).expect("encode key");
-            let value = ts.to_be_bytes();
-            table.put(&key, &value).await.expect("write entry");
-        }
-
-        let entries = table
-            .scan_prefix(&base, &ScanOptions::default())
-            .await
-            .expect("scan entries");
-
-        let observed: Vec<i64> = entries
-            .into_iter()
-            .map(|(key, value)| {
-                let ts = timestamps::extract(&base, &key).expect("decode timestamp");
-                let stored = i64::from_be_bytes(value.try_into().expect("value width"));
-                assert_eq!(ts, stored);
-                ts
-            })
-            .collect();
-
-        timestamps_to_insert.sort();
-        assert_eq!(observed, timestamps_to_insert);
-    }
 }
 
 impl SlateTable {
@@ -142,5 +94,53 @@ impl KeyValueTable for SlateTable {
             entries.push((kv.key.to_vec(), kv.value.to_vec()));
         }
         Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::KeyValueTable;
+    use crate::storage::keyspace::namespace_prefix;
+    use crate::storage::timestamps;
+    use object_store::memory::InMemory;
+
+    async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
+        Arc::new(SlateTable::new(db))
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_returns_chronological_order() {
+        let table = build_table("storage-ordering").await;
+
+        let mut base = namespace_prefix(crate::storage::keyspace::prefix::STREAM, "ordering");
+        base.extend_from_slice(b"data/");
+
+        let mut timestamps_to_insert = vec![5_i64, 1, 3, 2, 4];
+        for &ts in &timestamps_to_insert {
+            let key = timestamps::append(&base, ts).expect("encode key");
+            let value = ts.to_be_bytes();
+            table.put(&key, &value).await.expect("write entry");
+        }
+
+        let entries = table
+            .scan_prefix(&base, &ScanOptions::default())
+            .await
+            .expect("scan entries");
+
+        let observed: Vec<i64> = entries
+            .into_iter()
+            .map(|(key, value)| {
+                let ts = timestamps::extract(&base, &key).expect("decode timestamp");
+                let stored = i64::from_be_bytes(value.try_into().expect("value width"));
+                assert_eq!(ts, stored);
+                ts
+            })
+            .collect();
+
+        timestamps_to_insert.sort();
+        assert_eq!(observed, timestamps_to_insert);
     }
 }

@@ -180,7 +180,7 @@ where
             meta_key,
             next_id: AtomicU64::new(next_id),
             cache: Mutex::new(Cache::new()),
-            hash_fn: hash_fn.unwrap_or_else(|| Arc::new(|bytes| xxh3_64(bytes))),
+            hash_fn: hash_fn.unwrap_or_else(|| Arc::new(xxh3_64)),
             _marker: std::marker::PhantomData,
         })
     }

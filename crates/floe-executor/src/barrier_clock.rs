@@ -59,6 +59,12 @@ impl BarrierClock {
     }
 }
 
+impl Default for BarrierClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

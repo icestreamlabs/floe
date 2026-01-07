@@ -44,10 +44,10 @@ pub async fn run(config: Config, sender: SourceEventSender) -> Result<()> {
         "events-per-second must be a positive finite value"
     );
 
-    if let Some(limit) = config.max_events {
-        if limit == 0 {
-            return Ok(());
-        }
+    if let Some(limit) = config.max_events
+        && limit == 0
+    {
+        return Ok(());
     }
 
     let mut generator = EventGenerator::new(NexmarkConfig::default());
@@ -61,10 +61,10 @@ pub async fn run(config: Config, sender: SourceEventSender) -> Result<()> {
         forward_event(&sender, &event).await?;
         emitted = emitted.saturating_add(1);
 
-        if let Some(limit) = config.max_events {
-            if emitted >= limit {
-                break;
-            }
+        if let Some(limit) = config.max_events
+            && emitted >= limit
+        {
+            break;
         }
 
         if !interval.is_zero() {

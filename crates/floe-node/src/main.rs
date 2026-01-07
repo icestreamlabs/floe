@@ -196,16 +196,16 @@ async fn main() -> anyhow::Result<()> {
     generator_handle.abort();
     executor_handle.abort();
 
-    if let Err(err) = generator_handle.await {
-        if !err.is_cancelled() {
-            eprintln!("generator task joined with error: {err}");
-        }
+    if let Err(err) = generator_handle.await
+        && !err.is_cancelled()
+    {
+        eprintln!("generator task joined with error: {err}");
     }
 
-    if let Err(err) = executor_handle.await {
-        if !err.is_cancelled() {
-            eprintln!("executor task joined with error: {err}");
-        }
+    if let Err(err) = executor_handle.await
+        && !err.is_cancelled()
+    {
+        eprintln!("executor task joined with error: {err}");
     }
 
     server_result

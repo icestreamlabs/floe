@@ -22,6 +22,12 @@ impl KeyEncoder {
     }
 }
 
+impl Default for KeyEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn encode_scalar(value: &ScalarValue, buffer: &mut Vec<u8>) -> Result<()> {
     match value {
         ScalarValue::Int64(v) | ScalarValue::TimestampMillis(v) => {

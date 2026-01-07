@@ -14,6 +14,8 @@ use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
 use async_trait::async_trait;
 use slatedb::WriteBatch;
 
+type ObservedHandles = Arc<tokio::sync::Mutex<Vec<(i64, Vec<ZSetHandle>)>>>;
+
 #[tokio::test]
 async fn send_and_get_values() {
     let db = build_db().await;
@@ -501,7 +503,7 @@ async fn handle_operator_runtime_waits_for_alignment() {
 }
 
 struct RecordingOp {
-    observed: Arc<tokio::sync::Mutex<Vec<(i64, Vec<ZSetHandle>)>>>,
+    observed: ObservedHandles,
 }
 
 #[async_trait]
@@ -527,7 +529,7 @@ impl DeltaOperator for PassthroughOp {
         _ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
-        Ok(inputs.get(0).cloned())
+        Ok(inputs.first().cloned())
     }
 }
 
@@ -564,8 +566,7 @@ async fn pipeline_invokes_operator_with_aligned_inputs() {
     .await
     .expect("right stream");
 
-    let observed: Arc<tokio::sync::Mutex<Vec<(i64, Vec<ZSetHandle>)>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let observed: ObservedHandles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     let mut pipeline = PipelineBuilder::new(vec![left.handle_stream(), right.handle_stream()])
         .push_op(RecordingOp {
@@ -615,8 +616,7 @@ async fn single_input_pipeline_passes_through_operator() {
     .await
     .expect("stream");
 
-    let observed: Arc<tokio::sync::Mutex<Vec<(i64, Vec<ZSetHandle>)>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let observed: ObservedHandles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     let mut pipeline = single_input_pipeline(
         stream.handle_stream(),

@@ -122,7 +122,7 @@ where
             .await
             .expect("failed to construct stream for negation");
 
-        if let Some(first) = values.get(0) {
+        if let Some(first) = values.first() {
             let default_value = self.group.neg(first).await;
             set_default_in_place(&mut result, default_value.clone());
 

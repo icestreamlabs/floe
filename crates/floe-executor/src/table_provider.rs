@@ -90,10 +90,10 @@ impl TableProvider for SlateTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        if let Some(limit) = limit {
-            if rows.len() > limit {
-                rows.truncate(limit);
-            }
+        if let Some(limit) = limit
+            && rows.len() > limit
+        {
+            rows.truncate(limit);
         }
 
         let batches = build_i64_batches(rows, self.schema.clone()).map_err(to_datafusion_error)?;
@@ -533,7 +533,8 @@ mod tests {
         assert_eq!(version, Some(7));
         assert_eq!(retained, vec![other_filter.clone()]);
 
-        let (none_version, unchanged) = super::extract_mv_version_filter(&[other_filter.clone()]);
+        let (none_version, unchanged) =
+            super::extract_mv_version_filter(std::slice::from_ref(&other_filter));
         assert!(none_version.is_none());
         assert_eq!(unchanged, vec![other_filter.clone()]);
 

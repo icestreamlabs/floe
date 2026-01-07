@@ -377,7 +377,7 @@ impl PgwireClient {
             portal,
             statement,
             std::iter::empty::<i16>(),
-            params.iter().map(|value| *value),
+            params.iter().copied(),
             |value, out| {
                 out.extend_from_slice(value.as_bytes());
                 Ok(IsNull::No)
@@ -418,7 +418,7 @@ impl PgwireClient {
             Message::ParameterDescription(body) => {
                 let mut params = body.parameters();
                 let mut count = 0usize;
-                while let Some(_) = params.next().context("read parameter oid")? {
+                while params.next().context("read parameter oid")?.is_some() {
                     count += 1;
                 }
                 if count != expected {

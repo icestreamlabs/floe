@@ -286,6 +286,6 @@ fn base_stream_for(
     }
 }
 
-fn decode_row(bytes: &Vec<u8>) -> Result<Row> {
+fn decode_row(bytes: &[u8]) -> Result<Row> {
     decode_projected_row_key(bytes).map_err(|err| anyhow!("failed to decode row: {err}"))
 }
