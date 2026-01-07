@@ -13,9 +13,9 @@ use slatedb::WriteBatch;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::materialize_zset_handle;
 
@@ -81,7 +81,10 @@ where
                 .intern(key)
                 .await
                 .context("intern key while staging filter delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -181,14 +184,13 @@ where
             .map(|handle| handle.version);
         let new_integrated_handle =
             Self::apply_deltas_to_versioned(&mut self.state.integrated, &filtered, base_version)
-        .await
-        .context("update integrated filter state")?;
+                .await
+                .context("update integrated filter state")?;
         self.state.update_handle(new_integrated_handle);
 
-        let delta_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &filtered, None)
-                .await
-                .context("persist filter delta output")?;
+        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &filtered, None)
+            .await
+            .context("persist filter delta output")?;
         Ok(Some(delta_handle))
     }
 }
@@ -219,11 +221,11 @@ mod tests {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let mut dict_batch = dict.batch();
         for (key, delta) in deltas {
-            let id = dict_batch
-                .intern(key)
-                .await
-                .expect("intern key for filter");
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            let id = dict_batch.intern(key).await.expect("intern key for filter");
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -317,10 +319,9 @@ mod tests {
 
         let mut cache = HashMap::new();
         cache.insert("filter_output".to_string(), output_dict.clone());
-        let out1_materialized =
-            materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
-                .await
-                .expect("materialize t1 output");
+        let out1_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
+            .await
+            .expect("materialize t1 output");
         let integrated_after_t1 = op
             .state
             .integrated
@@ -346,12 +347,10 @@ mod tests {
             .expect("run filter t2")
             .expect("non-empty t2");
 
-        let out2_materialized =
-            materialize_zset_handle::<i64>(table.clone(), &mut cache, &out2)
-                .await
-                .expect("materialize t2 output");
-        let delta_out2 =
-            crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
+        let out2_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out2)
+            .await
+            .expect("materialize t2 output");
+        let delta_out2 = crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
         let delta_out2: HashMap<_, _> = delta_out2.into_iter().collect();
         let integrated_after_t2 = op
             .state

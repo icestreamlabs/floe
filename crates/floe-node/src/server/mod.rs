@@ -8,6 +8,7 @@ use std::task::{Context as TaskContext, Poll};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use core::ops::ControlFlow;
 use datafusion::arrow::array::{
     Array, Decimal128Array, Decimal256Array, Int16Array, Int32Array, Int64Array, StringArray,
@@ -17,7 +18,6 @@ use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::pgwire::tail::{
     TailBatch, TailStream, execute_tail, parse_tail_sql, tail_output_schema,
@@ -547,9 +547,8 @@ fn build_query_response(batches: Vec<RecordBatch>) -> PgWireResult<QueryResponse
     let schema_ref = info.clone();
     let row_stream = stream::iter(batches.into_iter().flat_map(move |batch| {
         let schema = Arc::clone(&schema_ref);
-        (0..batch.num_rows()).map(move |row_idx| {
-            encode_stream_row(&batch, row_idx, Arc::clone(&schema))
-        })
+        (0..batch.num_rows())
+            .map(move |row_idx| encode_stream_row(&batch, row_idx, Arc::clone(&schema)))
     }));
 
     Ok(QueryResponse::new(info, row_stream))
@@ -1146,8 +1145,8 @@ mod tests {
         FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
     };
     use futures::Stream;
-    use pgwire::messages::extendedquery::Bind;
     use pgwire::messages::data::DataRow;
+    use pgwire::messages::extendedquery::Bind;
     use slatedb::Db;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -1262,7 +1261,7 @@ mod tests {
 
         let dialect = PostgreSqlDialect {};
         let mut statements =
-        Parser::parse_sql(&dialect, "INSERT INTO t VALUES (1)").expect("parse");
+            Parser::parse_sql(&dialect, "INSERT INTO t VALUES (1)").expect("parse");
         let statement = statements.pop().expect("statement");
         let err = match handler.execute_statement(statement).await {
             Ok(_) => panic!("expected INSERT to be rejected"),
@@ -1277,7 +1276,11 @@ mod tests {
     #[test]
     fn arrow_schema_maps_timestamp_types() {
         let schema = SchemaRef::from(Schema::new(vec![
-            Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "ts_micros",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
             Field::new(
                 "ts_millis",
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
@@ -1303,8 +1306,8 @@ mod tests {
 
         let micros_array = TimestampMicrosecondArray::from(vec![Some(micros), None]);
         let millis_array = {
-            use arrow_data::ArrayData;
             use arrow_buffer::{Buffer, NullBuffer};
+            use arrow_data::ArrayData;
 
             let values = Buffer::from_slice_ref(&[millis, 0]);
             let nulls = NullBuffer::from(vec![true, false]);
@@ -1320,10 +1323,16 @@ mod tests {
             TimestampMillisecondArray::from(data)
         };
         let utf8_array = StringArray::from(vec![Some("hello"), None]);
-        let decimal_array = Decimal128Array::from(vec![Some(12_345i128), None]).with_precision_and_scale(10, 2).expect("decimal array");
+        let decimal_array = Decimal128Array::from(vec![Some(12_345i128), None])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal array");
 
         let schema = SchemaRef::from(Schema::new(vec![
-            Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "ts_micros",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
             Field::new(
                 "ts_millis",
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),

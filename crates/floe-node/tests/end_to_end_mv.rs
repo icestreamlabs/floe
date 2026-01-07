@@ -5,13 +5,13 @@ use datafusion::arrow::array::{Int64Array, StringArray, TimestampMillisecondArra
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::scalar::ScalarValue;
 use dbsp::Stream;
-use dbsp::handles::ZSetHandleView;
 use dbsp::handles::ZSetHandle;
+use dbsp::handles::ZSetHandleView;
+use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, MaterializedViewRegistry,
     OuterStreamRegistry, ValidatedPlan, load_or_register_mv, validate_dbsp_plan,
 };
-use floe_executor::outer_stream::OuterStreamHandle;
 use floe_node::executor::{available_sources_from_registry, build_dataflows};
 use floe_node::generator::{self, AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
 use floe_node::planner::plan_materialized_views;
@@ -52,8 +52,9 @@ impl MvTestHarness {
             "expected a single circuit plan for the view"
         );
 
-        let ValidatedPlan { required_sources, .. } =
-            validate_dbsp_plan(&circuit_plans[0], &available_sources, view_name)?;
+        let ValidatedPlan {
+            required_sources, ..
+        } = validate_dbsp_plan(&circuit_plans[0], &available_sources, view_name)?;
 
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
         let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db)).await?;
@@ -111,7 +112,14 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
     .await?;
 
     let handles = vec![
-        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 42, 100).await?,
+        append_bid(
+            &mut harness.outer,
+            &mut harness.ingestion_bridge,
+            1,
+            42,
+            100,
+        )
+        .await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 10, 50).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 3, 42, 75).await?,
     ];
@@ -215,9 +223,23 @@ async fn materialized_view_joins_auctions() -> Result<()> {
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 3, 9, 70).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 10, 0).await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 4, 11, 90).await?,
-        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 3, 12, 130).await?,
+        append_bid(
+            &mut harness.outer,
+            &mut harness.ingestion_bridge,
+            3,
+            12,
+            130,
+        )
+        .await?,
         append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 13, 0).await?,
-        append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 14, 200).await?,
+        append_bid(
+            &mut harness.outer,
+            &mut harness.ingestion_bridge,
+            2,
+            14,
+            200,
+        )
+        .await?,
     ];
     for handle in &handles {
         assert_manifest_exists(
@@ -316,7 +338,10 @@ async fn assert_manifest_exists(
         .await
         .context("lookup manifest key")?
         .is_some();
-    anyhow::ensure!(exists, "manifest {version} missing for namespace {namespace}");
+    anyhow::ensure!(
+        exists,
+        "manifest {version} missing for namespace {namespace}"
+    );
     Ok(())
 }
 
@@ -327,7 +352,13 @@ async fn append_bid(
     bidder: i64,
     price: i64,
 ) -> Result<OuterStreamHandle> {
-    append_row(outer, bridge, BID_SOURCE_NAME, bid_row(auction, bidder, price)).await
+    append_row(
+        outer,
+        bridge,
+        BID_SOURCE_NAME,
+        bid_row(auction, bidder, price),
+    )
+    .await
 }
 
 async fn append_auction(

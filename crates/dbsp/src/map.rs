@@ -15,12 +15,12 @@ use crate::operators::map::MapOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::Stream;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
-use crate::stream::Stream;
 
 /// Map wrapper that drives the MapOp over handle streams.
 pub struct DbspMap {

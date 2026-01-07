@@ -15,7 +15,6 @@ use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use crate::storage::KeyValueTable;
 use super::super::core::stream::Stream;
 use super::super::cursor::StreamCursor;
 use super::super::groups::HandleGroup;
@@ -27,6 +26,7 @@ use super::super::util::{
     next_lifted_zset_namespace, push_value_in_place, set_default_in_place,
 };
 use super::super::zset_stream::{StreamRetention, ZSetStream};
+use crate::storage::KeyValueTable;
 
 pub async fn lifted_select_zset_stream<K, P>(
     input: &Stream<ZSetHandle>,
@@ -323,9 +323,8 @@ where
 
     result_stream.flush().await?;
 
-    let mut runtime = HandleOperatorRuntime::new(vec![left.clone(), right.clone()], |_, _| async {
-        Ok(())
-    });
+    let mut runtime =
+        HandleOperatorRuntime::new(vec![left.clone(), right.clone()], |_, _| async { Ok(()) });
     tokio::spawn(async move {
         let mut left_cache = left_cache;
         let mut right_cache = right_cache;
@@ -337,7 +336,10 @@ where
             match runtime.next_handles().await {
                 Ok((_, handles)) => {
                     if handles.len() != 2 {
-                        eprintln!("join runtime produced unexpected handle count {}", handles.len());
+                        eprintln!(
+                            "join runtime produced unexpected handle count {}",
+                            handles.len()
+                        );
                         break;
                     }
                     match join_handle(

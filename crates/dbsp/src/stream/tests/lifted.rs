@@ -6,13 +6,12 @@ use crate::algebra::AbelianGroup;
 use crate::handles::{StreamHandle, ZSetHandle};
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
-use crate::stream::cursor::StreamCursor;
 use crate::stream::core::stream::Stream;
+use crate::stream::cursor::StreamCursor;
 use crate::stream::groups::HandleGroup;
 use crate::stream::operations::{
-    delta_lifted_delta_lifted_join, lifted_delay, lifted_h_zset_stream,
-    lifted_join_zset_stream, lifted_lifted_select_zset_stream, lifted_select_zset_stream,
-    lifted_stream_introduction,
+    delta_lifted_delta_lifted_join, lifted_delay, lifted_h_zset_stream, lifted_join_zset_stream,
+    lifted_lifted_select_zset_stream, lifted_select_zset_stream, lifted_stream_introduction,
 };
 use crate::stream::tests::common::{IntegerGroup, build_db};
 use crate::stream::util::{
@@ -180,8 +179,9 @@ async fn lifted_select_zset_stream_emits_updates_after_build() {
         .expect("select update");
 
     let mut cache = HashMap::new();
-    let materialized =
-        materialize_zset_handle::<String>(table.clone(), &mut cache, &handle).await.unwrap();
+    let materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &handle)
+        .await
+        .unwrap();
     assert_eq!(materialized.get("keep-me"), Some(&1));
 }
 
@@ -250,10 +250,9 @@ async fn lifted_join_zset_stream_emits_updates_after_build() {
         .expect("join update wait")
         .expect("join update");
     let mut cache = HashMap::new();
-    let materialized =
-        materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache, &handle)
-            .await
-            .unwrap();
+    let materialized = materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache, &handle)
+        .await
+        .unwrap();
     assert_eq!(materialized.get(&(7, 7)), Some(&1));
 }
 

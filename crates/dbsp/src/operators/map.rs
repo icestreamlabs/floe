@@ -13,9 +13,9 @@ use slatedb::WriteBatch;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::materialize_zset_handle;
 
@@ -99,7 +99,10 @@ where
                 .intern(key)
                 .await
                 .context("intern key while staging map delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -208,14 +211,13 @@ where
             .map(|handle| handle.version);
         let new_integrated_handle =
             Self::apply_deltas_to_versioned(&mut self.state.integrated, &projected, base_version)
-        .await
-        .context("update integrated map state")?;
+                .await
+                .context("update integrated map state")?;
         self.state.update_handle(new_integrated_handle);
 
-        let delta_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &projected, None)
-                .await
-                .context("persist map delta output")?;
+        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &projected, None)
+            .await
+            .context("persist map delta output")?;
         Ok(Some(delta_handle))
     }
 }
@@ -261,7 +263,10 @@ mod tests {
                 .intern(key)
                 .await
                 .expect("intern key for map test");
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -321,13 +326,10 @@ mod tests {
         )
         .await
         .expect("integrated");
-        let output = VersionedZSet::new(
-            output_dict.clone(),
-            table.clone(),
-            "map_output".to_string(),
-        )
-        .await
-        .expect("output");
+        let output =
+            VersionedZSet::new(output_dict.clone(), table.clone(), "map_output".to_string())
+                .await
+                .expect("output");
 
         let state = RelationState {
             integrated,
@@ -388,8 +390,7 @@ mod tests {
             materialize_zset_handle::<usize>(table.clone(), &mut cache_out, &out2)
                 .await
                 .expect("materialize t2 output");
-        let delta_out2 =
-            crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
+        let delta_out2 = crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
         let delta_out2: HashMap<_, _> = delta_out2.into_iter().collect();
         let integrated_after_t2 = op
             .state

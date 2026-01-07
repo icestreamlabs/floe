@@ -5,9 +5,9 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::dictionary::Dictionary;
 use crate::storage::KeyValueTable;
+use crate::storage::dictionary::Dictionary;
+use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use anyhow::Context;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -56,10 +56,7 @@ where
         self.integrated.dictionary()
     }
 
-    pub async fn empty(
-        table: Arc<dyn KeyValueTable>,
-        namespace: String,
-    ) -> anyhow::Result<Self> {
+    pub async fn empty(table: Arc<dyn KeyValueTable>, namespace: String) -> anyhow::Result<Self> {
         let dict = Arc::new(
             Dictionary::<K>::with_table(table.clone(), namespace.clone(), None)
                 .await

@@ -1134,9 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn insert_then_negates_to_zero_removes_entry() {
         let db = build_db().await;
-        let mut zset = ZSet::new(db, "zero_remove")
-            .await
-            .expect("create zset");
+        let mut zset = ZSet::new(db, "zero_remove").await.expect("create zset");
 
         zset.add_weight("gone".to_string(), 1).await.unwrap();
         zset.flush().await.unwrap();
@@ -1144,7 +1142,9 @@ mod tests {
         zset.flush().await.unwrap();
 
         assert_eq!(
-            zset.contains(&"gone".to_string()).await.expect("contains check"),
+            zset.contains(&"gone".to_string())
+                .await
+                .expect("contains check"),
             false
         );
         assert!(zset.items().await.expect("items after cancel").is_empty());
@@ -1166,12 +1166,7 @@ mod tests {
             }
             seq.flush().await.unwrap();
         }
-        let seq_items: HashMap<_, _> = seq
-            .items()
-            .await
-            .expect("seq items")
-            .into_iter()
-            .collect();
+        let seq_items: HashMap<_, _> = seq.items().await.expect("seq items").into_iter().collect();
 
         let mut aggregate_map: HashMap<String, i64> = HashMap::new();
         for batch in &deltas {

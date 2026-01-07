@@ -7,9 +7,9 @@ use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::relation_state::RelationState;
 use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::runtime::DeltaOperator;
 use dbsp::stream::util::materialize_zset_handle;
-use dbsp::storage::dictionary::Dictionary;
 
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 
@@ -52,7 +52,10 @@ impl MvSinkOp {
                 .intern(key)
                 .await
                 .context("intern key while staging mv sink delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -111,9 +114,10 @@ impl DeltaOperator for MvSinkOp {
         }
 
         let dict = self.state.dictionary();
-        let new_handle = Self::apply_deltas_to_versioned(dict, &mut self.state.integrated, &delta_map)
-            .await
-            .context("update materialized view state")?;
+        let new_handle =
+            Self::apply_deltas_to_versioned(dict, &mut self.state.integrated, &delta_map)
+                .await
+                .context("update materialized view state")?;
         self.state.update_handle(new_handle.clone());
 
         let view = self
@@ -168,13 +172,10 @@ mod tests {
         .await
         .expect("delta stream");
 
-        let integrated = VersionedZSet::new(
-            dict.clone(),
-            table.clone(),
-            "mv_sink_state".to_string(),
-        )
-        .await
-        .expect("integrated state");
+        let integrated =
+            VersionedZSet::new(dict.clone(), table.clone(), "mv_sink_state".to_string())
+                .await
+                .expect("integrated state");
         let state = RelationState {
             integrated,
             latest_handle: ZSetHandle {
@@ -190,9 +191,7 @@ mod tests {
         delta_stream.add_delta(b"a".to_vec(), 1);
         let delta_handle = delta_stream.flush().await.expect("flush t1");
 
-        op.on_step(1, &[delta_handle])
-            .await
-            .expect("run mv sink");
+        op.on_step(1, &[delta_handle]).await.expect("run mv sink");
 
         let persisted = view_handle.dbsp_state().expect("persisted state");
         assert_eq!(persisted.namespace(), "mv_sink_state");

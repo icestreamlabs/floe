@@ -14,6 +14,7 @@ pub mod materialized_view;
 pub mod mv;
 pub mod mv_loader;
 pub mod namespaces;
+pub mod nexmark_sources;
 pub mod operator_state;
 pub mod operators;
 pub mod outer_stream;
@@ -23,7 +24,6 @@ pub mod source_decoder;
 pub mod source_registry;
 pub mod stream_types;
 pub mod table_provider;
-pub mod nexmark_sources;
 
 pub use barrier_clock::{BarrierClock, StepId};
 pub use context::FloeQueryContext;

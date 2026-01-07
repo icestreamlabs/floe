@@ -1,23 +1,19 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
-use datafusion::scalar::ScalarValue;
-use dbsp::storage::dictionary::Dictionary;
-use dbsp::storage::KeyValueTable;
-use dbsp::{StreamRetention, ZSetStream};
-use nexmark::event::{Auction, Bid, Person};
 use crate::encoding::encode_projected_row_key;
 use crate::namespaces;
+use anyhow::{Context, Result, anyhow};
+use datafusion::scalar::ScalarValue;
+use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
+use dbsp::{StreamRetention, ZSetStream};
+use nexmark::event::{Auction, Bid, Person};
 
-pub async fn nexmark_person_stream(
-    table: Arc<dyn KeyValueTable>,
-) -> Result<ZSetStream<Vec<u8>>> {
+pub async fn nexmark_person_stream(table: Arc<dyn KeyValueTable>) -> Result<ZSetStream<Vec<u8>>> {
     build_stream(table, namespaces::source("nexmark_person")?.as_str()).await
 }
 
-pub async fn nexmark_auction_stream(
-    table: Arc<dyn KeyValueTable>,
-) -> Result<ZSetStream<Vec<u8>>> {
+pub async fn nexmark_auction_stream(table: Arc<dyn KeyValueTable>) -> Result<ZSetStream<Vec<u8>>> {
     build_stream(table, namespaces::source("nexmark_auction")?.as_str()).await
 }
 
@@ -76,7 +72,10 @@ fn ts_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| anyhow!("timestamp {value} exceeds i64 range"))
 }
 
-async fn build_stream(table: Arc<dyn KeyValueTable>, namespace: &str) -> Result<ZSetStream<Vec<u8>>> {
+async fn build_stream(
+    table: Arc<dyn KeyValueTable>,
+    namespace: &str,
+) -> Result<ZSetStream<Vec<u8>>> {
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.to_string(), None)
             .await
@@ -101,8 +100,13 @@ mod tests {
     use std::collections::HashMap;
 
     async fn build_db() -> Arc<Db> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        Arc::new(Db::open("nexmark_source", store).await.expect("open SlateDB"))
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        Arc::new(
+            Db::open("nexmark_source", store)
+                .await
+                .expect("open SlateDB"),
+        )
     }
 
     #[tokio::test]
@@ -127,10 +131,9 @@ mod tests {
         let handle = stream.flush().await.expect("flush bid stream");
 
         let mut cache = HashMap::new();
-        let materialized =
-            materialize_zset_handle::<Vec<u8>>(table.clone(), &mut cache, &handle)
-                .await
-                .expect("materialize bid handle");
+        let materialized = materialize_zset_handle::<Vec<u8>>(table.clone(), &mut cache, &handle)
+            .await
+            .expect("materialize bid handle");
         assert_eq!(materialized.get(&key), Some(&1));
     }
 }

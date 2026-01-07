@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
-use crate::storage::dictionary::Dictionary;
 use crate::storage::KeyValueTable;
+use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::materialize_zset_handle;
@@ -78,7 +78,10 @@ where
                 .intern(key)
                 .await
                 .context("intern key while staging distinct delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -152,13 +155,10 @@ where
             .cloned()
             .context("distinct operator requires one input delta handle")?;
 
-        let delta_map = materialize_zset_handle::<K>(
-            self.table.clone(),
-            &mut self.dict_cache,
-            &delta_handle,
-        )
-        .await
-        .context("materialize delta for distinct")?;
+        let delta_map =
+            materialize_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+                .await
+                .context("materialize delta for distinct")?;
         let integrated_map = self
             .state
             .integrated
@@ -184,8 +184,8 @@ where
             .map(|handle| handle.version);
         let new_integrated_handle =
             Self::apply_deltas_to_versioned(&mut self.state.integrated, &delta_map, base_version)
-        .await
-        .context("update integrated state for distinct")?;
+                .await
+                .context("update integrated state for distinct")?;
         self.state.update_handle(new_integrated_handle);
 
         if h_deltas.is_empty() {
@@ -206,9 +206,9 @@ fn bucket_for(id: u64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::zset::SegmentRecord;
     use object_store::memory::InMemory;
     use slatedb::Db;
-    use crate::collections::zset::SegmentRecord;
     use std::collections::BTreeMap;
 
     async fn stage_version(
@@ -224,7 +224,10 @@ mod tests {
                 .intern(key)
                 .await
                 .expect("intern test key for distinct");
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -303,9 +306,13 @@ mod tests {
 
         let mut op = DistinctOp::new(state, table.clone(), output);
 
-        let first_delta =
-            stage_version(delta_dict.clone(), table.clone(), "distinct_delta", &[("a".to_string(), 1)])
-                .await;
+        let first_delta = stage_version(
+            delta_dict.clone(),
+            table.clone(),
+            "distinct_delta",
+            &[("a".to_string(), 1)],
+        )
+        .await;
         let out1 = op
             .on_step(1, &[first_delta])
             .await
@@ -314,10 +321,9 @@ mod tests {
 
         let mut cache = HashMap::new();
         cache.insert("distinct_output".to_string(), output_dict.clone());
-        let out1_materialized =
-            materialize_zset_handle::<String>(table.clone(), &mut cache, &out1)
-                .await
-                .expect("materialize output t1");
+        let out1_materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &out1)
+            .await
+            .expect("materialize output t1");
         let integrated_after_t1 = op
             .state
             .integrated
@@ -340,12 +346,10 @@ mod tests {
             .expect("run distinct t2")
             .expect("non-empty output t2");
 
-        let out2_materialized =
-            materialize_zset_handle::<String>(table.clone(), &mut cache, &out2)
-                .await
-                .expect("materialize output t2");
-        let delta_out2 =
-            crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
+        let out2_materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &out2)
+            .await
+            .expect("materialize output t2");
+        let delta_out2 = crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
         let delta_out2: HashMap<_, _> = delta_out2.into_iter().collect();
         let integrated_after_t2 = op
             .state

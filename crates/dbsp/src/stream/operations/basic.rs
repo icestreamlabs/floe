@@ -3,11 +3,11 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::Mutex;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::sync::Mutex;
 
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
@@ -22,10 +22,10 @@ use super::super::util::{
     build_derived_stream, collect_values, compute_delta, materialize_zset_handle,
     next_lifted_zset_namespace, push_value_in_place, set_default_in_place,
 };
+use super::zset_integral::integrate_zset_handle_stream;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::stream::runtime::HandleOperatorRuntime;
-use super::zset_integral::integrate_zset_handle_stream;
 
 pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
@@ -123,9 +123,7 @@ where
 
 /// Single-level helper: integrates a `Stream<ZSetHandle>` into cumulative state,
 /// returning another `Stream<ZSetHandle>` that carries integrated deltas only.
-pub async fn integrate_zset_stream<K>(
-    input: &Stream<ZSetHandle>,
-) -> Result<Stream<ZSetHandle>>
+pub async fn integrate_zset_stream<K>(input: &Stream<ZSetHandle>) -> Result<Stream<ZSetHandle>>
 where
     K: Archive
         + Clone
@@ -142,9 +140,7 @@ where
 
 /// Single-level helper: differentiates `Stream<ZSetHandle>` by emitting the
 /// per-step Z-set deltas in a new `Stream<ZSetHandle>`.
-pub async fn differentiate_zset_stream<K>(
-    input: &Stream<ZSetHandle>,
-) -> Result<Stream<ZSetHandle>>
+pub async fn differentiate_zset_stream<K>(input: &Stream<ZSetHandle>) -> Result<Stream<ZSetHandle>>
 where
     K: Archive
         + Clone
@@ -441,11 +437,9 @@ where
     }
 
     if segments.is_empty() {
-        return Ok(
-            versioned
-                .current_handle()
-                .unwrap_or_else(|| versioned.handle_for_version(0)),
-        );
+        return Ok(versioned
+            .current_handle()
+            .unwrap_or_else(|| versioned.handle_for_version(0)));
     }
 
     let mut batch = slatedb::WriteBatch::new();

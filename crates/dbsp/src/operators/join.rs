@@ -13,9 +13,9 @@ use slatedb::WriteBatch;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::materialize_zset_handle;
 
@@ -156,7 +156,10 @@ where
                 .intern(key)
                 .await
                 .context("intern key while staging join delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -300,10 +303,13 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
-        let new_left_handle =
-            Self::apply_deltas_to_versioned(&mut self.left_state.integrated, &left_delta, left_base)
-                .await
-                .context("update left integrated state")?;
+        let new_left_handle = Self::apply_deltas_to_versioned(
+            &mut self.left_state.integrated,
+            &left_delta,
+            left_base,
+        )
+        .await
+        .context("update left integrated state")?;
         self.left_state.update_handle(new_left_handle);
 
         let right_base = self
@@ -336,10 +342,9 @@ where
             integrated.update_handle(new_integrated_handle);
         }
 
-        let delta_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &delta_join, None)
-                .await
-                .context("persist join delta output")?;
+        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &delta_join, None)
+            .await
+            .context("persist join delta output")?;
         Ok(Some(delta_handle))
     }
 }
@@ -386,11 +391,11 @@ mod tests {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let mut dict_batch = dict.batch();
         for (key, delta) in deltas {
-            let id = dict_batch
-                .intern(key)
-                .await
-                .expect("intern key for join");
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            let id = dict_batch.intern(key).await.expect("intern key for join");
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
         drop(dict_batch);
 
@@ -483,13 +488,9 @@ mod tests {
                 version: 0,
             },
         };
-        let output = VersionedZSet::new(
-            out_dict.clone(),
-            table.clone(),
-            "join_output".to_string(),
-        )
-        .await
-        .expect("output");
+        let output = VersionedZSet::new(out_dict.clone(), table.clone(), "join_output".to_string())
+            .await
+            .expect("output");
         let match_sum = Arc::new(|l: &i64, r: &i64| *l == *r);
         let projector = Arc::new(project_sum);
         let integrated_join = RelationState {
@@ -520,10 +521,20 @@ mod tests {
         let mut full_right: HashMap<i64, i64> = HashMap::new();
 
         // t1
-        let left_delta1 =
-            stage_version(left_dict.clone(), table.clone(), "join_left_stream", &[(1, 1)]).await;
-        let right_delta1 =
-            stage_version(right_dict.clone(), table.clone(), "join_right_stream", &[(1, 2)]).await;
+        let left_delta1 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "join_left_stream",
+            &[(1, 1)],
+        )
+        .await;
+        let right_delta1 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "join_right_stream",
+            &[(1, 2)],
+        )
+        .await;
         full_left.insert(1, 1);
         full_right.insert(1, 2);
         let out1 = op
@@ -534,10 +545,9 @@ mod tests {
 
         let mut cache = HashMap::new();
         cache.insert("join_output".to_string(), out_dict.clone());
-        let out1_materialized =
-            materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
-                .await
-                .expect("materialize t1 output");
+        let out1_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
+            .await
+            .expect("materialize t1 output");
         assert_eq!(out1_materialized.get(&2), Some(&2));
         let integrated_t1 = op
             .integrated
@@ -550,10 +560,20 @@ mod tests {
         assert_eq!(integrated_t1.get(&2), Some(&2));
 
         // t2: add additional matches/mismatches
-        let left_delta2 =
-            stage_version(left_dict.clone(), table.clone(), "join_left_stream", &[(2, 1)]).await;
-        let right_delta2 =
-            stage_version(right_dict.clone(), table.clone(), "join_right_stream", &[(2, 3)]).await;
+        let left_delta2 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "join_left_stream",
+            &[(2, 1)],
+        )
+        .await;
+        let right_delta2 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "join_right_stream",
+            &[(2, 3)],
+        )
+        .await;
         full_left.insert(2, 1);
         full_right.insert(2, 3);
         let out2 = op
@@ -561,10 +581,9 @@ mod tests {
             .await
             .expect("run join t2")
             .expect("non-empty t2");
-        let out2_materialized =
-            materialize_zset_handle::<i64>(table.clone(), &mut cache, &out2)
-                .await
-                .expect("materialize t2 output");
+        let out2_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out2)
+            .await
+            .expect("materialize t2 output");
 
         // Expected joins: (1,1) persists, (2,2) => 4, (1,2) none
         assert_eq!(out2_materialized.get(&4), Some(&3));

@@ -107,10 +107,7 @@ impl OuterStreamRegistry {
             }
             let namespace = namespaces::source(&source)?;
             let stream = bridge
-                .new_stream(
-                    namespace.clone(),
-                    StreamRetention::None,
-                )
+                .new_stream(namespace.clone(), StreamRetention::None)
                 .await
                 .with_context(|| format!("create outer stream for source '{source}'"))?;
             ensure_outer_stream_codec(table.clone(), &namespace)

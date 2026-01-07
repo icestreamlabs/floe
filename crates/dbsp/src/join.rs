@@ -16,11 +16,11 @@ use crate::operators::join::JoinOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::Stream;
 use crate::stream::runtime::{DeltaOperator, HandleOperatorRuntime};
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
-use crate::stream::Stream;
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
@@ -132,20 +132,24 @@ impl DbspJoin {
         }
 
         let op = Arc::clone(&join_op);
-        let mut runtime = HandleOperatorRuntime::new(vec![left.clone(), right.clone()], move |ts, handles| {
-            let op = Arc::clone(&op);
-            let writer = Arc::clone(&writer);
-            let handles = handles.to_vec();
-            Box::pin(async move {
-                // If either side did not change at this ts, synthesize an empty delta
-                // handle in the corresponding namespace so downstream logic observes
-                // aligned timestamps with zero deltas.
-                if handles.len() != 2 {
-                    return Err(anyhow::anyhow!("join runtime expected 2 handles, got {}", handles.len()));
-                }
-                drive_join(&op, &writer, ts, handles).await
-            })
-        });
+        let mut runtime =
+            HandleOperatorRuntime::new(vec![left.clone(), right.clone()], move |ts, handles| {
+                let op = Arc::clone(&op);
+                let writer = Arc::clone(&writer);
+                let handles = handles.to_vec();
+                Box::pin(async move {
+                    // If either side did not change at this ts, synthesize an empty delta
+                    // handle in the corresponding namespace so downstream logic observes
+                    // aligned timestamps with zero deltas.
+                    if handles.len() != 2 {
+                        return Err(anyhow::anyhow!(
+                            "join runtime expected 2 handles, got {}",
+                            handles.len()
+                        ));
+                    }
+                    drive_join(&op, &writer, ts, handles).await
+                })
+            });
 
         tokio::spawn(async move {
             loop {

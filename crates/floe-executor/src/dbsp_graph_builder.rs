@@ -2,6 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::dbsp_bridge::DbspBridge;
+use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use datafusion::common::Column;
@@ -16,10 +20,6 @@ use dbsp::{
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
     Stream,
 };
-use crate::dbsp_bridge::DbspBridge;
-use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
-use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
-use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use tokio::sync::Mutex;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
@@ -201,10 +201,9 @@ impl DbspGraphBuilder {
         node: &DbspSelectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_upstream =
-            differentiate_zset_stream_live::<Vec<u8>>(&upstream)
-                .await
-                .context("build live delta stream for filter input")?;
+        let delta_upstream = differentiate_zset_stream_live::<Vec<u8>>(&upstream)
+            .await
+            .context("build live delta stream for filter input")?;
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
@@ -223,10 +222,9 @@ impl DbspGraphBuilder {
         node: &DbspProjectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_upstream =
-            differentiate_zset_stream_live::<Vec<u8>>(&upstream)
-                .await
-                .context("build live delta stream for project input")?;
+        let delta_upstream = differentiate_zset_stream_live::<Vec<u8>>(&upstream)
+            .await
+            .context("build live delta stream for project input")?;
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
@@ -248,14 +246,12 @@ impl DbspGraphBuilder {
         left: Stream<ZSetHandle>,
         right: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_left =
-            differentiate_zset_stream_live::<Vec<u8>>(&left)
-                .await
-                .context("build live delta stream for join left input")?;
-        let delta_right =
-            differentiate_zset_stream_live::<Vec<u8>>(&right)
-                .await
-                .context("build live delta stream for join right input")?;
+        let delta_left = differentiate_zset_stream_live::<Vec<u8>>(&left)
+            .await
+            .context("build live delta stream for join left input")?;
+        let delta_right = differentiate_zset_stream_live::<Vec<u8>>(&right)
+            .await
+            .context("build live delta stream for join right input")?;
         let keys = Arc::new(node.keys.clone());
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
@@ -377,9 +373,10 @@ impl DbspGraphBuilder {
             } else if seen_compare < 10 && !keys_equal {
                 eprintln!(
                     "join key comparison #{seen_compare}: no match for first key pair {:?}",
-                    key_indices
-                        .get(0)
-                        .and_then(|(li, ri)| Some((left_row.get(*li).cloned(), right_row.get(*ri).cloned())))
+                    key_indices.get(0).and_then(|(li, ri)| Some((
+                        left_row.get(*li).cloned(),
+                        right_row.get(*ri).cloned()
+                    )))
                 );
             }
             if !keys_equal {
@@ -408,10 +405,14 @@ impl DbspGraphBuilder {
             encode_projected_row_key(&combined).expect("combined join row encoding must succeed")
         };
 
-        let join =
-            DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&delta_left, &delta_right, predicate, projector)
-                .await
-                .context("initialize DBSP join")?;
+        let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+            &delta_left,
+            &delta_right,
+            predicate,
+            projector,
+        )
+        .await
+        .context("initialize DBSP join")?;
         // Log the first output handle, if any, to verify join activity.
         let mut join_cursor = StreamCursor::new(join.stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {

@@ -1,5 +1,5 @@
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 use crate::handles::ZSetHandle;
 use anyhow::{Context, Result, anyhow};

@@ -548,8 +548,8 @@ fn normalize_expr(expr: Expr) -> Result<Expr, PlannerError> {
         )),
         other => Ok(Transformed::no(other)),
     })
-        .map(|result| result.data)
-        .map_err(|err| PlannerError::AnalysisError(err.into()))
+    .map(|result| result.data)
+    .map_err(|err| PlannerError::AnalysisError(err.into()))
 }
 
 fn combine_filters(filters: Vec<Expr>) -> Option<Expr> {
