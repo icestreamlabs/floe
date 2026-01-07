@@ -28,6 +28,7 @@ use tokio::time::{Duration, timeout};
 const VIEW_NAME: &str = "mv_pgwire_test";
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_executes_selects_and_version_filters() -> Result<()> {
     let rows = vec![10, 20];
     let fixture = PgwireFixture::start("pgwire-positive", &rows).await?;
@@ -84,6 +85,7 @@ async fn pgwire_executes_selects_and_version_filters() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_errors_on_unknown_table() -> Result<()> {
     let rows = vec![1];
     let fixture = PgwireFixture::start("pgwire-unknown", &rows).await?;
@@ -112,6 +114,7 @@ async fn pgwire_errors_on_unknown_table() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_errors_on_parameter_mismatch() -> Result<()> {
     let rows = vec![5];
     let fixture = PgwireFixture::start("pgwire-param-mismatch", &rows).await?;
@@ -144,6 +147,7 @@ async fn pgwire_errors_on_parameter_mismatch() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_handles_client_drop_mid_stream() -> Result<()> {
     let rows: Vec<i64> = (0..40).collect();
     let fixture = PgwireFixture::start_with_server_config(
@@ -174,6 +178,7 @@ async fn pgwire_handles_client_drop_mid_stream() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_streams_rows_incrementally() -> Result<()> {
     let rows: Vec<i64> = (0..40).collect();
     let fixture = PgwireFixture::start_with_server_config(
@@ -217,6 +222,7 @@ async fn pgwire_streams_rows_incrementally() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-executor --test pgwire -- --ignored"]
 async fn pgwire_streaming_respects_version_snapshots() -> Result<()> {
     let rows = vec![5, 15];
     let fixture = PgwireFixture::start("pgwire-stream-versioned", &rows).await?;

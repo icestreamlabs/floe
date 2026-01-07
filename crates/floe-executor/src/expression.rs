@@ -34,7 +34,11 @@ impl ExpressionEvaluator {
     }
 }
 
-pub fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<bool> {
+// SQL comparisons involving NULL yield NULL (unknown).
+pub fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<Option<bool>> {
+    if lhs.is_null() || rhs.is_null() {
+        return Ok(None);
+    }
     let result = match (lhs, rhs) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l == r,
         (
@@ -43,16 +47,20 @@ pub fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<bool> {
         ) => l == r,
         (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r))) => l == r,
         (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => l == r,
-        (ScalarValue::Null, ScalarValue::Null) => true,
         _ => false,
     };
-    Ok(result)
+    Ok(Some(result))
 }
 
+// SQL predicate contexts treat NULL as false (unknown).
 pub fn scalar_to_bool(value: &ScalarValue) -> Result<bool> {
+    Ok(scalar_to_bool_opt(value)?.unwrap_or(false))
+}
+
+fn scalar_to_bool_opt(value: &ScalarValue) -> Result<Option<bool>> {
     match value {
-        ScalarValue::Boolean(Some(v)) => Ok(*v),
-        ScalarValue::Boolean(None) | ScalarValue::Null => Ok(false),
+        ScalarValue::Boolean(Some(v)) => Ok(Some(*v)),
+        ScalarValue::Boolean(None) | ScalarValue::Null => Ok(None),
         other => bail!("expected boolean value, found {other:?}"),
     }
 }
@@ -74,7 +82,8 @@ fn eval_df_expr(expr: &DfExpr, row: &Row, schema: &RowSchema) -> Result<ScalarVa
         }
         DfExpr::Not(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = scalar_to_bool_opt(&value)?.map(|val| !val);
+            Ok(ScalarValue::Boolean(result))
         }
         DfExpr::Negative(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
@@ -97,19 +106,23 @@ fn eval_df_expr(expr: &DfExpr, row: &Row, schema: &RowSchema) -> Result<ScalarVa
         }
         DfExpr::IsTrue(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(scalar_to_bool(&value)?)))
+            let result = matches!(scalar_to_bool_opt(&value)?, Some(true));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsNotTrue(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = !matches!(scalar_to_bool_opt(&value)?, Some(true));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsFalse(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = matches!(scalar_to_bool_opt(&value)?, Some(false));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsNotFalse(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(scalar_to_bool(&value)?)))
+            let result = !matches!(scalar_to_bool_opt(&value)?, Some(false));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::Like(like) => {
             let value = eval_df_expr(like.expr.as_ref(), row, schema)?;
@@ -148,7 +161,7 @@ fn eval_case(case: &Case, row: &Row, schema: &RowSchema) -> Result<ScalarValue> 
         let base_value = eval_df_expr(base, row, schema)?;
         for (when, then) in &case.when_then_expr {
             let when_value = eval_df_expr(when, row, schema)?;
-            if scalar_equals(&when_value, &base_value)? {
+            if scalar_equals(&when_value, &base_value)?.unwrap_or(false) {
                 return eval_df_expr(then, row, schema);
             }
         }
@@ -170,27 +183,38 @@ fn eval_case(case: &Case, row: &Row, schema: &RowSchema) -> Result<ScalarValue> 
 
 fn eval_binary(op: Operator, left: ScalarValue, right: ScalarValue) -> Result<ScalarValue> {
     match op {
-        Operator::Eq => Ok(ScalarValue::Boolean(Some(scalar_equals(&left, &right)?))),
-        Operator::NotEq => Ok(ScalarValue::Boolean(Some(!scalar_equals(&left, &right)?))),
+        Operator::Eq => Ok(ScalarValue::Boolean(scalar_equals(&left, &right)?)),
+        Operator::NotEq => {
+            let result = scalar_equals(&left, &right)?.map(|value| !value);
+            Ok(ScalarValue::Boolean(result))
+        }
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             let ordering = scalar_compare(&left, &right, op)?;
-            Ok(ScalarValue::Boolean(Some(ordering)))
+            Ok(ScalarValue::Boolean(ordering))
         }
         Operator::And => {
-            let lhs = scalar_to_bool(&left)?;
-            if !lhs {
-                return Ok(ScalarValue::Boolean(Some(false)));
-            }
-            let rhs = scalar_to_bool(&right)?;
-            Ok(ScalarValue::Boolean(Some(lhs && rhs)))
+            let lhs = scalar_to_bool_opt(&left)?;
+            let rhs = scalar_to_bool_opt(&right)?;
+            let result = match (lhs, rhs) {
+                (Some(false), _) => Some(false),
+                (Some(true), other) => other,
+                (None, Some(false)) => Some(false),
+                (None, Some(true)) => None,
+                (None, None) => None,
+            };
+            Ok(ScalarValue::Boolean(result))
         }
         Operator::Or => {
-            let lhs = scalar_to_bool(&left)?;
-            if lhs {
-                return Ok(ScalarValue::Boolean(Some(true)));
-            }
-            let rhs = scalar_to_bool(&right)?;
-            Ok(ScalarValue::Boolean(Some(lhs || rhs)))
+            let lhs = scalar_to_bool_opt(&left)?;
+            let rhs = scalar_to_bool_opt(&right)?;
+            let result = match (lhs, rhs) {
+                (Some(true), _) => Some(true),
+                (Some(false), other) => other,
+                (None, Some(true)) => Some(true),
+                (None, Some(false)) => None,
+                (None, None) => None,
+            };
+            Ok(ScalarValue::Boolean(result))
         }
         Operator::Plus
         | Operator::Minus
@@ -224,7 +248,10 @@ fn eval_binary(op: Operator, left: ScalarValue, right: ScalarValue) -> Result<Sc
     }
 }
 
-fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<bool> {
+fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<Option<bool>> {
+    if lhs.is_null() || rhs.is_null() {
+        return Ok(None);
+    }
     let ordering = match (lhs, rhs) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (
@@ -241,7 +268,7 @@ fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<
         Operator::GtEq => ordering.is_ge(),
         _ => unreachable!(),
     };
-    Ok(result)
+    Ok(Some(result))
 }
 
 fn scalar_to_i64(value: &ScalarValue, context: &str) -> Result<i64> {
@@ -273,4 +300,82 @@ fn resolve_column(schema: &RowSchema, column: &Column) -> Result<usize> {
     schema
         .field_index(&column.name)
         .ok_or_else(|| anyhow!("column {} not found in schema", column.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::Column;
+    use datafusion::logical_expr::{BinaryExpr, Expr as DfExpr, Operator};
+    use dbsp::circuit::schema::{Field, RowSchema};
+    use dbsp::circuit::types::DbspScalarType;
+    use std::sync::Arc;
+
+    fn schema(fields: Vec<(&str, DbspScalarType)>) -> Arc<RowSchema> {
+        let fields = fields
+            .into_iter()
+            .map(|(name, ty)| Field::new(name, ty, true))
+            .collect();
+        RowSchema::try_new(fields).expect("schema")
+    }
+
+    fn col(name: &str) -> DfExpr {
+        DfExpr::Column(Column::new_unqualified(name.to_string()))
+    }
+
+    fn eval_expr(expr: DfExpr, schema: Arc<RowSchema>, row: Row) -> ScalarValue {
+        let analyzed = DbspExpression::analyze(expr, Arc::clone(&schema)).expect("analyze expr");
+        let evaluator = ExpressionEvaluator::new(schema, &analyzed);
+        evaluator.eval(&row).expect("eval")
+    }
+
+    #[test]
+    fn null_equals_null_is_filtered_out() {
+        let schema = schema(vec![("a", DbspScalarType::Int64)]);
+        let expr = DfExpr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("a")),
+            Operator::Eq,
+            Box::new(col("a")),
+        ));
+        let row = vec![ScalarValue::Int64(None)];
+        let analyzed = DbspExpression::analyze(expr, Arc::clone(&schema)).expect("analyze expr");
+        let evaluator = ExpressionEvaluator::new(schema, &analyzed);
+
+        let value = evaluator.eval(&row).expect("eval");
+        assert!(matches!(value, ScalarValue::Boolean(None)));
+        assert!(!evaluator.eval_bool(&row).expect("eval bool"));
+    }
+
+    #[test]
+    fn boolean_ops_propagate_nulls() {
+        let schema = schema(vec![
+            ("a", DbspScalarType::Bool),
+            ("b", DbspScalarType::Bool),
+        ]);
+        let and_expr = DfExpr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("a")),
+            Operator::And,
+            Box::new(col("b")),
+        ));
+        let and_row = vec![ScalarValue::Boolean(Some(true)), ScalarValue::Boolean(None)];
+        let and_value = eval_expr(and_expr, Arc::clone(&schema), and_row);
+        assert!(matches!(and_value, ScalarValue::Boolean(None)));
+
+        let or_expr = DfExpr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("a")),
+            Operator::Or,
+            Box::new(col("b")),
+        ));
+        let or_row = vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(None),
+        ];
+        let or_value = eval_expr(or_expr, Arc::clone(&schema), or_row);
+        assert!(matches!(or_value, ScalarValue::Boolean(None)));
+
+        let not_expr = DfExpr::Not(Box::new(col("a")));
+        let not_row = vec![ScalarValue::Boolean(None), ScalarValue::Boolean(Some(true))];
+        let not_value = eval_expr(not_expr, schema, not_row);
+        assert!(matches!(not_value, ScalarValue::Boolean(None)));
+    }
 }

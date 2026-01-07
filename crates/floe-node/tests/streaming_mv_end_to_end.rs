@@ -12,7 +12,7 @@ const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_bid_passthrough AS \
      SELECT auction, bidder, price FROM nexmark_bid";
 
 #[tokio::test]
-#[ignore = "requires TCP networking"]
+#[ignore = "requires TCP sockets; run with cargo test -p floe-node --test streaming_mv_end_to_end -- --ignored"]
 async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
     let port = find_unused_port()?;
     let addr = format!("127.0.0.1:{port}");

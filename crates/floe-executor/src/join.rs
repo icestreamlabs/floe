@@ -40,7 +40,7 @@ impl JoinEvaluator {
         for (left_eval, right_eval) in &self.key_evaluators {
             let left_value = left_eval.eval(left)?;
             let right_value = right_eval.eval(right)?;
-            if !scalar_equals(&left_value, &right_value)? {
+            if !scalar_equals(&left_value, &right_value)?.unwrap_or(false) {
                 return Ok(false);
             }
         }
@@ -62,5 +62,40 @@ impl JoinEvaluator {
         combined.extend_from_slice(left);
         combined.extend_from_slice(right);
         combined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr as DfExpr;
+    use datafusion::scalar::ScalarValue;
+    use dbsp::circuit::plan::{DbspJoinNode, DbspJoinType};
+    use dbsp::circuit::schema::{Field, RowSchema};
+    use dbsp::circuit::types::DbspScalarType;
+    use std::sync::Arc;
+
+    #[test]
+    fn join_key_nulls_do_not_match() {
+        let schema = Arc::new(
+            RowSchema::try_new(vec![Field::new("id", DbspScalarType::Int64, true)])
+                .expect("schema"),
+        );
+        let left_expr = DfExpr::Column(Column::new_unqualified("id".to_string()));
+        let right_expr = DfExpr::Column(Column::new_unqualified("id".to_string()));
+        let node = DbspJoinNode::try_new(
+            DbspJoinType::Inner,
+            Arc::clone(&schema),
+            Arc::clone(&schema),
+            vec![(left_expr, right_expr)],
+            None,
+        )
+        .expect("join node");
+        let evaluator = JoinEvaluator::new(&node);
+
+        let left = vec![ScalarValue::Int64(None)];
+        let right = vec![ScalarValue::Int64(Some(1))];
+        assert!(!evaluator.matches(&left, &right).expect("join matches"));
     }
 }

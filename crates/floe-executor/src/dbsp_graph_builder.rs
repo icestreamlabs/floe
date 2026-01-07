@@ -610,7 +610,7 @@ fn eval_join_keys(
     for key in keys {
         let left_value = eval_df_expr(key.left_expression().expr(), left, left_schema)?;
         let right_value = eval_df_expr(key.right_expression().expr(), right, right_schema)?;
-        if !scalar_equals(&left_value, &right_value)? {
+        if !scalar_equals(&left_value, &right_value)?.unwrap_or(false) {
             return Ok(false);
         }
     }
@@ -639,7 +639,8 @@ fn eval_df_expr(expr: &DfExpr, row: &[ScalarValue], schema: &RowSchema) -> Resul
         }
         DfExpr::Not(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = scalar_to_bool_opt(&value)?.map(|val| !val);
+            Ok(ScalarValue::Boolean(result))
         }
         DfExpr::Negative(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
@@ -662,19 +663,23 @@ fn eval_df_expr(expr: &DfExpr, row: &[ScalarValue], schema: &RowSchema) -> Resul
         }
         DfExpr::IsTrue(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(scalar_to_bool(&value)?)))
+            let result = matches!(scalar_to_bool_opt(&value)?, Some(true));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsNotTrue(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = !matches!(scalar_to_bool_opt(&value)?, Some(true));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsFalse(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(!scalar_to_bool(&value)?)))
+            let result = matches!(scalar_to_bool_opt(&value)?, Some(false));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::IsNotFalse(inner) => {
             let value = eval_df_expr(inner, row, schema)?;
-            Ok(ScalarValue::Boolean(Some(scalar_to_bool(&value)?)))
+            let result = !matches!(scalar_to_bool_opt(&value)?, Some(false));
+            Ok(ScalarValue::Boolean(Some(result)))
         }
         DfExpr::Like(like) => {
             let value = eval_df_expr(like.expr.as_ref(), row, schema)?;
@@ -713,7 +718,7 @@ fn eval_case(case: &Case, row: &[ScalarValue], schema: &RowSchema) -> Result<Sca
         let base_value = eval_df_expr(base, row, schema)?;
         for (when, then) in &case.when_then_expr {
             let when_value = eval_df_expr(when, row, schema)?;
-            if scalar_equals(&when_value, &base_value)? {
+            if scalar_equals(&when_value, &base_value)?.unwrap_or(false) {
                 return eval_df_expr(then, row, schema);
             }
         }
@@ -735,27 +740,38 @@ fn eval_case(case: &Case, row: &[ScalarValue], schema: &RowSchema) -> Result<Sca
 
 fn eval_binary(op: Operator, left: ScalarValue, right: ScalarValue) -> Result<ScalarValue> {
     match op {
-        Operator::Eq => Ok(ScalarValue::Boolean(Some(scalar_equals(&left, &right)?))),
-        Operator::NotEq => Ok(ScalarValue::Boolean(Some(!scalar_equals(&left, &right)?))),
+        Operator::Eq => Ok(ScalarValue::Boolean(scalar_equals(&left, &right)?)),
+        Operator::NotEq => {
+            let result = scalar_equals(&left, &right)?.map(|value| !value);
+            Ok(ScalarValue::Boolean(result))
+        }
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             let ordering = scalar_compare(&left, &right, op)?;
-            Ok(ScalarValue::Boolean(Some(ordering)))
+            Ok(ScalarValue::Boolean(ordering))
         }
         Operator::And => {
-            let lhs = scalar_to_bool(&left)?;
-            if !lhs {
-                return Ok(ScalarValue::Boolean(Some(false)));
-            }
-            let rhs = scalar_to_bool(&right)?;
-            Ok(ScalarValue::Boolean(Some(lhs && rhs)))
+            let lhs = scalar_to_bool_opt(&left)?;
+            let rhs = scalar_to_bool_opt(&right)?;
+            let result = match (lhs, rhs) {
+                (Some(false), _) => Some(false),
+                (Some(true), other) => other,
+                (None, Some(false)) => Some(false),
+                (None, Some(true)) => None,
+                (None, None) => None,
+            };
+            Ok(ScalarValue::Boolean(result))
         }
         Operator::Or => {
-            let lhs = scalar_to_bool(&left)?;
-            if lhs {
-                return Ok(ScalarValue::Boolean(Some(true)));
-            }
-            let rhs = scalar_to_bool(&right)?;
-            Ok(ScalarValue::Boolean(Some(lhs || rhs)))
+            let lhs = scalar_to_bool_opt(&left)?;
+            let rhs = scalar_to_bool_opt(&right)?;
+            let result = match (lhs, rhs) {
+                (Some(true), _) => Some(true),
+                (Some(false), other) => other,
+                (None, Some(true)) => Some(true),
+                (None, Some(false)) => None,
+                (None, None) => None,
+            };
+            Ok(ScalarValue::Boolean(result))
         }
         Operator::Plus
         | Operator::Minus
@@ -789,7 +805,10 @@ fn eval_binary(op: Operator, left: ScalarValue, right: ScalarValue) -> Result<Sc
     }
 }
 
-fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<bool> {
+fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<Option<bool>> {
+    if lhs.is_null() || rhs.is_null() {
+        return Ok(None);
+    }
     let ordering = match (lhs, rhs) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (
@@ -806,10 +825,14 @@ fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<
         Operator::GtEq => ordering.is_ge(),
         _ => unreachable!(),
     };
-    Ok(result)
+    Ok(Some(result))
 }
 
-fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<bool> {
+// SQL comparisons involving NULL yield NULL (unknown).
+fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<Option<bool>> {
+    if lhs.is_null() || rhs.is_null() {
+        return Ok(None);
+    }
     let result = match (lhs, rhs) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l == r,
         (
@@ -818,16 +841,20 @@ fn scalar_equals(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<bool> {
         ) => l == r,
         (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r))) => l == r,
         (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => l == r,
-        (ScalarValue::Null, ScalarValue::Null) => true,
         _ => false,
     };
-    Ok(result)
+    Ok(Some(result))
 }
 
+// SQL predicate contexts treat NULL as false (unknown).
 fn scalar_to_bool(value: &ScalarValue) -> Result<bool> {
+    Ok(scalar_to_bool_opt(value)?.unwrap_or(false))
+}
+
+fn scalar_to_bool_opt(value: &ScalarValue) -> Result<Option<bool>> {
     match value {
-        ScalarValue::Boolean(Some(v)) => Ok(*v),
-        ScalarValue::Boolean(None) | ScalarValue::Null => Ok(false),
+        ScalarValue::Boolean(Some(v)) => Ok(Some(*v)),
+        ScalarValue::Boolean(None) | ScalarValue::Null => Ok(None),
         other => bail!("expected boolean value, found {other:?}"),
     }
 }
