@@ -24,12 +24,12 @@ pub struct ZSetHandle {
     pub version: u64,
 }
 
-/// Handle that references another stream at a particular frontier.
+/// Handle that references another stream at a particular committed frontier.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamHandle {
     /// Namespace of the nested stream.
     pub ns: String,
-    /// Frontier to read from (inclusive).
+    /// Committed frontier to read from (inclusive).
     pub frontier: i64,
 }
 

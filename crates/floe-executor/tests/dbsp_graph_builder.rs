@@ -279,7 +279,7 @@ fn gather_handle_streams(
 ) -> HashMap<String, Stream<ZSetHandle>> {
     let mut map = HashMap::new();
     for source in sources {
-        if let Some(stream) = registry.handle_stream(source) {
+        if let Some(stream) = registry.delta_handle_stream(source) {
             map.insert((*source).to_string(), stream);
         }
     }

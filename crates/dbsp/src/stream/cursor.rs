@@ -9,8 +9,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::core::stream::Stream;
 
-/// Cursor that observes frontier changes on a [`Stream<T>`] and surfaces
-/// `(timestamp, value)` pairs whenever the underlying stream advances.
+/// Cursor that observes committed frontier changes on a [`Stream<T>`] and surfaces
+/// `(timestamp, value)` pairs whenever the underlying stream commits.
 pub struct StreamCursor<T>
 where
     T: Archive
@@ -39,7 +39,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     /// Creates a new cursor pinned to the provided stream. The cursor starts
-    /// at the stream’s current frontier and will only return entries for
+    /// at the stream’s committed frontier and will only return entries for
     /// versions strictly greater than the observed timestamp.
     pub fn new(stream: Stream<T>) -> Self {
         let frontier_rx = stream.subscribe_frontier();
@@ -56,7 +56,7 @@ where
         self.observed_ts
     }
 
-    /// Ensures the cursor is caught up with the current frontier and returns
+    /// Ensures the cursor is caught up with the committed frontier and returns
     /// the latest `(timestamp, value)` without waiting for a new advancement.
     pub async fn snapshot(&mut self) -> Result<(i64, T)> {
         let ts = *self.frontier_rx.borrow();
@@ -65,7 +65,7 @@ where
         Ok((ts, value))
     }
 
-    /// Waits until the stream frontier advances beyond the last observed
+    /// Waits until the committed frontier advances beyond the last observed
     /// timestamp and returns the newly committed `(timestamp, value)` pair.
     pub async fn next(&mut self) -> Result<(i64, T)> {
         loop {
@@ -83,7 +83,7 @@ where
             self.frontier_rx
                 .changed()
                 .await
-                .context("stream frontier closed unexpectedly")?;
+                .context("committed frontier closed unexpectedly")?;
         }
     }
 }

@@ -181,13 +181,14 @@ where
         }
 
         if segments.is_empty() {
-            if let Some(handle) = versioned.current_handle() {
-                return Ok(handle);
+            if base.is_some() {
+                if let Some(handle) = versioned.current_handle() {
+                    return Ok(handle);
+                }
             }
             return Ok(versioned.handle_for_version(0));
         }
 
-        let base = base.or_else(|| versioned.current_handle().map(|h| h.version));
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -551,7 +552,7 @@ mod tests {
         let out1_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
             .await
             .expect("materialize t1 output");
-        assert_eq!(out1_materialized.get(&2), Some(&2));
+        assert_eq!(out1_materialized, HashMap::from([(2, 2)]));
         let integrated_t1 = op
             .integrated
             .as_ref()
@@ -589,7 +590,7 @@ mod tests {
             .expect("materialize t2 output");
 
         // Expected joins: (1,1) persists, (2,2) => 4, (1,2) none
-        assert_eq!(out2_materialized.get(&4), Some(&3));
+        assert_eq!(out2_materialized, HashMap::from([(4, 3)]));
 
         let mut expected_full_join: HashMap<i64, i64> = HashMap::new();
         for (lk, lw) in &full_left {

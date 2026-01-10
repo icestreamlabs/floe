@@ -121,13 +121,14 @@ where
         }
 
         if segments.is_empty() {
-            if let Some(handle) = versioned.current_handle() {
-                return Ok(handle);
+            if base.is_some() {
+                if let Some(handle) = versioned.current_handle() {
+                    return Ok(handle);
+                }
             }
             return Ok(versioned.handle_for_version(0));
         }
 
-        let base = base.or_else(|| versioned.current_handle().map(|h| h.version));
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -390,8 +391,6 @@ mod tests {
             materialize_zset_handle::<usize>(table.clone(), &mut cache_out, &out2)
                 .await
                 .expect("materialize t2 output");
-        let delta_out2 = crate::stream::util::compute_delta(&out1_materialized, &out2_materialized);
-        let delta_out2: HashMap<_, _> = delta_out2.into_iter().collect();
         let integrated_after_t2 = op
             .state
             .integrated
@@ -402,7 +401,7 @@ mod tests {
         let mut expected_out2 = HashMap::new();
         expected_out2.insert(2, -1);
         expected_out2.insert(4, 3);
-        assert_eq!(delta_out2, expected_out2);
+        assert_eq!(out2_materialized, expected_out2);
         assert_eq!(integrated_after_t2.get(&2), None);
         assert_eq!(integrated_after_t2.get(&3), Some(&2));
         assert_eq!(integrated_after_t2.get(&4), Some(&3));

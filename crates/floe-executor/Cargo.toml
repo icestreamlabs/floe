@@ -16,8 +16,6 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
-postgres-protocol = { workspace = true }
-postgres-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
@@ -30,4 +28,3 @@ nexmark = { workspace = true }
 [dev-dependencies]
 arrow-schema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-fallible-iterator = "0.2"

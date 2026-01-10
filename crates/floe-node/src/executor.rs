@@ -32,7 +32,7 @@ pub fn build_dataflows(
         .map(|planned| {
             let plan = planner
                 .build(planned.logical_plan())
-                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                .with_context(|| format!("build DBSP plan for {}", planned.definition().name()))?;
             validate_dbsp_plan(&plan, available_sources, planned.definition().name())
                 .context("validating query plan")?;
             Ok(plan)

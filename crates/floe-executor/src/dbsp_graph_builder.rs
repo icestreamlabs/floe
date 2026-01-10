@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::dbsp_bridge::DbspBridge;
+use crate::dbsp_bridge::{DbspBridge, DbspView};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
@@ -13,8 +13,10 @@ use datafusion::logical_expr::{Case, Expr as DfExpr, Operator};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspJoinKey, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::KeyValueTable;
+use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::StreamCursor;
-use dbsp::stream::operations::basic::differentiate_zset_stream_live;
+use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{
     CircuitNode, CircuitPlan, DbspExpression, DbspFilter, DbspJoin, DbspJoinNode, DbspMap,
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
@@ -201,17 +203,25 @@ impl DbspGraphBuilder {
         node: &DbspSelectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_upstream = differentiate_zset_stream_live::<Vec<u8>>(&upstream)
-            .await
-            .context("build live delta stream for filter input")?;
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
-            let row = decode_projected_row_key(bytes)
-                .expect("encoded row must decode for filter predicate");
-            eval_predicate(&predicate, &row, schema.as_ref()).unwrap_or(false)
+            let row = match decode_projected_row_key(bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode filter row: {err}");
+                    return false;
+                }
+            };
+            match eval_predicate(&predicate, &row, schema.as_ref()) {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!("failed to evaluate filter predicate: {err}");
+                    false
+                }
+            }
         };
-        let filter = DbspFilter::new::<Vec<u8>, _>(&delta_upstream, filter_pred)
+        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred)
             .await
             .context("initialize DBSP filter")?;
         Ok(filter.stream())
@@ -222,19 +232,32 @@ impl DbspGraphBuilder {
         node: &DbspProjectNode,
         upstream: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_upstream = differentiate_zset_stream_live::<Vec<u8>>(&upstream)
-            .await
-            .context("build live delta stream for project input")?;
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
-            let row =
-                decode_projected_row_key(bytes).expect("encoded row must decode for projection");
-            let projected = eval_projection(expressions.as_ref(), &row, schema.as_ref())
-                .expect("projection evaluation must succeed");
-            encode_projected_row_key(&projected).expect("projected row encoding must succeed")
+            let row = match decode_projected_row_key(bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode projection row: {err}");
+                    return Vec::new();
+                }
+            };
+            let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
+                Ok(projected) => projected,
+                Err(err) => {
+                    eprintln!("failed to evaluate projection: {err}");
+                    return Vec::new();
+                }
+            };
+            match encode_projected_row_key(&projected) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    eprintln!("failed to encode projected row: {err}");
+                    Vec::new()
+                }
+            }
         };
-        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&delta_upstream, projector)
+        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector)
             .await
             .context("initialize DBSP map")?;
         Ok(map.stream())
@@ -246,12 +269,6 @@ impl DbspGraphBuilder {
         left: Stream<ZSetHandle>,
         right: Stream<ZSetHandle>,
     ) -> Result<Stream<ZSetHandle>> {
-        let delta_left = differentiate_zset_stream_live::<Vec<u8>>(&left)
-            .await
-            .context("build live delta stream for join left input")?;
-        let delta_right = differentiate_zset_stream_live::<Vec<u8>>(&right)
-            .await
-            .context("build live delta stream for join right input")?;
         let keys = Arc::new(node.keys.clone());
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
@@ -263,8 +280,8 @@ impl DbspGraphBuilder {
         let left_log_limit = Arc::new(AtomicUsize::new(3));
         let right_log_limit = Arc::new(AtomicUsize::new(3));
 
-        let mut left_cursor = StreamCursor::new(delta_left.clone());
-        let mut right_cursor = StreamCursor::new(delta_right.clone());
+        let mut left_cursor = StreamCursor::new(left.clone());
+        let mut right_cursor = StreamCursor::new(right.clone());
         if let Ok((ts, handle)) = left_cursor.snapshot().await
             && left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
         {
@@ -325,40 +342,38 @@ impl DbspGraphBuilder {
             }
         });
 
-        let key_indices: Vec<(usize, usize)> = keys
-            .iter()
-            .map(|k| {
-                let left_name = match k.left_expression().expr() {
-                    datafusion::logical_expr::Expr::Column(c) => c.name.clone(),
-                    other => panic!("unexpected left join key expression: {other:?}"),
-                };
-                let right_name = match k.right_expression().expr() {
-                    datafusion::logical_expr::Expr::Column(c) => c.name.clone(),
-                    other => panic!("unexpected right join key expression: {other:?}"),
-                };
-                let left_idx = left_schema
-                    .field_index(&left_name)
-                    .unwrap_or_else(|| panic!("left key column {left_name} must exist"));
-                let right_idx = right_schema
-                    .field_index(&right_name)
-                    .unwrap_or_else(|| panic!("right key column {right_name} must exist"));
-                (left_idx, right_idx)
-            })
-            .collect();
+        let key_indices =
+            resolve_join_key_indices(&keys, left_schema.as_ref(), right_schema.as_ref())
+                .context("resolve join key indices")?;
 
         let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-            let left_row = decode_projected_row_key(left_bytes)
-                .expect("encoded left row must decode for join");
-            let right_row = decode_projected_row_key(right_bytes)
-                .expect("encoded right row must decode for join");
-            let keys_equal = eval_join_keys(
+            let left_row = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join left row: {err}");
+                    return false;
+                }
+            };
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join right row: {err}");
+                    return false;
+                }
+            };
+            let keys_equal = match eval_join_keys(
                 keys.as_ref(),
                 &left_row,
                 left_schema.as_ref(),
                 &right_row,
                 right_schema.as_ref(),
-            )
-            .unwrap_or(false);
+            ) {
+                Ok(equal) => equal,
+                Err(err) => {
+                    eprintln!("failed to evaluate join keys: {err}");
+                    return false;
+                }
+            };
             let seen_compare = compare_log_limit.fetch_add(1, Ordering::Relaxed);
             if seen_compare < 5 {
                 let mut logged = Vec::new();
@@ -389,27 +404,45 @@ impl DbspGraphBuilder {
                 let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                 combined.extend(left_row.into_iter());
                 combined.extend(right_row.into_iter());
-                eval_expression(expr, &combined, output_schema.as_ref()).unwrap_or(false)
+                match eval_expression(expr, &combined, output_schema.as_ref()) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        eprintln!("failed to evaluate join residual: {err}");
+                        false
+                    }
+                }
             } else {
                 true
             }
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            let mut combined = decode_projected_row_key(left_bytes)
-                .expect("encoded left row must decode for join projection");
-            let right_row = decode_projected_row_key(right_bytes)
-                .expect("encoded right row must decode for join projection");
+            let mut combined = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join projection left row: {err}");
+                    return Vec::new();
+                }
+            };
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join projection right row: {err}");
+                    return Vec::new();
+                }
+            };
             combined.extend(right_row);
-            encode_projected_row_key(&combined).expect("combined join row encoding must succeed")
+            match encode_projected_row_key(&combined) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    eprintln!("failed to encode join projection row: {err}");
+                    Vec::new()
+                }
+            }
         };
 
-        let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-            &delta_left,
-            &delta_right,
-            predicate,
-            projector,
-        )
+        let join =
+            DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&left, &right, predicate, projector)
         .await
         .context("initialize DBSP join")?;
         // Log the first output handle, if any, to verify join activity.
@@ -433,7 +466,6 @@ impl DbspGraphBuilder {
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
     ) -> Result<Stream<ZSetHandle>> {
         let handle_stream = upstream.clone();
-        let mut cursor = StreamCursor::new(upstream);
         let registry_handle = mv_registry.register(view_name.to_string());
         let arrow_schema = schema.to_arrow_schema();
         mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
@@ -445,41 +477,88 @@ impl DbspGraphBuilder {
                 .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
         }
 
-        if let Ok((ts, handle)) = cursor.snapshot().await {
-            let handle_version = handle.version;
+        let mut view = {
+            let mut bridge = self.bridge.lock().await;
+            bridge
+                .new_view(view_name)
+                .await
+                .with_context(|| format!("provision materialized view '{view_name}'"))?
+        };
+        let mut view_handle_stream = view.handle_stream();
+        let view_frontier = view_handle_stream.committed_frontier();
+        if view_frontier >= 0 {
+            let handle = view_handle_stream.get(view_frontier).await?;
             let state = self.state_from_handle(&handle).await?;
             registry_handle.set_dbsp_state(state);
-            registry_handle.publish_version(ts, handle.clone());
-            mv_latest.insert(view_name.to_string(), (ts, handle.clone()));
-            eprintln!(
-                "materialized view '{view_name}' snapshot at version {ts} (handle {})",
-                handle_version
-            );
+            registry_handle.publish_version(view_frontier, handle.clone());
+            mv_latest.insert(view_name.to_string(), (view_frontier, handle));
         }
 
         let registry_clone = registry_handle.clone();
+        let table = {
+            let bridge = self.bridge.lock().await;
+            bridge.table()
+        };
+        let cursor = StreamCursor::new(upstream);
+        let upstream_frontier = cursor.observed();
+        let mut upstream_stream = handle_stream.clone();
+        let mut dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
+        if view_frontier < upstream_frontier {
+            for ts in (view_frontier + 1)..=upstream_frontier {
+                let delta_handle = upstream_stream
+                    .get(ts)
+                    .await
+                    .with_context(|| {
+                        format!("load delta handle for view '{view_name}' at {ts}")
+                    })?;
+                let snapshot_handle = Self::apply_delta_handle_to_view(
+                    &mut view,
+                    table.clone(),
+                    &mut dict_cache,
+                    &delta_handle,
+                )
+                .await
+                .with_context(|| format!("apply delta for view '{view_name}' at {ts}"))?;
+                let state = self.state_from_handle(&snapshot_handle).await?;
+                registry_handle.set_dbsp_state(state);
+                registry_handle.publish_version(ts, snapshot_handle.clone());
+                mv_latest.insert(view_name.to_string(), (ts, snapshot_handle));
+            }
+        }
+
         let bridge_clone = Arc::clone(&self.bridge);
         let view_label = view_name.to_string();
         tokio::spawn(async move {
             let mut cursor = cursor;
+            let mut view = view;
+            let mut dict_cache = dict_cache;
             loop {
                 match cursor.next().await {
-                    Ok((ts, handle)) => {
-                        eprintln!(
-                            "Cursor for view '{view_label}' observed handle version {} at ts {}",
-                            handle.version, ts
-                        );
-                        let handle_clone = handle.clone();
-                        let handle_version = handle.version;
-                        match Self::state_from_handle_with_bridge(&bridge_clone, &handle_clone)
+                    Ok((ts, delta_handle)) => {
+                        let snapshot_handle = match Self::apply_delta_handle_to_view(
+                            &mut view,
+                            table.clone(),
+                            &mut dict_cache,
+                            &delta_handle,
+                        )
+                        .await
+                        {
+                            Ok(handle) => handle,
+                            Err(err) => {
+                                eprintln!(
+                                    "failed to apply delta for materialized view '{view_label}' at {ts}: {err}"
+                                );
+                                continue;
+                            }
+                        };
+                        match Self::state_from_handle_with_bridge(&bridge_clone, &snapshot_handle)
                             .await
                         {
                             Ok(state) => {
                                 registry_clone.set_dbsp_state(state);
-                                registry_clone.publish_version(ts, handle_clone);
+                                registry_clone.publish_version(ts, snapshot_handle);
                                 eprintln!(
-                                    "materialized view '{view_label}' advanced to version {ts} (handle {})",
-                                    handle_version
+                                    "materialized view '{view_label}' advanced to version {ts}"
                                 );
                             }
                             Err(err) => {
@@ -500,6 +579,23 @@ impl DbspGraphBuilder {
         });
 
         Ok(handle_stream)
+    }
+
+    async fn apply_delta_handle_to_view(
+        view: &mut DbspView,
+        table: Arc<dyn KeyValueTable>,
+        dict_cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+        delta_handle: &ZSetHandle,
+    ) -> Result<ZSetHandle> {
+        let deltas = materialize_zset_handle::<Vec<u8>>(table, dict_cache, delta_handle)
+            .await
+            .context("materialize delta handle for materialized view")?;
+        if !deltas.is_empty() {
+            view.add_deltas(deltas);
+        }
+        view.flush()
+            .await
+            .context("flush materialized view updates")
     }
 
     async fn state_from_handle(&self, handle: &ZSetHandle) -> Result<DbspPersistedState> {
@@ -598,6 +694,36 @@ fn eval_projection(
         .iter()
         .map(|expr| eval_df_expr(expr.expression().expr(), row, schema))
         .collect()
+}
+
+fn resolve_join_key_indices(
+    keys: &[DbspJoinKey],
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<Vec<(usize, usize)>> {
+    let mut indices = Vec::with_capacity(keys.len());
+    for key in keys {
+        let left_name = match key.left_expression().expr() {
+            DfExpr::Column(column) => column.name.clone(),
+            other => {
+                bail!("join key expression must be a column on the left, found {other:?}");
+            }
+        };
+        let right_name = match key.right_expression().expr() {
+            DfExpr::Column(column) => column.name.clone(),
+            other => {
+                bail!("join key expression must be a column on the right, found {other:?}");
+            }
+        };
+        let left_idx = left_schema
+            .field_index(&left_name)
+            .ok_or_else(|| anyhow!("left join key column '{left_name}' must exist"))?;
+        let right_idx = right_schema
+            .field_index(&right_name)
+            .ok_or_else(|| anyhow!("right join key column '{right_name}' must exist"))?;
+        indices.push((left_idx, right_idx));
+    }
+    Ok(indices)
 }
 
 fn eval_join_keys(
@@ -888,4 +1014,56 @@ fn resolve_column(schema: &RowSchema, column: &Column) -> Result<usize> {
     schema
         .field_index(&column.name)
         .ok_or_else(|| anyhow!("column {} not found in schema", column.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::Column;
+    use datafusion::logical_expr::Expr as DfExpr;
+    use dbsp::circuit::plan::DbspJoinType;
+    use dbsp::circuit::schema::Field;
+    use dbsp::circuit::types::DbspScalarType;
+
+    fn schema() -> Arc<RowSchema> {
+        RowSchema::try_new(vec![Field::new("id", DbspScalarType::Int64, true)]).expect("schema")
+    }
+
+    #[test]
+    fn join_key_requires_column_expressions() {
+        let schema = schema();
+        let left_expr = DfExpr::Literal(ScalarValue::Int64(Some(1)), None);
+        let right_expr = DfExpr::Column(Column::new_unqualified("id".to_string()));
+        let node = DbspJoinNode::try_new(
+            DbspJoinType::Inner,
+            Arc::clone(&schema),
+            Arc::clone(&schema),
+            vec![(left_expr, right_expr)],
+            None,
+        )
+        .expect("join node");
+
+        let err =
+            resolve_join_key_indices(&node.keys, schema.as_ref(), schema.as_ref()).unwrap_err();
+        assert!(err.to_string().contains("left"));
+    }
+
+    #[test]
+    fn join_key_rejects_non_column_on_right() {
+        let schema = schema();
+        let left_expr = DfExpr::Column(Column::new_unqualified("id".to_string()));
+        let right_expr = DfExpr::Literal(ScalarValue::Int64(Some(1)), None);
+        let node = DbspJoinNode::try_new(
+            DbspJoinType::Inner,
+            Arc::clone(&schema),
+            Arc::clone(&schema),
+            vec![(left_expr, right_expr)],
+            None,
+        )
+        .expect("join node");
+
+        let err =
+            resolve_join_key_indices(&node.keys, schema.as_ref(), schema.as_ref()).unwrap_err();
+        assert!(err.to_string().contains("right"));
+    }
 }

@@ -19,8 +19,13 @@ use crate::storage::timestamps;
 use crate::storage::{KeyValueTable, SlateTable};
 
 /// Logical-time stream: at time `t`, this holds one value of type `T`.
+///
+/// Terminology:
+/// - Logical time: the in-memory timeline advanced by `send`/`push_value_in_place`.
+/// - Committed frontier: the last flushed timestamp that is durable and safe for cross-process reads.
+///
 /// For Floe SQL:
-///   - `Stream<ZSetHandle>` represents the delta (Delta R_t) of a relation `R` at time `t`.
+/// - `Stream<ZSetHandle>` represents the delta (Delta R_t) of a relation `R` at time `t`.
 pub type DeltaStream = Stream<ZSetHandle>;
 
 /// Logical-time stream keyed by a logical transaction index.
@@ -74,7 +79,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    timestamp: i64,
+    logical_timestamp: i64,
     identity: bool,
     default: T,
     pending_data: BTreeMap<i64, T>,
@@ -98,7 +103,7 @@ where
 {
     fn new(default: T) -> Self {
         Self {
-            timestamp: 0,
+            logical_timestamp: 0,
             identity: true,
             default,
             pending_data: BTreeMap::new(),
@@ -214,7 +219,7 @@ where
         self.core.state.write().expect("stream state poisoned")
     }
 
-    fn notify_frontier(&self, ts: i64) {
+    fn notify_committed_frontier(&self, ts: i64) {
         let _ = self.core.frontier_tx.send(ts);
     }
 
@@ -246,7 +251,7 @@ where
 
         let initial_default = group.identity().await;
         let state = StreamState::new(initial_default.clone());
-        let (frontier_tx, frontier_rx) = watch::channel(state.timestamp);
+        let (frontier_tx, frontier_rx) = watch::channel(state.logical_timestamp);
         let core = Arc::new(StreamCore {
             table,
             namespace: namespace.clone(),
@@ -274,7 +279,7 @@ where
                 };
             {
                 let mut state = stream.write_state();
-                state.timestamp = timestamp;
+                state.logical_timestamp = timestamp;
                 state.identity = identity;
                 state.default = default.clone();
                 state.last_default_ts = last_default_ts;
@@ -286,7 +291,7 @@ where
                 state.last_default_ts = state.default_changes.keys().copied().max().unwrap_or(0);
                 let missing_default = state
                     .default_changes
-                    .range(..=state.timestamp)
+                    .range(..=state.logical_timestamp)
                     .next_back()
                     .is_none();
                 if missing_default {
@@ -294,7 +299,7 @@ where
                     state.default_changes.insert(0, default_value);
                 }
             }
-            stream.notify_frontier(timestamp);
+            stream.notify_committed_frontier(timestamp);
         } else {
             {
                 let mut state = stream.write_state();
@@ -352,8 +357,13 @@ where
     pub(crate) fn table(&self) -> Arc<dyn KeyValueTable> {
         self.core.table.clone()
     }
-
+    /// Current logical time (may be ahead of committed frontier).
     pub fn current_time(&self) -> i64 {
+        self.read_state().logical_timestamp
+    }
+
+    /// Last committed frontier persisted to storage.
+    pub fn committed_frontier(&self) -> i64 {
         *self.frontier_rx.borrow()
     }
 
@@ -373,30 +383,29 @@ where
     pub fn handle(&self) -> StreamHandle {
         StreamHandle {
             ns: self.core.namespace.clone(),
-            frontier: self.current_time(),
+            frontier: self.committed_frontier(),
         }
     }
 
     pub async fn send(&mut self, element: T) -> Result<i64> {
         let next_timestamp = {
             let mut state = self.write_state();
-            let next_timestamp = state.timestamp + 1;
+            let next_timestamp = state.logical_timestamp + 1;
             if element != state.default {
                 state.pending_data.insert(next_timestamp, element.clone());
                 state.data_cache.insert(next_timestamp, element);
                 state.identity = false;
             }
-            state.timestamp = next_timestamp;
+            state.logical_timestamp = next_timestamp;
             state.pending_state = true;
             next_timestamp
         };
-        self.notify_frontier(next_timestamp);
         Ok(next_timestamp)
     }
 
     pub async fn set_default(&mut self, new_default: T) -> Result<()> {
         let mut state = self.write_state();
-        let current_ts = state.timestamp;
+        let current_ts = state.logical_timestamp;
         state.default = new_default.clone();
         state.pending_defaults.insert(current_ts, new_default);
         state.pending_state = true;
@@ -415,7 +424,7 @@ where
 
             {
                 let state = self.read_state();
-                if timestamp > state.timestamp {
+                if timestamp > state.logical_timestamp {
                     needs_advance = true;
                 } else if let Some(value) = state.pending_data.get(&timestamp) {
                     return Ok(value.clone());
@@ -470,18 +479,20 @@ where
     pub async fn flush(&mut self) -> Result<()> {
         let mut batch = WriteBatch::new();
         let mut dirty = false;
-
         if self.flush_defaults_into(&mut batch)? {
             dirty = true;
         }
         if self.flush_data_into(&mut batch)? {
             dirty = true;
         }
-        if self.flush_state_into(&mut batch)? {
+        let committed_ts = self.flush_state_into(&mut batch)?;
+        if committed_ts.is_some() {
             dirty = true;
         }
 
         if dirty {
+            let committed_ts =
+                committed_ts.ok_or_else(|| anyhow!("stream flush missing committed timestamp"))?;
             let intent_key = self.encode_intent_key();
             batch.put(intent_key.clone(), vec![1]);
             self.core.table.write_batch(batch).await?;
@@ -489,6 +500,8 @@ where
             let mut cleanup = WriteBatch::new();
             cleanup.delete(intent_key);
             self.core.table.write_batch(cleanup).await?;
+
+            self.notify_committed_frontier(committed_ts);
         }
 
         {
@@ -541,14 +554,14 @@ where
         Ok(true)
     }
 
-    pub(crate) fn flush_state_into(&mut self, batch: &mut WriteBatch) -> Result<bool> {
+    pub(crate) fn flush_state_into(&mut self, batch: &mut WriteBatch) -> Result<Option<i64>> {
         let snapshot = {
             let state = self.read_state();
             if !state.pending_state {
-                return Ok(false);
+                return Ok(None);
             }
             (
-                state.timestamp,
+                state.logical_timestamp,
                 state.identity,
                 state.default.clone(),
                 state.last_default_ts,
@@ -556,7 +569,7 @@ where
         };
         let encoded = encoding::encode(&snapshot).context("unable to encode stream state")?;
         batch.put(self.core.state_key.clone(), encoded);
-        Ok(true)
+        Ok(Some(snapshot.0))
     }
 
     pub async fn advance_to(&mut self, timestamp: i64) -> Result<()> {
@@ -575,32 +588,33 @@ where
         self.core.encode_intent_key()
     }
 
+    /// Subscribe to committed frontier updates.
     pub fn subscribe_frontier(&self) -> watch::Receiver<i64> {
         self.core.frontier_tx.subscribe()
     }
 
+    pub(crate) fn commit_frontier(&self, ts: i64) {
+        self.notify_committed_frontier(ts);
+    }
+
     pub(crate) fn set_default_in_place(&self, value: T) {
         let mut state = self.write_state();
-        let current_ts = state.timestamp;
+        let current_ts = state.logical_timestamp;
         state.default = value.clone();
         state.pending_defaults.insert(current_ts, value);
         state.pending_state = true;
     }
 
     pub(crate) fn push_value_in_place(&self, value: T) {
-        let next_timestamp = {
-            let mut state = self.write_state();
-            let next_timestamp = state.timestamp + 1;
-            if value != state.default {
-                state.pending_data.insert(next_timestamp, value.clone());
-                state.data_cache.insert(next_timestamp, value);
-                state.identity = false;
-            }
-            state.timestamp = next_timestamp;
-            state.pending_state = true;
-            next_timestamp
-        };
-        self.notify_frontier(next_timestamp);
+        let mut state = self.write_state();
+        let next_timestamp = state.logical_timestamp + 1;
+        if value != state.default {
+            state.pending_data.insert(next_timestamp, value.clone());
+            state.data_cache.insert(next_timestamp, value);
+            state.identity = false;
+        }
+        state.logical_timestamp = next_timestamp;
+        state.pending_state = true;
     }
 }
 impl Stream<StreamHandle> {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 use datafusion::execution::context::SessionContext;
 use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
@@ -28,9 +28,10 @@ impl FloeQueryContext {
     pub async fn register_table(&self, table: TableDefinition) -> Result<()> {
         self.storage.upsert_table(table.clone()).await?;
         let provider = SlateTableProvider::new(self.storage.clone(), table.clone());
+        let name = table.name().to_string();
         self.session
             .register_table(table.name(), Arc::new(provider))
-            .map_err(|err| anyhow!(err.to_string()))?;
+            .with_context(|| format!("register table {name}"))?;
         Ok(())
     }
 
@@ -38,9 +39,10 @@ impl FloeQueryContext {
         let tables = self.storage.tables().await?;
         for table in tables {
             let provider = SlateTableProvider::new(self.storage.clone(), table.clone());
+            let name = table.name().to_string();
             self.session
                 .register_table(table.name(), Arc::new(provider))
-                .map_err(|err| anyhow!(err.to_string()))?;
+                .with_context(|| format!("register table {name}"))?;
         }
         Ok(())
     }

@@ -19,5 +19,10 @@ datafusion-common = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
 object_store = { workspace = true }
 rand = "0.8"
+
+[[bench]]
+name = "delta_emission"
+harness = false

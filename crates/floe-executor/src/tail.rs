@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context as TaskContext, Poll};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -91,7 +91,7 @@ impl TailStream {
 impl Stream for TailStream {
     type Item = PgResult<TailBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_recv(cx)
     }
 }
@@ -305,7 +305,11 @@ fn build_record_batches(rows: Vec<Row>, schema: SchemaRef) -> PgResult<Vec<Recor
     }
     let arrays: Vec<ArrayRef> = columns
         .into_iter()
-        .map(|col| ScalarValue::iter_to_array(col).map_err(|err| anyhow!(err.to_string())))
+        .enumerate()
+        .map(|(idx, col)| {
+            ScalarValue::iter_to_array(col)
+                .with_context(|| format!("convert tail column {idx} to array"))
+        })
         .collect::<PgResult<_>>()?;
     let batch = RecordBatch::try_new(schema, arrays)?;
     Ok(vec![batch])

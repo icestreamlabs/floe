@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError};
+use datafusion_common::{DFSchema, DFSchemaRef};
 
 use crate::circuit::types::{DbspScalarType, ScalarValue};
 
@@ -109,7 +109,7 @@ impl RowSchema {
     pub fn to_dfschema(&self) -> Result<DFSchemaRef> {
         let arrow_schema = self.to_arrow_schema();
         let df_schema = DFSchema::try_from((*arrow_schema.as_ref()).clone())
-            .map_err(|err: DataFusionError| anyhow!(err.to_string()))?;
+            .context("convert Arrow schema to DataFusion schema")?;
         Ok(Arc::new(df_schema))
     }
 }

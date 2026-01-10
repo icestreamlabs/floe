@@ -469,7 +469,7 @@ fn gather_handle_streams(
 ) -> std::collections::HashMap<String, Stream<ZSetHandle>> {
     let mut map = std::collections::HashMap::new();
     for source in sources {
-        if let Some(stream) = outer.handle_stream(source) {
+        if let Some(stream) = outer.delta_handle_stream(source) {
             map.insert((*source).to_string(), stream);
         }
     }

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
-use crate::stream::operations::basic::differentiate_zset_stream_live;
 use crate::stream::tests::common::build_db;
 use crate::stream::util::{collect_values, materialize_zset_handle};
 use crate::stream::zset_stream::{StreamRetention, ZSetStream};
@@ -36,10 +35,8 @@ async fn live_diff_emits_empty_delta_for_noop_ticks() {
     // t3: no change
     zset.flush().await.expect("flush t3 noop");
 
-    let diff_stream = differentiate_zset_stream_live::<Vec<u8>>(&zset.handle_stream())
-        .await
-        .expect("build live diff stream");
-    let diff_handles = collect_values(&diff_stream, 3)
+    let diff_stream = zset.delta_handle_stream();
+    let diff_handles = collect_values(&diff_stream, diff_stream.current_time())
         .await
         .expect("collect diff handles");
 

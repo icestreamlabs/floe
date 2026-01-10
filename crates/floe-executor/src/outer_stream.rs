@@ -51,6 +51,10 @@ impl OuterStreamWriter {
         self.stream.handle_stream()
     }
 
+    pub fn delta_handle_stream(&self) -> Stream<ZSetHandle> {
+        self.stream.delta_handle_stream()
+    }
+
     pub fn append(&mut self, row: &[ScalarValue], diff: Diff) -> Result<()> {
         if diff == 0 {
             return Ok(());
@@ -136,6 +140,12 @@ impl OuterStreamRegistry {
         self.writers
             .get(source)
             .map(|writer| writer.handle_stream())
+    }
+
+    pub fn delta_handle_stream(&self, source: &str) -> Option<Stream<ZSetHandle>> {
+        self.writers
+            .get(source)
+            .map(|writer| writer.delta_handle_stream())
     }
 
     pub async fn flush_all(&mut self) -> Result<Vec<OuterStreamHandle>> {

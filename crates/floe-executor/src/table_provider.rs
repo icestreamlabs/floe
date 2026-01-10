@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use datafusion::arrow::array::{ArrayRef, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -393,9 +393,9 @@ fn build_scalar_batches(
     }
 
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_count);
-    for column in columns {
+    for (idx, column) in columns.into_iter().enumerate() {
         let array = ScalarValue::iter_to_array(column.into_iter())
-            .map_err(|err| anyhow!(err.to_string()))?;
+            .with_context(|| format!("convert column {idx} to array"))?;
         arrays.push(array);
     }
 

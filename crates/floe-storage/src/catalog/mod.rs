@@ -183,7 +183,7 @@ fn table_row_key(table: &TableDefinition, row: &RowValues) -> Result<Vec<u8>> {
 }
 
 fn map_slate_err(err: SlateError) -> anyhow::Error {
-    anyhow!(err.to_string())
+    anyhow::Error::new(err)
 }
 
 #[cfg(test)]

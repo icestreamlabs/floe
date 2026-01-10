@@ -40,6 +40,31 @@ async fn send_and_get_values() {
 }
 
 #[tokio::test]
+async fn committed_frontier_advances_after_flush() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+    let mut stream = Stream::new(db, "frontier_commit", group).await.unwrap();
+
+    assert_eq!(stream.current_time(), 0);
+    assert_eq!(stream.committed_frontier(), 0);
+
+    stream.send(5).await.unwrap();
+    assert_eq!(stream.current_time(), 1);
+    assert_eq!(stream.committed_frontier(), 0);
+
+    stream.flush().await.unwrap();
+    assert_eq!(stream.committed_frontier(), 1);
+
+    stream.send(7).await.unwrap();
+    stream.send(9).await.unwrap();
+    assert_eq!(stream.current_time(), 3);
+    assert_eq!(stream.committed_frontier(), 1);
+
+    stream.flush().await.unwrap();
+    assert_eq!(stream.committed_frontier(), 3);
+}
+
+#[tokio::test]
 async fn fills_with_default_when_reading_ahead() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);

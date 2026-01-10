@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow, ensure};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::RowValues;
@@ -46,10 +47,26 @@ impl ColumnDefinition {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TableDefinition {
     name: String,
     columns: Vec<ColumnDefinition>,
+}
+
+impl<'de> Deserialize<'de> for TableDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TableDefinitionData {
+            name: String,
+            columns: Vec<ColumnDefinition>,
+        }
+
+        let data = TableDefinitionData::deserialize(deserializer)?;
+        TableDefinition::new(data.name, data.columns).map_err(de::Error::custom)
+    }
 }
 
 impl TableDefinition {
@@ -107,5 +124,34 @@ impl TableDefinition {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_rejects_invalid_table_definition() {
+        let cases = [
+            r#"{"name":"","columns":[{"name":"id","data_type":"Int64","primary_key":true}]}"#,
+            r#"{"name":"missing_pk","columns":[{"name":"id","data_type":"Int64","primary_key":false}]}"#,
+            r#"{"name":"two_pk","columns":[{"name":"id","data_type":"Int64","primary_key":true},{"name":"other","data_type":"Int64","primary_key":true}]}"#,
+            r#"{"name":"no_cols","columns":[]}"#,
+        ];
+
+        for json in cases {
+            let result = serde_json::from_str::<TableDefinition>(json);
+            assert!(result.is_err(), "expected error for {json}");
+        }
+    }
+
+    #[test]
+    fn deserialize_accepts_valid_table_definition() {
+        let json =
+            r#"{"name":"ok","columns":[{"name":"id","data_type":"Int64","primary_key":true}]}"#;
+        let table = serde_json::from_str::<TableDefinition>(json).expect("valid table");
+        assert_eq!(table.name(), "ok");
+        assert_eq!(table.columns().len(), 1);
     }
 }

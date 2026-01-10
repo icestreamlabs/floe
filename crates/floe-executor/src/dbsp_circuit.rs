@@ -218,12 +218,24 @@ impl DbspCircuitInstance {
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
             let row = match decode_row(bytes) {
                 Ok(row) => row,
-                Err(_) => return Vec::new(),
+                Err(err) => {
+                    eprintln!("failed to decode projection row: {err}");
+                    return Vec::new();
+                }
             };
-            match projector_eval.project(&row) {
-                Ok(projected) => encode_projected_row_key(&projected)
-                    .expect("projected row encoding must succeed"),
-                Err(_) => Vec::new(),
+            let projected = match projector_eval.project(&row) {
+                Ok(projected) => projected,
+                Err(err) => {
+                    eprintln!("failed to evaluate projection: {err}");
+                    return Vec::new();
+                }
+            };
+            match encode_projected_row_key(&projected) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    eprintln!("failed to encode projected row: {err}");
+                    Vec::new()
+                }
             }
         };
         let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector).await?;
@@ -257,14 +269,26 @@ impl DbspCircuitInstance {
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             let left_row = match decode_row(left_bytes) {
                 Ok(row) => row,
-                Err(_) => return Vec::new(),
+                Err(err) => {
+                    eprintln!("failed to decode join left row: {err}");
+                    return Vec::new();
+                }
             };
             let right_row = match decode_row(right_bytes) {
                 Ok(row) => row,
-                Err(_) => return Vec::new(),
+                Err(err) => {
+                    eprintln!("failed to decode join right row: {err}");
+                    return Vec::new();
+                }
             };
             let combined = projector_eval.project(&left_row, &right_row);
-            encode_projected_row_key(&combined).expect("combined join row encoding must succeed")
+            match encode_projected_row_key(&combined) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    eprintln!("failed to encode join projection row: {err}");
+                    Vec::new()
+                }
+            }
         };
 
         let join =
