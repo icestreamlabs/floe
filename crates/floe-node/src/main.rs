@@ -20,6 +20,7 @@ use floe_executor::{
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
 use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
 use crate::executor::{available_sources_from_registry, build_dataflows};
@@ -143,36 +144,63 @@ async fn main() -> anyhow::Result<()> {
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut rx = event_rx;
         let mut epoch: u64 = 0;
-        while let Some(event) = rx.recv().await {
-            epoch = epoch.saturating_add(1);
-            let source_name = event.source().to_string();
-            let decoder = match decoder_for_task.get(&source_name) {
-                Some(decoder) => decoder,
-                None => continue,
-            };
-            let (row, _ts) = match decoder.decode(&event) {
-                Ok(result) => result,
-                Err(err) => {
-                    eprintln!("failed to decode source event for {source_name}: {err}");
-                    continue;
+        const MAX_BATCH: usize = 256;
+        while let Some(first_event) = rx.recv().await {
+            let mut batch = Vec::with_capacity(MAX_BATCH);
+            batch.push(first_event);
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok(event) => batch.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
                 }
-            };
+            }
+
+            let mut decoded_rows = Vec::with_capacity(batch.len());
+            for event in batch {
+                let source_name = event.source().to_string();
+                let decoder = match decoder_for_task.get(&source_name) {
+                    Some(decoder) => decoder,
+                    None => continue,
+                };
+                let (row, _ts) = match decoder.decode(&event) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        eprintln!("failed to decode source event for {source_name}: {err}");
+                        continue;
+                    }
+                };
+                decoded_rows.push((source_name, row));
+            }
+
+            if decoded_rows.is_empty() {
+                continue;
+            }
 
             let mut registry = outer_for_task.lock().await;
-            let Some(writer) = registry.writer_mut(&source_name) else {
-                eprintln!("no writer for source {source_name}, skipping row");
-                continue;
-            };
-            if let Err(err) = writer.append(&row, 1) {
-                eprintln!("failed to append row for '{source_name}': {err}");
-                continue;
-            }
-            if source_name == generator::BID_SOURCE_NAME {
-                eprintln!("ingested bid row: {:?}", row);
-            } else if source_name == generator::AUCTION_SOURCE_NAME {
-                eprintln!("ingested auction row: {:?}", row);
+            let mut changed = false;
+            for (source_name, row) in decoded_rows {
+                let Some(writer) = registry.writer_mut(&source_name) else {
+                    eprintln!("no writer for source {source_name}, skipping row");
+                    continue;
+                };
+                if let Err(err) = writer.append(&row, 1) {
+                    eprintln!("failed to append row for '{source_name}': {err}");
+                    continue;
+                }
+                changed = true;
+                if source_name == generator::BID_SOURCE_NAME {
+                    eprintln!("ingested bid row: {:?}", row);
+                } else if source_name == generator::AUCTION_SOURCE_NAME {
+                    eprintln!("ingested auction row: {:?}", row);
+                }
             }
 
+            if !changed {
+                continue;
+            }
+
+            epoch = epoch.saturating_add(1);
             // Advance frontier for all sources this epoch, even if they had no rows.
             if let Err(err) = registry.tick_all().await {
                 eprintln!("failed to tick outer streams at epoch {epoch}: {err}");
@@ -249,7 +277,7 @@ fn df_schema_to_arrow(schema: &DFSchemaRef) -> anyhow::Result<SchemaRef> {
 fn gather_handle_streams(
     registry: &OuterStreamRegistry,
     sources: &BTreeSet<String>,
-) -> HashMap<String, dbsp::Stream<dbsp::handles::ZSetHandle>> {
+) -> HashMap<String, dbsp::DeltaHandleStream> {
     let mut map = HashMap::new();
     for source in sources {
         if let Some(stream) = registry.delta_handle_stream(source) {

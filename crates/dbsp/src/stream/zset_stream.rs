@@ -19,6 +19,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::core::stream::Stream;
 use super::groups::HandleGroup;
+use super::roles::{DeltaHandleStream, SnapshotHandleStream};
 use super::util::collect_values;
 
 const DELTA_SUFFIX: &str = "/delta";
@@ -212,12 +213,12 @@ where
         self.handle_view(&self.current_handle)
     }
 
-    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
-        self.stream.clone()
+    pub fn handle_stream(&self) -> SnapshotHandleStream {
+        SnapshotHandleStream::new(self.stream.clone())
     }
 
-    pub fn delta_handle_stream(&self) -> Stream<ZSetHandle> {
-        self.delta_stream.clone()
+    pub fn delta_handle_stream(&self) -> DeltaHandleStream {
+        DeltaHandleStream::new(self.delta_stream.clone())
     }
 
     /// Publishes an externally produced [`ZSetHandle`] into this stream
@@ -228,6 +229,9 @@ where
             .send(handle.clone())
             .await
             .context("publish handle to stream")?;
+        if self.stream.default_value() != handle {
+            self.stream.set_default_in_place(handle.clone());
+        }
         self.stream.flush().await.context("flush handle stream")?;
         Ok(())
     }
@@ -403,6 +407,9 @@ where
             .send(delta_handle.clone())
             .await
             .context("append delta handle to stream")?;
+        if self.stream.default_value() != new_handle {
+            self.stream.set_default_in_place(new_handle.clone());
+        }
 
         let (stream_dirty, committed_ts) = flush_stream_into_batch(&mut self.stream, &mut batch)?;
         if stream_dirty {

@@ -6,9 +6,8 @@ use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{col, table_scan};
 use datafusion::scalar::ScalarValue;
-use dbsp::Stream;
 use dbsp::circuit::CircuitPlan;
-use dbsp::handles::{ZSetHandle, ZSetHandleView};
+use dbsp::handles::ZSetHandleView;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
@@ -248,7 +247,7 @@ fn build_q1_plan() -> CircuitPlan {
 fn gather_handle_streams(
     registry: &OuterStreamRegistry,
     sources: &[&str],
-) -> HashMap<String, Stream<ZSetHandle>> {
+) -> HashMap<String, dbsp::DeltaHandleStream> {
     let mut map = HashMap::new();
     for source in sources {
         if let Some(stream) = registry.delta_handle_stream(source) {

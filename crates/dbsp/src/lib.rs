@@ -33,10 +33,11 @@ pub use operators::join::JoinOp;
 pub use operators::map::MapOp;
 pub use relation_state::RelationState;
 pub use stream::{
-    Stream, StreamRetention, ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate,
-    incrementalize2, integrate, lift1, lift2, lifted_delay, lifted_differentiate,
-    lifted_h_zset_stream, lifted_integrate, lifted_join_zset_stream, lifted_lifted_h_zset_stream,
-    lifted_lifted_join_zset_stream, lifted_lifted_project_zset_stream,
-    lifted_lifted_select_zset_stream, lifted_project_zset_stream, lifted_select_zset_stream,
-    lifted_stream_elimination, lifted_stream_introduction, stream_elimination, stream_introduction,
+    DeltaHandleStream, SnapshotHandleStream, Stream, StreamRetention, ZSetStream, delay,
+    delta_lifted_delta_lifted_join, differentiate, incrementalize2, integrate, lift1, lift2,
+    lifted_delay, lifted_differentiate, lifted_h_zset_stream, lifted_integrate,
+    lifted_join_zset_stream, lifted_lifted_h_zset_stream, lifted_lifted_join_zset_stream,
+    lifted_lifted_project_zset_stream, lifted_lifted_select_zset_stream, lifted_project_zset_stream,
+    lifted_select_zset_stream, lifted_stream_elimination, lifted_stream_introduction,
+    stream_elimination, stream_introduction,
 };

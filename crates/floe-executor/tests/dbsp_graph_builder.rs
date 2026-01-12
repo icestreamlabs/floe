@@ -5,8 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
 use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
-use dbsp::Stream;
-use dbsp::handles::{ZSetHandle, ZSetHandleView};
+use dbsp::handles::ZSetHandleView;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
@@ -276,7 +275,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 fn gather_handle_streams(
     registry: &OuterStreamRegistry,
     sources: &[&str],
-) -> HashMap<String, Stream<ZSetHandle>> {
+) -> HashMap<String, dbsp::DeltaHandleStream> {
     let mut map = HashMap::new();
     for source in sources {
         if let Some(stream) = registry.delta_handle_stream(source) {

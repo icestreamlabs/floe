@@ -15,7 +15,7 @@ use crate::operators::filter::FilterOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
+use crate::stream::DeltaHandleStream;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
@@ -24,11 +24,11 @@ use crate::stream::util::{
 
 /// Filter wrapper that drives the FilterOp over handle streams.
 pub struct DbspFilter {
-    stream: Stream<ZSetHandle>,
+    stream: DeltaHandleStream,
 }
 
 impl DbspFilter {
-    pub async fn new<K, P>(input: &Stream<ZSetHandle>, predicate: P) -> anyhow::Result<Self>
+    pub async fn new<K, P>(input: &DeltaHandleStream, predicate: P) -> anyhow::Result<Self>
     where
         K: Archive
             + Clone
@@ -97,7 +97,7 @@ impl DbspFilter {
             }
         }
 
-        let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, handles| {
+        let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
             let op = Arc::clone(&filter_op);
             let writer = Arc::clone(&writer);
             let handles_vec = handles.to_vec();
@@ -128,10 +128,12 @@ impl DbspFilter {
         });
 
         stream.flush().await?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream: DeltaHandleStream::new(stream),
+        })
     }
 
-    pub fn stream(&self) -> Stream<ZSetHandle> {
+    pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
     }
 }

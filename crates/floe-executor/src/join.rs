@@ -53,6 +53,43 @@ impl JoinEvaluator {
         }
     }
 
+    pub fn left_key(&self, left: &Row) -> Result<Option<Row>> {
+        let mut values = Vec::with_capacity(self.key_evaluators.len());
+        for (left_eval, _) in &self.key_evaluators {
+            let value = left_eval.eval(left)?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            values.push(value);
+        }
+        Ok(Some(values))
+    }
+
+    pub fn right_key(&self, right: &Row) -> Result<Option<Row>> {
+        let mut values = Vec::with_capacity(self.key_evaluators.len());
+        for (_, right_eval) in &self.key_evaluators {
+            let value = right_eval.eval(right)?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            values.push(value);
+        }
+        Ok(Some(values))
+    }
+
+    pub fn residual_matches(&self, left: &Row, right: &Row) -> Result<bool> {
+        if let Some(residual) = &self.residual {
+            let combined = self.combine(left, right);
+            residual.eval_bool(&combined)
+        } else {
+            Ok(true)
+        }
+    }
+
+    pub fn has_residual(&self) -> bool {
+        self.residual.is_some()
+    }
+
     pub fn project(&self, left: &Row, right: &Row) -> Row {
         self.combine(left, right)
     }

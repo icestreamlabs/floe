@@ -10,7 +10,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{Stream, StreamRetention, ZSetStream};
+use dbsp::stream::SnapshotHandleStream;
+use dbsp::{StreamRetention, ZSetStream};
 use slatedb::Db;
 
 use crate::namespaces;
@@ -170,7 +171,7 @@ impl DbspView {
         self.zset.latest_view()
     }
 
-    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
+    pub fn handle_stream(&self) -> SnapshotHandleStream {
         self.zset.handle_stream()
     }
 }

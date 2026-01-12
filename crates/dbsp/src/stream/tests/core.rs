@@ -305,7 +305,7 @@ async fn stream_cursor_tracks_new_versions() {
     .await
     .expect("create zset stream");
     let stream = zset.handle_stream();
-    let mut cursor = StreamCursor::new(stream);
+    let mut cursor = StreamCursor::new(stream.stream());
 
     let (ts0, handle0) = cursor.snapshot().await.expect("snapshot ts0");
     assert_eq!(ts0, 0);
@@ -497,7 +497,7 @@ async fn handle_operator_runtime_waits_for_alignment() {
     let records_clone = Arc::clone(&records);
 
     let mut runtime = HandleOperatorRuntime::new(
-        vec![left.handle_stream(), right.handle_stream()],
+        vec![left.handle_stream().stream(), right.handle_stream().stream()],
         move |ts, handles| {
             let records = Arc::clone(&records_clone);
             let snapshot = handles.to_vec();
@@ -593,7 +593,10 @@ async fn pipeline_invokes_operator_with_aligned_inputs() {
 
     let observed: ObservedHandles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    let mut pipeline = PipelineBuilder::new(vec![left.handle_stream(), right.handle_stream()])
+    let mut pipeline = PipelineBuilder::new(vec![
+        left.handle_stream().stream(),
+        right.handle_stream().stream(),
+    ])
         .push_op(RecordingOp {
             observed: Arc::clone(&observed),
         })
@@ -644,7 +647,7 @@ async fn single_input_pipeline_passes_through_operator() {
     let observed: ObservedHandles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     let mut pipeline = single_input_pipeline(
-        stream.handle_stream(),
+        stream.handle_stream().stream(),
         vec![
             Box::new(PassthroughOp),
             Box::new(RecordingOp {

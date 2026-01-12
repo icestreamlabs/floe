@@ -15,12 +15,11 @@ use dbsp::circuit::plan::{DbspJoinKey, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
-use dbsp::stream::StreamCursor;
+use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{
     CircuitNode, CircuitPlan, DbspExpression, DbspFilter, DbspJoin, DbspJoinNode, DbspMap,
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
-    Stream,
 };
 use tokio::sync::Mutex;
 
@@ -86,11 +85,11 @@ impl DbspGraphBuilder {
         &mut self,
         plan: &CircuitPlan,
         node_idx: usize,
-        outer_streams: &HashMap<String, Stream<ZSetHandle>>,
-        built: &mut HashMap<usize, Stream<ZSetHandle>>,
+        outer_streams: &HashMap<String, DeltaHandleStream>,
+        built: &mut HashMap<usize, DeltaHandleStream>,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
-    ) -> Result<Stream<ZSetHandle>> {
+    ) -> Result<DeltaHandleStream> {
         if let Some(stream) = built.get(&node_idx) {
             return Ok(stream.clone());
         }
@@ -185,8 +184,8 @@ impl DbspGraphBuilder {
     async fn compile_source(
         &self,
         source: &DbspSourceNode,
-        outer_streams: &HashMap<String, Stream<ZSetHandle>>,
-    ) -> Result<Stream<ZSetHandle>> {
+        outer_streams: &HashMap<String, DeltaHandleStream>,
+    ) -> Result<DeltaHandleStream> {
         eprintln!(
             "Attaching DBSP source node '{}' to outer stream",
             source.table.name
@@ -201,8 +200,8 @@ impl DbspGraphBuilder {
     async fn compile_filter(
         &mut self,
         node: &DbspSelectNode,
-        upstream: Stream<ZSetHandle>,
-    ) -> Result<Stream<ZSetHandle>> {
+        upstream: DeltaHandleStream,
+    ) -> Result<DeltaHandleStream> {
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
@@ -230,8 +229,8 @@ impl DbspGraphBuilder {
     async fn compile_map(
         &mut self,
         node: &DbspProjectNode,
-        upstream: Stream<ZSetHandle>,
-    ) -> Result<Stream<ZSetHandle>> {
+        upstream: DeltaHandleStream,
+    ) -> Result<DeltaHandleStream> {
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
@@ -266,22 +265,19 @@ impl DbspGraphBuilder {
     async fn compile_join(
         &mut self,
         node: &DbspJoinNode,
-        left: Stream<ZSetHandle>,
-        right: Stream<ZSetHandle>,
-    ) -> Result<Stream<ZSetHandle>> {
-        let keys = Arc::new(node.keys.clone());
+        left: DeltaHandleStream,
+        right: DeltaHandleStream,
+    ) -> Result<DeltaHandleStream> {
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
         let residual = node.residual.clone();
         let output_schema = Arc::clone(&node.output_schema);
 
-        let match_log_limit = Arc::new(AtomicUsize::new(0));
-        let compare_log_limit = Arc::new(AtomicUsize::new(0));
         let left_log_limit = Arc::new(AtomicUsize::new(3));
         let right_log_limit = Arc::new(AtomicUsize::new(3));
 
-        let mut left_cursor = StreamCursor::new(left.clone());
-        let mut right_cursor = StreamCursor::new(right.clone());
+        let mut left_cursor = StreamCursor::new(left.stream());
+        let mut right_cursor = StreamCursor::new(right.stream());
         if let Ok((ts, handle)) = left_cursor.snapshot().await
             && left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
         {
@@ -343,10 +339,78 @@ impl DbspGraphBuilder {
         });
 
         let key_indices =
-            resolve_join_key_indices(&keys, left_schema.as_ref(), right_schema.as_ref())
+            resolve_join_key_indices(&node.keys, left_schema.as_ref(), right_schema.as_ref())
                 .context("resolve join key indices")?;
+        let key_indices = Arc::new(key_indices);
+        let left_key_indices = Arc::clone(&key_indices);
+        let right_key_indices = Arc::clone(&key_indices);
+
+        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            let left_row = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join left key: {err}");
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(left_key_indices.len());
+            for (li, _) in left_key_indices.iter() {
+                let value = match left_row.get(*li) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("join left key index {li} out of bounds");
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            match encode_projected_row_key(&key_columns) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    eprintln!("failed to encode join left key: {err}");
+                    None
+                }
+            }
+        };
+
+        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    eprintln!("failed to decode join right key: {err}");
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(right_key_indices.len());
+            for (_, ri) in right_key_indices.iter() {
+                let value = match right_row.get(*ri) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("join right key index {ri} out of bounds");
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            match encode_projected_row_key(&key_columns) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    eprintln!("failed to encode join right key: {err}");
+                    None
+                }
+            }
+        };
 
         let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
+            let Some(expr) = residual.as_ref() else {
+                return true;
+            };
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -361,58 +425,15 @@ impl DbspGraphBuilder {
                     return false;
                 }
             };
-            let keys_equal = match eval_join_keys(
-                keys.as_ref(),
-                &left_row,
-                left_schema.as_ref(),
-                &right_row,
-                right_schema.as_ref(),
-            ) {
-                Ok(equal) => equal,
+            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+            combined.extend(left_row.into_iter());
+            combined.extend(right_row.into_iter());
+            match eval_expression(expr, &combined, output_schema.as_ref()) {
+                Ok(result) => result,
                 Err(err) => {
-                    eprintln!("failed to evaluate join keys: {err}");
-                    return false;
+                    eprintln!("failed to evaluate join residual: {err}");
+                    false
                 }
-            };
-            let seen_compare = compare_log_limit.fetch_add(1, Ordering::Relaxed);
-            if seen_compare < 5 {
-                let mut logged = Vec::new();
-                for (li, ri) in &key_indices {
-                    let left_key = left_row.get(*li).cloned();
-                    let right_key = right_row.get(*ri).cloned();
-                    logged.push((left_key, right_key));
-                }
-                eprintln!(
-                    "join key comparison #{seen_compare}: equal={keys_equal}, pairs={logged:?}"
-                );
-            } else if seen_compare < 10 && !keys_equal {
-                eprintln!(
-                    "join key comparison #{seen_compare}: no match for first key pair {:?}",
-                    key_indices.first().map(|(li, ri)| {
-                        (left_row.get(*li).cloned(), right_row.get(*ri).cloned())
-                    })
-                );
-            }
-            if !keys_equal {
-                return false;
-            }
-            let seen = match_log_limit.fetch_add(1, Ordering::Relaxed);
-            if seen < 5 {
-                eprintln!("join predicate matched on keys");
-            }
-            if let Some(expr) = residual.as_ref() {
-                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-                combined.extend(left_row.into_iter());
-                combined.extend(right_row.into_iter());
-                match eval_expression(expr, &combined, output_schema.as_ref()) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        eprintln!("failed to evaluate join residual: {err}");
-                        false
-                    }
-                }
-            } else {
-                true
             }
         };
 
@@ -441,12 +462,18 @@ impl DbspGraphBuilder {
             }
         };
 
-        let join =
-            DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(&left, &right, predicate, projector)
+        let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+            &left,
+            &right,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+        )
         .await
         .context("initialize DBSP join")?;
         // Log the first output handle, if any, to verify join activity.
-        let mut join_cursor = StreamCursor::new(join.stream());
+        let mut join_cursor = StreamCursor::new(join.stream().stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {
             eprintln!(
                 "join output snapshot version {} at ts {}",
@@ -461,10 +488,10 @@ impl DbspGraphBuilder {
         &mut self,
         view_name: &str,
         schema: Arc<RowSchema>,
-        upstream: Stream<ZSetHandle>,
+        upstream: DeltaHandleStream,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
-    ) -> Result<Stream<ZSetHandle>> {
+    ) -> Result<DeltaHandleStream> {
         let handle_stream = upstream.clone();
         let registry_handle = mv_registry.register(view_name.to_string());
         let arrow_schema = schema.to_arrow_schema();
@@ -499,9 +526,9 @@ impl DbspGraphBuilder {
             let bridge = self.bridge.lock().await;
             bridge.table()
         };
-        let cursor = StreamCursor::new(upstream);
+        let cursor = StreamCursor::new(upstream.stream());
         let upstream_frontier = cursor.observed();
-        let mut upstream_stream = handle_stream.clone();
+        let mut upstream_stream = handle_stream.stream();
         let mut dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
         if view_frontier < upstream_frontier {
             for ts in (view_frontier + 1)..=upstream_frontier {
@@ -632,11 +659,11 @@ pub struct BuildInputs<'a> {
     pub view_name: &'a str,
     pub plan: &'a CircuitPlan,
     pub mv_registry: Arc<MaterializedViewRegistry>,
-    pub outer_handle_streams: &'a HashMap<String, Stream<ZSetHandle>>,
+    pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
 }
 
 pub struct BuildOutputs {
-    pub node_streams: HashMap<usize, Stream<ZSetHandle>>,
+    pub node_streams: HashMap<usize, DeltaHandleStream>,
     pub mv_latest: HashMap<String, (i64, ZSetHandle)>,
     pub required_sources: BTreeSet<String>,
 }
@@ -724,23 +751,6 @@ fn resolve_join_key_indices(
         indices.push((left_idx, right_idx));
     }
     Ok(indices)
-}
-
-fn eval_join_keys(
-    keys: &[DbspJoinKey],
-    left: &[ScalarValue],
-    left_schema: &RowSchema,
-    right: &[ScalarValue],
-    right_schema: &RowSchema,
-) -> Result<bool> {
-    for key in keys {
-        let left_value = eval_df_expr(key.left_expression().expr(), left, left_schema)?;
-        let right_value = eval_df_expr(key.right_expression().expr(), right, right_schema)?;
-        if !scalar_equals(&left_value, &right_value)?.unwrap_or(false) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn eval_expression(expr: &DbspExpression, row: &[ScalarValue], schema: &RowSchema) -> Result<bool> {

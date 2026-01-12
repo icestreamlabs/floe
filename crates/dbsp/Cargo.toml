@@ -26,3 +26,7 @@ rand = "0.8"
 [[bench]]
 name = "delta_emission"
 harness = false
+
+[[bench]]
+name = "incremental_join"
+harness = false

@@ -4,8 +4,6 @@ use anyhow::{Context, Result};
 use datafusion::arrow::array::{Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::scalar::ScalarValue;
-use dbsp::Stream;
-use dbsp::handles::ZSetHandle;
 use dbsp::handles::ZSetHandleView;
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{
@@ -466,7 +464,7 @@ fn auction_row(
 fn gather_handle_streams(
     outer: &OuterStreamRegistry,
     sources: &[&str],
-) -> std::collections::HashMap<String, Stream<ZSetHandle>> {
+) -> std::collections::HashMap<String, dbsp::DeltaHandleStream> {
     let mut map = std::collections::HashMap::new();
     for source in sources {
         if let Some(stream) = outer.delta_handle_stream(source) {

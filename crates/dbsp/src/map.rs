@@ -15,7 +15,7 @@ use crate::operators::map::MapOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
+use crate::stream::DeltaHandleStream;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
@@ -24,12 +24,12 @@ use crate::stream::util::{
 
 /// Map wrapper that drives the MapOp over handle streams.
 pub struct DbspMap {
-    stream: Stream<ZSetHandle>,
+    stream: DeltaHandleStream,
 }
 
 impl DbspMap {
     pub async fn new<K, R, FProj>(
-        input: &Stream<ZSetHandle>,
+        input: &DeltaHandleStream,
         projector: FProj,
     ) -> anyhow::Result<Self>
     where
@@ -108,7 +108,7 @@ impl DbspMap {
             }
         }
 
-        let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, handles| {
+        let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
             let op = Arc::clone(&map_op);
             let writer = Arc::clone(&writer);
             let handles_vec = handles.to_vec();
@@ -139,10 +139,12 @@ impl DbspMap {
         });
 
         stream.flush().await?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream: DeltaHandleStream::new(stream),
+        })
     }
 
-    pub fn stream(&self) -> Stream<ZSetHandle> {
+    pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
     }
 }

@@ -16,7 +16,7 @@ use crate::operators::join::JoinOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
+use crate::stream::{DeltaHandleStream, Stream};
 use crate::stream::runtime::{DeltaOperator, HandleOperatorRuntime};
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
@@ -24,13 +24,15 @@ use crate::stream::util::{
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
-    stream: Stream<ZSetHandle>,
+    stream: DeltaHandleStream,
 }
 
 impl DbspJoin {
-    pub async fn new<L, R, O, P, F>(
-        left: &Stream<ZSetHandle>,
-        right: &Stream<ZSetHandle>,
+    pub async fn new<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        left_key: KL,
+        right_key: KR,
         predicate: P,
         projector: F,
     ) -> Result<Self>
@@ -62,6 +64,17 @@ impl DbspJoin {
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
+        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
@@ -82,10 +95,22 @@ impl DbspJoin {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for join")?;
+        let left_index = crate::collections::IndexedZSet::new(
+            table.clone(),
+            format!("join_left_index_{join_id}"),
+        );
+        let right_index = crate::collections::IndexedZSet::new(
+            table.clone(),
+            format!("join_right_index_{join_id}"),
+        );
 
         let join_op = Arc::new(AsyncMutex::new(JoinOp::new(
             left_state,
             right_state,
+            left_index,
+            right_index,
+            Arc::new(left_key),
+            Arc::new(right_key),
             Arc::new(predicate),
             Arc::new(projector),
             table.clone(),
@@ -133,7 +158,7 @@ impl DbspJoin {
 
         let op = Arc::clone(&join_op);
         let mut runtime =
-            HandleOperatorRuntime::new(vec![left.clone(), right.clone()], move |ts, handles| {
+            HandleOperatorRuntime::new(vec![left.stream(), right.stream()], move |ts, handles| {
                 let op = Arc::clone(&op);
                 let writer = Arc::clone(&writer);
                 let handles = handles.to_vec();
@@ -161,16 +186,18 @@ impl DbspJoin {
         });
 
         stream.flush().await?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream: DeltaHandleStream::new(stream),
+        })
     }
 
-    pub fn stream(&self) -> Stream<ZSetHandle> {
+    pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
     }
 }
 
-async fn drive_join<L, R, O>(
-    op: &Arc<AsyncMutex<JoinOp<L, R, O>>>,
+async fn drive_join<L, R, O, K>(
+    op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
     writer: &Arc<AsyncMutex<Stream<ZSetHandle>>>,
     ts: i64,
     handles: Vec<ZSetHandle>,
@@ -203,6 +230,15 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let mut op_guard = op.lock().await;
     if let Some(out) = op_guard.on_step(ts, &handles).await? {

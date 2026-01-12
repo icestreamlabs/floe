@@ -6,10 +6,10 @@ use dbsp::circuit::tables::{
     nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
     nexmark_person_alias_table, nexmark_person_table,
 };
-use dbsp::handles::ZSetHandle;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{Stream, StreamRetention, ZSetStream};
+use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
+use dbsp::{StreamRetention, ZSetStream};
 use nexmark::event::{Auction, Bid, Event, Person};
 use slatedb::Db;
 
@@ -115,8 +115,19 @@ impl DbspTableEnvironment {
     }
 
     /// Returns the handle stream backing the provided table descriptor.
-    pub fn handle_stream_for(&self, table: &dbsp::TableDescriptor) -> Option<Stream<ZSetHandle>> {
+    pub fn handle_stream_for(
+        &self,
+        table: &dbsp::TableDescriptor,
+    ) -> Option<SnapshotHandleStream> {
         self.zset_for(table).map(|zset| zset.handle_stream())
+    }
+
+    pub fn delta_handle_stream_for(
+        &self,
+        table: &dbsp::TableDescriptor,
+    ) -> Option<DeltaHandleStream> {
+        self.zset_for(table)
+            .map(|zset| zset.delta_handle_stream())
     }
 
     /// Provides mutable access to the ZSet stream for a table descriptor.

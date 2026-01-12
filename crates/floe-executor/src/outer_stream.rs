@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
-use dbsp::handles::ZSetHandle;
-use dbsp::{Stream, StreamRetention, ZSetStream};
+use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
+use dbsp::{StreamRetention, ZSetStream};
 
 use crate::codec::ensure_outer_stream_codec;
 use crate::dbsp_bridge::DbspBridge;
@@ -47,11 +47,11 @@ impl OuterStreamWriter {
         &self.namespace
     }
 
-    pub fn handle_stream(&self) -> Stream<ZSetHandle> {
+    pub fn handle_stream(&self) -> SnapshotHandleStream {
         self.stream.handle_stream()
     }
 
-    pub fn delta_handle_stream(&self) -> Stream<ZSetHandle> {
+    pub fn delta_handle_stream(&self) -> DeltaHandleStream {
         self.stream.delta_handle_stream()
     }
 
@@ -136,13 +136,13 @@ impl OuterStreamRegistry {
         self.writers.get_mut(source)
     }
 
-    pub fn handle_stream(&self, source: &str) -> Option<Stream<ZSetHandle>> {
+    pub fn handle_stream(&self, source: &str) -> Option<SnapshotHandleStream> {
         self.writers
             .get(source)
             .map(|writer| writer.handle_stream())
     }
 
-    pub fn delta_handle_stream(&self, source: &str) -> Option<Stream<ZSetHandle>> {
+    pub fn delta_handle_stream(&self, source: &str) -> Option<DeltaHandleStream> {
         self.writers
             .get(source)
             .map(|writer| writer.delta_handle_stream())
