@@ -6,6 +6,7 @@ use crate::dbsp_bridge::{DbspBridge, DbspView};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::task_events::{GraphTaskSender, report_graph_task_error};
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use datafusion::common::Column;
@@ -16,12 +17,14 @@ use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
+use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{
     CircuitNode, CircuitPlan, DbspExpression, DbspFilter, DbspJoin, DbspJoinNode, DbspMap,
     DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSourceNode, RowSchema,
 };
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -52,6 +55,8 @@ impl DbspGraphBuilder {
                 inputs.plan,
                 inputs.plan.root,
                 inputs.outer_handle_streams,
+                &inputs.cancel,
+                &inputs.task_events,
                 &mut built,
                 &inputs.mv_registry,
                 &mut mv_latest,
@@ -67,6 +72,8 @@ impl DbspGraphBuilder {
                 inputs.view_name,
                 root_schema,
                 root_stream,
+                &inputs.cancel,
+                &inputs.task_events,
                 &inputs.mv_registry,
                 &mut mv_latest,
             )
@@ -86,6 +93,8 @@ impl DbspGraphBuilder {
         plan: &CircuitPlan,
         node_idx: usize,
         outer_streams: &HashMap<String, DeltaHandleStream>,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
         built: &mut HashMap<usize, DeltaHandleStream>,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
@@ -109,12 +118,14 @@ impl DbspGraphBuilder {
                         plan,
                         input_idx,
                         outer_streams,
+                        cancel,
+                        task_events,
                         built,
                         mv_registry,
                         mv_latest,
                     )
                     .await?;
-                self.compile_filter(select, upstream).await?
+                self.compile_filter(select, upstream, task_events).await?
             }
             DbspNodeKind::Project(project) => {
                 let input_idx = first_input(node, "project")?;
@@ -123,29 +134,43 @@ impl DbspGraphBuilder {
                         plan,
                         input_idx,
                         outer_streams,
+                        cancel,
+                        task_events,
                         built,
                         mv_registry,
                         mv_latest,
                     )
                     .await?;
-                self.compile_map(project, upstream).await?
+                self.compile_map(project, upstream, task_events).await?
             }
             DbspNodeKind::Join(join) => {
                 let (left_idx, right_idx) = join_inputs(node)?;
                 let left = self
-                    .compile_node(plan, left_idx, outer_streams, built, mv_registry, mv_latest)
+                    .compile_node(
+                        plan,
+                        left_idx,
+                        outer_streams,
+                        cancel,
+                        task_events,
+                        built,
+                        mv_registry,
+                        mv_latest,
+                    )
                     .await?;
                 let right = self
                     .compile_node(
                         plan,
                         right_idx,
                         outer_streams,
+                        cancel,
+                        task_events,
                         built,
                         mv_registry,
                         mv_latest,
                     )
                     .await?;
-                self.compile_join(join, left, right).await?
+                self.compile_join(join, left, right, cancel, task_events)
+                    .await?
             }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
@@ -154,6 +179,8 @@ impl DbspGraphBuilder {
                         plan,
                         input_idx,
                         outer_streams,
+                        cancel,
+                        task_events,
                         built,
                         mv_registry,
                         mv_latest,
@@ -163,6 +190,8 @@ impl DbspGraphBuilder {
                     &sink.name,
                     Arc::clone(sink.input_schema()),
                     upstream,
+                    cancel,
+                    task_events,
                     mv_registry,
                     mv_latest,
                 )
@@ -201,9 +230,16 @@ impl DbspGraphBuilder {
         &mut self,
         node: &DbspSelectNode,
         upstream: DeltaHandleStream,
+        task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
+        let graph_id = self.ns.graph_id.clone();
+        let task_events = task_events.clone();
+        let task_label = format!("filter:{graph_id}");
+        let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+        });
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
@@ -220,7 +256,7 @@ impl DbspGraphBuilder {
                 }
             }
         };
-        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred)
+        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred, Some(error_handler))
             .await
             .context("initialize DBSP filter")?;
         Ok(filter.stream())
@@ -230,9 +266,16 @@ impl DbspGraphBuilder {
         &mut self,
         node: &DbspProjectNode,
         upstream: DeltaHandleStream,
+        task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
+        let graph_id = self.ns.graph_id.clone();
+        let task_events = task_events.clone();
+        let task_label = format!("map:{graph_id}");
+        let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+        });
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
@@ -256,7 +299,7 @@ impl DbspGraphBuilder {
                 }
             }
         };
-        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector)
+        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector, Some(error_handler))
             .await
             .context("initialize DBSP map")?;
         Ok(map.stream())
@@ -267,11 +310,20 @@ impl DbspGraphBuilder {
         node: &DbspJoinNode,
         left: DeltaHandleStream,
         right: DeltaHandleStream,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
         let residual = node.residual.clone();
         let output_schema = Arc::clone(&node.output_schema);
+        let graph_id = self.ns.graph_id.clone();
+        let join_events = task_events.clone();
+        let join_graph_id = graph_id.clone();
+        let join_label = format!("join:{graph_id}");
+        let join_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&join_events, &join_graph_id, join_label.clone(), err);
+        });
 
         let left_log_limit = Arc::new(AtomicUsize::new(3));
         let right_log_limit = Arc::new(AtomicUsize::new(3));
@@ -301,18 +353,45 @@ impl DbspGraphBuilder {
         let left_log_limit_clone = Arc::clone(&left_log_limit);
         let left_schema_clone = Arc::clone(&left_schema);
         let bridge_clone = Arc::clone(&self.bridge);
+        let left_task_events = task_events.clone();
+        let left_graph_id = graph_id.clone();
+        let left_task_label = "join-left-logger".to_string();
+        let cancel_left = cancel.clone();
         tokio::spawn(async move {
             let mut cursor = left_cursor;
-            while let Ok((ts, handle)) = cursor.next().await {
-                if left_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
-                    eprintln!(
-                        "join left handle version {} at ts {} (schema width {})",
-                        handle.version,
-                        ts,
-                        left_schema_clone.len()
-                    );
-                    if let Err(err) = log_handle_rows("left handle", &handle, &bridge_clone).await {
-                        eprintln!("failed to log left handle rows: {err}");
+            loop {
+                tokio::select! {
+                    _ = cancel_left.cancelled() => break,
+                    result = cursor.next() => {
+                        let (ts, handle) = match result {
+                            Ok(next) => next,
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &left_task_events,
+                                    &left_graph_id,
+                                    left_task_label.clone(),
+                                    anyhow!("join left handle stream closed: {err}"),
+                                );
+                                break;
+                            }
+                        };
+                        if left_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
+                            eprintln!(
+                                "join left handle version {} at ts {} (schema width {})",
+                                handle.version,
+                                ts,
+                                left_schema_clone.len()
+                            );
+                            if let Err(err) = log_handle_rows("left handle", &handle, &bridge_clone).await {
+                                report_graph_task_error(
+                                    &left_task_events,
+                                    &left_graph_id,
+                                    left_task_label.clone(),
+                                    anyhow!("failed to log left handle rows: {err}"),
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -320,19 +399,46 @@ impl DbspGraphBuilder {
         let right_log_limit_clone = Arc::clone(&right_log_limit);
         let right_schema_clone = Arc::clone(&right_schema);
         let bridge_clone = Arc::clone(&self.bridge);
+        let right_task_events = task_events.clone();
+        let right_graph_id = graph_id.clone();
+        let right_task_label = "join-right-logger".to_string();
+        let cancel_right = cancel.clone();
         tokio::spawn(async move {
             let mut cursor = right_cursor;
-            while let Ok((ts, handle)) = cursor.next().await {
-                if right_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
-                    eprintln!(
-                        "join right handle version {} at ts {} (schema width {})",
-                        handle.version,
-                        ts,
-                        right_schema_clone.len()
-                    );
-                    if let Err(err) = log_handle_rows("right handle", &handle, &bridge_clone).await
-                    {
-                        eprintln!("failed to log right handle rows: {err}");
+            loop {
+                tokio::select! {
+                    _ = cancel_right.cancelled() => break,
+                    result = cursor.next() => {
+                        let (ts, handle) = match result {
+                            Ok(next) => next,
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &right_task_events,
+                                    &right_graph_id,
+                                    right_task_label.clone(),
+                                    anyhow!("join right handle stream closed: {err}"),
+                                );
+                                break;
+                            }
+                        };
+                        if right_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
+                            eprintln!(
+                                "join right handle version {} at ts {} (schema width {})",
+                                handle.version,
+                                ts,
+                                right_schema_clone.len()
+                            );
+                            if let Err(err) = log_handle_rows("right handle", &handle, &bridge_clone).await
+                            {
+                                report_graph_task_error(
+                                    &right_task_events,
+                                    &right_graph_id,
+                                    right_task_label.clone(),
+                                    anyhow!("failed to log right handle rows: {err}"),
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -469,6 +575,7 @@ impl DbspGraphBuilder {
             right_key,
             predicate,
             projector,
+            Some(join_error_handler),
         )
         .await
         .context("initialize DBSP join")?;
@@ -489,6 +596,8 @@ impl DbspGraphBuilder {
         view_name: &str,
         schema: Arc<RowSchema>,
         upstream: DeltaHandleStream,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
     ) -> Result<DeltaHandleStream> {
@@ -555,51 +664,76 @@ impl DbspGraphBuilder {
 
         let bridge_clone = Arc::clone(&self.bridge);
         let view_label = view_name.to_string();
+        let task_label = format!("materialize-view:{view_label}");
+        let task_events = task_events.clone();
+        let graph_id = self.ns.graph_id.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut cursor = cursor;
             let mut view = view;
             let mut dict_cache = dict_cache;
             loop {
-                match cursor.next().await {
-                    Ok((ts, delta_handle)) => {
-                        let snapshot_handle = match Self::apply_delta_handle_to_view(
-                            &mut view,
-                            table.clone(),
-                            &mut dict_cache,
-                            &delta_handle,
-                        )
-                        .await
-                        {
-                            Ok(handle) => handle,
-                            Err(err) => {
-                                eprintln!(
-                                    "failed to apply delta for materialized view '{view_label}' at {ts}: {err}"
-                                );
-                                continue;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = cursor.next() => {
+                        match result {
+                            Ok((ts, delta_handle)) => {
+                                let snapshot_handle = match Self::apply_delta_handle_to_view(
+                                    &mut view,
+                                    table.clone(),
+                                    &mut dict_cache,
+                                    &delta_handle,
+                                )
+                                .await
+                                {
+                                    Ok(handle) => handle,
+                                    Err(err) => {
+                                        report_graph_task_error(
+                                            &task_events,
+                                            &graph_id,
+                                            task_label.clone(),
+                                            anyhow!(
+                                                "failed to apply delta for materialized view '{view_label}' at {ts}: {err}"
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                };
+                                match Self::state_from_handle_with_bridge(&bridge_clone, &snapshot_handle)
+                                    .await
+                                {
+                                    Ok(state) => {
+                                        registry_clone.set_dbsp_state(state);
+                                        registry_clone.publish_version(ts, snapshot_handle);
+                                        eprintln!(
+                                            "materialized view '{view_label}' advanced to version {ts}"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        report_graph_task_error(
+                                            &task_events,
+                                            &graph_id,
+                                            task_label.clone(),
+                                            anyhow!(
+                                                "failed to update materialized view '{view_label}': {err}"
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                }
                             }
-                        };
-                        match Self::state_from_handle_with_bridge(&bridge_clone, &snapshot_handle)
-                            .await
-                        {
-                            Ok(state) => {
-                                registry_clone.set_dbsp_state(state);
-                                registry_clone.publish_version(ts, snapshot_handle);
-                                eprintln!(
-                                    "materialized view '{view_label}' advanced to version {ts}"
-                                );
-                            }
                             Err(err) => {
-                                eprintln!(
-                                    "failed to update materialized view '{view_label}': {err}"
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    anyhow!(
+                                        "stream for materialized view '{view_label}' closed unexpectedly: {err}"
+                                    ),
                                 );
+                                break;
                             }
                         }
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "stream for materialized view '{view_label}' closed unexpectedly: {err}"
-                        );
-                        break;
                     }
                 }
             }
@@ -658,6 +792,8 @@ pub struct BuildInputs<'a> {
     pub graph_id: &'a str,
     pub view_name: &'a str,
     pub plan: &'a CircuitPlan,
+    pub cancel: CancellationToken,
+    pub task_events: GraphTaskSender,
     pub mv_registry: Arc<MaterializedViewRegistry>,
     pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
 }

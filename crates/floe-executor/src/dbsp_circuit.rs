@@ -11,6 +11,7 @@ use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::StreamCursor;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
 use crate::dbsp_table_environment::DbspTableEnvironment;
@@ -20,6 +21,7 @@ use crate::join::JoinEvaluator;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::projection::ProjectionEvaluator;
 use crate::stream_types::Row;
+use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 /// Runtime instance of a compiled DBSP circuit.
 pub struct DbspCircuitInstance {
@@ -109,6 +111,8 @@ impl DbspCircuitInstance {
         bridge: &mut DbspBridge,
         registry: &MaterializedViewRegistry,
         view_name: &str,
+        cancel: CancellationToken,
+        task_events: GraphTaskSender,
     ) -> Result<()> {
         let root_stream = self.get_stream(self.root_id).clone();
         let mut cursor = StreamCursor::new(root_stream.stream());
@@ -142,42 +146,64 @@ impl DbspCircuitInstance {
         }
 
         let view_label = view_name.to_string();
+        let task_label = format!("attach-view:{view_label}");
+        let graph_id = view_label.clone();
+        let task_events = task_events.clone();
         let table_for_task = table.clone();
         let view_handle = view_handle.clone();
 
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut cursor = cursor;
             let mut view = view;
             let mut cache = cache;
             let table = table_for_task;
             loop {
-                match cursor.next().await {
-                    Ok((ts, delta_handle)) => match apply_delta_handle_to_view(
-                        &mut view,
-                        table.clone(),
-                        &mut cache,
-                        &delta_handle,
-                    )
-                    .await
-                    {
-                        Ok(snapshot_handle) => {
-                            let latest = view.latest_handle_view();
-                            let (dict, table, namespace, version) = latest.into_parts();
-                            view_handle.set_dbsp_state(DbspPersistedState::new(
-                                dict, table, namespace, version,
-                            ));
-                            view_handle.publish_version(ts, snapshot_handle);
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = cursor.next() => {
+                        match result {
+                            Ok((ts, delta_handle)) => match apply_delta_handle_to_view(
+                                &mut view,
+                                table.clone(),
+                                &mut cache,
+                                &delta_handle,
+                            )
+                            .await
+                            {
+                                Ok(snapshot_handle) => {
+                                    let latest = view.latest_handle_view();
+                                    let (dict, table, namespace, version) = latest.into_parts();
+                                    view_handle.set_dbsp_state(DbspPersistedState::new(
+                                        dict, table, namespace, version,
+                                    ));
+                                    view_handle.publish_version(ts, snapshot_handle);
+                                }
+                                Err(err) => {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        anyhow!(
+                                            "failed to update materialized view '{view_label}': {err}"
+                                        ),
+                                    );
+                                    break;
+                                }
+                            },
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    anyhow!(
+                                        "root stream cursor for view '{}' closed unexpectedly: {err}",
+                                        view_label
+                                    ),
+                                );
+                                break;
+                            }
                         }
-                        Err(err) => {
-                            eprintln!("failed to update materialized view '{view_label}': {err}");
-                        }
-                    },
-                    Err(err) => {
-                        eprintln!(
-                            "root stream cursor for view '{}' closed unexpectedly: {err}",
-                            view_label
-                        );
-                        break;
                     }
                 }
             }
@@ -202,7 +228,7 @@ impl DbspCircuitInstance {
             };
             evaluator.eval_bool(&row).unwrap_or(false)
         };
-        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred).await?;
+        let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred, None).await?;
         Ok(filter.stream())
     }
 
@@ -238,7 +264,7 @@ impl DbspCircuitInstance {
                 }
             }
         };
-        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector).await?;
+        let map = DbspMap::new::<Vec<u8>, Vec<u8>, _>(&upstream, projector, None).await?;
         Ok(map.stream())
     }
 
@@ -354,6 +380,7 @@ impl DbspCircuitInstance {
             right_key,
             predicate,
             projector,
+            None,
         )
         .await?;
         Ok(join.stream())

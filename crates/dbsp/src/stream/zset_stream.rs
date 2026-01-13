@@ -11,7 +11,7 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::collections::zset::{CompactionPolicy, SegmentRecord, VersionedZSet};
 use crate::handles::{ZSetHandle, ZSetHandleView};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -60,6 +60,7 @@ where
     delta_versioned: VersionedZSet<K>,
     overlay: HashMap<K, i64>,
     retention: StreamRetention,
+    compaction: CompactionPolicy,
     retention_window: VecDeque<ZSetHandle>,
     retention_counts: HashMap<u64, usize>,
     current_handle: ZSetHandle,
@@ -133,6 +134,7 @@ where
             delta_versioned,
             overlay: HashMap::new(),
             retention,
+            compaction: CompactionPolicy::default(),
             retention_window,
             retention_counts,
             current_handle,
@@ -240,6 +242,10 @@ where
         self.versioned.namespace()
     }
 
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) {
+        self.compaction = policy;
+    }
+
     async fn flush_without_version_update(&mut self) -> Result<(ZSetHandle, ZSetHandle)> {
         let handle = self.current_handle.clone();
         let delta_handle = self.delta_versioned.handle_for_version(0);
@@ -312,23 +318,66 @@ where
         let delta_dict = self.delta_versioned.dictionary();
         let mut delta_dict_batch = delta_dict.batch();
         let mut delta_buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        for (key, delta) in overlay {
-            if delta == 0 {
+        let mut compacted = false;
+        let chain_stats = self.versioned.chain_stats().await?;
+        if !self.compaction.is_disabled() && self.compaction.should_compact(chain_stats) {
+            let mut materialized = self
+                .versioned
+                .materialize()
+                .await
+                .context("materialize zset for compaction")?;
+            for (key, delta) in &overlay {
+                if *delta == 0 {
+                    continue;
+                }
+                let current = materialized.get(key).copied().unwrap_or(0);
+                let next = current + *delta;
+                if next == 0 {
+                    materialized.remove(key);
+                } else {
+                    materialized.insert(key.clone(), next);
+                }
+            }
+            if !materialized.is_empty() {
+                for (key, weight) in materialized {
+                    let id = dict_batch
+                        .intern(&key)
+                        .await
+                        .context("intern key while staging compaction")?;
+                    buckets
+                        .entry(bucket_for(id))
+                        .or_default()
+                        .push((id, weight));
+                }
+                compacted = true;
+            }
+        }
+
+        if !compacted {
+            for (key, delta) in &overlay {
+                if *delta == 0 {
+                    continue;
+                }
+                let id = dict_batch
+                    .intern(key)
+                    .await
+                    .context("intern key while staging overlay")?;
+                buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            }
+        }
+
+        for (key, delta) in &overlay {
+            if *delta == 0 {
                 continue;
             }
-            let id = dict_batch
-                .intern(&key)
-                .await
-                .context("intern key while staging overlay")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, delta));
             let delta_id = delta_dict_batch
-                .intern(&key)
+                .intern(key)
                 .await
                 .context("intern key while staging delta overlay")?;
             delta_buckets
                 .entry(bucket_for(delta_id))
                 .or_default()
-                .push((delta_id, delta));
+                .push((delta_id, *delta));
         }
         drop(dict_batch);
         drop(delta_dict_batch);
@@ -365,7 +414,7 @@ where
             return self.flush_without_version_update().await;
         }
 
-        let base = if self.current_handle.version == 0 {
+        let base = if self.current_handle.version == 0 || compacted {
             None
         } else {
             Some(self.current_handle.version)
@@ -374,7 +423,7 @@ where
         let mut batch = WriteBatch::new();
         let plan = self
             .versioned
-            .enqueue_version_with_base(segments, base, 1, &mut batch)
+            .enqueue_version_with_base(segments, base, 0, &mut batch)
             .await
             .context("schedule versioned update with overlay")?;
 
@@ -384,7 +433,7 @@ where
         } else {
             Some(
                 self.delta_versioned
-                    .enqueue_version_with_base(delta_segments, None, 1, &mut batch)
+                    .enqueue_version_with_base(delta_segments, None, 0, &mut batch)
                     .await
                     .context("schedule delta version update")?,
             )

@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::handles::ZSetHandle;
 use anyhow::{Context, Result, anyhow};
@@ -22,6 +23,19 @@ pub trait DeltaOperator: Send {
 
 pub type PipelineExecFut = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub type PipelineExec = Box<dyn FnMut(i64, &[ZSetHandle]) -> PipelineExecFut + Send>;
+pub type RuntimeErrorHandler = Arc<dyn Fn(anyhow::Error) + Send + Sync + 'static>;
+
+pub fn report_runtime_error(
+    handler: &Option<RuntimeErrorHandler>,
+    label: &str,
+    err: anyhow::Error,
+) {
+    if let Some(handler) = handler {
+        handler(err);
+    } else {
+        eprintln!("{label} runtime terminated with error: {err}");
+    }
+}
 
 /// Lightweight helper that blocks until all input streams advance to the next
 /// frontier, then invokes the supplied callback with the `(timestamp, handle)`

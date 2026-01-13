@@ -28,6 +28,44 @@ static PROJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static JOIN_COUNTER: AtomicU64 = AtomicU64::new(0);
 static H_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionPolicy {
+    pub max_chain_len: usize,
+    pub max_segments: usize,
+}
+
+impl CompactionPolicy {
+    pub const fn disabled() -> Self {
+        Self {
+            max_chain_len: usize::MAX,
+            max_segments: usize::MAX,
+        }
+    }
+
+    pub fn is_disabled(self) -> bool {
+        self.max_chain_len == usize::MAX && self.max_segments == usize::MAX
+    }
+
+    pub fn should_compact(self, stats: VersionChainStats) -> bool {
+        stats.version_count >= self.max_chain_len || stats.segment_count >= self.max_segments
+    }
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            max_chain_len: 32,
+            max_segments: 256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VersionChainStats {
+    pub version_count: usize,
+    pub segment_count: usize,
+}
+
 pub struct ZSet<K>
 where
     K: Archive
@@ -381,6 +419,31 @@ where
         }
     }
 
+    pub async fn chain_stats(&self) -> Result<VersionChainStats> {
+        if self.current_version == 0 {
+            return Ok(VersionChainStats::default());
+        }
+
+        let mut version_count = 0;
+        let mut segment_count = 0;
+        let mut current = self.manifest.clone();
+
+        while let Some(manifest) = current {
+            version_count += 1;
+            segment_count += manifest.buckets.values().map(|segments| segments.len()).sum::<usize>();
+            if let Some(base_version) = manifest.base {
+                current = Some(self.load_manifest_record(base_version).await?);
+            } else {
+                break;
+            }
+        }
+
+        Ok(VersionChainStats {
+            version_count,
+            segment_count,
+        })
+    }
+
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
         let mut aggregate = if let Some(base_version) = self.manifest.as_ref().and_then(|m| m.base)
         {
@@ -483,12 +546,12 @@ where
     }
 
     #[cfg(test)]
-    fn manifest_prefix_bytes(&self) -> &[u8] {
+    pub(crate) fn manifest_prefix_bytes(&self) -> &[u8] {
         &self.manifest_prefix
     }
 
     #[cfg(test)]
-    fn segment_prefix_bytes(&self) -> &[u8] {
+    pub(crate) fn segment_prefix_bytes(&self) -> &[u8] {
         &self.segment_prefix
     }
 

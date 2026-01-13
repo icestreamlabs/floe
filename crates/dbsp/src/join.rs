@@ -17,7 +17,9 @@ use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::{DeltaHandleStream, Stream};
-use crate::stream::runtime::{DeltaOperator, HandleOperatorRuntime};
+use crate::stream::runtime::{
+    DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
+};
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
@@ -35,6 +37,7 @@ impl DbspJoin {
         right_key: KR,
         predicate: P,
         projector: F,
+        error_handler: Option<RuntimeErrorHandler>,
     ) -> Result<Self>
     where
         L: Archive
@@ -176,10 +179,11 @@ impl DbspJoin {
                 })
             });
 
+        let error_handler = error_handler.clone();
         tokio::spawn(async move {
             loop {
                 if let Err(err) = runtime.step().await {
-                    eprintln!("join runtime terminated with error: {err}");
+                    report_runtime_error(&error_handler, "join", err);
                     break;
                 }
             }

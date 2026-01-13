@@ -13,15 +13,17 @@ use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, MaterializedViewRegistry,
-    MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder, ValidatedPlan,
-    validate_dbsp_plan,
+    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
+    MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
+    ValidatedPlan, validate_dbsp_plan,
 };
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
 use planner::{PlannedMaterializedView, plan_materialized_views};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::executor::{available_sources_from_registry, build_dataflows};
 use crate::source::SourceRegistry;
@@ -85,6 +87,18 @@ async fn main() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
+    let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let graph_cancel = CancellationToken::new();
+    let cancel_for_monitor = graph_cancel.clone();
+    let task_monitor: JoinHandle<()> = tokio::spawn(async move {
+        while let Some(event) = task_event_rx.recv().await {
+            eprintln!(
+                "graph '{}' background task '{}' failed: {:#}",
+                event.graph_id, event.task, event.error
+            );
+            cancel_for_monitor.cancel();
+        }
+    });
     for (idx, plan) in circuit_plans.iter().enumerate() {
         let mv_def = &planned_materialized_views[idx];
         let view_name = mv_def.definition().name();
@@ -104,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
                 graph_id: view_name,
                 view_name,
                 plan,
+                cancel: graph_cancel.clone(),
+                task_events: task_event_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
             })
@@ -223,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
     drop(event_tx);
     generator_handle.abort();
     executor_handle.abort();
+    task_monitor.abort();
 
     if let Err(err) = generator_handle.await
         && !err.is_cancelled()
@@ -234,6 +251,12 @@ async fn main() -> anyhow::Result<()> {
         && !err.is_cancelled()
     {
         eprintln!("executor task joined with error: {err}");
+    }
+
+    if let Err(err) = task_monitor.await
+        && !err.is_cancelled()
+    {
+        eprintln!("graph monitor task joined with error: {err}");
     }
 
     server_result

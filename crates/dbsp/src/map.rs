@@ -16,8 +16,9 @@ use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::DeltaHandleStream;
-use crate::stream::runtime::DeltaOperator;
-use crate::stream::runtime::HandleOperatorRuntime;
+use crate::stream::runtime::{
+    DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
+};
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
@@ -31,6 +32,7 @@ impl DbspMap {
     pub async fn new<K, R, FProj>(
         input: &DeltaHandleStream,
         projector: FProj,
+        error_handler: Option<RuntimeErrorHandler>,
     ) -> anyhow::Result<Self>
     where
         K: Archive
@@ -129,10 +131,11 @@ impl DbspMap {
             })
         });
 
+        let error_handler = error_handler.clone();
         tokio::spawn(async move {
             loop {
                 if let Err(err) = runtime.step().await {
-                    eprintln!("map runtime terminated with error: {err}");
+                    report_runtime_error(&error_handler, "map", err);
                     break;
                 }
             }

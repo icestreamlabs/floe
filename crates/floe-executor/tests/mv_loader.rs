@@ -17,9 +17,12 @@ use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
+use floe_executor::GraphTaskError;
 use floe_storage::SlateCatalog;
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::Db;
+use tokio_util::sync::CancellationToken;
+use tokio::sync::mpsc;
 
 const VIEW_NAME: &str = "mv_q1";
 const SOURCE_NAME: &str = "nexmark_bid";
@@ -186,11 +189,14 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
         .expect("graph builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&outer, &source_refs);
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     builder
         .build(BuildInputs {
             graph_id: VIEW_NAME,
             view_name: VIEW_NAME,
             plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
         })

@@ -10,12 +10,15 @@ use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, MaterializedViewRegistry,
     OuterStreamRegistry, ValidatedPlan, load_or_register_mv, validate_dbsp_plan,
 };
+use floe_executor::GraphTaskError;
 use floe_node::executor::{available_sources_from_registry, build_dataflows};
 use floe_node::generator::{self, AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
 use floe_node::planner::plan_materialized_views;
 use floe_node::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;
 use floe_storage::SlateCatalog;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio::time::{Duration, timeout};
 
 struct MvTestHarness {
@@ -62,11 +65,14 @@ impl MvTestHarness {
                 .await?;
         let source_refs: Vec<&str> = required_sources.iter().map(String::as_str).collect();
         let handle_streams = gather_handle_streams(&outer, &source_refs);
+        let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
         graph_builder
             .build(BuildInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &circuit_plans[0],
+                cancel: CancellationToken::new(),
+                task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
             })

@@ -440,9 +440,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
         cancel.cancel();
-        let err = stream
-            .next()
+        let err = timeout(Duration::from_millis(100), stream.next())
             .await
+            .expect("cancellation timeout")
             .expect("expected cancellation event")
             .expect_err("expected cancellation error");
         assert!(is_tail_canceled_error(&err));

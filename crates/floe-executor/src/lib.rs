@@ -24,6 +24,7 @@ pub mod source_registry;
 pub mod stream_types;
 pub mod table_provider;
 pub mod tail;
+pub mod task_events;
 
 pub use barrier_clock::{BarrierClock, StepId};
 pub use context::FloeQueryContext;
@@ -41,3 +42,4 @@ pub use source_decoder::SourceRowDecoder;
 pub use source_registry::SourceRegistry;
 pub use stream_types::{Diff, Row, Timestamp};
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
+pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};

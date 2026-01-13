@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
 use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
-use dbsp::handles::ZSetHandleView;
+use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
@@ -15,8 +15,12 @@ use floe_executor::dbsp_plan::{
 use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
+use floe_executor::GraphTaskError;
 use object_store::memory::InMemory;
 use slatedb::Db;
+use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
+use tokio::sync::mpsc;
 
 fn arrow_schema(fields: Vec<Field>) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
@@ -70,6 +74,7 @@ async fn filter_and_projection_materializes_mv() {
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -78,6 +83,8 @@ async fn filter_and_projection_materializes_mv() {
             graph_id: view_name,
             view_name,
             plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
         })
@@ -162,6 +169,7 @@ async fn inner_join_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -170,6 +178,8 @@ async fn inner_join_materializes_mv() {
             graph_id: view_name,
             view_name,
             plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
         })
@@ -235,6 +245,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
 
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     {
         let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
             .await
@@ -244,6 +255,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
                 graph_id: view_name,
                 view_name,
                 plan: &plan,
+                cancel: CancellationToken::new(),
+                task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
             })
@@ -260,6 +273,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             graph_id: view_name,
             view_name,
             plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
         })
@@ -270,6 +285,161 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn cancel_stops_materialized_view_updates() {
+    let db = test_db("cancel-updates").await;
+    let view_name = "mv_cancel_updates";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let view_handle = mv_registry.register(view_name);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let cancel = CancellationToken::new();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: cancel.clone(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+        })
+        .await
+        .expect("build graph");
+
+    let mut version_rx = view_handle.version_watch();
+    {
+        let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        writer
+            .append(&bid_row(1, 42, 99), 1)
+            .expect("append first");
+        writer.flush().await.expect("flush first");
+    }
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("expected version update")
+        .expect("version watch update");
+    let first_version = view_handle.latest_version().expect("latest version");
+
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    {
+        let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        writer
+            .append(&bid_row(2, 42, 100), 1)
+            .expect("append second");
+        writer.flush().await.expect("flush second");
+    }
+
+    let update = timeout(Duration::from_millis(100), version_rx.changed()).await;
+    assert!(update.is_err(), "expected no update after cancel");
+    assert_eq!(view_handle.latest_version(), Some(first_version));
+}
+
+#[tokio::test]
+async fn graph_task_error_is_reported() {
+    let db = test_db("graph-task-error").await;
+    let view_name = "mv_error";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .project(vec![col("price")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let cancel = CancellationToken::new();
+
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: cancel.clone(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+        })
+        .await
+        .expect("build graph");
+
+    tokio::task::yield_now().await;
+
+    let mut stream = handle_streams
+        .get("nexmark_bid")
+        .expect("bid stream")
+        .clone();
+    stream
+        .send(ZSetHandle {
+            ns: "missing_namespace".to_string(),
+            version: 99,
+        })
+        .await
+        .expect("send invalid handle");
+    stream.flush().await.expect("flush invalid handle");
+
+    let event = timeout(Duration::from_millis(200), task_rx.recv())
+        .await
+        .expect("graph task error timeout")
+        .expect("graph task error");
+    assert_eq!(event.graph_id, view_name);
+    assert!(event.task.contains("map"));
+    let message = event.error.to_string();
+    assert!(!message.is_empty(), "expected error message");
+    drop(cancel);
 }
 
 fn gather_handle_streams(
