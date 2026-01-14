@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -23,6 +23,9 @@ use crate::stream::runtime::{
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
+
+static JOIN_STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const JOIN_STEP_LOG_SAMPLE_EVERY: u64 = 256;
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
@@ -244,6 +247,26 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    let span = tracing::trace_span!(
+        "join_step",
+        ts,
+        left_ns = tracing::field::Empty,
+        left_version = tracing::field::Empty,
+        right_ns = tracing::field::Empty,
+        right_version = tracing::field::Empty
+    );
+    let _enter = span.enter();
+    if let Some(left) = handles.get(0) {
+        span.record("left_ns", left.ns.as_str());
+        span.record("left_version", left.version);
+    }
+    if let Some(right) = handles.get(1) {
+        span.record("right_ns", right.ns.as_str());
+        span.record("right_version", right.version);
+    }
+    if JOIN_STEP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % JOIN_STEP_LOG_SAMPLE_EVERY == 0 {
+        tracing::trace!("join step");
+    }
     let mut op_guard = op.lock().await;
     if let Some(out) = op_guard.on_step(ts, &handles).await? {
         let mut writer_guard = writer.lock().await;

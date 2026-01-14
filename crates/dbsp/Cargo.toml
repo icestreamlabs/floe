@@ -17,6 +17,7 @@ datafusion = { workspace = true }
 arrow-schema = { workspace = true }
 datafusion-common = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -29,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "incremental_join"
+harness = false
+
+[[bench]]
+name = "materialization_metrics"
 harness = false

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
 use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
 use dbsp::{StreamRetention, ZSetStream};
+use tracing::field;
 
 use crate::codec::ensure_outer_stream_codec;
 use crate::dbsp_bridge::DbspBridge;
@@ -66,11 +67,16 @@ impl OuterStreamWriter {
 
     /// Advance the stream frontier even when no rows were appended.
     pub async fn tick(&mut self) -> Result<OuterStreamHandle> {
-        let handle = self.stream.flush().await?;
-        eprintln!(
-            "Outer stream '{}' ticked version {}",
-            self.source, handle.version
+        let span = tracing::debug_span!(
+            "tick",
+            source = %self.source,
+            namespace = %self.namespace,
+            version = field::Empty
         );
+        let _enter = span.enter();
+        let handle = self.stream.flush().await?;
+        span.record("version", handle.version);
+        tracing::debug!("outer stream ticked");
         Ok(OuterStreamHandle {
             source: self.source.clone(),
             namespace: self.namespace.clone(),
@@ -79,11 +85,16 @@ impl OuterStreamWriter {
     }
 
     pub async fn flush(&mut self) -> Result<OuterStreamHandle> {
-        let handle = self.stream.flush().await?;
-        eprintln!(
-            "Outer stream '{}' flushed version {}",
-            self.source, handle.version
+        let span = tracing::debug_span!(
+            "flush",
+            source = %self.source,
+            namespace = %self.namespace,
+            version = field::Empty
         );
+        let _enter = span.enter();
+        let handle = self.stream.flush().await?;
+        span.record("version", handle.version);
+        tracing::debug!("outer stream flushed");
         Ok(OuterStreamHandle {
             source: self.source.clone(),
             namespace: self.namespace.clone(),

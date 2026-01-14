@@ -7,6 +7,7 @@ mod source;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use clap::Parser;
@@ -25,16 +26,18 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+static INGEST_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const INGEST_LOG_SAMPLE_EVERY: u64 = 512;
+const TICK_LOG_SAMPLE_EVERY: u64 = 128;
+
 use crate::executor::{available_sources_from_registry, build_dataflows};
 use crate::source::SourceRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     let cli = cli::Cli::parse();
-
-    if cli.mv_query.len() > 1 {
-        anyhow::bail!("--mv-query may only be provided once");
-    }
 
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(generator::definitions()?);
@@ -43,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let storage = server::init_storage().await?;
     let db = storage.db();
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
-    if let Some(sql) = cli.mv_query.first() {
+    if let Some(sql) = cli.mv_query.as_deref() {
         materialized_views.push(parse_materialized_view(sql)?);
     }
 
@@ -72,14 +75,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let outer_registry = Arc::new(Mutex::new(outer_registry));
     if circuit_plans.is_empty() {
-        eprintln!("DBSP planning produced no circuit plans.");
+        tracing::warn!("DBSP planning produced no circuit plans.");
     } else {
-        eprintln!(
-            "DBSP planning produced {} circuit plan(s):",
-            circuit_plans.len()
+        tracing::info!(
+            circuit_plans = circuit_plans.len(),
+            "DBSP planning produced circuit plans"
         );
         for plan in &circuit_plans {
-            eprintln!("  • CircuitPlan root node id = {}", plan.root);
+            tracing::debug!(root = plan.root, "circuit plan root node");
         }
     }
 
@@ -92,9 +95,11 @@ async fn main() -> anyhow::Result<()> {
     let cancel_for_monitor = graph_cancel.clone();
     let task_monitor: JoinHandle<()> = tokio::spawn(async move {
         while let Some(event) = task_event_rx.recv().await {
-            eprintln!(
-                "graph '{}' background task '{}' failed: {:#}",
-                event.graph_id, event.task, event.error
+            tracing::error!(
+                graph_id = %event.graph_id,
+                task = %event.task,
+                error = %event.error,
+                "graph background task failed"
             );
             cancel_for_monitor.cancel();
         }
@@ -107,10 +112,11 @@ async fn main() -> anyhow::Result<()> {
             let registry_guard = outer_registry.lock().await;
             gather_handle_streams(&registry_guard, required_sources)
         };
-        eprintln!(
-            "building DBSP graph for view '{view_name}' with required sources {:?} and handle streams {:?}",
-            required_sources,
-            handle_streams.keys()
+        tracing::info!(
+            view = %view_name,
+            required_sources = ?required_sources,
+            handle_streams = ?handle_streams.keys(),
+            "building DBSP graph"
         );
 
         graph_builder
@@ -150,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         let sender = event_tx.clone();
         tokio::spawn(async move {
             if let Err(err) = generator::run(generator_config, sender).await {
-                eprintln!("Nexmark generator failed: {err}");
+                tracing::error!(error = %err, "Nexmark generator failed");
             }
         })
     };
@@ -182,7 +188,11 @@ async fn main() -> anyhow::Result<()> {
                 let (row, _ts) = match decoder.decode(&event) {
                     Ok(result) => result,
                     Err(err) => {
-                        eprintln!("failed to decode source event for {source_name}: {err}");
+                        tracing::warn!(
+                            source = %source_name,
+                            error = %err,
+                            "failed to decode source event"
+                        );
                         continue;
                     }
                 };
@@ -197,18 +207,27 @@ async fn main() -> anyhow::Result<()> {
             let mut changed = false;
             for (source_name, row) in decoded_rows {
                 let Some(writer) = registry.writer_mut(&source_name) else {
-                    eprintln!("no writer for source {source_name}, skipping row");
+                    tracing::warn!(
+                        source = %source_name,
+                        "no writer for source, skipping row"
+                    );
                     continue;
                 };
                 if let Err(err) = writer.append(&row, 1) {
-                    eprintln!("failed to append row for '{source_name}': {err}");
+                    tracing::error!(
+                        source = %source_name,
+                        error = %err,
+                        "failed to append row"
+                    );
                     continue;
                 }
                 changed = true;
-                if source_name == generator::BID_SOURCE_NAME {
-                    eprintln!("ingested bid row: {:?}", row);
-                } else if source_name == generator::AUCTION_SOURCE_NAME {
-                    eprintln!("ingested auction row: {:?}", row);
+                if should_sample(&INGEST_LOG_COUNTER, INGEST_LOG_SAMPLE_EVERY) {
+                    if source_name == generator::BID_SOURCE_NAME {
+                        tracing::debug!(row = ?row, "ingested bid row");
+                    } else if source_name == generator::AUCTION_SOURCE_NAME {
+                        tracing::debug!(row = ?row, "ingested auction row");
+                    }
                 }
             }
 
@@ -219,9 +238,11 @@ async fn main() -> anyhow::Result<()> {
             epoch = epoch.saturating_add(1);
             // Advance frontier for all sources this epoch, even if they had no rows.
             if let Err(err) = registry.tick_all().await {
-                eprintln!("failed to tick outer streams at epoch {epoch}: {err}");
+                tracing::error!(epoch, error = %err, "failed to tick outer streams");
             } else {
-                eprintln!("advanced all source frontiers to epoch {epoch}");
+                if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
+                    tracing::debug!(epoch, "advanced all source frontiers");
+                }
             }
         }
     });
@@ -244,22 +265,35 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = generator_handle.await
         && !err.is_cancelled()
     {
-        eprintln!("generator task joined with error: {err}");
+        tracing::error!(error = %err, "generator task joined with error");
     }
 
     if let Err(err) = executor_handle.await
         && !err.is_cancelled()
     {
-        eprintln!("executor task joined with error: {err}");
+        tracing::error!(error = %err, "executor task joined with error");
     }
 
     if let Err(err) = task_monitor.await
         && !err.is_cancelled()
     {
-        eprintln!("graph monitor task joined with error: {err}");
+        tracing::error!(error = %err, "graph monitor task joined with error");
     }
 
     server_result
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+fn should_sample(counter: &AtomicU64, every: u64) -> bool {
+    if every == 0 {
+        return true;
+    }
+    counter.fetch_add(1, Ordering::Relaxed) % every == 0
 }
 
 fn register_materialized_view_tables(

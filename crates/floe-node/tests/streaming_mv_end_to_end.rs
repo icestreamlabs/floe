@@ -42,7 +42,7 @@ async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
                 .context("connect to floe-node pgwire endpoint")?;
         let connection_handle = tokio::spawn(async move {
             if let Err(err) = connection.await {
-                eprintln!("pgwire connection closed: {err}");
+                tracing::warn!(error = %err, "pgwire connection closed");
             }
         });
 
@@ -76,7 +76,7 @@ async fn wait_for_pgwire(addr: &str) -> Result<()> {
             Err(err) if attempt < 49 => {
                 sleep(Duration::from_millis(100)).await;
                 if attempt == 25 {
-                    eprintln!("waiting for pgwire listener: {err}");
+                    tracing::warn!(error = %err, "waiting for pgwire listener");
                 }
             }
             Err(err) => bail!("pgwire listener never became ready: {err}"),
@@ -94,7 +94,7 @@ async fn wait_for_bid_rows(client: &tokio_postgres::Client) -> Result<Vec<tokio_
             Err(err) => {
                 // Connection is ready but the mv may not be registered yet.
                 sleep(Duration::from_millis(100)).await;
-                eprintln!("query attempt failed: {err:?}");
+                tracing::debug!(error = %err, "query attempt failed");
             }
         }
     }

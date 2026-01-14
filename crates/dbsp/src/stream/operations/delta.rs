@@ -195,19 +195,20 @@ where
         build_derived_stream(table.clone(), handle_group, DELTA_LIFTED_JOIN_STREAM_PREFIX).await?;
 
     if aggregated_handles.is_empty() {
-        eprintln!(
-            "delta_lifted_delta_lifted_join produced no aggregated handles (left default ns={}, right default ns={})",
-            left_default.ns, right_default.ns
+        tracing::debug!(
+            left_default_ns = %left_default.ns,
+            right_default_ns = %right_default.ns,
+            "delta_lifted_delta_lifted_join produced no aggregated handles"
         );
         set_default_in_place(&mut result_stream, default_handle);
     } else {
-        eprintln!(
-            "delta_lifted_delta_lifted_join aggregated {} handles (latest version {})",
-            aggregated_handles.len(),
-            aggregated_handles
+        tracing::debug!(
+            handle_count = aggregated_handles.len(),
+            latest_version = aggregated_handles
                 .last()
                 .map(|h| h.frontier)
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            "delta_lifted_delta_lifted_join aggregated handles"
         );
         set_default_in_place(&mut result_stream, aggregated_handles[0].clone());
         for handle in aggregated_handles.iter().skip(1) {

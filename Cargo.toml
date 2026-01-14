@@ -38,3 +38,4 @@ tokio = { version = "1.38", features = ["full"] }
 tokio-util = "0.7"
 floe-sql-parser = { path = "crates/floe-sql-parser" }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

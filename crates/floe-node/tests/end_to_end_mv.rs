@@ -33,6 +33,14 @@ struct MvTestHarness {
 impl MvTestHarness {
     async fn new(view_name: &str, view_sql: &str) -> Result<Self> {
         let catalog = Arc::new(SlateCatalog::in_memory().await?);
+        Self::new_with_catalog(catalog, view_name, view_sql).await
+    }
+
+    async fn new_with_catalog(
+        catalog: Arc<SlateCatalog>,
+        view_name: &str,
+        view_sql: &str,
+    ) -> Result<Self> {
         let db = catalog.db();
 
         let mut registry = SourceRegistry::new();
@@ -330,6 +338,155 @@ async fn materialized_view_joins_auctions() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn sql_filter_excludes_nulls() -> Result<()> {
+    let mut harness = MvTestHarness::new(
+        "mv_null_filter",
+        "CREATE MATERIALIZED VIEW mv_null_filter AS \
+         SELECT auction, bidder FROM nexmark_bid WHERE bidder = 42",
+    )
+    .await?;
+
+    append_row(
+        &mut harness.outer,
+        &mut harness.ingestion_bridge,
+        BID_SOURCE_NAME,
+        bid_row_nullable(Some(1), None, 10),
+    )
+    .await?;
+    append_row(
+        &mut harness.outer,
+        &mut harness.ingestion_bridge,
+        BID_SOURCE_NAME,
+        bid_row_nullable(Some(2), Some(42), 20),
+    )
+    .await?;
+
+    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+
+    let (session, _) = harness.session_with_view().await?;
+    let df = session
+        .sql("SELECT auction, bidder FROM mv_null_filter ORDER BY auction")
+        .await?;
+    let batches = df.collect().await?;
+    let rows = int_rows2(&batches);
+    assert_eq!(rows, vec![vec![2, 42]]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_projection_applies_expressions() -> Result<()> {
+    let mut harness = MvTestHarness::new(
+        "mv_projection_expr",
+        "CREATE MATERIALIZED VIEW mv_projection_expr AS \
+         SELECT auction, price + 10 AS adjusted_price \
+         FROM nexmark_bid WHERE price > 50",
+    )
+    .await?;
+
+    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 7, 40).await?;
+    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 8, 70).await?;
+
+    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+
+    let (session, _) = harness.session_with_view().await?;
+    let df = session
+        .sql("SELECT auction, adjusted_price FROM mv_projection_expr ORDER BY auction")
+        .await?;
+    let batches = df.collect().await?;
+    let rows = int_rows2(&batches);
+    assert_eq!(rows, vec![vec![2, 80]]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_join_skips_null_keys() -> Result<()> {
+    let mut harness = MvTestHarness::new(
+        "mv_null_join",
+        "CREATE MATERIALIZED VIEW mv_null_join AS \
+         SELECT b.auction, b.bidder, a.seller \
+         FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id",
+    )
+    .await?;
+
+    append_auction(
+        &mut harness.outer,
+        &mut harness.ingestion_bridge,
+        1,
+        100,
+        5,
+        1_600_010_000,
+        "chair",
+    )
+    .await?;
+    append_row(
+        &mut harness.outer,
+        &mut harness.ingestion_bridge,
+        BID_SOURCE_NAME,
+        bid_row_nullable(None, Some(7), 50),
+    )
+    .await?;
+    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 8, 60).await?;
+
+    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+
+    let (session, _) = harness.session_with_view().await?;
+    let df = session
+        .sql("SELECT auction, bidder, seller FROM mv_null_join ORDER BY bidder")
+        .await?;
+    let batches = df.collect().await?;
+    let rows = int_rows(&batches);
+    assert_eq!(rows, vec![vec![1, 8, 100]]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_restart_recovers_view_state() -> Result<()> {
+    let catalog = Arc::new(SlateCatalog::in_memory().await?);
+    let mut harness = MvTestHarness::new_with_catalog(
+        Arc::clone(&catalog),
+        "mv_restart",
+        "CREATE MATERIALIZED VIEW mv_restart AS \
+         SELECT auction, bidder, price FROM nexmark_bid WHERE price > 0",
+    )
+    .await?;
+
+    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 7, 50).await?;
+    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 8, 60).await?;
+    wait_for_version(&harness.mv_registry, &harness.view_name, 2).await?;
+
+    let (session, _) = harness.session_with_view().await?;
+    let df = session
+        .sql("SELECT auction, bidder, price FROM mv_restart ORDER BY auction")
+        .await?;
+    let batches = df.collect().await?;
+    let rows = int_rows(&batches);
+    assert_eq!(rows, vec![vec![1, 7, 50], vec![2, 8, 60]]);
+
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let session = query.session();
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut bridge = DbspBridge::new(catalog.db()).await?;
+    load_or_register_mv(
+        &session,
+        Arc::clone(&mv_registry),
+        &mut bridge,
+        "mv_restart",
+    )
+    .await?;
+    let df = session
+        .sql("SELECT auction, bidder, price FROM mv_restart ORDER BY auction")
+        .await?;
+    let batches = df.collect().await?;
+    let recovered_rows = int_rows(&batches);
+    assert_eq!(recovered_rows, rows);
+
+    Ok(())
+}
+
 async fn assert_manifest_exists(
     table: Arc<dyn dbsp::storage::KeyValueTable>,
     namespace: &str,
@@ -435,9 +592,17 @@ async fn wait_for_version(
 }
 
 fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
+    bid_row_nullable(Some(auction), Some(bidder), price)
+}
+
+fn bid_row_nullable(
+    auction: Option<i64>,
+    bidder: Option<i64>,
+    price: i64,
+) -> Vec<ScalarValue> {
     vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Int64(Some(bidder)),
+        ScalarValue::Int64(auction),
+        ScalarValue::Int64(bidder),
         ScalarValue::Int64(Some(price)),
         ScalarValue::Utf8(Some("channel".to_string())),
         ScalarValue::Utf8(Some("http://example.com".to_string())),
@@ -504,6 +669,26 @@ fn int_rows(batches: &[RecordBatch]) -> Vec<Vec<i64>> {
                 bidders.value(idx),
                 prices.value(idx),
             ]);
+        }
+    }
+    rows
+}
+
+fn int_rows2(batches: &[RecordBatch]) -> Vec<Vec<i64>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let first = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("first column");
+        let second = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("second column");
+        for idx in 0..batch.num_rows() {
+            rows.push(vec![first.value(idx), second.value(idx)]);
         }
     }
     rows

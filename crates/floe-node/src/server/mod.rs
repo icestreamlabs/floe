@@ -51,7 +51,7 @@ pub async fn run(
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind pgwire listener at {address}"))?;
-    println!("Floe pgwire endpoint listening on {address}");
+    tracing::info!(address = %address, "Floe pgwire endpoint listening");
 
     loop {
         tokio::select! {
@@ -60,17 +60,21 @@ pub async fn run(
                 let handlers = factory.clone();
                 tokio::spawn(async move {
                     if let Err(err) = process_socket(socket, None, handlers).await {
-                        eprintln!("connection {peer:?} terminated with error: {err}");
+                        tracing::warn!(
+                            peer = ?peer,
+                            error = %err,
+                            "connection terminated with error"
+                        );
                     }
                 });
             }
             signal = signal::ctrl_c() => {
                 match signal {
                     Ok(()) => {
-                        println!("Shutdown signal received, closing pgwire listener");
+                        tracing::info!("shutdown signal received, closing pgwire listener");
                     }
                     Err(err) => {
-                        eprintln!("Failed to listen for shutdown signal: {err}");
+                        tracing::error!(error = %err, "failed to listen for shutdown signal");
                     }
                 }
                 break;

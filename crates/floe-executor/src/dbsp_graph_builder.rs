@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
@@ -25,6 +25,9 @@ use dbsp::{
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+static MV_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MV_UPDATE_LOG_SAMPLE_EVERY: u64 = 128;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -215,9 +218,9 @@ impl DbspGraphBuilder {
         source: &DbspSourceNode,
         outer_streams: &HashMap<String, DeltaHandleStream>,
     ) -> Result<DeltaHandleStream> {
-        eprintln!(
-            "Attaching DBSP source node '{}' to outer stream",
-            source.table.name
+        tracing::info!(
+            source = %source.table.name,
+            "attaching DBSP source node to outer stream"
         );
         let snapshot_stream = outer_streams
             .get(source.table.name)
@@ -237,21 +240,31 @@ impl DbspGraphBuilder {
         let graph_id = self.ns.graph_id.clone();
         let task_events = task_events.clone();
         let task_label = format!("filter:{graph_id}");
+        let error_graph_id = graph_id.clone();
         let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
-            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+            report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
         });
+        let log_graph_id = graph_id.clone();
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode filter row: {err}");
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to decode filter row"
+                    );
                     return false;
                 }
             };
             match eval_predicate(&predicate, &row, schema.as_ref()) {
                 Ok(result) => result,
                 Err(err) => {
-                    eprintln!("failed to evaluate filter predicate: {err}");
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to evaluate filter predicate"
+                    );
                     false
                 }
             }
@@ -273,28 +286,42 @@ impl DbspGraphBuilder {
         let graph_id = self.ns.graph_id.clone();
         let task_events = task_events.clone();
         let task_label = format!("map:{graph_id}");
+        let error_graph_id = graph_id.clone();
         let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
-            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+            report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
         });
+        let log_graph_id = graph_id.clone();
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode projection row: {err}");
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to decode projection row"
+                    );
                     return Vec::new();
                 }
             };
             let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
                 Ok(projected) => projected,
                 Err(err) => {
-                    eprintln!("failed to evaluate projection: {err}");
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to evaluate projection"
+                    );
                     return Vec::new();
                 }
             };
             match encode_projected_row_key(&projected) {
                 Ok(encoded) => encoded,
                 Err(err) => {
-                    eprintln!("failed to encode projected row: {err}");
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to encode projected row"
+                    );
                     Vec::new()
                 }
             }
@@ -333,20 +360,24 @@ impl DbspGraphBuilder {
         if let Ok((ts, handle)) = left_cursor.snapshot().await
             && left_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
         {
-            eprintln!(
-                "join left snapshot version {ts}, handle {}, schema width {}",
-                handle.version,
-                left_schema.len()
+            tracing::debug!(
+                graph_id = %graph_id,
+                ts,
+                handle_version = handle.version,
+                schema_width = left_schema.len(),
+                "join left snapshot"
             );
             log_handle_rows("left snapshot", &handle, &self.bridge).await?;
         }
         if let Ok((ts, handle)) = right_cursor.snapshot().await
             && right_log_limit.fetch_sub(1, Ordering::Relaxed) > 0
         {
-            eprintln!(
-                "join right snapshot version {ts}, handle {}, schema width {}",
-                handle.version,
-                right_schema.len()
+            tracing::debug!(
+                graph_id = %graph_id,
+                ts,
+                handle_version = handle.version,
+                schema_width = right_schema.len(),
+                "join right snapshot"
             );
             log_handle_rows("right snapshot", &handle, &self.bridge).await?;
         }
@@ -376,11 +407,12 @@ impl DbspGraphBuilder {
                             }
                         };
                         if left_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
-                            eprintln!(
-                                "join left handle version {} at ts {} (schema width {})",
-                                handle.version,
+                            tracing::debug!(
+                                graph_id = %left_graph_id,
                                 ts,
-                                left_schema_clone.len()
+                                handle_version = handle.version,
+                                schema_width = left_schema_clone.len(),
+                                "join left handle"
                             );
                             if let Err(err) = log_handle_rows("left handle", &handle, &bridge_clone).await {
                                 report_graph_task_error(
@@ -422,11 +454,12 @@ impl DbspGraphBuilder {
                             }
                         };
                         if right_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
-                            eprintln!(
-                                "join right handle version {} at ts {} (schema width {})",
-                                handle.version,
+                            tracing::debug!(
+                                graph_id = %right_graph_id,
                                 ts,
-                                right_schema_clone.len()
+                                handle_version = handle.version,
+                                schema_width = right_schema_clone.len(),
+                                "join right handle"
                             );
                             if let Err(err) = log_handle_rows("right handle", &handle, &bridge_clone).await
                             {
@@ -450,12 +483,20 @@ impl DbspGraphBuilder {
         let key_indices = Arc::new(key_indices);
         let left_key_indices = Arc::clone(&key_indices);
         let right_key_indices = Arc::clone(&key_indices);
+        let left_graph_id = graph_id.clone();
+        let right_graph_id = graph_id.clone();
+        let predicate_graph_id = graph_id.clone();
+        let projector_graph_id = graph_id.clone();
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join left key: {err}");
+                    tracing::warn!(
+                        graph_id = %left_graph_id,
+                        error = %err,
+                        "failed to decode join left key"
+                    );
                     return None;
                 }
             };
@@ -464,7 +505,11 @@ impl DbspGraphBuilder {
                 let value = match left_row.get(*li) {
                     Some(value) => value.clone(),
                     None => {
-                        eprintln!("join left key index {li} out of bounds");
+                        tracing::warn!(
+                            graph_id = %left_graph_id,
+                            index = *li,
+                            "join left key index out of bounds"
+                        );
                         return None;
                     }
                 };
@@ -476,7 +521,11 @@ impl DbspGraphBuilder {
             match encode_projected_row_key(&key_columns) {
                 Ok(encoded) => Some(encoded),
                 Err(err) => {
-                    eprintln!("failed to encode join left key: {err}");
+                    tracing::warn!(
+                        graph_id = %left_graph_id,
+                        error = %err,
+                        "failed to encode join left key"
+                    );
                     None
                 }
             }
@@ -486,7 +535,11 @@ impl DbspGraphBuilder {
             let right_row = match decode_projected_row_key(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join right key: {err}");
+                    tracing::warn!(
+                        graph_id = %right_graph_id,
+                        error = %err,
+                        "failed to decode join right key"
+                    );
                     return None;
                 }
             };
@@ -495,7 +548,11 @@ impl DbspGraphBuilder {
                 let value = match right_row.get(*ri) {
                     Some(value) => value.clone(),
                     None => {
-                        eprintln!("join right key index {ri} out of bounds");
+                        tracing::warn!(
+                            graph_id = %right_graph_id,
+                            index = *ri,
+                            "join right key index out of bounds"
+                        );
                         return None;
                     }
                 };
@@ -507,7 +564,11 @@ impl DbspGraphBuilder {
             match encode_projected_row_key(&key_columns) {
                 Ok(encoded) => Some(encoded),
                 Err(err) => {
-                    eprintln!("failed to encode join right key: {err}");
+                    tracing::warn!(
+                        graph_id = %right_graph_id,
+                        error = %err,
+                        "failed to encode join right key"
+                    );
                     None
                 }
             }
@@ -520,14 +581,22 @@ impl DbspGraphBuilder {
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join left row: {err}");
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to decode join left row"
+                    );
                     return false;
                 }
             };
             let right_row = match decode_projected_row_key(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join right row: {err}");
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to decode join right row"
+                    );
                     return false;
                 }
             };
@@ -537,7 +606,11 @@ impl DbspGraphBuilder {
             match eval_expression(expr, &combined, output_schema.as_ref()) {
                 Ok(result) => result,
                 Err(err) => {
-                    eprintln!("failed to evaluate join residual: {err}");
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to evaluate join residual"
+                    );
                     false
                 }
             }
@@ -547,14 +620,22 @@ impl DbspGraphBuilder {
             let mut combined = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join projection left row: {err}");
+                    tracing::warn!(
+                        graph_id = %projector_graph_id,
+                        error = %err,
+                        "failed to decode join projection left row"
+                    );
                     return Vec::new();
                 }
             };
             let right_row = match decode_projected_row_key(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join projection right row: {err}");
+                    tracing::warn!(
+                        graph_id = %projector_graph_id,
+                        error = %err,
+                        "failed to decode join projection right row"
+                    );
                     return Vec::new();
                 }
             };
@@ -562,7 +643,11 @@ impl DbspGraphBuilder {
             match encode_projected_row_key(&combined) {
                 Ok(encoded) => encoded,
                 Err(err) => {
-                    eprintln!("failed to encode join projection row: {err}");
+                    tracing::warn!(
+                        graph_id = %projector_graph_id,
+                        error = %err,
+                        "failed to encode join projection row"
+                    );
                     Vec::new()
                 }
             }
@@ -582,9 +667,11 @@ impl DbspGraphBuilder {
         // Log the first output handle, if any, to verify join activity.
         let mut join_cursor = StreamCursor::new(join.stream().stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {
-            eprintln!(
-                "join output snapshot version {} at ts {}",
-                handle.version, ts
+            tracing::debug!(
+                graph_id = %graph_id,
+                ts,
+                handle_version = handle.version,
+                "join output snapshot"
             );
             log_handle_rows("join output snapshot", &handle, &self.bridge).await?;
         }
@@ -705,9 +792,17 @@ impl DbspGraphBuilder {
                                     Ok(state) => {
                                         registry_clone.set_dbsp_state(state);
                                         registry_clone.publish_version(ts, snapshot_handle);
-                                        eprintln!(
-                                            "materialized view '{view_label}' advanced to version {ts}"
-                                        );
+                                        if MV_UPDATE_LOG_COUNTER
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            % MV_UPDATE_LOG_SAMPLE_EVERY
+                                            == 0
+                                        {
+                                            tracing::info!(
+                                                view = %view_label,
+                                                version = ts,
+                                                "materialized view advanced"
+                                            );
+                                        }
                                     }
                                     Err(err) => {
                                         report_graph_task_error(
@@ -821,7 +916,12 @@ async fn log_handle_rows(
         let decoded = decode_projected_row_key(&row);
         rows.push((decoded, diff));
     }
-    eprintln!("{label}: row_count={}, first_rows={:?}", total, rows);
+    tracing::debug!(
+        label,
+        row_count = total,
+        first_rows = ?rows,
+        "handle rows"
+    );
     Ok(())
 }
 

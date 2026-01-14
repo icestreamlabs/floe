@@ -445,6 +445,12 @@ where
     }
 
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
+        let span = tracing::debug_span!(
+            "materialize",
+            namespace = %self.namespace,
+            version = self.current_version
+        );
+        let _enter = span.enter();
         let mut aggregate = if let Some(base_version) = self.manifest.as_ref().and_then(|m| m.base)
         {
             self.load_version_chain(base_version).await?

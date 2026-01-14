@@ -26,6 +26,8 @@ slatedb = { workspace = true }
 bytes = "1.6"
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
 chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }

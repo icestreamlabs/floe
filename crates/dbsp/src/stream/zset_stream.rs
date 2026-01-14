@@ -180,10 +180,26 @@ where
 
     pub async fn flush_with_delta(&mut self) -> Result<(ZSetHandle, ZSetHandle)> {
         let overlay = std::mem::take(&mut self.overlay);
-        if overlay.is_empty() {
-            return self.flush_without_version_update().await;
+        let overlay_len = overlay.len();
+        let span = tracing::debug_span!(
+            "flush",
+            namespace = %self.namespace(),
+            overlay_len,
+            version = tracing::field::Empty,
+            delta_version = tracing::field::Empty
+        );
+        let _enter = span.enter();
+        let result = if overlay.is_empty() {
+            self.flush_without_version_update().await
+        } else {
+            self.flush_with_overlay(overlay).await
+        };
+        if let Ok((snapshot, delta)) = &result {
+            span.record("version", snapshot.version);
+            span.record("delta_version", delta.version);
+            tracing::debug!("flush complete");
         }
-        self.flush_with_overlay(overlay).await
+        result
     }
 
     pub async fn get_handle(&mut self, timestamp: i64) -> Result<ZSetHandle> {

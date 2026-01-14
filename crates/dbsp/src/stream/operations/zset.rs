@@ -106,21 +106,28 @@ where
                             if let Err(err) =
                                 publish_handle(&mut writer, output_handle, &mut initialized).await
                             {
-                                eprintln!("failed to publish lifted select handle: {err}");
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to publish lifted select handle"
+                                );
                                 break;
                             }
                         }
                         Err(err) => {
-                            eprintln!(
-                                "failed to compute lifted select handle for ns '{}': {err:#?}",
-                                handle.ns
+                            tracing::error!(
+                                namespace = %handle.ns,
+                                error = %err,
+                                "failed to compute lifted select handle"
                             );
                             break;
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("select input stream closed unexpectedly: {err}");
+                    tracing::warn!(
+                        error = %err,
+                        "select input stream closed unexpectedly"
+                    );
                     break;
                 }
             }
@@ -217,21 +224,28 @@ where
                             if let Err(err) =
                                 publish_handle(&mut writer, output_handle, &mut initialized).await
                             {
-                                eprintln!("failed to publish lifted project handle: {err}");
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to publish lifted project handle"
+                                );
                                 break;
                             }
                         }
                         Err(err) => {
-                            eprintln!(
-                                "failed to compute lifted project handle for ns '{}': {err:#?}",
-                                handle.ns
+                            tracing::error!(
+                                namespace = %handle.ns,
+                                error = %err,
+                                "failed to compute lifted project handle"
                             );
                             break;
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("project input stream closed unexpectedly: {err}");
+                    tracing::warn!(
+                        error = %err,
+                        "project input stream closed unexpectedly"
+                    );
                     break;
                 }
             }
@@ -334,9 +348,9 @@ where
             match runtime.next_handles().await {
                 Ok((_, handles)) => {
                     if handles.len() != 2 {
-                        eprintln!(
-                            "join runtime produced unexpected handle count {}",
-                            handles.len()
+                        tracing::error!(
+                            handle_count = handles.len(),
+                            "join runtime produced unexpected handle count"
                         );
                         break;
                     }
@@ -354,18 +368,27 @@ where
                             if let Err(err) =
                                 publish_handle(&mut writer, output_handle, &mut initialized).await
                             {
-                                eprintln!("failed to publish lifted join handle: {err}");
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to publish lifted join handle"
+                                );
                                 break;
                             }
                         }
                         Err(err) => {
-                            eprintln!("failed to compute lifted join handle: {err:#?}");
+                            tracing::error!(
+                                error = %err,
+                                "failed to compute lifted join handle"
+                            );
                             break;
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("join input streams closed unexpectedly: {err}");
+                    tracing::warn!(
+                        error = %err,
+                        "join input streams closed unexpectedly"
+                    );
                     break;
                 }
             }

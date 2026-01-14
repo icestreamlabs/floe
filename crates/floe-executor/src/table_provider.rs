@@ -190,9 +190,9 @@ impl MaterializedViewTableProvider {
         })?;
 
         let Some(state) = view.dbsp_state() else {
-            eprintln!(
-                "Materialized view '{}' has no DBSP state when loading rows",
-                self.view_name
+            tracing::warn!(
+                view = %self.view_name,
+                "materialized view has no DBSP state when loading rows"
             );
             return Ok((Vec::new(), 0));
         };
@@ -200,11 +200,11 @@ impl MaterializedViewTableProvider {
         let rows = self
             .materialize_dbsp_rows(state, Some(target_version))
             .await?;
-        eprintln!(
-            "Materialized view '{}' loaded {} row(s) at version {}",
-            self.view_name,
-            rows.len(),
-            target_version
+        tracing::info!(
+            view = %self.view_name,
+            version = target_version,
+            rows = rows.len(),
+            "materialized view loaded rows"
         );
         Ok((rows, target_version))
     }
@@ -226,11 +226,11 @@ impl MaterializedViewTableProvider {
             .await
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
         #[cfg(test)]
-        eprintln!(
-            "materialize_dbsp_rows view={} version {} snapshot len {}",
-            self.view_name,
-            target_version,
-            snapshot.len()
+        tracing::debug!(
+            view = %self.view_name,
+            version = target_version,
+            snapshot_len = snapshot.len(),
+            "materialize dbsp rows"
         );
         let mut rows = Vec::new();
         for (key, diff) in snapshot {

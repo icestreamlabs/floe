@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -10,12 +10,17 @@ use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::join::JoinOp;
 use dbsp::relation_state::RelationState;
+use dbsp::stream::util::materialize_zset_handle;
 use dbsp::stream::runtime::DeltaOperator;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
 
 struct JoinBenchState {
     op: JoinOp<i64, i64, i64, i64>,
+    table: Arc<dyn KeyValueTable>,
+    dict_cache: HashMap<String, Arc<Dictionary<i64>>>,
+    left_base: ZSetHandle,
+    right_base: ZSetHandle,
     left_delta: ZSetHandle,
     right_delta: ZSetHandle,
 }
@@ -141,7 +146,7 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     )
     .await;
     let _ = op
-        .on_step(0, &[left_base, right_base])
+        .on_step(0, &[left_base.clone(), right_base.clone()])
         .await
         .expect("bootstrap join");
 
@@ -153,13 +158,21 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
         &delta_left,
     )
     .await;
-    let right_delta = ZSetHandle {
-        ns: "bench_right_stream".to_string(),
-        version: 0,
-    };
+    let delta_right: Vec<(i64, i64)> = (0..delta_size as i64).map(|idx| (idx, 1)).collect();
+    let right_delta = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "bench_right_stream",
+        &delta_right,
+    )
+    .await;
 
     JoinBenchState {
         op,
+        table,
+        dict_cache: HashMap::new(),
+        left_base,
+        right_base,
         left_delta,
         right_delta,
     }
@@ -173,21 +186,73 @@ async fn run_incremental_join(mut state: JoinBenchState) {
         .expect("join step");
 }
 
+async fn run_nested_loop_join(mut state: JoinBenchState) {
+    let mut left =
+        materialize_zset_handle::<i64>(state.table.clone(), &mut state.dict_cache, &state.left_base)
+            .await
+            .expect("materialize left base");
+    let left_delta = materialize_zset_handle::<i64>(
+        state.table.clone(),
+        &mut state.dict_cache,
+        &state.left_delta,
+    )
+    .await
+    .expect("materialize left delta");
+    apply_deltas(&mut left, left_delta);
+
+    let mut right =
+        materialize_zset_handle::<i64>(state.table.clone(), &mut state.dict_cache, &state.right_base)
+            .await
+            .expect("materialize right base");
+    let right_delta = materialize_zset_handle::<i64>(
+        state.table.clone(),
+        &mut state.dict_cache,
+        &state.right_delta,
+    )
+    .await
+    .expect("materialize right delta");
+    apply_deltas(&mut right, right_delta);
+
+    let mut matches = 0_i64;
+    for (left_key, left_weight) in &left {
+        for (right_key, right_weight) in &right {
+            if left_key == right_key {
+                matches += left_weight * right_weight;
+            }
+        }
+    }
+    criterion::black_box(matches);
+}
+
+fn apply_deltas(target: &mut HashMap<i64, i64>, deltas: HashMap<i64, i64>) {
+    for (key, delta) in deltas {
+        let entry = target.entry(key).or_insert(0);
+        *entry += delta;
+        if *entry == 0 {
+            target.remove(&key);
+        }
+    }
+}
+
 fn bench_incremental_join(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("build runtime");
     let mut group = c.benchmark_group("incremental_join");
     for base_size in [1_000_usize, 10_000] {
         let delta_size = 100;
-        group.bench_function(
-            BenchmarkId::new("delta_left", base_size),
-            |b| {
-                b.iter_batched(
-                    || runtime.block_on(build_state(base_size, delta_size)),
-                    |state| runtime.block_on(run_incremental_join(state)),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_function(BenchmarkId::new("incremental", base_size), |b| {
+            b.iter_batched(
+                || runtime.block_on(build_state(base_size, delta_size)),
+                |state| runtime.block_on(run_incremental_join(state)),
+                BatchSize::SmallInput,
+            );
+        });
+        group.bench_function(BenchmarkId::new("nested_loop", base_size), |b| {
+            b.iter_batched(
+                || runtime.block_on(build_state(base_size, delta_size)),
+                |state| runtime.block_on(run_nested_loop_join(state)),
+                BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }

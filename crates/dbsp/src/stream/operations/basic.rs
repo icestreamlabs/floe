@@ -366,7 +366,10 @@ where
     tokio::spawn(async move {
         loop {
             if let Err(err) = runtime.step().await {
-                eprintln!("live differentiate_zset_stream runtime terminated: {err}");
+                tracing::error!(
+                    error = %err,
+                    "live differentiate_zset_stream runtime terminated"
+                );
                 break;
             }
         }

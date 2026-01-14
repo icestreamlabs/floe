@@ -91,6 +91,12 @@ where
     }
 
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
+        let span = tracing::debug_span!(
+            "materialize",
+            namespace = %self.namespace,
+            version = self.version
+        );
+        let _enter = span.enter();
         let versioned = VersionedZSet::open_for_handle(
             self.dict.clone(),
             self.table.clone(),

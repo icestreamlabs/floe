@@ -33,7 +33,7 @@ pub fn report_runtime_error(
     if let Some(handler) = handler {
         handler(err);
     } else {
-        eprintln!("{label} runtime terminated with error: {err}");
+        tracing::error!(label, error = %err, "runtime terminated with error");
     }
 }
 

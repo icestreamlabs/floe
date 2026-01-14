@@ -140,7 +140,11 @@ impl DbspCircuitInstance {
                     view_handle.publish_version(ts, snapshot_handle);
                 }
                 Err(err) => {
-                    eprintln!("failed to seed materialized view '{view_name}': {err}");
+                    tracing::error!(
+                        view = %view_name,
+                        error = %err,
+                        "failed to seed materialized view"
+                    );
                 }
             }
         }
@@ -245,21 +249,21 @@ impl DbspCircuitInstance {
             let row = match decode_row(bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode projection row: {err}");
+                    tracing::warn!(error = %err, "failed to decode projection row");
                     return Vec::new();
                 }
             };
             let projected = match projector_eval.project(&row) {
                 Ok(projected) => projected,
                 Err(err) => {
-                    eprintln!("failed to evaluate projection: {err}");
+                    tracing::warn!(error = %err, "failed to evaluate projection");
                     return Vec::new();
                 }
             };
             match encode_projected_row_key(&projected) {
                 Ok(encoded) => encoded,
                 Err(err) => {
-                    eprintln!("failed to encode projected row: {err}");
+                    tracing::warn!(error = %err, "failed to encode projected row");
                     Vec::new()
                 }
             }
@@ -282,7 +286,7 @@ impl DbspCircuitInstance {
             let left_row = match decode_row(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join left key: {err}");
+                    tracing::warn!(error = %err, "failed to decode join left key");
                     return None;
                 }
             };
@@ -290,14 +294,14 @@ impl DbspCircuitInstance {
                 Ok(Some(columns)) => columns,
                 Ok(None) => return None,
                 Err(err) => {
-                    eprintln!("failed to evaluate join left key: {err}");
+                    tracing::warn!(error = %err, "failed to evaluate join left key");
                     return None;
                 }
             };
             match encode_projected_row_key(&key_columns) {
                 Ok(encoded) => Some(encoded),
                 Err(err) => {
-                    eprintln!("failed to encode join left key: {err}");
+                    tracing::warn!(error = %err, "failed to encode join left key");
                     None
                 }
             }
@@ -308,7 +312,7 @@ impl DbspCircuitInstance {
             let right_row = match decode_row(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join right key: {err}");
+                    tracing::warn!(error = %err, "failed to decode join right key");
                     return None;
                 }
             };
@@ -316,14 +320,14 @@ impl DbspCircuitInstance {
                 Ok(Some(columns)) => columns,
                 Ok(None) => return None,
                 Err(err) => {
-                    eprintln!("failed to evaluate join right key: {err}");
+                    tracing::warn!(error = %err, "failed to evaluate join right key");
                     return None;
                 }
             };
             match encode_projected_row_key(&key_columns) {
                 Ok(encoded) => Some(encoded),
                 Err(err) => {
-                    eprintln!("failed to encode join right key: {err}");
+                    tracing::warn!(error = %err, "failed to encode join right key");
                     None
                 }
             }
@@ -352,14 +356,14 @@ impl DbspCircuitInstance {
             let left_row = match decode_row(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join left row: {err}");
+                    tracing::warn!(error = %err, "failed to decode join left row");
                     return Vec::new();
                 }
             };
             let right_row = match decode_row(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("failed to decode join right row: {err}");
+                    tracing::warn!(error = %err, "failed to decode join right row");
                     return Vec::new();
                 }
             };
@@ -367,7 +371,7 @@ impl DbspCircuitInstance {
             match encode_projected_row_key(&combined) {
                 Ok(encoded) => encoded,
                 Err(err) => {
-                    eprintln!("failed to encode join projection row: {err}");
+                    tracing::warn!(error = %err, "failed to encode join projection row");
                     Vec::new()
                 }
             }

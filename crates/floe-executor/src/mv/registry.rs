@@ -8,6 +8,7 @@ use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
+use tracing::field;
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -110,12 +111,15 @@ impl MaterializedViewHandle {
     }
 
     pub fn set_dbsp_state(&self, state: DbspPersistedState) {
-        eprintln!(
-            "Materialized view '{}' set DBSP state to namespace {} version {}",
-            self.name,
-            state.namespace(),
-            state.version()
+        let span = tracing::debug_span!(
+            "materialize",
+            view = %self.name,
+            namespace = %state.namespace(),
+            version = field::Empty
         );
+        let _enter = span.enter();
+        span.record("version", state.version());
+        tracing::debug!("materialized view DBSP state updated");
         *self.dbsp_state.write().expect("mutex poisoned") = Some(state);
     }
 
@@ -124,6 +128,7 @@ impl MaterializedViewHandle {
     }
 
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
+        let namespace = handle.ns.clone();
         {
             let mut guard = self
                 .versions
@@ -138,9 +143,11 @@ impl MaterializedViewHandle {
                 .expect("materialized view version lock poisoned");
             *guard = Some(version);
         }
-        eprintln!(
-            "Materialized view '{}' recorded version {version}",
-            self.name
+        tracing::debug!(
+            view = %self.name,
+            version,
+            namespace = %namespace,
+            "materialized view version recorded"
         );
         let _ = self.version_watch.send_replace(Some(version));
     }
