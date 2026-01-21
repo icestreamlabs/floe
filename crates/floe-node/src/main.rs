@@ -1,9 +1,4 @@
 mod cli;
-mod executor;
-mod generator;
-mod planner;
-mod server;
-mod source;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -13,13 +8,16 @@ use anyhow::Context;
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
+use floe_node_core::tail_client;
+use floe_node_core::generator;
+use floe_server as server;
 use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
-    ValidatedPlan, validate_dbsp_plan,
+    SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
 };
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
-use planner::{PlannedMaterializedView, plan_materialized_views};
+use floe_node_core::planner::{PlannedMaterializedView, camel_case_schema, plan_materialized_views};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -31,22 +29,31 @@ static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const INGEST_LOG_SAMPLE_EVERY: u64 = 512;
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 
-use crate::executor::{available_sources_from_registry, build_dataflows};
-use crate::source::SourceRegistry;
+use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
+use floe_node_core::source::SourceRegistry;
+use floe_node_core::source as core_source;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = cli::Cli::parse();
+    let run_args = match cli.command {
+        cli::Command::Run(args) => args,
+        cli::Command::Tail(args) => {
+            let config = args.to_config()?;
+            tail_client::run(config)?;
+            return Ok(());
+        }
+    };
 
     let mut source_registry = SourceRegistry::new();
-    source_registry.extend(generator::definitions()?);
+    source_registry.extend(floe_node_core::generator::definitions()?);
     let available_sources = available_sources_from_registry(&source_registry);
 
     let storage = server::init_storage().await?;
     let db = storage.db();
     let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
-    if let Some(sql) = cli.mv_query.as_deref() {
+    if let Some(sql) = run_args.mv_query.as_deref() {
         materialized_views.push(parse_materialized_view(sql)?);
     }
 
@@ -67,6 +74,12 @@ async fn main() -> anyhow::Result<()> {
         all_required_sources.extend(required_sources.iter().cloned());
         plan_required_sources.push(required_sources);
     }
+    all_required_sources.extend(
+        source_registry
+            .definitions()
+            .iter()
+            .map(|definition| definition.name().to_string()),
+    );
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
         OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
@@ -145,17 +158,17 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     let decoder_registry = Arc::new(decoder_registry);
 
-    let (event_tx, event_rx) = source::channel(1024);
+    let (event_tx, event_rx) = core_source::channel(1024);
 
-    let generator_config = generator::Config {
-        events_per_second: cli.events_per_second,
-        max_events: cli.max_events,
+    let generator_config = floe_node_core::generator::Config {
+        events_per_second: run_args.events_per_second,
+        max_events: run_args.max_events,
     };
 
     let generator_handle: JoinHandle<()> = {
         let sender = event_tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = generator::run(generator_config, sender).await {
+            if let Err(err) = floe_node_core::generator::run(generator_config, sender).await {
                 tracing::error!(error = %err, "Nexmark generator failed");
             }
         })
@@ -247,11 +260,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let source_bridge = Arc::new(Mutex::new(DbspBridge::new(Arc::clone(&db)).await?));
     let query = FloeQueryContext::new(storage);
     query
         .preload_tables()
         .await
         .context("failed to register tables with DataFusion")?;
+    register_source_tables(&query, &source_registry, Arc::clone(&source_bridge))
+        .await
+        .context("register source tables")?;
     register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
         .context("register materialized view tables")?;
 
@@ -319,6 +336,45 @@ fn register_materialized_view_tables(
             .context("register materialized view provider")?;
     }
 
+    Ok(())
+}
+
+async fn register_source_tables(
+    context: &FloeQueryContext,
+    sources: &SourceRegistry,
+    bridge: Arc<Mutex<DbspBridge>>,
+) -> anyhow::Result<()> {
+    let session = context.session();
+    for definition in sources.definitions() {
+        let schema = definition.to_arrow_schema();
+        let provider = SourceTableProvider::new(
+            Arc::clone(&bridge),
+            definition.name(),
+            definition.name(),
+            schema,
+        )?;
+        session
+            .register_table(definition.name(), Arc::new(provider))
+            .with_context(|| format!("register source table {}", definition.name()))?;
+
+        if let Some(short_name) = definition.name().strip_prefix("nexmark_") {
+            let alias_schema = camel_case_schema(definition);
+            let alias_provider = SourceTableProvider::new(
+                Arc::clone(&bridge),
+                short_name,
+                definition.name(),
+                alias_schema,
+            )?;
+            session
+                .register_table(short_name, Arc::new(alias_provider))
+                .with_context(|| {
+                    format!(
+                        "register alias table {short_name} for source {}",
+                        definition.name()
+                    )
+                })?;
+        }
+    }
     Ok(())
 }
 

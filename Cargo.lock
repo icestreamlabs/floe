@@ -1641,22 +1641,66 @@ dependencies = [
 name = "dbsp"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "dbsp-circuit",
+ "dbsp-planner",
+ "dbsp-runtime",
+ "dbsp-storage",
+ "object_store",
+ "rand 0.8.5",
+ "slatedb",
+ "tokio",
+]
+
+[[package]]
+name = "dbsp-circuit"
+version = "0.1.0"
+dependencies = [
  "anyhow",
  "arrow-schema",
- "async-trait",
- "criterion",
  "datafusion",
  "datafusion-common",
+ "once_cell",
+]
+
+[[package]]
+name = "dbsp-planner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "datafusion",
+ "datafusion-common",
+ "dbsp-circuit",
+]
+
+[[package]]
+name = "dbsp-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dbsp-storage",
  "futures",
+ "object_store",
+ "rkyv 0.8.12",
+ "slatedb",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dbsp-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
  "lru",
  "object_store",
- "once_cell",
  "rand 0.8.5",
  "rkyv 0.8.12",
  "slatedb",
  "snap",
  "tokio",
- "tracing",
  "xxhash-rust",
 ]
 
@@ -1868,31 +1912,60 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "async-trait",
- "bytes",
- "chrono",
  "clap",
  "datafusion",
- "datafusion-common",
  "dbsp",
- "floe-core",
  "floe-executor",
+ "floe-node-core",
+ "floe-server",
  "floe-sql-parser",
  "floe-storage",
- "futures",
- "nexmark",
- "pgwire",
- "postgres-types",
- "serde",
- "serde_json",
  "slatedb",
- "sqlparser",
  "tempfile",
  "tokio",
  "tokio-postgres",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "floe-node-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "datafusion",
+ "floe-core",
+ "floe-executor",
+ "floe-sql-parser",
+ "nexmark",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "floe-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "floe-executor",
+ "floe-storage",
+ "futures",
+ "pgwire",
+ "postgres-types",
+ "slatedb",
+ "sqlparser",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -41,5 +41,5 @@ pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::SourceRowDecoder;
 pub use source_registry::SourceRegistry;
 pub use stream_types::{Diff, Row, Timestamp};
-pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
+pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider, SourceTableProvider};
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};

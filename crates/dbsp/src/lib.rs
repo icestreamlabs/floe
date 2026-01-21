@@ -1,15 +1,18 @@
-pub mod algebra;
-pub mod circuit;
-pub mod collections;
-pub mod filter;
-pub mod handles;
-pub mod join;
-pub mod map;
-pub mod operators;
-pub mod relation_state;
-pub mod stream;
+pub mod circuit {
+    pub use dbsp_circuit::circuit::*;
+    pub use dbsp_planner::{CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError};
 
-pub mod storage;
+    pub mod planner {
+        pub use dbsp_planner::{
+            CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError,
+        };
+    }
+}
+
+pub use dbsp_runtime::{
+    algebra, collections, filter, handles, join, map, operators, relation_state, stream,
+};
+pub use dbsp_storage::storage;
 
 pub use algebra::AbelianGroup;
 pub use circuit::{

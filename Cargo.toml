@@ -1,10 +1,16 @@
 [workspace]
 members = [
     "crates/floe-node",
+    "crates/floe-node-core",
     "crates/floe-core",
     "crates/floe-executor",
+    "crates/floe-server",
     "crates/floe-storage",
     "crates/dbsp",
+    "crates/dbsp-runtime",
+    "crates/dbsp-storage",
+    "crates/dbsp-circuit",
+    "crates/dbsp-planner",
     "crates/floe-sql-parser",
 ]
 default-members = ["crates/floe-node"]
