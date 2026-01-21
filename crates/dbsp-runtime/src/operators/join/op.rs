@@ -18,7 +18,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::materialize_zset_handle;
+use crate::stream::util::delta_zset_handle;
 
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
@@ -117,6 +117,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
@@ -192,6 +193,21 @@ where
         keyed
     }
 
+    fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> HashMap<T, i64>
+    where
+        T: Clone + Eq + Hash,
+    {
+        let mut merged = HashMap::new();
+        for (row, weight) in deltas {
+            let entry = merged.entry(row.clone()).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                merged.remove(&row);
+            }
+        }
+        merged
+    }
+
     async fn apply_deltas_to_versioned<T>(
         versioned: &mut VersionedZSet<T>,
         deltas: &HashMap<T, i64>,
@@ -241,10 +257,8 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() {
-                if let Some(handle) = versioned.current_handle() {
-                    return Ok(handle);
-                }
+            if base.is_some() && let Some(handle) = versioned.current_handle() {
+                return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
         }
@@ -328,20 +342,22 @@ where
             .cloned()
             .context("join operator requires right delta handle")?;
 
-        let left_delta = materialize_zset_handle::<L>(
+        let left_delta_values = delta_zset_handle::<L>(
             self.table.clone(),
             &mut self.dict_cache_left,
             &left_delta_handle,
         )
         .await
-        .context("materialize left delta for join")?;
-        let right_delta = materialize_zset_handle::<R>(
+        .context("load left delta for join")?;
+        let right_delta_values = delta_zset_handle::<R>(
             self.table.clone(),
             &mut self.dict_cache_right,
             &right_delta_handle,
         )
         .await
-        .context("materialize right delta for join")?;
+        .context("load right delta for join")?;
+        let left_delta = self.coalesce_deltas(left_delta_values);
+        let right_delta = self.coalesce_deltas(right_delta_values);
         let left_keyed = self.keyed_deltas(&left_delta, &self.left_key);
         let right_keyed = self.keyed_deltas(&right_delta, &self.right_key);
 

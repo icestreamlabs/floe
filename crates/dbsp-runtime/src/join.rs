@@ -256,7 +256,7 @@ where
         right_version = tracing::field::Empty
     );
     let _enter = span.enter();
-    if let Some(left) = handles.get(0) {
+    if let Some(left) = handles.first() {
         span.record("left_ns", left.ns.as_str());
         span.record("left_version", left.version);
     }
@@ -264,7 +264,10 @@ where
         span.record("right_ns", right.ns.as_str());
         span.record("right_version", right.version);
     }
-    if JOIN_STEP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % JOIN_STEP_LOG_SAMPLE_EVERY == 0 {
+    if JOIN_STEP_LOG_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(JOIN_STEP_LOG_SAMPLE_EVERY)
+    {
         tracing::trace!("join step");
     }
     let mut op_guard = op.lock().await;

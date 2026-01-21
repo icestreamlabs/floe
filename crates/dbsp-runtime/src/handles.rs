@@ -106,4 +106,21 @@ where
         .await?;
         versioned.load_existing_version(self.version).await
     }
+
+    pub async fn delta_iter(&self) -> Result<Vec<(K, i64)>> {
+        let span = tracing::debug_span!(
+            "delta_iter",
+            namespace = %self.namespace,
+            version = self.version
+        );
+        let _enter = span.enter();
+        let versioned = VersionedZSet::open_for_handle(
+            self.dict.clone(),
+            self.table.clone(),
+            self.namespace.clone(),
+            self.version,
+        )
+        .await?;
+        versioned.delta_iter_with_dict(self.version).await
+    }
 }

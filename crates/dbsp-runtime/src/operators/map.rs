@@ -17,7 +17,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::materialize_zset_handle;
+use crate::stream::util::delta_zset_handle;
 
 pub struct MapOp<K, R>
 where
@@ -121,10 +121,8 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() {
-                if let Some(handle) = versioned.current_handle() {
-                    return Ok(handle);
-                }
+            if base.is_some() && let Some(handle) = versioned.current_handle() {
+                return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
         }
@@ -186,18 +184,18 @@ where
             .cloned()
             .context("map operator requires one input delta handle")?;
 
-        let delta_map =
-            materialize_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+        let delta_values =
+            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
-                .context("materialize input delta for map")?;
+                .context("load input delta for map")?;
 
         let mut projected: HashMap<R, i64> = HashMap::new();
-        for (key, weight) in delta_map {
+        for (key, weight) in delta_values {
             let projected_key = (self.projector)(&key);
-            let entry = projected.entry(projected_key).or_insert(0);
+            let entry = projected.entry(projected_key.clone()).or_insert(0);
             *entry += weight;
             if *entry == 0 {
-                projected.remove(&(self.projector)(&key));
+                projected.remove(&projected_key);
             }
         }
 
@@ -231,6 +229,7 @@ fn bucket_for(id: u64) -> u16 {
 mod tests {
     use super::*;
     use crate::collections::zset::SegmentRecord;
+    use crate::stream::util::{compute_delta, materialize_zset_handle};
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeMap;
@@ -298,6 +297,16 @@ mod tests {
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         Arc::new(Db::open("mapop", store).await.expect("open SlateDB"))
+    }
+
+    fn apply_deltas<K: Clone + Eq + Hash>(state: &mut HashMap<K, i64>, deltas: &[(K, i64)]) {
+        for (key, delta) in deltas {
+            let entry = state.entry(key.clone()).or_insert(0);
+            *entry += *delta;
+            if *entry == 0 {
+                state.remove(key);
+            }
+        }
     }
 
     #[tokio::test]
@@ -405,5 +414,107 @@ mod tests {
         assert_eq!(integrated_after_t2.get(&2), None);
         assert_eq!(integrated_after_t2.get(&3), Some(&2));
         assert_eq!(integrated_after_t2.get(&4), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn map_operator_matches_full_recompute() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "map_recompute_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let integrated_dict = Arc::new(
+            Dictionary::<usize>::with_table(table.clone(), "map_recompute_integrated", None)
+                .await
+                .expect("integrated dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<usize>::with_table(table.clone(), "map_recompute_output", None)
+                .await
+                .expect("output dict"),
+        );
+
+        let integrated = VersionedZSet::new(
+            integrated_dict.clone(),
+            table.clone(),
+            "map_recompute_integrated".to_string(),
+        )
+        .await
+        .expect("integrated");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "map_recompute_output".to_string(),
+        )
+        .await
+        .expect("output");
+
+        let state = RelationState {
+            integrated,
+            latest_handle: ZSetHandle {
+                ns: "map_recompute_integrated".to_string(),
+                version: 0,
+            },
+        };
+
+        let projector = Arc::new(|k: &String| k.len());
+        let mut op = MapOp::new(projector, state, table.clone(), output);
+
+        let steps = vec![
+            vec![("aa".to_string(), 1), ("bbb".to_string(), 2)],
+            vec![("aa".to_string(), -1), ("bbbb".to_string(), 3)],
+        ];
+
+        let mut full_input: HashMap<String, i64> = HashMap::new();
+        let mut full_output: HashMap<usize, i64> = HashMap::new();
+
+        for (idx, deltas) in steps.into_iter().enumerate() {
+            let delta_handle = stage_version(
+                input_dict.clone(),
+                table.clone(),
+                "map_recompute_input",
+                &deltas,
+            )
+            .await;
+            let output_handle = op
+                .on_step(idx as i64 + 1, &[delta_handle])
+                .await
+                .expect("run map step");
+
+            apply_deltas(&mut full_input, &deltas);
+            let mut recompute: HashMap<usize, i64> = HashMap::new();
+            for (key, weight) in &full_input {
+                *recompute.entry(key.len()).or_insert(0) += *weight;
+            }
+            recompute.retain(|_, weight| *weight != 0);
+
+            let expected_delta_vec = compute_delta(&full_output, &recompute);
+            let expected_delta: HashMap<usize, i64> =
+                expected_delta_vec.into_iter().collect();
+
+            if let Some(handle) = output_handle {
+                let mut cache_out = HashMap::new();
+                cache_out.insert("map_recompute_output".to_string(), output_dict.clone());
+                let actual_delta =
+                    materialize_zset_handle::<usize>(table.clone(), &mut cache_out, &handle)
+                        .await
+                        .expect("materialize map output");
+                assert_eq!(actual_delta, expected_delta);
+            } else {
+                assert!(expected_delta.is_empty());
+            }
+
+            let integrated_after = op
+                .state
+                .integrated
+                .materialize()
+                .await
+                .expect("materialize integrated");
+            assert_eq!(integrated_after, recompute);
+
+            full_output = recompute;
+        }
     }
 }

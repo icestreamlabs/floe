@@ -158,6 +158,7 @@ where
     apply_on_resolved_handles(outer, inner_group, out_prefix, op).await
 }
 
+// Use this for operators that require the full integrated ZSet snapshot.
 pub async fn materialize_zset_handle<K>(
     table: Arc<dyn KeyValueTable>,
     cache: &mut HashMap<String, Arc<Dictionary<K>>>,
@@ -193,6 +194,44 @@ where
         .context("materialize ZSet handle")?;
     map.retain(|_, weight| *weight != 0);
     Ok(map)
+}
+
+// Use this for delta-first operators that only need the newest layer.
+pub async fn delta_zset_handle<K>(
+    table: Arc<dyn KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    handle: &ZSetHandle,
+) -> Result<Vec<(K, i64)>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let dict = if let Some(existing) = cache.get(&handle.ns) {
+        existing.clone()
+    } else {
+        let dictionary = Arc::new(
+            Dictionary::with_table(table.clone(), handle.ns.clone(), None)
+                .await
+                .context("open dictionary for ZSet handle")?,
+        );
+        cache.insert(handle.ns.clone(), dictionary.clone());
+        dictionary
+    };
+
+    let view = ZSetHandleView::new(dict, table, handle.ns.clone(), handle.version);
+    let mut deltas = view
+        .delta_iter()
+        .await
+        .context("delta iterate ZSet handle")?;
+    deltas.retain(|(_, delta)| *delta != 0);
+    Ok(deltas)
 }
 
 pub fn compute_delta<K>(previous: &HashMap<K, i64>, next: &HashMap<K, i64>) -> Vec<(K, i64)>

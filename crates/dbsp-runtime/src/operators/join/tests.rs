@@ -17,7 +17,7 @@ use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::util::materialize_zset_handle;
+use crate::stream::util::{compute_delta, materialize_zset_handle};
 use crate::stream::runtime::DeltaOperator;
 
 async fn build_db() -> Arc<Db> {
@@ -83,6 +83,29 @@ where
 
 fn project_sum(l: &i64, r: &i64) -> i64 {
     l + r
+}
+
+fn apply_deltas(state: &mut HashMap<i64, i64>, deltas: &[(i64, i64)]) {
+    for (key, delta) in deltas {
+        let entry = state.entry(*key).or_insert(0);
+        *entry += *delta;
+        if *entry == 0 {
+            state.remove(key);
+        }
+    }
+}
+
+fn recompute_join(left: &HashMap<i64, i64>, right: &HashMap<i64, i64>) -> HashMap<i64, i64> {
+    let mut out = HashMap::new();
+    for (lk, lw) in left {
+        for (rk, rw) in right {
+            if lk == rk {
+                *out.entry(lk + rk).or_insert(0) += lw * rw;
+            }
+        }
+    }
+    out.retain(|_, weight| *weight != 0);
+    out
 }
 
 #[tokio::test]
@@ -534,4 +557,167 @@ async fn join_operator_skips_null_keys() {
             .await
             .expect("materialize join output");
     assert_eq!(out_materialized, HashMap::from([(2, 1)]));
+}
+
+#[tokio::test]
+async fn join_operator_matches_full_recompute() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+    let left_state_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_left_state", None)
+            .await
+            .expect("left state dict"),
+    );
+    let right_state_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_right_state", None)
+            .await
+            .expect("right state dict"),
+    );
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_output", None)
+            .await
+            .expect("out dict"),
+    );
+    let integrated_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "recompute_integrated", None)
+            .await
+            .expect("integrated dict"),
+    );
+
+    let left_state = RelationState {
+        integrated: VersionedZSet::new(
+            left_state_dict.clone(),
+            table.clone(),
+            "recompute_left_state".to_string(),
+        )
+        .await
+        .expect("left integrated"),
+        latest_handle: ZSetHandle {
+            ns: "recompute_left_state".to_string(),
+            version: 0,
+        },
+    };
+    let right_state = RelationState {
+        integrated: VersionedZSet::new(
+            right_state_dict.clone(),
+            table.clone(),
+            "recompute_right_state".to_string(),
+        )
+        .await
+        .expect("right integrated"),
+        latest_handle: ZSetHandle {
+            ns: "recompute_right_state".to_string(),
+            version: 0,
+        },
+    };
+    let output = VersionedZSet::new(
+        out_dict.clone(),
+        table.clone(),
+        "recompute_output".to_string(),
+    )
+    .await
+    .expect("output");
+    let integrated_join = RelationState {
+        integrated: VersionedZSet::new(
+            integrated_dict.clone(),
+            table.clone(),
+            "recompute_integrated".to_string(),
+        )
+        .await
+        .expect("integrated join"),
+        latest_handle: ZSetHandle {
+            ns: "recompute_integrated".to_string(),
+            version: 0,
+        },
+    };
+    let left_index = IndexedZSet::new(table.clone(), "recompute_left_index");
+    let right_index = IndexedZSet::new(table.clone(), "recompute_right_index");
+    let left_key = Arc::new(|value: &i64| Some(*value));
+    let right_key = Arc::new(|value: &i64| Some(*value));
+
+    let mut op = JoinOp::new(
+        left_state,
+        right_state,
+        left_index,
+        right_index,
+        left_key,
+        right_key,
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        output,
+        Some(integrated_join),
+    );
+
+    let steps = vec![
+        (vec![(1, 1), (2, 1)], vec![(1, 2)]),
+        (vec![(1, -1), (3, 1)], vec![(2, 3), (3, 1)]),
+    ];
+
+    let mut full_left: HashMap<i64, i64> = HashMap::new();
+    let mut full_right: HashMap<i64, i64> = HashMap::new();
+    let mut full_join: HashMap<i64, i64> = HashMap::new();
+
+    for (idx, (left_deltas, right_deltas)) in steps.into_iter().enumerate() {
+        let left_delta_handle = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "recompute_left_stream",
+            &left_deltas,
+        )
+        .await;
+        let right_delta_handle = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "recompute_right_stream",
+            &right_deltas,
+        )
+        .await;
+
+        let output_handle = op
+            .on_step(idx as i64 + 1, &[left_delta_handle, right_delta_handle])
+            .await
+            .expect("run join step");
+
+        apply_deltas(&mut full_left, &left_deltas);
+        apply_deltas(&mut full_right, &right_deltas);
+
+        let recompute = recompute_join(&full_left, &full_right);
+        let expected_delta_vec = compute_delta(&full_join, &recompute);
+        let expected_delta: HashMap<i64, i64> = expected_delta_vec.into_iter().collect();
+
+        if let Some(handle) = output_handle {
+            let mut cache = HashMap::new();
+            cache.insert("recompute_output".to_string(), out_dict.clone());
+            let actual_delta =
+                materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle)
+                    .await
+                    .expect("materialize join output");
+            assert_eq!(actual_delta, expected_delta);
+        } else {
+            assert!(expected_delta.is_empty());
+        }
+
+        let integrated_after = op
+            .integrated
+            .as_ref()
+            .unwrap()
+            .integrated
+            .materialize()
+            .await
+            .expect("materialize join integrated");
+        assert_eq!(integrated_after, recompute);
+
+        full_join = recompute;
+    }
 }

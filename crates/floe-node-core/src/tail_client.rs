@@ -128,7 +128,7 @@ fn send_query(stream: &mut TcpStream, sql: &str) -> anyhow::Result<()> {
     payload.extend_from_slice(sql.as_bytes());
     payload.push(0);
     let len = (payload.len() + 4) as u32;
-    stream.write_all(&[b'Q'])?;
+    stream.write_all(b"Q")?;
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(&payload)?;
     stream.flush()?;
@@ -136,7 +136,7 @@ fn send_query(stream: &mut TcpStream, sql: &str) -> anyhow::Result<()> {
 }
 
 fn send_terminate(stream: &mut TcpStream) -> anyhow::Result<()> {
-    stream.write_all(&[b'X'])?;
+    stream.write_all(b"X")?;
     stream.write_all(&4u32.to_be_bytes())?;
     stream.flush()?;
     Ok(())
@@ -187,7 +187,7 @@ fn parse_data_row(payload: &[u8]) -> anyhow::Result<Vec<String>> {
         if idx + 4 > payload.len() {
             anyhow::bail!("data row truncated");
         }
-        let len = i32::from_be_bytes(payload[idx..idx + 4].try_into()?) as i32;
+        let len = i32::from_be_bytes(payload[idx..idx + 4].try_into()?);
         idx += 4;
         if len < 0 {
             values.push("NULL".to_string());

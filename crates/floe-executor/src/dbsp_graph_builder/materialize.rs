@@ -22,6 +22,7 @@ static MV_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_UPDATE_LOG_SAMPLE_EVERY: u64 = 128;
 
 impl DbspGraphBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn materialize_view(
         &mut self,
         view_name: &str,
@@ -138,8 +139,7 @@ impl DbspGraphBuilder {
                                         registry_clone.publish_version(ts, snapshot_handle);
                                         if MV_UPDATE_LOG_COUNTER
                                             .fetch_add(1, Ordering::Relaxed)
-                                            % MV_UPDATE_LOG_SAMPLE_EVERY
-                                            == 0
+                                            .is_multiple_of(MV_UPDATE_LOG_SAMPLE_EVERY)
                                         {
                                             tracing::info!(
                                                 view = %view_label,

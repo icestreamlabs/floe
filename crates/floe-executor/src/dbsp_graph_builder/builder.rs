@@ -80,6 +80,7 @@ impl DbspGraphBuilder {
         &self.ns.graph_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[async_recursion]
     async fn compile_node(
         &mut self,

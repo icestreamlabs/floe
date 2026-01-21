@@ -12,7 +12,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::materialize_zset_handle;
+use crate::stream::util::delta_zset_handle;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -35,6 +35,7 @@ where
     pub table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    integrated_cache: Option<HashMap<K, i64>>,
 }
 
 impl<K> DistinctOp<K>
@@ -59,7 +60,23 @@ where
             table,
             output,
             dict_cache: HashMap::new(),
+            integrated_cache: None,
         }
+    }
+
+    async fn ensure_integrated_cache(&mut self) -> Result<()> {
+        if self.integrated_cache.is_some() {
+            return Ok(());
+        }
+
+        let materialized = self
+            .state
+            .integrated
+            .materialize()
+            .await
+            .context("materialize integrated state for distinct cache")?;
+        self.integrated_cache = Some(materialized);
+        Ok(())
     }
 
     async fn apply_deltas_to_versioned(
@@ -100,10 +117,8 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() {
-                if let Some(handle) = versioned.current_handle() {
-                    return Ok(handle);
-                }
+            if base.is_some() && let Some(handle) = versioned.current_handle() {
+                return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
         }
@@ -156,25 +171,48 @@ where
             .cloned()
             .context("distinct operator requires one input delta handle")?;
 
-        let delta_map =
-            materialize_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+        let delta_values =
+            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
-                .context("materialize delta for distinct")?;
-        let integrated_map = self
-            .state
-            .integrated
-            .materialize()
+                .context("load delta for distinct")?;
+
+        if delta_values.is_empty() {
+            return Ok(None);
+        }
+
+        self.ensure_integrated_cache()
             .await
-            .context("materialize integrated state for distinct")?;
+            .context("load distinct cache")?;
+
+        let mut delta_map = HashMap::new();
+        for (key, diff_weight) in delta_values {
+            let entry = delta_map.entry(key.clone()).or_insert(0);
+            *entry += diff_weight;
+            if *entry == 0 {
+                delta_map.remove(&key);
+            }
+        }
+
+        if delta_map.is_empty() {
+            return Ok(None);
+        }
 
         let mut h_deltas = HashMap::new();
-        for (key, diff_weight) in &delta_map {
-            let state_weight = integrated_map.get(key).copied().unwrap_or(0);
-            let coalesced = diff_weight + state_weight;
-            if state_weight > 0 && coalesced <= 0 {
-                h_deltas.insert(key.clone(), -1);
-            } else if state_weight <= 0 && coalesced > 0 {
-                h_deltas.insert(key.clone(), 1);
+        let mut cache_updates = Vec::new();
+        {
+            let integrated_map = self
+                .integrated_cache
+                .as_ref()
+                .context("integrated cache missing for distinct")?;
+            for (key, diff_weight) in &delta_map {
+                let state_weight = integrated_map.get(key).copied().unwrap_or(0);
+                let coalesced = diff_weight + state_weight;
+                if state_weight > 0 && coalesced <= 0 {
+                    h_deltas.insert(key.clone(), -1);
+                } else if state_weight <= 0 && coalesced > 0 {
+                    h_deltas.insert(key.clone(), 1);
+                }
+                cache_updates.push((key.clone(), coalesced));
             }
         }
 
@@ -188,6 +226,16 @@ where
                 .await
                 .context("update integrated state for distinct")?;
         self.state.update_handle(new_integrated_handle);
+
+        if let Some(integrated_map) = self.integrated_cache.as_mut() {
+            for (key, weight) in cache_updates {
+                if weight == 0 {
+                    integrated_map.remove(&key);
+                } else {
+                    integrated_map.insert(key, weight);
+                }
+            }
+        }
 
         if h_deltas.is_empty() {
             return Ok(None);
@@ -208,6 +256,7 @@ fn bucket_for(id: u64) -> u16 {
 mod tests {
     use super::*;
     use crate::collections::zset::SegmentRecord;
+    use crate::stream::util::{compute_delta, materialize_zset_handle};
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeMap;
@@ -260,6 +309,16 @@ mod tests {
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         Arc::new(Db::open("distinct", store).await.expect("open SlateDB"))
+    }
+
+    fn apply_deltas(state: &mut HashMap<String, i64>, deltas: &[(String, i64)]) {
+        for (key, delta) in deltas {
+            let entry = state.entry(key.clone()).or_insert(0);
+            *entry += *delta;
+            if *entry == 0 {
+                state.remove(key);
+            }
+        }
     }
 
     #[tokio::test]
@@ -363,5 +422,110 @@ mod tests {
         assert_eq!(out2_materialized, expected_out2);
         assert_eq!(integrated_after_t2.get("a"), None);
         assert_eq!(integrated_after_t2.get("b"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn distinct_operator_matches_full_recompute() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let delta_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "distinct_recompute_delta", None)
+                .await
+                .expect("build delta dictionary"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "distinct_recompute_state", None)
+                .await
+                .expect("build state dictionary"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "distinct_recompute_output", None)
+                .await
+                .expect("build output dictionary"),
+        );
+
+        let integrated = VersionedZSet::new(
+            state_dict.clone(),
+            table.clone(),
+            "distinct_recompute_state".to_string(),
+        )
+        .await
+        .expect("integrated state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "distinct_recompute_output".to_string(),
+        )
+        .await
+        .expect("output state");
+        let initial_handle = ZSetHandle {
+            ns: "distinct_recompute_state".to_string(),
+            version: 0,
+        };
+        let state = RelationState {
+            integrated,
+            latest_handle: initial_handle,
+        };
+
+        let mut op = DistinctOp::new(state, table.clone(), output);
+
+        let steps = vec![
+            vec![("a".to_string(), 1), ("b".to_string(), 2)],
+            vec![("a".to_string(), -1), ("b".to_string(), -2), ("c".to_string(), 1)],
+        ];
+
+        let mut full_input: HashMap<String, i64> = HashMap::new();
+        let mut full_distinct: HashMap<String, i64> = HashMap::new();
+
+        for (idx, deltas) in steps.into_iter().enumerate() {
+            let delta_handle = stage_version(
+                delta_dict.clone(),
+                table.clone(),
+                "distinct_recompute_delta",
+                &deltas,
+            )
+            .await;
+            let output_handle = op
+                .on_step(idx as i64 + 1, &[delta_handle])
+                .await
+                .expect("run distinct step");
+
+            apply_deltas(&mut full_input, &deltas);
+            let mut recompute_distinct = HashMap::new();
+            for (key, weight) in &full_input {
+                if *weight > 0 {
+                    recompute_distinct.insert(key.clone(), 1);
+                }
+            }
+
+            let expected_delta_vec = compute_delta(&full_distinct, &recompute_distinct);
+            let expected_delta: HashMap<String, i64> =
+                expected_delta_vec.into_iter().collect();
+
+            if let Some(handle) = output_handle {
+                let mut cache = HashMap::new();
+                cache.insert(
+                    "distinct_recompute_output".to_string(),
+                    output_dict.clone(),
+                );
+                let actual_delta =
+                    materialize_zset_handle::<String>(table.clone(), &mut cache, &handle)
+                        .await
+                        .expect("materialize distinct output");
+                assert_eq!(actual_delta, expected_delta);
+            } else {
+                assert!(expected_delta.is_empty());
+            }
+
+            let integrated_after = op
+                .state
+                .integrated
+                .materialize()
+                .await
+                .expect("materialize integrated");
+            assert_eq!(integrated_after, full_input);
+
+            full_distinct = recompute_distinct;
+        }
     }
 }

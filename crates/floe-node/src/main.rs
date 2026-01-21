@@ -252,10 +252,8 @@ async fn main() -> anyhow::Result<()> {
             // Advance frontier for all sources this epoch, even if they had no rows.
             if let Err(err) = registry.tick_all().await {
                 tracing::error!(epoch, error = %err, "failed to tick outer streams");
-            } else {
-                if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
-                    tracing::debug!(epoch, "advanced all source frontiers");
-                }
+            } else if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
+                tracing::debug!(epoch, "advanced all source frontiers");
             }
         }
     });
@@ -310,7 +308,9 @@ fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;
     }
-    counter.fetch_add(1, Ordering::Relaxed) % every == 0
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(every)
 }
 
 fn register_materialized_view_tables(
