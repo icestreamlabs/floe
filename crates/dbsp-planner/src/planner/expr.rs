@@ -1,0 +1,153 @@
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion_common::{
+    Column,
+    tree_node::{Transformed, TreeNode},
+};
+
+use dbsp_circuit::circuit::plan::DbspAggregateFunction;
+
+use super::error::PlannerError;
+
+type JoinKeysAndResidual = (Vec<(Expr, Expr)>, Option<Expr>);
+
+pub(super) fn normalize_expr(expr: Expr) -> Result<Expr, PlannerError> {
+    expr.transform_up(|expr| match expr {
+        Expr::Column(column) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+            column.name.clone(),
+        )))),
+        Expr::OuterReferenceColumn(data_type, column) => Ok(Transformed::yes(
+            Expr::OuterReferenceColumn(data_type, Column::new_unqualified(column.name.clone())),
+        )),
+        other => Ok(Transformed::no(other)),
+    })
+    .map(|result| result.data)
+    .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+pub(super) fn combine_filters(filters: Vec<Expr>) -> Option<Expr> {
+    let mut iter = filters.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, expr| {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(acc),
+            op: Operator::And,
+            right: Box::new(expr),
+        })
+    }))
+}
+
+pub(super) fn extract_join_keys_and_residual(expr: &Expr) -> Result<JoinKeysAndResidual, PlannerError> {
+    let mut key_pairs = Vec::new();
+    let mut residuals = Vec::new();
+    accumulate_conjuncts(expr, &mut key_pairs, &mut residuals)?;
+    Ok((key_pairs, combine_filters(residuals)))
+}
+
+fn accumulate_conjuncts(
+    expr: &Expr,
+    key_pairs: &mut Vec<(Expr, Expr)>,
+    residuals: &mut Vec<Expr>,
+) -> Result<(), PlannerError> {
+    let normalized = normalize_expr(expr.clone())?;
+    match &normalized {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            accumulate_conjuncts(&binary.left, key_pairs, residuals)?;
+            accumulate_conjuncts(&binary.right, key_pairs, residuals)?;
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            match (&*binary.left, &*binary.right) {
+                (Expr::Column(_), Expr::Column(_)) => {
+                    key_pairs.push(((*binary.left).clone(), (*binary.right).clone()))
+                }
+                _ => residuals.push(normalized),
+            }
+        }
+        _ => residuals.push(normalized),
+    }
+    Ok(())
+}
+
+pub(super) fn extract_alias(expr: Expr) -> Result<(Expr, Option<String>), PlannerError> {
+    if let Expr::Alias(alias) = expr {
+        let (inner, existing_alias) = extract_alias(alias.expr.as_ref().clone())?;
+        let alias = existing_alias.or_else(|| Some(alias.name.clone()));
+        Ok((inner, alias))
+    } else {
+        Ok((normalize_expr(expr)?, None))
+    }
+}
+
+#[allow(deprecated)]
+fn is_wildcard_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Wildcard { .. })
+}
+
+pub(super) fn map_aggregate_expr(
+    expr: &Expr,
+) -> Result<(DbspAggregateFunction, Option<Expr>, Option<String>), PlannerError> {
+    match expr {
+        Expr::Alias(alias) => {
+            let (function, arg, existing_alias) = map_aggregate_expr(alias.expr.as_ref())?;
+            let alias = existing_alias.or_else(|| Some(alias.name.clone()));
+            Ok((function, arg, alias))
+        }
+        Expr::AggregateFunction(func) => {
+            if func.params.distinct {
+                return Err(PlannerError::UnsupportedPlan(
+                    "DISTINCT aggregates are not supported".to_string(),
+                ));
+            }
+            if func.params.filter.is_some() {
+                return Err(PlannerError::UnsupportedPlan(
+                    "FILTER clauses on aggregates are not supported".to_string(),
+                ));
+            }
+            if !func.params.order_by.is_empty() {
+                return Err(PlannerError::UnsupportedPlan(
+                    "ORDER BY within aggregates is not supported".to_string(),
+                ));
+            }
+            if func.params.null_treatment.is_some() {
+                return Err(PlannerError::UnsupportedPlan(
+                    "NULL treatment modifiers on aggregates are not supported".to_string(),
+                ));
+            }
+
+            let name = func.func.name().to_ascii_lowercase();
+            let agg_function = match name.as_str() {
+                "count" => DbspAggregateFunction::Count,
+                "sum" => DbspAggregateFunction::Sum,
+                "min" => DbspAggregateFunction::Min,
+                "max" => DbspAggregateFunction::Max,
+                "avg" => DbspAggregateFunction::Avg,
+                other => {
+                    return Err(PlannerError::UnsupportedPlan(format!(
+                        "aggregate function '{other}' is not supported",
+                    )));
+                }
+            };
+
+            if func.params.args.len() > 1 {
+                return Err(PlannerError::UnsupportedPlan(
+                    "aggregates with more than one argument are not supported".to_string(),
+                ));
+            }
+
+            let expression = func
+                .params
+                .args
+                .first()
+                .and_then(|arg| (!is_wildcard_expr(arg)).then(|| arg.clone()));
+
+            let expression = match expression {
+                Some(expr) => Some(normalize_expr(expr)?),
+                None => None,
+            };
+
+            Ok((agg_function, expression, None))
+        }
+        _ => Err(PlannerError::UnsupportedPlan(
+            "aggregate expressions must be aggregate functions".to_string(),
+        )),
+    }
+}

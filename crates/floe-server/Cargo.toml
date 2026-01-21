@@ -1,0 +1,26 @@
+[package]
+name = "floe-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+floe-executor = { path = "../floe-executor" }
+floe-storage = { path = "../floe-storage" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+pgwire = { workspace = true }
+postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
+sqlparser = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow-schema = { workspace = true }
+arrow-buffer = "56.2.0"
+arrow-data = "56.2.0"
+slatedb = { workspace = true }
