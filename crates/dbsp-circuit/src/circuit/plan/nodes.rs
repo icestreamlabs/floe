@@ -363,6 +363,22 @@ impl DbspAggregateExpr {
     fn field(&self) -> Field {
         Field::new(self.alias.clone(), self.output_type.clone(), true)
     }
+
+    pub fn function(&self) -> &DbspAggregateFunction {
+        &self.function
+    }
+
+    pub fn expression(&self) -> Option<&DbspExpression> {
+        self.expression.as_ref()
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn output_type(&self) -> &DbspScalarType {
+        &self.output_type
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +403,14 @@ impl GroupKeyExpr {
             self.expression.data_type().clone(),
             self.expression.nullable(),
         )
+    }
+
+    pub fn expression(&self) -> &DbspExpression {
+        &self.expression
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -431,6 +455,18 @@ impl DbspAggregateNode {
 
     pub fn output_schema(&self) -> &Arc<RowSchema> {
         &self.output_schema
+    }
+
+    pub fn input_schema(&self) -> &Arc<RowSchema> {
+        &self.input_schema
+    }
+
+    pub fn group_keys(&self) -> &[GroupKeyExpr] {
+        &self.group_keys
+    }
+
+    pub fn aggregates(&self) -> &[DbspAggregateExpr] {
+        &self.aggregates
     }
 }
 

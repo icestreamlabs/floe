@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
+use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
@@ -196,6 +197,152 @@ async fn inner_join_materializes_mv() {
             ScalarValue::Utf8(Some("alice".to_string())),
         ]]
     );
+}
+
+#[tokio::test]
+async fn aggregate_materializes_mv() {
+    let db = test_db("aggregate").await;
+    let view_name = "mv_aggregate";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .aggregate(
+                vec![col("bidder")],
+                vec![
+                    count(col("price")).alias("cnt"),
+                    sum(col("price")).alias("total"),
+                    min(col("price")).alias("min_price"),
+                    max(col("price")).alias("max_price"),
+                    avg(col("price")).alias("avg_price"),
+                ],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let view_handle = mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("cnt", DataType::Int64, true),
+        Field::new("total", DataType::Int64, true),
+        Field::new("min_price", DataType::Int64, true),
+        Field::new("max_price", DataType::Int64, true),
+        Field::new("avg_price", DataType::Int64, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+        })
+        .await
+        .expect("build aggregate graph");
+
+    let mut version_rx = view_handle.version_watch();
+    version_rx.borrow_and_update();
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append(&bid_row(1, 42, 10), 1)
+        .expect("append bidder 42");
+    bid_writer
+        .append(&bid_row(2, 42, 30), 1)
+        .expect("append bidder 42");
+    bid_writer
+        .append(&bid_row(3, 7, 5), 1)
+        .expect("append bidder 7");
+    bid_writer.flush().await.expect("flush bids");
+
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("aggregate update timeout")
+        .expect("aggregate update");
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    let mut expected = vec![
+        vec![
+            ScalarValue::Int64(Some(7)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+        ],
+        vec![
+            ScalarValue::Int64(Some(42)),
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Int64(Some(40)),
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(30)),
+            ScalarValue::Int64(Some(20)),
+        ],
+    ];
+    sort_rows_by_first_column(&mut expected);
+    assert_eq!(rows, expected);
+
+    bid_writer
+        .append(&bid_row(2, 42, 30), -1)
+        .expect("remove bidder 42");
+    bid_writer.flush().await.expect("flush removal");
+
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("aggregate update timeout")
+        .expect("aggregate update");
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    let mut expected = vec![
+        vec![
+            ScalarValue::Int64(Some(7)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Int64(Some(5)),
+        ],
+        vec![
+            ScalarValue::Int64(Some(42)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(10)),
+        ],
+    ];
+    sort_rows_by_first_column(&mut expected);
+    assert_eq!(rows, expected);
 }
 
 #[tokio::test]
@@ -453,6 +600,14 @@ fn gather_handle_streams(
         }
     }
     map
+}
+
+fn sort_rows_by_first_column(rows: &mut [Vec<ScalarValue>]) {
+    rows.sort_by_key(|row| match row.first() {
+        Some(ScalarValue::Int64(Some(value))) => *value,
+        Some(ScalarValue::TimestampMillisecond(Some(value), _)) => *value,
+        _ => 0,
+    });
 }
 
 fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {

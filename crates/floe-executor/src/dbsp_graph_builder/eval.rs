@@ -25,6 +25,14 @@ pub(super) fn eval_projection(
         .collect()
 }
 
+pub(super) fn eval_scalar_expression(
+    expr: &DbspExpression,
+    row: &[ScalarValue],
+    schema: &RowSchema,
+) -> Result<ScalarValue> {
+    eval_df_expr(expr.expr(), row, schema)
+}
+
 pub(super) fn resolve_join_key_indices(
     keys: &[DbspJoinKey],
     left_schema: &RowSchema,

@@ -1,4 +1,5 @@
 pub mod algebra;
+pub mod aggregate;
 pub mod collections;
 pub mod filter;
 pub mod handles;
@@ -11,15 +12,26 @@ pub mod stream;
 pub use dbsp_storage::storage;
 
 pub use algebra::AbelianGroup;
-pub use collections::{ZSet, h};
+pub use aggregate::DbspAggregate;
+pub use collections::{OrderedBytes, ZSet, h};
 pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
 pub use map::DbspMap;
 pub use operators::distinct::DistinctOp;
+pub use operators::consolidate::ConsolidateOp;
 pub use operators::filter::FilterOp;
+pub use operators::aggregate::{AggregateOp, AggregateSpec};
+pub use operators::group_by::GroupByOp;
+pub use operators::index::ArrangeByKeyOp;
 pub use operators::join::JoinOp;
+pub use operators::join_range::JoinRangeOp;
 pub use operators::map::MapOp;
+pub use operators::rolling_aggregate::RollingAggregateOp;
+pub use operators::asof_join::AsofJoinOp;
+pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
+pub use operators::waterline::WaterlineOp;
+pub use operators::window::{WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
 pub use stream::{
     DeltaHandleStream, SnapshotHandleStream, Stream, StreamRetention, ZSetStream, delay,

@@ -166,6 +166,23 @@ impl DbspGraphBuilder {
                 self.compile_join(join, left, right, cancel, task_events)
                     .await?
             }
+            DbspNodeKind::Aggregate(aggregate) => {
+                let input_idx = first_input(node, "aggregate")?;
+                let upstream = self
+                    .compile_node(
+                        plan,
+                        input_idx,
+                        outer_streams,
+                        cancel,
+                        task_events,
+                        built,
+                        mv_registry,
+                        mv_latest,
+                    )
+                    .await?;
+                self.compile_aggregate(aggregate, upstream, task_events)
+                    .await?
+            }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
                 let upstream = self
@@ -191,8 +208,7 @@ impl DbspGraphBuilder {
                 )
                 .await?
             }
-            DbspNodeKind::Aggregate(_)
-            | DbspNodeKind::WindowAggregate(_)
+            DbspNodeKind::WindowAggregate(_)
             | DbspNodeKind::TopN(_)
             | DbspNodeKind::Union(_)
             | DbspNodeKind::Passthrough => {

@@ -250,52 +250,15 @@ where
         let delta_dict = self.delta_versioned.dictionary();
         let mut delta_dict_batch = delta_dict.batch();
         let mut delta_buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let mut compacted = false;
-        let chain_stats = self.versioned.chain_stats().await?;
-        if !self.compaction.is_disabled() && self.compaction.should_compact(chain_stats) {
-            let mut materialized = self
-                .versioned
-                .materialize()
+        for (key, delta) in &overlay {
+            if *delta == 0 {
+                continue;
+            }
+            let id = dict_batch
+                .intern(key)
                 .await
-                .context("materialize zset for compaction")?;
-            for (key, delta) in &overlay {
-                if *delta == 0 {
-                    continue;
-                }
-                let current = materialized.get(key).copied().unwrap_or(0);
-                let next = current + *delta;
-                if next == 0 {
-                    materialized.remove(key);
-                } else {
-                    materialized.insert(key.clone(), next);
-                }
-            }
-            if !materialized.is_empty() {
-                for (key, weight) in materialized {
-                    let id = dict_batch
-                        .intern(&key)
-                        .await
-                        .context("intern key while staging compaction")?;
-                    buckets
-                        .entry(bucket_for(id))
-                        .or_default()
-                        .push((id, weight));
-                }
-                compacted = true;
-            }
-        }
-
-        if !compacted {
-            for (key, delta) in &overlay {
-                if *delta == 0 {
-                    continue;
-                }
-                let id = dict_batch
-                    .intern(key)
-                    .await
-                    .context("intern key while staging overlay")?;
-                buckets.entry(bucket_for(id)).or_default().push((id, *delta));
-            }
+                .context("intern key while staging overlay")?;
+            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
         }
 
         for (key, delta) in &overlay {
@@ -346,7 +309,7 @@ where
             return self.flush_without_version_update().await;
         }
 
-        let base = if self.current_handle.version == 0 || compacted {
+        let base = if self.current_handle.version == 0 {
             None
         } else {
             Some(self.current_handle.version)
@@ -358,8 +321,6 @@ where
             .enqueue_version_with_base(segments, base, 0, &mut batch)
             .await
             .context("schedule versioned update with overlay")?;
-
-        let new_handle = self.versioned.handle_for_version(plan.version);
         let delta_plan = if delta_segments.is_empty() {
             None
         } else {
@@ -370,15 +331,48 @@ where
                     .context("schedule delta version update")?,
             )
         };
+
+        self.versioned
+            .table()
+            .write_batch(batch)
+            .await
+            .context("write versioned updates")?;
+
+        let mut cleanup_versions = WriteBatch::new();
+        cleanup_versions.delete(self.versioned.intent_key_bytes());
+        cleanup_versions.delete(self.delta_versioned.intent_key_bytes());
+        self.versioned
+            .table()
+            .write_batch(cleanup_versions)
+            .await
+            .context("clear version intents")?;
+
+        self.versioned.apply_version_plan(&plan);
+        if let Some(delta_plan) = &delta_plan {
+            self.delta_versioned.apply_version_plan(delta_plan);
+        }
+
+        let mut new_handle = self.versioned.handle_for_version(plan.version);
+        if !self.compaction.is_disabled() {
+            let chain_stats = self.versioned.chain_stats().await?;
+            if self.compaction.should_compact(chain_stats) {
+                match self.versioned.compact_current().await {
+                    Ok(compacted_version) => {
+                        new_handle = self.versioned.handle_for_version(compacted_version);
+                    }
+                    Err(err) if err.to_string().contains("cannot compact empty version") => {}
+                    Err(err) => {
+                        return Err(err).context("compact versioned chain");
+                    }
+                }
+            }
+        }
+
         let delta_handle = if let Some(delta_plan) = &delta_plan {
             self.delta_versioned.handle_for_version(delta_plan.version)
         } else {
             self.delta_versioned.handle_for_version(0)
         };
-        let stream_intent = self.stream.encode_intent_key();
-        let delta_stream_intent = self.delta_stream.encode_intent_key();
-        let version_intent = self.versioned.intent_key_bytes().to_vec();
-        let delta_version_intent = self.delta_versioned.intent_key_bytes().to_vec();
 
         self.stream
             .send(new_handle.clone())
@@ -392,37 +386,35 @@ where
             self.stream.set_default_in_place(new_handle.clone());
         }
 
-        let (stream_dirty, committed_ts) = flush_stream_into_batch(&mut self.stream, &mut batch)?;
+        let stream_intent = self.stream.encode_intent_key();
+        let delta_stream_intent = self.delta_stream.encode_intent_key();
+        let mut stream_batch = WriteBatch::new();
+        let (stream_dirty, committed_ts) =
+            flush_stream_into_batch(&mut self.stream, &mut stream_batch)?;
         if stream_dirty {
-            batch.put(stream_intent.clone(), vec![1]);
+            stream_batch.put(stream_intent.clone(), vec![1]);
         }
         let (delta_dirty, delta_committed_ts) =
-            flush_stream_into_batch(&mut self.delta_stream, &mut batch)?;
+            flush_stream_into_batch(&mut self.delta_stream, &mut stream_batch)?;
         if delta_dirty {
-            batch.put(delta_stream_intent.clone(), vec![1]);
+            stream_batch.put(delta_stream_intent.clone(), vec![1]);
         }
 
         self.versioned
             .table()
-            .write_batch(batch)
+            .write_batch(stream_batch)
             .await
-            .context("write combined stream and version update")?;
+            .context("write stream updates")?;
 
-        let mut cleanup = WriteBatch::new();
-        cleanup.delete(stream_intent.clone());
-        cleanup.delete(version_intent.clone());
-        cleanup.delete(delta_stream_intent.clone());
-        cleanup.delete(delta_version_intent.clone());
+        let mut cleanup_streams = WriteBatch::new();
+        cleanup_streams.delete(stream_intent.clone());
+        cleanup_streams.delete(delta_stream_intent.clone());
         self.versioned
             .table()
-            .write_batch(cleanup)
+            .write_batch(cleanup_streams)
             .await
-            .context("clear intents after versioned update")?;
+            .context("clear stream intents")?;
 
-        self.versioned.apply_version_plan(&plan);
-        if let Some(delta_plan) = delta_plan {
-            self.delta_versioned.apply_version_plan(&delta_plan);
-        }
         self.current_handle = new_handle.clone();
         self.delta_current_handle = delta_handle.clone();
 
