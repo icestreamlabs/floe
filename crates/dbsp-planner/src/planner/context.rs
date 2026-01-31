@@ -235,14 +235,9 @@ impl<'cfg> PlannerContext<'cfg> {
             .map(|(left_expr, right_expr)| {
                 let left = normalize_expr(left_expr.clone())?;
                 let right = normalize_expr(right_expr.clone())?;
-                match (&left, &right) {
-                    (Expr::Column(_), Expr::Column(_)) => Ok((left, right)),
-                    _ => Err(PlannerError::UnsupportedJoin(
-                        "join keys must be column references".to_string(),
-                    )),
-                }
+                Ok((left, right))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, PlannerError>>()?;
 
         let mut residuals: Vec<Expr> = Vec::new();
         if let Some(filter_expr) = &join.filter {

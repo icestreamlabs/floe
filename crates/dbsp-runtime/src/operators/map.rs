@@ -121,7 +121,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -491,8 +493,7 @@ mod tests {
             recompute.retain(|_, weight| *weight != 0);
 
             let expected_delta_vec = compute_delta(&full_output, &recompute);
-            let expected_delta: HashMap<usize, i64> =
-                expected_delta_vec.into_iter().collect();
+            let expected_delta: HashMap<usize, i64> = expected_delta_vec.into_iter().collect();
 
             if let Some(handle) = output_handle {
                 let mut cache_out = HashMap::new();

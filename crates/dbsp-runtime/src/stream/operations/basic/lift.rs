@@ -13,8 +13,8 @@ use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
 
-use crate::stream::addition::StreamAddition;
 use super::time::{delay, integrate};
+use crate::stream::addition::StreamAddition;
 
 pub async fn lift1<I, O, F>(
     input: &Stream<I>,

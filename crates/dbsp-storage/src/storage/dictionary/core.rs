@@ -11,13 +11,13 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::{Db, WriteBatch};
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::super::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use super::super::keyspace::{self, namespace_prefix};
+use super::super::{KeyValueTable, SlateTable};
 use super::batch::DictionaryBatch;
 use super::cache::{BatchOverlay, Cache};
 use super::codec::{compress_value, decode_id, decompress_value, encode_id};
 use super::{HashFn, KeyIntern};
-use super::super::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use super::super::keyspace::{self, namespace_prefix};
-use super::super::{KeyValueTable, SlateTable};
 
 const K2ID_PREFIX: &[u8] = b"k2id/";
 const ID2K_PREFIX: &[u8] = b"id2k/";
@@ -111,7 +111,6 @@ where
     pub(super) fn next_id_value(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
     }
-
 
     pub(super) fn hash(&self, key: &[u8]) -> u64 {
         (self.hash_fn)(key)

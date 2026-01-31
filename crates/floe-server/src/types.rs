@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use datafusion::arrow::array::{
-    Array, Decimal128Array, Decimal256Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Decimal128Array, Decimal256Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -104,6 +105,18 @@ pub(super) fn encode_arrow_value(
                 None
             } else {
                 Some(array.value(row_idx) as i64)
+            };
+            encoder.encode_field(&value)
+        }
+        DataType::Boolean => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| user_error(format!("expected BooleanArray for {data_type:?}")))?;
+            let value = if array.is_null(row_idx) {
+                None
+            } else {
+                Some(array.value(row_idx))
             };
             encoder.encode_field(&value)
         }
@@ -208,6 +221,7 @@ pub(super) fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec
             | DataType::UInt32
             | DataType::Int64
             | DataType::UInt64
+            | DataType::Boolean
             | DataType::Utf8
             | DataType::Timestamp(TimeUnit::Microsecond, _)
             | DataType::Timestamp(TimeUnit::Millisecond, _)
@@ -223,6 +237,7 @@ pub(super) fn arrow_schema_to_field_info(schema: &SchemaRef) -> PgWireResult<Vec
         let pg_type = match field.data_type() {
             DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
             DataType::Timestamp(_, None) => Type::TIMESTAMP,
+            DataType::Boolean => Type::BOOL,
             DataType::Utf8 => Type::TEXT,
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Type::NUMERIC,
             _ => Type::INT8,
@@ -243,7 +258,10 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Buf;
-    use datafusion::arrow::array::{ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray};
+    use datafusion::arrow::array::{
+        ArrayRef, BooleanArray, Decimal128Array, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray,
+    };
 
     #[test]
     fn arrow_schema_maps_timestamp_types() {
@@ -258,16 +276,18 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
                 true,
             ),
+            Field::new("flag", DataType::Boolean, true),
             Field::new("label", DataType::Utf8, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
         ]));
 
         let fields = arrow_schema_to_field_info(&schema).expect("map schema");
-        assert_eq!(fields.len(), 4);
+        assert_eq!(fields.len(), 5);
         assert_eq!(fields[0].datatype(), &Type::TIMESTAMP);
         assert_eq!(fields[1].datatype(), &Type::TIMESTAMPTZ);
-        assert_eq!(fields[2].datatype(), &Type::TEXT);
-        assert_eq!(fields[3].datatype(), &Type::NUMERIC);
+        assert_eq!(fields[2].datatype(), &Type::BOOL);
+        assert_eq!(fields[3].datatype(), &Type::TEXT);
+        assert_eq!(fields[4].datatype(), &Type::NUMERIC);
     }
 
     #[test]
@@ -294,6 +314,7 @@ mod tests {
             .expect("array data");
             TimestampMillisecondArray::from(data)
         };
+        let bool_array = BooleanArray::from(vec![Some(true), None]);
         let utf8_array = StringArray::from(vec![Some("hello"), None]);
         let decimal_array = Decimal128Array::from(vec![Some(12_345i128), None])
             .with_precision_and_scale(10, 2)
@@ -310,6 +331,7 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
                 true,
             ),
+            Field::new("flag", DataType::Boolean, true),
             Field::new("label", DataType::Utf8, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
         ]));
@@ -319,6 +341,7 @@ mod tests {
             vec![
                 Arc::new(micros_array) as ArrayRef,
                 Arc::new(millis_array) as ArrayRef,
+                Arc::new(bool_array) as ArrayRef,
                 Arc::new(utf8_array) as ArrayRef,
                 Arc::new(decimal_array) as ArrayRef,
             ],
@@ -341,10 +364,14 @@ mod tests {
         let _ = buf.split_to(third_len as usize);
         let fourth_len = buf.get_i32();
         assert!(fourth_len > 0);
+        let _ = buf.split_to(fourth_len as usize);
+        let fifth_len = buf.get_i32();
+        assert!(fifth_len > 0);
 
         // Null row should encode null markers.
         let null_row = encode_stream_row(&batch, 1, field_info).expect("encode null row");
         let mut buf_null = null_row.data.clone();
+        assert_eq!(buf_null.get_i32(), -1);
         assert_eq!(buf_null.get_i32(), -1);
         assert_eq!(buf_null.get_i32(), -1);
         assert_eq!(buf_null.get_i32(), -1);

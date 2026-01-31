@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+use dbsp::RowSchema;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
-use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::stream::util::materialize_zset_handle;
-use dbsp::RowSchema;
+use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -76,9 +76,7 @@ impl DbspGraphBuilder {
                 let delta_handle = upstream_stream
                     .get(ts)
                     .await
-                    .with_context(|| {
-                        format!("load delta handle for view '{view_name}' at {ts}")
-                    })?;
+                    .with_context(|| format!("load delta handle for view '{view_name}' at {ts}"))?;
                 let snapshot_handle = Self::apply_delta_handle_to_view(
                     &mut view,
                     table.clone(),

@@ -179,6 +179,7 @@ mod tests {
     use crate::stream::util::materialize_zset_handle;
     use object_store::memory::InMemory;
     use slatedb::Db;
+    use std::collections::HashMap;
 
     async fn stage_version(
         dict: Arc<Dictionary<String>>,
@@ -229,6 +230,16 @@ mod tests {
         Arc::new(Db::open("consolidate", store).await.expect("open SlateDB"))
     }
 
+    fn apply_deltas(state: &mut HashMap<String, i64>, deltas: &[(String, i64)]) {
+        for (key, delta) in deltas {
+            let entry = state.entry(key.clone()).or_insert(0);
+            *entry += *delta;
+            if *entry == 0 {
+                state.remove(key);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn consolidate_operator_coalesces_deltas() {
         let db = build_db().await;
@@ -276,10 +287,9 @@ mod tests {
 
         let mut cache = HashMap::new();
         cache.insert("consolidate_output".to_string(), output_dict);
-        let materialized =
-            materialize_zset_handle::<String>(table.clone(), &mut cache, &out)
-                .await
-                .expect("materialize consolidate output");
+        let materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &out)
+            .await
+            .expect("materialize consolidate output");
         assert_eq!(materialized.get("a"), Some(&3));
         assert_eq!(materialized.get("c"), Some(&-1));
         assert!(!materialized.contains_key("b"));
@@ -317,10 +327,79 @@ mod tests {
         )
         .await;
 
-        let out = op
-            .on_step(1, &[delta])
-            .await
-            .expect("consolidate step");
+        let out = op.on_step(1, &[delta]).await.expect("consolidate step");
         assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn consolidate_operator_matches_full_recompute() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "consolidate_recompute_input", None)
+                .await
+                .expect("build input dictionary"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "consolidate_recompute_output", None)
+                .await
+                .expect("build output dictionary"),
+        );
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "consolidate_recompute_output".to_string(),
+        )
+        .await
+        .expect("output state");
+
+        let mut op = ConsolidateOp::new(table.clone(), output);
+
+        let steps = vec![
+            vec![
+                ("a".to_string(), 1),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("b".to_string(), -1),
+            ],
+            vec![
+                ("c".to_string(), -2),
+                ("c".to_string(), 1),
+                ("a".to_string(), -3),
+            ],
+        ];
+
+        for (idx, deltas) in steps.into_iter().enumerate() {
+            let delta = stage_version(
+                input_dict.clone(),
+                table.clone(),
+                "consolidate_recompute_input",
+                &deltas,
+            )
+            .await;
+
+            let out = op
+                .on_step(idx as i64 + 1, &[delta])
+                .await
+                .expect("consolidate step");
+
+            let mut expected = HashMap::new();
+            apply_deltas(&mut expected, &deltas);
+
+            if let Some(handle) = out {
+                let mut cache = HashMap::new();
+                cache.insert(
+                    "consolidate_recompute_output".to_string(),
+                    output_dict.clone(),
+                );
+                let materialized =
+                    materialize_zset_handle::<String>(table.clone(), &mut cache, &handle)
+                        .await
+                        .expect("materialize consolidate output");
+                assert_eq!(materialized, expected);
+            } else {
+                assert!(expected.is_empty());
+            }
+        }
     }
 }

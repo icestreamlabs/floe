@@ -83,11 +83,7 @@ where
                 count += *weight;
             }
         }
-        if has_rows {
-            Some(count)
-        } else {
-            None
-        }
+        if has_rows { Some(count) } else { None }
     })
 }
 
@@ -111,11 +107,7 @@ where
                 has_value = true;
             }
         }
-        if has_value {
-            Some(sum)
-        } else {
-            None
-        }
+        if has_value { Some(sum) } else { None }
     })
 }
 
@@ -139,11 +131,7 @@ where
                 count += *weight;
             }
         }
-        if count != 0 {
-            Some(sum / count)
-        } else {
-            None
-        }
+        if count != 0 { Some(sum / count) } else { None }
     })
 }
 
@@ -503,14 +491,7 @@ mod tests {
             Some(sum)
         });
 
-        let mut op = AggregateOp::new(
-            state,
-            index,
-            table.clone(),
-            key_extractor,
-            spec,
-            output,
-        );
+        let mut op = AggregateOp::new(state, index, table.clone(), key_extractor, spec, output);
 
         let delta = stage_version(
             input_dict.clone(),
@@ -527,14 +508,13 @@ mod tests {
 
         let mut cache = std::collections::HashMap::new();
         cache.insert("aggregate_output".to_string(), output_dict.clone());
-        let out_materialized =
-            crate::stream::util::materialize_zset_handle::<(i64, i64)>(
-                table.clone(),
-                &mut cache,
-                &out,
-            )
-            .await
-            .expect("materialize aggregate output");
+        let out_materialized = crate::stream::util::materialize_zset_handle::<(i64, i64)>(
+            table.clone(),
+            &mut cache,
+            &out,
+        )
+        .await
+        .expect("materialize aggregate output");
         assert_eq!(out_materialized.get(&(1, 7)), Some(&1));
         assert_eq!(out_materialized.get(&(0, 2)), Some(&1));
     }
@@ -586,14 +566,12 @@ mod tests {
                     version: 0,
                 },
             };
-            let output =
-                VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
-                    .await
-                    .expect("output");
+            let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
+                .await
+                .expect("output");
 
             let index = IndexedZSet::new(table.clone(), index_ns);
-            let key_extractor: KeyExtractor<i64, i64> =
-                Arc::new(|value: &i64| Some(value % 2));
+            let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(value % 2));
 
             let mut op = AggregateOp::new(
                 state,
@@ -623,13 +601,8 @@ mod tests {
                     }
                 }
 
-                let delta_handle = stage_version(
-                    input_dict.clone(),
-                    table.clone(),
-                    &input_ns,
-                    deltas,
-                )
-                .await;
+                let delta_handle =
+                    stage_version(input_dict.clone(), table.clone(), &input_ns, deltas).await;
                 op.on_step(step_idx as i64, &[delta_handle])
                     .await
                     .expect("aggregate step");

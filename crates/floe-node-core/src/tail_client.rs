@@ -26,13 +26,8 @@ pub fn build_tail_sql(mv: &str, with_snapshot: bool, as_of: Option<i64>) -> Stri
 }
 
 pub fn run(config: TailConfig) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect((config.host.as_str(), config.port)).with_context(|| {
-        format!(
-            "connect to {}:{}",
-            config.host.as_str(),
-            config.port
-        )
-    })?;
+    let mut stream = TcpStream::connect((config.host.as_str(), config.port))
+        .with_context(|| format!("connect to {}:{}", config.host.as_str(), config.port))?;
     stream.set_nodelay(true)?;
 
     send_startup(&mut stream, &config.user, &config.database)?;

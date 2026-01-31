@@ -293,7 +293,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -640,9 +642,7 @@ mod tests {
             if *weight == 0 {
                 continue;
             }
-            let entry = right_by_key
-                .entry(row.0)
-                .or_insert_with(HashMap::new);
+            let entry = right_by_key.entry(row.0).or_insert_with(HashMap::new);
             let value = entry.entry(*row).or_insert(0);
             *value += *weight;
             if *value == 0 {
@@ -664,7 +664,9 @@ mod tests {
                     }
                     let replace = match best {
                         None => true,
-                        Some((current, _)) => row.1 > current.1 || (row.1 == current.1 && row > current),
+                        Some((current, _)) => {
+                            row.1 > current.1 || (row.1 == current.1 && row > current)
+                        }
                     };
                     if replace {
                         best = Some((row, *weight));
@@ -780,17 +782,16 @@ mod tests {
         let mut cache_out = HashMap::new();
         cache_out.insert("asof_output".to_string(), output_dict.clone());
 
-        for (step, (left_delta, right_delta)) in left_deltas
-            .iter()
-            .zip(right_deltas.iter())
-            .enumerate()
+        for (step, (left_delta, right_delta)) in
+            left_deltas.iter().zip(right_deltas.iter()).enumerate()
         {
             apply_deltas(&mut left_state_map, left_delta);
             apply_deltas(&mut right_state_map, right_delta);
 
             let output_now = recompute_asof(&left_state_map, &right_state_map);
-            let expected_delta: HashMap<Out, i64> =
-                compute_delta(&prev_output, &output_now).into_iter().collect();
+            let expected_delta: HashMap<Out, i64> = compute_delta(&prev_output, &output_now)
+                .into_iter()
+                .collect();
 
             let left_handle = if left_delta.is_empty() {
                 ZSetHandle {
@@ -827,19 +828,13 @@ mod tests {
                 .expect("asof join step");
 
             if expected_delta.is_empty() {
-                assert!(
-                    out_handle.is_none(),
-                    "expected empty output at step {step}"
-                );
+                assert!(out_handle.is_none(), "expected empty output at step {step}");
             } else {
                 let out_handle = out_handle.expect("output handle");
-                let materialized = materialize_zset_handle::<Out>(
-                    table.clone(),
-                    &mut cache_out,
-                    &out_handle,
-                )
-                .await
-                .expect("materialize output");
+                let materialized =
+                    materialize_zset_handle::<Out>(table.clone(), &mut cache_out, &out_handle)
+                        .await
+                        .expect("materialize output");
                 assert_eq!(materialized, expected_delta, "step {step}");
             }
 

@@ -12,8 +12,11 @@ use slatedb::config::ScanOptions;
 use crate::storage::dictionary::KeyIntern;
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::{SegmentId, SegmentRecord, VersionChainStats, VersionWritePlan, VersionedZSet, ZSetVersionManifest};
 use super::super::prefix_bounds;
+use super::{
+    SegmentId, SegmentRecord, VersionChainStats, VersionWritePlan, VersionedZSet,
+    ZSetVersionManifest,
+};
 
 #[allow(dead_code)]
 impl<K> VersionedZSet<K>
@@ -149,7 +152,11 @@ where
 
         while let Some(manifest) = current {
             version_count += 1;
-            segment_count += manifest.buckets.values().map(|segments| segments.len()).sum::<usize>();
+            segment_count += manifest
+                .buckets
+                .values()
+                .map(|segments| segments.len())
+                .sum::<usize>();
             if let Some(base_version) = manifest.base {
                 current = Some(self.load_manifest_record(base_version).await?);
             } else {
@@ -256,7 +263,8 @@ where
                     self.order.push_back(key);
                     return;
                 }
-                if self.values.len() == self.capacity && let Some(evicted) = self.order.pop_front()
+                if self.values.len() == self.capacity
+                    && let Some(evicted) = self.order.pop_front()
                 {
                     self.values.remove(&evicted);
                 }

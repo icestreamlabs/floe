@@ -1,0 +1,15 @@
+[package]
+name = "floe-benchmarks"
+version = "0.1.0"
+edition.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+datafusion = { workspace = true }
+dbsp = { path = "../dbsp" }
+rkyv = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "rkyv_arrow_datafusion"
+harness = false

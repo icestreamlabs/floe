@@ -1,24 +1,32 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, ensure};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::catalog::ColumnType;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceDataType {
     Int64,
+    Bool,
     Utf8,
     TimestampMillis,
 }
 
 impl SourceDataType {
-    pub fn arrow_type(&self) -> DataType {
+    pub fn column_type(&self) -> ColumnType {
         match self {
-            SourceDataType::Int64 => DataType::Int64,
-            SourceDataType::Utf8 => DataType::Utf8,
-            SourceDataType::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+            SourceDataType::Int64 => ColumnType::Int64,
+            SourceDataType::Bool => ColumnType::Bool,
+            SourceDataType::Utf8 => ColumnType::Utf8,
+            SourceDataType::TimestampMillis => ColumnType::TimestampMillis,
         }
+    }
+
+    pub fn arrow_type(&self) -> DataType {
+        self.column_type().arrow_type()
     }
 }
 
@@ -103,6 +111,51 @@ impl SourceDefinition {
     }
 }
 
+#[derive(Default, Debug, Clone)]
+pub struct SourceRegistry {
+    definitions: Vec<SourceDefinition>,
+    by_name: HashMap<String, usize>,
+}
+
+impl SourceRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, definition: SourceDefinition) {
+        let name = definition.name().to_string();
+        if let Some(idx) = self.by_name.get(&name).copied() {
+            self.definitions[idx] = definition;
+        } else {
+            self.by_name.insert(name, self.definitions.len());
+            self.definitions.push(definition);
+        }
+    }
+
+    pub fn extend<I>(&mut self, definitions: I)
+    where
+        I: IntoIterator<Item = SourceDefinition>,
+    {
+        for definition in definitions {
+            self.register(definition);
+        }
+    }
+
+    pub fn definitions(&self) -> &[SourceDefinition] {
+        &self.definitions
+    }
+
+    pub fn get(&self, name: &str) -> Option<&SourceDefinition> {
+        self.by_name
+            .get(name)
+            .and_then(|idx| self.definitions.get(*idx))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceEvent {
     source: String,
@@ -151,6 +204,7 @@ mod tests {
             "nexmark_person",
             vec![
                 SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("active", SourceDataType::Bool),
                 SourceColumn::new("name", SourceDataType::Utf8),
                 SourceColumn::new("date_time", SourceDataType::TimestampMillis),
             ],
@@ -158,13 +212,14 @@ mod tests {
         .expect("valid definition");
 
         let schema = definition.to_arrow_schema();
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
         assert_eq!(
-            schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Millisecond, None)
+            schema.field(3).data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
         );
     }
 

@@ -87,7 +87,6 @@ async fn lifted_join_zset_stream_emits_updates_after_build() {
     assert_eq!(materialized.get(&(7, 7)), Some(&1));
 }
 
-
 #[tokio::test]
 async fn lifted_join_covers_each_delta_term() {
     let db = build_db().await;

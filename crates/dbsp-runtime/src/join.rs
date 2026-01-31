@@ -16,13 +16,13 @@ use crate::operators::join::JoinOp;
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::{DeltaHandleStream, Stream};
 use crate::stream::runtime::{
     DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
 };
 use crate::stream::util::{
     build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
 };
+use crate::stream::{DeltaHandleStream, Stream};
 
 static JOIN_STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const JOIN_STEP_LOG_SAMPLE_EVERY: u64 = 256;

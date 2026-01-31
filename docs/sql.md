@@ -39,10 +39,12 @@ semantics for materialized views and TAIL.
 - Each time sources are ticked, the current epoch is advanced by 1 and any
   materialized views update to that version.
 - `__mv_version` corresponds to this global epoch.
+- `__time` is the wall-clock UTC time (microseconds since Unix epoch) when the
+  version was committed. All rows in the same version share the same `__time`.
 
 ## TAIL Semantics
 
-`TAIL` streams **full snapshots** of the materialized view at each version
+`TAIL` streams **delta updates** (row-level diffs) for each version
 in ascending version order.
 
 Syntax:
@@ -53,21 +55,31 @@ TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]
 
 Behavior:
 
-- `WITH SNAPSHOT` emits the snapshot for the requested version immediately.
+- `WITH SNAPSHOT` emits the snapshot for the requested version immediately,
+  encoded as inserts (`__op = 1`).
   - If `AS OF` is provided, that exact version is used.
   - Otherwise, the latest available version is used.
 - Without `WITH SNAPSHOT`, streaming starts **after** the current version.
 - If `AS OF` is provided without `WITH SNAPSHOT`, the stream starts after that
   version.
+- Subsequent versions emit **only the delta** (insert/delete rows) rather than
+  full snapshots.
 
 Output columns (in order):
 
 1) `__mv_version` (Int64) - version for the emitted snapshot
-2) `__op` (Int16) - currently always `1` (full snapshot rows)
-3) `__time` (Timestamp, UTC) - currently `NULL`
+2) `__op` (Int16) - `1` for inserts, `-1` for deletes (updates appear
+   as a delete + insert pair)
+3) `__time` (Timestamp, UTC) - commit time for the version (microseconds since Unix epoch)
 4) User-defined columns from the materialized view
 
 Row order within a version is not guaranteed; versions are emitted in order.
+
+
+## Schema Evolution
+
+- Schema evolution is not supported. Changing source or materialized view schemas
+  requires recreating the view and re-ingesting data.
 
 ## Restart and Recovery
 

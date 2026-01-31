@@ -18,6 +18,18 @@ pub struct MaterializedViewDefinition {
 }
 
 impl MaterializedViewDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        query: impl Into<String>,
+        if_not_exists: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            query: query.into(),
+            if_not_exists,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name

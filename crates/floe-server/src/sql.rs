@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use core::ops::ControlFlow;
+use std::collections::HashSet;
 
 use bytes::Bytes;
 use pgwire::api::results::FieldFormat;

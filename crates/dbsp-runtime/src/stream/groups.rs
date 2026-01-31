@@ -25,11 +25,11 @@ where
     T: Clone + Send + Sync + 'static,
 {
     async fn add(&self, _a: &T, _b: &T) -> T {
-        panic!("handle addition is unsupported")
+        unreachable!("handle addition is unsupported")
     }
 
     async fn neg(&self, _a: &T) -> T {
-        panic!("handle negation is unsupported")
+        unreachable!("handle negation is unsupported")
     }
 
     async fn identity(&self) -> T {

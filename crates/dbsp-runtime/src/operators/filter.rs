@@ -103,7 +103,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -452,10 +454,7 @@ mod tests {
 
             if let Some(handle) = output_handle {
                 let mut cache = HashMap::new();
-                cache.insert(
-                    "filter_recompute_output".to_string(),
-                    output_dict.clone(),
-                );
+                cache.insert("filter_recompute_output".to_string(), output_dict.clone());
                 let actual_delta =
                     materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle)
                         .await

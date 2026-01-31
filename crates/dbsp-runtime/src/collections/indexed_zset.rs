@@ -6,8 +6,8 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
-use slatedb::config::ScanOptions;
 use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 
 use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator, decode, encode};
@@ -48,16 +48,7 @@ pub trait RangeKey {
     fn encoded_len(encoded: &[u8]) -> Result<usize>;
 }
 
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct OrderedBytes(pub Vec<u8>);
 
 impl OrderedBytes {
@@ -118,9 +109,7 @@ fn memcomparable_len(encoded: &[u8]) -> Result<usize> {
                 return Ok(idx + 2);
             }
             other => {
-                return Err(anyhow!(
-                    "invalid memcomparable escape byte: {other:#04x}"
-                ));
+                return Err(anyhow!("invalid memcomparable escape byte: {other:#04x}"));
             }
         }
     }
@@ -503,11 +492,7 @@ where
         Ok(prefix)
     }
 
-    fn data_prefix_for_value(
-        &self,
-        reverse_prefix: &[u8],
-        value_bytes: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn data_prefix_for_value(&self, reverse_prefix: &[u8], value_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut prefix = reverse_prefix.to_vec();
         prefix.extend_from_slice(&encode_len(value_bytes.len())?);
         prefix.extend_from_slice(value_bytes);
@@ -521,11 +506,7 @@ where
         Ok(key)
     }
 
-    fn range_prefix_for_bound(
-        &self,
-        range_prefix: &[u8],
-        range_bytes: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn range_prefix_for_bound(&self, range_prefix: &[u8], range_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut prefix = range_prefix.to_vec();
         prefix.extend_from_slice(range_bytes);
         Ok(prefix)
@@ -698,7 +679,11 @@ mod tests {
 
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        Arc::new(Db::open("indexed_zset_reverse", store).await.expect("open SlateDB"))
+        Arc::new(
+            Db::open("indexed_zset_reverse", store)
+                .await
+                .expect("open SlateDB"),
+        )
     }
 
     #[tokio::test]
@@ -712,17 +697,11 @@ mod tests {
             .await
             .expect("apply deltas");
 
-        let mut values = index
-            .values_for_key(&1)
-            .await
-            .expect("values for key");
+        let mut values = index.values_for_key(&1).await.expect("values for key");
         values.sort_by_key(|(value, _)| *value);
         assert_eq!(values, vec![(10, 2), (11, 3)]);
 
-        let mut keys = index
-            .keys_for_value(&10)
-            .await
-            .expect("keys for value");
+        let mut keys = index.keys_for_value(&10).await.expect("keys for value");
         keys.sort_by_key(|(key, _)| *key);
         assert_eq!(keys, vec![(1, 2), (2, 1)]);
 
@@ -731,10 +710,7 @@ mod tests {
             .await
             .expect("apply deletes");
 
-        let keys_after = index
-            .keys_for_value(&10)
-            .await
-            .expect("keys after delete");
+        let keys_after = index.keys_for_value(&10).await.expect("keys after delete");
         assert!(keys_after.is_empty());
     }
 
@@ -762,10 +738,8 @@ mod tests {
     async fn range_index_orders_bytes_lexicographically() {
         let db = build_db().await;
         let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
-        let index = IndexedZSet::<OrderedBytes, i64>::with_range_index(
-            table.clone(),
-            "range_index_bytes",
-        );
+        let index =
+            IndexedZSet::<OrderedBytes, i64>::with_range_index(table.clone(), "range_index_bytes");
 
         index
             .apply_deltas_with_range(vec![
@@ -781,9 +755,7 @@ mod tests {
             .await
             .expect("range scan");
         entries.sort_by(|(ka, va, _), (kb, vb, _)| {
-            ka.as_bytes()
-                .cmp(kb.as_bytes())
-                .then_with(|| va.cmp(vb))
+            ka.as_bytes().cmp(kb.as_bytes()).then_with(|| va.cmp(vb))
         });
 
         assert_eq!(

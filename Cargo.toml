@@ -4,6 +4,7 @@ members = [
     "crates/floe-node-core",
     "crates/floe-core",
     "crates/floe-executor",
+    "crates/floe-benchmarks",
     "crates/floe-server",
     "crates/floe-storage",
     "crates/dbsp",
@@ -28,6 +29,7 @@ bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 datafusion = "50.2.0"
 datafusion-common = "50.2.0"
+axum = "0.7"
 futures = "0.3"
 nexmark = { version = "0.2.0", features = ["serde"] }
 object_store = "0.12.4"
@@ -35,6 +37,7 @@ pgwire = { version = "0.33.0", default-features = false, features = ["server-api
 postgres-protocol = "0.6"
 postgres-types = "0.2"
 rkyv = "0.8.12"
+rdkafka = { version = "0.36", features = ["tokio", "cmake-build"] }
 arrow-schema = "56.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

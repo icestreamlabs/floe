@@ -87,7 +87,10 @@ pub fn validate_dbsp_plan(
                     bail!("node {node_id} → Source expects 0 inputs (found {input_count})");
                 }
             }
-            DbspNodeKind::Project(_) | DbspNodeKind::Select(_) | DbspNodeKind::Aggregate(_) => {
+            DbspNodeKind::Project(_)
+            | DbspNodeKind::Select(_)
+            | DbspNodeKind::Aggregate(_)
+            | DbspNodeKind::TopN(_) => {
                 if input_count != 1 {
                     bail!(
                         "node {node_id} → {} expects 1 input (found {input_count})",
@@ -128,7 +131,6 @@ pub fn validate_dbsp_plan(
                 }
             }
             DbspNodeKind::WindowAggregate(_) => unsupported(node_id, &circuit_node.kind)?,
-            DbspNodeKind::TopN(_) => unsupported(node_id, &circuit_node.kind)?,
             DbspNodeKind::Union(_) => unsupported(node_id, &circuit_node.kind)?,
             DbspNodeKind::Passthrough => unsupported(node_id, &circuit_node.kind)?,
             _ => {}

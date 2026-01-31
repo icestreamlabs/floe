@@ -123,20 +123,14 @@ impl DbspCircuitInstance {
         let view_handle = registry.register(view_name.to_string());
 
         if let Ok((ts, delta_handle)) = cursor.snapshot().await {
-            match apply_delta_handle_to_view(
-                &mut view,
-                table.clone(),
-                &mut cache,
-                &delta_handle,
-            )
-            .await
+            match apply_delta_handle_to_view(&mut view, table.clone(), &mut cache, &delta_handle)
+                .await
             {
                 Ok(snapshot_handle) => {
                     let latest = view.latest_handle_view();
                     let (dict, table, namespace, version) = latest.into_parts();
-                    view_handle.set_dbsp_state(DbspPersistedState::new(
-                        dict, table, namespace, version,
-                    ));
+                    view_handle
+                        .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
                     view_handle.publish_version(ts, snapshot_handle);
                 }
                 Err(err) => {
@@ -378,13 +372,7 @@ impl DbspCircuitInstance {
         };
 
         let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-            &left,
-            &right,
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            None,
+            &left, &right, left_key, right_key, predicate, projector, None,
         )
         .await?;
         Ok(join.stream())

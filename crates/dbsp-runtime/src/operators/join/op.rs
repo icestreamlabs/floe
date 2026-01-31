@@ -148,12 +148,7 @@ where
         }
     }
 
-    fn join_entries(
-        &self,
-        left: &[(L, i64)],
-        right: &[(R, i64)],
-        acc: &mut HashMap<O, i64>,
-    ) {
+    fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut HashMap<O, i64>) {
         for (lk, lw) in left {
             if *lw == 0 {
                 continue;
@@ -257,7 +252,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));

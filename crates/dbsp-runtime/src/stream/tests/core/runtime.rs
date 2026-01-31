@@ -44,7 +44,10 @@ async fn handle_operator_runtime_waits_for_alignment() {
     let records_clone = Arc::clone(&records);
 
     let mut runtime = HandleOperatorRuntime::new(
-        vec![left.handle_stream().stream(), right.handle_stream().stream()],
+        vec![
+            left.handle_stream().stream(),
+            right.handle_stream().stream(),
+        ],
         move |ts, handles| {
             let records = Arc::clone(&records_clone);
             let snapshot = handles.to_vec();

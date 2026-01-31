@@ -10,10 +10,10 @@ use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::join::JoinOp;
 use dbsp::relation_state::RelationState;
-use dbsp::stream::util::materialize_zset_handle;
-use dbsp::stream::runtime::DeltaOperator;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
+use dbsp::stream::runtime::DeltaOperator;
+use dbsp::stream::util::materialize_zset_handle;
 
 struct JoinBenchState {
     op: JoinOp<i64, i64, i64, i64>,
@@ -52,7 +52,10 @@ where
     let mut dict_batch = dict.batch();
     for (key, delta) in deltas {
         let id = dict_batch.intern(key).await.expect("intern key for join");
-        buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+        buckets
+            .entry(bucket_for(id))
+            .or_default()
+            .push((id, *delta));
     }
     drop(dict_batch);
 
@@ -187,10 +190,13 @@ async fn run_incremental_join(mut state: JoinBenchState) {
 }
 
 async fn run_nested_loop_join(mut state: JoinBenchState) {
-    let mut left =
-        materialize_zset_handle::<i64>(state.table.clone(), &mut state.dict_cache, &state.left_base)
-            .await
-            .expect("materialize left base");
+    let mut left = materialize_zset_handle::<i64>(
+        state.table.clone(),
+        &mut state.dict_cache,
+        &state.left_base,
+    )
+    .await
+    .expect("materialize left base");
     let left_delta = materialize_zset_handle::<i64>(
         state.table.clone(),
         &mut state.dict_cache,
@@ -200,10 +206,13 @@ async fn run_nested_loop_join(mut state: JoinBenchState) {
     .expect("materialize left delta");
     apply_deltas(&mut left, left_delta);
 
-    let mut right =
-        materialize_zset_handle::<i64>(state.table.clone(), &mut state.dict_cache, &state.right_base)
-            .await
-            .expect("materialize right base");
+    let mut right = materialize_zset_handle::<i64>(
+        state.table.clone(),
+        &mut state.dict_cache,
+        &state.right_base,
+    )
+    .await
+    .expect("materialize right base");
     let right_delta = materialize_zset_handle::<i64>(
         state.table.clone(),
         &mut state.dict_cache,

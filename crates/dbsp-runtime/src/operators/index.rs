@@ -172,6 +172,7 @@ mod tests {
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn bucket_for(id: u64) -> u16 {
@@ -224,7 +225,21 @@ mod tests {
 
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        Arc::new(Db::open("arrange_by_key", store).await.expect("open SlateDB"))
+        Arc::new(
+            Db::open("arrange_by_key", store)
+                .await
+                .expect("open SlateDB"),
+        )
+    }
+
+    fn apply_deltas(state: &mut HashMap<i64, i64>, deltas: &[(i64, i64)]) {
+        for (key, delta) in deltas {
+            let entry = state.entry(*key).or_insert(0);
+            *entry += *delta;
+            if *entry == 0 {
+                state.remove(key);
+            }
+        }
     }
 
     #[tokio::test]
@@ -238,13 +253,12 @@ mod tests {
         );
 
         let index = IndexedZSet::new(table.clone(), "arrange_index");
-        let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| {
-            if *value >= 0 {
-                Some(value % 2)
-            } else {
-                None
-            }
-        });
+        let key_extractor: KeyExtractor<i64, i64> =
+            Arc::new(
+                |value: &i64| {
+                    if *value >= 0 { Some(value % 2) } else { None }
+                },
+            );
         let mut op = ArrangeByKeyOp::new(index, table.clone(), key_extractor);
 
         let first_delta = stage_version(
@@ -254,25 +268,14 @@ mod tests {
             &[(1, 1), (2, 1), (3, 2), (-1, 1)],
         )
         .await;
-        let out = op
-            .on_step(1, &[first_delta])
-            .await
-            .expect("arrange step 1");
+        let out = op.on_step(1, &[first_delta]).await.expect("arrange step 1");
         assert!(out.is_none());
 
-        let mut odd = op
-            .index
-            .values_for_key(&1)
-            .await
-            .expect("read odd index");
+        let mut odd = op.index.values_for_key(&1).await.expect("read odd index");
         odd.sort_by_key(|(value, _)| *value);
         assert_eq!(odd, vec![(1, 1), (3, 2)]);
 
-        let even = op
-            .index
-            .values_for_key(&0)
-            .await
-            .expect("read even index");
+        let even = op.index.values_for_key(&0).await.expect("read even index");
         assert_eq!(even, vec![(2, 1)]);
 
         let second_delta = stage_version(
@@ -301,5 +304,64 @@ mod tests {
             .expect("read even index after");
         even_after.sort_by_key(|(value, _)| *value);
         assert_eq!(even_after, vec![(2, 1), (4, 3)]);
+    }
+
+    #[tokio::test]
+    async fn arrange_by_key_matches_full_recompute() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "arrange_recompute_input", None)
+                .await
+                .expect("build input dictionary"),
+        );
+
+        let index = IndexedZSet::new(table.clone(), "arrange_recompute_index");
+        let key_extractor: KeyExtractor<i64, i64> =
+            Arc::new(
+                |value: &i64| {
+                    if *value >= 0 { Some(value % 2) } else { None }
+                },
+            );
+        let mut op = ArrangeByKeyOp::new(index, table.clone(), key_extractor.clone());
+
+        let steps = vec![
+            vec![(1, 1), (2, 1), (3, 2), (-1, 1)],
+            vec![(1, -1), (4, 3), (2, -1)],
+        ];
+
+        let mut full_input: HashMap<i64, i64> = HashMap::new();
+
+        for (idx, deltas) in steps.into_iter().enumerate() {
+            let delta_handle = stage_version(
+                input_dict.clone(),
+                table.clone(),
+                "arrange_recompute_input",
+                &deltas,
+            )
+            .await;
+            op.on_step(idx as i64 + 1, &[delta_handle])
+                .await
+                .expect("arrange step");
+
+            apply_deltas(&mut full_input, &deltas);
+
+            let mut expected: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+            for (value, weight) in &full_input {
+                if let Some(key) = key_extractor(value) {
+                    expected.entry(key).or_default().push((*value, *weight));
+                }
+            }
+            for values in expected.values_mut() {
+                values.sort_by_key(|(value, _)| *value);
+            }
+
+            for key in [0, 1] {
+                let mut actual = op.index.values_for_key(&key).await.expect("read index");
+                actual.sort_by_key(|(value, _)| *value);
+                let expected_values = expected.get(&key).cloned().unwrap_or_default();
+                assert_eq!(actual, expected_values);
+            }
+        }
     }
 }

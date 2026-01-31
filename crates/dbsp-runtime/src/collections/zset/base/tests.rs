@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{SegmentRecord, VersionedZSet, h, prefix_bounds};
+use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -251,10 +251,9 @@ async fn compacts_versioned_zset() {
             .expect("build dictionary"),
     );
 
-    let mut versioned =
-        VersionedZSet::new(dict.clone(), table.clone(), "vz_compact".to_string())
-            .await
-            .expect("create versioned zset");
+    let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_compact".to_string())
+        .await
+        .expect("create versioned zset");
 
     let id_a = dict.intern(&"a".to_string()).await.expect("intern a");
     let id_b = dict.intern(&"b".to_string()).await.expect("intern b");
@@ -329,10 +328,9 @@ async fn release_version_removes_segments() {
             .expect("build dictionary"),
     );
 
-    let mut versioned =
-        VersionedZSet::new(dict.clone(), table.clone(), "vz_release".to_string())
-            .await
-            .expect("create versioned zset");
+    let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_release".to_string())
+        .await
+        .expect("create versioned zset");
 
     let id = dict.intern(&"x".to_string()).await.expect("intern key");
     let version = versioned
@@ -451,10 +449,9 @@ async fn recovers_version_intent_on_reopen() {
             .expect("build dictionary"),
     );
 
-    let mut versioned =
-        VersionedZSet::new(dict.clone(), table.clone(), "vz_intent".to_string())
-            .await
-            .expect("create versioned zset");
+    let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_intent".to_string())
+        .await
+        .expect("create versioned zset");
 
     let id = dict.intern(&"y".to_string()).await.expect("intern key");
     versioned

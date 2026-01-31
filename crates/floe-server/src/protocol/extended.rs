@@ -20,7 +20,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::execution::{build_query_response, FloeServerState};
+use crate::execution::{FloeServerState, build_query_response};
 use crate::sql::{
     collect_placeholder_indices, decode_parameter_value, ensure_select_statement,
     extract_tables_from_query, substitute_placeholders,

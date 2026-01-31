@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
-use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_executor::outer_stream::OuterStreamHandle;
+use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
 use tokio::time::{Duration, timeout};
 
@@ -35,7 +35,13 @@ pub(crate) async fn append_bid(
     bidder: i64,
     price: i64,
 ) -> Result<OuterStreamHandle> {
-    append_row(outer, bridge, BID_SOURCE_NAME, bid_row(auction, bidder, price)).await
+    append_row(
+        outer,
+        bridge,
+        BID_SOURCE_NAME,
+        bid_row(auction, bidder, price),
+    )
+    .await
 }
 
 pub(crate) async fn append_auction(

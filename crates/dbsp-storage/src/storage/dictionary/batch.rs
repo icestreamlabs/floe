@@ -4,10 +4,10 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
+use super::super::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use super::KeyIntern;
 use super::cache::BatchOverlay;
 use super::core::Dictionary;
-use super::KeyIntern;
-use super::super::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 #[allow(dead_code)]
 pub struct DictionaryBatch<'a, K>

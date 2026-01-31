@@ -2,7 +2,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use datafusion::arrow::record_batch::RecordBatch;
 use futures::Stream;
 use pgwire::api::results::DataRowEncoder;
 use pgwire::api::results::FieldInfo;
@@ -15,8 +14,6 @@ use floe_executor::tail::{TailBatch, TailStream};
 use super::types::encode_arrow_value;
 use super::user_error;
 
-const TAIL_OP_VALUE: i16 = 1;
-
 pub(super) struct TailResponseStream {
     schema: Arc<Vec<FieldInfo>>,
     stream: TailStream,
@@ -26,7 +23,11 @@ pub(super) struct TailResponseStream {
 }
 
 impl TailResponseStream {
-    pub(super) fn new(schema: Arc<Vec<FieldInfo>>, stream: TailStream, cancel: CancellationToken) -> Self {
+    pub(super) fn new(
+        schema: Arc<Vec<FieldInfo>>,
+        stream: TailStream,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             schema,
             stream,
@@ -51,7 +52,7 @@ impl Stream for TailResponseStream {
             if let Some(batch) = self.current_batch.as_ref() {
                 if self.next_row < batch.batch.num_rows() {
                     let schema = Arc::clone(&self.schema);
-                    let row = encode_tail_row(schema, batch.version, &batch.batch, self.next_row);
+                    let row = encode_tail_row(schema, batch, self.next_row);
                     self.next_row += 1;
                     return Poll::Ready(Some(row));
                 }
@@ -81,17 +82,22 @@ impl Stream for TailResponseStream {
 
 fn encode_tail_row(
     schema: Arc<Vec<FieldInfo>>,
-    version: i64,
-    batch: &RecordBatch,
+    batch: &TailBatch,
     row_idx: usize,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema);
-    encoder.encode_field(&Some(version))?;
-    encoder.encode_field(&Some(i64::from(TAIL_OP_VALUE)))?;
-    encoder.encode_field(&Option::<i64>::None)?;
-    for col_idx in 0..batch.num_columns() {
-        let array = batch.column(col_idx);
-        let data_type = batch.schema().field(col_idx).data_type().clone();
+    let op = batch
+        .ops
+        .get(row_idx)
+        .copied()
+        .ok_or_else(|| user_error("TAIL batch missing __op".to_string()))?;
+    let time = batch.times.get(row_idx).cloned().unwrap_or(None);
+    encoder.encode_field(&Some(batch.version))?;
+    encoder.encode_field(&Some(i64::from(op)))?;
+    encoder.encode_field(&time)?;
+    for col_idx in 0..batch.batch.num_columns() {
+        let array = batch.batch.column(col_idx);
+        let data_type = batch.batch.schema().field(col_idx).data_type().clone();
         encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
     }
     encoder.finish()

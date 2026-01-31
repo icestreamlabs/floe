@@ -6,8 +6,9 @@ use nexmark::EventGenerator;
 use nexmark::config::NexmarkConfig;
 use nexmark::event::Event;
 use serde::Serialize;
-use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
+use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
 
 const CONNECTOR_NAME: &str = "nexmark";
@@ -22,6 +23,84 @@ pub const BID_SOURCE_NAME: &str = "nexmark_bid";
 pub struct Config {
     pub events_per_second: f64,
     pub max_events: Option<u64>,
+}
+
+pub struct NexmarkConnector {
+    config: Config,
+    definitions: Vec<SourceDefinition>,
+    generator: Option<EventGenerator>,
+    emitted: u64,
+    interval: Duration,
+}
+
+impl NexmarkConnector {
+    pub fn new(config: Config) -> Result<Self> {
+        ensure!(
+            config.events_per_second.is_finite() && config.events_per_second > 0.0,
+            "events-per-second must be a positive finite value"
+        );
+        let interval = Duration::from_secs_f64(1.0 / config.events_per_second);
+        let definitions = definitions()?;
+        Ok(Self {
+            config,
+            definitions,
+            generator: None,
+            emitted: 0,
+            interval,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Connector for NexmarkConnector {
+    fn name(&self) -> &str {
+        CONNECTOR_NAME
+    }
+
+    fn definitions(&self) -> &[SourceDefinition] {
+        &self.definitions
+    }
+
+    fn tick_interval(&self) -> Duration {
+        self.interval
+    }
+
+    async fn init(&mut self, _ctx: &ConnectorContext) -> Result<()> {
+        self.generator = Some(EventGenerator::new(NexmarkConfig::default()));
+        self.emitted = 0;
+        Ok(())
+    }
+
+    async fn tick(&mut self, ctx: &ConnectorContext) -> Result<ConnectorTick> {
+        if let Some(limit) = self.config.max_events
+            && self.emitted >= limit
+        {
+            return Ok(ConnectorTick::Finished);
+        }
+
+        let generator = self
+            .generator
+            .as_mut()
+            .context("nexmark connector is not initialized")?;
+        let event = generator
+            .next()
+            .context("nexmark generator produced no event")?;
+        forward_event(ctx.sender(), &event).await?;
+        self.emitted = self.emitted.saturating_add(1);
+
+        if let Some(limit) = self.config.max_events
+            && self.emitted >= limit
+        {
+            Ok(ConnectorTick::Finished)
+        } else {
+            Ok(ConnectorTick::Emitted(1))
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        self.generator = None;
+        Ok(())
+    }
 }
 
 pub fn definitions() -> Result<Vec<SourceDefinition>> {
@@ -39,42 +118,9 @@ pub fn definitions() -> Result<Vec<SourceDefinition>> {
 }
 
 pub async fn run(config: Config, sender: SourceEventSender) -> Result<()> {
-    ensure!(
-        config.events_per_second.is_finite() && config.events_per_second > 0.0,
-        "events-per-second must be a positive finite value"
-    );
-
-    if let Some(limit) = config.max_events
-        && limit == 0
-    {
-        return Ok(());
-    }
-
-    let mut generator = EventGenerator::new(NexmarkConfig::default());
-    let interval = Duration::from_secs_f64(1.0 / config.events_per_second);
-    let mut emitted: u64 = 0;
-
-    loop {
-        let event = generator
-            .next()
-            .context("nexmark generator produced no event")?;
-        forward_event(&sender, &event).await?;
-        emitted = emitted.saturating_add(1);
-
-        if let Some(limit) = config.max_events
-            && emitted >= limit
-        {
-            break;
-        }
-
-        if !interval.is_zero() {
-            sleep(interval).await;
-        } else {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    Ok(())
+    let mut connector = NexmarkConnector::new(config)?;
+    let ctx = ConnectorContext::new(sender);
+    run_connector(&mut connector, &ctx, CancellationToken::new()).await
 }
 
 async fn forward_event(sender: &SourceEventSender, event: &Event) -> Result<()> {

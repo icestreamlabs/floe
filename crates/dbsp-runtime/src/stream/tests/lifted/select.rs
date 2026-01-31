@@ -77,7 +77,6 @@ async fn lifted_select_zset_stream_filters_elements() {
     assert!(!second.contains_key("drop"));
 }
 
-
 #[tokio::test]
 async fn lifted_select_zset_stream_emits_updates_after_build() {
     let db = build_db().await;

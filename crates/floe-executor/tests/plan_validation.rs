@@ -69,18 +69,14 @@ fn validates_join_plan_with_available_sources() -> Result<()> {
 }
 
 #[test]
-fn rejects_topn_operator() -> Result<()> {
+fn accepts_topn_operator() -> Result<()> {
     let planner = planner();
     let plan = topn_plan(&planner)?;
     let mut sources = BTreeSet::new();
     sources.insert(nexmark_bid_table().name.to_string());
 
-    let err = validate_dbsp_plan(&plan, &sources, "mv_topn").unwrap_err();
-    let expected = format!(
-        "node {} (TopN) is planned by DBSP but not yet executable in Floe (MVP)",
-        plan.root
-    );
-    assert!(err.to_string().contains(&expected));
+    let validated = validate_dbsp_plan(&plan, &sources, "mv_topn")?;
+    assert_eq!(validated.root_node, plan.root);
     Ok(())
 }
 

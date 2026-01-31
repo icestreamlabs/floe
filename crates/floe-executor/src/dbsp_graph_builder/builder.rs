@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
-use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind};
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::DeltaHandleStream;
+use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -183,6 +183,22 @@ impl DbspGraphBuilder {
                 self.compile_aggregate(aggregate, upstream, task_events)
                     .await?
             }
+            DbspNodeKind::TopN(topn) => {
+                let input_idx = first_input(node, "topn")?;
+                let upstream = self
+                    .compile_node(
+                        plan,
+                        input_idx,
+                        outer_streams,
+                        cancel,
+                        task_events,
+                        built,
+                        mv_registry,
+                        mv_latest,
+                    )
+                    .await?;
+                self.compile_topn(topn, upstream, task_events).await?
+            }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
                 let upstream = self
@@ -209,7 +225,6 @@ impl DbspGraphBuilder {
                 .await?
             }
             DbspNodeKind::WindowAggregate(_)
-            | DbspNodeKind::TopN(_)
             | DbspNodeKind::Union(_)
             | DbspNodeKind::Passthrough => {
                 bail!("Unsupported in MVP: {:?}", node.kind)

@@ -26,5 +26,6 @@ tracing = { workspace = true }
 nexmark = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
 arrow-schema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

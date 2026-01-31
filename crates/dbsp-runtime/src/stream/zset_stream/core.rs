@@ -17,10 +17,10 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::StreamRetention;
 use super::super::core::stream::Stream;
 use super::super::groups::HandleGroup;
 use super::super::util::collect_values;
+use super::StreamRetention;
 use super::ZSetStream;
 
 const DELTA_SUFFIX: &str = "/delta";
@@ -258,7 +258,10 @@ where
                 .intern(key)
                 .await
                 .context("intern key while staging overlay")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, *delta));
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
 
         for (key, delta) in &overlay {

@@ -65,6 +65,12 @@ fn convert_value(data_type: &SourceDataType, value: &Value) -> Result<ScalarValu
                 .with_context(|| format!("expected string value, found {value}"))?;
             Ok(ScalarValue::Utf8(Some(string.to_string())))
         }
+        SourceDataType::Bool => {
+            let boolean = value
+                .as_bool()
+                .with_context(|| format!("expected boolean value, found {value}"))?;
+            Ok(ScalarValue::Boolean(Some(boolean)))
+        }
         SourceDataType::TimestampMillis => {
             let number = value
                 .as_i64()
@@ -125,5 +131,31 @@ mod tests {
             ScalarValue::TimestampMillisecond(Some(1_600_000_000), None)
         );
         assert_eq!(ts, Some(1_600_000_000_u64));
+    }
+
+    #[test]
+    fn decodes_boolean_column() {
+        let definition = SourceDefinition::new(
+            "flags",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("enabled", SourceDataType::Bool),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new(
+            "flags",
+            json!({
+                "id": 1,
+                "enabled": true
+            }),
+        );
+
+        let (row, ts) = decoder.decode(&event).expect("decode");
+        assert_eq!(row.len(), 2);
+        assert_eq!(row[0], ScalarValue::Int64(Some(1)));
+        assert_eq!(row[1], ScalarValue::Boolean(Some(true)));
+        assert_eq!(ts, None);
     }
 }

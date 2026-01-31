@@ -9,8 +9,8 @@ use tokio::sync::watch;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::ZSetHandle;
-use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::KeyValueTable;
+use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 mod accessors;
 mod constructors;

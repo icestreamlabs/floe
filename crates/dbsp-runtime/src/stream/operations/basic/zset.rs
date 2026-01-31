@@ -14,9 +14,9 @@ use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::runtime::HandleOperatorRuntime;
-use crate::stream::Stream;
 use crate::stream::util::{
     build_derived_stream, collect_values, compute_delta, materialize_zset_handle,
     next_lifted_zset_namespace, push_value_in_place, set_default_in_place,

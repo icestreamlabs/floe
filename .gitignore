@@ -1,5 +1,7 @@
 /target
 .floe/
+out
+*merged_output*.txt
 
 # ide
 .idea

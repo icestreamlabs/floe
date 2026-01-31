@@ -1,24 +1,64 @@
+use std::io::Cursor;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
-use floe_core::RowValues;
+use anyhow::{Context, Result, anyhow, ensure};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::SchemaRef;
 use floe_core::catalog::TableDefinition;
 use floe_core::encoding::{self, ArchivedRow};
+use floe_core::{RowValue, RowValues};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use serde::{Deserialize, Serialize};
 use slatedb::config::ScanOptions;
 use slatedb::{Db, Error as SlateError};
 use tokio::fs;
 
 const TABLE_DEF_PREFIX: &str = "meta/table/";
 const TABLE_DATA_PREFIX: &str = "data/";
+const MV_DEF_PREFIX: &str = "meta/mv/definition/";
+const MV_SCHEMA_PREFIX: &str = "meta/mv/schema/";
 
 #[derive(Clone)]
 pub struct SlateCatalog {
     db: Arc<Db>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedViewMetadata {
+    name: String,
+    query: String,
+    if_not_exists: bool,
+}
+
+impl MaterializedViewMetadata {
+    pub fn new(
+        name: impl Into<String>,
+        query: impl Into<String>,
+        if_not_exists: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            query: query.into(),
+            if_not_exists,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn if_not_exists(&self) -> bool {
+        self.if_not_exists
+    }
 }
 
 impl SlateCatalog {
@@ -134,6 +174,94 @@ impl SlateCatalog {
             .collect()
     }
 
+    pub async fn upsert_materialized_view(&self, metadata: MaterializedViewMetadata) -> Result<()> {
+        ensure!(
+            !metadata.name().trim().is_empty(),
+            "materialized view name cannot be empty"
+        );
+        let key = mv_definition_key(metadata.name());
+        let encoded = serde_json::to_vec(&metadata).with_context(|| {
+            format!(
+                "failed to serialize materialized view definition {}",
+                metadata.name()
+            )
+        })?;
+        self.db
+            .put(&key, encoded)
+            .await
+            .map_err(map_slate_err)
+            .with_context(|| {
+                format!(
+                    "failed to persist materialized view definition {}",
+                    metadata.name()
+                )
+            })
+    }
+
+    pub async fn materialized_view(
+        &self,
+        name: &str,
+    ) -> Result<Option<MaterializedViewMetadata>> {
+        let key = mv_definition_key(name);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let metadata = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse materialized view definition for {name}")
+            })?;
+            Ok(Some(metadata))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn materialized_views(&self) -> Result<Vec<MaterializedViewMetadata>> {
+        scan_prefix(&self.db, MV_DEF_PREFIX.as_bytes())
+            .await?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_slice::<MaterializedViewMetadata>(&value)
+                    .context("failed to deserialize materialized view definition")
+            })
+            .collect()
+    }
+
+    pub async fn save_materialized_view_schema(
+        &self,
+        name: &str,
+        schema: SchemaRef,
+    ) -> Result<()> {
+        let key = mv_schema_key(name);
+        let mut payload = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut payload, schema.as_ref())
+                .context("encode materialized view schema via Arrow IPC")?;
+            writer.finish().context("finalize schema IPC stream")?;
+        }
+        self.db
+            .put(&key, payload)
+            .await
+            .map_err(map_slate_err)
+            .with_context(|| format!("persist schema for materialized view '{name}'"))
+    }
+
+    pub async fn materialized_view_schema(&self, name: &str) -> Result<Option<SchemaRef>> {
+        let key = mv_schema_key(name);
+        let bytes = match self
+            .db
+            .get(&key)
+            .await
+            .map_err(map_slate_err)
+            .with_context(|| format!("load schema metadata for materialized view '{name}'"))?
+        {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let cursor = Cursor::new(bytes);
+        let reader = StreamReader::try_new(cursor, None)
+            .with_context(|| format!("decode persisted schema for materialized view '{name}'"))?;
+        Ok(Some(reader.schema()))
+    }
+
     pub fn db(&self) -> Arc<Db> {
         self.db.clone()
     }
@@ -167,6 +295,14 @@ fn table_definition_key(name: &str) -> Vec<u8> {
     format!("{TABLE_DEF_PREFIX}{name}").into_bytes()
 }
 
+fn mv_definition_key(name: &str) -> Vec<u8> {
+    format!("{MV_DEF_PREFIX}{name}").into_bytes()
+}
+
+fn mv_schema_key(name: &str) -> Vec<u8> {
+    format!("{MV_SCHEMA_PREFIX}{name}").into_bytes()
+}
+
 fn table_row_prefix(name: &str) -> Vec<u8> {
     format!("{TABLE_DATA_PREFIX}{name}/").into_bytes()
 }
@@ -175,11 +311,38 @@ fn table_row_key(table: &TableDefinition, row: &RowValues) -> Result<Vec<u8>> {
     let pk_index = table.primary_key_index();
     let pk_value = row
         .get(pk_index)
-        .copied()
+        .cloned()
         .ok_or_else(|| anyhow!("missing value for primary key index {}", pk_index))?;
     let mut key = table_row_prefix(table.name());
-    key.extend_from_slice(&pk_value.to_be_bytes());
+    key.extend_from_slice(&encode_key_value(&pk_value)?);
     Ok(key)
+}
+
+fn encode_key_value(value: &RowValue) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    match value {
+        RowValue::Int64(v) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        RowValue::Bool(flag) => {
+            buf.push(0x02);
+            buf.push(if *flag { 1 } else { 0 });
+        }
+        RowValue::Utf8(text) => {
+            buf.push(0x03);
+            let bytes = text.as_bytes();
+            let len =
+                u32::try_from(bytes.len()).map_err(|_| anyhow!("string primary key too large"))?;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        RowValue::TimestampMillis(value) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    Ok(buf)
 }
 
 fn map_slate_err(err: SlateError) -> anyhow::Error {
@@ -189,7 +352,70 @@ fn map_slate_err(err: SlateError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use floe_core::catalog::{ColumnDefinition, TableDefinition};
+    use arrow_schema::{DataType, Field, Schema};
+    use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
+
+    #[tokio::test]
+    async fn roundtrip_typed_rows() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+
+        let table = TableDefinition::new(
+            "typed_rows",
+            vec![
+                ColumnDefinition::new_typed("name", ColumnType::Utf8, true),
+                ColumnDefinition::new_typed("active", ColumnType::Bool, false),
+                ColumnDefinition::new_typed("seen_at", ColumnType::TimestampMillis, false),
+            ],
+        )
+        .unwrap();
+
+        catalog.upsert_table(table.clone()).await.unwrap();
+
+        let row = vec![
+            RowValue::Utf8("alice".to_string()),
+            RowValue::Bool(true),
+            RowValue::TimestampMillis(1_700_000_000_000),
+        ];
+        catalog.insert_row(&table, &row).await.unwrap();
+
+        let rows = catalog.read_rows(&table).await.unwrap();
+        assert_eq!(rows, vec![row]);
+    }
+
+    #[tokio::test]
+    async fn persists_materialized_view_metadata_and_schema() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+        let metadata =
+            MaterializedViewMetadata::new("mv_meta", "SELECT 1 AS value", false);
+        catalog
+            .upsert_materialized_view(metadata.clone())
+            .await
+            .expect("persist metadata");
+
+        let loaded = catalog
+            .materialized_view("mv_meta")
+            .await
+            .expect("load metadata")
+            .expect("metadata exists");
+        assert_eq!(loaded, metadata);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        catalog
+            .save_materialized_view_schema("mv_meta", Arc::clone(&schema))
+            .await
+            .expect("persist schema");
+
+        let loaded_schema = catalog
+            .materialized_view_schema("mv_meta")
+            .await
+            .expect("load schema")
+            .expect("schema exists");
+        assert_eq!(loaded_schema.as_ref(), schema.as_ref());
+    }
 
     #[tokio::test]
     async fn roundtrip_table_definitions() {
@@ -210,11 +436,18 @@ mod tests {
         assert_eq!(loaded.name(), "stream");
         assert_eq!(loaded.columns().len(), 2);
 
-        catalog.insert_row(&table, &vec![1, 10]).await.unwrap();
-        catalog.insert_row(&table, &vec![2, 20]).await.unwrap();
+        catalog
+            .insert_row(&table, &vec![RowValue::Int64(1), RowValue::Int64(10)])
+            .await
+            .unwrap();
+        catalog
+            .insert_row(&table, &vec![RowValue::Int64(2), RowValue::Int64(20)])
+            .await
+            .unwrap();
 
-        let mut rows = catalog.read_rows(&table).await.unwrap();
-        rows.sort();
-        assert_eq!(rows, vec![vec![1, 10], vec![2, 20]]);
+        let rows = catalog.read_rows(&table).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&vec![RowValue::Int64(1), RowValue::Int64(10)]));
+        assert!(rows.contains(&vec![RowValue::Int64(2), RowValue::Int64(20)]));
     }
 }

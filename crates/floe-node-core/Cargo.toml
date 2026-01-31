@@ -8,8 +8,12 @@ floe-core = { path = "../floe-core" }
 floe-executor = { path = "../floe-executor" }
 floe-sql-parser = { path = "../floe-sql-parser" }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 datafusion = { workspace = true }
 nexmark = { workspace = true }
+rdkafka = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

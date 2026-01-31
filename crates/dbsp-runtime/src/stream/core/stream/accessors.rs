@@ -8,8 +8,8 @@ use tokio::sync::watch;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::StreamHandle;
-use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::KeyValueTable;
+use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::Stream;
 

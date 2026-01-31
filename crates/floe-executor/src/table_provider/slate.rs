@@ -6,11 +6,12 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::memory::MemTable;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use floe_core::RowValue;
 use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
 
 use super::filters::parse_mv_version_expr;
-use super::helpers::{build_i64_batches, to_datafusion_error};
+use super::helpers::{build_scalar_batches, to_datafusion_error};
 
 pub struct SlateTableProvider {
     storage: Arc<SlateCatalog>,
@@ -86,8 +87,31 @@ impl TableProvider for SlateTableProvider {
             rows.truncate(limit);
         }
 
-        let batches = build_i64_batches(rows, self.schema.clone()).map_err(to_datafusion_error)?;
+        let scalar_rows = rows
+            .into_iter()
+            .map(row_values_to_scalar_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(to_datafusion_error)?;
+
+        let batches =
+            build_scalar_batches(scalar_rows, self.schema.clone()).map_err(to_datafusion_error)?;
         let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
         mem_table.scan(state, projection, filters, limit).await
     }
+}
+
+fn row_values_to_scalar_row(values: Vec<RowValue>) -> anyhow::Result<crate::stream_types::Row> {
+    let mut row = Vec::with_capacity(values.len());
+    for value in values {
+        let scalar = match value {
+            RowValue::Int64(v) => datafusion::scalar::ScalarValue::Int64(Some(v)),
+            RowValue::Bool(flag) => datafusion::scalar::ScalarValue::Boolean(Some(flag)),
+            RowValue::Utf8(text) => datafusion::scalar::ScalarValue::Utf8(Some(text)),
+            RowValue::TimestampMillis(value) => {
+                datafusion::scalar::ScalarValue::TimestampMillisecond(Some(value), None)
+            }
+        };
+        row.push(scalar);
+    }
+    Ok(row)
 }

@@ -7,6 +7,7 @@ use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
+use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
@@ -16,12 +17,11 @@ use floe_executor::dbsp_plan::{
 use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
-use floe_executor::GraphTaskError;
 use object_store::memory::InMemory;
 use slatedb::Db;
-use tokio::time::{timeout, Duration};
-use tokio_util::sync::CancellationToken;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 fn arrow_schema(fields: Vec<Field>) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
@@ -252,7 +252,9 @@ async fn aggregate_materializes_mv() {
     mv_registry.set_schema(view_name, arrow_schema);
 
     let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     builder
@@ -343,6 +345,83 @@ async fn aggregate_materializes_mv() {
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
+}
+
+#[tokio::test]
+async fn topn_materializes_mv() {
+    let db = test_db("topn").await;
+    let view_name = "mv_topn";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .project(vec![col("price")])
+            .expect("project")
+            .sort(vec![col("price").sort(false, true)])
+            .expect("sort")
+            .limit(0, Some(2))
+            .expect("limit")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 7, 10), 1).expect("append 10");
+    bid_writer.append(&bid_row(2, 8, 30), 1).expect("append 30");
+    bid_writer.append(&bid_row(3, 9, 20), 1).expect("append 20");
+    bid_writer
+        .append(&bid_row(4, 10, 30), 1)
+        .expect("append 30 again");
+    bid_writer.flush().await.expect("flush bids");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+        })
+        .await
+        .expect("build topn graph");
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ScalarValue::Int64(Some(30))],
+            vec![ScalarValue::Int64(Some(30))],
+        ]
+    );
 }
 
 #[tokio::test]
@@ -467,7 +546,9 @@ async fn cancel_stops_materialized_view_updates() {
 
     let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let cancel = CancellationToken::new();
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     builder
@@ -486,9 +567,7 @@ async fn cancel_stops_materialized_view_updates() {
     let mut version_rx = view_handle.version_watch();
     {
         let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
-        writer
-            .append(&bid_row(1, 42, 99), 1)
-            .expect("append first");
+        writer.append(&bid_row(1, 42, 99), 1).expect("append first");
         writer.flush().await.expect("flush first");
     }
     timeout(Duration::from_millis(200), version_rx.changed())
@@ -547,7 +626,9 @@ async fn graph_task_error_is_reported() {
     let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let cancel = CancellationToken::new();
 
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db)).await.expect("builder");
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     builder

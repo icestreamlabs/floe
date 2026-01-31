@@ -1,0 +1,162 @@
+use anyhow::{Context, Result, ensure};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+use floe_node_core::source::{SourceEvent, SourceEventSender};
+
+#[derive(Debug, Clone)]
+pub struct HttpIngestConfig {
+    pub host: String,
+    pub port: u16,
+    pub default_source: Option<String>,
+}
+
+#[derive(Clone)]
+struct HttpIngestState {
+    sender: SourceEventSender,
+    default_source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IngestQuery {
+    source: Option<String>,
+}
+
+pub async fn run_http_ingest(
+    config: HttpIngestConfig,
+    sender: SourceEventSender,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let state = HttpIngestState {
+        sender,
+        default_source: config.default_source,
+    };
+    let app = Router::new()
+        .route("/ingest", post(ingest))
+        .with_state(state);
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind http ingest {addr}"))?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            cancel.cancelled().await;
+        })
+        .await
+        .context("run http ingest server")?;
+    Ok(())
+}
+
+async fn ingest(
+    State(state): State<HttpIngestState>,
+    Query(query): Query<IngestQuery>,
+    Json(payload): Json<Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let default_source = query.source.as_deref().or(state.default_source.as_deref());
+    let events = parse_events(payload, default_source).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid event payload: {err}"),
+        )
+    })?;
+
+    for event in events {
+        state.sender.send(event).await.map_err(|err| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("ingest channel closed: {err}"),
+            )
+        })?;
+    }
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+fn parse_events(value: Value, default_source: Option<&str>) -> Result<Vec<SourceEvent>> {
+    match value {
+        Value::Array(items) => {
+            if items.is_empty() {
+                ensure!(false, "event array must not be empty");
+            }
+            let mut events = Vec::with_capacity(items.len());
+            for item in items {
+                events.push(parse_event(item, default_source)?);
+            }
+            Ok(events)
+        }
+        other => Ok(vec![parse_event(other, default_source)?]),
+    }
+}
+
+fn parse_event(value: Value, default_source: Option<&str>) -> Result<SourceEvent> {
+    let object = value
+        .as_object()
+        .context("event payload must be a JSON object")?;
+
+    if let (Some(source), Some(payload)) = (object.get("source"), object.get("data")) {
+        let source = source.as_str().context("event source must be a string")?;
+        ensure!(payload.is_object(), "event payload must be an object");
+        return Ok(SourceEvent::new(source, payload.clone()));
+    }
+
+    let source = default_source.context("event payload missing source")?;
+    Ok(SourceEvent::new(source, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tower::util::ServiceExt;
+
+    #[test]
+    fn parse_events_accepts_source_wrapped_payload() {
+        let value = json!({"source": "nexmark_bid", "data": {"auction": 1}});
+        let events = parse_events(value, None).expect("parse events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "nexmark_bid");
+    }
+
+    #[test]
+    fn parse_events_uses_default_source() {
+        let value = json!({"auction": 1});
+        let events = parse_events(value, Some("nexmark_bid")).expect("parse events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "nexmark_bid");
+    }
+
+    #[tokio::test]
+    async fn http_ingest_accepts_events() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let state = HttpIngestState {
+            sender: tx,
+            default_source: Some("nexmark_bid".to_string()),
+        };
+        let app = Router::new()
+            .route("/ingest", post(ingest))
+            .with_state(state);
+
+        let payload = json!({"auction": 1});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let event = rx.recv().await.expect("event");
+        assert_eq!(event.source(), "nexmark_bid");
+    }
+}

@@ -141,7 +141,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -250,10 +252,9 @@ where
                 .context("update waterline state")?;
         self.state.update_handle(new_integrated_handle);
 
-        let delta_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &updates, None)
-                .await
-                .context("persist waterline output")?;
+        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &updates, None)
+            .await
+            .context("persist waterline output")?;
         Ok(Some(delta_handle))
     }
 }
@@ -359,20 +360,10 @@ mod tests {
             .expect("output zset");
 
         let extractor = Arc::new(|row: &Row| *row);
-        let mut op = WaterlineOp::new(
-            state,
-            table.clone(),
-            extractor,
-            output,
-            0i64,
-        );
+        let mut op = WaterlineOp::new(state, table.clone(), extractor, output, 0i64);
 
-        let deltas: Vec<Vec<(Row, i64)>> = vec![
-            vec![(5, 1)],
-            vec![(3, 1), (7, 1)],
-            vec![(-1, 1)],
-            vec![],
-        ];
+        let deltas: Vec<Vec<(Row, i64)>> =
+            vec![vec![(5, 1)], vec![(3, 1), (7, 1)], vec![(-1, 1)], vec![]];
 
         let mut prev_output: HashMap<i64, i64> = HashMap::new();
         let mut cache_out = HashMap::new();
@@ -385,18 +376,14 @@ mod tests {
                 .map(|(row, _)| *row)
                 .max();
             let expected_current = match max_ts {
-                Some(ts) => prev_output
-                    .keys()
-                    .copied()
-                    .max()
-                    .unwrap_or(0)
-                    .max(ts),
+                Some(ts) => prev_output.keys().copied().max().unwrap_or(0).max(ts),
                 None => prev_output.keys().copied().max().unwrap_or(0),
             };
             let mut expected_state = HashMap::new();
             expected_state.insert(expected_current, 1);
-            let expected_delta: HashMap<i64, i64> =
-                compute_delta(&prev_output, &expected_state).into_iter().collect();
+            let expected_delta: HashMap<i64, i64> = compute_delta(&prev_output, &expected_state)
+                .into_iter()
+                .collect();
 
             let handle = if delta.is_empty() {
                 ZSetHandle {
@@ -416,13 +403,10 @@ mod tests {
                 assert!(out_handle.is_none(), "expected empty output at step {step}");
             } else {
                 let out_handle = out_handle.expect("output handle");
-                let materialized = materialize_zset_handle::<i64>(
-                    table.clone(),
-                    &mut cache_out,
-                    &out_handle,
-                )
-                .await
-                .expect("materialize output");
+                let materialized =
+                    materialize_zset_handle::<i64>(table.clone(), &mut cache_out, &out_handle)
+                        .await
+                        .expect("materialize output");
                 assert_eq!(materialized, expected_delta, "step {step}");
             }
 

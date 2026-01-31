@@ -558,6 +558,18 @@ impl OrderExpr {
             nulls_first,
         })
     }
+
+    pub fn expression(&self) -> &DbspExpression {
+        &self.expression
+    }
+
+    pub fn ascending(&self) -> bool {
+        self.ascending
+    }
+
+    pub fn nulls_first(&self) -> bool {
+        self.nulls_first
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -592,6 +604,18 @@ impl DbspTopNNode {
 
     pub fn output_schema(&self) -> &Arc<RowSchema> {
         &self.input_schema
+    }
+
+    pub fn order_by(&self) -> &[OrderExpr] {
+        &self.order_by
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
     }
 }
 

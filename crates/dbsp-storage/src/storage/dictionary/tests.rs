@@ -6,10 +6,10 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use slatedb::{Db, WriteBatch};
 
-use super::codec::{compress_value, decode_id, decompress_value, encode_id};
-use super::{Dictionary, HashFn, KeyIntern};
 use super::super::encoding;
 use super::super::{KeyValueTable, SlateTable};
+use super::codec::{compress_value, decode_id, decompress_value, encode_id};
+use super::{Dictionary, HashFn, KeyIntern};
 
 #[derive(Debug, Clone, PartialEq, Archive, RkyvSerialize, RkyvDeserialize)]
 struct TestKey {

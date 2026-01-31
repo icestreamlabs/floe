@@ -6,7 +6,10 @@ edition.workspace = true
 [dependencies]
 floe-core = { path = "../floe-core" }
 anyhow = { workspace = true }
+arrow-ipc = "56.2.0"
+arrow-schema = { workspace = true }
 object_store = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
 tokio = { workspace = true }

@@ -71,11 +71,8 @@ impl DbspAggregate {
         let aggregate_id = NEXT_AGGREGATE_ID.fetch_add(1, Ordering::Relaxed);
         let output_ns = format!("aggregate_output_{aggregate_id}");
 
-        let state = RelationState::empty(
-            table.clone(),
-            format!("aggregate_state_{aggregate_id}"),
-        )
-        .await?;
+        let state =
+            RelationState::empty(table.clone(), format!("aggregate_state_{aggregate_id}")).await?;
         let output_dict = Arc::new(
             Dictionary::<(K, A)>::with_table(table.clone(), output_ns.clone(), None)
                 .await

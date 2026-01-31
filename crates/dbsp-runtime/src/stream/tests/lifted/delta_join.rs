@@ -116,7 +116,6 @@ async fn delta_lifted_delta_lifted_join_produces_handles() {
     }
 }
 
-
 #[tokio::test]
 async fn delta_lifted_delta_lifted_join_aligns_to_shortest_stream() {
     let db = build_db().await;

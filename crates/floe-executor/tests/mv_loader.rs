@@ -8,6 +8,7 @@ use datafusion::logical_expr::{col, table_scan};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::CircuitPlan;
 use dbsp::handles::ZSetHandleView;
+use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
@@ -17,12 +18,11 @@ use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
-use floe_executor::GraphTaskError;
 use floe_storage::SlateCatalog;
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::Db;
-use tokio_util::sync::CancellationToken;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const VIEW_NAME: &str = "mv_q1";
 const SOURCE_NAME: &str = "nexmark_bid";

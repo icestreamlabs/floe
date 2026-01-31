@@ -7,14 +7,12 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
 use crate::handles::ZSetHandle;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
 
-use super::{
-    CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, ZSetVersionManifest,
-};
 use super::super::ZSET_PREFIX;
+use super::{CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, ZSetVersionManifest};
 
 impl CompactionPolicy {
     pub const fn disabled() -> Self {

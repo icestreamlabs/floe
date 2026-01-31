@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::runtime::{DeltaOperator, PipelineBuilder, single_input_pipeline};
 use crate::stream::tests::common::build_db;
 use crate::stream::{StreamRetention, ZSetStream};
+use async_trait::async_trait;
 
 type ObservedHandles = Arc<tokio::sync::Mutex<Vec<(i64, Vec<ZSetHandle>)>>>;
 

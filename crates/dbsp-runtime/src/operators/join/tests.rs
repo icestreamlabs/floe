@@ -17,8 +17,8 @@ use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::util::{compute_delta, materialize_zset_handle};
 use crate::stream::runtime::DeltaOperator;
+use crate::stream::util::{compute_delta, materialize_zset_handle};
 
 async fn build_db() -> Arc<Db> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -552,10 +552,9 @@ async fn join_operator_skips_null_keys() {
 
     let mut cache = HashMap::new();
     cache.insert("null_output".to_string(), out_dict.clone());
-    let out_materialized =
-        materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
-            .await
-            .expect("materialize join output");
+    let out_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
+        .await
+        .expect("materialize join output");
     assert_eq!(out_materialized, HashMap::from([(2, 1)]));
 }
 
@@ -699,10 +698,9 @@ async fn join_operator_matches_full_recompute() {
         if let Some(handle) = output_handle {
             let mut cache = HashMap::new();
             cache.insert("recompute_output".to_string(), out_dict.clone());
-            let actual_delta =
-                materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle)
-                    .await
-                    .expect("materialize join output");
+            let actual_delta = materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle)
+                .await
+                .expect("materialize join output");
             assert_eq!(actual_delta, expected_delta);
         } else {
             assert!(expected_delta.is_empty());

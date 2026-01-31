@@ -10,8 +10,8 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::{IndexedZSet, RangeKey};
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::collections::{IndexedZSet, RangeKey};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
@@ -166,12 +166,7 @@ where
         }
     }
 
-    fn join_entries(
-        &self,
-        left: &[(L, i64)],
-        right: &[(R, i64)],
-        acc: &mut HashMap<O, i64>,
-    ) {
+    fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut HashMap<O, i64>) {
         for (lk, lw) in left {
             if *lw == 0 {
                 continue;
@@ -296,7 +291,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -750,17 +747,16 @@ mod tests {
         let mut cache_out = HashMap::new();
         cache_out.insert("range_output".to_string(), output_dict.clone());
 
-        for (step, (left_delta, right_delta)) in left_deltas
-            .iter()
-            .zip(right_deltas.iter())
-            .enumerate()
+        for (step, (left_delta, right_delta)) in
+            left_deltas.iter().zip(right_deltas.iter()).enumerate()
         {
             apply_deltas(&mut left_state_map, left_delta);
             apply_deltas(&mut right_state_map, right_delta);
 
             let output_now = recompute_range_join(&left_state_map, &right_state_map);
-            let expected_delta: HashMap<Out, i64> =
-                compute_delta(&prev_output, &output_now).into_iter().collect();
+            let expected_delta: HashMap<Out, i64> = compute_delta(&prev_output, &output_now)
+                .into_iter()
+                .collect();
 
             let left_handle = if left_delta.is_empty() {
                 ZSetHandle {
@@ -797,19 +793,13 @@ mod tests {
                 .expect("range join step");
 
             if expected_delta.is_empty() {
-                assert!(
-                    out_handle.is_none(),
-                    "expected empty output at step {step}"
-                );
+                assert!(out_handle.is_none(), "expected empty output at step {step}");
             } else {
                 let out_handle = out_handle.expect("output handle");
-                let materialized = materialize_zset_handle::<Out>(
-                    table.clone(),
-                    &mut cache_out,
-                    &out_handle,
-                )
-                .await
-                .expect("materialize output");
+                let materialized =
+                    materialize_zset_handle::<Out>(table.clone(), &mut cache_out, &out_handle)
+                        .await
+                        .expect("materialize output");
                 assert_eq!(materialized, expected_delta, "step {step}");
             }
 

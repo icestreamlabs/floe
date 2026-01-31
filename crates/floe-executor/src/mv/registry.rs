@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::stream_types::{Diff, Row, Timestamp};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -63,6 +64,7 @@ pub struct MaterializedViewHandle {
     watermark: RwLock<Option<Timestamp>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
+    version_times: RwLock<HashMap<i64, i64>>,
     latest_version: RwLock<Option<i64>>,
     version_watch: watch::Sender<Option<i64>>,
 }
@@ -76,6 +78,7 @@ impl MaterializedViewHandle {
             watermark: RwLock::new(None),
             dbsp_state: RwLock::new(None),
             versions: RwLock::new(HashMap::new()),
+            version_times: RwLock::new(HashMap::new()),
             latest_version: RwLock::new(None),
             version_watch: tx,
         }
@@ -129,12 +132,20 @@ impl MaterializedViewHandle {
 
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
         let namespace = handle.ns.clone();
+        let version_time = current_time_micros();
         {
             let mut guard = self
                 .versions
                 .write()
                 .expect("materialized view versions lock poisoned");
             guard.insert(version, handle);
+        }
+        {
+            let mut guard = self
+                .version_times
+                .write()
+                .expect("materialized view versions lock poisoned");
+            guard.insert(version, version_time);
         }
         {
             let mut guard = self
@@ -159,6 +170,14 @@ impl MaterializedViewHandle {
             .expect("materialized view version lock poisoned")
     }
 
+    pub fn version_time(&self, version: i64) -> Option<i64> {
+        self.version_times
+            .read()
+            .expect("materialized view version lock poisoned")
+            .get(&version)
+            .copied()
+    }
+
     pub fn version_watch(&self) -> watch::Receiver<Option<i64>> {
         self.version_watch.subscribe()
     }
@@ -169,6 +188,13 @@ impl MaterializedViewHandle {
             .expect("materialized view versions lock poisoned")
             .get(&version)
             .cloned()
+    }
+}
+
+fn current_time_micros() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().try_into().unwrap_or(0),
+        Err(_) => 0,
     }
 }
 

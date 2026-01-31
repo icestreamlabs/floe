@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use datafusion::arrow::array::{ArrayRef, Int64Array};
+use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -10,36 +10,6 @@ use datafusion::scalar::ScalarValue;
 use crate::stream_types::{Diff, Row};
 
 use super::MV_VERSION_COLUMN;
-
-pub(super) fn build_i64_batches(
-    rows: Vec<Vec<i64>>,
-    schema: SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    if rows.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(schema)]);
-    }
-
-    let column_count = schema.fields().len();
-    let mut columns: Vec<Vec<i64>> = vec![Vec::with_capacity(rows.len()); column_count];
-
-    for row in rows {
-        for (idx, value) in row.into_iter().enumerate() {
-            if let Some(column) = columns.get_mut(idx) {
-                column.push(value);
-            } else {
-                return Err(anyhow!("row contains unexpected column index {idx}"));
-            }
-        }
-    }
-
-    let arrays: Vec<ArrayRef> = columns
-        .into_iter()
-        .map(|col| Arc::new(Int64Array::from(col)) as ArrayRef)
-        .collect();
-
-    let batch = RecordBatch::try_new(schema, arrays).map_err(anyhow::Error::from)?;
-    Ok(vec![batch])
-}
 
 pub(super) fn to_datafusion_error(err: anyhow::Error) -> DataFusionError {
     DataFusionError::Execution(err.to_string())

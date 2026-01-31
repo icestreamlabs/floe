@@ -10,16 +10,16 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::ZSetHandle;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
-use crate::stream::{Stream, StreamRetention, ZSetStream};
 use crate::stream::groups::HandleGroup;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
     LIFTED_JOIN_STREAM_PREFIX, LIFTED_JOIN_ZSET_PREFIX, build_derived_stream, collect_values,
     compute_delta, next_lifted_zset_namespace,
 };
+use crate::stream::{Stream, StreamRetention, ZSetStream};
 
 use super::helpers::{materialize_zset_with_retry, publish_handle};
 
@@ -241,18 +241,10 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + 'static,
     F: Fn(&L, &R) -> O + Send + Sync + 'static,
 {
-    let left_map = materialize_zset_with_retry::<L>(
-        ctx.table.clone(),
-        ctx.left_cache,
-        left_handle,
-    )
-    .await?;
-    let right_map = materialize_zset_with_retry::<R>(
-        ctx.table.clone(),
-        ctx.right_cache,
-        right_handle,
-    )
-    .await?;
+    let left_map =
+        materialize_zset_with_retry::<L>(ctx.table.clone(), ctx.left_cache, left_handle).await?;
+    let right_map =
+        materialize_zset_with_retry::<R>(ctx.table.clone(), ctx.right_cache, right_handle).await?;
 
     let mut joined: HashMap<O, i64> = HashMap::new();
     for (left_key, &left_weight) in &left_map {

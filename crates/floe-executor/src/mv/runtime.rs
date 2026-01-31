@@ -8,6 +8,7 @@ pub trait MaterializedView: Send + Sync {
     fn latest_version(&self) -> Option<i64>;
     fn subscribe_versions(&self) -> watch::Receiver<Option<i64>>;
     fn handle_for(&self, version: i64) -> Result<ZSetHandleView<Vec<u8>>>;
+    fn version_time(&self, version: i64) -> Option<i64>;
 }
 
 impl MaterializedView for MaterializedViewHandle {
@@ -38,6 +39,10 @@ impl MaterializedView for MaterializedViewHandle {
             handle.ns,
             handle.version,
         ))
+    }
+
+    fn version_time(&self, version: i64) -> Option<i64> {
+        MaterializedViewHandle::version_time(self, version)
     }
 }
 

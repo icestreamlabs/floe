@@ -10,15 +10,15 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
 use crate::handles::ZSetHandle;
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
-use crate::stream::{Stream, StreamCursor, StreamRetention, ZSetStream};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    LIFTED_PROJECT_STREAM_PREFIX, LIFTED_PROJECT_ZSET_PREFIX, build_derived_stream,
-    collect_values, compute_delta, next_lifted_zset_namespace,
+    LIFTED_PROJECT_STREAM_PREFIX, LIFTED_PROJECT_ZSET_PREFIX, build_derived_stream, collect_values,
+    compute_delta, next_lifted_zset_namespace,
 };
+use crate::stream::{Stream, StreamCursor, StreamRetention, ZSetStream};
 
 use super::helpers::{materialize_zset_with_retry, publish_handle};
 

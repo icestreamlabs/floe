@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::collections::CompactionPolicy;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
-use crate::stream::{StreamRetention, ZSetStream};
 use crate::stream::tests::common::build_db;
+use crate::stream::{StreamRetention, ZSetStream};
 use slatedb::config::ScanOptions;
 
 #[tokio::test]
@@ -37,11 +37,7 @@ async fn zset_stream_compacts_and_releases_versions() {
     zset.add_delta(b"c".to_vec(), 1);
     zset.flush().await.expect("flush t3");
 
-    let stats = zset
-        .versioned()
-        .chain_stats()
-        .await
-        .expect("chain stats");
+    let stats = zset.versioned().chain_stats().await.expect("chain stats");
     assert_eq!(stats.version_count, 1);
 
     let manifests = table

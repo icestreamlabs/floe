@@ -6,11 +6,12 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::handles::ZSetHandle;
-use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::stream::runtime::RuntimeErrorHandler;
+use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::{
     DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspFilter, DbspJoin, DbspJoinNode,
-    DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSourceNode,
+    DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSourceNode, DbspTopN,
+    DbspTopNNode,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -20,10 +21,138 @@ use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
-use super::eval::{
-    eval_expression, eval_predicate, eval_projection, eval_scalar_expression,
-    resolve_join_key_indices,
-};
+use super::eval::{eval_expression, eval_predicate, eval_projection, eval_scalar_expression};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TopNSortSpec {
+    ascending: bool,
+    nulls_first: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TopNValue {
+    Null,
+    Int64(i64),
+    Timestamp(i64),
+    Utf8(String),
+    Bool(bool),
+}
+
+impl TopNValue {
+    fn from_scalar(value: &ScalarValue) -> Result<Self> {
+        match value {
+            ScalarValue::Int64(Some(v)) => Ok(Self::Int64(*v)),
+            ScalarValue::Int64(None) => Ok(Self::Null),
+            ScalarValue::TimestampMillisecond(Some(v), _) => Ok(Self::Timestamp(*v)),
+            ScalarValue::TimestampMillisecond(None, _) => Ok(Self::Null),
+            ScalarValue::Utf8(Some(v)) => Ok(Self::Utf8(v.clone())),
+            ScalarValue::Utf8(None) => Ok(Self::Null),
+            ScalarValue::Boolean(Some(v)) => Ok(Self::Bool(*v)),
+            ScalarValue::Boolean(None) | ScalarValue::Null => Ok(Self::Null),
+            other => Err(anyhow!("unsupported sort value {other:?}")),
+        }
+    }
+}
+
+impl Ord for TopNValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use TopNValue::*;
+        let rank = |value: &TopNValue| -> u8 {
+            match value {
+                Null => 0,
+                Int64(_) => 1,
+                Timestamp(_) => 2,
+                Utf8(_) => 3,
+                Bool(_) => 4,
+            }
+        };
+
+        let left_rank = rank(self);
+        let right_rank = rank(other);
+        if left_rank != right_rank {
+            return left_rank.cmp(&right_rank);
+        }
+
+        match (self, other) {
+            (Null, Null) => std::cmp::Ordering::Equal,
+            (Int64(a), Int64(b)) => a.cmp(b),
+            (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            (Utf8(a), Utf8(b)) => a.cmp(b),
+            (Bool(a), Bool(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for TopNValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TopNKey {
+    specs: Arc<Vec<TopNSortSpec>>,
+    values: Vec<TopNValue>,
+    tie_breaker: Vec<u8>,
+}
+
+impl TopNKey {
+    fn new(specs: Arc<Vec<TopNSortSpec>>, values: Vec<TopNValue>, tie_breaker: Vec<u8>) -> Self {
+        Self {
+            specs,
+            values,
+            tie_breaker,
+        }
+    }
+}
+
+impl Ord for TopNKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (idx, spec) in self.specs.iter().enumerate() {
+            let left = self.values.get(idx);
+            let right = other.values.get(idx);
+            let (left, right) = match (left, right) {
+                (Some(left), Some(right)) => (left, right),
+                _ => continue,
+            };
+
+            let cmp = match (left, right) {
+                (TopNValue::Null, TopNValue::Null) => std::cmp::Ordering::Equal,
+                (TopNValue::Null, _) => {
+                    if spec.nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (_, TopNValue::Null) => {
+                    if spec.nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                _ => {
+                    let cmp = left.cmp(right);
+                    if spec.ascending { cmp } else { cmp.reverse() }
+                }
+            };
+
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+
+        self.tie_breaker.cmp(&other.tie_breaker)
+    }
+}
+
+impl PartialOrd for TopNKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl DbspGraphBuilder {
     pub(super) async fn compile_source(
@@ -290,12 +419,11 @@ impl DbspGraphBuilder {
             }
         });
 
-        let key_indices =
-            resolve_join_key_indices(&node.keys, left_schema.as_ref(), right_schema.as_ref())
-                .context("resolve join key indices")?;
-        let key_indices = Arc::new(key_indices);
-        let left_key_indices = Arc::clone(&key_indices);
-        let right_key_indices = Arc::clone(&key_indices);
+        let join_keys = Arc::new(node.keys.clone());
+        let left_key_exprs = Arc::clone(&join_keys);
+        let right_key_exprs = Arc::clone(&join_keys);
+        let left_key_schema = Arc::clone(&left_schema);
+        let right_key_schema = Arc::clone(&right_schema);
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
@@ -313,15 +441,19 @@ impl DbspGraphBuilder {
                     return None;
                 }
             };
-            let mut key_columns = Vec::with_capacity(left_key_indices.len());
-            for (li, _) in left_key_indices.iter() {
-                let value = match left_row.get(*li) {
-                    Some(value) => value.clone(),
-                    None => {
+            let mut key_columns = Vec::with_capacity(left_key_exprs.len());
+            for key in left_key_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.left_expression(),
+                    &left_row,
+                    left_key_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
                         tracing::warn!(
                             graph_id = %left_graph_id,
-                            index = *li,
-                            "join left key index out of bounds"
+                            error = %err,
+                            "failed to evaluate join left key expression"
                         );
                         return None;
                     }
@@ -356,15 +488,19 @@ impl DbspGraphBuilder {
                     return None;
                 }
             };
-            let mut key_columns = Vec::with_capacity(right_key_indices.len());
-            for (_, ri) in right_key_indices.iter() {
-                let value = match right_row.get(*ri) {
-                    Some(value) => value.clone(),
-                    None => {
+            let mut key_columns = Vec::with_capacity(right_key_exprs.len());
+            for key in right_key_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.right_expression(),
+                    &right_row,
+                    right_key_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
                         tracing::warn!(
                             graph_id = %right_graph_id,
-                            index = *ri,
-                            "join right key index out of bounds"
+                            error = %err,
+                            "failed to evaluate join right key expression"
                         );
                         return None;
                     }
@@ -830,6 +966,93 @@ impl DbspGraphBuilder {
         .context("initialize aggregate output map")?;
 
         Ok(mapped.stream())
+    }
+
+    pub(super) async fn compile_topn(
+        &mut self,
+        node: &DbspTopNNode,
+        upstream: DeltaHandleStream,
+        task_events: &GraphTaskSender,
+    ) -> Result<DeltaHandleStream> {
+        let order_exprs: Arc<Vec<_>> = Arc::new(node.order_by().to_vec());
+        let schema = Arc::clone(node.output_schema());
+        let limit = node.limit();
+        let offset = node.offset();
+        let graph_id = self.graph_id().to_string();
+        let task_events = task_events.clone();
+        let task_label = format!("topn:{graph_id}");
+        let error_graph_id = graph_id.clone();
+        let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
+        });
+
+        let order_specs = Arc::new(
+            order_exprs
+                .iter()
+                .map(|expr| TopNSortSpec {
+                    ascending: expr.ascending(),
+                    nulls_first: expr.nulls_first(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let log_graph_id = graph_id.clone();
+        let order_key = move |bytes: &Vec<u8>| -> Option<TopNKey> {
+            let row = match decode_projected_row_key(bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to decode topn row"
+                    );
+                    return None;
+                }
+            };
+
+            let mut values = Vec::with_capacity(order_exprs.len());
+            for expr in order_exprs.iter() {
+                let value = match eval_scalar_expression(expr.expression(), &row, schema.as_ref()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %log_graph_id,
+                            error = %err,
+                            "failed to evaluate topn order expression"
+                        );
+                        return None;
+                    }
+                };
+                match TopNValue::from_scalar(&value) {
+                    Ok(value) => values.push(value),
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %log_graph_id,
+                            error = %err,
+                            "failed to map topn order value"
+                        );
+                        return None;
+                    }
+                }
+            }
+
+            Some(TopNKey::new(
+                Arc::clone(&order_specs),
+                values,
+                bytes.clone(),
+            ))
+        };
+
+        let topn = DbspTopN::new::<Vec<u8>, TopNKey, _>(
+            &upstream,
+            order_key,
+            limit,
+            offset,
+            Some(error_handler),
+        )
+        .await
+        .context("initialize DBSP topn")?;
+        Ok(topn.stream())
     }
 }
 

@@ -51,10 +51,13 @@ async fn run_materialize_diff(mut state: BenchState) {
     for key in &state.keys {
         state.zset.add_delta(key.clone(), 1);
         let snapshot = state.zset.flush().await.expect("flush snapshot");
-        let current =
-            materialize_zset_handle::<Vec<u8>>(state.table.clone(), &mut state.dict_cache, &snapshot)
-                .await
-                .expect("materialize snapshot");
+        let current = materialize_zset_handle::<Vec<u8>>(
+            state.table.clone(),
+            &mut state.dict_cache,
+            &snapshot,
+        )
+        .await
+        .expect("materialize snapshot");
         let _ = compute_delta(&prev, &current);
         prev = current;
     }
@@ -63,12 +66,14 @@ async fn run_materialize_diff(mut state: BenchState) {
 async fn run_overlay_delta(mut state: BenchState) {
     for key in &state.keys {
         state.zset.add_delta(key.clone(), 1);
-        let (_snapshot, delta_handle) =
-            state.zset.flush_with_delta().await.expect("flush delta");
-        let _ =
-            materialize_zset_handle::<Vec<u8>>(state.table.clone(), &mut state.dict_cache, &delta_handle)
-                .await
-                .expect("materialize delta");
+        let (_snapshot, delta_handle) = state.zset.flush_with_delta().await.expect("flush delta");
+        let _ = materialize_zset_handle::<Vec<u8>>(
+            state.table.clone(),
+            &mut state.dict_cache,
+            &delta_handle,
+        )
+        .await
+        .expect("materialize delta");
     }
 }
 

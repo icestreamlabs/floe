@@ -1,23 +1,31 @@
 mod cli;
+mod http_ingest;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
-use floe_node_core::tail_client;
-use floe_node_core::generator;
-use floe_server as server;
 use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
     SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
 };
+use floe_node_core::connector::{ConnectorContext, run_connector};
+use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
+use floe_node_core::generator;
+use floe_node_core::kafka_connector::{KafkaConnector, KafkaConnectorConfig};
+use floe_node_core::planner::{
+    PlannedMaterializedView, camel_case_schema, plan_materialized_views,
+};
+use floe_node_core::tail_client;
+use floe_server as server;
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
-use floe_node_core::planner::{PlannedMaterializedView, camel_case_schema, plan_materialized_views};
+use floe_storage::MaterializedViewMetadata;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -26,12 +34,15 @@ use tokio_util::sync::CancellationToken;
 
 static INGEST_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const INGEST_LOG_SAMPLE_EVERY: u64 = 512;
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
+const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
 
 use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
-use floe_node_core::source::SourceRegistry;
 use floe_node_core::source as core_source;
+use floe_node_core::source::SourceRegistry;
+use http_ingest::HttpIngestConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,16 +57,62 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    if run_args.kafka_brokers.is_some() && run_args.kafka_topics.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--kafka-topics is required when --kafka-brokers is set"
+        ));
+    }
+    if run_args.kafka_brokers.is_some() && run_args.input_file.is_some() {
+        return Err(anyhow::anyhow!(
+            "--kafka-brokers cannot be combined with --input-file"
+        ));
+    }
+
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(floe_node_core::generator::definitions()?);
     let available_sources = available_sources_from_registry(&source_registry);
 
     let storage = server::init_storage().await?;
     let db = storage.db();
-    let mut materialized_views: Vec<MaterializedViewDefinition> = Vec::new();
-    if let Some(sql) = run_args.mv_query.as_deref() {
-        materialized_views.push(parse_materialized_view(sql)?);
+    let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
+    let stored_views = storage
+        .materialized_views()
+        .await
+        .context("load persisted materialized views")?;
+    for metadata in stored_views {
+        let definition = MaterializedViewDefinition::new(
+            metadata.name(),
+            metadata.query(),
+            metadata.if_not_exists(),
+        );
+        materialized_view_map.insert(definition.name().to_string(), definition);
     }
+    if let Some(sql) = run_args.mv_query.as_deref() {
+        let definition = parse_materialized_view(sql)?;
+        let name = definition.name().to_string();
+        if definition.if_not_exists() && materialized_view_map.contains_key(&name) {
+            tracing::info!(
+                view = %name,
+                "materialized view already exists; skipping due to IF NOT EXISTS"
+            );
+        } else {
+            let metadata = MaterializedViewMetadata::new(
+                definition.name(),
+                definition.query(),
+                definition.if_not_exists(),
+            );
+            storage
+                .upsert_materialized_view(metadata)
+                .await
+                .with_context(|| {
+                    format!("persist materialized view definition for '{}'", definition.name())
+                })?;
+            materialized_view_map.insert(name, definition);
+        }
+    }
+    let mut materialized_views: Vec<MaterializedViewDefinition> =
+        materialized_view_map.into_values().collect();
+    materialized_views.sort_by(|a, b| a.name().cmp(b.name()));
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
@@ -158,40 +215,151 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     let decoder_registry = Arc::new(decoder_registry);
 
-    let (event_tx, event_rx) = core_source::channel(1024);
+    let queue_capacity = run_args.ingest_queue_capacity;
+    let max_batch = run_args.ingest_batch_size;
+    let max_batch_per_source = run_args.ingest_batch_per_source;
+    let (event_tx, event_rx) = core_source::channel(queue_capacity);
 
     let generator_config = floe_node_core::generator::Config {
         events_per_second: run_args.events_per_second,
         max_events: run_args.max_events,
     };
 
+    let connector_cancel = CancellationToken::new();
+
+    let http_ingest_handle: Option<JoinHandle<()>> = if let Some(port) = run_args.http_port {
+        let sender = event_tx.clone();
+        let cancel = connector_cancel.clone();
+        let config = HttpIngestConfig {
+            host: run_args.http_host.clone(),
+            port,
+            default_source: run_args.http_source.clone(),
+        };
+        Some(tokio::spawn(async move {
+            if let Err(err) = http_ingest::run_http_ingest(config, sender, cancel).await {
+                tracing::error!(error = %err, "HTTP ingest server failed");
+            }
+        }))
+    } else {
+        None
+    };
+
     let generator_handle: JoinHandle<()> = {
         let sender = event_tx.clone();
+        let cancel = connector_cancel.clone();
+        let input_file = run_args.input_file.clone();
+        let input_source = run_args.input_source.clone();
+        let kafka_brokers = run_args.kafka_brokers.clone();
+        let kafka_topics = run_args.kafka_topics.clone();
+        let kafka_group_id = run_args.kafka_group_id.clone();
+        let kafka_default_source = run_args.kafka_default_source.clone();
+        let kafka_poll_ms = run_args.kafka_poll_ms;
+        let kafka_max_messages = run_args.kafka_max_messages;
+        let definitions = source_registry.definitions().to_vec();
         tokio::spawn(async move {
-            if let Err(err) = floe_node_core::generator::run(generator_config, sender).await {
-                tracing::error!(error = %err, "Nexmark generator failed");
+            if let Some(brokers) = kafka_brokers {
+                let definitions = definitions.clone();
+                let config = KafkaConnectorConfig {
+                    brokers,
+                    topics: kafka_topics,
+                    group_id: kafka_group_id,
+                    default_source: kafka_default_source,
+                    poll_timeout: Duration::from_millis(kafka_poll_ms),
+                    max_messages_per_tick: kafka_max_messages,
+                };
+                let mut connector = match KafkaConnector::new(config, definitions) {
+                    Ok(connector) => connector,
+                    Err(err) => {
+                        tracing::error!(error = %err, "Kafka connector config invalid");
+                        return;
+                    }
+                };
+                let ctx = ConnectorContext::new(sender);
+                if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                    tracing::error!(error = %err, "Kafka connector failed");
+                }
+                return;
+            }
+
+            if let Some(path) = input_file {
+                let definitions = definitions.clone();
+                let config = FileConnectorConfig {
+                    path: path.into(),
+                    default_source: input_source,
+                };
+                let mut connector = FileConnector::new(config, definitions);
+                let ctx = ConnectorContext::new(sender);
+                if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                    tracing::error!(error = %err, "File connector failed");
+                }
+                return;
+            }
+
+            let mut connector =
+                match floe_node_core::generator::NexmarkConnector::new(generator_config) {
+                    Ok(connector) => connector,
+                    Err(err) => {
+                        tracing::error!(error = %err, "Nexmark connector config invalid");
+                        return;
+                    }
+                };
+            let ctx = ConnectorContext::new(sender);
+            if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                tracing::error!(error = %err, "Nexmark connector failed");
             }
         })
     };
 
+    let sender_for_metrics = event_tx.clone();
     let outer_for_task = Arc::clone(&outer_registry);
     let decoder_for_task = Arc::clone(&decoder_registry);
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut rx = event_rx;
+        let mut pending: VecDeque<core_source::SourceEvent> = VecDeque::new();
         let mut epoch: u64 = 0;
-        const MAX_BATCH: usize = 256;
-        while let Some(first_event) = rx.recv().await {
-            let mut batch = Vec::with_capacity(MAX_BATCH);
-            batch.push(first_event);
-            while batch.len() < MAX_BATCH {
+        loop {
+            if pending.is_empty() {
+                match rx.recv().await {
+                    Some(event) => pending.push_back(event),
+                    None => break,
+                }
+            }
+
+            while pending.len() < queue_capacity {
                 match rx.try_recv() {
-                    Ok(event) => batch.push(event),
+                    Ok(event) => pending.push_back(event),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
                 }
             }
 
-            let mut decoded_rows = Vec::with_capacity(batch.len());
+            let mut batch = Vec::with_capacity(max_batch);
+            let mut per_source_counts: HashMap<String, usize> = HashMap::new();
+            let mut remaining: VecDeque<core_source::SourceEvent> = VecDeque::new();
+            while let Some(event) = pending.pop_front() {
+                if batch.len() >= max_batch {
+                    remaining.push_back(event);
+                    continue;
+                }
+                let source = event.source();
+                let count = per_source_counts.entry(source.to_string()).or_insert(0);
+                if *count >= max_batch_per_source {
+                    remaining.push_back(event);
+                    continue;
+                }
+                *count += 1;
+                batch.push(event);
+            }
+            pending = remaining;
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            let batch_len = batch.len();
+            let decode_start = Instant::now();
+            let mut decoded_rows = Vec::with_capacity(batch_len);
+            let mut decoded_counts: HashMap<String, usize> = HashMap::new();
             for event in batch {
                 let source_name = event.source().to_string();
                 let decoder = match decoder_for_task.get(&source_name) {
@@ -209,13 +377,16 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                *decoded_counts.entry(source_name.clone()).or_insert(0) += 1;
                 decoded_rows.push((source_name, row));
             }
+            let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
 
             if decoded_rows.is_empty() {
                 continue;
             }
 
+            let decoded_rows_len = decoded_rows.len();
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
             for (source_name, row) in decoded_rows {
@@ -249,11 +420,30 @@ async fn main() -> anyhow::Result<()> {
             }
 
             epoch = epoch.saturating_add(1);
+            let tick_start = Instant::now();
             // Advance frontier for all sources this epoch, even if they had no rows.
             if let Err(err) = registry.tick_all().await {
                 tracing::error!(epoch, error = %err, "failed to tick outer streams");
             } else if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
                 tracing::debug!(epoch, "advanced all source frontiers");
+            }
+            let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
+
+            if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
+                let queue_depth = queue_capacity
+                    .saturating_sub(sender_for_metrics.capacity())
+                    .saturating_add(pending.len());
+                tracing::info!(
+                    epoch,
+                    queue_depth,
+                    batch_size = batch_len,
+                    pending = pending.len(),
+                    decoded_rows = decoded_rows_len,
+                    decode_latency_ms,
+                    tick_latency_ms,
+                    per_source = ?decoded_counts,
+                    "ingest batch metrics"
+                );
             }
         }
     });
@@ -268,12 +458,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("register source tables")?;
     register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
+        .await
         .context("register materialized view tables")?;
 
     let server_result = server::run(query, Arc::clone(&mv_registry)).await;
 
+    connector_cancel.cancel();
     drop(event_tx);
-    generator_handle.abort();
     executor_handle.abort();
     task_monitor.abort();
 
@@ -295,6 +486,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %err, "graph monitor task joined with error");
     }
 
+    if let Some(handle) = http_ingest_handle {
+        handle.abort();
+        if let Err(err) = handle.await
+            && !err.is_cancelled()
+        {
+            tracing::error!(error = %err, "http ingest task joined with error");
+        }
+    }
+
     server_result
 }
 
@@ -313,7 +513,7 @@ fn should_sample(counter: &AtomicU64, every: u64) -> bool {
         .is_multiple_of(every)
 }
 
-fn register_materialized_view_tables(
+async fn register_materialized_view_tables(
     context: &FloeQueryContext,
     planned: &[PlannedMaterializedView],
     registry: &Arc<MaterializedViewRegistry>,
@@ -323,9 +523,19 @@ fn register_materialized_view_tables(
     }
 
     let session = context.session();
+    let storage = context.storage();
     for mv in planned {
         let arrow_schema = df_schema_to_arrow(mv.logical_plan().schema())?;
         registry.set_schema(mv.definition().name(), arrow_schema.clone());
+        storage
+            .save_materialized_view_schema(mv.definition().name(), arrow_schema.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "persist schema metadata for materialized view '{}'",
+                    mv.definition().name()
+                )
+            })?;
         let provider = MaterializedViewTableProvider::new(
             Arc::clone(registry),
             mv.definition().name().to_string(),

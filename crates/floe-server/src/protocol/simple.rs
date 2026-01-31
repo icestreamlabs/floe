@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use datafusion::dataframe::DataFrame;
 use floe_executor::tail::{execute_tail, parse_tail_sql, tail_output_schema};
 use futures::Sink;
+use pgwire::api::ClientInfo;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{QueryResponse, Response, Tag};
-use pgwire::api::ClientInfo;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{Query, Statement};
@@ -16,9 +16,9 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{build_query_response_stream, FloeServerState};
+use crate::execution::{FloeServerState, build_query_response_stream};
 use crate::sql::extract_tables_from_query;
-use crate::tail::{detect_single_tail_statement, TailResponseStream};
+use crate::tail::{TailResponseStream, detect_single_tail_statement};
 use crate::types::arrow_schema_to_field_info;
 use crate::user_error;
 

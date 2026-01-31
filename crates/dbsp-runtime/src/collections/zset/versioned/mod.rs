@@ -11,9 +11,9 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
+use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::storage::KeyValueTable;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionPolicy {

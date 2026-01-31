@@ -1,8 +1,8 @@
+pub mod aggregate;
+pub mod asof_join;
 pub mod consolidate;
 pub mod distinct;
 pub mod filter;
-pub mod aggregate;
-pub mod asof_join;
 pub mod group_by;
 pub mod index;
 pub mod join;
@@ -10,5 +10,7 @@ pub mod join_range;
 pub mod map;
 pub mod rolling_aggregate;
 pub mod semijoin;
+pub mod topk;
+pub mod topn;
 pub mod waterline;
 pub mod window;

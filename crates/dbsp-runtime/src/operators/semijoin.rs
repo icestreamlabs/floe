@@ -227,7 +227,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -411,10 +413,13 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
-        let new_left_handle =
-            Self::apply_deltas_to_versioned(&mut self.left_state.integrated, &left_delta, left_base)
-                .await
-                .context("update left integrated state")?;
+        let new_left_handle = Self::apply_deltas_to_versioned(
+            &mut self.left_state.integrated,
+            &left_delta,
+            left_base,
+        )
+        .await
+        .context("update left integrated state")?;
         self.left_state.update_handle(new_left_handle);
 
         let right_base = self
@@ -610,14 +615,12 @@ mod tests {
                 .expect("output dict"),
         );
 
-        let left_state =
-            RelationState::empty(table.clone(), "semijoin_left_state".to_string())
-                .await
-                .expect("left state");
-        let right_state =
-            RelationState::empty(table.clone(), "semijoin_right_state".to_string())
-                .await
-                .expect("right state");
+        let left_state = RelationState::empty(table.clone(), "semijoin_left_state".to_string())
+            .await
+            .expect("left state");
+        let right_state = RelationState::empty(table.clone(), "semijoin_right_state".to_string())
+            .await
+            .expect("right state");
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), "semijoin_output")
             .await
             .expect("output zset");
@@ -662,17 +665,16 @@ mod tests {
         let mut cache_out = HashMap::new();
         cache_out.insert("semijoin_output".to_string(), output_dict.clone());
 
-        for (step, (left_delta, right_delta)) in left_deltas
-            .iter()
-            .zip(right_deltas.iter())
-            .enumerate()
+        for (step, (left_delta, right_delta)) in
+            left_deltas.iter().zip(right_deltas.iter()).enumerate()
         {
             apply_deltas(&mut left_state_map, left_delta);
             apply_deltas(&mut right_state_map, right_delta);
 
             let output_now = recompute_semijoin(&left_state_map, &right_state_map, mode);
-            let expected_delta: HashMap<Row, i64> =
-                compute_delta(&prev_output, &output_now).into_iter().collect();
+            let expected_delta: HashMap<Row, i64> = compute_delta(&prev_output, &output_now)
+                .into_iter()
+                .collect();
 
             let left_handle = if left_delta.is_empty() {
                 ZSetHandle {
@@ -709,19 +711,13 @@ mod tests {
                 .expect("semijoin step");
 
             if expected_delta.is_empty() {
-                assert!(
-                    out_handle.is_none(),
-                    "expected empty output at step {step}"
-                );
+                assert!(out_handle.is_none(), "expected empty output at step {step}");
             } else {
                 let out_handle = out_handle.expect("output handle");
-                let materialized = materialize_zset_handle::<Row>(
-                    table.clone(),
-                    &mut cache_out,
-                    &out_handle,
-                )
-                .await
-                .expect("materialize output");
+                let materialized =
+                    materialize_zset_handle::<Row>(table.clone(), &mut cache_out, &out_handle)
+                        .await
+                        .expect("materialize output");
                 assert_eq!(materialized, expected_delta, "step {step}");
             }
 

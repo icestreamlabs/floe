@@ -115,10 +115,7 @@ impl DbspTableEnvironment {
     }
 
     /// Returns the handle stream backing the provided table descriptor.
-    pub fn handle_stream_for(
-        &self,
-        table: &dbsp::TableDescriptor,
-    ) -> Option<SnapshotHandleStream> {
+    pub fn handle_stream_for(&self, table: &dbsp::TableDescriptor) -> Option<SnapshotHandleStream> {
         self.zset_for(table).map(|zset| zset.handle_stream())
     }
 
@@ -126,8 +123,7 @@ impl DbspTableEnvironment {
         &self,
         table: &dbsp::TableDescriptor,
     ) -> Option<DeltaHandleStream> {
-        self.zset_for(table)
-            .map(|zset| zset.delta_handle_stream())
+        self.zset_for(table).map(|zset| zset.delta_handle_stream())
     }
 
     /// Provides mutable access to the ZSet stream for a table descriptor.

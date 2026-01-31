@@ -1,3 +1,3 @@
 pub mod catalog;
 
-pub use catalog::SlateCatalog;
+pub use catalog::{MaterializedViewMetadata, SlateCatalog};

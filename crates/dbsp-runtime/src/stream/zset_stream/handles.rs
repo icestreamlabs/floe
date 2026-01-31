@@ -9,8 +9,8 @@ use rkyv::bytecheck::CheckBytes;
 use crate::handles::{ZSetHandle, ZSetHandleView};
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::ZSetStream;
 use super::super::roles::{DeltaHandleStream, SnapshotHandleStream};
+use super::ZSetStream;
 
 impl<K> ZSetStream<K>
 where
@@ -47,6 +47,11 @@ where
 
     pub fn delta_handle_stream(&self) -> DeltaHandleStream {
         DeltaHandleStream::new(self.delta_stream.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_versioned_intent_key(&self) -> Vec<u8> {
+        self.delta_versioned.intent_key_bytes().to_vec()
     }
 
     /// Publishes an externally produced [`ZSetHandle`] into this stream

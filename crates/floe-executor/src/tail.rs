@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -31,6 +31,8 @@ pub type PgResult<T> = Result<T>;
 pub struct TailBatch {
     pub version: i64,
     pub batch: RecordBatch,
+    pub ops: Vec<i16>,
+    pub times: Vec<Option<i64>>,
 }
 
 #[derive(Debug)]
@@ -220,7 +222,7 @@ async fn run_tail_task<M: MaterializedView + 'static>(
         let latest_now = mv.latest_version().unwrap_or(last_emitted);
         if latest_now > last_emitted {
             for version in last_emitted + 1..=latest_now {
-                emit_version(mv.as_ref(), &schema, version, tx).await?;
+                emit_delta(mv.as_ref(), &schema, version, tx).await?;
                 last_emitted = version;
             }
             continue;
@@ -246,9 +248,11 @@ async fn emit_version<M: MaterializedView>(
     version: i64,
     tx: &mut mpsc::Sender<PgResult<TailBatch>>,
 ) -> PgResult<()> {
-    let batches = materialize_version_batches(mv, Arc::clone(schema), version).await?;
+    let version_time = mv.version_time(version);
+    let batches =
+        materialize_snapshot_batches(mv, Arc::clone(schema), version, version_time).await?;
     for batch in batches {
-        let payload = TailBatch { version, batch };
+        let payload = TailBatch { version, ..batch };
         if tx.send(Ok(payload)).await.is_err() {
             break;
         }
@@ -256,19 +260,48 @@ async fn emit_version<M: MaterializedView>(
     Ok(())
 }
 
-async fn materialize_version_batches<M: MaterializedView>(
+async fn emit_delta<M: MaterializedView>(
+    mv: &M,
+    schema: &SchemaRef,
+    version: i64,
+    tx: &mut mpsc::Sender<PgResult<TailBatch>>,
+) -> PgResult<()> {
+    let version_time = mv.version_time(version);
+    let batches = materialize_delta_batches(mv, Arc::clone(schema), version, version_time).await?;
+    for batch in batches {
+        let payload = TailBatch { version, ..batch };
+        if tx.send(Ok(payload)).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn materialize_snapshot_batches<M: MaterializedView>(
     mv: &M,
     schema: SchemaRef,
     version: i64,
-) -> PgResult<Vec<RecordBatch>> {
+    version_time: Option<i64>,
+) -> PgResult<Vec<TailBatch>> {
     let handle = mv.handle_for(version)?;
     let snapshot = handle.materialize().await?;
     let rows = rows_from_snapshot(snapshot)?;
-    let batches = build_record_batches(rows, schema)?;
-    Ok(batches)
+    build_tail_batches(rows, schema, version_time)
 }
 
-fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<Row>> {
+async fn materialize_delta_batches<M: MaterializedView>(
+    mv: &M,
+    schema: SchemaRef,
+    version: i64,
+    version_time: Option<i64>,
+) -> PgResult<Vec<TailBatch>> {
+    let handle = mv.handle_for(version)?;
+    let deltas = handle.delta_iter().await?;
+    let rows = rows_from_delta(deltas)?;
+    build_tail_batches(rows, schema, version_time)
+}
+
+fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<(Row, i16)>> {
     let mut rows = Vec::new();
     for (key, diff) in snapshot {
         if diff < 0 {
@@ -278,11 +311,56 @@ fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<Row>> {
             continue;
         }
         let decoded = decode_projected_row_key(&key)?;
-        for _ in 0..diff {
-            rows.push(decoded.clone());
+        let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
+        for _ in 0..count {
+            rows.push((decoded.clone(), 1));
         }
     }
     Ok(rows)
+}
+
+fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>) -> PgResult<Vec<(Row, i16)>> {
+    let mut rows = Vec::new();
+    for (key, diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let op = if diff > 0 { 1 } else { -1 };
+        let count = diff.checked_abs().context("delta diff overflow")? as usize;
+        let decoded = decode_projected_row_key(&key)?;
+        for _ in 0..count {
+            rows.push((decoded.clone(), op));
+        }
+    }
+    Ok(rows)
+}
+
+fn build_tail_batches(
+    rows: Vec<(Row, i16)>,
+    schema: SchemaRef,
+    version_time: Option<i64>,
+) -> PgResult<Vec<TailBatch>> {
+    let (rows, ops): (Vec<Row>, Vec<i16>) = rows.into_iter().unzip();
+    let batches = build_record_batches(rows, schema)?;
+    let mut offset = 0usize;
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let row_count = batch.num_rows();
+        let ops_slice = ops
+            .get(offset..offset + row_count)
+            .context("tail ops length mismatch")?
+            .to_vec();
+        let times = vec![version_time; row_count];
+        offset += row_count;
+        result.push(TailBatch {
+            version: 0,
+            batch,
+            ops: ops_slice,
+            times,
+        });
+    }
+    ensure!(offset == ops.len(), "tail ops length mismatch");
+    Ok(result)
 }
 
 fn build_record_batches(rows: Vec<Row>, schema: SchemaRef) -> PgResult<Vec<RecordBatch>> {
@@ -352,6 +430,18 @@ mod tests {
         view.flush().await
     }
 
+    async fn append_deltas(
+        view: &mut crate::dbsp_bridge::DbspView,
+        deltas: &[(i64, i64)],
+    ) -> PgResult<dbsp::handles::ZSetHandle> {
+        for (value, diff) in deltas {
+            let row = scalar_row(*value);
+            let encoded = encode_projected_row_key(&row)?;
+            view.add_delta(encoded, *diff);
+        }
+        view.flush().await
+    }
+
     #[tokio::test]
     async fn snapshot_then_streams_new_versions() -> PgResult<()> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -409,6 +499,141 @@ mod tests {
         let second_snapshot: Vec<i64> = (0..values.len()).map(|idx| values.value(idx)).collect();
         assert!(second_snapshot.contains(&3));
 
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tail_emits_delta_ops() -> PgResult<()> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("tail-delta-ops", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_delta_ops").await?;
+
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_delta_ops", build_schema());
+        let handle = registry.register("mv_tail_delta_ops");
+
+        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1)]).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, ns, version);
+        handle.set_dbsp_state(state);
+        let handle1_version = handle1.version as i64;
+        handle.publish_version(handle1_version, handle1);
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_delta_ops".to_string(),
+            with_snapshot: false,
+            as_of: Some(handle1_version),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (2, 1)]).await?;
+        let handle2_version = handle2.version as i64;
+        handle.publish_version(handle2_version, handle2);
+
+        let batch = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for delta batch")
+            .expect("expected delta batch")?;
+        assert_eq!(batch.version, handle2_version);
+        let values = batch
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column");
+        assert_eq!(batch.ops.len(), values.len());
+        assert_eq!(batch.times.len(), values.len());
+        assert!(batch.times.iter().all(|time| time.is_some()));
+        let mut rows = Vec::new();
+        for idx in 0..values.len() {
+            rows.push((values.value(idx), batch.ops[idx]));
+        }
+        assert!(rows.contains(&(1, -1)));
+        assert!(rows.contains(&(2, 1)));
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tail_deltas_match_materialized_state() -> PgResult<()> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("tail-delta-validate", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_delta_validate").await?;
+
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_delta_validate", build_schema());
+        let handle = registry.register("mv_tail_delta_validate");
+
+        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1), (2, 1)]).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, ns, version);
+        handle.set_dbsp_state(state);
+        let handle1_version = handle1.version as i64;
+        handle.publish_version(handle1_version, handle1);
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_delta_validate".to_string(),
+            with_snapshot: true,
+            as_of: Some(handle1_version),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (3, 1)]).await?;
+        let handle2_version = handle2.version as i64;
+        handle.publish_version(handle2_version, handle2);
+
+        let handle3 = append_deltas(&mut dbsp_view, &[(2, -1), (4, 1)]).await?;
+        let handle3_version = handle3.version as i64;
+        handle.publish_version(handle3_version, handle3);
+
+        let mut state: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let batch = timeout(Duration::from_millis(200), stream.next())
+                .await
+                .expect("timeout waiting for tail batch")
+                .expect("expected tail batch")?;
+            let values = batch
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..values.len() {
+                let value = values.value(idx);
+                let op = batch.ops[idx] as i64;
+                let entry = state.entry(value).or_insert(0);
+                *entry += op;
+                if *entry == 0 {
+                    state.remove(&value);
+                }
+            }
+        }
+
+        let view = MaterializedView::handle_for(handle.as_ref(), handle3_version)?;
+        let snapshot = view.materialize().await?;
+        let mut expected: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for (key, diff) in snapshot {
+            if diff == 0 {
+                continue;
+            }
+            let row = decode_projected_row_key(&key)?;
+            let value = match row.get(0) {
+                Some(ScalarValue::Int64(Some(v))) => *v,
+                _ => continue,
+            };
+            expected.insert(value, diff);
+        }
+
+        assert_eq!(state, expected);
         cancel.cancel();
         Ok(())
     }

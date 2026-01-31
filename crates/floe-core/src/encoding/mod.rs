@@ -29,3 +29,22 @@ pub fn decode(row: &ArchivedRow) -> Result<RowValues> {
         .map_err(|err| anyhow!("failed to decode row using rkyv: {err}"))?;
     Ok(values)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RowValue;
+
+    #[test]
+    fn roundtrips_row_values() {
+        let row = vec![
+            RowValue::Int64(42),
+            RowValue::Bool(true),
+            RowValue::Utf8("hello".to_string()),
+            RowValue::TimestampMillis(1_700_000_000_000),
+        ];
+        let encoded = encode(&row).expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(row, decoded);
+    }
+}

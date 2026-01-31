@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
-use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
 use crate::stream::tests::common::build_db;
+use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
 
 #[tokio::test]
 async fn stream_cursor_tracks_new_versions() {

@@ -6,9 +6,9 @@ mod tests;
 
 use std::sync::Arc;
 
+use pgwire::api::PgWireServerHandlers;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::PgWireServerHandlers;
 
 use super::execution::FloeServerState;
 use extended::FloeExtendedHandler;

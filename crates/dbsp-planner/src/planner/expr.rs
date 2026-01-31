@@ -36,7 +36,9 @@ pub(super) fn combine_filters(filters: Vec<Expr>) -> Option<Expr> {
     }))
 }
 
-pub(super) fn extract_join_keys_and_residual(expr: &Expr) -> Result<JoinKeysAndResidual, PlannerError> {
+pub(super) fn extract_join_keys_and_residual(
+    expr: &Expr,
+) -> Result<JoinKeysAndResidual, PlannerError> {
     let mut key_pairs = Vec::new();
     let mut residuals = Vec::new();
     accumulate_conjuncts(expr, &mut key_pairs, &mut residuals)?;

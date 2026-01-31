@@ -6,9 +6,7 @@ use datafusion::scalar::ScalarValue;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::DbspPersistedState;
-use floe_executor::{
-    FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
-};
+use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_storage::SlateCatalog;
 use futures::StreamExt;
 use pgwire::api::portal::Portal;
@@ -256,8 +254,7 @@ async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u
         false,
     )]));
     let db = catalog.db();
-    let (dbsp_state, versions) =
-        seed_mv_state(Arc::clone(&db), rows, Arc::clone(&schema)).await;
+    let (dbsp_state, versions) = seed_mv_state(Arc::clone(&db), rows, Arc::clone(&schema)).await;
     let registry = Arc::new(MaterializedViewRegistry::new());
     registry.set_schema(STREAM_VIEW_NAME.to_string(), Arc::clone(&schema));
     let handle = registry.register(STREAM_VIEW_NAME.to_string());
@@ -288,8 +285,8 @@ async fn seed_mv_state(
         .expect("create view");
     let mut versions = Vec::new();
     for value in rows {
-        let key = encode_projected_row_key(&[ScalarValue::Int64(Some(*value))])
-            .expect("encode row key");
+        let key =
+            encode_projected_row_key(&[ScalarValue::Int64(Some(*value))]).expect("encode row key");
         view.add_delta(key, 1);
         let handle = view.flush().await.expect("flush view");
         versions.push(handle.version);

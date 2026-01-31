@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
@@ -103,11 +103,9 @@ where
         aggregator: Aggregator<K, V, A>,
         output: VersionedZSet<(K, A)>,
         window_size: usize,
-    ) -> Self {
-        if window_size == 0 {
-            panic!("rolling window size must be positive");
-        }
-        Self {
+    ) -> Result<Self> {
+        ensure!(window_size > 0, "rolling window size must be positive");
+        Ok(Self {
             state,
             index,
             table,
@@ -118,7 +116,7 @@ where
             buffer: VecDeque::new(),
             dict_cache: HashMap::new(),
             aggregate_cache: None,
-        }
+        })
     }
 
     async fn ensure_aggregate_cache(&mut self) -> Result<()> {
@@ -206,7 +204,9 @@ where
         }
 
         if segments.is_empty() {
-            if base.is_some() && let Some(handle) = versioned.current_handle() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
@@ -380,10 +380,13 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
-        let new_integrated_handle =
-            Self::apply_deltas_to_versioned(&mut self.state.integrated, &aggregate_updates, base_version)
-                .await
-                .context("update rolling aggregate state")?;
+        let new_integrated_handle = Self::apply_deltas_to_versioned(
+            &mut self.state.integrated,
+            &aggregate_updates,
+            base_version,
+        )
+        .await
+        .context("update rolling aggregate state")?;
         self.state.update_handle(new_integrated_handle);
 
         let delta_handle =
@@ -500,10 +503,13 @@ mod tests {
         let state = RelationState::empty(table.clone(), "rolling_state".to_string())
             .await
             .expect("rolling state");
-        let output =
-            VersionedZSet::new(output_dict.clone(), table.clone(), "rolling_output".to_string())
-                .await
-                .expect("output zset");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "rolling_output".to_string(),
+        )
+        .await
+        .expect("output zset");
 
         let index = IndexedZSet::new(table.clone(), "rolling_index");
         let key_extractor = Arc::new(|row: &Row| Some(*row % 2));
@@ -518,11 +524,7 @@ mod tests {
                     has_rows = true;
                     count += *weight;
                 }
-                if has_rows {
-                    Some(count)
-                } else {
-                    None
-                }
+                if has_rows { Some(count) } else { None }
             });
 
         let mut op = RollingAggregateOp::new(
@@ -533,14 +535,11 @@ mod tests {
             aggregator,
             output,
             2,
-        );
+        )
+        .expect("rolling aggregate op");
 
-        let deltas: Vec<Vec<(Row, i64)>> = vec![
-            vec![(1, 1), (2, 1)],
-            vec![(3, 1)],
-            vec![],
-            vec![(4, 1)],
-        ];
+        let deltas: Vec<Vec<(Row, i64)>> =
+            vec![vec![(1, 1), (2, 1)], vec![(3, 1)], vec![], vec![(4, 1)]];
 
         let mut window_buffer: VecDeque<HashMap<Row, i64>> = VecDeque::new();
         let mut window_state: HashMap<Row, i64> = HashMap::new();
@@ -577,8 +576,9 @@ mod tests {
                 aggregated.insert((key, count), 1);
             }
 
-            let expected_delta: HashMap<(i64, i64), i64> =
-                compute_delta(&prev_output, &aggregated).into_iter().collect();
+            let expected_delta: HashMap<(i64, i64), i64> = compute_delta(&prev_output, &aggregated)
+                .into_iter()
+                .collect();
 
             let handle = if delta.is_empty() {
                 ZSetHandle {
