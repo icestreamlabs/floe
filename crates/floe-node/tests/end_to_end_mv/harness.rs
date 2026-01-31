@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use dbsp::StreamRetention;
 use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan, load_or_register_mv,
@@ -78,6 +79,7 @@ impl MvTestHarness {
                 task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
+                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             })
             .await?;
 

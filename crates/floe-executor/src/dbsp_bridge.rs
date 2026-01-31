@@ -55,13 +55,14 @@ impl DbspBridge {
         ZSetStream::new(dict, self.table.clone(), namespace, retention).await
     }
 
-    pub async fn new_view(&mut self, view_name: &str) -> Result<DbspView> {
+    pub async fn new_view(
+        &mut self,
+        view_name: &str,
+        retention: StreamRetention,
+    ) -> Result<DbspView> {
         let namespace = namespaces::materialized_view(view_name)?;
         let zset = self
-            .new_stream(
-                namespace.clone(),
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
+            .new_stream(namespace.clone(), retention)
             .await?;
         Ok(DbspView {
             name: view_name.to_string(),

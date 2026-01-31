@@ -8,6 +8,7 @@ use dbsp::circuit::{
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
+use dbsp::StreamRetention;
 use dbsp::stream::StreamCursor;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};
@@ -117,7 +118,9 @@ impl DbspCircuitInstance {
         let root_stream = self.get_stream(self.root_id).clone();
         let mut cursor = StreamCursor::new(root_stream.stream());
         let table = bridge.table();
-        let mut view = bridge.new_view(view_name).await?;
+        let mut view = bridge
+            .new_view(view_name, StreamRetention::KeepLast { keep_last: 1 })
+            .await?;
 
         let mut cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
         let view_handle = registry.register(view_name.to_string());

@@ -402,6 +402,7 @@ mod tests {
     use crate::mv::registry::MaterializedViewRegistry;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use dbsp::StreamRetention;
     use object_store::memory::InMemory;
     use slatedb::Db;
     use tokio::time::{Duration, timeout};
@@ -447,7 +448,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-test", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail", build_schema());
@@ -508,7 +509,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-delta-ops", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_delta_ops").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_delta_ops", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_delta_ops", build_schema());
@@ -564,7 +565,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-delta-validate", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_delta_validate").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_delta_validate", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_delta_validate", build_schema());
@@ -643,7 +644,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-cancel", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_cancel").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_cancel", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_cancel", build_schema());
@@ -679,7 +680,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-asof-snap", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_asof_snap").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_asof_snap", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_asof_snap", build_schema());
@@ -715,7 +716,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-asof-no-snap", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_asof_no_snap").await?;
+        let mut dbsp_view = bridge.new_view("mv_tail_asof_no_snap", StreamRetention::KeepLast { keep_last: 1 }).await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_asof_no_snap", build_schema());

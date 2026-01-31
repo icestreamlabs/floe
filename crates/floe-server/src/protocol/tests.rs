@@ -3,11 +3,12 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::{Buf, Bytes};
 use datafusion::scalar::ScalarValue;
+use dbsp::StreamRetention;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::DbspPersistedState;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
-use floe_storage::SlateCatalog;
+use floe_storage::{MaterializedViewMetadata, SlateCatalog};
 use futures::StreamExt;
 use pgwire::api::portal::Portal;
 use pgwire::api::results::Response;
@@ -23,6 +24,7 @@ use sqlparser::parser::Parser;
 use super::extended::{FloeExtendedHandler, FloeExtendedQueryParser};
 use super::simple::FloeQueryHandler;
 use crate::execution::FloeServerState;
+use crate::management::{ManagementStatement, handle_management_statement};
 
 async fn state_with_single_mv() -> Arc<FloeServerState> {
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
@@ -280,7 +282,7 @@ async fn seed_mv_state(
 ) -> (DbspPersistedState, Vec<u64>) {
     let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
     let mut view = bridge
-        .new_view(STREAM_VIEW_NAME)
+        .new_view(STREAM_VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("create view");
     let mut versions = Vec::new();
@@ -303,6 +305,107 @@ async fn seed_mv_state(
     )
 }
 
+#[tokio::test]
+async fn show_materialized_views_lists_persisted_definitions() {
+    let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+    catalog
+        .upsert_materialized_view(MaterializedViewMetadata::new(
+            "mv_alpha",
+            "SELECT 1",
+            false,
+        ))
+        .await
+        .expect("persist mv alpha");
+    catalog
+        .upsert_materialized_view(MaterializedViewMetadata::new(
+            "mv_beta",
+            "SELECT 2",
+            true,
+        ))
+        .await
+        .expect("persist mv beta");
+
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+    let state = Arc::new(FloeServerState::new(query, registry, bridge));
+
+    let response = handle_management_statement(
+        state.as_ref(),
+        &ManagementStatement::ShowMaterializedViews,
+    )
+    .await
+    .expect("show mv response");
+    let Response::Query(mut query) = response else {
+        panic!("expected query response");
+    };
+    let rows_stream = query.data_rows();
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(decode_text_row(row.expect("row")));
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_deref(), Some("mv_alpha"));
+    assert_eq!(rows[0][1].as_deref(), Some("SELECT 1"));
+    assert_bool_text(rows[0][2].as_deref(), false);
+    assert_eq!(rows[1][0].as_deref(), Some("mv_beta"));
+    assert_eq!(rows[1][1].as_deref(), Some("SELECT 2"));
+    assert_bool_text(rows[1][2].as_deref(), true);
+}
+
+#[tokio::test]
+async fn describe_materialized_view_returns_schema_and_metadata() {
+    let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+    catalog
+        .upsert_materialized_view(MaterializedViewMetadata::new(
+            "mv_desc",
+            "SELECT 1 AS value",
+            false,
+        ))
+        .await
+        .expect("persist mv");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("flag", DataType::Boolean, true),
+    ]));
+    catalog
+        .save_materialized_view_schema("mv_desc", Arc::clone(&schema))
+        .await
+        .expect("persist schema");
+
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+    let state = Arc::new(FloeServerState::new(query, registry, bridge));
+
+    let response = handle_management_statement(
+        state.as_ref(),
+        &ManagementStatement::DescribeMaterializedView {
+            name: "mv_desc".to_string(),
+        },
+    )
+    .await
+    .expect("describe mv response");
+    let Response::Query(mut query) = response else {
+        panic!("expected query response");
+    };
+    let rows_stream = query.data_rows();
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(decode_text_row(row.expect("row")));
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_deref(), Some("mv_desc"));
+    assert_eq!(rows[0][1].as_deref(), Some("value"));
+    assert_eq!(rows[0][2].as_deref(), Some("Int64"));
+    assert_bool_text(rows[0][3].as_deref(), false);
+    assert_eq!(rows[0][4].as_deref(), Some("SELECT 1 AS value"));
+    assert_bool_text(rows[0][5].as_deref(), false);
+    assert_eq!(rows[1][1].as_deref(), Some("flag"));
+    assert_eq!(rows[1][2].as_deref(), Some("Boolean"));
+    assert_bool_text(rows[1][3].as_deref(), true);
+}
+
 fn decode_text_row(mut row: DataRow) -> Vec<Option<String>> {
     let mut values = Vec::with_capacity(row.field_count as usize);
     for _ in 0..row.field_count {
@@ -315,4 +418,13 @@ fn decode_text_row(mut row: DataRow) -> Vec<Option<String>> {
         }
     }
     values
+}
+
+fn assert_bool_text(value: Option<&str>, expected: bool) {
+    let Some(text) = value else {
+        panic!("expected boolean text, got None");
+    };
+    let normalized = text.to_ascii_lowercase();
+    let actual = matches!(normalized.as_str(), "t" | "true" | "1");
+    assert_eq!(actual, expected, "expected boolean {expected}, got {text}");
 }

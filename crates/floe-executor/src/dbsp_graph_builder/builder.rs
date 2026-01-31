@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::DeltaHandleStream;
-use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind};
+use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind, StreamRetention};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +49,7 @@ impl DbspGraphBuilder {
                 &mut built,
                 &inputs.mv_registry,
                 &mut mv_latest,
+                inputs.mv_retention,
             )
             .await?;
 
@@ -65,6 +66,7 @@ impl DbspGraphBuilder {
                 &inputs.task_events,
                 &inputs.mv_registry,
                 &mut mv_latest,
+                inputs.mv_retention,
             )
             .await?;
         }
@@ -92,6 +94,7 @@ impl DbspGraphBuilder {
         built: &mut HashMap<usize, DeltaHandleStream>,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
+        mv_retention: StreamRetention,
     ) -> Result<DeltaHandleStream> {
         if let Some(stream) = built.get(&node_idx) {
             return Ok(stream.clone());
@@ -117,6 +120,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.compile_filter(select, upstream, task_events).await?
@@ -133,6 +137,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.compile_map(project, upstream, task_events).await?
@@ -149,6 +154,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 let right = self
@@ -161,6 +167,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.compile_join(join, left, right, cancel, task_events)
@@ -178,6 +185,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.compile_aggregate(aggregate, upstream, task_events)
@@ -195,6 +203,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.compile_topn(topn, upstream, task_events).await?
@@ -211,6 +220,7 @@ impl DbspGraphBuilder {
                         built,
                         mv_registry,
                         mv_latest,
+                        mv_retention,
                     )
                     .await?;
                 self.materialize_view(
@@ -221,6 +231,7 @@ impl DbspGraphBuilder {
                     task_events,
                     mv_registry,
                     mv_latest,
+                    mv_retention,
                 )
                 .await?
             }
@@ -255,6 +266,7 @@ pub struct BuildInputs<'a> {
     pub task_events: GraphTaskSender,
     pub mv_registry: Arc<MaterializedViewRegistry>,
     pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
+    pub mv_retention: StreamRetention,
 }
 
 pub struct BuildOutputs {

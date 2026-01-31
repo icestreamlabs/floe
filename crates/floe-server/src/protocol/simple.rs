@@ -17,6 +17,7 @@ use sqlparser::parser::Parser;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{FloeServerState, build_query_response_stream};
+use crate::management::{detect_single_management_statement, handle_management_statement};
 use crate::sql::extract_tables_from_query;
 use crate::tail::{TailResponseStream, detect_single_tail_statement};
 use crate::types::arrow_schema_to_field_info;
@@ -131,6 +132,10 @@ impl SimpleQueryHandler for FloeQueryHandler {
     {
         if let Some(tail_sql) = detect_single_tail_statement(query) {
             let response = self.execute_tail_statement(tail_sql).await?;
+            return Ok(vec![response]);
+        }
+        if let Some(statement) = detect_single_management_statement(query) {
+            let response = handle_management_statement(self.state.as_ref(), &statement).await?;
             return Ok(vec![response]);
         }
 

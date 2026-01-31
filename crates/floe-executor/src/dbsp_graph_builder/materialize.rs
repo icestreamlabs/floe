@@ -9,6 +9,7 @@ use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
+use dbsp::StreamRetention;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,7 @@ impl DbspGraphBuilder {
         task_events: &GraphTaskSender,
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
+        retention: StreamRetention,
     ) -> Result<DeltaHandleStream> {
         let handle_stream = upstream.clone();
         let registry_handle = mv_registry.register(view_name.to_string());
@@ -48,7 +50,7 @@ impl DbspGraphBuilder {
         let mut view = {
             let mut bridge = self.bridge.lock().await;
             bridge
-                .new_view(view_name)
+                .new_view(view_name, retention)
                 .await
                 .with_context(|| format!("provision materialized view '{view_name}'"))?
         };

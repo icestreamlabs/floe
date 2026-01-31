@@ -23,4 +23,5 @@ tracing = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-buffer = "56.2.0"
 arrow-data = "56.2.0"
+dbsp = { path = "../dbsp" }
 slatedb = { workspace = true }

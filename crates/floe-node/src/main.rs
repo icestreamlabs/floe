@@ -10,6 +10,7 @@ use anyhow::Context;
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
+use dbsp::StreamRetention;
 use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
@@ -156,7 +157,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let mv_retention = if run_args.mv_retain_last == 0 {
+        StreamRetention::None
+    } else {
+        StreamRetention::KeepLast {
+            keep_last: run_args.mv_retain_last,
+        }
+    };
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new_with_retention(
+        if run_args.mv_retain_last == 0 {
+            None
+        } else {
+            Some(run_args.mv_retain_last)
+        },
+    ));
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
@@ -198,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 task_events: task_event_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
+                mv_retention,
             })
             .await
             .with_context(|| format!("building DBSP graph for '{view_name}'"))?;

@@ -2046,6 +2046,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "dbsp",
  "floe-executor",
  "floe-storage",
  "futures",

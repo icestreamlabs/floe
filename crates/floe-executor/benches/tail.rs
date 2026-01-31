@@ -4,6 +4,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::execution::context::SessionContext;
 use datafusion::scalar::ScalarValue;
+use dbsp::StreamRetention;
 use futures::StreamExt;
 use object_store::memory::InMemory;
 use slatedb::Db;
@@ -52,7 +53,9 @@ fn bench_tail_delta(c: &mut Criterion) {
                         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
                         let db = Arc::new(Db::open("tail-bench", store).await.expect("db"));
                         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-                        let mut dbsp_view = bridge.new_view("mv_tail_bench").await?;
+                        let mut dbsp_view = bridge
+                            .new_view("mv_tail_bench", StreamRetention::KeepLast { keep_last: 1 })
+                            .await?;
 
                         let registry = Arc::new(MaterializedViewRegistry::new());
                         registry.set_schema("mv_tail_bench", build_schema());

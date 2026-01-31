@@ -21,6 +21,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::execution::{FloeServerState, build_query_response};
+use crate::management::{
+    ManagementStatement, handle_management_statement, management_result_schema,
+    parse_management_statement,
+};
 use crate::sql::{
     collect_placeholder_indices, decode_parameter_value, ensure_select_statement,
     extract_tables_from_query, substitute_placeholders,
@@ -30,11 +34,17 @@ use crate::user_error;
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedStatement {
-    statement: Statement,
+    kind: PreparedStatementKind,
     result_fields: Arc<Vec<pgwire::api::results::FieldInfo>>,
     referenced_views: Vec<String>,
     parameter_count: usize,
     param_types: Vec<PgType>,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedStatementKind {
+    Query(Statement),
+    Management(ManagementStatement),
 }
 
 impl PreparedStatement {
@@ -52,6 +62,10 @@ impl PreparedStatement {
 
     pub(super) fn parameter_types(&self) -> Vec<PgType> {
         self.param_types.clone()
+    }
+
+    fn kind(&self) -> &PreparedStatementKind {
+        &self.kind
     }
 }
 
@@ -73,6 +87,18 @@ impl FloeExtendedQueryParser {
         sql: &str,
         parameter_types: &[PgType],
     ) -> PgWireResult<PreparedStatement> {
+        if let Some(statement) = parse_management_statement(sql) {
+            let schema = management_result_schema(&statement);
+            let fields = Arc::new(arrow_schema_to_field_info(&schema)?);
+            return Ok(PreparedStatement {
+                kind: PreparedStatementKind::Management(statement),
+                result_fields: fields,
+                referenced_views: Vec::new(),
+                parameter_count: 0,
+                param_types: Vec::new(),
+            });
+        }
+
         let mut statements = Parser::parse_sql(&self.dialect, sql)
             .map_err(|err| user_error(format!("SQL parse error: {err}")))?;
         if statements.len() != 1 {
@@ -125,7 +151,7 @@ impl FloeExtendedQueryParser {
         }
 
         Ok(PreparedStatement {
-            statement,
+            kind: PreparedStatementKind::Query(statement),
             result_fields: fields,
             referenced_views: deduped,
             parameter_count,
@@ -227,6 +253,12 @@ impl ExtendedQueryHandler for FloeExtendedHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let PreparedStatementKind::Management(statement) =
+            portal.statement.statement.kind()
+        {
+            return handle_management_statement(self.state.as_ref(), statement).await;
+        }
+
         for view in portal.statement.statement.referenced_views() {
             self.state.ensure_materialized_view_registered(view).await?;
         }
@@ -253,6 +285,9 @@ fn render_sql_with_params(
     prepared: &PreparedStatement,
     portal: &Portal<PreparedStatement>,
 ) -> PgWireResult<String> {
+    let PreparedStatementKind::Query(statement) = prepared.kind() else {
+        return Err(user_error("management statements do not support parameters"));
+    };
     let expected = prepared.parameter_count();
     if portal.parameter_len() != expected {
         return Err(user_error(format!(
@@ -275,7 +310,7 @@ fn render_sql_with_params(
         decoded.push(value);
     }
 
-    let mut statement = prepared.statement.clone();
+    let mut statement = statement.clone();
     substitute_placeholders(&mut statement, &decoded)?;
     Ok(statement.to_string())
 }

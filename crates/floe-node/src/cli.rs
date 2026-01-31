@@ -33,6 +33,10 @@ pub struct RunArgs {
     #[arg(long = "mv-query", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub mv_query: Option<String>,
 
+    /// Number of materialized view versions to retain (0 keeps all versions).
+    #[arg(long = "mv-retain-last", default_value_t = 1, value_parser = parse_nonnegative_usize)]
+    pub mv_retain_last: usize,
+
     /// Read newline-delimited JSON events from a file (use "-" for stdin).
     #[arg(long = "input-file")]
     pub input_file: Option<String>,
@@ -170,4 +174,10 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_nonnegative_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| "value must be a non-negative integer".to_string())
 }

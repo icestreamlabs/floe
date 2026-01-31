@@ -1,4 +1,5 @@
 mod execution;
+mod management;
 mod protocol;
 mod sql;
 mod tail;

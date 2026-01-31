@@ -15,13 +15,19 @@ use tracing::field;
 pub struct MaterializedViewRegistry {
     views: RwLock<HashMap<String, Arc<MaterializedViewHandle>>>,
     schemas: RwLock<HashMap<String, SchemaRef>>,
+    retention_keep_last: Option<usize>,
 }
 
 impl MaterializedViewRegistry {
     pub fn new() -> Self {
+        Self::new_with_retention(None)
+    }
+
+    pub fn new_with_retention(retention_keep_last: Option<usize>) -> Self {
         Self {
             views: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashMap::new()),
+            retention_keep_last,
         }
     }
 
@@ -30,7 +36,12 @@ impl MaterializedViewRegistry {
         let name = name.into();
         guard
             .entry(name.clone())
-            .or_insert_with(|| Arc::new(MaterializedViewHandle::new(name)))
+            .or_insert_with(|| {
+                Arc::new(MaterializedViewHandle::new(
+                    name,
+                    self.retention_keep_last,
+                ))
+            })
             .clone()
     }
 
@@ -67,10 +78,11 @@ pub struct MaterializedViewHandle {
     version_times: RwLock<HashMap<i64, i64>>,
     latest_version: RwLock<Option<i64>>,
     version_watch: watch::Sender<Option<i64>>,
+    retention_keep_last: Option<usize>,
 }
 
 impl MaterializedViewHandle {
-    fn new(name: String) -> Self {
+    fn new(name: String, retention_keep_last: Option<usize>) -> Self {
         let (tx, _rx) = watch::channel(None);
         Self {
             name,
@@ -81,6 +93,7 @@ impl MaterializedViewHandle {
             version_times: RwLock::new(HashMap::new()),
             latest_version: RwLock::new(None),
             version_watch: tx,
+            retention_keep_last,
         }
     }
 
@@ -154,6 +167,7 @@ impl MaterializedViewHandle {
                 .expect("materialized view version lock poisoned");
             *guard = Some(version);
         }
+        self.prune_versions();
         tracing::debug!(
             view = %self.name,
             version,
@@ -188,6 +202,36 @@ impl MaterializedViewHandle {
             .expect("materialized view versions lock poisoned")
             .get(&version)
             .cloned()
+    }
+
+    fn prune_versions(&self) {
+        let Some(keep_last) = self.retention_keep_last else {
+            return;
+        };
+        if keep_last == 0 {
+            return;
+        }
+        let mut guard = self
+            .versions
+            .write()
+            .expect("materialized view versions lock poisoned");
+        if guard.len() <= keep_last {
+            return;
+        }
+        let mut versions: Vec<i64> = guard.keys().copied().collect();
+        versions.sort_unstable();
+        let remove_count = versions.len().saturating_sub(keep_last);
+        if remove_count == 0 {
+            return;
+        }
+        let mut times = self
+            .version_times
+            .write()
+            .expect("materialized view versions lock poisoned");
+        for version in versions.into_iter().take(remove_count) {
+            guard.remove(&version);
+            times.remove(&version);
+        }
     }
 }
 
@@ -265,6 +309,7 @@ impl DbspPersistedState {
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
+    use dbsp::handles::ZSetHandle;
 
     use super::*;
 
@@ -287,5 +332,37 @@ mod tests {
         let view_a = registry.register("mv");
         let view_b = registry.get("mv").expect("view registered");
         assert!(Arc::ptr_eq(&view_a, &view_b));
+    }
+
+    #[test]
+    fn retention_prunes_old_versions() {
+        let registry = MaterializedViewRegistry::new_with_retention(Some(2));
+        let view = registry.register("mv_retained");
+
+        view.publish_version(
+            1,
+            ZSetHandle {
+                ns: "mv_retained".to_string(),
+                version: 1,
+            },
+        );
+        view.publish_version(
+            2,
+            ZSetHandle {
+                ns: "mv_retained".to_string(),
+                version: 2,
+            },
+        );
+        view.publish_version(
+            3,
+            ZSetHandle {
+                ns: "mv_retained".to_string(),
+                version: 3,
+            },
+        );
+
+        assert!(view.handle_for_version(1).is_none());
+        assert!(view.handle_for_version(2).is_some());
+        assert!(view.handle_for_version(3).is_some());
     }
 }

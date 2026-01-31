@@ -6,6 +6,7 @@ use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{col, table_scan};
 use datafusion::scalar::ScalarValue;
+use dbsp::StreamRetention;
 use dbsp::circuit::CircuitPlan;
 use dbsp::handles::ZSetHandleView;
 use floe_executor::GraphTaskError;
@@ -199,6 +200,7 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
         })
         .await
         .expect("build graph");
