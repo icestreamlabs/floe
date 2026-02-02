@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::delta_zset_handle;
 
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
+type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -64,9 +66,13 @@ where
     pub index: IndexedZSet<WindowKey<K>, V>,
     pub table: Arc<dyn KeyValueTable>,
     pub key_extractor: KeyExtractor<V, K>,
+    pub time_extractor: TimeExtractor<V>,
     pub aggregator: Aggregator<K, V, A>,
+    pub watermark: Arc<AtomicI64>,
     output: VersionedZSet<(WindowKey<K>, A)>,
     window_size: i64,
+    window_slide: i64,
+    allowed_lateness_ms: i64,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     aggregate_cache: Option<HashMap<WindowKey<K>, A>>,
 }
@@ -106,28 +112,62 @@ where
         index: IndexedZSet<WindowKey<K>, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
+        time_extractor: TimeExtractor<V>,
         aggregator: Aggregator<K, V, A>,
         output: VersionedZSet<(WindowKey<K>, A)>,
         window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
     ) -> Result<Self> {
         ensure!(window_size > 0, "window size must be positive");
+        ensure!(window_slide > 0, "window slide must be positive");
+        ensure!(
+            window_size % window_slide == 0,
+            "window size must be a multiple of slide"
+        );
+        ensure!(
+            allowed_lateness_ms >= 0,
+            "allowed lateness must be non-negative"
+        );
         Ok(Self {
             state,
             index,
             table,
             key_extractor,
+            time_extractor,
             aggregator,
+            watermark,
             output,
             window_size,
+            window_slide,
+            allowed_lateness_ms,
             dict_cache: HashMap::new(),
             aggregate_cache: None,
         })
     }
 
-    fn window_for(&self, ts: i64) -> (i64, i64) {
-        let start = ts.div_euclid(self.window_size) * self.window_size;
-        let end = start + self.window_size;
-        (start, end)
+    fn windows_for(&self, ts: i64) -> Vec<(i64, i64)> {
+        let slide = self.window_slide;
+        let size = self.window_size;
+        let latest_start = ts.div_euclid(slide) * slide;
+        let count = (size / slide).max(1);
+        let first_start = latest_start - (count - 1) * slide;
+        let mut windows = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let start = first_start + i * slide;
+            windows.push((start, start + size));
+        }
+        windows
+    }
+
+    fn watermark_cutoff(&self) -> Option<i64> {
+        let watermark = self.watermark.load(Ordering::Relaxed);
+        if watermark < 0 {
+            return None;
+        }
+        let allowed = self.allowed_lateness_ms.max(0);
+        Some(watermark.saturating_sub(allowed))
     }
 
     async fn ensure_aggregate_cache(&mut self) -> Result<()> {
@@ -281,7 +321,7 @@ where
 {
     async fn on_step(
         &mut self,
-        ts: i64,
+        _ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
         let delta_handle = inputs
@@ -303,23 +343,37 @@ where
             return Ok(None);
         }
 
-        let (window_start, window_end) = self.window_for(ts);
+        let cutoff = self.watermark_cutoff();
 
         let mut keyed_deltas: HashMap<WindowKey<K>, Vec<(V, i64)>> = HashMap::new();
         for (row, weight) in &delta_map {
             if *weight == 0 {
                 continue;
             }
+            let event_ts = match (self.time_extractor)(row) {
+                Some(ts) => ts,
+                None => continue,
+            };
+            if event_ts < 0 {
+                continue;
+            }
+            if let Some(cutoff) = cutoff {
+                if event_ts < cutoff {
+                    continue;
+                }
+            }
             if let Some(key) = (self.key_extractor)(row) {
-                let window_key = WindowKey {
-                    start: window_start,
-                    end: window_end,
-                    key,
-                };
-                keyed_deltas
-                    .entry(window_key)
-                    .or_insert_with(Vec::new)
-                    .push((row.clone(), *weight));
+                for (window_start, window_end) in self.windows_for(event_ts) {
+                    let window_key = WindowKey {
+                        start: window_start,
+                        end: window_end,
+                        key: key.clone(),
+                    };
+                    keyed_deltas
+                        .entry(window_key)
+                        .or_insert_with(Vec::new)
+                        .push((row.clone(), *weight));
+                }
             }
         }
 
@@ -418,6 +472,7 @@ mod tests {
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicI64;
 
     type Row = i64;
 
@@ -510,6 +565,7 @@ mod tests {
 
         let index = IndexedZSet::new(table.clone(), "window_index");
         let key_extractor = Arc::new(|row: &Row| Some(*row % 2));
+        let time_extractor = Arc::new(|row: &Row| Some(*row));
         let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
             Arc::new(|_key, values| {
                 let mut count = 0i64;
@@ -523,15 +579,20 @@ mod tests {
                 }
                 if has_rows { Some(count) } else { None }
             });
+        let watermark = Arc::new(AtomicI64::new(-1));
 
         let mut op = WindowAggregateOp::new(
             state,
             index,
             table.clone(),
             key_extractor,
+            time_extractor,
             aggregator,
             output,
             2,
+            2,
+            0,
+            watermark,
         )
         .expect("window aggregate op");
 
@@ -549,17 +610,18 @@ mod tests {
         cache_out.insert("window_output".to_string(), output_dict.clone());
 
         for (step, delta) in deltas.iter().enumerate() {
-            let (start, end) = op.window_for(step as i64);
             for (row, weight) in delta {
-                let key = WindowKey {
-                    start,
-                    end,
-                    key: row % 2,
-                };
-                let entry = window_counts.entry(key.clone()).or_insert(0);
-                *entry += *weight;
-                if *entry == 0 {
-                    window_counts.remove(&key);
+                for (start, end) in op.windows_for(*row) {
+                    let key = WindowKey {
+                        start,
+                        end,
+                        key: row % 2,
+                    };
+                    let entry = window_counts.entry(key.clone()).or_insert(0);
+                    *entry += *weight;
+                    if *entry == 0 {
+                        window_counts.remove(&key);
+                    }
                 }
             }
             let mut aggregated = HashMap::new();

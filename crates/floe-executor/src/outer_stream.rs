@@ -20,6 +20,15 @@ pub struct OuterStreamHandle {
     pub version: u64,
 }
 
+/// Snapshot of an outer stream's committed frontier for checkpoint manifests.
+#[derive(Debug, Clone)]
+pub struct OuterStreamCheckpoint {
+    pub source: String,
+    pub namespace: String,
+    pub version: u64,
+    pub frontier: i64,
+}
+
 /// Batches decoded source rows into a DBSP `ZSetStream`.
 pub struct OuterStreamWriter {
     source: String,
@@ -173,6 +182,22 @@ impl OuterStreamRegistry {
             handles.push(writer.tick().await?);
         }
         Ok(handles)
+    }
+
+    pub fn checkpoint_state(&self) -> Vec<OuterStreamCheckpoint> {
+        self.writers
+            .values()
+            .map(|writer| {
+                let handle = writer.stream.current_handle().clone();
+                let frontier = writer.stream.handle_stream().committed_frontier();
+                OuterStreamCheckpoint {
+                    source: writer.source.clone(),
+                    namespace: handle.ns,
+                    version: handle.version,
+                    frontier,
+                }
+            })
+            .collect()
     }
 
     #[cfg(test)]

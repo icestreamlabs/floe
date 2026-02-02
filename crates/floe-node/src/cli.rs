@@ -33,6 +33,54 @@ pub struct RunArgs {
     #[arg(long = "mv-query", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub mv_query: Option<String>,
 
+    /// Connector configuration file (TOML/YAML/JSON).
+    #[arg(long = "config")]
+    pub config: Option<String>,
+
+    /// SlateDB settings file (TOML/YAML/JSON). Overrides SLATEDB_ env settings.
+    #[arg(long = "slatedb-config")]
+    pub slatedb_config: Option<String>,
+
+    /// Environment variable prefix to read SlateDB settings from (default: SLATEDB_).
+    #[arg(long = "slatedb-env-prefix")]
+    pub slatedb_env_prefix: Option<String>,
+
+    /// SlateDB flush interval in milliseconds (0 disables automatic flushing).
+    #[arg(long = "slatedb-flush-interval-ms", value_parser = parse_nonnegative_u64)]
+    pub slatedb_flush_interval_ms: Option<u64>,
+
+    /// SlateDB L0 SST size in bytes.
+    #[arg(long = "slatedb-l0-sst-bytes", value_parser = parse_positive_usize)]
+    pub slatedb_l0_sst_size_bytes: Option<usize>,
+
+    /// Max unflushed bytes before SlateDB applies backpressure.
+    #[arg(long = "slatedb-max-unflushed-bytes", value_parser = parse_positive_usize)]
+    pub slatedb_max_unflushed_bytes: Option<usize>,
+
+    /// SlateDB compactor max SST size in bytes.
+    #[arg(long = "slatedb-compaction-max-sst-bytes", value_parser = parse_positive_usize)]
+    pub slatedb_compaction_max_sst_bytes: Option<usize>,
+
+    /// SlateDB compactor max concurrent compactions.
+    #[arg(long = "slatedb-compaction-max-concurrent", value_parser = parse_positive_usize)]
+    pub slatedb_compaction_max_concurrent: Option<usize>,
+
+    /// Enable SlateDB object-store cache at this local directory.
+    #[arg(long = "slatedb-cache-dir")]
+    pub slatedb_cache_dir: Option<String>,
+
+    /// Max SlateDB object-store cache size in bytes.
+    #[arg(long = "slatedb-cache-max-bytes", value_parser = parse_positive_usize)]
+    pub slatedb_cache_max_bytes: Option<usize>,
+
+    /// SlateDB object-store cache part size in bytes.
+    #[arg(long = "slatedb-cache-part-bytes", value_parser = parse_positive_usize)]
+    pub slatedb_cache_part_bytes: Option<usize>,
+
+    /// Cache SlateDB PUT operations to disk (requires --slatedb-cache-dir).
+    #[arg(long = "slatedb-cache-puts")]
+    pub slatedb_cache_puts: bool,
+
     /// Number of materialized view versions to retain (0 keeps all versions).
     #[arg(long = "mv-retain-last", default_value_t = 1, value_parser = parse_nonnegative_usize)]
     pub mv_retain_last: usize,
@@ -92,6 +140,14 @@ pub struct RunArgs {
         value_parser = parse_positive_usize
     )]
     pub ingest_batch_per_source: usize,
+
+    /// Max number of events per connector per ingestion batch.
+    #[arg(
+        long = "ingest-batch-per-connector",
+        default_value_t = 64,
+        value_parser = parse_positive_usize
+    )]
+    pub ingest_batch_per_connector: usize,
 
     /// Host for the HTTP ingest endpoint (requires --http-port).
     #[arg(long = "http-host", default_value = "127.0.0.1")]
@@ -177,6 +233,12 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 }
 
 fn parse_nonnegative_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| "value must be a non-negative integer".to_string())
+}
+
+fn parse_nonnegative_u64(value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| "value must be a non-negative integer".to_string())

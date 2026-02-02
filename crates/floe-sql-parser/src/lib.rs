@@ -1,4 +1,7 @@
 use anyhow::{Result, anyhow};
+use sqlparser::ast::{ObjectName, Statement};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloeStatement {
@@ -18,11 +21,7 @@ pub struct MaterializedViewDefinition {
 }
 
 impl MaterializedViewDefinition {
-    pub fn new(
-        name: impl Into<String>,
-        query: impl Into<String>,
-        if_not_exists: bool,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, query: impl Into<String>, if_not_exists: bool) -> Self {
         Self {
             name: name.into(),
             query: query.into(),
@@ -49,7 +48,7 @@ impl MaterializedViewDefinition {
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
     let normalized = normalize_sql(sql)?;
     if starts_with_keyword(normalized, "CREATE") {
-        let definition = parse_materialized_view(sql)?;
+        let definition = parse_materialized_view(normalized)?;
         return Ok(FloeStatement::CreateMaterializedView(definition));
     }
     if starts_with_keyword(normalized, "TAIL") {
@@ -59,52 +58,76 @@ pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
 }
 
 pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> {
-    let mut rest = sql.trim();
-    if rest.is_empty() {
+    let normalized = normalize_sql(sql)?;
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, normalized)
+        .map_err(|err| anyhow!("failed to parse materialized view statement: {err}"))?;
+
+    if statements.is_empty() {
         return Err(anyhow!("materialized view definition cannot be empty"));
     }
-
-    rest = rest.trim_start_matches(|c: char| c.is_ascii_control());
-    rest = rest.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
-
-    rest = consume_keyword(rest, "CREATE")
-        .ok_or_else(|| anyhow!("expected CREATE at start of materialized view"))?;
-    rest = consume_keyword(rest, "MATERIALIZED")
-        .ok_or_else(|| anyhow!("expected MATERIALIZED after CREATE"))?;
-    rest = consume_keyword(rest, "VIEW")
-        .ok_or_else(|| anyhow!("expected VIEW after CREATE MATERIALIZED"))?;
-
-    let mut if_not_exists = false;
-    if let Some(next) = consume_sequence(rest, &["IF", "NOT", "EXISTS"]) {
-        if_not_exists = true;
-        rest = next;
-    }
-
-    let (next, name) = parse_identifier(rest)?;
-    rest = next;
-
-    let trimmed = rest.trim_start();
-    if starts_with_keyword(trimmed, "WITH") {
+    if statements.len() != 1 {
         return Err(anyhow!(
-            "WITH clause for materialized views is not supported yet"
+            "materialized view definition cannot contain multiple statements"
         ));
     }
 
-    rest = consume_keyword(rest, "AS")
-        .ok_or_else(|| anyhow!("expected AS clause in materialized view"))?;
+    let statement = statements.remove(0);
+    match statement {
+        Statement::CreateView {
+            or_alter,
+            or_replace,
+            materialized,
+            name,
+            columns,
+            query,
+            options: _,
+            cluster_by,
+            comment,
+            with_no_schema_binding,
+            if_not_exists,
+            temporary,
+            to,
+            params,
+        } => {
+            if !materialized {
+                return Err(anyhow!("expected CREATE MATERIALIZED VIEW statement"));
+            }
+            if or_alter || or_replace || temporary {
+                return Err(anyhow!(
+                    "CREATE MATERIALIZED VIEW does not support OR ALTER/REPLACE or TEMPORARY"
+                ));
+            }
+            if !columns.is_empty() {
+                return Err(anyhow!(
+                    "column lists are not supported in materialized view definitions"
+                ));
+            }
+            if !cluster_by.is_empty()
+                || comment.is_some()
+                || with_no_schema_binding
+                || to.is_some()
+                || params.is_some()
+            {
+                return Err(anyhow!(
+                    "unsupported CREATE MATERIALIZED VIEW options are present"
+                ));
+            }
 
-    let query = rest.trim();
-    if query.is_empty() {
-        return Err(anyhow!("materialized view requires a SELECT query"));
+            let name = object_name_to_string(&name)?;
+            let query = query.to_string();
+            if query.trim().is_empty() {
+                return Err(anyhow!("materialized view requires a SELECT query"));
+            }
+
+            Ok(MaterializedViewDefinition {
+                name,
+                query,
+                if_not_exists,
+            })
+        }
+        _ => Err(anyhow!("expected CREATE MATERIALIZED VIEW statement")),
     }
-
-    let query = trim_query(query)?;
-
-    Ok(MaterializedViewDefinition {
-        name,
-        query: query.to_string(),
-        if_not_exists,
-    })
 }
 
 fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
@@ -241,6 +264,17 @@ fn starts_with_keyword(input: &str, keyword: &str) -> bool {
     consume_keyword(input, keyword).is_some()
 }
 
+fn object_name_to_string(name: &ObjectName) -> Result<String> {
+    let mut parts = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let ident = part.as_ident().ok_or_else(|| {
+            anyhow!("materialized view name contains unsupported identifier syntax")
+        })?;
+        parts.push(ident.value.as_str());
+    }
+    Ok(parts.join("."))
+}
+
 fn normalize_sql(sql: &str) -> Result<&str> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -278,20 +312,6 @@ fn parse_integer_literal(input: &str) -> Result<(&str, i64)> {
     Ok((&trimmed[end..], value))
 }
 
-fn trim_query(query: &str) -> Result<&str> {
-    let trimmed = query.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
-    if let Some(idx) = trimmed.rfind(';') {
-        if trimmed[idx + 1..].trim().is_empty() {
-            return Ok(trimmed[..idx].trim_end());
-        } else {
-            return Err(anyhow!(
-                "materialized view definition cannot contain multiple statements"
-            ));
-        }
-    }
-    Ok(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,24 +334,31 @@ mod tests {
     }
 
     #[test]
-    fn reject_with_clause() {
+    fn parse_with_clause() {
         let sql = "CREATE MATERIALIZED VIEW mv WITH (foo = 'bar') AS SELECT 1";
-        let err = parse_materialized_view(sql).unwrap_err();
-        assert!(err.to_string().contains("WITH"));
+        let mv = parse_materialized_view(sql).expect("parse mv");
+        assert_eq!(mv.name, "mv");
+        assert_eq!(mv.query, "SELECT 1");
     }
 
     #[test]
     fn reject_missing_as() {
         let sql = "CREATE MATERIALIZED VIEW mv SELECT 1";
         let err = parse_materialized_view(sql).unwrap_err();
-        assert!(err.to_string().contains("AS"));
+        assert!(
+            err.to_string()
+                .contains("failed to parse materialized view statement")
+        );
     }
 
     #[test]
     fn reject_empty_query() {
         let sql = "CREATE MATERIALIZED VIEW mv AS";
         let err = parse_materialized_view(sql).unwrap_err();
-        assert!(err.to_string().contains("SELECT"));
+        assert!(
+            err.to_string()
+                .contains("failed to parse materialized view statement")
+        );
     }
 
     #[test]

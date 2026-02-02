@@ -1,11 +1,11 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
+use crate::event_parser::parse_event_line;
 use crate::source::SourceEventSender;
 use floe_core::source::{SourceDefinition, SourceEvent};
 
@@ -106,26 +106,9 @@ fn read_events(path: PathBuf, default_source: Option<String>) -> Result<Vec<Sour
         if trimmed.is_empty() {
             continue;
         }
-        let event = parse_event(trimmed, default_source.as_deref())
+        let event = parse_event_line(trimmed, default_source.as_deref())
             .with_context(|| format!("parse event line {}", idx + 1))?;
         events.push(event);
     }
     Ok(events)
-}
-
-fn parse_event(line: &str, default_source: Option<&str>) -> Result<SourceEvent> {
-    let value: Value = serde_json::from_str(line).context("decode json line")?;
-    let object = value
-        .as_object()
-        .context("event line must be a JSON object")?;
-
-    if let (Some(source), Some(payload)) = (object.get("source"), object.get("data")) {
-        let source = source.as_str().context("event source must be a string")?;
-        ensure!(payload.is_object(), "event payload must be an object");
-        return Ok(SourceEvent::new(source, payload.clone()));
-    }
-
-    let source = default_source.context("event line missing source and no default provided")?;
-    ensure!(value.is_object(), "event payload must be an object");
-    Ok(SourceEvent::new(source, value))
 }

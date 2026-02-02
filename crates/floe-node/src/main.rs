@@ -1,12 +1,16 @@
 mod cli;
+mod config;
 mod http_ingest;
+mod metrics;
+mod sinks;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
@@ -20,18 +24,26 @@ use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
 use floe_node_core::generator;
 use floe_node_core::kafka_connector::{KafkaConnector, KafkaConnectorConfig};
+use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreConnectorConfig};
 use floe_node_core::planner::{
     PlannedMaterializedView, camel_case_schema, plan_materialized_views,
 };
+use floe_node_core::postgres_cdc_connector::{PostgresCdcConnector, PostgresCdcConnectorConfig};
 use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
 use floe_storage::MaterializedViewMetadata;
+use futures::future::select_all;
+use slatedb::config::{CompactorOptions, Settings};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::config::{
+    ConnectorConfig, apply_connector_properties, load_config, normalize_connectors, normalize_sinks,
+};
 
 static INGEST_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +51,32 @@ static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const INGEST_LOG_SAMPLE_EVERY: u64 = 512;
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
+const SLATEDB_CONFIG_ENV: &str = "FLOE_SLATEDB_CONFIG";
+const SLATEDB_ENV_PREFIX_ENV: &str = "FLOE_SLATEDB_ENV_PREFIX";
+const DEFAULT_SLATEDB_ENV_PREFIX: &str = "SLATEDB_";
+
+struct ConnectorQueue {
+    name: String,
+    receiver: core_source::SourceEventReceiver,
+    pending: VecDeque<core_source::SourceEvent>,
+    closed: bool,
+}
+
+struct BatchSelection {
+    batch: Vec<core_source::SourceEvent>,
+    per_connector_counts: HashMap<String, usize>,
+}
+
+impl ConnectorQueue {
+    fn new(name: impl Into<String>, receiver: core_source::SourceEventReceiver) -> Self {
+        Self {
+            name: name.into(),
+            receiver,
+            pending: VecDeque::new(),
+            closed: false,
+        }
+    }
+}
 
 use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
 use floe_node_core::source as core_source;
@@ -48,6 +86,7 @@ use http_ingest::HttpIngestConfig;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    metrics::init();
     let cli = cli::Cli::parse();
     let run_args = match cli.command {
         cli::Command::Run(args) => args,
@@ -63,17 +102,32 @@ async fn main() -> anyhow::Result<()> {
             "--kafka-topics is required when --kafka-brokers is set"
         ));
     }
-    if run_args.kafka_brokers.is_some() && run_args.input_file.is_some() {
-        return Err(anyhow::anyhow!(
-            "--kafka-brokers cannot be combined with --input-file"
-        ));
-    }
+
+    let config = if let Some(path) = run_args.config.as_deref() {
+        Some(load_config(path)?)
+    } else {
+        None
+    };
+
+    let (connector_specs, sink_specs) = if let Some(config) = config {
+        let connectors = normalize_connectors(config.connectors)?;
+        if connectors.is_empty() {
+            return Err(anyhow!("config must declare at least one connector"));
+        }
+        let sinks = normalize_sinks(config.sinks)?;
+        (connectors, sinks)
+    } else {
+        let connectors = normalize_connectors(connectors_from_cli(&run_args))?;
+        (connectors, Vec::new())
+    };
 
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(floe_node_core::generator::definitions()?);
+    apply_connector_properties(&mut source_registry, &connector_specs);
     let available_sources = available_sources_from_registry(&source_registry);
 
-    let storage = server::init_storage().await?;
+    let slate_settings = load_slatedb_settings(&run_args)?;
+    let storage = server::init_storage(slate_settings).await?;
     let db = storage.db();
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
     let stored_views = storage
@@ -106,7 +160,10 @@ async fn main() -> anyhow::Result<()> {
                 .upsert_materialized_view(metadata)
                 .await
                 .with_context(|| {
-                    format!("persist materialized view definition for '{}'", definition.name())
+                    format!(
+                        "persist materialized view definition for '{}'",
+                        definition.name()
+                    )
                 })?;
             materialized_view_map.insert(name, definition);
         }
@@ -175,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
+    let event_watermark = Arc::new(AtomicI64::new(-1));
     let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let graph_cancel = CancellationToken::new();
     let cancel_for_monitor = graph_cancel.clone();
@@ -214,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
                 mv_retention,
+                watermark: Arc::clone(&event_watermark),
             })
             .await
             .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
@@ -234,155 +293,238 @@ async fn main() -> anyhow::Result<()> {
     let queue_capacity = run_args.ingest_queue_capacity;
     let max_batch = run_args.ingest_batch_size;
     let max_batch_per_source = run_args.ingest_batch_per_source;
-    let (event_tx, event_rx) = core_source::channel(queue_capacity);
-
-    let generator_config = floe_node_core::generator::Config {
-        events_per_second: run_args.events_per_second,
-        max_events: run_args.max_events,
-    };
+    let max_batch_per_connector = run_args.ingest_batch_per_connector;
 
     let connector_cancel = CancellationToken::new();
+    let connector_count = connector_specs.len();
+    let per_connector_queue_capacity = (queue_capacity / connector_count).max(1);
 
-    let http_ingest_handle: Option<JoinHandle<()>> = if let Some(port) = run_args.http_port {
-        let sender = event_tx.clone();
+    let mut connector_handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut connector_queues: Vec<ConnectorQueue> = Vec::new();
+    let definitions = source_registry.definitions().to_vec();
+
+    for connector in connector_specs {
+        let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
+        connector_queues.push(ConnectorQueue::new(connector.name.clone(), receiver));
         let cancel = connector_cancel.clone();
-        let config = HttpIngestConfig {
-            host: run_args.http_host.clone(),
-            port,
-            default_source: run_args.http_source.clone(),
-        };
-        Some(tokio::spawn(async move {
-            if let Err(err) = http_ingest::run_http_ingest(config, sender, cancel).await {
-                tracing::error!(error = %err, "HTTP ingest server failed");
-            }
-        }))
-    } else {
-        None
-    };
-
-    let generator_handle: JoinHandle<()> = {
-        let sender = event_tx.clone();
-        let cancel = connector_cancel.clone();
-        let input_file = run_args.input_file.clone();
-        let input_source = run_args.input_source.clone();
-        let kafka_brokers = run_args.kafka_brokers.clone();
-        let kafka_topics = run_args.kafka_topics.clone();
-        let kafka_group_id = run_args.kafka_group_id.clone();
-        let kafka_default_source = run_args.kafka_default_source.clone();
-        let kafka_poll_ms = run_args.kafka_poll_ms;
-        let kafka_max_messages = run_args.kafka_max_messages;
-        let definitions = source_registry.definitions().to_vec();
-        tokio::spawn(async move {
-            if let Some(brokers) = kafka_brokers {
-                let definitions = definitions.clone();
-                let config = KafkaConnectorConfig {
-                    brokers,
-                    topics: kafka_topics,
-                    group_id: kafka_group_id,
-                    default_source: kafka_default_source,
-                    poll_timeout: Duration::from_millis(kafka_poll_ms),
-                    max_messages_per_tick: kafka_max_messages,
+        match connector.config {
+            ConnectorConfig::Http {
+                host,
+                port,
+                default_source,
+                ..
+            } => {
+                let config = HttpIngestConfig {
+                    host: host.unwrap_or_else(|| run_args.http_host.clone()),
+                    port,
+                    default_source,
                 };
-                let mut connector = match KafkaConnector::new(config, definitions) {
-                    Ok(connector) => connector,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Kafka connector config invalid");
-                        return;
+                connector_handles.push(tokio::spawn(async move {
+                    if let Err(err) = http_ingest::run_http_ingest(config, sender, cancel).await {
+                        tracing::error!(error = %err, "HTTP ingest server failed");
                     }
-                };
-                let ctx = ConnectorContext::new(sender);
-                if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
-                    tracing::error!(error = %err, "Kafka connector failed");
-                }
-                return;
+                }));
             }
-
-            if let Some(path) = input_file {
+            ConnectorConfig::Kafka {
+                brokers,
+                topics,
+                group_id,
+                default_source,
+                poll_ms,
+                max_messages_per_tick,
+                ..
+            } => {
+                let group_id = group_id.unwrap_or_else(|| run_args.kafka_group_id.clone());
+                let poll_timeout = Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms));
+                let max_messages_per_tick =
+                    max_messages_per_tick.unwrap_or(run_args.kafka_max_messages);
                 let definitions = definitions.clone();
-                let config = FileConnectorConfig {
-                    path: path.into(),
-                    default_source: input_source,
-                };
-                let mut connector = FileConnector::new(config, definitions);
-                let ctx = ConnectorContext::new(sender);
-                if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
-                    tracing::error!(error = %err, "File connector failed");
-                }
-                return;
-            }
-
-            let mut connector =
-                match floe_node_core::generator::NexmarkConnector::new(generator_config) {
-                    Ok(connector) => connector,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Nexmark connector config invalid");
-                        return;
+                connector_handles.push(tokio::spawn(async move {
+                    let config = KafkaConnectorConfig {
+                        brokers,
+                        topics,
+                        group_id,
+                        default_source,
+                        poll_timeout,
+                        max_messages_per_tick,
+                    };
+                    let mut connector = match KafkaConnector::new(config, definitions) {
+                        Ok(connector) => connector,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Kafka connector config invalid");
+                            return;
+                        }
+                    };
+                    let ctx = ConnectorContext::new(sender);
+                    if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                        tracing::error!(error = %err, "Kafka connector failed");
                     }
-                };
-            let ctx = ConnectorContext::new(sender);
-            if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
-                tracing::error!(error = %err, "Nexmark connector failed");
+                }));
             }
-        })
-    };
-
-    let sender_for_metrics = event_tx.clone();
+            ConnectorConfig::File {
+                path,
+                default_source,
+                ..
+            } => {
+                let definitions = definitions.clone();
+                connector_handles.push(tokio::spawn(async move {
+                    let config = FileConnectorConfig {
+                        path: path.into(),
+                        default_source,
+                    };
+                    let mut connector = FileConnector::new(config, definitions);
+                    let ctx = ConnectorContext::new(sender);
+                    if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                        tracing::error!(error = %err, "File connector failed");
+                    }
+                }));
+            }
+            ConnectorConfig::Generator {
+                events_per_second,
+                max_events,
+                ..
+            } => {
+                let events_per_second = events_per_second.unwrap_or(run_args.events_per_second);
+                let max_events = max_events.or(run_args.max_events);
+                let generator_config = floe_node_core::generator::Config {
+                    events_per_second,
+                    max_events,
+                };
+                connector_handles.push(tokio::spawn(async move {
+                    let mut connector =
+                        match floe_node_core::generator::NexmarkConnector::new(generator_config) {
+                            Ok(connector) => connector,
+                            Err(err) => {
+                                tracing::error!(error = %err, "Nexmark connector config invalid");
+                                return;
+                            }
+                        };
+                    let ctx = ConnectorContext::new(sender);
+                    if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                        tracing::error!(error = %err, "Nexmark connector failed");
+                    }
+                }));
+            }
+            ConnectorConfig::ObjectStore {
+                url,
+                default_source,
+                ..
+            } => {
+                let definitions = definitions.clone();
+                connector_handles.push(tokio::spawn(async move {
+                    let config = ObjectStoreConnectorConfig {
+                        url,
+                        default_source,
+                    };
+                    let mut connector = ObjectStoreConnector::new(config, definitions);
+                    let ctx = ConnectorContext::new(sender);
+                    if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                        tracing::error!(error = %err, "Object store connector failed");
+                    }
+                }));
+            }
+            ConnectorConfig::PostgresCdc {
+                connection,
+                slot,
+                poll_ms,
+                max_changes,
+                default_schema,
+                include_tables,
+                include_schema_in_source,
+                ..
+            } => {
+                let poll_interval = Duration::from_millis(poll_ms.unwrap_or(1000));
+                let max_changes = max_changes.unwrap_or(1000);
+                let default_schema = default_schema.unwrap_or_else(|| "public".to_string());
+                let include_schema_in_source = include_schema_in_source.unwrap_or(false);
+                let definitions = definitions.clone();
+                connector_handles.push(tokio::spawn(async move {
+                    let config = PostgresCdcConnectorConfig {
+                        connection_string: connection,
+                        slot,
+                        poll_interval,
+                        max_changes,
+                        default_schema,
+                        include_tables,
+                        include_schema_in_source,
+                    };
+                    let mut connector = match PostgresCdcConnector::new(config, definitions) {
+                        Ok(connector) => connector,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Postgres CDC connector config invalid");
+                            return;
+                        }
+                    };
+                    let ctx = ConnectorContext::new(sender);
+                    if let Err(err) = run_connector(&mut connector, &ctx, cancel).await {
+                        tracing::error!(error = %err, "Postgres CDC connector failed");
+                    }
+                }));
+            }
+        }
+    }
     let outer_for_task = Arc::clone(&outer_registry);
     let decoder_for_task = Arc::clone(&decoder_registry);
+    let watermark_for_task = Arc::clone(&event_watermark);
+    let mv_for_task = Arc::clone(&mv_registry);
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
-        let mut rx = event_rx;
-        let mut pending: VecDeque<core_source::SourceEvent> = VecDeque::new();
+        let mut connector_queues = connector_queues;
+        let mut next_connector = 0usize;
         let mut epoch: u64 = 0;
         loop {
-            if pending.is_empty() {
-                match rx.recv().await {
-                    Some(event) => pending.push_back(event),
-                    None => break,
+            if connector_queues.is_empty() {
+                break;
+            }
+            if connector_queues
+                .iter()
+                .all(|queue| queue.pending.is_empty())
+            {
+                if !recv_from_any(&mut connector_queues).await {
+                    break;
                 }
             }
+            drain_connectors(&mut connector_queues, per_connector_queue_capacity);
 
-            while pending.len() < queue_capacity {
-                match rx.try_recv() {
-                    Ok(event) => pending.push_back(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
-                }
-            }
-
-            let mut batch = Vec::with_capacity(max_batch);
-            let mut per_source_counts: HashMap<String, usize> = HashMap::new();
-            let mut remaining: VecDeque<core_source::SourceEvent> = VecDeque::new();
-            while let Some(event) = pending.pop_front() {
-                if batch.len() >= max_batch {
-                    remaining.push_back(event);
-                    continue;
-                }
-                let source = event.source();
-                let count = per_source_counts.entry(source.to_string()).or_insert(0);
-                if *count >= max_batch_per_source {
-                    remaining.push_back(event);
-                    continue;
-                }
-                *count += 1;
-                batch.push(event);
-            }
-            pending = remaining;
+            let BatchSelection {
+                batch,
+                per_connector_counts,
+            } = build_batch(
+                &mut connector_queues,
+                next_connector,
+                max_batch,
+                max_batch_per_source,
+                max_batch_per_connector,
+            );
 
             if batch.is_empty() {
                 continue;
             }
 
+            next_connector = if connector_queues.is_empty() {
+                0
+            } else {
+                (next_connector + 1) % connector_queues.len()
+            };
+
+            let pending_epoch = epoch.saturating_add(1);
             let batch_len = batch.len();
             let decode_start = Instant::now();
             let mut decoded_rows = Vec::with_capacity(batch_len);
             let mut decoded_counts: HashMap<String, usize> = HashMap::new();
+            let mut batch_max_event_ts: Option<u64> = None;
+            let decode_span = tracing::debug_span!(
+                "ingest_decode",
+                epoch = pending_epoch,
+                raw_batch_size = batch_len
+            );
+            let _decode_guard = decode_span.enter();
             for event in batch {
                 let source_name = event.source().to_string();
                 let decoder = match decoder_for_task.get(&source_name) {
                     Some(decoder) => decoder,
                     None => continue,
                 };
-                let (row, _ts) = match decoder.decode(&event) {
+                let (row, event_ts) = match decoder.decode(&event) {
                     Ok(result) => result,
                     Err(err) => {
                         tracing::warn!(
@@ -393,10 +535,19 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                if let Some(ts) = event_ts {
+                    batch_max_event_ts = Some(batch_max_event_ts.map_or(ts, |max| max.max(ts)));
+                }
                 *decoded_counts.entry(source_name.clone()).or_insert(0) += 1;
                 decoded_rows.push((source_name, row));
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
+            metrics::observe_decode_latency_ms(decode_latency_ms);
+            tracing::debug!(
+                decoded_rows = decoded_rows.len(),
+                latency_ms = decode_latency_ms,
+                "decoded ingest batch"
+            );
 
             if decoded_rows.is_empty() {
                 continue;
@@ -435,8 +586,25 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            epoch = epoch.saturating_add(1);
+            epoch = pending_epoch;
+            if let Some(batch_watermark) = batch_max_event_ts {
+                let watermark_value = i64::try_from(batch_watermark).unwrap_or(i64::MAX);
+                let prev = watermark_for_task.load(Ordering::Relaxed);
+                let next = prev.max(watermark_value);
+                if next != prev {
+                    watermark_for_task.store(next, Ordering::Relaxed);
+                }
+                if next >= 0 {
+                    mv_for_task.update_watermark_all(next as u64);
+                }
+            }
             let tick_start = Instant::now();
+            let tick_span = tracing::info_span!(
+                "connector_tick",
+                epoch,
+                watermark = watermark_for_task.load(Ordering::Relaxed),
+            );
+            let _tick_guard = tick_span.enter();
             // Advance frontier for all sources this epoch, even if they had no rows.
             if let Err(err) = registry.tick_all().await {
                 tracing::error!(epoch, error = %err, "failed to tick outer streams");
@@ -444,20 +612,25 @@ async fn main() -> anyhow::Result<()> {
                 tracing::debug!(epoch, "advanced all source frontiers");
             }
             let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
+            metrics::observe_tick_latency_ms(tick_latency_ms);
+            tracing::debug!(tick_latency_ms, "connector tick completed");
 
+            let queue_depth: usize = connector_queues
+                .iter()
+                .map(|queue| queue.pending.len() + queue.receiver.len())
+                .sum();
+            metrics::record_ingest_queue_depth(queue_depth);
             if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
-                let queue_depth = queue_capacity
-                    .saturating_sub(sender_for_metrics.capacity())
-                    .saturating_add(pending.len());
                 tracing::info!(
                     epoch,
                     queue_depth,
                     batch_size = batch_len,
-                    pending = pending.len(),
+                    pending = queue_depth,
                     decoded_rows = decoded_rows_len,
                     decode_latency_ms,
                     tick_latency_ms,
                     per_source = ?decoded_counts,
+                    per_connector = ?per_connector_counts,
                     "ingest batch metrics"
                 );
             }
@@ -477,17 +650,33 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("register materialized view tables")?;
 
+    let sink_handles = sinks::spawn_sinks(
+        sink_specs,
+        query.clone(),
+        Arc::clone(&mv_registry),
+        connector_cancel.clone(),
+    );
+
     let server_result = server::run(query, Arc::clone(&mv_registry)).await;
 
     connector_cancel.cancel();
-    drop(event_tx);
     executor_handle.abort();
     task_monitor.abort();
 
-    if let Err(err) = generator_handle.await
-        && !err.is_cancelled()
-    {
-        tracing::error!(error = %err, "generator task joined with error");
+    for handle in connector_handles {
+        if let Err(err) = handle.await
+            && !err.is_cancelled()
+        {
+            tracing::error!(error = %err, "connector task joined with error");
+        }
+    }
+
+    for handle in sink_handles {
+        if let Err(err) = handle.await
+            && !err.is_cancelled()
+        {
+            tracing::error!(error = %err, "sink task joined with error");
+        }
     }
 
     if let Err(err) = executor_handle.await
@@ -502,15 +691,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %err, "graph monitor task joined with error");
     }
 
-    if let Some(handle) = http_ingest_handle {
-        handle.abort();
-        if let Err(err) = handle.await
-            && !err.is_cancelled()
-        {
-            tracing::error!(error = %err, "http ingest task joined with error");
-        }
-    }
-
     server_result
 }
 
@@ -520,6 +700,134 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+fn load_slatedb_settings(args: &cli::RunArgs) -> anyhow::Result<Option<Settings>> {
+    let config_path = args
+        .slatedb_config
+        .clone()
+        .or_else(|| std::env::var(SLATEDB_CONFIG_ENV).ok());
+
+    let mut settings = if let Some(path) = config_path {
+        Some(
+            Settings::from_file(&path)
+                .map_err(|err| anyhow!("failed to load SlateDB settings from {path}: {err}"))?,
+        )
+    } else {
+        let prefix = args
+            .slatedb_env_prefix
+            .clone()
+            .or_else(|| std::env::var(SLATEDB_ENV_PREFIX_ENV).ok())
+            .unwrap_or_else(|| DEFAULT_SLATEDB_ENV_PREFIX.to_string());
+        let prefix = prefix.trim();
+        if !prefix.is_empty() && env_has_prefix(prefix) {
+            Some(Settings::from_env(prefix).map_err(|err| {
+                anyhow!("failed to load SlateDB settings from env prefix '{prefix}': {err}")
+            })?)
+        } else {
+            None
+        }
+    };
+
+    if settings.is_none() && slatedb_overrides_present(args) {
+        settings = Some(Settings::default());
+    }
+    if let Some(settings) = settings.as_mut() {
+        apply_slatedb_overrides(settings, args);
+    }
+    Ok(settings)
+}
+
+fn env_has_prefix(prefix: &str) -> bool {
+    std::env::vars().any(|(key, _)| key.starts_with(prefix))
+}
+
+fn slatedb_overrides_present(args: &cli::RunArgs) -> bool {
+    args.slatedb_flush_interval_ms.is_some()
+        || args.slatedb_l0_sst_size_bytes.is_some()
+        || args.slatedb_max_unflushed_bytes.is_some()
+        || args.slatedb_compaction_max_sst_bytes.is_some()
+        || args.slatedb_compaction_max_concurrent.is_some()
+        || args.slatedb_cache_dir.is_some()
+        || args.slatedb_cache_max_bytes.is_some()
+        || args.slatedb_cache_part_bytes.is_some()
+        || args.slatedb_cache_puts
+}
+
+fn apply_slatedb_overrides(settings: &mut Settings, args: &cli::RunArgs) {
+    if let Some(interval_ms) = args.slatedb_flush_interval_ms {
+        settings.flush_interval = if interval_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(interval_ms))
+        };
+    }
+    if let Some(bytes) = args.slatedb_l0_sst_size_bytes {
+        settings.l0_sst_size_bytes = bytes;
+    }
+    if let Some(bytes) = args.slatedb_max_unflushed_bytes {
+        settings.max_unflushed_bytes = bytes;
+    }
+    if let Some(max_sst_size) = args.slatedb_compaction_max_sst_bytes {
+        let compactor = settings
+            .compactor_options
+            .get_or_insert_with(CompactorOptions::default);
+        compactor.max_sst_size = max_sst_size;
+    }
+    if let Some(max_concurrent) = args.slatedb_compaction_max_concurrent {
+        let compactor = settings
+            .compactor_options
+            .get_or_insert_with(CompactorOptions::default);
+        compactor.max_concurrent_compactions = max_concurrent;
+    }
+    if let Some(dir) = args.slatedb_cache_dir.as_ref() {
+        settings.object_store_cache_options.root_folder = Some(PathBuf::from(dir));
+    }
+    if let Some(max_bytes) = args.slatedb_cache_max_bytes {
+        settings.object_store_cache_options.max_cache_size_bytes = Some(max_bytes);
+    }
+    if let Some(part_bytes) = args.slatedb_cache_part_bytes {
+        settings.object_store_cache_options.part_size_bytes = part_bytes;
+    }
+    if args.slatedb_cache_puts {
+        settings.object_store_cache_options.cache_puts = true;
+    }
+}
+
+fn connectors_from_cli(args: &cli::RunArgs) -> Vec<ConnectorConfig> {
+    let mut connectors = Vec::new();
+    if let Some(port) = args.http_port {
+        connectors.push(ConnectorConfig::Http {
+            name: None,
+            host: Some(args.http_host.clone()),
+            port,
+            default_source: args.http_source.clone(),
+        });
+    }
+    if let Some(brokers) = args.kafka_brokers.clone() {
+        connectors.push(ConnectorConfig::Kafka {
+            name: None,
+            brokers,
+            topics: args.kafka_topics.clone(),
+            group_id: Some(args.kafka_group_id.clone()),
+            default_source: args.kafka_default_source.clone(),
+            poll_ms: Some(args.kafka_poll_ms),
+            max_messages_per_tick: Some(args.kafka_max_messages),
+        });
+    }
+    if let Some(path) = args.input_file.clone() {
+        connectors.push(ConnectorConfig::File {
+            name: None,
+            path,
+            default_source: args.input_source.clone(),
+        });
+    }
+    connectors.push(ConnectorConfig::Generator {
+        name: None,
+        events_per_second: Some(args.events_per_second),
+        max_events: args.max_events,
+    });
+    connectors
+}
+
 fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;
@@ -527,6 +835,143 @@ fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     counter
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(every)
+}
+
+async fn recv_from_any(queues: &mut Vec<ConnectorQueue>) -> bool {
+    if queues.is_empty() {
+        return false;
+    }
+    let (event, index) = {
+        let futures: Vec<_> = queues
+            .iter_mut()
+            .map(|queue| Box::pin(queue.receiver.recv()))
+            .collect();
+        let (event, index, _remaining) = select_all(futures).await;
+        (event, index)
+    };
+    match event {
+        Some(event) => {
+            queues[index].pending.push_back(event);
+        }
+        None => {
+            queues[index].closed = true;
+        }
+    }
+    queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
+    !queues.is_empty()
+}
+
+fn drain_connectors(queues: &mut Vec<ConnectorQueue>, capacity: usize) {
+    for queue in queues.iter_mut() {
+        while queue.pending.len() < capacity {
+            match queue.receiver.try_recv() {
+                Ok(event) => queue.pending.push_back(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    queue.closed = true;
+                    break;
+                }
+            }
+        }
+    }
+    queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
+}
+
+fn build_batch(
+    queues: &mut Vec<ConnectorQueue>,
+    start_index: usize,
+    max_batch: usize,
+    max_per_source: usize,
+    max_per_connector: usize,
+) -> BatchSelection {
+    let mut batch = Vec::with_capacity(max_batch);
+    let mut per_source_counts: HashMap<String, usize> = HashMap::new();
+    let mut per_connector_counts: HashMap<String, usize> = HashMap::new();
+    let mut deferred: Vec<VecDeque<core_source::SourceEvent>> = vec![VecDeque::new(); queues.len()];
+    let connector_count = queues.len();
+    for step in 0..connector_count {
+        let idx = (start_index + step) % connector_count;
+        let queue = &mut queues[idx];
+        let deferred_queue = &mut deferred[idx];
+        let per_connector = per_connector_counts.entry(queue.name.clone()).or_insert(0);
+        while *per_connector < max_per_connector && batch.len() < max_batch {
+            let Some(event) = queue.pending.pop_front() else {
+                break;
+            };
+            let source = event.source();
+            let count = per_source_counts.entry(source.to_string()).or_insert(0);
+            if *count >= max_per_source {
+                deferred_queue.push_back(event);
+                continue;
+            }
+            *count += 1;
+            *per_connector += 1;
+            batch.push(event);
+        }
+    }
+    for (queue, mut deferred_queue) in queues.iter_mut().zip(deferred) {
+        if !deferred_queue.is_empty() {
+            deferred_queue.append(&mut queue.pending);
+            queue.pending = deferred_queue;
+        }
+    }
+
+    BatchSelection {
+        batch,
+        per_connector_counts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(source: &str, id: i64) -> core_source::SourceEvent {
+        core_source::SourceEvent::new(source, json!({ "id": id }))
+    }
+
+    #[test]
+    fn build_batch_limits_per_connector() {
+        let (_tx_a, rx_a) = core_source::channel(8);
+        let (_tx_b, rx_b) = core_source::channel(8);
+        let mut queues = vec![
+            ConnectorQueue {
+                name: "a".to_string(),
+                receiver: rx_a,
+                pending: VecDeque::from([event("s1", 1), event("s1", 2)]),
+                closed: false,
+            },
+            ConnectorQueue {
+                name: "b".to_string(),
+                receiver: rx_b,
+                pending: VecDeque::from([event("s2", 3), event("s2", 4)]),
+                closed: false,
+            },
+        ];
+
+        let selection = build_batch(&mut queues, 0, 10, 10, 1);
+        assert_eq!(selection.batch.len(), 2);
+        assert_eq!(selection.per_connector_counts.get("a"), Some(&1));
+        assert_eq!(selection.per_connector_counts.get("b"), Some(&1));
+        assert_eq!(queues[0].pending.len(), 1);
+        assert_eq!(queues[1].pending.len(), 1);
+    }
+
+    #[test]
+    fn build_batch_limits_per_source() {
+        let (_tx, rx) = core_source::channel(8);
+        let mut queues = vec![ConnectorQueue {
+            name: "a".to_string(),
+            receiver: rx,
+            pending: VecDeque::from([event("s1", 1), event("s1", 2), event("s1", 3)]),
+            closed: false,
+        }];
+
+        let selection = build_batch(&mut queues, 0, 10, 1, 10);
+        assert_eq!(selection.batch.len(), 1);
+        assert_eq!(queues[0].pending.len(), 2);
+    }
 }
 
 async fn register_materialized_view_tables(

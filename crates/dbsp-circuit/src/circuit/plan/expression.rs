@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
 use datafusion::scalar::ScalarValue as DfScalarValue;
 use datafusion_common::DFSchema;
@@ -162,14 +163,38 @@ impl DbspExpression {
                 let to_type = DbspScalarType::try_from_arrow(&cast.data_type)?;
                 Self::validate_cast(&from_type, &to_type)
             }
-            Expr::TryCast(_) => bail!("TRY_CAST is not supported"),
-            Expr::Between(_) => bail!("BETWEEN expressions are not supported yet"),
-            Expr::ScalarFunction(_) => bail!("scalar functions are not supported yet"),
+            Expr::TryCast(cast) => {
+                Self::validate_supported(cast.expr.as_ref(), df_schema)?;
+                let from_type = Self::infer_type(cast.expr.as_ref(), df_schema)?;
+                let to_type = DbspScalarType::try_from_arrow(&cast.data_type)?;
+                Self::validate_cast(&from_type, &to_type)
+            }
+            Expr::Between(between) => {
+                Self::validate_supported(between.expr.as_ref(), df_schema)?;
+                Self::validate_supported(between.low.as_ref(), df_schema)?;
+                Self::validate_supported(between.high.as_ref(), df_schema)?;
+                let expr_type = Self::infer_type(between.expr.as_ref(), df_schema)?;
+                let low_type = Self::infer_type(between.low.as_ref(), df_schema)?;
+                let high_type = Self::infer_type(between.high.as_ref(), df_schema)?;
+                Self::ensure_comparable(&expr_type, &low_type)?;
+                Self::ensure_comparable(&expr_type, &high_type)?;
+                Ok(())
+            }
+            Expr::ScalarFunction(func) => Self::validate_scalar_function(func, df_schema),
             Expr::AggregateFunction(_) => {
                 bail!("aggregate functions are not expected in this context")
             }
             Expr::WindowFunction(_) => bail!("window functions are not supported in expressions"),
-            Expr::InList(_) => bail!("IN lists are not supported"),
+            Expr::InList(in_list) => {
+                Self::validate_supported(in_list.expr.as_ref(), df_schema)?;
+                let expr_type = Self::infer_type(in_list.expr.as_ref(), df_schema)?;
+                for item in &in_list.list {
+                    Self::validate_supported(item, df_schema)?;
+                    let item_type = Self::infer_type(item, df_schema)?;
+                    Self::ensure_comparable(&expr_type, &item_type)?;
+                }
+                Ok(())
+            }
             Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_) => {
                 bail!("subqueries are not supported in DBSP expressions")
             }
@@ -234,13 +259,87 @@ impl DbspExpression {
 
         match (from, to) {
             (DbspScalarType::Int64, DbspScalarType::TimestampMillis)
-            | (DbspScalarType::TimestampMillis, DbspScalarType::Int64) => Ok(()),
+            | (DbspScalarType::TimestampMillis, DbspScalarType::Int64)
+            | (DbspScalarType::Utf8, DbspScalarType::Int64)
+            | (DbspScalarType::Utf8, DbspScalarType::TimestampMillis)
+            | (DbspScalarType::Int64, DbspScalarType::Utf8)
+            | (DbspScalarType::TimestampMillis, DbspScalarType::Utf8) => Ok(()),
             _ => bail!(
-                "casts are restricted to Int64 ↔ TimestampMillis conversions (attempted {} -> {})",
+                "casts are restricted to Int64/Utf8/TimestampMillis conversions (attempted {} -> {})",
                 from.name(),
                 to.name()
             ),
         }
+    }
+
+    fn validate_scalar_function(func: &ScalarFunction, df_schema: &DFSchema) -> Result<()> {
+        let name = func.name().to_ascii_lowercase();
+        match name.as_str() {
+            "lower" | "upper" => {
+                Self::ensure_arg_count(func, 1)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                let arg_type = Self::infer_type(&func.args[0], df_schema)?;
+                Self::ensure_string(&arg_type, "lower/upper require Utf8 input")
+            }
+            "length" | "char_length" | "character_length" => {
+                Self::ensure_arg_count(func, 1)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                let arg_type = Self::infer_type(&func.args[0], df_schema)?;
+                Self::ensure_string(&arg_type, "length requires Utf8 input")
+            }
+            "abs" => {
+                Self::ensure_arg_count(func, 1)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                let arg_type = Self::infer_type(&func.args[0], df_schema)?;
+                Self::ensure_int64(&arg_type, "abs requires Int64 input")
+            }
+            "coalesce" => {
+                if func.args.is_empty() {
+                    bail!("coalesce requires at least one argument");
+                }
+                let mut base: Option<DbspScalarType> = None;
+                for arg in &func.args {
+                    Self::validate_supported(arg, df_schema)?;
+                    let arg_type = Self::infer_type(arg, df_schema)?;
+                    match &base {
+                        Some(base_type) => Self::ensure_comparable(base_type, &arg_type)?,
+                        None => base = Some(arg_type),
+                    }
+                }
+                Ok(())
+            }
+            "nullif" => {
+                Self::ensure_arg_count(func, 2)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                Self::validate_supported(&func.args[1], df_schema)?;
+                let left = Self::infer_type(&func.args[0], df_schema)?;
+                let right = Self::infer_type(&func.args[1], df_schema)?;
+                Self::ensure_comparable(&left, &right)
+            }
+            "concat" => {
+                if func.args.is_empty() {
+                    bail!("concat requires at least one argument");
+                }
+                for arg in &func.args {
+                    Self::validate_supported(arg, df_schema)?;
+                    let arg_type = Self::infer_type(arg, df_schema)?;
+                    Self::ensure_string(&arg_type, "concat requires Utf8 input")?;
+                }
+                Ok(())
+            }
+            _ => bail!("scalar function '{name}' is not supported"),
+        }
+    }
+
+    fn ensure_arg_count(func: &ScalarFunction, expected: usize) -> Result<()> {
+        if func.args.len() != expected {
+            bail!(
+                "scalar function '{}' expects {expected} arguments (found {})",
+                func.name(),
+                func.args.len()
+            );
+        }
+        Ok(())
     }
 
     fn validate_like_operand(pattern_expr: &Expr) -> Result<()> {

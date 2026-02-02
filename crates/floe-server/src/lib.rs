@@ -14,6 +14,7 @@ use floe_executor::{FloeQueryContext, MaterializedViewRegistry};
 use floe_storage::SlateCatalog;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::tokio::process_socket;
+use slatedb::config::Settings;
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -23,16 +24,16 @@ use protocol::FloeServerFactory;
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
 
-pub async fn init_storage() -> Result<Arc<SlateCatalog>> {
+pub async fn init_storage(settings: Option<Settings>) -> Result<Arc<SlateCatalog>> {
     match std::env::var(DATA_ENV) {
         Ok(dir) => {
             let path = PathBuf::from(dir);
-            SlateCatalog::with_filesystem(path)
+            SlateCatalog::with_filesystem_with_settings(path, settings)
                 .await
                 .map(Arc::new)
                 .context("failed to initialise SlateDB filesystem catalog")
         }
-        Err(_) => SlateCatalog::in_memory()
+        Err(_) => SlateCatalog::in_memory_with_settings(settings)
             .await
             .map(Arc::new)
             .context("failed to initialise SlateDB in-memory catalog"),

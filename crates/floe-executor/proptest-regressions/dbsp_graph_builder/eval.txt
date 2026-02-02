@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a0bab4a10fc8242238dcaa586362fb254be4bbf6299916b250acb4c8234ac459 # shrinks to expr = BinaryExpr(BinaryExpr { left: IsNotTrue(IsNull(BinaryExpr(BinaryExpr { left: Literal(Int64(-2791), None), op: Multiply, right: BinaryExpr(BinaryExpr { left: Literal(Int64(6994292451193748962), None), op: Minus, right: BinaryExpr(BinaryExpr { left: Literal(Int64(6601758714972825471), None), op: Multiply, right: Literal(Int64(7679015558718121385), None) }) }) }))), op: And, right: IsNotTrue(IsTrue(IsNotNull(BinaryExpr(BinaryExpr { left: BinaryExpr(BinaryExpr { left: BinaryExpr(BinaryExpr { left: Column(Column { relation: None, name: "a" }), op: Plus, right: Column(Column { relation: None, name: "b" }) }), op: Multiply, right: Column(Column { relation: None, name: "b" }) }), op: Multiply, right: BinaryExpr(BinaryExpr { left: Literal(Int64(NULL), None), op: Minus, right: Literal(Int64(NULL), None) }) })))) }), row = [Int64(7090259530288526974), Int64(-2466946727652224653), Boolean(NULL), Utf8(NULL)]

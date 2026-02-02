@@ -253,9 +253,7 @@ impl ExtendedQueryHandler for FloeExtendedHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let PreparedStatementKind::Management(statement) =
-            portal.statement.statement.kind()
-        {
+        if let PreparedStatementKind::Management(statement) = portal.statement.statement.kind() {
             return handle_management_statement(self.state.as_ref(), statement).await;
         }
 
@@ -286,7 +284,9 @@ fn render_sql_with_params(
     portal: &Portal<PreparedStatement>,
 ) -> PgWireResult<String> {
     let PreparedStatementKind::Query(statement) = prepared.kind() else {
-        return Err(user_error("management statements do not support parameters"));
+        return Err(user_error(
+            "management statements do not support parameters",
+        ));
     };
     let expected = prepared.parameter_count();
     if portal.parameter_len() != expected {

@@ -14,7 +14,7 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use serde::{Deserialize, Serialize};
-use slatedb::config::ScanOptions;
+use slatedb::config::{ScanOptions, Settings};
 use slatedb::{Db, Error as SlateError};
 use tokio::fs;
 
@@ -36,11 +36,7 @@ pub struct MaterializedViewMetadata {
 }
 
 impl MaterializedViewMetadata {
-    pub fn new(
-        name: impl Into<String>,
-        query: impl Into<String>,
-        if_not_exists: bool,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, query: impl Into<String>, if_not_exists: bool) -> Self {
         Self {
             name: name.into(),
             query: query.into(),
@@ -64,7 +60,7 @@ impl MaterializedViewMetadata {
 impl SlateCatalog {
     pub async fn in_memory() -> Result<Self> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        Self::with_object_store("in-memory", object_store).await
+        Self::with_object_store_with_settings("in-memory", object_store, None).await
     }
 
     pub async fn with_filesystem(root: impl AsRef<Path>) -> Result<Self> {
@@ -80,16 +76,57 @@ impl SlateCatalog {
             format!("failed to create local object store at {}", root.display())
         })?;
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
-        Self::with_object_store("floe", object_store).await
+        Self::with_object_store_with_settings("floe", object_store, None).await
+    }
+
+    pub async fn in_memory_with_settings(settings: Option<Settings>) -> Result<Self> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        Self::with_object_store_with_settings("in-memory", object_store, settings).await
+    }
+
+    pub async fn with_filesystem_with_settings(
+        root: impl AsRef<Path>,
+        settings: Option<Settings>,
+    ) -> Result<Self> {
+        let root: PathBuf = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root).await.with_context(|| {
+            format!(
+                "failed to create SlateDB root directory at {}",
+                root.display()
+            )
+        })?;
+
+        let object_store = LocalFileSystem::new_with_prefix(&root).with_context(|| {
+            format!("failed to create local object store at {}", root.display())
+        })?;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
+        Self::with_object_store_with_settings("floe", object_store, settings).await
     }
 
     pub async fn with_object_store(
         name: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        let db = Db::open(name.into(), object_store)
-            .await
-            .map_err(|err| anyhow!("unable to open SlateDB: {err}"))?;
+        Self::with_object_store_with_settings(name, object_store, None).await
+    }
+
+    pub async fn with_object_store_with_settings(
+        name: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        settings: Option<Settings>,
+    ) -> Result<Self> {
+        let builder = Db::builder(name.into(), object_store);
+        let db = match settings {
+            Some(settings) => builder
+                .with_settings(settings)
+                .build()
+                .await
+                .map_err(|err| anyhow!("unable to open SlateDB: {err}"))?,
+            None => builder
+                .build()
+                .await
+                .map_err(|err| anyhow!("unable to open SlateDB: {err}"))?,
+        };
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -198,10 +235,7 @@ impl SlateCatalog {
             })
     }
 
-    pub async fn materialized_view(
-        &self,
-        name: &str,
-    ) -> Result<Option<MaterializedViewMetadata>> {
+    pub async fn materialized_view(&self, name: &str) -> Result<Option<MaterializedViewMetadata>> {
         let key = mv_definition_key(name);
         let bytes = self.db.get(key).await.map_err(map_slate_err)?;
         if let Some(bytes) = bytes {
@@ -225,11 +259,7 @@ impl SlateCatalog {
             .collect()
     }
 
-    pub async fn save_materialized_view_schema(
-        &self,
-        name: &str,
-        schema: SchemaRef,
-    ) -> Result<()> {
+    pub async fn save_materialized_view_schema(&self, name: &str, schema: SchemaRef) -> Result<()> {
         let key = mv_schema_key(name);
         let mut payload = Vec::new();
         {
@@ -385,8 +415,7 @@ mod tests {
     #[tokio::test]
     async fn persists_materialized_view_metadata_and_schema() {
         let catalog = SlateCatalog::in_memory().await.expect("open catalog");
-        let metadata =
-            MaterializedViewMetadata::new("mv_meta", "SELECT 1 AS value", false);
+        let metadata = MaterializedViewMetadata::new("mv_meta", "SELECT 1 AS value", false);
         catalog
             .upsert_materialized_view(metadata.clone())
             .await

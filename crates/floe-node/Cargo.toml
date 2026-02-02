@@ -20,6 +20,13 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+rdkafka = { workspace = true }
+slatedb = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 slatedb = { workspace = true }

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
+use dbsp::handles::ZSetHandleView;
+use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
@@ -111,4 +113,60 @@ pub(crate) async fn wait_for_version(
     .await
     .context("timeout waiting for mv version")??;
     Ok(())
+}
+
+pub(crate) async fn rows_at_version(
+    registry: &MaterializedViewRegistry,
+    view: &str,
+    version: u64,
+) -> Result<Vec<Vec<i64>>> {
+    let handle = registry
+        .get(view)
+        .with_context(|| format!("materialized view handle for '{view}'"))?;
+    let state = handle
+        .dbsp_state()
+        .with_context(|| format!("materialized view '{view}' missing DBSP state"))?;
+    let handle_view = ZSetHandleView::new(
+        state.dictionary(),
+        state.table(),
+        state.namespace().to_string(),
+        version,
+    );
+    let snapshot = handle_view
+        .materialize()
+        .await
+        .with_context(|| format!("materialize view '{view}' at version {version}"))?;
+    let mut rows = Vec::new();
+    for (key, diff) in snapshot {
+        if diff <= 0 {
+            continue;
+        }
+        let decoded = decode_projected_row_key(&key)
+            .with_context(|| format!("decode row key for view '{view}'"))?;
+        let ints = row_values_to_ints(&decoded, 3)?;
+        for _ in 0..diff {
+            rows.push(ints.clone());
+        }
+    }
+    Ok(rows)
+}
+
+fn row_values_to_ints(values: &[ScalarValue], count: usize) -> Result<Vec<i64>> {
+    let mut out = Vec::with_capacity(count);
+    for value in values.iter().take(count) {
+        match value {
+            ScalarValue::Int64(Some(v)) => out.push(*v),
+            ScalarValue::Null => {
+                return Err(anyhow::anyhow!(
+                    "unexpected NULL value while decoding materialized view row"
+                ));
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unexpected ScalarValue while decoding row: {other:?}"
+                ));
+            }
+        }
+    }
+    Ok(out)
 }

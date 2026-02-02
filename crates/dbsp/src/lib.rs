@@ -11,7 +11,7 @@ pub mod circuit {
 
 pub use dbsp_runtime::{
     aggregate, algebra, collections, filter, handles, join, map, operators, relation_state, stream,
-    topk, topn,
+    topk, topn, union, window,
 };
 pub use dbsp_storage::storage;
 
@@ -39,6 +39,7 @@ pub use operators::join::JoinOp;
 pub use operators::map::MapOp;
 pub use operators::topk::TopKOp;
 pub use operators::topn::TopNOp;
+pub use operators::window::WindowKey;
 pub use relation_state::RelationState;
 pub use stream::{
     DeltaHandleStream, SnapshotHandleStream, Stream, StreamRetention, ZSetStream, delay,
@@ -51,3 +52,5 @@ pub use stream::{
 };
 pub use topk::DbspTopK;
 pub use topn::DbspTopN;
+pub use union::DbspUnion;
+pub use window::DbspWindowAggregate;

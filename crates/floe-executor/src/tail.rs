@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::encoding::decode_projected_row_key;
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
+use crate::metrics;
 use crate::mv::runtime::MaterializedView;
 use crate::stream_types::Row;
 use floe_sql_parser::{FloeStatement, parse_floe_statement};
@@ -126,6 +127,7 @@ pub async fn execute_tail<C>(
 where
     C: MvCatalog + ?Sized,
 {
+    crate::metrics::init();
     let _ = ctx;
     let mv = catalog
         .materialized_view(&params.mv_name)
@@ -206,13 +208,13 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     if let Some(as_of_version) = as_of {
         let _ = mv.handle_for(as_of_version)?;
         if with_snapshot {
-            emit_version(mv.as_ref(), &schema, as_of_version, tx).await?;
+            emit_version(mv.as_ref(), &schema, &mv_name, as_of_version, tx).await?;
         }
         last_emitted = as_of_version;
     } else if with_snapshot {
         let version =
             latest.ok_or_else(|| anyhow!("materialized view '{}' has no versions yet", mv_name))?;
-        emit_version(mv.as_ref(), &schema, version, tx).await?;
+        emit_version(mv.as_ref(), &schema, &mv_name, version, tx).await?;
         last_emitted = version;
     } else {
         last_emitted = latest.unwrap_or(-1);
@@ -222,7 +224,7 @@ async fn run_tail_task<M: MaterializedView + 'static>(
         let latest_now = mv.latest_version().unwrap_or(last_emitted);
         if latest_now > last_emitted {
             for version in last_emitted + 1..=latest_now {
-                emit_delta(mv.as_ref(), &schema, version, tx).await?;
+                emit_delta(mv.as_ref(), &schema, &mv_name, version, tx).await?;
                 last_emitted = version;
             }
             continue;
@@ -245,17 +247,28 @@ async fn run_tail_task<M: MaterializedView + 'static>(
 async fn emit_version<M: MaterializedView>(
     mv: &M,
     schema: &SchemaRef,
+    mv_name: &str,
     version: i64,
     tx: &mut mpsc::Sender<PgResult<TailBatch>>,
 ) -> PgResult<()> {
     let version_time = mv.version_time(version);
     let batches =
         materialize_snapshot_batches(mv, Arc::clone(schema), version, version_time).await?;
+    let emit_span = tracing::debug_span!(
+        "tail_emit",
+        mv = %mv_name,
+        version,
+        mode = "snapshot"
+    );
+    let _emit_guard = emit_span.enter();
     for batch in batches {
         let payload = TailBatch { version, ..batch };
+        let row_count = payload.batch.num_rows();
         if tx.send(Ok(payload)).await.is_err() {
             break;
         }
+        metrics::inc_tail_rows(row_count);
+        tracing::debug!(rows = row_count, "tail batch emitted");
     }
     Ok(())
 }
@@ -263,16 +276,27 @@ async fn emit_version<M: MaterializedView>(
 async fn emit_delta<M: MaterializedView>(
     mv: &M,
     schema: &SchemaRef,
+    mv_name: &str,
     version: i64,
     tx: &mut mpsc::Sender<PgResult<TailBatch>>,
 ) -> PgResult<()> {
     let version_time = mv.version_time(version);
     let batches = materialize_delta_batches(mv, Arc::clone(schema), version, version_time).await?;
+    let emit_span = tracing::debug_span!(
+        "tail_emit",
+        mv = %mv_name,
+        version,
+        mode = "delta"
+    );
+    let _emit_guard = emit_span.enter();
     for batch in batches {
         let payload = TailBatch { version, ..batch };
+        let row_count = payload.batch.num_rows();
         if tx.send(Ok(payload)).await.is_err() {
             break;
         }
+        metrics::inc_tail_rows(row_count);
+        tracing::debug!(rows = row_count, "tail batch emitted");
     }
     Ok(())
 }
@@ -448,7 +472,9 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-test", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view("mv_tail", StreamRetention::KeepLast { keep_last: 1 })
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail", build_schema());
@@ -509,7 +535,12 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-delta-ops", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_delta_ops", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_delta_ops",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_delta_ops", build_schema());
@@ -565,7 +596,12 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-delta-validate", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_delta_validate", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_delta_validate",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_delta_validate", build_schema());
@@ -644,7 +680,9 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-cancel", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_cancel", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view("mv_tail_cancel", StreamRetention::KeepLast { keep_last: 1 })
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_cancel", build_schema());
@@ -680,7 +718,12 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-asof-snap", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_asof_snap", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_asof_snap",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_asof_snap", build_schema());
@@ -716,7 +759,12 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-asof-no-snap", store).await.expect("db"));
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge.new_view("mv_tail_asof_no_snap", StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_asof_no_snap",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_tail_asof_no_snap", build_schema());

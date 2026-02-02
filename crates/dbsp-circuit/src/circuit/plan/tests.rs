@@ -128,7 +128,7 @@ fn like_only_allows_prefix_or_suffix_wildcards() {
 }
 
 #[test]
-fn cast_matrix_is_restricted_to_int_timestamp() {
+fn cast_matrix_rejects_unsupported_types() {
     let schema = base_schema();
     let to_timestamp = cast(
         col("value"),
@@ -136,9 +136,9 @@ fn cast_matrix_is_restricted_to_int_timestamp() {
     );
     assert!(DbspExpression::analyze(to_timestamp, schema.clone()).is_ok());
 
-    let err = DbspExpression::analyze(cast(col("text"), DataType::Int64), schema).unwrap_err();
+    let err = DbspExpression::analyze(cast(col("text"), DataType::Boolean), schema).unwrap_err();
     assert!(
         err.to_string()
-            .contains("casts are restricted to Int64 ↔ TimestampMillis")
+            .contains("casts are restricted to Int64/Utf8/TimestampMillis conversions")
     );
 }

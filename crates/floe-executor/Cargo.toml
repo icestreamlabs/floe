@@ -24,8 +24,10 @@ tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 nexmark = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
 arrow-schema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+proptest = "1.5"

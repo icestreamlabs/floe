@@ -27,7 +27,10 @@ async fn materialized_view_provider_emits_rows() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(Db::open("mv-provider", store).await.expect("open SlateDB"));
     let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge.new_view("mv_test", StreamRetention::KeepLast { keep_last: 1 }).await.expect("dbsp view");
+    let mut dbsp_view = bridge
+        .new_view("mv_test", StreamRetention::KeepLast { keep_last: 1 })
+        .await
+        .expect("dbsp view");
     let row_one = vec![
         ScalarValue::Int64(Some(1)),
         ScalarValue::Utf8(Some("one".into())),
@@ -91,7 +94,10 @@ async fn materialized_view_provider_empty_then_populated() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(Db::open("mv-empty", store).await.expect("open SlateDB"));
     let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge.new_view("mv_empty", StreamRetention::KeepLast { keep_last: 1 }).await.expect("view");
+    let mut dbsp_view = bridge
+        .new_view("mv_empty", StreamRetention::KeepLast { keep_last: 1 })
+        .await
+        .expect("view");
     let row = vec![ScalarValue::Int64(Some(5))];
     dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
     dbsp_view.flush().await.expect("flush view");

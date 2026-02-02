@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use dbsp::RowSchema;
+use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
-use dbsp::StreamRetention;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::metrics;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
@@ -73,8 +75,17 @@ impl DbspGraphBuilder {
         let upstream_frontier = cursor.observed();
         let mut upstream_stream = handle_stream.stream();
         let mut dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
+        let graph_id = self.graph_id().to_string();
         if view_frontier < upstream_frontier {
             for ts in (view_frontier + 1)..=upstream_frontier {
+                let update_start = Instant::now();
+                let update_span = tracing::info_span!(
+                    "dbsp_write",
+                    graph_id = %graph_id,
+                    view = %view_name,
+                    version = ts,
+                );
+                let _enter = update_span.enter();
                 let delta_handle = upstream_stream
                     .get(ts)
                     .await
@@ -91,6 +102,9 @@ impl DbspGraphBuilder {
                 registry_handle.set_dbsp_state(state);
                 registry_handle.publish_version(ts, snapshot_handle.clone());
                 mv_latest.insert(view_name.to_string(), (ts, snapshot_handle));
+                let latency_ms = update_start.elapsed().as_millis() as u64;
+                metrics::observe_mv_update_latency_ms(latency_ms);
+                tracing::debug!(latency_ms, "materialized view update applied");
             }
         }
 
@@ -98,7 +112,6 @@ impl DbspGraphBuilder {
         let view_label = view_name.to_string();
         let task_label = format!("materialize-view:{view_label}");
         let task_events = task_events.clone();
-        let graph_id = self.graph_id().to_string();
         let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut cursor = cursor;
@@ -110,6 +123,14 @@ impl DbspGraphBuilder {
                     result = cursor.next() => {
                         match result {
                             Ok((ts, delta_handle)) => {
+                                let update_start = Instant::now();
+                                let update_span = tracing::info_span!(
+                                    "dbsp_write",
+                                    graph_id = %graph_id,
+                                    view = %view_label,
+                                    version = ts,
+                                );
+                                let _enter = update_span.enter();
                                 let snapshot_handle = match Self::apply_delta_handle_to_view(
                                     &mut view,
                                     table.clone(),
@@ -137,6 +158,12 @@ impl DbspGraphBuilder {
                                     Ok(state) => {
                                         registry_clone.set_dbsp_state(state);
                                         registry_clone.publish_version(ts, snapshot_handle);
+                                        let latency_ms = update_start.elapsed().as_millis() as u64;
+                                        metrics::observe_mv_update_latency_ms(latency_ms);
+                                        tracing::debug!(
+                                            latency_ms,
+                                            "materialized view update applied"
+                                        );
                                         if MV_UPDATE_LOG_COUNTER
                                             .fetch_add(1, Ordering::Relaxed)
                                             .is_multiple_of(MV_UPDATE_LOG_SAMPLE_EVERY)

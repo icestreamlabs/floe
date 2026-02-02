@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
@@ -89,7 +90,8 @@ async fn filter_and_projection_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build graph");
@@ -185,7 +187,8 @@ async fn inner_join_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build join graph");
@@ -269,7 +272,8 @@ async fn aggregate_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build aggregate graph");
@@ -413,7 +417,8 @@ async fn topn_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build topn graph");
@@ -491,6 +496,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+                watermark: Arc::new(AtomicI64::new(-1)),
             })
             .await
             .expect("initial build");
@@ -509,7 +515,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("rebuild");
@@ -567,7 +574,8 @@ async fn cancel_stops_materialized_view_updates() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build graph");
@@ -648,7 +656,8 @@ async fn graph_task_error_is_reported() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build graph");

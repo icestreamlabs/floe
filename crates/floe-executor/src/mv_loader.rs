@@ -201,7 +201,9 @@ mod tests {
         persist_schema: bool,
     ) -> Result<DbspPersistedState> {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut view = bridge.new_view(VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 }).await?;
+        let mut view = bridge
+            .new_view(VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
+            .await?;
         for row in rows {
             let key = encode_projected_row_key(row)?;
             view.add_delta(key, 1);

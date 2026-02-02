@@ -93,3 +93,88 @@ Examples (message value):
 Enable it with `--kafka-brokers` and `--kafka-topics`. Optional flags:
 `--kafka-group-id`, `--kafka-default-source`, `--kafka-poll-ms`, and
 `--kafka-max-messages`.
+
+## Connector Configuration Files
+
+Floe can load connector and sink definitions from a config file:
+
+- `--config path/to/connectors.toml`
+- Supported formats: TOML, YAML, JSON
+
+Example (TOML):
+
+```toml
+[[connectors]]
+type = "generator"
+events_per_second = 50.0
+max_events = 10000
+
+[[connectors]]
+type = "kafka"
+brokers = "localhost:9092"
+topics = ["nexmark_bid"]
+group_id = "floe"
+default_source = "nexmark_bid"
+
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = 8080
+default_source = "nexmark_bid"
+
+[[sinks]]
+type = "file"
+mv = "mv_bid_passthrough"
+path = "/tmp/mv_bid.jsonl"
+with_snapshot = true
+```
+
+Connector config fields are mapped into `SourceDefinition` properties for
+introspection (e.g., `connector.kafka.brokers`, `connector.generator.events_per_second`).
+
+## Object Store Connector
+
+The object store connector reads newline-delimited JSON from an object store
+prefix (S3-compatible via `s3://` URLs).
+
+Example (TOML):
+
+```toml
+[[connectors]]
+type = "object_store"
+url = "s3://my-bucket/events/nexmark/"
+default_source = "nexmark_bid"
+```
+
+The connector lists all objects under the prefix and ingests each line as an
+event payload.
+
+## Postgres CDC Connector
+
+The Postgres CDC connector polls a logical replication slot using
+`pg_logical_slot_get_changes` with the `wal2json` output plugin. Only insert
+and update events are emitted (delete events are ignored).
+
+Example (TOML):
+
+```toml
+[[connectors]]
+type = "postgres_cdc"
+connection = "postgres://user:password@localhost:5432/db"
+slot = "floe_slot"
+poll_ms = 1000
+max_changes = 500
+include_tables = ["nexmark_bid", "nexmark_auction"]
+```
+
+## Sink Connectors
+
+Sinks stream materialized view output (TAIL semantics) to external systems.
+Each sink specifies the materialized view name (`mv`) and optional tail
+parameters (`with_snapshot`, `as_of`).
+
+Supported sinks:
+
+- Kafka (`type = "kafka"`) writes JSON rows to a topic.
+- File (`type = "file"`) appends JSONL rows to a file.
+- HTTP (`type = "http"`) POSTs JSON batches to a URL.

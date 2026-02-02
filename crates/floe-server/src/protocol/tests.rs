@@ -309,19 +309,11 @@ async fn seed_mv_state(
 async fn show_materialized_views_lists_persisted_definitions() {
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
     catalog
-        .upsert_materialized_view(MaterializedViewMetadata::new(
-            "mv_alpha",
-            "SELECT 1",
-            false,
-        ))
+        .upsert_materialized_view(MaterializedViewMetadata::new("mv_alpha", "SELECT 1", false))
         .await
         .expect("persist mv alpha");
     catalog
-        .upsert_materialized_view(MaterializedViewMetadata::new(
-            "mv_beta",
-            "SELECT 2",
-            true,
-        ))
+        .upsert_materialized_view(MaterializedViewMetadata::new("mv_beta", "SELECT 2", true))
         .await
         .expect("persist mv beta");
 
@@ -330,12 +322,10 @@ async fn show_materialized_views_lists_persisted_definitions() {
     let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
     let state = Arc::new(FloeServerState::new(query, registry, bridge));
 
-    let response = handle_management_statement(
-        state.as_ref(),
-        &ManagementStatement::ShowMaterializedViews,
-    )
-    .await
-    .expect("show mv response");
+    let response =
+        handle_management_statement(state.as_ref(), &ManagementStatement::ShowMaterializedViews)
+            .await
+            .expect("show mv response");
     let Response::Query(mut query) = response else {
         panic!("expected query response");
     };

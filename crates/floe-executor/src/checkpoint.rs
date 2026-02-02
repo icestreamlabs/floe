@@ -2,11 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use serde::{Deserialize, Serialize};
 use slatedb::WriteBatch;
 
+use crate::dbsp_bridge::DbspBridge;
+use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operator_state::OperatorStateHandle;
+use crate::outer_stream::{OuterStreamCheckpoint, OuterStreamRegistry};
 use crate::stream_types::Timestamp;
 
 const CHECKPOINT_PREFIX: &str = "checkpoint";
@@ -101,6 +105,8 @@ pub struct MaterializedViewCheckpointEntry {
     pub view: String,
     pub namespace: String,
     pub version: u64,
+    #[serde(default)]
+    pub frontier: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +121,8 @@ pub struct SourceStreamCheckpointEntry {
     pub source: String,
     pub namespace: String,
     pub version: u64,
+    #[serde(default)]
+    pub frontier: i64,
     pub partition: u32,
     pub offset: u64,
 }
@@ -329,6 +337,29 @@ impl CheckpointManager {
         Ok(())
     }
 
+    pub async fn persist_snapshot(
+        &mut self,
+        watermark: Timestamp,
+        mv_registry: &MaterializedViewRegistry,
+        outer_registry: &OuterStreamRegistry,
+    ) -> Result<CheckpointManifest> {
+        let mut manifest = CheckpointManifest {
+            id: self.next_id,
+            watermark,
+            format: ManifestFormat::V2,
+            dbsp_handles: Vec::new(),
+            source_offsets: self.snapshot_offsets(),
+            operator_states: Vec::new(),
+            materialized_views: materialized_view_entries(mv_registry),
+            outer_streams: outer_stream_entries(outer_registry, &self.offsets),
+        };
+        manifest.ensure_dbsp_payload();
+        self.store.persist(&manifest).await?;
+        self.next_id = self.next_id.saturating_add(1);
+        self.latest_manifest = Some(manifest.clone());
+        Ok(manifest)
+    }
+
     pub fn snapshot_offsets(&self) -> Vec<SourceOffset> {
         self.offsets
             .iter()
@@ -351,4 +382,85 @@ impl CheckpointManager {
     pub fn latest_manifest(&self) -> Option<&CheckpointManifest> {
         self.latest_manifest.as_ref()
     }
+}
+
+fn materialized_view_entries(
+    registry: &MaterializedViewRegistry,
+) -> Vec<MaterializedViewCheckpointEntry> {
+    registry
+        .handles()
+        .into_iter()
+        .filter_map(|handle| {
+            let frontier = handle.latest_version()?;
+            let zset_handle = handle.handle_for_version(frontier)?;
+            Some(MaterializedViewCheckpointEntry {
+                view: handle.name().to_string(),
+                namespace: zset_handle.ns,
+                version: zset_handle.version,
+                frontier,
+            })
+        })
+        .collect()
+}
+
+fn outer_stream_entries(
+    registry: &OuterStreamRegistry,
+    offsets: &HashMap<String, u64>,
+) -> Vec<SourceStreamCheckpointEntry> {
+    registry
+        .checkpoint_state()
+        .into_iter()
+        .map(|checkpoint| checkpoint_entry_from_state(checkpoint, offsets))
+        .collect()
+}
+
+fn checkpoint_entry_from_state(
+    checkpoint: OuterStreamCheckpoint,
+    offsets: &HashMap<String, u64>,
+) -> SourceStreamCheckpointEntry {
+    let offset = offsets.get(&checkpoint.source).copied().unwrap_or(0);
+    SourceStreamCheckpointEntry {
+        source: checkpoint.source,
+        namespace: checkpoint.namespace,
+        version: checkpoint.version,
+        frontier: checkpoint.frontier,
+        partition: 0,
+        offset,
+    }
+}
+
+pub async fn recover_materialized_views(
+    manifest: &CheckpointManifest,
+    registry: &MaterializedViewRegistry,
+    bridge: &mut DbspBridge,
+) -> Result<()> {
+    for entry in &manifest.materialized_views {
+        let view_handle = registry.register(entry.view.clone());
+        let handle = ZSetHandle {
+            ns: entry.namespace.clone(),
+            version: entry.version,
+        };
+        let handle_view = bridge
+            .handle_view_for(&handle.ns, handle.version)
+            .await
+            .with_context(|| {
+                format!(
+                    "open handle view for materialized view '{}' version {}",
+                    entry.view, entry.version
+                )
+            })?;
+        let (dict, table, namespace, version) = handle_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, namespace, version);
+        view_handle.set_dbsp_state(state);
+        let frontier = if entry.frontier == 0 {
+            i64::try_from(entry.version).unwrap_or(i64::MAX)
+        } else {
+            entry.frontier
+        };
+        view_handle.publish_version(frontier, handle);
+    }
+    if manifest.watermark > 0 {
+        registry.update_watermark_all(manifest.watermark);
+    }
+    Ok(())
 }

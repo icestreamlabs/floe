@@ -1,14 +1,24 @@
+use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use datafusion::arrow::array::{ArrayRef, BooleanBuilder, Int64Builder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::functions_aggregate::expr_fn::sum;
-use datafusion::logical_expr::col;
+use datafusion::logical_expr::{Expr, TableType, col};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
+use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use dbsp::storage::encoding::{decode, encode};
+use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -31,6 +41,116 @@ impl BenchRow {
             flag: idx % 2 == 0,
             text: format!("value-{idx:08}"),
         }
+    }
+}
+
+#[derive(Debug)]
+struct BenchBatchState {
+    batch: Option<RecordBatch>,
+    yielded: bool,
+}
+
+impl BenchBatchState {
+    fn new() -> Self {
+        Self {
+            batch: None,
+            yielded: true,
+        }
+    }
+
+    fn set_batch(&mut self, batch: RecordBatch) {
+        self.batch = Some(batch);
+        self.yielded = false;
+    }
+}
+
+#[derive(Debug)]
+struct BenchBatchGenerator {
+    state: Arc<RwLock<BenchBatchState>>,
+}
+
+impl BenchBatchGenerator {
+    fn new(state: Arc<RwLock<BenchBatchState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl fmt::Display for BenchBatchGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BenchBatchGenerator")
+    }
+}
+
+impl LazyBatchGenerator for BenchBatchGenerator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn generate_next_batch(&mut self) -> DataFusionResult<Option<RecordBatch>> {
+        let mut state = self.state.write();
+        if state.yielded {
+            return Ok(None);
+        }
+        state.yielded = true;
+        Ok(state.batch.clone())
+    }
+}
+
+#[derive(Debug)]
+struct BenchTableProvider {
+    schema: SchemaRef,
+    state: Arc<RwLock<BenchBatchState>>,
+}
+
+impl BenchTableProvider {
+    fn new(schema: SchemaRef, state: Arc<RwLock<BenchBatchState>>) -> Self {
+        Self { schema, state }
+    }
+}
+
+#[async_trait]
+impl TableProvider for BenchTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let generator = BenchBatchGenerator::new(Arc::clone(&self.state));
+        let exec = Arc::new(LazyMemoryExec::try_new(
+            Arc::clone(&self.schema),
+            vec![Arc::new(RwLock::new(generator))],
+        )?);
+
+        let Some(projection) = projection else {
+            return Ok(exec);
+        };
+
+        let exprs = projection
+            .iter()
+            .map(|index| {
+                let field = self.schema.field(*index);
+                ProjectionExpr {
+                    expr: Arc::new(Column::new(field.name(), *index)),
+                    alias: field.name().to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let projected = ProjectionExec::try_new(exprs, exec)?;
+        Ok(Arc::new(projected))
     }
 }
 
@@ -153,22 +273,36 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
             });
         });
 
-        let batch = decode_to_batch(schema.clone(), &encoded);
-        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-        let plan = runtime
+        let reuse_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let reuse_state = Arc::new(RwLock::new(BenchBatchState::new()));
+        reuse_ctx
+            .register_table(
+                "bench",
+                Arc::new(BenchTableProvider::new(
+                    schema.clone(),
+                    Arc::clone(&reuse_state),
+                )),
+            )
+            .expect("register table");
+        let reuse_plan = runtime
             .block_on(async {
-                let df = ctx.read_batch(batch.clone())?;
+                let df = reuse_ctx.table("bench").await?;
                 let df = df.filter(col("flag"))?;
                 let df = df.aggregate(vec![], vec![sum(col("value"))])?;
                 df.create_physical_plan().await
             })
-            .expect("create physical plan");
-        let task_ctx = ctx.task_ctx();
+            .expect("create reuse plan");
+        let reuse_task_ctx = reuse_ctx.task_ctx();
+        let reuse_batch = decode_to_batch(schema.clone(), &encoded);
 
         group.bench_function(BenchmarkId::new("datafusion_eval", batch_size), |b| {
-            let plan = plan.clone();
-            let task_ctx = task_ctx.clone();
+            let plan = reuse_plan.clone();
+            let task_ctx = reuse_task_ctx.clone();
+            let state = Arc::clone(&reuse_state);
+            let batch = reuse_batch.clone();
             b.iter(|| {
+                state.write().set_batch(batch.clone());
                 runtime
                     .block_on(async {
                         let result =
@@ -182,12 +316,12 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
         });
 
         group.bench_function(BenchmarkId::new("vectorized_reuse_plan", batch_size), |b| {
-            let plan = plan.clone();
-            let task_ctx = task_ctx.clone();
+            let plan = reuse_plan.clone();
+            let task_ctx = reuse_task_ctx.clone();
+            let state = Arc::clone(&reuse_state);
             b.iter(|| {
-                // Approximate reuse-plan cost by combining decode + execute.
                 let decoded = decode_to_batch(schema.clone(), &encoded);
-                black_box(&decoded);
+                state.write().set_batch(decoded);
                 runtime
                     .block_on(async {
                         let result =

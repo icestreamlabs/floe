@@ -37,10 +37,7 @@ impl MaterializedViewRegistry {
         guard
             .entry(name.clone())
             .or_insert_with(|| {
-                Arc::new(MaterializedViewHandle::new(
-                    name,
-                    self.retention_keep_last,
-                ))
+                Arc::new(MaterializedViewHandle::new(name, self.retention_keep_last))
             })
             .clone()
     }
@@ -51,6 +48,28 @@ impl MaterializedViewRegistry {
             .expect("mutex poisoned")
             .get(name)
             .cloned()
+    }
+
+    pub fn handles(&self) -> Vec<Arc<MaterializedViewHandle>> {
+        self.views
+            .read()
+            .expect("mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn update_watermark_all(&self, watermark: Timestamp) {
+        let views: Vec<Arc<MaterializedViewHandle>> = self
+            .views
+            .read()
+            .expect("mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for view in views {
+            view.update_watermark(watermark);
+        }
     }
 
     pub fn set_schema(&self, name: impl Into<String>, schema: SchemaRef) {
@@ -145,7 +164,10 @@ impl MaterializedViewHandle {
 
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
         let namespace = handle.ns.clone();
-        let version_time = current_time_micros();
+        let version_time = self
+            .watermark()
+            .map(watermark_to_micros)
+            .unwrap_or_else(current_time_micros);
         {
             let mut guard = self
                 .versions
@@ -240,6 +262,11 @@ fn current_time_micros() -> i64 {
         Ok(duration) => duration.as_micros().try_into().unwrap_or(0),
         Err(_) => 0,
     }
+}
+
+fn watermark_to_micros(watermark: Timestamp) -> i64 {
+    let micros = watermark.saturating_mul(1_000);
+    i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
 impl fmt::Debug for MaterializedViewHandle {

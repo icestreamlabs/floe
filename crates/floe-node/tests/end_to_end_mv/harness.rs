@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use anyhow::Result;
 use dbsp::StreamRetention;
@@ -80,6 +81,7 @@ impl MvTestHarness {
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+                watermark: Arc::new(AtomicI64::new(-1)),
             })
             .await?;
 

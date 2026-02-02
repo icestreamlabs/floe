@@ -10,6 +10,8 @@ pub mod relation_state;
 pub mod stream;
 pub mod topk;
 pub mod topn;
+pub mod union;
+pub mod window;
 
 pub use dbsp_storage::storage;
 
@@ -34,6 +36,7 @@ pub use operators::rolling_aggregate::RollingAggregateOp;
 pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
 pub use operators::topk::TopKOp;
 pub use operators::topn::TopNOp;
+pub use operators::union::UnionOp;
 pub use operators::waterline::WaterlineOp;
 pub use operators::window::{WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
@@ -48,3 +51,5 @@ pub use stream::{
 };
 pub use topk::DbspTopK;
 pub use topn::DbspTopN;
+pub use union::DbspUnion;
+pub use window::DbspWindowAggregate;

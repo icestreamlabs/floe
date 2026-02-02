@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
+use chrono::{DateTime, Utc};
 use futures::Stream;
 use pgwire::api::results::DataRowEncoder;
 use pgwire::api::results::FieldInfo;
@@ -91,7 +92,13 @@ fn encode_tail_row(
         .get(row_idx)
         .copied()
         .ok_or_else(|| user_error("TAIL batch missing __op".to_string()))?;
-    let time = batch.times.get(row_idx).cloned().unwrap_or(None);
+    let time = match batch.times.get(row_idx).cloned().unwrap_or(None) {
+        Some(micros) => Some(
+            DateTime::<Utc>::from_timestamp_micros(micros)
+                .ok_or_else(|| user_error(format!("timestamp micros {micros} out of range")))?,
+        ),
+        None => None,
+    };
     encoder.encode_field(&Some(batch.version))?;
     encoder.encode_field(&Some(i64::from(op)))?;
     encoder.encode_field(&time)?;

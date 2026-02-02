@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use arrow_schema::SchemaRef;
 use datafusion::arrow::array::{Array, Int64Array};
@@ -200,7 +201,8 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
-                mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
         .await
         .expect("build graph");

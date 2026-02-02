@@ -56,7 +56,11 @@ def main():
         return
 
     sizes = sorted(results.keys())
-    print("Batch, ns/row decode->arrow, ns/row decode->scalar, ns/row scalar_eval, ns/row df_eval, ns/row vec_reuse, ns/row scalar_e2e, ratio vec_reuse/scalar_e2e, ratio df_eval/scalar_eval")
+    print(
+        "Batch, ns/row decode->arrow, ns/row decode->scalar, ns/row scalar_eval,"
+        " ns/row df_eval, ns/row vec_reuse, ns/row df_e2e, ns/row scalar_e2e,"
+        " speedup vec_reuse, speedup df_eval, speedup df_e2e"
+    )
 
     for size in sizes:
         row = results[size]
@@ -65,6 +69,7 @@ def main():
         scalar_eval = row.get("scalar_eval")
         df_eval = row.get("datafusion_eval")
         vec_reuse = row.get("vectorized_reuse_plan")
+        df_e2e = row.get("end_to_end")
         scalar_e2e = row.get("scalar_end_to_end")
 
         def per_row(value):
@@ -75,10 +80,12 @@ def main():
         scalar_eval_pr = per_row(scalar_eval)
         df_eval_pr = per_row(df_eval)
         vec_reuse_pr = per_row(vec_reuse)
+        df_e2e_pr = per_row(df_e2e)
         scalar_e2e_pr = per_row(scalar_e2e)
 
-        ratio_vec = vec_reuse / scalar_e2e if vec_reuse and scalar_e2e else None
-        ratio_eval = df_eval / scalar_eval if df_eval and scalar_eval else None
+        speedup_vec = scalar_e2e / vec_reuse if vec_reuse and scalar_e2e else None
+        speedup_eval = scalar_eval / df_eval if df_eval and scalar_eval else None
+        speedup_e2e = scalar_e2e / df_e2e if df_e2e and scalar_e2e else None
 
         print(
             f"{size},"
@@ -87,9 +94,11 @@ def main():
             f" {fmt(scalar_eval_pr) if scalar_eval_pr is not None else 'NA'},"
             f" {fmt(df_eval_pr) if df_eval_pr is not None else 'NA'},"
             f" {fmt(vec_reuse_pr) if vec_reuse_pr is not None else 'NA'},"
+            f" {fmt(df_e2e_pr) if df_e2e_pr is not None else 'NA'},"
             f" {fmt(scalar_e2e_pr) if scalar_e2e_pr is not None else 'NA'},"
-            f" {fmt(ratio_vec) if ratio_vec is not None else 'NA'},"
-            f" {fmt(ratio_eval) if ratio_eval is not None else 'NA'}"
+            f" {fmt(speedup_vec) if speedup_vec is not None else 'NA'},"
+            f" {fmt(speedup_eval) if speedup_eval is not None else 'NA'},"
+            f" {fmt(speedup_e2e) if speedup_e2e is not None else 'NA'}"
         )
 
 

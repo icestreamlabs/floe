@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use dbsp::StreamRetention;
 use dbsp::circuit::{
     CircuitNode, CircuitPlan, DbspJoinNode, DbspNodeKind, DbspProjectNode, DbspSelectNode,
 };
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
-use dbsp::StreamRetention;
 use dbsp::stream::StreamCursor;
 use dbsp::stream::util::materialize_zset_handle;
 use dbsp::{DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};

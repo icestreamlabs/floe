@@ -4,9 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 
 [dev-dependencies]
+async-trait = { workspace = true }
 criterion = "0.5"
 datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }
+parking_lot = "0.12"
 rkyv = { workspace = true }
 tokio = { workspace = true }
 

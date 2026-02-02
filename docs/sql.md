@@ -5,17 +5,20 @@ semantics for materialized views and TAIL.
 
 ## Supported Statements
 
-- `CREATE MATERIALIZED VIEW <name> AS <select>`
+- `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [WITH (<options>)] AS <select>`
 - `TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]`
 - `SELECT ... FROM <materialized_view>` (read-only queries via pgwire)
 
 ## Materialized View Definition Rules
 
 - Exactly one statement; multiple statements are rejected.
-- `WITH` clauses are rejected in materialized view definitions.
-- The logical plan must compile to Source/Select/Project/Join/Sink nodes only.
-  Queries that introduce aggregates, window aggregates, `TOP N`/`LIMIT`,
-  `UNION`, or passthrough nodes are rejected.
+- `WITH` clauses are accepted in materialized view definitions, but the
+  options are currently ignored.
+- Identifiers can be double-quoted to preserve case or include special
+  characters (`"MyView"`).
+- The logical plan must compile to supported nodes (for example:
+  Source/Select/Project/Join/Aggregate/WindowAggregate/TopN/Union/Passthrough/Sink).
+  Unsupported nodes are rejected at plan validation time.
 - Joins are **inner equi-joins** on column references only.
   Non-column join expressions are rejected.
 - NULL semantics:
@@ -33,14 +36,25 @@ semantics for materialized views and TAIL.
   - `SELECT ... FROM mv WHERE __mv_version = 42`
   - Only equality filters on `__mv_version` are recognized for as-of reads.
 
+## Window Semantics
+
+- `TUMBLE` / `HOP` assign rows to windows using the event-time expression in the
+  window spec.
+- Rows with event-time earlier than `(watermark - allowed_lateness)` are
+  dropped. The SQL planner currently defaults `allowed_lateness` to `0`.
+
 ## Version and Time Semantics
 
 - Floe uses a single global logical epoch (monotonic `i64`) for ingestion.
 - Each time sources are ticked, the current epoch is advanced by 1 and any
   materialized views update to that version.
 - `__mv_version` corresponds to this global epoch.
-- `__time` is the wall-clock UTC time (microseconds since Unix epoch) when the
-  version was committed. All rows in the same version share the same `__time`.
+- Floe tracks a global **event-time watermark** in milliseconds based on the
+  latest decoded source timestamps (the first `TIMESTAMP(MILLISECOND)` column in
+  each ingested row).
+- `__time` reports the current event-time watermark (microseconds since Unix
+  epoch) when available. If no event timestamps have been observed yet, it
+  falls back to the wall-clock commit time.
 
 ## TAIL Semantics
 
@@ -70,7 +84,7 @@ Output columns (in order):
 1) `__mv_version` (Int64) - version for the emitted snapshot
 2) `__op` (Int16) - `1` for inserts, `-1` for deletes (updates appear
    as a delete + insert pair)
-3) `__time` (Timestamp, UTC) - commit time for the version (microseconds since Unix epoch)
+3) `__time` (Timestamp, UTC) - event-time watermark for the version (microseconds since Unix epoch), or commit time if no watermark is available
 4) User-defined columns from the materialized view
 
 Row order within a version is not guaranteed; versions are emitted in order.

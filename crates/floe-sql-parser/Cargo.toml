@@ -7,3 +7,4 @@ description = "Lightweight SQL helpers for Floe CLI"
 
 [dependencies]
 anyhow = { workspace = true }
+sqlparser = { workspace = true }

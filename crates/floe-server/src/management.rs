@@ -43,9 +43,7 @@ pub(crate) fn parse_management_statement(sql: &str) -> Option<ManagementStatemen
     None
 }
 
-pub(crate) fn detect_single_management_statement(
-    query: &str,
-) -> Option<ManagementStatement> {
+pub(crate) fn detect_single_management_statement(query: &str) -> Option<ManagementStatement> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return None;
@@ -72,9 +70,7 @@ pub(crate) async fn handle_management_statement(
     statement: &ManagementStatement,
 ) -> PgWireResult<Response> {
     let batch = match statement {
-        ManagementStatement::ShowMaterializedViews => {
-            show_materialized_views_batch(state).await?
-        }
+        ManagementStatement::ShowMaterializedViews => show_materialized_views_batch(state).await?,
         ManagementStatement::DescribeMaterializedView { name } => {
             describe_materialized_view_batch(state, name).await?
         }
@@ -102,9 +98,7 @@ fn describe_schema() -> SchemaRef {
     ]))
 }
 
-async fn show_materialized_views_batch(
-    state: &FloeServerState,
-) -> PgWireResult<RecordBatch> {
+async fn show_materialized_views_batch(state: &FloeServerState) -> PgWireResult<RecordBatch> {
     let storage = state.query.storage();
     let mut views = storage
         .materialized_views()
@@ -146,7 +140,10 @@ async fn describe_materialized_view_batch(
     let row_count = fields.len();
 
     let view_names = vec![name.to_string(); row_count];
-    let column_names: Vec<String> = fields.iter().map(|field| field.name().to_string()).collect();
+    let column_names: Vec<String> = fields
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect();
     let data_types: Vec<String> = fields
         .iter()
         .map(|field| field.data_type().to_string())
@@ -179,7 +176,9 @@ async fn load_view_schema(state: &FloeServerState, name: &str) -> PgWireResult<S
         .map_err(|err| user_error(format!("failed to load materialized view schema: {err}")))?;
     match schema {
         Some(schema) => {
-            state.materialized_views.set_schema(name.to_string(), Arc::clone(&schema));
+            state
+                .materialized_views
+                .set_schema(name.to_string(), Arc::clone(&schema));
             Ok(schema)
         }
         None => Err(user_error(format!(

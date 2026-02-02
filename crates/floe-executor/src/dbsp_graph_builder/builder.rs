@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
@@ -18,19 +19,23 @@ use crate::task_events::GraphTaskSender;
 pub struct DbspGraphBuilder {
     pub(super) bridge: Arc<Mutex<DbspBridge>>,
     ns: GraphNamespace,
+    pub(super) watermark: Arc<AtomicI64>,
 }
 
 impl DbspGraphBuilder {
     pub async fn new(db: Arc<slatedb::Db>) -> Result<Self> {
+        crate::metrics::init();
         let bridge = DbspBridge::new(db).await?;
         Ok(Self {
             bridge: Arc::new(Mutex::new(bridge)),
             ns: GraphNamespace::default(),
+            watermark: Arc::new(AtomicI64::new(-1)),
         })
     }
 
     pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {
         self.ns.set_graph_id(inputs.graph_id);
+        self.watermark = Arc::clone(&inputs.watermark);
         let available_sources: BTreeSet<String> =
             inputs.outer_handle_streams.keys().cloned().collect();
         let ValidatedPlan {
@@ -208,6 +213,59 @@ impl DbspGraphBuilder {
                     .await?;
                 self.compile_topn(topn, upstream, task_events).await?
             }
+            DbspNodeKind::WindowAggregate(window) => {
+                let input_idx = first_input(node, "window aggregate")?;
+                let upstream = self
+                    .compile_node(
+                        plan,
+                        input_idx,
+                        outer_streams,
+                        cancel,
+                        task_events,
+                        built,
+                        mv_registry,
+                        mv_latest,
+                        mv_retention,
+                    )
+                    .await?;
+                self.compile_window_aggregate(window, upstream, task_events)
+                    .await?
+            }
+            DbspNodeKind::Union(union) => {
+                let mut inputs = Vec::with_capacity(node.inputs.len());
+                for &input_idx in &node.inputs {
+                    let upstream = self
+                        .compile_node(
+                            plan,
+                            input_idx,
+                            outer_streams,
+                            cancel,
+                            task_events,
+                            built,
+                            mv_registry,
+                            mv_latest,
+                            mv_retention,
+                        )
+                        .await?;
+                    inputs.push(upstream);
+                }
+                self.compile_union(union, inputs, task_events).await?
+            }
+            DbspNodeKind::Passthrough => {
+                let input_idx = first_input(node, "passthrough")?;
+                self.compile_node(
+                    plan,
+                    input_idx,
+                    outer_streams,
+                    cancel,
+                    task_events,
+                    built,
+                    mv_registry,
+                    mv_latest,
+                    mv_retention,
+                )
+                .await?
+            }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
                 let upstream = self
@@ -234,11 +292,6 @@ impl DbspGraphBuilder {
                     mv_retention,
                 )
                 .await?
-            }
-            DbspNodeKind::WindowAggregate(_)
-            | DbspNodeKind::Union(_)
-            | DbspNodeKind::Passthrough => {
-                bail!("Unsupported in MVP: {:?}", node.kind)
             }
         };
 
@@ -267,6 +320,7 @@ pub struct BuildInputs<'a> {
     pub mv_registry: Arc<MaterializedViewRegistry>,
     pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
     pub mv_retention: StreamRetention,
+    pub watermark: Arc<AtomicI64>,
 }
 
 pub struct BuildOutputs {

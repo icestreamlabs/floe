@@ -61,9 +61,7 @@ impl DbspBridge {
         retention: StreamRetention,
     ) -> Result<DbspView> {
         let namespace = namespaces::materialized_view(view_name)?;
-        let zset = self
-            .new_stream(namespace.clone(), retention)
-            .await?;
+        let zset = self.new_stream(namespace.clone(), retention).await?;
         Ok(DbspView {
             name: view_name.to_string(),
             namespace,

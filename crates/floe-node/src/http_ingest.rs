@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, ensure};
+use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use prometheus::{Encoder, TextEncoder};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -38,7 +42,9 @@ pub async fn run_http_ingest(
         default_source: config.default_source,
     };
     let app = Router::new()
+        .route("/healthz", get(healthz))
         .route("/ingest", post(ingest))
+        .route("/metrics", get(metrics))
         .with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr)
@@ -77,6 +83,25 @@ async fn ingest(
     }
 
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn metrics() -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+    if encoder.encode(&metric_families, &mut buffer).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let mut response = Response::new(Body::from(buffer));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    response
 }
 
 fn parse_events(value: Value, default_source: Option<&str>) -> Result<Vec<SourceEvent>> {

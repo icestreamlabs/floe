@@ -4,8 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use datafusion::logical_expr::LogicalPlan;
 
 pub use dbsp::circuit::{
-    CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateNode, DbspJoinNode, DbspJoinType,
-    DbspNodeKind, DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSourceNode, DbspUnionNode,
+    CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
+    DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType, DbspSelectNode,
+    DbspSourceNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec,
     Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem, RowSchema, ScalarValue,
     TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
     nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
@@ -90,7 +91,9 @@ pub fn validate_dbsp_plan(
             DbspNodeKind::Project(_)
             | DbspNodeKind::Select(_)
             | DbspNodeKind::Aggregate(_)
-            | DbspNodeKind::TopN(_) => {
+            | DbspNodeKind::TopN(_)
+            | DbspNodeKind::WindowAggregate(_)
+            | DbspNodeKind::Passthrough => {
                 if input_count != 1 {
                     bail!(
                         "node {node_id} → {} expects 1 input (found {input_count})",
@@ -113,7 +116,6 @@ pub fn validate_dbsp_plan(
                     bail!("node {node_id} → Union expects ≥2 inputs (found {input_count})");
                 }
             }
-            _ => {}
         }
 
         match &circuit_node.kind {
@@ -130,9 +132,6 @@ pub fn validate_dbsp_plan(
                     );
                 }
             }
-            DbspNodeKind::WindowAggregate(_) => unsupported(node_id, &circuit_node.kind)?,
-            DbspNodeKind::Union(_) => unsupported(node_id, &circuit_node.kind)?,
-            DbspNodeKind::Passthrough => unsupported(node_id, &circuit_node.kind)?,
             _ => {}
         }
     }
@@ -219,13 +218,6 @@ fn required_sources(plan: &CircuitPlan) -> BTreeSet<String> {
 fn format_set(values: &BTreeSet<String>) -> String {
     let joined = values.iter().cloned().collect::<Vec<_>>().join(", ");
     format!("{{{joined}}}")
-}
-
-fn unsupported(node_id: usize, kind: &DbspNodeKind) -> Result<()> {
-    bail!(
-        "node {node_id} ({}) is planned by DBSP but not yet executable in Floe (MVP)",
-        kind_name(kind)
-    );
 }
 
 fn kind_name(kind: &DbspNodeKind) -> &'static str {

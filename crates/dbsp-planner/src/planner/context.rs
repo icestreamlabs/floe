@@ -3,12 +3,15 @@ use std::sync::Arc;
 use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
+use datafusion::scalar::ScalarValue;
 
 use dbsp_circuit::circuit::plan::{
     DbspAggregateNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspSelectNode,
-    DbspSourceNode, DbspTopNNode, DbspUnionNode, OrderExpr, ProjectItem,
+    DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
+    DbspWindowSpec, OrderExpr, ProjectItem,
 };
-use dbsp_circuit::circuit::schema::RowSchema;
+use dbsp_circuit::circuit::schema::{Field, RowSchema};
+use dbsp_circuit::circuit::types::DbspScalarType;
 
 use super::circuit::{CircuitNode, CircuitPlan};
 use super::config::PlannerConfig;
@@ -287,11 +290,20 @@ impl<'cfg> PlannerContext<'cfg> {
             ));
         }
 
-        let group_keys = aggregate
-            .group_expr
-            .iter()
-            .map(|expr| extract_alias(expr.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut group_keys = Vec::with_capacity(aggregate.group_expr.len());
+        let mut window_spec: Option<DbspWindowSpec> = None;
+        for expr in &aggregate.group_expr {
+            if let Some(spec) = self.parse_window_spec(expr, input.schema.clone())? {
+                if window_spec.is_some() {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "only one window specification is supported in GROUP BY".to_string(),
+                    ));
+                }
+                window_spec = Some(spec);
+                continue;
+            }
+            group_keys.push(extract_alias(expr.clone())?);
+        }
 
         let aggregates = aggregate
             .aggr_expr
@@ -300,6 +312,24 @@ impl<'cfg> PlannerContext<'cfg> {
             .collect::<Result<Vec<_>, _>>()?;
 
         let agg_node = DbspAggregateNode::try_new(input.schema.clone(), group_keys, aggregates)?;
+
+        if let Some(window_spec) = window_spec {
+            let output_schema = self.window_output_schema(&agg_node, &window_spec)?;
+            let window_node = DbspWindowAggregateNode {
+                aggregate: agg_node,
+                window: window_spec,
+            };
+            let id = self.add_node(
+                vec![input.id],
+                DbspNodeKind::WindowAggregate(window_node),
+                output_schema.clone(),
+            );
+            return Ok(PlannedNode {
+                id,
+                schema: output_schema,
+            });
+        }
+
         let output_schema = agg_node.output_schema().clone();
         let id = self.add_node(
             vec![input.id],
@@ -400,6 +430,88 @@ impl<'cfg> PlannerContext<'cfg> {
             id,
             schema: output_schema,
         })
+    }
+
+    fn parse_window_spec(
+        &self,
+        expr: &Expr,
+        input_schema: Arc<RowSchema>,
+    ) -> Result<Option<DbspWindowSpec>, PlannerError> {
+        let expr = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            _ => expr,
+        };
+        let Expr::ScalarFunction(func) = expr else {
+            return Ok(None);
+        };
+
+        let name = func.name().to_ascii_lowercase();
+        match name.as_str() {
+            "tumble" => {
+                if func.args.len() != 2 {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "TUMBLE requires (time_expr, size_ms) arguments".to_string(),
+                    ));
+                }
+                let time_expr = normalize_expr(func.args[0].clone())?;
+                let size_ms = self.parse_window_arg(&func.args[1])?;
+                let spec = DbspWindowSpec::try_new(
+                    DbspWindowPolicy::Tumbling { size_ms },
+                    time_expr,
+                    input_schema,
+                    0,
+                )?;
+                Ok(Some(spec))
+            }
+            "hop" => {
+                if func.args.len() != 3 {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "HOP requires (time_expr, slide_ms, size_ms) arguments".to_string(),
+                    ));
+                }
+                let time_expr = normalize_expr(func.args[0].clone())?;
+                let slide_ms = self.parse_window_arg(&func.args[1])?;
+                let size_ms = self.parse_window_arg(&func.args[2])?;
+                let spec = DbspWindowSpec::try_new(
+                    DbspWindowPolicy::Hopping { size_ms, slide_ms },
+                    time_expr,
+                    input_schema,
+                    0,
+                )?;
+                Ok(Some(spec))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn parse_window_arg(&self, expr: &Expr) -> Result<i64, PlannerError> {
+        match expr {
+            Expr::Literal(ScalarValue::Int64(Some(value)), _) => Ok(*value),
+            _ => Err(PlannerError::UnsupportedPlan(
+                "window sizes must be literal Int64 milliseconds".to_string(),
+            )),
+        }
+    }
+
+    fn window_output_schema(
+        &self,
+        aggregate: &DbspAggregateNode,
+        window_spec: &DbspWindowSpec,
+    ) -> Result<Arc<RowSchema>, PlannerError> {
+        let nullable = window_spec.time_expression.nullable();
+        let mut fields = Vec::with_capacity(2 + aggregate.output_schema().fields().len());
+        fields.push(Field::new(
+            "window_start",
+            DbspScalarType::TimestampMillis,
+            nullable,
+        ));
+        fields.push(Field::new(
+            "window_end",
+            DbspScalarType::TimestampMillis,
+            nullable,
+        ));
+        fields.extend(aggregate.output_schema().fields().iter().cloned());
+        RowSchema::try_new(fields).map_err(PlannerError::from)
     }
 
     fn add_node(

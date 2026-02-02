@@ -12,5 +12,6 @@ pub mod rolling_aggregate;
 pub mod semijoin;
 pub mod topk;
 pub mod topn;
+pub mod union;
 pub mod waterline;
 pub mod window;

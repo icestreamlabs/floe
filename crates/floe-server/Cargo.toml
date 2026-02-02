@@ -18,6 +18,7 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+slatedb = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
