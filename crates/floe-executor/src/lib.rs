@@ -7,6 +7,8 @@ pub mod dbsp_circuit;
 pub mod dbsp_graph_builder;
 pub mod dbsp_plan;
 pub mod dbsp_table_environment;
+pub mod delta_batch;
+pub mod delta_consolidation;
 pub mod encoding;
 pub mod expression;
 mod expression_eval;
@@ -33,6 +35,8 @@ pub use dbsp_bridge::DbspBridge;
 pub use dbsp_graph_builder::{BuildInputs, BuildOutputs, DbspGraphBuilder};
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use dbsp_table_environment::DbspTableEnvironment;
+pub use delta_batch::{DeltaBatchBuffer, DeltaBatchConfig, FlushReason};
+pub use delta_consolidation::{ConsolidationMode, DeltaConsolidator};
 pub use floe_core::source::SourceRegistry;
 pub use materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use mv::runtime::MaterializedView;
@@ -42,5 +46,8 @@ pub use operators::MvSinkOp;
 pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::SourceRowDecoder;
 pub use stream_types::{Diff, Row, Timestamp};
-pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider, SourceTableProvider};
+pub use table_provider::{
+    DynamicStateExec, DynamicStateTableProvider, MaterializedViewTableProvider, SlateTableProvider,
+    SourceTableProvider,
+};
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};

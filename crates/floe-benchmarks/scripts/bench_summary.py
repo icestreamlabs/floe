@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 CRITERION_ROOT = ROOT / "target" / "criterion" / "rkyv_arrow_datafusion"
 
 BENCHES = [
@@ -42,7 +42,7 @@ def load_results():
 
 
 def ns(value_s: float) -> float:
-    return value_s * 1e9
+    return value_s
 
 
 def fmt(value: float) -> str:

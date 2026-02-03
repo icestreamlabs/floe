@@ -1,3 +1,4 @@
+pub mod arrow_batch;
 pub mod encoding;
 pub mod plan;
 pub mod row;
@@ -5,6 +6,9 @@ pub mod schema;
 pub mod tables;
 pub mod types;
 
+pub use arrow_batch::{
+    KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME, delta_arrow_fields, delta_arrow_schema,
+};
 pub use encoding::{KeyEncoder, encode_composite_key, encode_scalar};
 pub use plan::{
     DbspAggregateFunction, DbspAggregateNode, DbspExpression, DbspJoinNode, DbspJoinType,

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion_common::{DFSchema, DFSchemaRef};
 
+use crate::circuit::arrow_batch::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 use crate::circuit::types::{DbspScalarType, ScalarValue};
 
 pub type FieldRef = usize;
@@ -36,6 +37,12 @@ impl RowSchema {
     pub fn try_new(fields: Vec<Field>) -> Result<Arc<Self>> {
         let mut index_by_name = HashMap::new();
         for (idx, field) in fields.iter().enumerate() {
+            if field.name == WEIGHT_COLUMN_NAME || field.name == KEY_COLUMN_NAME {
+                return Err(anyhow!(
+                    "reserved field name: {} (used for delta metadata)",
+                    field.name
+                ));
+            }
             if index_by_name.insert(field.name.clone(), idx).is_some() {
                 return Err(anyhow!("duplicate field name: {}", field.name));
             }
@@ -152,6 +159,23 @@ mod tests {
             Field::new("active", DbspScalarType::Bool, true),
         ])
         .expect("build schema")
+    }
+
+    #[test]
+    fn rejects_reserved_fields() {
+        let result = RowSchema::try_new(vec![Field::new(
+            WEIGHT_COLUMN_NAME,
+            DbspScalarType::Int64,
+            false,
+        )]);
+        assert!(result.is_err());
+
+        let result = RowSchema::try_new(vec![Field::new(
+            KEY_COLUMN_NAME,
+            DbspScalarType::Utf8,
+            false,
+        )]);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 anyhow = "1.0"
 async-recursion = "1.0"
 async-trait = "0.1"

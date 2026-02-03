@@ -358,26 +358,43 @@ where
         let left_keyed = self.keyed_deltas(&left_delta, &self.left_key);
         let right_keyed = self.keyed_deltas(&right_delta, &self.right_key);
 
+        // Build output delta from pre-update state (A, B) and current deltas
+        // (ΔA, ΔB). State/index updates happen after this block to keep
+        // each tick atomic.
         let mut delta_join: HashMap<O, i64> = HashMap::new();
-        for (key, left_entries) in &left_keyed {
-            let right_entries = self
-                .right_index
-                .values_for_key(key)
-                .await
-                .context("load right join index")?;
-            self.join_entries(left_entries, &right_entries, &mut delta_join);
+        let has_left = !left_keyed.is_empty();
+        let has_right = !right_keyed.is_empty();
+
+        // ΔA ⋈ B
+        if has_left {
+            for (key, left_entries) in &left_keyed {
+                let right_entries = self
+                    .right_index
+                    .values_for_key(key)
+                    .await
+                    .context("load right join index")?;
+                self.join_entries(left_entries, &right_entries, &mut delta_join);
+            }
         }
-        for (key, right_entries) in &right_keyed {
-            let left_entries = self
-                .left_index
-                .values_for_key(key)
-                .await
-                .context("load left join index")?;
-            self.join_entries(&left_entries, right_entries, &mut delta_join);
+
+        // A ⋈ ΔB
+        if has_right {
+            for (key, right_entries) in &right_keyed {
+                let left_entries = self
+                    .left_index
+                    .values_for_key(key)
+                    .await
+                    .context("load left join index")?;
+                self.join_entries(&left_entries, right_entries, &mut delta_join);
+            }
         }
-        for (key, left_entries) in &left_keyed {
-            if let Some(right_entries) = right_keyed.get(key) {
-                self.join_entries(left_entries, right_entries, &mut delta_join);
+
+        // ΔA ⋈ ΔB
+        if has_left && has_right {
+            for (key, left_entries) in &left_keyed {
+                if let Some(right_entries) = right_keyed.get(key) {
+                    self.join_entries(left_entries, right_entries, &mut delta_join);
+                }
             }
         }
         delta_join.retain(|_, w| *w != 0);

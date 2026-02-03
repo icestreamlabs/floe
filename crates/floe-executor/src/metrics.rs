@@ -18,6 +18,43 @@ static TAIL_THROUGHPUT_ROWS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register floe_tail_rows_total")
 });
 
+static DELTA_BATCH_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(HistogramOpts::new(
+        "floe_delta_batch_rows",
+        "Number of rows emitted per delta batch",
+    ))
+    .expect("register floe_delta_batch_rows")
+});
+
+static DELTA_BATCH_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(HistogramOpts::new(
+        "floe_delta_batch_bytes",
+        "Estimated byte size of emitted delta batches",
+    ))
+    .expect("register floe_delta_batch_bytes")
+});
+
+static DELTA_BATCH_FLUSHES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "floe_delta_batch_flush_total",
+        "Number of delta batch flushes emitted"
+    )
+    .expect("register floe_delta_batch_flush_total")
+});
+
+pub(crate) fn observe_delta_batch(rows: usize, bytes: usize) {
+    if rows > 0 {
+        DELTA_BATCH_ROWS.observe(rows as f64);
+    }
+    if bytes > 0 {
+        DELTA_BATCH_BYTES.observe(bytes as f64);
+    }
+}
+
+pub(crate) fn inc_delta_batch_flushes() {
+    DELTA_BATCH_FLUSHES.inc();
+}
+
 pub(crate) fn observe_mv_update_latency_ms(latency_ms: u64) {
     MV_UPDATE_LATENCY_MS.observe(latency_ms as f64);
 }
@@ -31,4 +68,7 @@ pub(crate) fn inc_tail_rows(count: usize) {
 pub(crate) fn init() {
     let _ = &*MV_UPDATE_LATENCY_MS;
     let _ = &*TAIL_THROUGHPUT_ROWS;
+    let _ = &*DELTA_BATCH_ROWS;
+    let _ = &*DELTA_BATCH_BYTES;
+    let _ = &*DELTA_BATCH_FLUSHES;
 }
