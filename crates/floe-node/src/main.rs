@@ -16,7 +16,7 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
 use dbsp::StreamRetention;
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
+    BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
     SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
 };
@@ -232,6 +232,11 @@ async fn main() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
+    let consolidation_mode = match run_args.output_consolidation_mode {
+        cli::OutputConsolidationMode::AllColumns => ConsolidationMode::ByAllColumns,
+        cli::OutputConsolidationMode::Key => ConsolidationMode::ByKey,
+    };
+    graph_builder.set_output_consolidation_mode(consolidation_mode);
     let event_watermark = Arc::new(AtomicI64::new(-1));
     let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let graph_cancel = CancellationToken::new();

@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use floe_node_core::tail_client::{TailConfig, build_tail_sql};
 
@@ -84,6 +84,14 @@ pub struct RunArgs {
     /// Number of materialized view versions to retain (0 keeps all versions).
     #[arg(long = "mv-retain-last", default_value_t = 1, value_parser = parse_nonnegative_usize)]
     pub mv_retain_last: usize,
+
+    /// Output delta consolidation mode for materialized view writes.
+    #[arg(
+        long = "output-consolidation-mode",
+        value_enum,
+        default_value_t = OutputConsolidationMode::AllColumns
+    )]
+    pub output_consolidation_mode: OutputConsolidationMode,
 
     /// Read newline-delimited JSON events from a file (use "-" for stdin).
     #[arg(long = "input-file")]
@@ -184,6 +192,12 @@ pub struct TailArgs {
     pub max_rows: Option<usize>,
     #[arg(long)]
     pub no_header: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+pub enum OutputConsolidationMode {
+    AllColumns,
+    Key,
 }
 
 impl TailArgs {

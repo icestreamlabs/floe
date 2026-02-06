@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
+use crate::delta_consolidation::ConsolidationMode;
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::task_events::GraphTaskSender;
 
@@ -20,6 +21,7 @@ pub struct DbspGraphBuilder {
     pub(super) bridge: Arc<Mutex<DbspBridge>>,
     ns: GraphNamespace,
     pub(super) watermark: Arc<AtomicI64>,
+    output_consolidation_mode: ConsolidationMode,
 }
 
 impl DbspGraphBuilder {
@@ -30,7 +32,12 @@ impl DbspGraphBuilder {
             bridge: Arc::new(Mutex::new(bridge)),
             ns: GraphNamespace::default(),
             watermark: Arc::new(AtomicI64::new(-1)),
+            output_consolidation_mode: ConsolidationMode::ByAllColumns,
         })
+    }
+
+    pub fn set_output_consolidation_mode(&mut self, mode: ConsolidationMode) {
+        self.output_consolidation_mode = mode;
     }
 
     pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {
@@ -72,6 +79,7 @@ impl DbspGraphBuilder {
                 &inputs.mv_registry,
                 &mut mv_latest,
                 inputs.mv_retention,
+                self.output_consolidation_mode,
             )
             .await?;
         }
@@ -290,6 +298,7 @@ impl DbspGraphBuilder {
                     mv_registry,
                     mv_latest,
                     mv_retention,
+                    self.output_consolidation_mode,
                 )
                 .await?
             }

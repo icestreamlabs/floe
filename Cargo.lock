@@ -1977,6 +1977,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "dbsp",
+ "floe-executor",
  "parking_lot",
  "rkyv 0.8.12",
  "tokio",

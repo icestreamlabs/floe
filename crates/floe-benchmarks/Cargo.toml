@@ -8,6 +8,7 @@ async-trait = { workspace = true }
 criterion = "0.5"
 datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }
+floe-executor = { path = "../floe-executor" }
 parking_lot = "0.12"
 rkyv = { workspace = true }
 tokio = { workspace = true }
