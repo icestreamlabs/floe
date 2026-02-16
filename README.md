@@ -101,7 +101,7 @@ Tradeoffs:
 - `crates/floe-server`: pgwire protocol server and TAIL query execution.
 - `crates/floe-storage`: SlateDB catalog integration and persistence glue.
 - `crates/floe-core`: shared types (catalog, source definitions, row values).
-- `crates/floe-sql-parser`: SQL parsing for Floe-specific statements (MV/TAIL).
+- `crates/floe-sql-parser`: SQL parsing for Floe-specific statements (MV/SINK/TAIL).
 - `crates/dbsp`: core DBSP APIs and types (align semantics with Feldera).
 - `crates/dbsp-circuit`: circuit representation and planning utilities.
 - `crates/dbsp-planner`: DataFusion to DBSP plan translation.

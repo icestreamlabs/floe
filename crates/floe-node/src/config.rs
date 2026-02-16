@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME, PERSON_SOURCE_NAME};
 use floe_node_core::source::SourceRegistry;
+use floe_sql_parser::{SinkConnector, SinkDefinition};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
@@ -94,6 +95,18 @@ pub enum SinkConfig {
         with_snapshot: Option<bool>,
         #[serde(default)]
         as_of: Option<i64>,
+        #[serde(default)]
+        batch_rows: Option<usize>,
+        #[serde(default)]
+        batch_bytes: Option<usize>,
+        #[serde(default)]
+        queue_capacity: Option<usize>,
+        #[serde(default)]
+        retry_max_attempts: Option<usize>,
+        #[serde(default)]
+        retry_base_ms: Option<u64>,
+        #[serde(default)]
+        retry_max_backoff_ms: Option<u64>,
     },
     File {
         #[serde(default)]
@@ -106,6 +119,12 @@ pub enum SinkConfig {
         as_of: Option<i64>,
         #[serde(default)]
         append: Option<bool>,
+        #[serde(default)]
+        batch_rows: Option<usize>,
+        #[serde(default)]
+        batch_bytes: Option<usize>,
+        #[serde(default)]
+        queue_capacity: Option<usize>,
     },
     Http {
         #[serde(default)]
@@ -118,6 +137,18 @@ pub enum SinkConfig {
         as_of: Option<i64>,
         #[serde(default)]
         batch_size: Option<usize>,
+        #[serde(default)]
+        batch_rows: Option<usize>,
+        #[serde(default)]
+        batch_bytes: Option<usize>,
+        #[serde(default)]
+        queue_capacity: Option<usize>,
+        #[serde(default)]
+        retry_max_attempts: Option<usize>,
+        #[serde(default)]
+        retry_base_ms: Option<u64>,
+        #[serde(default)]
+        retry_max_backoff_ms: Option<u64>,
     },
 }
 
@@ -218,6 +249,54 @@ pub fn normalize_sinks(sinks: Vec<SinkConfig>) -> Result<Vec<SinkSpec>> {
     }
 
     Ok(specs)
+}
+
+pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
+    let config = match definition.connector() {
+        SinkConnector::Kafka { brokers, topic } => SinkConfig::Kafka {
+            name: Some(definition.name().to_string()),
+            brokers: brokers.clone(),
+            topic: topic.clone(),
+            mv: definition.mv_name().to_string(),
+            with_snapshot: Some(definition.with_snapshot()),
+            as_of: definition.as_of(),
+            batch_rows: None,
+            batch_bytes: None,
+            queue_capacity: None,
+            retry_max_attempts: None,
+            retry_base_ms: None,
+            retry_max_backoff_ms: None,
+        },
+        SinkConnector::File { path, append } => SinkConfig::File {
+            name: Some(definition.name().to_string()),
+            path: path.clone(),
+            mv: definition.mv_name().to_string(),
+            with_snapshot: Some(definition.with_snapshot()),
+            as_of: definition.as_of(),
+            append: *append,
+            batch_rows: None,
+            batch_bytes: None,
+            queue_capacity: None,
+        },
+        SinkConnector::Http { url, batch_size } => SinkConfig::Http {
+            name: Some(definition.name().to_string()),
+            url: url.clone(),
+            mv: definition.mv_name().to_string(),
+            with_snapshot: Some(definition.with_snapshot()),
+            as_of: definition.as_of(),
+            batch_size: *batch_size,
+            batch_rows: None,
+            batch_bytes: None,
+            queue_capacity: None,
+            retry_max_attempts: None,
+            retry_base_ms: None,
+            retry_max_backoff_ms: None,
+        },
+    };
+    Ok(SinkSpec {
+        name: definition.name().to_string(),
+        config,
+    })
 }
 
 pub fn apply_connector_properties(registry: &mut SourceRegistry, connectors: &[ConnectorSpec]) {
@@ -454,6 +533,7 @@ impl SinkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_sql_parser::{SinkConnector, SinkDefinition};
 
     #[test]
     fn normalize_assigns_unique_names() {
@@ -492,5 +572,39 @@ mod tests {
         "#;
         let config: NodeConfig = toml::from_str(input).expect("parse toml");
         assert_eq!(config.connectors.len(), 1);
+    }
+
+    #[test]
+    fn maps_sql_sink_definition_to_runtime_config() {
+        let definition = SinkDefinition::new(
+            "out_http",
+            "mv_bid",
+            SinkConnector::Http {
+                url: "http://localhost:8080".to_string(),
+                batch_size: Some(16),
+            },
+            true,
+            Some(7),
+        );
+        let spec = sink_spec_from_sql(&definition).expect("map sink");
+        match spec.config {
+            SinkConfig::Http {
+                name,
+                url,
+                mv,
+                with_snapshot,
+                as_of,
+                batch_size,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("out_http"));
+                assert_eq!(url, "http://localhost:8080");
+                assert_eq!(mv, "mv_bid");
+                assert_eq!(with_snapshot, Some(true));
+                assert_eq!(as_of, Some(7));
+                assert_eq!(batch_size, Some(16));
+            }
+            other => panic!("expected HTTP sink config, got {other:?}"),
+        }
     }
 }

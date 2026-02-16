@@ -5,11 +5,11 @@ use datafusion::logical_expr::LogicalPlan;
 
 pub use dbsp::circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType, DbspSelectNode,
-    DbspSourceNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec,
-    Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem, RowSchema, ScalarValue,
-    TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
-    nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
+    DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType,
+    DbspSelectNode, DbspSourceNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
+    DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem, RowSchema,
+    ScalarValue, TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table,
+    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
 
 use crate::namespaces;
@@ -90,6 +90,7 @@ pub fn validate_dbsp_plan(
             }
             DbspNodeKind::Project(_)
             | DbspNodeKind::Select(_)
+            | DbspNodeKind::Distinct(_)
             | DbspNodeKind::Aggregate(_)
             | DbspNodeKind::TopN(_)
             | DbspNodeKind::WindowAggregate(_)
@@ -227,6 +228,7 @@ fn kind_name(kind: &DbspNodeKind) -> &'static str {
         DbspNodeKind::Project(_) => "Project",
         DbspNodeKind::Join(_) => "Join",
         DbspNodeKind::Aggregate(_) => "Aggregate",
+        DbspNodeKind::Distinct(_) => "Distinct",
         DbspNodeKind::WindowAggregate(_) => "WindowAggregate",
         DbspNodeKind::TopN(_) => "TopN",
         DbspNodeKind::Union(_) => "Union",

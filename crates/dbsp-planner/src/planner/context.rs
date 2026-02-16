@@ -4,11 +4,12 @@ use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
 use datafusion::scalar::ScalarValue;
+use datafusion_common::Column;
 
 use dbsp_circuit::circuit::plan::{
-    DbspAggregateNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspSelectNode,
-    DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, OrderExpr, ProjectItem,
+    DbspAggregateNode, DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode,
+    DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, OrderExpr, ProjectItem,
 };
 use dbsp_circuit::circuit::schema::{Field, RowSchema};
 use dbsp_circuit::circuit::types::DbspScalarType;
@@ -73,23 +74,65 @@ impl<'cfg> PlannerContext<'cfg> {
                     .config
                     .table(&scan.table_name)
                     .ok_or_else(|| PlannerError::TableNotFound(scan.table_name.to_string()))?;
-
-                if scan.projection.is_some() {
-                    return Err(PlannerError::UnsupportedPlan(
-                        "column projection pushdown is not supported yet".to_string(),
-                    ));
-                }
+                let source_schema = table.schema().clone();
+                let source_id = self.add_node(
+                    vec![],
+                    DbspNodeKind::Source(DbspSourceNode { table }),
+                    source_schema.clone(),
+                );
+                let mut current = PlannedNode {
+                    id: source_id,
+                    schema: source_schema.clone(),
+                };
 
                 if !scan.filters.is_empty() {
-                    return Err(PlannerError::UnsupportedPlan(
-                        "table scan filters are not supported yet".to_string(),
-                    ));
+                    let predicates = scan
+                        .filters
+                        .iter()
+                        .cloned()
+                        .map(normalize_expr)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let predicate = combine_filters(predicates).ok_or_else(|| {
+                        PlannerError::UnsupportedPlan(
+                            "table scan filter list unexpectedly empty".to_string(),
+                        )
+                    })?;
+                    let select = DbspSelectNode::try_new(source_schema.clone(), predicate)?;
+                    let id = self.add_node(
+                        vec![current.id],
+                        DbspNodeKind::Select(select),
+                        current.schema.clone(),
+                    );
+                    current.id = id;
                 }
 
-                let node = DbspNodeKind::Source(DbspSourceNode { table });
-                let schema = table.schema().clone();
-                let id = self.add_node(vec![], node, schema.clone());
-                Ok(PlannedNode { id, schema })
+                if let Some(projection) = &scan.projection {
+                    let mut items = Vec::with_capacity(projection.len());
+                    for idx in projection {
+                        let Some(field) = source_schema.field(*idx) else {
+                            return Err(PlannerError::UnsupportedPlan(format!(
+                                "table scan projection index {idx} out of bounds",
+                            )));
+                        };
+                        items.push(ProjectItem {
+                            expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                            alias: Some(field.name.clone()),
+                        });
+                    }
+                    let project = DbspProjectNode::try_new(current.schema.clone(), items)?;
+                    let output_schema = project.output_schema().clone();
+                    let id = self.add_node(
+                        vec![current.id],
+                        DbspNodeKind::Project(project),
+                        output_schema.clone(),
+                    );
+                    current = PlannedNode {
+                        id,
+                        schema: output_schema,
+                    };
+                }
+
+                Ok(current)
             }
             LogicalPlan::Projection(projection) => {
                 let input = self.plan_node(&projection.input)?;
@@ -158,9 +201,7 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::SubqueryAlias(alias) => self.plan_node(&alias.input),
             LogicalPlan::Subquery(subquery) => self.plan_node(&subquery.subquery),
             LogicalPlan::Repartition(repartition) => self.plan_node(&repartition.input),
-            LogicalPlan::Distinct(_) => Err(PlannerError::UnsupportedPlan(
-                "DISTINCT is not supported".to_string(),
-            )),
+            LogicalPlan::Distinct(distinct) => self.plan_distinct(distinct),
             LogicalPlan::EmptyRelation(relation) => Err(PlannerError::UnsupportedPlan(format!(
                 "empty relation nodes are not supported (produce_one_row = {})",
                 relation.produce_one_row
@@ -424,6 +465,32 @@ impl<'cfg> PlannerContext<'cfg> {
         let id = self.add_node(
             input_ids,
             DbspNodeKind::Union(union_node),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
+    }
+
+    fn plan_distinct(
+        &mut self,
+        distinct: &datafusion::logical_expr::logical_plan::Distinct,
+    ) -> Result<PlannedNode, PlannerError> {
+        let input_plan = match distinct {
+            datafusion::logical_expr::logical_plan::Distinct::All(input) => input,
+            datafusion::logical_expr::logical_plan::Distinct::On(_) => {
+                return Err(PlannerError::UnsupportedPlan(
+                    "DISTINCT ON is not supported".to_string(),
+                ));
+            }
+        };
+        let input = self.plan_node(input_plan)?;
+        let distinct_node = DbspDistinctNode::new(input.schema.clone());
+        let output_schema = distinct_node.output_schema().clone();
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::Distinct(distinct_node),
             output_schema.clone(),
         );
         Ok(PlannedNode {

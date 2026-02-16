@@ -11,7 +11,7 @@ use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::StreamCursor;
 use dbsp::stream::util::materialize_zset_handle;
-use dbsp::{DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};
+use dbsp::{DbspDistinct, DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
@@ -59,6 +59,10 @@ impl DbspCircuitInstance {
                 DbspNodeKind::Project(project) => {
                     let upstream = instance.stream_for_input(&node, 0)?;
                     instance.compile_map(project, upstream.clone()).await?
+                }
+                DbspNodeKind::Distinct(_) => {
+                    let upstream = instance.stream_for_input(&node, 0)?;
+                    instance.compile_distinct(upstream.clone()).await?
                 }
                 DbspNodeKind::Join(join) => {
                     let left = instance.stream_for_input(&node, 0)?;
@@ -231,6 +235,11 @@ impl DbspCircuitInstance {
         };
         let filter = DbspFilter::new::<Vec<u8>, _>(&upstream, filter_pred, None).await?;
         Ok(filter.stream())
+    }
+
+    async fn compile_distinct(&self, upstream: DeltaHandleStream) -> Result<DeltaHandleStream> {
+        let distinct = DbspDistinct::new::<Vec<u8>>(&upstream, None).await?;
+        Ok(distinct.stream())
     }
 
     async fn compile_map(

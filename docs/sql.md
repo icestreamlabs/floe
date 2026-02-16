@@ -6,18 +6,28 @@ semantics for materialized views and TAIL.
 ## Supported Statements
 
 - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [WITH (<options>)] AS <select>`
+- `CREATE SINK <sink_name> FROM <mv_name> WITH (<options>)`
 - `TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]`
 - `SELECT ... FROM <materialized_view>` (read-only queries via pgwire)
 
+## SQL Program Parsing
+
+- Floe accepts SQL program text with multiple semicolon-separated statements.
+- Statement order is preserved and processed in-order.
+- `--mv-query` accepts SQL programs containing:
+  - `CREATE MATERIALIZED VIEW`
+  - `CREATE SINK`
+- `TAIL` remains a query-time statement and is not valid in `--mv-query`.
+
 ## Materialized View Definition Rules
 
-- Exactly one statement; multiple statements are rejected.
+- A single `CREATE MATERIALIZED VIEW` statement must be syntactically valid.
 - `WITH` clauses are accepted in materialized view definitions, but the
   options are currently ignored.
 - Identifiers can be double-quoted to preserve case or include special
   characters (`"MyView"`).
 - The logical plan must compile to supported nodes (for example:
-  Source/Select/Project/Join/Aggregate/WindowAggregate/TopN/Union/Passthrough/Sink).
+  Source/Select/Project/Join/Aggregate/WindowAggregate/TopN/Union/Distinct/Passthrough/Sink).
   Unsupported nodes are rejected at plan validation time.
 - Joins are **inner equi-joins** on column references only.
   Non-column join expressions are rejected.
@@ -27,6 +37,47 @@ semantics for materialized views and TAIL.
 - Supported scalar types in expressions: `INT64`, `BOOL`, `UTF8`, and
   `TIMESTAMP(MILLISECOND)`.
 - `LIKE` only supports a single prefix or suffix `%` wildcard (no substring).
+- `SELECT DISTINCT` and `UNION DISTINCT` are supported.
+
+## CREATE SINK Syntax
+
+Syntax:
+
+```sql
+CREATE SINK <sink_name>
+FROM <mv_name>
+WITH (
+  connector = '<kafka|file|http>',
+  ... connector/reliability options ...
+)
+```
+
+Connector options:
+
+- Kafka: `brokers`, `topic`
+- File: `path`, optional `append`
+- HTTP: `url`, optional `batch_size`
+
+Common tail options:
+
+- `with_snapshot` (bool)
+- `as_of` (int64)
+
+Reliability options:
+
+- `batch_rows` (flush threshold by row count)
+- `batch_bytes` (flush threshold by serialized payload bytes)
+- `queue_capacity` (bounded sink queue size)
+- `retry_max_attempts` (Kafka/HTTP)
+- `retry_base_ms` (Kafka/HTTP)
+- `retry_max_backoff_ms` (Kafka/HTTP)
+
+Sink execution behavior:
+
+- Flush occurs when a threshold is hit, on each tail tick boundary, and on shutdown.
+- Kafka/HTTP emission retries use bounded exponential backoff.
+- On permanent Kafka/HTTP failures, sink execution stops and the sink task exits with error.
+- Bounded sink queues apply backpressure when consumers fall behind.
 
 ## Materialized View Query Semantics
 

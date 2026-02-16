@@ -1,6 +1,9 @@
 use std::sync::LazyLock;
 
-use prometheus::{Histogram, HistogramOpts, IntGauge, register_histogram, register_int_gauge};
+use prometheus::{
+    Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, register_histogram,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+};
 
 static INGEST_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
@@ -26,6 +29,33 @@ static INGEST_TICK_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("register floe_ingest_tick_latency_ms")
 });
 
+static SINK_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_sink_queue_depth",
+        "Number of records currently buffered in a sink queue",
+        &["sink"]
+    )
+    .expect("register floe_sink_queue_depth")
+});
+
+static SINK_VERSION_LAG: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_sink_version_lag",
+        "Difference between latest enqueued and latest flushed MV version per sink",
+        &["sink"]
+    )
+    .expect("register floe_sink_version_lag")
+});
+
+static SINK_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_sink_failures_total",
+        "Total sink emission failures by sink and transport",
+        &["sink", "transport"]
+    )
+    .expect("register floe_sink_failures_total")
+});
+
 pub(crate) fn record_ingest_queue_depth(depth: usize) {
     INGEST_QUEUE_DEPTH.set(depth as i64);
 }
@@ -38,8 +68,25 @@ pub(crate) fn observe_tick_latency_ms(latency_ms: u64) {
     INGEST_TICK_LATENCY_MS.observe(latency_ms as f64);
 }
 
+pub(crate) fn record_sink_queue_depth(sink: &str, depth: usize) {
+    SINK_QUEUE_DEPTH
+        .with_label_values(&[sink])
+        .set(depth as i64);
+}
+
+pub(crate) fn record_sink_version_lag(sink: &str, lag: i64) {
+    SINK_VERSION_LAG.with_label_values(&[sink]).set(lag.max(0));
+}
+
+pub(crate) fn inc_sink_failure(sink: &str, transport: &str) {
+    SINK_FAILURES.with_label_values(&[sink, transport]).inc();
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
     let _ = &*INGEST_TICK_LATENCY_MS;
+    let _ = &*SINK_QUEUE_DEPTH;
+    let _ = &*SINK_VERSION_LAG;
+    let _ = &*SINK_FAILURES;
 }

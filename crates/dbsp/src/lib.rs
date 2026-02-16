@@ -10,8 +10,8 @@ pub mod circuit {
 }
 
 pub use dbsp_runtime::{
-    aggregate, algebra, collections, filter, handles, join, map, operators, relation_state, stream,
-    topk, topn, union, window,
+    aggregate, algebra, collections, distinct, filter, handles, join, map, operators,
+    relation_state, stream, topk, topn, union, window,
 };
 pub use dbsp_storage::storage;
 
@@ -19,15 +19,16 @@ pub use aggregate::DbspAggregate;
 pub use algebra::AbelianGroup;
 pub use circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectNode,
-    DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
-    DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef, KeyEncoder,
-    OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem, Row, RowBuilder, RowSchema,
-    ScalarValue, TableDescriptor, encode_composite_key, encode_scalar, nexmark_auction_alias_table,
-    nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table,
-    nexmark_person_table,
+    DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate,
+    DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode,
+    DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef,
+    KeyEncoder, OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem, Row, RowBuilder,
+    RowSchema, ScalarValue, TableDescriptor, encode_composite_key, encode_scalar,
+    nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
+    nexmark_person_alias_table, nexmark_person_table,
 };
 pub use collections::{ZSet, h};
+pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;

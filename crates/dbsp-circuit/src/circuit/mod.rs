@@ -11,10 +11,10 @@ pub use arrow_batch::{
 };
 pub use encoding::{KeyEncoder, encode_composite_key, encode_scalar};
 pub use plan::{
-    DbspAggregateFunction, DbspAggregateNode, DbspExpression, DbspJoinNode, DbspJoinType,
-    DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSinkNode, DbspSourceNode,
-    DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec,
-    OrderExpr, ProjectItem,
+    DbspAggregateFunction, DbspAggregateNode, DbspDistinctNode, DbspExpression, DbspJoinNode,
+    DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSinkNode,
+    DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
+    DbspWindowSpec, OrderExpr, ProjectItem,
 };
 pub use row::{Row, RowBuilder};
 pub use schema::{Field, FieldRef, PrimaryKey, RowSchema};

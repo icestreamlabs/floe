@@ -221,6 +221,24 @@ impl DbspGraphBuilder {
                     .await?;
                 self.compile_topn(topn, upstream, task_events).await?
             }
+            DbspNodeKind::Distinct(distinct) => {
+                let input_idx = first_input(node, "distinct")?;
+                let upstream = self
+                    .compile_node(
+                        plan,
+                        input_idx,
+                        outer_streams,
+                        cancel,
+                        task_events,
+                        built,
+                        mv_registry,
+                        mv_latest,
+                        mv_retention,
+                    )
+                    .await?;
+                self.compile_distinct(distinct, upstream, task_events)
+                    .await?
+            }
             DbspNodeKind::WindowAggregate(window) => {
                 let input_idx = first_input(node, "window aggregate")?;
                 let upstream = self

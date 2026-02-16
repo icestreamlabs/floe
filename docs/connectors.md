@@ -178,3 +178,23 @@ Supported sinks:
 - Kafka (`type = "kafka"`) writes JSON rows to a topic.
 - File (`type = "file"`) appends JSONL rows to a file.
 - HTTP (`type = "http"`) POSTs JSON batches to a URL.
+
+Reliability and throughput options:
+
+- `batch_rows` (all sinks): flush when buffered row count reaches threshold.
+- `batch_bytes` (all sinks): flush when buffered serialized bytes reach threshold.
+- `queue_capacity` (all sinks): bounded in-memory queue size between TAIL producer and sink worker.
+- `retry_max_attempts` (Kafka/HTTP): max delivery attempts before permanent failure.
+- `retry_base_ms` (Kafka/HTTP): base delay for exponential backoff.
+- `retry_max_backoff_ms` (Kafka/HTTP): max delay cap for backoff.
+
+Execution semantics:
+
+- Rows are flushed on threshold, tail tick boundary, and shutdown.
+- Kafka and HTTP sinks retry transient failures with bounded exponential backoff.
+- Permanent failures are recorded and stop the sink task.
+- Backpressure is applied naturally via bounded queues when sink workers lag.
+- Metrics exported per sink:
+  - `floe_sink_queue_depth{sink=...}`
+  - `floe_sink_version_lag{sink=...}`
+  - `floe_sink_failures_total{sink=...,transport=...}`

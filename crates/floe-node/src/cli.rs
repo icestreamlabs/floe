@@ -29,7 +29,7 @@ pub struct RunArgs {
     #[arg(long = "max-events")]
     pub max_events: Option<u64>,
 
-    /// SQL text for a single materialized view definition (specify at most once).
+    /// SQL program text (supports CREATE MATERIALIZED VIEW and CREATE SINK statements).
     #[arg(long = "mv-query", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub mv_query: Option<String>,
 

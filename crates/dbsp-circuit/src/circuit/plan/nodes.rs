@@ -649,6 +649,21 @@ impl DbspUnionNode {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspDistinctNode {
+    input_schema: Arc<RowSchema>,
+}
+
+impl DbspDistinctNode {
+    pub fn new(input_schema: Arc<RowSchema>) -> Self {
+        Self { input_schema }
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.input_schema
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DbspSinkNode {
     pub name: String,
     input_schema: Arc<RowSchema>,
@@ -677,6 +692,7 @@ pub enum DbspNodeKind {
     WindowAggregate(DbspWindowAggregateNode),
     TopN(DbspTopNNode),
     Union(DbspUnionNode),
+    Distinct(DbspDistinctNode),
     Passthrough,
     Sink(DbspSinkNode),
 }

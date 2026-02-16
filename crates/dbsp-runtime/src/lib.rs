@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod algebra;
 pub mod collections;
+pub mod distinct;
 pub mod filter;
 pub mod handles;
 pub mod join;
@@ -18,6 +19,7 @@ pub use dbsp_storage::storage;
 pub use aggregate::DbspAggregate;
 pub use algebra::AbelianGroup;
 pub use collections::{OrderedBytes, ZSet, h};
+pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;

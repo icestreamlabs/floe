@@ -31,7 +31,7 @@ use floe_node_core::planner::{
 use floe_node_core::postgres_cdc_connector::{PostgresCdcConnector, PostgresCdcConnectorConfig};
 use floe_node_core::tail_client;
 use floe_server as server;
-use floe_sql_parser::{MaterializedViewDefinition, parse_materialized_view};
+use floe_sql_parser::{FloeStatement, MaterializedViewDefinition, parse_floe_program};
 use floe_storage::MaterializedViewMetadata;
 use futures::future::select_all;
 use slatedb::config::{CompactorOptions, Settings};
@@ -42,7 +42,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    ConnectorConfig, apply_connector_properties, load_config, normalize_connectors, normalize_sinks,
+    ConnectorConfig, SinkConfig, SinkSpec, apply_connector_properties, load_config,
+    normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
 
 static INGEST_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -109,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let (connector_specs, sink_specs) = if let Some(config) = config {
+    let (connector_specs, mut sink_specs) = if let Some(config) = config {
         let connectors = normalize_connectors(config.connectors)?;
         if connectors.is_empty() {
             return Err(anyhow!("config must declare at least one connector"));
@@ -130,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     let storage = server::init_storage(slate_settings).await?;
     let db = storage.db();
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
+    let mut sql_sink_specs = Vec::new();
     let stored_views = storage
         .materialized_views()
         .await
@@ -142,32 +144,48 @@ async fn main() -> anyhow::Result<()> {
         );
         materialized_view_map.insert(definition.name().to_string(), definition);
     }
-    if let Some(sql) = run_args.mv_query.as_deref() {
-        let definition = parse_materialized_view(sql)?;
-        let name = definition.name().to_string();
-        if definition.if_not_exists() && materialized_view_map.contains_key(&name) {
-            tracing::info!(
-                view = %name,
-                "materialized view already exists; skipping due to IF NOT EXISTS"
-            );
-        } else {
-            let metadata = MaterializedViewMetadata::new(
-                definition.name(),
-                definition.query(),
-                definition.if_not_exists(),
-            );
-            storage
-                .upsert_materialized_view(metadata)
-                .await
-                .with_context(|| {
-                    format!(
-                        "persist materialized view definition for '{}'",
-                        definition.name()
-                    )
-                })?;
-            materialized_view_map.insert(name, definition);
+    if let Some(sql_program) = run_args.mv_query.as_deref() {
+        for statement in parse_floe_program(sql_program)? {
+            match statement {
+                FloeStatement::CreateMaterializedView(definition) => {
+                    let name = definition.name().to_string();
+                    if definition.if_not_exists() && materialized_view_map.contains_key(&name) {
+                        tracing::info!(
+                            view = %name,
+                            "materialized view already exists; skipping due to IF NOT EXISTS"
+                        );
+                    } else {
+                        let metadata = MaterializedViewMetadata::new(
+                            definition.name(),
+                            definition.query(),
+                            definition.if_not_exists(),
+                        );
+                        storage
+                            .upsert_materialized_view(metadata)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "persist materialized view definition for '{}'",
+                                    definition.name()
+                                )
+                            })?;
+                        materialized_view_map.insert(name, definition);
+                    }
+                }
+                FloeStatement::CreateSink(definition) => {
+                    sql_sink_specs.push(sink_spec_from_sql(&definition)?);
+                }
+                FloeStatement::Tail { .. } => {
+                    return Err(anyhow!(
+                        "TAIL statements are not supported in --mv-query programs"
+                    ));
+                }
+            }
         }
     }
+
+    merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)?;
+
     let mut materialized_views: Vec<MaterializedViewDefinition> =
         materialized_view_map.into_values().collect();
     materialized_views.sort_by(|a, b| a.name().cmp(b.name()));
@@ -833,6 +851,38 @@ fn connectors_from_cli(args: &cli::RunArgs) -> Vec<ConnectorConfig> {
     connectors
 }
 
+fn sink_mv_name(config: &SinkConfig) -> &str {
+    match config {
+        SinkConfig::Kafka { mv, .. }
+        | SinkConfig::File { mv, .. }
+        | SinkConfig::Http { mv, .. } => mv,
+    }
+}
+
+fn merge_sql_sinks(
+    sink_specs: &mut Vec<SinkSpec>,
+    sql_sink_specs: Vec<SinkSpec>,
+    materialized_view_map: &HashMap<String, MaterializedViewDefinition>,
+) -> anyhow::Result<()> {
+    let mut sink_names: BTreeSet<String> =
+        sink_specs.iter().map(|spec| spec.name.clone()).collect();
+    for sink in sql_sink_specs {
+        let mv_name = sink_mv_name(&sink.config);
+        if !materialized_view_map.contains_key(mv_name) {
+            return Err(anyhow!(
+                "sink '{}' references unknown materialized view '{}'",
+                sink.name,
+                mv_name
+            ));
+        }
+        if !sink_names.insert(sink.name.clone()) {
+            return Err(anyhow!("duplicate sink name '{}'", sink.name));
+        }
+        sink_specs.push(sink);
+    }
+    Ok(())
+}
+
 fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;
@@ -976,6 +1026,77 @@ mod tests {
         let selection = build_batch(&mut queues, 0, 10, 1, 10);
         assert_eq!(selection.batch.len(), 1);
         assert_eq!(queues[0].pending.len(), 2);
+    }
+
+    #[test]
+    fn merge_sql_sinks_validates_mv_reference() {
+        let mut sink_specs = Vec::new();
+        let sql_sink_specs = vec![SinkSpec {
+            name: "sink_missing".to_string(),
+            config: SinkConfig::File {
+                name: Some("sink_missing".to_string()),
+                path: "/tmp/out.jsonl".to_string(),
+                mv: "missing_mv".to_string(),
+                with_snapshot: Some(false),
+                as_of: None,
+                append: Some(true),
+                batch_rows: None,
+                batch_bytes: None,
+                queue_capacity: None,
+            },
+        }];
+        let materialized_view_map = HashMap::new();
+
+        let err = merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)
+            .expect_err("expected unknown mv validation error");
+        assert!(
+            err.to_string()
+                .contains("references unknown materialized view 'missing_mv'")
+        );
+    }
+
+    #[test]
+    fn merge_sql_sinks_rejects_duplicate_names() {
+        let mut sink_specs = vec![SinkSpec {
+            name: "sink_dup".to_string(),
+            config: SinkConfig::File {
+                name: Some("sink_dup".to_string()),
+                path: "/tmp/first.jsonl".to_string(),
+                mv: "mv_a".to_string(),
+                with_snapshot: Some(false),
+                as_of: None,
+                append: Some(true),
+                batch_rows: None,
+                batch_bytes: None,
+                queue_capacity: None,
+            },
+        }];
+        let sql_sink_specs = vec![SinkSpec {
+            name: "sink_dup".to_string(),
+            config: SinkConfig::Http {
+                name: Some("sink_dup".to_string()),
+                url: "http://localhost:8080".to_string(),
+                mv: "mv_a".to_string(),
+                with_snapshot: Some(true),
+                as_of: None,
+                batch_size: Some(1),
+                batch_rows: None,
+                batch_bytes: None,
+                queue_capacity: None,
+                retry_max_attempts: None,
+                retry_base_ms: None,
+                retry_max_backoff_ms: None,
+            },
+        }];
+        let mut materialized_view_map = HashMap::new();
+        materialized_view_map.insert(
+            "mv_a".to_string(),
+            MaterializedViewDefinition::new("mv_a", "SELECT 1", false),
+        );
+
+        let err = merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)
+            .expect_err("expected duplicate sink name error");
+        assert!(err.to_string().contains("duplicate sink name 'sink_dup'"));
     }
 }
 

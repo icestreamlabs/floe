@@ -9,10 +9,10 @@ use dbsp::handles::ZSetHandle;
 use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::{
-    DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspFilter, DbspJoin, DbspJoinNode,
-    DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSourceNode, DbspTopN,
-    DbspTopNNode, DbspUnion, DbspUnionNode, DbspWindowAggregate, DbspWindowAggregateNode,
-    DbspWindowPolicy, WindowKey,
+    DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspDistinct, DbspDistinctNode,
+    DbspFilter, DbspJoin, DbspJoinNode, DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode,
+    DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode, DbspWindowAggregate,
+    DbspWindowAggregateNode, DbspWindowPolicy, WindowKey,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -1364,6 +1364,31 @@ impl DbspGraphBuilder {
             .await
             .context("initialize DBSP union")?;
         Ok(union.stream())
+    }
+
+    pub(super) async fn compile_distinct(
+        &mut self,
+        _node: &DbspDistinctNode,
+        upstream: DeltaHandleStream,
+        task_events: &GraphTaskSender,
+    ) -> Result<DeltaHandleStream> {
+        let graph_id = self.graph_id().to_string();
+        let distinct_events = task_events.clone();
+        let distinct_label = format!("distinct:{graph_id}");
+        let distinct_graph_id = graph_id.clone();
+        let distinct_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &distinct_events,
+                &distinct_graph_id,
+                distinct_label.clone(),
+                err,
+            );
+        });
+
+        let distinct = DbspDistinct::new::<Vec<u8>>(&upstream, Some(distinct_error_handler))
+            .await
+            .context("initialize DBSP distinct")?;
+        Ok(distinct.stream())
     }
 
     pub(super) async fn compile_topn(
