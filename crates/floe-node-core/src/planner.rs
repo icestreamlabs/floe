@@ -1,10 +1,16 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::expr_fn::create_udf;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Volatility,
+};
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 use floe_sql_parser::MaterializedViewDefinition;
 
 use crate::source::SourceRegistry;
@@ -36,6 +42,7 @@ pub async fn plan_materialized_views(
     let ctx = SessionContext::new();
 
     register_sources(&ctx, sources).await?;
+    register_nexmark_udfs(&ctx);
 
     let mut plans = Vec::with_capacity(definitions.len());
     for definition in definitions {
@@ -79,6 +86,139 @@ async fn register_sources(ctx: &SessionContext, sources: &SourceRegistry) -> Res
     }
 
     Ok(())
+}
+
+fn register_nexmark_udfs(ctx: &SessionContext) {
+    for udf in planner_udfs() {
+        ctx.register_udf(udf);
+    }
+}
+
+fn planner_udfs() -> Vec<ScalarUDF> {
+    let passthrough_ts: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(args.first().cloned().unwrap_or(ColumnarValue::Scalar(
+                ScalarValue::TimestampMillisecond(None, None),
+            )))
+        },
+    );
+    let scalar_utf8: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(args
+                .first()
+                .cloned()
+                .unwrap_or(ColumnarValue::Scalar(ScalarValue::Utf8(None))))
+        },
+    );
+    let scalar_int: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(args
+                .first()
+                .cloned()
+                .unwrap_or(ColumnarValue::Scalar(ScalarValue::Int64(None))))
+        },
+    );
+    let proctime: ScalarFunctionImplementation =
+        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
+                None, None,
+            )))
+        });
+
+    let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
+    vec![
+        create_udf(
+            "tumble",
+            vec![ts.clone(), DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "hop",
+            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "tumble_start",
+            vec![ts.clone(), DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "tumble_end",
+            vec![ts.clone(), DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "hop_start",
+            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "hop_end",
+            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "tumble_rowtime",
+            vec![ts.clone(), DataType::Int64],
+            ts.clone(),
+            Volatility::Immutable,
+            Arc::clone(&passthrough_ts),
+        ),
+        create_udf(
+            "proctime",
+            vec![],
+            ts.clone(),
+            Volatility::Volatile,
+            proctime,
+        ),
+        create_udf(
+            "regexp_extract",
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::clone(&scalar_utf8),
+        ),
+        create_udf(
+            "split_index",
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::clone(&scalar_utf8),
+        ),
+        create_udf(
+            "date_format",
+            vec![ts.clone(), DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::clone(&scalar_utf8),
+        ),
+        create_udf(
+            "hour",
+            vec![ts],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::clone(&scalar_int),
+        ),
+        create_udf(
+            "count_char",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Int64,
+            Volatility::Immutable,
+            scalar_int,
+        ),
+    ]
 }
 
 pub fn camel_case_schema(definition: &floe_core::source::SourceDefinition) -> Arc<Schema> {

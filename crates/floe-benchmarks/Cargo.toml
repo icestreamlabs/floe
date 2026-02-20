@@ -3,16 +3,32 @@ name = "floe-benchmarks"
 version = "0.1.0"
 edition.workspace = true
 
+[dependencies]
+anyhow = { workspace = true }
+floe-executor = { path = "../floe-executor" }
+floe-node-core = { path = "../floe-node-core" }
+floe-sql-parser = { path = "../floe-sql-parser" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
 [dev-dependencies]
 async-trait = { workspace = true }
 criterion = "0.5"
 datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }
-floe-executor = { path = "../floe-executor" }
 parking_lot = "0.12"
 rkyv = { workspace = true }
-tokio = { workspace = true }
+arrow-ipc = "56.2.0"
+object_store = { workspace = true }
+slatedb = { workspace = true }
 
 [[bench]]
 name = "rkyv_arrow_datafusion"
+harness = false
+
+[[bench]]
+name = "rkyv_arrow_ipc_storage"
+harness = false
+
+[[bench]]
+name = "update_model_storage"
 harness = false

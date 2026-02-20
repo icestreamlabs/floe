@@ -29,9 +29,10 @@ pub struct DbspTopN {
 }
 
 impl DbspTopN {
-    pub async fn new<K, O, F>(
+    pub async fn new<K, P, O, FP, FO>(
         input: &DeltaHandleStream,
-        order_key: F,
+        partition_key: FP,
+        order_key: FO,
         limit: usize,
         offset: usize,
         error_handler: Option<RuntimeErrorHandler>,
@@ -47,8 +48,10 @@ impl DbspTopN {
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        P: Ord + Clone + Send + Sync + 'static,
         O: Ord + Clone + Send + Sync + 'static,
-        F: Fn(&K) -> Option<O> + Send + Sync + Clone + 'static,
+        FP: Fn(&K) -> Option<P> + Send + Sync + Clone + 'static,
+        FO: Fn(&K) -> Option<O> + Send + Sync + Clone + 'static,
     {
         let table = input.table();
         let topn_id = NEXT_TOPN_ID.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +71,7 @@ impl DbspTopN {
             state,
             table.clone(),
             output,
+            Arc::new(partition_key),
             Arc::new(order_key),
             limit,
             offset,

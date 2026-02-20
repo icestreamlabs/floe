@@ -665,4 +665,201 @@ mod tests {
             prev_output = aggregated;
         }
     }
+
+    #[tokio::test]
+    async fn window_aggregate_respects_watermark_allowed_lateness_cutoff() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let input_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "window_late_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<(WindowKey<i64>, i64)>::with_table(
+                table.clone(),
+                "window_late_output",
+                None,
+            )
+            .await
+            .expect("output dict"),
+        );
+
+        let state = RelationState::empty(table.clone(), "window_late_state".to_string())
+            .await
+            .expect("window state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "window_late_output".to_string(),
+        )
+        .await
+        .expect("output zset");
+
+        let index = IndexedZSet::new(table.clone(), "window_late_index");
+        let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
+        let time_extractor = Arc::new(|row: &Row| Some(*row));
+        let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
+            Arc::new(|_key, values| {
+                let mut count = 0i64;
+                for (_row, weight) in values {
+                    count += *weight;
+                }
+                (count != 0).then_some(count)
+            });
+        let watermark = Arc::new(AtomicI64::new(5_000));
+
+        let mut op = WindowAggregateOp::new(
+            state,
+            index,
+            table.clone(),
+            key_extractor,
+            time_extractor,
+            aggregator,
+            output,
+            1_000,
+            1_000,
+            500,
+            watermark,
+        )
+        .expect("window aggregate op");
+
+        let handle = stage_version(
+            input_dict,
+            table.clone(),
+            "window_late_input",
+            &[(4_499, 1), (4_500, 1), (5_200, 1)],
+        )
+        .await;
+        let out = op
+            .on_step(1, &[handle])
+            .await
+            .expect("window step")
+            .expect("non-empty output");
+
+        let mut cache = HashMap::new();
+        cache.insert("window_late_output".to_string(), output_dict);
+        let materialized =
+            materialize_zset_handle::<(WindowKey<i64>, i64)>(table.clone(), &mut cache, &out)
+                .await
+                .expect("materialize output");
+
+        // 4499 is dropped (< watermark - allowed_lateness = 4500).
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(
+            materialized.get(&(
+                WindowKey {
+                    start: 4_000,
+                    end: 5_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            materialized.get(&(
+                WindowKey {
+                    start: 5_000,
+                    end: 6_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn window_aggregate_ignores_too_late_retractions_after_window_close() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let input_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "window_retract_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<(WindowKey<i64>, i64)>::with_table(
+                table.clone(),
+                "window_retract_output",
+                None,
+            )
+            .await
+            .expect("output dict"),
+        );
+
+        let state = RelationState::empty(table.clone(), "window_retract_state".to_string())
+            .await
+            .expect("window state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "window_retract_output".to_string(),
+        )
+        .await
+        .expect("output zset");
+
+        let index = IndexedZSet::new(table.clone(), "window_retract_index");
+        let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
+        let time_extractor = Arc::new(|row: &Row| Some(*row));
+        let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
+            Arc::new(|_key, values| {
+                let mut count = 0i64;
+                for (_row, weight) in values {
+                    count += *weight;
+                }
+                (count != 0).then_some(count)
+            });
+        let watermark = Arc::new(AtomicI64::new(-1));
+
+        let mut op = WindowAggregateOp::new(
+            state,
+            index,
+            table.clone(),
+            key_extractor,
+            time_extractor,
+            aggregator,
+            output,
+            1_000,
+            1_000,
+            0,
+            Arc::clone(&watermark),
+        )
+        .expect("window aggregate op");
+
+        let first = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "window_retract_input",
+            &[(1_000, 1)],
+        )
+        .await;
+        let out1 = op
+            .on_step(1, &[first])
+            .await
+            .expect("window step")
+            .expect("non-empty output");
+        let mut cache = HashMap::new();
+        cache.insert("window_retract_output".to_string(), output_dict.clone());
+        let out1_materialized =
+            materialize_zset_handle::<(WindowKey<i64>, i64)>(table.clone(), &mut cache, &out1)
+                .await
+                .expect("materialize output");
+        assert_eq!(out1_materialized.len(), 1);
+
+        // Advance watermark so event timestamp 1000 is now too late.
+        watermark.store(3_000, Ordering::Relaxed);
+        let retract = stage_version(
+            input_dict,
+            table.clone(),
+            "window_retract_input",
+            &[(1_000, -1)],
+        )
+        .await;
+        let out2 = op.on_step(2, &[retract]).await.expect("window step");
+        assert!(out2.is_none(), "late retraction should not produce output");
+    }
 }

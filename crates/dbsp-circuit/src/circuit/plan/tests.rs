@@ -73,6 +73,8 @@ fn aggregate_output_schema_combines_keys_and_aggs() {
         vec![(
             DbspAggregateFunction::Sum,
             Some(col("value")),
+            None,
+            false,
             Some("total".to_string()),
         )],
     )

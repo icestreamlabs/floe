@@ -274,7 +274,7 @@ impl DbspJoinNode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DbspAggregateFunction {
     Count,
     Sum,
@@ -287,12 +287,24 @@ impl DbspAggregateFunction {
     pub fn result_type(&self, input_type: &DbspScalarType) -> Result<DbspScalarType> {
         match self {
             DbspAggregateFunction::Count => Ok(DbspScalarType::Int64),
-            DbspAggregateFunction::Sum
-            | DbspAggregateFunction::Min
-            | DbspAggregateFunction::Max => {
+            DbspAggregateFunction::Sum => {
                 if matches!(
                     input_type,
                     DbspScalarType::Int64 | DbspScalarType::TimestampMillis
+                ) {
+                    Ok(input_type.clone())
+                } else {
+                    bail!(
+                        "aggregate {:?} not supported for {}",
+                        self,
+                        input_type.name()
+                    );
+                }
+            }
+            DbspAggregateFunction::Min | DbspAggregateFunction::Max => {
+                if matches!(
+                    input_type,
+                    DbspScalarType::Int64 | DbspScalarType::TimestampMillis | DbspScalarType::Utf8
                 ) {
                     Ok(input_type.clone())
                 } else {
@@ -319,6 +331,8 @@ impl DbspAggregateFunction {
 pub struct DbspAggregateExpr {
     function: DbspAggregateFunction,
     expression: Option<DbspExpression>,
+    filter: Option<DbspExpression>,
+    distinct: bool,
     alias: String,
     output_type: DbspScalarType,
 }
@@ -327,14 +341,28 @@ impl DbspAggregateExpr {
     fn try_new(
         function: DbspAggregateFunction,
         expr: Option<Expr>,
+        filter: Option<Expr>,
+        distinct: bool,
         alias: Option<String>,
         input_schema: Arc<RowSchema>,
     ) -> Result<Self> {
         let (expression, input_type) = if let Some(expr) = expr {
-            let typed = DbspExpression::analyze(expr, input_schema)?;
+            let typed = DbspExpression::analyze(expr, input_schema.clone())?;
             (Some(typed.clone()), Some(typed.data_type().clone()))
         } else {
             (None, None)
+        };
+        let filter = if let Some(filter) = filter {
+            let typed = DbspExpression::analyze(filter, input_schema)?;
+            if typed.data_type() != &DbspScalarType::Bool {
+                bail!(
+                    "aggregate FILTER expression must return Bool, found {}",
+                    typed.data_type().name()
+                );
+            }
+            Some(typed)
+        } else {
+            None
         };
 
         let resolved_input_type = match (&function, input_type) {
@@ -342,6 +370,14 @@ impl DbspAggregateExpr {
             (_, Some(ty)) => ty,
             _ => bail!("aggregate {:?} requires an input expression", function),
         };
+        if distinct {
+            if function != DbspAggregateFunction::Count {
+                bail!("DISTINCT is only supported for COUNT aggregates");
+            }
+            if expression.is_none() {
+                bail!("COUNT(DISTINCT ...) requires an argument expression");
+            }
+        }
 
         let output_type = function.result_type(&resolved_input_type)?;
         let alias = alias.unwrap_or_else(|| match &function {
@@ -355,6 +391,8 @@ impl DbspAggregateExpr {
         Ok(Self {
             function,
             expression,
+            filter,
+            distinct,
             alias,
             output_type,
         })
@@ -370,6 +408,14 @@ impl DbspAggregateExpr {
 
     pub fn expression(&self) -> Option<&DbspExpression> {
         self.expression.as_ref()
+    }
+
+    pub fn filter(&self) -> Option<&DbspExpression> {
+        self.filter.as_ref()
+    }
+
+    pub fn distinct(&self) -> bool {
+        self.distinct
     }
 
     pub fn alias(&self) -> &str {
@@ -427,7 +473,13 @@ impl DbspAggregateNode {
     pub fn try_new(
         input_schema: Arc<RowSchema>,
         group_keys: Vec<(Expr, Option<String>)>,
-        aggregates: Vec<(DbspAggregateFunction, Option<Expr>, Option<String>)>,
+        aggregates: Vec<(
+            DbspAggregateFunction,
+            Option<Expr>,
+            Option<Expr>,
+            bool,
+            Option<String>,
+        )>,
     ) -> Result<Self> {
         let mut group_exprs = Vec::with_capacity(group_keys.len());
         let mut fields = Vec::new();
@@ -438,8 +490,15 @@ impl DbspAggregateNode {
         }
 
         let mut agg_exprs = Vec::with_capacity(aggregates.len());
-        for (func, expr, alias) in aggregates {
-            let agg = DbspAggregateExpr::try_new(func, expr, alias, input_schema.clone())?;
+        for (func, expr, filter, distinct, alias) in aggregates {
+            let agg = DbspAggregateExpr::try_new(
+                func,
+                expr,
+                filter,
+                distinct,
+                alias,
+                input_schema.clone(),
+            )?;
             fields.push(agg.field());
             agg_exprs.push(agg);
         }
@@ -576,6 +635,7 @@ impl OrderExpr {
 #[allow(dead_code)]
 pub struct DbspTopNNode {
     input_schema: Arc<RowSchema>,
+    partition_by: Vec<DbspExpression>,
     order_by: Vec<OrderExpr>,
     limit: usize,
     offset: usize,
@@ -584,6 +644,7 @@ pub struct DbspTopNNode {
 impl DbspTopNNode {
     pub fn try_new(
         input_schema: Arc<RowSchema>,
+        partition_by: Vec<Expr>,
         order_by: Vec<OrderExpr>,
         limit: usize,
         offset: usize,
@@ -594,8 +655,17 @@ impl DbspTopNNode {
         if order_by.is_empty() {
             bail!("TopN requires at least one ORDER BY expression");
         }
+        let mut partition_exprs = Vec::with_capacity(partition_by.len());
+        for expr in partition_by {
+            let analyzed = DbspExpression::analyze(expr, input_schema.clone())?;
+            if analyzed.data_type() == &DbspScalarType::Bool {
+                bail!("boolean partition keys are not supported");
+            }
+            partition_exprs.push(analyzed);
+        }
         Ok(Self {
             input_schema,
+            partition_by: partition_exprs,
             order_by,
             limit,
             offset,
@@ -608,6 +678,10 @@ impl DbspTopNNode {
 
     pub fn order_by(&self) -> &[OrderExpr] {
         &self.order_by
+    }
+
+    pub fn partition_by(&self) -> &[DbspExpression] {
+        &self.partition_by
     }
 
     pub fn limit(&self) -> usize {

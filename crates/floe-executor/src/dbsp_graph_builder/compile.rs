@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use datafusion::scalar::ScalarValue;
-use dbsp::circuit::plan::DbspProjectExpr;
+use dbsp::circuit::plan::{DbspAggregateExpr, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
@@ -12,7 +12,7 @@ use dbsp::{
     DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspDistinct, DbspDistinctNode,
     DbspFilter, DbspJoin, DbspJoinNode, DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode,
     DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode, DbspWindowAggregate,
-    DbspWindowAggregateNode, DbspWindowPolicy, WindowKey,
+    DbspWindowAggregateNode, DbspWindowPolicy, RowSchema, WindowKey,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -724,161 +724,13 @@ impl DbspGraphBuilder {
 
             let mut outputs = Vec::with_capacity(aggregates.len());
             for agg in &aggregates {
-                let output = match agg.function() {
-                    DbspAggregateFunction::Count => {
-                        let mut count = 0i64;
-                        match agg.expression() {
-                            Some(expr) => {
-                                for (row, weight) in &decoded {
-                                    match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                        Ok(value) => {
-                                            if !value.is_null() {
-                                                count += *weight;
-                                            }
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                graph_id = %agg_graph_id,
-                                                error = %err,
-                                                "failed to evaluate count expression"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                for (_, weight) in &decoded {
-                                    count += *weight;
-                                }
-                            }
-                        }
-                        ScalarValue::Int64(Some(count))
-                    }
-                    DbspAggregateFunction::Sum => {
-                        if let Some(expr) = agg.expression() {
-                            let mut sum = 0i64;
-                            let mut has_value = false;
-                            for (row, weight) in &decoded {
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            sum += number * *weight;
-                                            has_value = true;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate sum expression"
-                                        );
-                                    }
-                                }
-                            }
-                            if has_value {
-                                scalar_from_i64(sum, agg.output_type())
-                            } else {
-                                ScalarValue::Null
-                            }
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Avg => {
-                        if let Some(expr) = agg.expression() {
-                            let mut sum = 0i64;
-                            let mut count = 0i64;
-                            for (row, weight) in &decoded {
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            sum += number * *weight;
-                                            count += *weight;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate avg expression"
-                                        );
-                                    }
-                                }
-                            }
-                            if count != 0 {
-                                ScalarValue::Int64(Some(sum / count))
-                            } else {
-                                ScalarValue::Null
-                            }
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Min => {
-                        if let Some(expr) = agg.expression() {
-                            let mut current: Option<i64> = None;
-                            for (row, weight) in &decoded {
-                                if *weight == 0 {
-                                    continue;
-                                }
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            current = Some(match current {
-                                                Some(existing) => existing.min(number),
-                                                None => number,
-                                            });
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate min expression"
-                                        );
-                                    }
-                                }
-                            }
-                            current
-                                .map(|value| scalar_from_i64(value, agg.output_type()))
-                                .unwrap_or(ScalarValue::Null)
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Max => {
-                        if let Some(expr) = agg.expression() {
-                            let mut current: Option<i64> = None;
-                            for (row, weight) in &decoded {
-                                if *weight == 0 {
-                                    continue;
-                                }
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            current = Some(match current {
-                                                Some(existing) => existing.max(number),
-                                                None => number,
-                                            });
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate max expression"
-                                        );
-                                    }
-                                }
-                            }
-                            current
-                                .map(|value| scalar_from_i64(value, agg.output_type()))
-                                .unwrap_or(ScalarValue::Null)
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                };
+                let output = evaluate_aggregate_value(
+                    agg,
+                    &decoded,
+                    agg_schema.as_ref(),
+                    &agg_graph_id,
+                    "aggregate",
+                );
                 outputs.push(output);
             }
 
@@ -1096,161 +948,13 @@ impl DbspGraphBuilder {
 
             let mut outputs = Vec::with_capacity(aggregates.len());
             for agg in &aggregates {
-                let output = match agg.function() {
-                    DbspAggregateFunction::Count => {
-                        let mut count = 0i64;
-                        match agg.expression() {
-                            Some(expr) => {
-                                for (row, weight) in &decoded {
-                                    match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                        Ok(value) => {
-                                            if !value.is_null() {
-                                                count += *weight;
-                                            }
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                graph_id = %agg_graph_id,
-                                                error = %err,
-                                                "failed to evaluate window aggregate count"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                for (_, weight) in &decoded {
-                                    count += *weight;
-                                }
-                            }
-                        }
-                        ScalarValue::Int64(Some(count))
-                    }
-                    DbspAggregateFunction::Sum => {
-                        if let Some(expr) = agg.expression() {
-                            let mut sum = 0i64;
-                            let mut has_value = false;
-                            for (row, weight) in &decoded {
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            sum += number * *weight;
-                                            has_value = true;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate window aggregate sum"
-                                        );
-                                    }
-                                }
-                            }
-                            if has_value {
-                                scalar_from_i64(sum, agg.output_type())
-                            } else {
-                                ScalarValue::Null
-                            }
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Avg => {
-                        if let Some(expr) = agg.expression() {
-                            let mut sum = 0i64;
-                            let mut count = 0i64;
-                            for (row, weight) in &decoded {
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            sum += number * *weight;
-                                            count += *weight;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate window aggregate avg"
-                                        );
-                                    }
-                                }
-                            }
-                            if count != 0 {
-                                ScalarValue::Int64(Some(sum / count))
-                            } else {
-                                ScalarValue::Null
-                            }
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Min => {
-                        if let Some(expr) = agg.expression() {
-                            let mut current: Option<i64> = None;
-                            for (row, weight) in &decoded {
-                                if *weight == 0 {
-                                    continue;
-                                }
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            current = Some(match current {
-                                                Some(existing) => existing.min(number),
-                                                None => number,
-                                            });
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate window aggregate min"
-                                        );
-                                    }
-                                }
-                            }
-                            current
-                                .map(|value| scalar_from_i64(value, agg.output_type()))
-                                .unwrap_or(ScalarValue::Null)
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                    DbspAggregateFunction::Max => {
-                        if let Some(expr) = agg.expression() {
-                            let mut current: Option<i64> = None;
-                            for (row, weight) in &decoded {
-                                if *weight == 0 {
-                                    continue;
-                                }
-                                match eval_scalar_expression(expr, row, agg_schema.as_ref()) {
-                                    Ok(value) => {
-                                        if let Some(number) = scalar_to_i64(&value) {
-                                            current = Some(match current {
-                                                Some(existing) => existing.max(number),
-                                                None => number,
-                                            });
-                                        }
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            graph_id = %agg_graph_id,
-                                            error = %err,
-                                            "failed to evaluate window aggregate max"
-                                        );
-                                    }
-                                }
-                            }
-                            current
-                                .map(|value| scalar_from_i64(value, agg.output_type()))
-                                .unwrap_or(ScalarValue::Null)
-                        } else {
-                            ScalarValue::Null
-                        }
-                    }
-                };
+                let output = evaluate_aggregate_value(
+                    agg,
+                    &decoded,
+                    agg_schema.as_ref(),
+                    &agg_graph_id,
+                    "window aggregate",
+                );
                 outputs.push(output);
             }
 
@@ -1397,6 +1101,7 @@ impl DbspGraphBuilder {
         upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
+        let partition_exprs: Arc<Vec<_>> = Arc::new(node.partition_by().to_vec());
         let order_exprs: Arc<Vec<_>> = Arc::new(node.order_by().to_vec());
         let schema = Arc::clone(node.output_schema());
         let limit = node.limit();
@@ -1420,6 +1125,53 @@ impl DbspGraphBuilder {
         );
 
         let log_graph_id = graph_id.clone();
+        let partition_schema = Arc::clone(&schema);
+        let partition_key = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if partition_exprs.is_empty() {
+                return Some(Vec::new());
+            }
+
+            let row = match decode_projected_row_key(bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to decode topn row for partition key"
+                    );
+                    return None;
+                }
+            };
+            let mut partition_values = Vec::with_capacity(partition_exprs.len());
+            for expr in partition_exprs.iter() {
+                let value = match eval_scalar_expression(expr, &row, partition_schema.as_ref()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %log_graph_id,
+                            error = %err,
+                            "failed to evaluate topn partition expression"
+                        );
+                        return None;
+                    }
+                };
+                partition_values.push(value);
+            }
+            match encode_projected_row_key(&partition_values) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %log_graph_id,
+                        error = %err,
+                        "failed to encode topn partition key"
+                    );
+                    None
+                }
+            }
+        };
+
+        let log_graph_id = graph_id.clone();
+        let order_schema = Arc::clone(&schema);
         let order_key = move |bytes: &Vec<u8>| -> Option<TopNKey> {
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
@@ -1435,17 +1187,18 @@ impl DbspGraphBuilder {
 
             let mut values = Vec::with_capacity(order_exprs.len());
             for expr in order_exprs.iter() {
-                let value = match eval_scalar_expression(expr.expression(), &row, schema.as_ref()) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %log_graph_id,
-                            error = %err,
-                            "failed to evaluate topn order expression"
-                        );
-                        return None;
-                    }
-                };
+                let value =
+                    match eval_scalar_expression(expr.expression(), &row, order_schema.as_ref()) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %log_graph_id,
+                                error = %err,
+                                "failed to evaluate topn order expression"
+                            );
+                            return None;
+                        }
+                    };
                 match TopNValue::from_scalar(&value) {
                     Ok(value) => values.push(value),
                     Err(err) => {
@@ -1466,8 +1219,9 @@ impl DbspGraphBuilder {
             ))
         };
 
-        let topn = DbspTopN::new::<Vec<u8>, TopNKey, _>(
+        let topn = DbspTopN::new::<Vec<u8>, Vec<u8>, TopNKey, _, _>(
             &upstream,
+            partition_key,
             order_key,
             limit,
             offset,
@@ -1513,10 +1267,345 @@ fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
     }
 }
 
+fn compare_scalar_values(left: &ScalarValue, right: &ScalarValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => Some(l.cmp(r)),
+        (
+            ScalarValue::TimestampMillisecond(Some(l), _),
+            ScalarValue::TimestampMillisecond(Some(r), _),
+        ) => Some(l.cmp(r)),
+        (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r))) => Some(l.cmp(r)),
+        (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => Some(l.cmp(r)),
+        _ => None,
+    }
+}
+
+fn evaluate_aggregate_value(
+    agg: &DbspAggregateExpr,
+    decoded: &[(Vec<ScalarValue>, i64)],
+    schema: &RowSchema,
+    graph_id: &str,
+    context: &str,
+) -> ScalarValue {
+    let mut filtered_rows = Vec::with_capacity(decoded.len());
+    for (row, weight) in decoded {
+        if *weight == 0 {
+            continue;
+        }
+        if !row_passes_aggregate_filter(agg, row, schema, graph_id, context) {
+            continue;
+        }
+        filtered_rows.push((row.as_slice(), *weight));
+    }
+
+    match agg.function() {
+        DbspAggregateFunction::Count => {
+            if agg.distinct() {
+                let Some(expr) = agg.expression() else {
+                    return ScalarValue::Int64(Some(0));
+                };
+                let mut distinct_weights: HashMap<ScalarValue, i64> = HashMap::new();
+                for (row, weight) in &filtered_rows {
+                    match eval_scalar_expression(expr, row, schema) {
+                        Ok(value) => {
+                            if value.is_null() {
+                                continue;
+                            }
+                            let entry = distinct_weights.entry(value.clone()).or_insert(0);
+                            *entry += *weight;
+                            if *entry == 0 {
+                                distinct_weights.remove(&value);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %graph_id,
+                                error = %err,
+                                "failed to evaluate {context} COUNT(DISTINCT) expression"
+                            );
+                        }
+                    }
+                }
+                let count = distinct_weights
+                    .values()
+                    .filter(|weight| **weight > 0)
+                    .count() as i64;
+                ScalarValue::Int64(Some(count))
+            } else {
+                let mut count = 0i64;
+                match agg.expression() {
+                    Some(expr) => {
+                        for (row, weight) in &filtered_rows {
+                            match eval_scalar_expression(expr, row, schema) {
+                                Ok(value) => {
+                                    if !value.is_null() {
+                                        count += *weight;
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        graph_id = %graph_id,
+                                        error = %err,
+                                        "failed to evaluate {context} count expression"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        for (_, weight) in &filtered_rows {
+                            count += *weight;
+                        }
+                    }
+                }
+                ScalarValue::Int64(Some(count))
+            }
+        }
+        DbspAggregateFunction::Sum => {
+            let Some(expr) = agg.expression() else {
+                return ScalarValue::Null;
+            };
+            let mut sum = 0i64;
+            let mut has_value = false;
+            for (row, weight) in &filtered_rows {
+                match eval_scalar_expression(expr, row, schema) {
+                    Ok(value) => {
+                        if let Some(number) = scalar_to_i64(&value) {
+                            sum += number * *weight;
+                            has_value = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} sum expression"
+                        );
+                    }
+                }
+            }
+            if has_value {
+                scalar_from_i64(sum, agg.output_type())
+            } else {
+                ScalarValue::Null
+            }
+        }
+        DbspAggregateFunction::Avg => {
+            let Some(expr) = agg.expression() else {
+                return ScalarValue::Null;
+            };
+            let mut sum = 0i64;
+            let mut count = 0i64;
+            for (row, weight) in &filtered_rows {
+                match eval_scalar_expression(expr, row, schema) {
+                    Ok(value) => {
+                        if let Some(number) = scalar_to_i64(&value) {
+                            sum += number * *weight;
+                            count += *weight;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} avg expression"
+                        );
+                    }
+                }
+            }
+            if count != 0 {
+                ScalarValue::Int64(Some(sum / count))
+            } else {
+                ScalarValue::Null
+            }
+        }
+        DbspAggregateFunction::Min => {
+            let Some(expr) = agg.expression() else {
+                return ScalarValue::Null;
+            };
+            let mut current: Option<ScalarValue> = None;
+            for (row, _weight) in &filtered_rows {
+                match eval_scalar_expression(expr, row, schema) {
+                    Ok(value) => {
+                        if value.is_null() {
+                            continue;
+                        }
+                        current = Some(match current {
+                            Some(existing) => match compare_scalar_values(&value, &existing) {
+                                Some(std::cmp::Ordering::Less) => value,
+                                Some(_) | None => existing,
+                            },
+                            None => value,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} min expression"
+                        );
+                    }
+                }
+            }
+            current.unwrap_or(ScalarValue::Null)
+        }
+        DbspAggregateFunction::Max => {
+            let Some(expr) = agg.expression() else {
+                return ScalarValue::Null;
+            };
+            let mut current: Option<ScalarValue> = None;
+            for (row, _weight) in &filtered_rows {
+                match eval_scalar_expression(expr, row, schema) {
+                    Ok(value) => {
+                        if value.is_null() {
+                            continue;
+                        }
+                        current = Some(match current {
+                            Some(existing) => match compare_scalar_values(&value, &existing) {
+                                Some(std::cmp::Ordering::Greater) => value,
+                                Some(_) | None => existing,
+                            },
+                            None => value,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} max expression"
+                        );
+                    }
+                }
+            }
+            current.unwrap_or(ScalarValue::Null)
+        }
+    }
+}
+
+fn row_passes_aggregate_filter(
+    agg: &DbspAggregateExpr,
+    row: &[ScalarValue],
+    schema: &RowSchema,
+    graph_id: &str,
+    context: &str,
+) -> bool {
+    let Some(filter) = agg.filter() else {
+        return true;
+    };
+    match eval_expression(filter, row, schema) {
+        Ok(include) => include,
+        Err(err) => {
+            tracing::warn!(
+                graph_id = %graph_id,
+                error = %err,
+                "failed to evaluate {context} FILTER expression"
+            );
+            false
+        }
+    }
+}
+
 fn scalar_from_i64(value: i64, output_type: &DbspScalarType) -> ScalarValue {
     match output_type {
         DbspScalarType::Int64 => ScalarValue::Int64(Some(value)),
         DbspScalarType::TimestampMillis => ScalarValue::TimestampMillisecond(Some(value), None),
         _ => ScalarValue::Int64(Some(value)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evaluate_aggregate_value;
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::scalar::ScalarValue;
+    use dbsp::circuit::schema::{Field, RowSchema};
+    use dbsp::circuit::types::DbspScalarType;
+    use dbsp::{DbspAggregateFunction, DbspAggregateNode};
+    use std::sync::Arc;
+
+    fn schema(fields: Vec<(&str, DbspScalarType)>) -> Arc<RowSchema> {
+        let fields = fields
+            .into_iter()
+            .map(|(name, ty)| Field::new(name, ty, true))
+            .collect();
+        RowSchema::try_new(fields).expect("schema")
+    }
+
+    #[test]
+    fn aggregate_eval_supports_filtered_distinct_count() {
+        let input_schema = schema(vec![
+            ("price", DbspScalarType::Int64),
+            ("bidder", DbspScalarType::Int64),
+        ]);
+        let aggregate = DbspAggregateNode::try_new(
+            Arc::clone(&input_schema),
+            vec![],
+            vec![(
+                DbspAggregateFunction::Count,
+                Some(col("bidder")),
+                Some(col("price").lt(lit(100_i64))),
+                true,
+                Some("filtered_distinct_bidders".to_string()),
+            )],
+        )
+        .expect("aggregate node");
+        let expr = &aggregate.aggregates()[0];
+
+        let decoded = vec![
+            (
+                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(1))],
+                2,
+            ),
+            (
+                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(2))],
+                1,
+            ),
+            (
+                vec![ScalarValue::Int64(Some(200)), ScalarValue::Int64(Some(3))],
+                1,
+            ),
+        ];
+        let value =
+            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
+        assert_eq!(value, ScalarValue::Int64(Some(2)));
+
+        let decoded = vec![
+            (
+                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(1))],
+                1,
+            ),
+            (
+                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(2))],
+                -1,
+            ),
+        ];
+        let value =
+            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
+        assert_eq!(value, ScalarValue::Int64(Some(1)));
+    }
+
+    #[test]
+    fn aggregate_eval_supports_utf8_max() {
+        let input_schema = schema(vec![("label", DbspScalarType::Utf8)]);
+        let aggregate = DbspAggregateNode::try_new(
+            Arc::clone(&input_schema),
+            vec![],
+            vec![(
+                DbspAggregateFunction::Max,
+                Some(col("label")),
+                None,
+                false,
+                Some("max_label".to_string()),
+            )],
+        )
+        .expect("aggregate node");
+        let expr = &aggregate.aggregates()[0];
+        let decoded = vec![
+            (vec![ScalarValue::Utf8(Some("alpha".to_string()))], 1),
+            (vec![ScalarValue::Utf8(Some("zeta".to_string()))], 1),
+        ];
+        let value =
+            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
+        assert_eq!(value, ScalarValue::Utf8(Some("zeta".to_string())));
     }
 }

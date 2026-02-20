@@ -4,6 +4,7 @@ pub mod executor;
 pub mod file_connector;
 pub mod generator;
 pub mod kafka_connector;
+pub mod nexmark_queries;
 pub mod object_store_connector;
 pub mod planner;
 pub mod postgres_cdc_connector;

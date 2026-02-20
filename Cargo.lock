@@ -1775,6 +1775,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "dbsp-circuit",
+ "tokio",
 ]
 
 [[package]]
@@ -1973,13 +1974,19 @@ dependencies = [
 name = "floe-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arrow-ipc",
  "async-trait",
  "criterion",
  "datafusion",
  "dbsp",
  "floe-executor",
+ "floe-node-core",
+ "floe-sql-parser",
+ "object_store",
  "parking_lot",
  "rkyv 0.8.12",
+ "slatedb",
  "tokio",
 ]
 
@@ -2017,6 +2024,7 @@ dependencies = [
  "object_store",
  "prometheus",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "slatedb",

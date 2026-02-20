@@ -235,6 +235,14 @@ impl DbspExpression {
         }
     }
 
+    fn ensure_timestamp(ty: &DbspScalarType, msg: &str) -> Result<()> {
+        if ty == &DbspScalarType::TimestampMillis {
+            Ok(())
+        } else {
+            bail!("{msg}: found {}", ty.name())
+        }
+    }
+
     fn ensure_comparable(left: &DbspScalarType, right: &DbspScalarType) -> Result<()> {
         if left == right {
             match left {
@@ -325,6 +333,58 @@ impl DbspExpression {
                     let arg_type = Self::infer_type(arg, df_schema)?;
                     Self::ensure_string(&arg_type, "concat requires Utf8 input")?;
                 }
+                Ok(())
+            }
+            "hour" => {
+                Self::ensure_arg_count(func, 1)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                let arg_type = Self::infer_type(&func.args[0], df_schema)?;
+                Self::ensure_timestamp(&arg_type, "hour requires TimestampMillis input")
+            }
+            "date_format" => {
+                Self::ensure_arg_count(func, 2)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                Self::validate_supported(&func.args[1], df_schema)?;
+                let ts_type = Self::infer_type(&func.args[0], df_schema)?;
+                Self::ensure_timestamp(&ts_type, "date_format requires TimestampMillis input")?;
+                let fmt_type = Self::infer_type(&func.args[1], df_schema)?;
+                Self::ensure_string(&fmt_type, "date_format requires Utf8 format pattern")
+            }
+            "regexp_extract" => {
+                Self::ensure_arg_count(func, 3)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                Self::validate_supported(&func.args[1], df_schema)?;
+                Self::validate_supported(&func.args[2], df_schema)?;
+                let text_type = Self::infer_type(&func.args[0], df_schema)?;
+                let pattern_type = Self::infer_type(&func.args[1], df_schema)?;
+                let group_type = Self::infer_type(&func.args[2], df_schema)?;
+                Self::ensure_string(&text_type, "regexp_extract requires Utf8 input")?;
+                Self::ensure_string(&pattern_type, "regexp_extract requires Utf8 pattern")?;
+                Self::ensure_int64(&group_type, "regexp_extract requires Int64 group index")
+            }
+            "split_index" => {
+                Self::ensure_arg_count(func, 3)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                Self::validate_supported(&func.args[1], df_schema)?;
+                Self::validate_supported(&func.args[2], df_schema)?;
+                let text_type = Self::infer_type(&func.args[0], df_schema)?;
+                let delimiter_type = Self::infer_type(&func.args[1], df_schema)?;
+                let index_type = Self::infer_type(&func.args[2], df_schema)?;
+                Self::ensure_string(&text_type, "split_index requires Utf8 input")?;
+                Self::ensure_string(&delimiter_type, "split_index requires Utf8 delimiter")?;
+                Self::ensure_int64(&index_type, "split_index requires Int64 index")
+            }
+            "count_char" => {
+                Self::ensure_arg_count(func, 2)?;
+                Self::validate_supported(&func.args[0], df_schema)?;
+                Self::validate_supported(&func.args[1], df_schema)?;
+                let text_type = Self::infer_type(&func.args[0], df_schema)?;
+                let needle_type = Self::infer_type(&func.args[1], df_schema)?;
+                Self::ensure_string(&text_type, "count_char requires Utf8 input")?;
+                Self::ensure_string(&needle_type, "count_char requires Utf8 needle")
+            }
+            "proctime" => {
+                Self::ensure_arg_count(func, 0)?;
                 Ok(())
             }
             _ => bail!("scalar function '{name}' is not supported"),

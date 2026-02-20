@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, WindowFunctionDefinition};
 use datafusion::scalar::ScalarValue;
 use datafusion_common::Column;
 
@@ -139,6 +139,9 @@ impl<'cfg> PlannerContext<'cfg> {
                 self.build_projection_node(input, projection)
             }
             LogicalPlan::Filter(filter) => {
+                if let Some(topn) = self.plan_row_number_filter(filter)? {
+                    return Ok(topn);
+                }
                 if let LogicalPlan::Projection(projection) = filter.input.as_ref() {
                     let base = self.plan_node(&projection.input)?;
                     let select = DbspSelectNode::try_new(
@@ -235,8 +238,15 @@ impl<'cfg> PlannerContext<'cfg> {
         input: PlannedNode,
         projection: &datafusion::logical_expr::logical_plan::Projection,
     ) -> Result<PlannedNode, PlannerError> {
-        let items = projection
-            .expr
+        self.build_projection_items(input, &projection.expr)
+    }
+
+    fn build_projection_items(
+        &mut self,
+        input: PlannedNode,
+        expressions: &[Expr],
+    ) -> Result<PlannedNode, PlannerError> {
+        let items = expressions
             .iter()
             .map(|expr| {
                 let (expression, alias) = extract_alias(expr.clone())?;
@@ -257,6 +267,54 @@ impl<'cfg> PlannerContext<'cfg> {
             id,
             schema: output_schema,
         })
+    }
+
+    fn plan_row_number_filter(
+        &mut self,
+        filter: &datafusion::logical_expr::logical_plan::Filter,
+    ) -> Result<Option<PlannedNode>, PlannerError> {
+        let Some((rank_column, limit)) = extract_row_number_limit(&filter.predicate)? else {
+            return Ok(None);
+        };
+
+        let (window_plan, post_projection) =
+            match self.extract_window_plan(filter.input.as_ref(), &rank_column) {
+                Some(found) => found,
+                None => return Ok(None),
+            };
+
+        if window_plan.window_expr.len() != 1 {
+            return Ok(None);
+        }
+        let Some((rank_alias, partition_by, order_by)) =
+            self.parse_row_number_spec(&window_plan.window_expr[0])?
+        else {
+            return Ok(None);
+        };
+
+        if rank_column != rank_alias && post_projection.is_none() {
+            return Ok(None);
+        }
+
+        let input = self.plan_node(&window_plan.input)?;
+        let order_by = self.map_sort_expressions(&order_by, input.schema.clone())?;
+        let topn = DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, 0)?;
+        let output_schema = topn.output_schema().clone();
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::TopN(topn),
+            output_schema.clone(),
+        );
+        let topn_node = PlannedNode {
+            id,
+            schema: output_schema,
+        };
+
+        if let Some(exprs) = post_projection {
+            return self.build_projection_items(topn_node, &exprs).map(Some);
+        }
+
+        Ok(Some(topn_node))
     }
 
     fn plan_join(
@@ -343,7 +401,16 @@ impl<'cfg> PlannerContext<'cfg> {
                 window_spec = Some(spec);
                 continue;
             }
-            group_keys.push(extract_alias(expr.clone())?);
+            let default_alias = match expr {
+                Expr::Column(column) => column.name.clone(),
+                Expr::Alias(alias) => match alias.expr.as_ref() {
+                    Expr::Column(column) => column.name.clone(),
+                    _ => expr.schema_name().to_string(),
+                },
+                _ => expr.schema_name().to_string(),
+            };
+            let (group_expr, alias) = extract_alias(expr.clone())?;
+            group_keys.push((group_expr, alias.or(Some(default_alias))));
         }
 
         let aggregates = aggregate
@@ -423,7 +490,8 @@ impl<'cfg> PlannerContext<'cfg> {
         if let LogicalPlan::Sort(sort) = limit.input.as_ref() {
             let input = self.plan_node(&sort.input)?;
             let order_by = self.map_sort_expressions(&sort.expr, input.schema.clone())?;
-            let topn = DbspTopNNode::try_new(input.schema.clone(), order_by, fetch, offset)?;
+            let topn =
+                DbspTopNNode::try_new(input.schema.clone(), Vec::new(), order_by, fetch, offset)?;
             let output_schema = topn.output_schema().clone();
             let id = self.add_node(
                 vec![input.id],
@@ -439,6 +507,97 @@ impl<'cfg> PlannerContext<'cfg> {
         Err(PlannerError::UnsupportedPlan(
             "LIMIT requires an ORDER BY to form a TopN operator".to_string(),
         ))
+    }
+
+    fn parse_row_number_spec(
+        &self,
+        expr: &Expr,
+    ) -> Result<Option<(String, Vec<Expr>, Vec<ExprSort>)>, PlannerError> {
+        let (alias, window) = match expr {
+            Expr::Alias(alias) => {
+                let Expr::WindowFunction(window) = alias.expr.as_ref() else {
+                    return Ok(None);
+                };
+                (alias.name.clone(), window)
+            }
+            Expr::WindowFunction(window) => (expr.schema_name().to_string(), window),
+            _ => return Ok(None),
+        };
+        let is_row_number = matches!(
+            &window.fun,
+            WindowFunctionDefinition::WindowUDF(udf)
+                if udf.name().eq_ignore_ascii_case("row_number")
+        );
+        if !is_row_number {
+            return Ok(None);
+        }
+        if window.params.filter.is_some()
+            || window.params.null_treatment.is_some()
+            || window.params.distinct
+        {
+            return Ok(None);
+        }
+
+        let partition_by = window
+            .params
+            .partition_by
+            .iter()
+            .cloned()
+            .map(normalize_expr)
+            .collect::<Result<Vec<_>, _>>()?;
+        let order_by = window.params.order_by.clone();
+        Ok(Some((alias, partition_by, order_by)))
+    }
+
+    fn strip_passthrough_wrappers<'a>(&self, mut plan: &'a LogicalPlan) -> &'a LogicalPlan {
+        loop {
+            match plan {
+                LogicalPlan::SubqueryAlias(alias) => {
+                    plan = alias.input.as_ref();
+                }
+                LogicalPlan::Repartition(repartition) => {
+                    plan = repartition.input.as_ref();
+                }
+                _ => return plan,
+            }
+        }
+    }
+
+    fn extract_window_plan<'a>(
+        &self,
+        input: &'a LogicalPlan,
+        rank_column: &str,
+    ) -> Option<(
+        &'a datafusion::logical_expr::logical_plan::Window,
+        Option<Vec<Expr>>,
+    )> {
+        let direct = self.strip_passthrough_wrappers(input);
+        if let LogicalPlan::Window(window) = direct {
+            return Some((window, None));
+        }
+
+        let projection = match direct {
+            LogicalPlan::Projection(projection) => projection,
+            _ => return None,
+        };
+        let window = match self.strip_passthrough_wrappers(projection.input.as_ref()) {
+            LogicalPlan::Window(window) => window,
+            _ => return None,
+        };
+
+        let mut saw_rank = false;
+        let mut remaining = Vec::with_capacity(projection.expr.len());
+        for expr in &projection.expr {
+            if projection_expr_matches_rank(expr, rank_column) {
+                saw_rank = true;
+                continue;
+            }
+            remaining.push(expr.clone());
+        }
+        if !saw_rank {
+            return None;
+        }
+        Some((window, Some(remaining)))
     }
 
     fn plan_union(
@@ -611,4 +770,68 @@ impl<'cfg> PlannerContext<'cfg> {
             })
             .collect()
     }
+}
+
+fn extract_row_number_limit(predicate: &Expr) -> Result<Option<(String, usize)>, PlannerError> {
+    let normalized = normalize_expr(predicate.clone())?;
+    let Expr::BinaryExpr(binary) = normalized else {
+        return Ok(None);
+    };
+
+    let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
+        (Expr::Column(column), Operator::LtEq, Expr::Literal(value, _)) => {
+            (column.name.clone(), value.clone(), false)
+        }
+        (Expr::Column(column), Operator::Lt, Expr::Literal(value, _)) => {
+            (column.name.clone(), value.clone(), true)
+        }
+        _ => return Ok(None),
+    };
+
+    let mut limit = scalar_to_positive_usize(&literal)?;
+    if exclusive {
+        if limit == 0 {
+            return Ok(None);
+        }
+        limit -= 1;
+    }
+    if limit == 0 {
+        return Ok(None);
+    }
+    Ok(Some((column, limit)))
+}
+
+fn projection_expr_matches_rank(expr: &Expr, rank_column: &str) -> bool {
+    match expr {
+        Expr::Column(column) => column.name == rank_column,
+        Expr::Alias(alias) => alias.name == rank_column,
+        _ => false,
+    }
+}
+
+fn scalar_to_positive_usize(value: &ScalarValue) -> Result<usize, PlannerError> {
+    let as_i128 = match value {
+        ScalarValue::Int8(Some(v)) => i128::from(*v),
+        ScalarValue::Int16(Some(v)) => i128::from(*v),
+        ScalarValue::Int32(Some(v)) => i128::from(*v),
+        ScalarValue::Int64(Some(v)) => i128::from(*v),
+        ScalarValue::UInt8(Some(v)) => i128::from(*v),
+        ScalarValue::UInt16(Some(v)) => i128::from(*v),
+        ScalarValue::UInt32(Some(v)) => i128::from(*v),
+        ScalarValue::UInt64(Some(v)) => i128::from(*v),
+        _ => {
+            return Err(PlannerError::UnsupportedPlan(
+                "ROW_NUMBER filter limit must be a positive integer literal".to_string(),
+            ));
+        }
+    };
+
+    if as_i128 <= 0 {
+        return Err(PlannerError::UnsupportedPlan(
+            "ROW_NUMBER filter limit must be positive".to_string(),
+        ));
+    }
+    usize::try_from(as_i128).map_err(|_| {
+        PlannerError::UnsupportedPlan("ROW_NUMBER filter limit is out of range".to_string())
+    })
 }

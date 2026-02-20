@@ -1,0 +1,30 @@
+{
+  "description": "Deterministic minimal Nexmark fixture batches for Sprint 0005 integration checks.",
+  "initial": {
+    "person": [
+      { "id": 10, "name": "seller-10", "state": "or", "city": "portland", "date_time": 1600000000 },
+      { "id": 20, "name": "seller-20", "state": "ca", "city": "san_francisco", "date_time": 1600000001 }
+    ],
+    "auction": [
+      { "id": 1, "seller": 10, "category": 10, "expires_ms": 1600001000, "item_name": "item-1" },
+      { "id": 2, "seller": 20, "category": 11, "expires_ms": 1600002000, "item_name": "item-2" }
+    ],
+    "bid": [
+      { "auction": 1, "bidder": 100, "price": 1200 },
+      { "auction": 1, "bidder": 101, "price": 1800 },
+      { "auction": 2, "bidder": 102, "price": 2200 }
+    ]
+  },
+  "incremental": {
+    "person": [
+      { "id": 30, "name": "seller-30", "state": "id", "city": "boise", "date_time": 1600000002 }
+    ],
+    "auction": [
+      { "id": 3, "seller": 30, "category": 10, "expires_ms": 1600003000, "item_name": "item-3" }
+    ],
+    "bid": [
+      { "auction": 3, "bidder": 103, "price": 2600 },
+      { "auction": 1, "bidder": 100, "price": 3200 }
+    ]
+  }
+}

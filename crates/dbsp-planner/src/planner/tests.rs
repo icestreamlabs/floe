@@ -1,9 +1,18 @@
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::Result as DataFusionResult;
+use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
 use datafusion::logical_expr::expr::WildcardOptions;
+use datafusion::logical_expr::expr_fn::create_udf;
 use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlanBuilder, TableSource, col, lit};
+use datafusion::logical_expr::{
+    ColumnarValue, Expr, JoinType, LogicalPlanBuilder, ScalarFunctionImplementation, TableSource,
+    Volatility, col, lit,
+};
+use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 
 use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspNodeKind};
 use dbsp_circuit::circuit::tables::TableDescriptor;
@@ -14,13 +23,60 @@ use super::{CircuitPlanner, PlannerConfig};
 fn planner_config() -> PlannerConfig {
     let mut config = PlannerConfig::new();
     config.register_table(dbsp_circuit::circuit::tables::nexmark_person_table());
+    config.register_table(dbsp_circuit::circuit::tables::nexmark_person_alias_table());
     config.register_table(dbsp_circuit::circuit::tables::nexmark_auction_table());
+    config.register_table(dbsp_circuit::circuit::tables::nexmark_auction_alias_table());
     config.register_table(dbsp_circuit::circuit::tables::nexmark_bid_table());
+    config.register_table(dbsp_circuit::circuit::tables::nexmark_bid_alias_table());
     config
 }
 
 fn table_source(table: &'static TableDescriptor) -> Arc<dyn TableSource> {
     Arc::new(LogicalTableSource::new(table.schema().to_arrow_schema()))
+}
+
+async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
+    let ctx = SessionContext::new();
+    for table in [
+        dbsp_circuit::circuit::tables::nexmark_person_table(),
+        dbsp_circuit::circuit::tables::nexmark_person_alias_table(),
+        dbsp_circuit::circuit::tables::nexmark_auction_table(),
+        dbsp_circuit::circuit::tables::nexmark_auction_alias_table(),
+        dbsp_circuit::circuit::tables::nexmark_bid_table(),
+        dbsp_circuit::circuit::tables::nexmark_bid_alias_table(),
+    ] {
+        let provider: Arc<dyn TableProvider> =
+            Arc::new(EmptyTable::new(table.schema().to_arrow_schema()));
+        ctx.register_table(table.name, provider)
+            .expect("register nexmark table");
+    }
+    let passthrough_ts: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(args.first().cloned().unwrap_or(ColumnarValue::Scalar(
+                ScalarValue::TimestampMillisecond(None, None),
+            )))
+        },
+    );
+    let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
+    ctx.register_udf(create_udf(
+        "tumble",
+        vec![ts.clone(), DataType::Int64],
+        ts.clone(),
+        Volatility::Immutable,
+        Arc::clone(&passthrough_ts),
+    ));
+    ctx.register_udf(create_udf(
+        "hop",
+        vec![ts.clone(), DataType::Int64, DataType::Int64],
+        ts,
+        Volatility::Immutable,
+        passthrough_ts,
+    ));
+
+    ctx.state()
+        .create_logical_plan(sql)
+        .await
+        .expect("build SQL logical plan")
 }
 
 fn qualified(table: &'static TableDescriptor, column: &str) -> String {
@@ -36,11 +92,14 @@ fn count_star_maps_to_untyped_count() {
     };
 
     let expr = count(wildcard);
-    let (function, arg, alias) = map_aggregate_expr(&expr).expect("map aggregate");
+    let (function, arg, filter, distinct, alias) =
+        map_aggregate_expr(&expr).expect("map aggregate");
 
     assert!(matches!(function, DbspAggregateFunction::Count));
     assert!(arg.is_none());
-    assert!(alias.is_none());
+    assert!(filter.is_none());
+    assert!(!distinct);
+    assert_eq!(alias.as_deref(), Some("count(*)"));
 }
 
 #[test]
@@ -259,4 +318,131 @@ fn plans_aggregate_and_topn() {
         }
         other => panic!("expected TopN node, found {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn lowers_row_number_filter_to_partitioned_topn() {
+    let sql = "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY \"dateTime\" DESC) AS rank_number FROM bid) ranked \
+        WHERE rank_number <= 1";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let topn_nodes = circuit_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(topn_nodes.len(), 1, "expected exactly one TopN node");
+    assert_eq!(topn_nodes[0].limit(), 1);
+    assert_eq!(topn_nodes[0].partition_by().len(), 2);
+}
+
+#[tokio::test]
+async fn preserves_subquery_projection_aliases_after_row_number_lowering() {
+    let sql = "SELECT auction, bidder, price, \"bidTime\" \
+        FROM (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", \
+              ROW_NUMBER() OVER (PARTITION BY b.auction ORDER BY b.price DESC, b.\"dateTime\" ASC) AS rownum \
+              FROM bid b) ranked \
+        WHERE rownum <= 1";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root node");
+    let root_fields = root
+        .output_schema
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(root_fields, vec!["auction", "bidder", "price", "bidTime"]);
+
+    let topn = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::TopN(topn) => Some(topn),
+        _ => None,
+    });
+    let topn = topn.expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 1);
+    assert_eq!(topn.partition_by().len(), 1);
+}
+
+#[tokio::test]
+async fn plans_hop_grouping_as_window_aggregate() {
+    let sql =
+        "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.aggregate.group_keys().len(), 1);
+    match &window.window.policy {
+        dbsp_circuit::circuit::plan::DbspWindowPolicy::Hopping { size_ms, slide_ms } => {
+            assert_eq!(*size_ms, 10_000);
+            assert_eq!(*slide_ms, 2_000);
+        }
+        other => panic!("expected hopping window, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plans_tumble_grouping_as_window_aggregate() {
+    let sql = "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, TUMBLE(\"dateTime\", 10000)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.aggregate.group_keys().len(), 1);
+    match &window.window.policy {
+        dbsp_circuit::circuit::plan::DbspWindowPolicy::Tumbling { size_ms } => {
+            assert_eq!(*size_ms, 10_000);
+        }
+        other => panic!("expected tumbling window, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plans_filtered_and_distinct_count_aggregates() {
+    let sql = "SELECT \
+        COUNT(*) FILTER (WHERE price > 100) AS filtered_rows, \
+        COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS filtered_distinct_bidders \
+        FROM bid";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let aggregate = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::Aggregate(aggregate) => Some(aggregate),
+        _ => None,
+    });
+    let aggregate = aggregate.expect("expected Aggregate node");
+    assert_eq!(aggregate.aggregates().len(), 2);
+
+    let filtered = &aggregate.aggregates()[0];
+    assert!(matches!(filtered.function(), DbspAggregateFunction::Count));
+    assert!(filtered.filter().is_some());
+    assert!(!filtered.distinct());
+
+    let filtered_distinct = &aggregate.aggregates()[1];
+    assert!(matches!(
+        filtered_distinct.function(),
+        DbspAggregateFunction::Count
+    ));
+    assert!(filtered_distinct.filter().is_some());
+    assert!(filtered_distinct.distinct());
 }

@@ -8,3 +8,6 @@ anyhow = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 dbsp-circuit = { path = "../dbsp-circuit" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -94,6 +94,34 @@ Sink execution behavior:
 - Rows with event-time earlier than `(watermark - allowed_lateness)` are
   dropped. The SQL planner currently defaults `allowed_lateness` to `0`.
 
+## Nexmark Support Matrix
+
+The canonical Sprint 0005 Nexmark suite (`q0-q9`, `q12-q22`) is tracked by:
+
+- `reports/nexmark_query_coverage_status.json`
+- `reports/NEXMARK_QUERY_MATRIX.md`
+- `crates/floe-node-core/tests/nexmark_query_coverage.rs`
+
+Current status:
+- All canonical queries pass logical planning, circuit planning, and runtime
+  graph validation in the coverage harness.
+- `q13` currently uses a processing-time + regular join SQL shape in Floe
+  canonical coverage. Temporal lookup syntax (`FOR SYSTEM_TIME AS OF`) remains
+  documented as unsupported below.
+
+## Nexmark-Specific Limitations
+
+Unsupported constructs with concrete errors:
+
+- Temporal joins using `FOR SYSTEM_TIME AS OF`
+  - Example parser error:
+    - `failed to parse materialized view statement: sql parser error: Expected: one of UPDATE or SHARE, found: SYSTEM_TIME`
+- Full `DATE_FORMAT` token parity is not yet guaranteed beyond tokens required
+  by the Nexmark suite (`yyyy`, `MM`, `dd`, `HH`, `mm`, `ss`).
+- `REGEXP_EXTRACT` returns `NULL` for invalid patterns (some systems raise
+  errors instead).
+- `SPLIT_INDEX` returns `NULL` for negative indices and empty delimiters.
+
 ## Version and Time Semantics
 
 - Floe uses a single global logical epoch (monotonic `i64`) for ingestion.

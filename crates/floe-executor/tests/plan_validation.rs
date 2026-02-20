@@ -266,6 +266,8 @@ fn window_aggregate_plan() -> Result<CircuitPlan> {
         vec![(
             DbspAggregateFunction::Count,
             None,
+            None,
+            false,
             Some("bid_count".to_string()),
         )],
     )?;

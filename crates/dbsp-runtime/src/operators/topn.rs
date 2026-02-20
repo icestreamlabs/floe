@@ -21,7 +21,7 @@ use crate::stream::util::{compute_delta, delta_zset_handle};
 
 /// Top-N operator that applies row-number semantics: it counts multiplicity and
 /// supports OFFSET, matching ORDER BY/LIMIT/OFFSET behavior.
-pub struct TopNOp<K, O>
+pub struct TopNOp<K, P, O>
 where
     K: Archive
         + Clone
@@ -33,6 +33,7 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
     pub state: RelationState<K>,
@@ -42,14 +43,16 @@ where
     input_cache: Option<HashMap<K, i64>>,
     output_cache: HashMap<K, i64>,
     // In-memory ordering index for top-N row semantics; rebuilt from storage on restart.
-    order_index: Option<BTreeMap<(O, K), i64>>,
+    order_index: Option<BTreeMap<(P, O, K), i64>>,
+    row_partition_cache: HashMap<K, Option<P>>,
     row_order_cache: HashMap<K, Option<O>>,
+    partition_key: Arc<dyn Fn(&K) -> Option<P> + Send + Sync>,
     order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
     limit: usize,
     offset: usize,
 }
 
-impl<K, O> TopNOp<K, O>
+impl<K, P, O> TopNOp<K, P, O>
 where
     K: Archive
         + Clone
@@ -61,12 +64,14 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
     pub fn new(
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<K>,
+        partition_key: Arc<dyn Fn(&K) -> Option<P> + Send + Sync>,
         order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
         limit: usize,
         offset: usize,
@@ -79,7 +84,9 @@ where
             input_cache: None,
             output_cache: HashMap::new(),
             order_index: None,
+            row_partition_cache: HashMap::new(),
             row_order_cache: HashMap::new(),
+            partition_key,
             order_key,
             limit,
             offset,
@@ -102,18 +109,25 @@ where
         Ok(())
     }
 
-    fn compute_topn(&self, order_index: &BTreeMap<(O, K), i64>) -> HashMap<K, i64> {
+    fn compute_topn(&self, order_index: &BTreeMap<(P, O, K), i64>) -> HashMap<K, i64> {
         if self.limit == 0 {
             return HashMap::new();
         }
 
-        let mut remaining_skip = self.offset;
-        let mut remaining_take = self.limit;
+        let mut current_partition: Option<&P> = None;
+        let mut remaining_skip = 0usize;
+        let mut remaining_take = 0usize;
         let mut output = HashMap::new();
 
-        for ((_order_key, row), weight) in order_index.iter() {
+        for ((partition, _order_key, row), weight) in order_index.iter() {
+            if current_partition != Some(partition) {
+                current_partition = Some(partition);
+                remaining_skip = self.offset;
+                remaining_take = self.limit;
+            }
+
             if remaining_take == 0 {
-                break;
+                continue;
             }
 
             let mut remaining_weight = *weight;
@@ -157,13 +171,24 @@ where
             if weight <= 0 {
                 continue;
             }
+            let partition_key = self.partition_key_for(&key);
             let order_key = self.order_key_for(&key);
-            if let Some(order_key) = order_key {
-                index.insert((order_key, key), weight);
+            if let (Some(partition_key), Some(order_key)) = (partition_key, order_key) {
+                index.insert((partition_key, order_key, key), weight);
             }
         }
         self.order_index = Some(index);
         Ok(())
+    }
+
+    fn partition_key_for(&mut self, key: &K) -> Option<P> {
+        if let Some(cached) = self.row_partition_cache.get(key) {
+            return cached.clone();
+        }
+        let computed = (self.partition_key)(key);
+        self.row_partition_cache
+            .insert(key.clone(), computed.clone());
+        computed
     }
 
     fn order_key_for(&mut self, key: &K) -> Option<O> {
@@ -247,7 +272,7 @@ where
 }
 
 #[async_trait]
-impl<K, O> DeltaOperator for TopNOp<K, O>
+impl<K, P, O> DeltaOperator for TopNOp<K, P, O>
 where
     K: Archive
         + Clone
@@ -259,6 +284,7 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
     async fn on_step(
@@ -309,12 +335,12 @@ where
                 .and_then(|cache| cache.get(key).copied())
                 .unwrap_or(0);
             let new_weight = existing + diff_weight;
-            let order_key = if existing > 0 || new_weight > 0 {
-                self.order_key_for(key)
+            let (partition_key, order_key) = if existing > 0 || new_weight > 0 {
+                (self.partition_key_for(key), self.order_key_for(key))
             } else {
-                None
+                (None, None)
             };
-            cache_updates.push((key.clone(), existing, new_weight, order_key));
+            cache_updates.push((key.clone(), existing, new_weight, partition_key, order_key));
         }
 
         let base_version = self
@@ -329,7 +355,7 @@ where
         self.state.update_handle(new_integrated_handle);
 
         if let Some(input_cache) = self.input_cache.as_mut() {
-            for (key, _old_weight, new_weight, _order_key) in &cache_updates {
+            for (key, _old_weight, new_weight, _partition_key, _order_key) in &cache_updates {
                 if *new_weight == 0 {
                     input_cache.remove(&key);
                 } else {
@@ -340,7 +366,7 @@ where
 
         let mut cache_prune = Vec::new();
         if let Some(mut order_index) = self.order_index.take() {
-            for (key, old_weight, new_weight, order_key) in &cache_updates {
+            for (key, old_weight, new_weight, partition_key, order_key) in &cache_updates {
                 let old_positive = *old_weight > 0;
                 let new_positive = *new_weight > 0;
                 if !old_positive && !new_positive {
@@ -355,8 +381,14 @@ where
                     }
                     continue;
                 };
+                let Some(partition_key) = partition_key.clone() else {
+                    if *new_weight == 0 {
+                        cache_prune.push(key.clone());
+                    }
+                    continue;
+                };
 
-                let index_key = (order_key, key.clone());
+                let index_key = (partition_key, order_key, key.clone());
                 if old_positive && new_positive {
                     order_index.insert(index_key, *new_weight);
                 } else if old_positive {
@@ -372,6 +404,7 @@ where
             self.order_index = Some(order_index);
         }
         for key in cache_prune {
+            self.row_partition_cache.remove(&key);
             self.row_order_cache.remove(&key);
         }
 
@@ -544,9 +577,10 @@ mod tests {
         .await
         .expect("output");
 
+        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value));
-        let mut op = TopNOp::new(state, table.clone(), output, order_key, 2, 0);
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 0);
 
         let first_delta = stage_version(
             input_dict.clone(),
@@ -627,9 +661,10 @@ mod tests {
         .await
         .expect("output");
 
+        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value));
-        let mut op = TopNOp::new(state, table.clone(), output, order_key, 2, 1);
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 1);
 
         let steps = vec![vec![(5, 1), (2, 1), (1, 1)], vec![(1, -1), (3, 2)]];
 
@@ -676,5 +711,159 @@ mod tests {
 
             full_output = recompute;
         }
+    }
+
+    #[tokio::test]
+    async fn topn_operator_applies_limit_per_partition() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_output", None)
+                .await
+                .expect("output dict"),
+        );
+        let integrated_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_state", None)
+                .await
+                .expect("state dict"),
+        );
+
+        let state = RelationState {
+            integrated: VersionedZSet::new(
+                integrated_dict,
+                table.clone(),
+                "topn_partition_state".to_string(),
+            )
+            .await
+            .expect("integrated state"),
+            latest_handle: ZSetHandle {
+                ns: "topn_partition_state".to_string(),
+                version: 0,
+            },
+        };
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "topn_partition_output".to_string(),
+        )
+        .await
+        .expect("output");
+
+        // Key encoding: partition = key / 100, order = key % 100.
+        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value / 100));
+        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value % 100));
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+
+        let delta = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "topn_partition_input",
+            &[(101, 1), (102, 1), (201, 1), (203, 1)],
+        )
+        .await;
+        let out = op
+            .on_step(1, &[delta])
+            .await
+            .expect("topn partition step")
+            .expect("non-empty delta");
+
+        let mut cache = HashMap::new();
+        cache.insert("topn_partition_output".to_string(), output_dict.clone());
+        let materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
+            .await
+            .expect("materialize output");
+        assert_eq!(materialized, HashMap::from([(101, 1), (201, 1)]));
+    }
+
+    #[tokio::test]
+    async fn topn_operator_uses_stable_tie_breaking_and_retractions() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_tie_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_tie_output", None)
+                .await
+                .expect("output dict"),
+        );
+        let integrated_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_tie_state", None)
+                .await
+                .expect("state dict"),
+        );
+
+        let state = RelationState {
+            integrated: VersionedZSet::new(
+                integrated_dict,
+                table.clone(),
+                "topn_tie_state".to_string(),
+            )
+            .await
+            .expect("integrated state"),
+            latest_handle: ZSetHandle {
+                ns: "topn_tie_state".to_string(),
+                version: 0,
+            },
+        };
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "topn_tie_output".to_string(),
+        )
+        .await
+        .expect("output");
+
+        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
+        // All inserted rows tie on this key (value % 10 == 1).
+        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value % 10));
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 0);
+
+        let first_delta = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "topn_tie_input",
+            &[(11, 1), (21, 1), (31, 1)],
+        )
+        .await;
+        let out1 = op
+            .on_step(1, &[first_delta])
+            .await
+            .expect("topn tie t1")
+            .expect("non-empty t1");
+
+        let mut cache = HashMap::new();
+        cache.insert("topn_tie_output".to_string(), output_dict.clone());
+        let out1_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out1)
+            .await
+            .expect("materialize output t1");
+        assert_eq!(out1_materialized, HashMap::from([(11, 1), (21, 1)]));
+
+        let second_delta = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "topn_tie_input",
+            &[(11, -1), (41, 1)],
+        )
+        .await;
+        let out2 = op
+            .on_step(2, &[second_delta])
+            .await
+            .expect("topn tie t2")
+            .expect("non-empty t2");
+        let out2_materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out2)
+            .await
+            .expect("materialize output t2");
+        assert_eq!(out2_materialized, HashMap::from([(11, -1), (31, 1)]));
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use chrono::{TimeZone, Timelike, Utc};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::Column;
 use datafusion::logical_expr::expr::Case;
@@ -6,6 +7,7 @@ use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::{Expr as DfExpr, Operator};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::RowSchema;
+use regex::Regex;
 
 pub(crate) fn eval_df_expr(
     expr: &DfExpr,
@@ -305,6 +307,12 @@ fn eval_scalar_function(
         "coalesce" => eval_coalesce(&args),
         "nullif" => eval_nullif(&args),
         "concat" => eval_concat(&args),
+        "hour" => eval_hour(&args),
+        "date_format" => eval_date_format(&args),
+        "regexp_extract" => eval_regexp_extract(&args),
+        "split_index" => eval_split_index(&args),
+        "count_char" => eval_count_char(&args),
+        "proctime" => eval_proctime(&args),
         _ => bail!("unsupported scalar function '{}'", func.name()),
     }
 }
@@ -390,6 +398,149 @@ fn eval_concat(args: &[ScalarValue]) -> Result<ScalarValue> {
         }
     }
     Ok(ScalarValue::Utf8(Some(out)))
+}
+
+fn eval_hour(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if args.len() != 1 {
+        bail!("hour expects 1 argument, found {}", args.len());
+    }
+    match &args[0] {
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
+            let Some(ts) = Utc.timestamp_millis_opt(*value).single() else {
+                return Ok(ScalarValue::Int64(None));
+            };
+            Ok(ScalarValue::Int64(Some(ts.hour() as i64)))
+        }
+        ScalarValue::TimestampMillisecond(None, _) | ScalarValue::Null => {
+            Ok(ScalarValue::Int64(None))
+        }
+        other => bail!("hour expects timestamp input, found {other:?}"),
+    }
+}
+
+fn eval_date_format(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if args.len() != 2 {
+        bail!("date_format expects 2 arguments, found {}", args.len());
+    }
+    let timestamp = match &args[0] {
+        ScalarValue::TimestampMillisecond(Some(value), _) => *value,
+        ScalarValue::TimestampMillisecond(None, _) | ScalarValue::Null => {
+            return Ok(ScalarValue::Utf8(None));
+        }
+        other => bail!("date_format expects timestamp input, found {other:?}"),
+    };
+    let pattern = match &args[1] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("date_format expects Utf8 pattern, found {other:?}"),
+    };
+    let Some(ts) = Utc.timestamp_millis_opt(timestamp).single() else {
+        return Ok(ScalarValue::Utf8(None));
+    };
+    let chrono_pattern = normalize_date_format_pattern(pattern);
+    Ok(ScalarValue::Utf8(Some(
+        ts.format(&chrono_pattern).to_string(),
+    )))
+}
+
+fn eval_regexp_extract(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if args.len() != 3 {
+        bail!("regexp_extract expects 3 arguments, found {}", args.len());
+    }
+    let text = match &args[0] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("regexp_extract expects Utf8 text input, found {other:?}"),
+    };
+    let pattern = match &args[1] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("regexp_extract expects Utf8 pattern input, found {other:?}"),
+    };
+    let group = match &args[2] {
+        ScalarValue::Int64(Some(value)) => *value,
+        ScalarValue::Int64(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("regexp_extract expects Int64 group index, found {other:?}"),
+    };
+    if group < 0 {
+        return Ok(ScalarValue::Utf8(None));
+    }
+    let regex = match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(_) => return Ok(ScalarValue::Utf8(None)),
+    };
+    let extracted = regex
+        .captures(text)
+        .and_then(|caps| caps.get(group as usize))
+        .map(|m| m.as_str().to_string());
+    Ok(ScalarValue::Utf8(extracted))
+}
+
+fn eval_split_index(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if args.len() != 3 {
+        bail!("split_index expects 3 arguments, found {}", args.len());
+    }
+    let text = match &args[0] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("split_index expects Utf8 text input, found {other:?}"),
+    };
+    let delimiter = match &args[1] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("split_index expects Utf8 delimiter input, found {other:?}"),
+    };
+    let index = match &args[2] {
+        ScalarValue::Int64(Some(value)) => *value,
+        ScalarValue::Int64(None) | ScalarValue::Null => return Ok(ScalarValue::Utf8(None)),
+        other => bail!("split_index expects Int64 index input, found {other:?}"),
+    };
+    if index < 0 || delimiter.is_empty() {
+        return Ok(ScalarValue::Utf8(None));
+    }
+    let out = text
+        .split(delimiter)
+        .nth(index as usize)
+        .map(ToString::to_string);
+    Ok(ScalarValue::Utf8(out))
+}
+
+fn eval_count_char(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if args.len() != 2 {
+        bail!("count_char expects 2 arguments, found {}", args.len());
+    }
+    let text = match &args[0] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Int64(None)),
+        other => bail!("count_char expects Utf8 text input, found {other:?}"),
+    };
+    let needle = match &args[1] {
+        ScalarValue::Utf8(Some(value)) => value,
+        ScalarValue::Utf8(None) | ScalarValue::Null => return Ok(ScalarValue::Int64(None)),
+        other => bail!("count_char expects Utf8 needle input, found {other:?}"),
+    };
+    if needle.is_empty() {
+        return Ok(ScalarValue::Int64(Some(0)));
+    }
+    let count = text.matches(needle).count() as i64;
+    Ok(ScalarValue::Int64(Some(count)))
+}
+
+fn eval_proctime(args: &[ScalarValue]) -> Result<ScalarValue> {
+    if !args.is_empty() {
+        bail!("proctime expects 0 arguments, found {}", args.len());
+    }
+    Ok(ScalarValue::TimestampMillisecond(None, None))
+}
+
+fn normalize_date_format_pattern(pattern: &str) -> String {
+    pattern
+        .replace("yyyy", "%Y")
+        .replace("MM", "%m")
+        .replace("dd", "%d")
+        .replace("HH", "%H")
+        .replace("mm", "%M")
+        .replace("ss", "%S")
 }
 
 fn scalar_compare(lhs: &ScalarValue, rhs: &ScalarValue, op: Operator) -> Result<Option<bool>> {
@@ -544,10 +695,13 @@ fn resolve_column(schema: &RowSchema, column: &Column) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
     use datafusion::common::Column;
     use datafusion::functions::expr_fn;
-    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::expr::{InList, ScalarFunction};
+    use datafusion::logical_expr::expr_fn::create_udf;
     use datafusion::logical_expr::{Between, Expr as DfExpr, Operator, TryCast};
+    use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility};
     use dbsp::circuit::schema::{Field, RowSchema};
     use dbsp::circuit::types::DbspScalarType;
     use std::sync::Arc;
@@ -566,6 +720,30 @@ mod tests {
 
     fn eval(expr: DfExpr, schema: Arc<RowSchema>, row: Vec<ScalarValue>) -> ScalarValue {
         eval_df_expr(&expr, &row, schema.as_ref()).expect("eval")
+    }
+
+    fn udf_expr(
+        name: &str,
+        input_types: Vec<DataType>,
+        return_type: DataType,
+        args: Vec<DfExpr>,
+    ) -> DfExpr {
+        let passthrough: ScalarFunctionImplementation = Arc::new(
+            |args: &[ColumnarValue]| -> datafusion::common::Result<ColumnarValue> {
+                Ok(args
+                    .first()
+                    .cloned()
+                    .unwrap_or(ColumnarValue::Scalar(ScalarValue::Null)))
+            },
+        );
+        let udf = create_udf(
+            name,
+            input_types,
+            return_type,
+            Volatility::Immutable,
+            passthrough,
+        );
+        DfExpr::ScalarFunction(ScalarFunction::new_udf(Arc::new(udf), args))
     }
 
     #[test]
@@ -677,6 +855,215 @@ mod tests {
             vec![ScalarValue::Utf8(Some("hi".to_string()))],
         );
         assert_eq!(value, ScalarValue::Int64(Some(2)));
+    }
+
+    #[test]
+    fn nexmark_scalar_functions_execute_with_null_semantics() {
+        let schema = schema(vec![
+            ("ts", DbspScalarType::TimestampMillis),
+            ("url", DbspScalarType::Utf8),
+            ("text", DbspScalarType::Utf8),
+            ("channel", DbspScalarType::Utf8),
+        ]);
+
+        let hour_expr = udf_expr(
+            "hour",
+            vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+            DataType::Int64,
+            vec![col("ts")],
+        );
+        let value = eval(
+            hour_expr,
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(Some("http://x/?a=1&channel_id=42".to_string())),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Int64(Some(12)));
+
+        let date_expr = udf_expr(
+            "date_format",
+            vec![
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Utf8,
+            ],
+            DataType::Utf8,
+            vec![
+                col("ts"),
+                DfExpr::Literal(ScalarValue::Utf8(Some("yyyy-MM-dd".to_string())), None),
+            ],
+        );
+        let value = eval(
+            date_expr,
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(Some("http://x/?a=1&channel_id=42".to_string())),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Utf8(Some("1970-01-19".to_string())));
+
+        let regex_expr = udf_expr(
+            "regexp_extract",
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+            DataType::Utf8,
+            vec![
+                col("url"),
+                DfExpr::Literal(
+                    ScalarValue::Utf8(Some("(&|^)channel_id=([^&]*)".to_string())),
+                    None,
+                ),
+                DfExpr::Literal(ScalarValue::Int64(Some(2)), None),
+            ],
+        );
+        let value = eval(
+            regex_expr.clone(),
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(Some("http://x/?a=1&channel_id=42".to_string())),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Utf8(Some("42".to_string())));
+        let value = eval(
+            regex_expr,
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(None),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Utf8(None));
+
+        let split_expr = udf_expr(
+            "split_index",
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+            DataType::Utf8,
+            vec![
+                col("url"),
+                DfExpr::Literal(ScalarValue::Utf8(Some("/".to_string())), None),
+                DfExpr::Literal(ScalarValue::Int64(Some(3)), None),
+            ],
+        );
+        let value = eval(
+            split_expr,
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(Some("http://host/a/b/c".to_string())),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Utf8(Some("a".to_string())));
+
+        let count_char_expr = udf_expr(
+            "count_char",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Int64,
+            vec![
+                col("text"),
+                DfExpr::Literal(ScalarValue::Utf8(Some("c".to_string())), None),
+            ],
+        );
+        let value = eval(
+            count_char_expr,
+            Arc::clone(&schema),
+            vec![
+                ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
+                ScalarValue::Utf8(Some("http://x/?channel_id=42".to_string())),
+                ScalarValue::Utf8(Some("abcccd".to_string())),
+                ScalarValue::Utf8(Some("Apple".to_string())),
+            ],
+        );
+        assert_eq!(value, ScalarValue::Int64(Some(3)));
+    }
+
+    #[test]
+    fn case_and_nested_predicates_match_q21_shape() {
+        let schema = schema(vec![
+            ("channel", DbspScalarType::Utf8),
+            ("url", DbspScalarType::Utf8),
+        ]);
+
+        let lower_channel = expr_fn::lower(col("channel"));
+        let extract = udf_expr(
+            "regexp_extract",
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+            DataType::Utf8,
+            vec![
+                col("url"),
+                DfExpr::Literal(
+                    ScalarValue::Utf8(Some("(&|^)channel_id=([^&]*)".to_string())),
+                    None,
+                ),
+                DfExpr::Literal(ScalarValue::Int64(Some(2)), None),
+            ],
+        );
+
+        let case_expr = DfExpr::Case(Case::new(
+            None,
+            vec![(
+                Box::new(DfExpr::BinaryExpr(
+                    datafusion::logical_expr::BinaryExpr::new(
+                        Box::new(lower_channel),
+                        Operator::Eq,
+                        Box::new(DfExpr::Literal(
+                            ScalarValue::Utf8(Some("apple".to_string())),
+                            None,
+                        )),
+                    ),
+                )),
+                Box::new(DfExpr::Literal(
+                    ScalarValue::Utf8(Some("0".to_string())),
+                    None,
+                )),
+            )],
+            Some(Box::new(extract.clone())),
+        ));
+
+        let row = vec![
+            ScalarValue::Utf8(Some("custom".to_string())),
+            ScalarValue::Utf8(Some("http://x/?a=1&channel_id=17".to_string())),
+        ];
+        let value = eval(case_expr.clone(), Arc::clone(&schema), row);
+        assert_eq!(value, ScalarValue::Utf8(Some("17".to_string())));
+
+        let row = vec![
+            ScalarValue::Utf8(Some("Apple".to_string())),
+            ScalarValue::Utf8(Some("http://x/?a=1&channel_id=17".to_string())),
+        ];
+        let value = eval(case_expr, Arc::clone(&schema), row);
+        assert_eq!(value, ScalarValue::Utf8(Some("0".to_string())));
+
+        let predicate = DfExpr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+            Box::new(DfExpr::IsNotNull(Box::new(extract))),
+            Operator::Or,
+            Box::new(DfExpr::InList(InList::new(
+                Box::new(expr_fn::lower(col("channel"))),
+                vec![
+                    DfExpr::Literal(ScalarValue::Utf8(Some("apple".to_string())), None),
+                    DfExpr::Literal(ScalarValue::Utf8(Some("google".to_string())), None),
+                ],
+                false,
+            ))),
+        ));
+
+        let row = vec![
+            ScalarValue::Utf8(Some("custom".to_string())),
+            ScalarValue::Utf8(Some("http://x/".to_string())),
+        ];
+        let value = eval(predicate, Arc::clone(&schema), row);
+        assert_eq!(value, ScalarValue::Boolean(Some(false)));
     }
 
     #[test]

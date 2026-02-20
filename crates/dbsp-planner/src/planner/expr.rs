@@ -86,24 +86,24 @@ fn is_wildcard_expr(expr: &Expr) -> bool {
 
 pub(super) fn map_aggregate_expr(
     expr: &Expr,
-) -> Result<(DbspAggregateFunction, Option<Expr>, Option<String>), PlannerError> {
+) -> Result<
+    (
+        DbspAggregateFunction,
+        Option<Expr>,
+        Option<Expr>,
+        bool,
+        Option<String>,
+    ),
+    PlannerError,
+> {
     match expr {
         Expr::Alias(alias) => {
-            let (function, arg, existing_alias) = map_aggregate_expr(alias.expr.as_ref())?;
-            let alias = existing_alias.or_else(|| Some(alias.name.clone()));
-            Ok((function, arg, alias))
+            let (function, arg, filter, distinct, existing_alias) =
+                map_aggregate_expr(alias.expr.as_ref())?;
+            let alias = Some(alias.name.clone()).or(existing_alias);
+            Ok((function, arg, filter, distinct, alias))
         }
         Expr::AggregateFunction(func) => {
-            if func.params.distinct {
-                return Err(PlannerError::UnsupportedPlan(
-                    "DISTINCT aggregates are not supported".to_string(),
-                ));
-            }
-            if func.params.filter.is_some() {
-                return Err(PlannerError::UnsupportedPlan(
-                    "FILTER clauses on aggregates are not supported".to_string(),
-                ));
-            }
             if !func.params.order_by.is_empty() {
                 return Err(PlannerError::UnsupportedPlan(
                     "ORDER BY within aggregates is not supported".to_string(),
@@ -128,6 +128,11 @@ pub(super) fn map_aggregate_expr(
                     )));
                 }
             };
+            if func.params.distinct && agg_function != DbspAggregateFunction::Count {
+                return Err(PlannerError::UnsupportedPlan(
+                    "DISTINCT is only supported for COUNT aggregates".to_string(),
+                ));
+            }
 
             if func.params.args.len() > 1 {
                 return Err(PlannerError::UnsupportedPlan(
@@ -145,8 +150,18 @@ pub(super) fn map_aggregate_expr(
                 Some(expr) => Some(normalize_expr(expr)?),
                 None => None,
             };
+            let filter = match &func.params.filter {
+                Some(expr) => Some(normalize_expr((**expr).clone())?),
+                None => None,
+            };
 
-            Ok((agg_function, expression, None))
+            Ok((
+                agg_function,
+                expression,
+                filter,
+                func.params.distinct,
+                Some(expr.schema_name().to_string()),
+            ))
         }
         _ => Err(PlannerError::UnsupportedPlan(
             "aggregate expressions must be aggregate functions".to_string(),

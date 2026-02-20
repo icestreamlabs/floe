@@ -1,0 +1,26 @@
+{
+  "description": "Expected row counts per canonical query for deterministic fixture checkpoints.",
+  "queries": {
+    "q0": { "initial": 0, "incremental": 0 },
+    "q1": { "initial": 0, "incremental": 0 },
+    "q2": { "initial": 0, "incremental": 0 },
+    "q3": { "initial": 0, "incremental": 0 },
+    "q4": { "initial": 0, "incremental": 0 },
+    "q5": { "initial": 0, "incremental": 0 },
+    "q6": { "initial": 0, "incremental": 0 },
+    "q7": { "initial": 0, "incremental": 0 },
+    "q8": { "initial": 0, "incremental": 0 },
+    "q9": { "initial": 0, "incremental": 0 },
+    "q12": { "initial": 0, "incremental": 0 },
+    "q13": { "initial": 0, "incremental": 0 },
+    "q14": { "initial": 0, "incremental": 0 },
+    "q15": { "initial": 0, "incremental": 0 },
+    "q16": { "initial": 0, "incremental": 0 },
+    "q17": { "initial": 0, "incremental": 0 },
+    "q18": { "initial": 0, "incremental": 0 },
+    "q19": { "initial": 0, "incremental": 0 },
+    "q20": { "initial": 0, "incremental": 0 },
+    "q21": { "initial": 0, "incremental": 0 },
+    "q22": { "initial": 0, "incremental": 0 }
+  }
+}
