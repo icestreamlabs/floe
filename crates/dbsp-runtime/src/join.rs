@@ -101,11 +101,11 @@ impl DbspJoin {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for join")?;
-        let left_index = crate::collections::IndexedBatchZSet::new(
+        let left_index = crate::collections::LegacyIndexedBatchZSet::new(
             table.clone(),
             format!("join_left_index_{join_id}"),
         );
-        let right_index = crate::collections::IndexedBatchZSet::new(
+        let right_index = crate::collections::LegacyIndexedBatchZSet::new(
             table.clone(),
             format!("join_right_index_{join_id}"),
         );

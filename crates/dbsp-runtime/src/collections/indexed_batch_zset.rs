@@ -217,7 +217,7 @@ pub struct ApplyDeltaMetrics {
     pub persisted_records: usize,
 }
 
-pub struct IndexedBatchZSet<K, V>
+pub struct LegacyIndexedBatchZSet<K, V>
 where
     K: Archive
         + Clone
@@ -265,7 +265,7 @@ where
     marker: PhantomData<(K, V)>,
 }
 
-impl<K, V> IndexedBatchZSet<K, V>
+impl<K, V> LegacyIndexedBatchZSet<K, V>
 where
     K: Archive
         + Clone
@@ -2300,7 +2300,7 @@ mod tests {
     #[tokio::test]
     async fn apply_deltas_preserves_weight_semantics() {
         let table = build_table("indexed_batch_semantics").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_semantics");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_semantics");
 
         index
             .apply_deltas(vec![(1, 10, 2), (1, 11, 3), (1, 10, -1), (1, 11, -3)])
@@ -2316,7 +2316,7 @@ mod tests {
     async fn apply_deltas_does_not_intern_values_on_write_path() {
         let table = build_table("indexed_batch_no_write_intern").await;
         let index =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_no_write_intern");
+            LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_no_write_intern");
 
         index
             .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (2, 20, 1)])
@@ -2355,10 +2355,12 @@ mod tests {
     async fn apply_deltas_coalescing_matches_non_coalesced_behavior() {
         let coalesced_table = build_table("indexed_batch_coalesced").await;
         let coalesced =
-            IndexedBatchZSet::<i64, i64>::new(coalesced_table, "indexed_batch_coalesced");
+            LegacyIndexedBatchZSet::<i64, i64>::new(coalesced_table, "indexed_batch_coalesced");
         let non_coalesced_table = build_table("indexed_batch_non_coalesced").await;
-        let non_coalesced =
-            IndexedBatchZSet::<i64, i64>::new(non_coalesced_table, "indexed_batch_non_coalesced");
+        let non_coalesced = LegacyIndexedBatchZSet::<i64, i64>::new(
+            non_coalesced_table,
+            "indexed_batch_non_coalesced",
+        );
 
         let updates = vec![
             (1, 10, 1),
@@ -2407,7 +2409,7 @@ mod tests {
         }
 
         assert!(
-            IndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
+            LegacyIndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
             "large batches with obvious duplicates should keep coalescing enabled"
         );
     }
@@ -2420,7 +2422,7 @@ mod tests {
         }
 
         assert!(
-            !IndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
+            !LegacyIndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
             "large batches with unique pairs should skip coalescing when safe"
         );
     }
@@ -2428,8 +2430,10 @@ mod tests {
     #[tokio::test]
     async fn large_unique_batch_uses_segment_ref_l0_layout() {
         let table = build_table("indexed_batch_segment_ref_layout").await;
-        let index =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_segment_ref_layout");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_segment_ref_layout",
+        );
 
         let mut updates = Vec::new();
         for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 32) {
@@ -2478,7 +2482,8 @@ mod tests {
     #[tokio::test]
     async fn compaction_deletes_unreferenced_segments() {
         let table = build_table("indexed_batch_segment_gc").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_segment_gc");
+        let index =
+            LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_segment_gc");
 
         let mut updates = Vec::new();
         for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 32) {
@@ -2514,7 +2519,8 @@ mod tests {
     #[tokio::test]
     async fn values_for_key_uses_incremental_l0_cursor_after_cache_seed() {
         let table = build_table("indexed_batch_lookup_cursor").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_cursor");
+        let index =
+            LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_cursor");
 
         index
             .apply_deltas(vec![(1, 10, 1)])
@@ -2554,7 +2560,7 @@ mod tests {
     #[tokio::test]
     async fn values_for_key_cache_cold_and_warm_equivalent() {
         let table = build_table("indexed_batch_lookup_cache_cold_warm").await;
-        let writer = IndexedBatchZSet::<i64, i64>::new(
+        let writer = LegacyIndexedBatchZSet::<i64, i64>::new(
             table.clone(),
             "indexed_batch_lookup_cache_cold_warm",
         );
@@ -2565,7 +2571,7 @@ mod tests {
             .expect("write L0 deltas");
         writer.compact_l0_to_l1().await.expect("compact into L1");
 
-        let reader = IndexedBatchZSet::<i64, i64>::new(
+        let reader = LegacyIndexedBatchZSet::<i64, i64>::new(
             table.clone(),
             "indexed_batch_lookup_cache_cold_warm",
         );
@@ -2582,8 +2588,10 @@ mod tests {
     #[tokio::test]
     async fn warm_lookup_uses_memory_when_dictionary_bytes_go_missing() {
         let table = build_table("indexed_batch_lookup_memory_first").await;
-        let writer =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+        let writer = LegacyIndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_lookup_memory_first",
+        );
 
         writer
             .apply_deltas(vec![(1, 10, 2), (1, 11, 1)])
@@ -2591,8 +2599,10 @@ mod tests {
             .expect("write L0 deltas");
         writer.compact_l0_to_l1().await.expect("compact into L1");
 
-        let reader =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+        let reader = LegacyIndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_lookup_memory_first",
+        );
         let mut baseline = reader.values_for_key(&1).await.expect("seed warm cache");
         baseline.sort_unstable();
 
@@ -2626,8 +2636,10 @@ mod tests {
         warm.sort_unstable();
         assert_eq!(warm, baseline);
 
-        let reopened =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+        let reopened = LegacyIndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_lookup_memory_first",
+        );
         let err = reopened
             .values_for_key(&1)
             .await
@@ -2641,7 +2653,8 @@ mod tests {
     #[tokio::test]
     async fn values_for_key_reads_legacy_overlay_entry_payload() {
         let table = build_table("indexed_batch_legacy_l0").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_legacy_l0");
+        let index =
+            LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_legacy_l0");
 
         let key_bytes = encode_storage(&7_i64).expect("encode key");
         let legacy = OverlayEntry {
@@ -2671,7 +2684,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_merges_l0_and_compacted_l1() {
         let table = build_table("indexed_batch_merge").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_merge");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_merge");
 
         index
             .apply_deltas(vec![(1, 10, 2), (1, 11, 1)])
@@ -2693,13 +2706,13 @@ mod tests {
     #[tokio::test]
     async fn restart_keeps_overlay_append_sequence_monotonic() {
         let table = build_table("indexed_batch_restart").await;
-        let first = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_restart");
+        let first = LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_restart");
         first
             .apply_deltas(vec![(1, 10, 1)])
             .await
             .expect("first append");
 
-        let reopened = IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_restart");
+        let reopened = LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_restart");
         reopened
             .apply_deltas(vec![(1, 10, 2)])
             .await
@@ -2715,7 +2728,8 @@ mod tests {
     #[tokio::test]
     async fn row_reference_duplicate_retraction_toggle_workload() {
         let table = build_table("indexed_batch_row_refs").await;
-        let index = IndexedBatchZSet::<i64, RowReferenceV1>::new(table, "indexed_batch_row_refs");
+        let index =
+            LegacyIndexedBatchZSet::<i64, RowReferenceV1>::new(table, "indexed_batch_row_refs");
 
         let row_ref = RowReferenceV1::new(7, 12, 0);
         index
@@ -2740,7 +2754,7 @@ mod tests {
     async fn reverse_index_supports_value_lookups() {
         let table = build_table("indexed_batch_reverse").await;
         let index =
-            IndexedBatchZSet::<i64, i64>::with_reverse_index(table, "indexed_batch_reverse");
+            LegacyIndexedBatchZSet::<i64, i64>::with_reverse_index(table, "indexed_batch_reverse");
 
         index
             .apply_deltas(vec![(1, 10, 2), (2, 10, 1), (1, 11, 3)])
@@ -2771,7 +2785,8 @@ mod tests {
     #[tokio::test]
     async fn range_index_supports_key_scans() {
         let table = build_table("indexed_batch_range").await;
-        let index = IndexedBatchZSet::<i64, i64>::with_range_index(table, "indexed_batch_range");
+        let index =
+            LegacyIndexedBatchZSet::<i64, i64>::with_range_index(table, "indexed_batch_range");
 
         index
             .apply_deltas_with_range(vec![(1, 10, 1), (3, 30, 2), (5, 50, 1)])
@@ -2789,7 +2804,7 @@ mod tests {
     #[tokio::test]
     async fn range_index_orders_bytes_lexicographically() {
         let table = build_table("indexed_batch_range_bytes").await;
-        let index = IndexedBatchZSet::<OrderedBytes, i64>::with_range_index(
+        let index = LegacyIndexedBatchZSet::<OrderedBytes, i64>::with_range_index(
             table,
             "indexed_batch_range_bytes",
         );
@@ -2823,7 +2838,7 @@ mod tests {
     #[tokio::test]
     async fn shard_compaction_only_processes_selected_shard() {
         let table = build_table("indexed_batch_shards").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_shards");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_shards");
 
         index
             .apply_deltas(vec![(1, 10, 1), (2, 20, 1)])
@@ -2848,7 +2863,7 @@ mod tests {
     async fn publishes_index_manifest_atomically_after_compaction() {
         let table = build_table("indexed_batch_manifest").await;
         let namespace = "indexed_batch_manifest";
-        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
         let manifest_store = ManifestStore::<IndexManifest>::index(table, namespace);
 
         index
@@ -2892,7 +2907,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_preserves_lookup_semantics_and_reduces_read_amplification() {
         let table = build_table("indexed_batch_amp").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_amp");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_amp");
 
         index
             .apply_deltas(vec![
@@ -2939,7 +2954,7 @@ mod tests {
     async fn incremental_compaction_compacts_only_new_l0_ranges() {
         let table = build_table("indexed_batch_incremental_compaction").await;
         let index =
-            IndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_incremental_compaction");
+            LegacyIndexedBatchZSet::<i64, i64>::new(table, "indexed_batch_incremental_compaction");
 
         index
             .apply_deltas(vec![(1, 10, 1), (1, 11, 1)])
@@ -2969,7 +2984,7 @@ mod tests {
     #[tokio::test]
     async fn values_for_key_reads_v2_encoded_payload() {
         let table = build_table("indexed_batch_l0_v2").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_l0_v2");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_l0_v2");
 
         let key_bytes = encode_storage(&5_i64).expect("encode key");
         let value_bytes = encode_storage(&17_i64).expect("encode value");
@@ -2988,7 +3003,7 @@ mod tests {
     async fn values_for_key_reads_mixed_legacy_and_id_l1_layouts() {
         let table = build_table("indexed_batch_mixed_l1_layout").await;
         let index =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_mixed_l1_layout");
+            LegacyIndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_mixed_l1_layout");
 
         let key_bytes = encode_storage(&1_i64).expect("encode key");
         let legacy_value_bytes = encode_storage(&10_i64).expect("encode legacy value");
@@ -3024,8 +3039,10 @@ mod tests {
     #[tokio::test]
     async fn compaction_migrates_legacy_l1_entries_to_id_layout() {
         let table = build_table("indexed_batch_compact_migrate_l1").await;
-        let index =
-            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_compact_migrate_l1");
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_compact_migrate_l1",
+        );
 
         let key_bytes = encode_storage(&1_i64).expect("encode key");
         let value_bytes = encode_storage(&10_i64).expect("encode value");
@@ -3083,7 +3100,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_normalizes_payloads_to_dictionary_ids_in_background() {
         let table = build_table("indexed_batch_compaction_normalization").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(
             table.clone(),
             "indexed_batch_compaction_normalization",
         );
@@ -3143,7 +3160,7 @@ mod tests {
     #[tokio::test]
     async fn adaptive_hot_key_compaction_triggers_at_threshold() {
         let table = build_table("indexed_batch_adaptive_hot").await;
-        let index = IndexedBatchZSet::<i64, i64>::with_hot_key_compaction_threshold(
+        let index = LegacyIndexedBatchZSet::<i64, i64>::with_hot_key_compaction_threshold(
             table.clone(),
             "indexed_batch_adaptive_hot",
             4,
@@ -3191,7 +3208,7 @@ mod tests {
     #[tokio::test]
     async fn adaptive_hot_key_compaction_is_disabled_by_default() {
         let table = build_table("indexed_batch_adaptive_hot_default_off").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(
             table.clone(),
             "indexed_batch_adaptive_hot_default_off",
         );
@@ -3239,7 +3256,7 @@ mod tests {
     #[tokio::test]
     async fn payload_writes_and_background_normalization_preserve_semantics() {
         let table = build_table("indexed_batch_payload_normalization_interplay").await;
-        let index = IndexedBatchZSet::<i64, i64>::new(
+        let index = LegacyIndexedBatchZSet::<i64, i64>::new(
             table.clone(),
             "indexed_batch_payload_normalization_interplay",
         );
@@ -3280,7 +3297,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_lookup_and_updates_remain_consistent() {
         let table = build_table("indexed_batch_concurrent").await;
-        let index = Arc::new(IndexedBatchZSet::<i64, i64>::new(
+        let index = Arc::new(LegacyIndexedBatchZSet::<i64, i64>::new(
             table,
             "indexed_batch_concurrent",
         ));
@@ -3343,7 +3360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_lookup_updates_and_compaction_remain_consistent() {
         let table = build_table("indexed_batch_concurrent_compaction").await;
-        let index = Arc::new(IndexedBatchZSet::<i64, i64>::new(
+        let index = Arc::new(LegacyIndexedBatchZSet::<i64, i64>::new(
             table,
             "indexed_batch_concurrent_compaction",
         ));

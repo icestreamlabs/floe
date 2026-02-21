@@ -10,7 +10,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedBatchZSet;
+use crate::collections::LegacyIndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -54,7 +54,7 @@ where
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub state: RelationState<(K, A)>,
-    pub index: IndexedBatchZSet<K, V>,
+    pub index: LegacyIndexedBatchZSet<K, V>,
     pub table: Arc<dyn KeyValueTable>,
     pub key_extractor: KeyExtractor<V, K>,
     pub aggregator: Aggregator<K, V, A>,
@@ -97,7 +97,7 @@ where
 {
     pub fn new(
         state: RelationState<(K, A)>,
-        index: IndexedBatchZSet<K, V>,
+        index: LegacyIndexedBatchZSet<K, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
         aggregator: Aggregator<K, V, A>,
@@ -511,7 +511,7 @@ mod tests {
         .await
         .expect("output zset");
 
-        let index = IndexedBatchZSet::new(table.clone(), "rolling_index");
+        let index = LegacyIndexedBatchZSet::new(table.clone(), "rolling_index");
         let key_extractor = Arc::new(|row: &Row| Some(*row % 2));
         let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
             Arc::new(|_key, values| {

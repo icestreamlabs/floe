@@ -9,7 +9,7 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
-use crate::collections::IndexedBatchZSet;
+use crate::collections::LegacyIndexedBatchZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::group_by::GroupByOp;
 use crate::relation_state::RelationState;
@@ -279,7 +279,7 @@ where
 {
     pub fn new(
         state: RelationState<(K, A)>,
-        index: IndexedBatchZSet<K, V>,
+        index: LegacyIndexedBatchZSet<K, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
         spec: AggregateSpec<K, V, A>,
@@ -478,7 +478,7 @@ mod tests {
         .await
         .expect("output");
 
-        let index = IndexedBatchZSet::new(table.clone(), "aggregate_index");
+        let index = LegacyIndexedBatchZSet::new(table.clone(), "aggregate_index");
         let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(value % 2));
         let spec = AggregateSpec::new("sum", |_key, values| {
             if values.is_empty() {
@@ -570,7 +570,7 @@ mod tests {
                 .await
                 .expect("output");
 
-            let index = IndexedBatchZSet::new(table.clone(), index_ns);
+            let index = LegacyIndexedBatchZSet::new(table.clone(), index_ns);
             let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(value % 2));
 
             let mut op = AggregateOp::new(

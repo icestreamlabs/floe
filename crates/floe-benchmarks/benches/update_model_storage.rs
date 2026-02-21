@@ -12,8 +12,8 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
+use dbsp::collections::{IndexedBatchZSet, LegacyIndexedBatchZSet, VersionedBatchZSet};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::encoding::encode;
 use dbsp::storage::gc::{GcPolicy, GcService};
@@ -576,13 +576,14 @@ fn bench_update_model_indexed(c: &mut Criterion) {
         );
         let (indexed_read_amp, indexed_put_metrics, overlay_read_amp, cold_lookup, warm_lookup) =
             runtime.block_on(async {
-                let put_index = IndexedBatchZSet::new(indexed_put_table, indexed_put_namespace);
+                let put_index =
+                    LegacyIndexedBatchZSet::new(indexed_put_table, indexed_put_namespace);
                 let indexed_put_metrics = put_index
                     .apply_deltas_with_stats(coalescing_probe.iter().cloned())
                     .await
                     .expect("apply coalescing probe updates");
 
-                let index = IndexedBatchZSet::new(indexed_amp_table, indexed_amp_namespace);
+                let index = LegacyIndexedBatchZSet::new(indexed_amp_table, indexed_amp_namespace);
                 index
                     .apply_deltas(initial.iter().cloned())
                     .await
@@ -668,7 +669,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
             |b| {
                 let table = open_table(&runtime, next_db_name("bench-indexed-zset", batch_size));
                 let namespace = next_namespace("indexed_zset");
-                let index = IndexedBatchZSet::new(table, namespace);
+                let index = LegacyIndexedBatchZSet::new(table, namespace);
                 runtime.block_on(async {
                     index
                         .apply_deltas(initial.iter().cloned())
@@ -699,7 +700,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
             |b| {
                 let table = open_table(&runtime, next_db_name("bench-indexed-hot", batch_size));
                 let namespace = next_namespace("indexed_zset_hot");
-                let index = IndexedBatchZSet::new(table, namespace);
+                let index = LegacyIndexedBatchZSet::new(table, namespace);
                 runtime.block_on(async {
                     index
                         .apply_deltas(initial.iter().cloned())
@@ -732,6 +733,80 @@ fn bench_update_model_indexed(c: &mut Criterion) {
         );
 
         group.bench_function(
+            BenchmarkId::new("arrow_indexed_zset_apply_toggle", batch_size),
+            |b| {
+                let table = open_table(
+                    &runtime,
+                    next_db_name("bench-arrow-indexed-zset", batch_size),
+                );
+                let namespace = next_namespace("arrow_indexed_zset");
+                let index = IndexedBatchZSet::new(table, namespace);
+                runtime.block_on(async {
+                    index
+                        .apply_deltas(initial.iter().cloned())
+                        .await
+                        .expect("seed Arrow-indexed zset");
+                });
+
+                let mut flip = false;
+                b.iter(|| {
+                    let updates = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    runtime.block_on(async {
+                        index
+                            .apply_deltas(updates.iter().cloned())
+                            .await
+                            .expect("apply Arrow-indexed zset toggle");
+                    });
+                });
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("arrow_indexed_zset_apply_lookup_hot_key", batch_size),
+            |b| {
+                let table = open_table(
+                    &runtime,
+                    next_db_name("bench-arrow-indexed-hot", batch_size),
+                );
+                let namespace = next_namespace("arrow_indexed_zset_hot");
+                let index = IndexedBatchZSet::new(table, namespace);
+                runtime.block_on(async {
+                    index
+                        .apply_deltas(initial.iter().cloned())
+                        .await
+                        .expect("seed Arrow-indexed zset");
+                });
+
+                let lookup_key = 0_i64;
+                let mut flip = false;
+                b.iter(|| {
+                    let updates = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    runtime.block_on(async {
+                        index
+                            .apply_deltas(updates.iter().cloned())
+                            .await
+                            .expect("apply Arrow-indexed zset toggle");
+                        let values = index
+                            .values_for_key(&lookup_key)
+                            .await
+                            .expect("lookup Arrow-indexed zset key");
+                        black_box(values);
+                    });
+                });
+            },
+        );
+
+        group.bench_function(
             BenchmarkId::new("indexed_zset_apply_lookup_hot_key_compacted", batch_size),
             |b| {
                 let table = open_table(
@@ -739,7 +814,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
                     next_db_name("bench-indexed-hot-compacted", batch_size),
                 );
                 let namespace = next_namespace("indexed_zset_hot_compacted");
-                let index = IndexedBatchZSet::new(table.clone(), namespace.clone());
+                let index = LegacyIndexedBatchZSet::new(table.clone(), namespace.clone());
                 let manifest_store = ManifestStore::<IndexManifest>::index(table, namespace);
                 runtime.block_on(async {
                     index
@@ -1025,6 +1100,48 @@ fn bench_update_model_versioned(c: &mut Criterion) {
                             let _ = versioned.compact_current().await.expect("compact current");
                         }
                         let materialized = versioned.materialize().await.expect("materialize");
+                        black_box(materialized);
+                    });
+                });
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new(
+                "arrow_versioned_batch_zset_write_materialize_toggle",
+                batch_size,
+            ),
+            |b| {
+                let table = open_table(
+                    &runtime,
+                    next_db_name("bench-arrow-versioned-batch-zset", batch_size),
+                );
+                let namespace = next_namespace("arrow_versioned_batch_zset");
+                let versioned = VersionedBatchZSet::new(table, namespace);
+                runtime.block_on(async {
+                    versioned
+                        .apply_deltas(initial.iter().cloned())
+                        .await
+                        .expect("seed Arrow versioned batch zset");
+                });
+
+                let mut flip = false;
+                b.iter(|| {
+                    let updates = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    runtime.block_on(async {
+                        versioned
+                            .apply_deltas(updates.iter().cloned())
+                            .await
+                            .expect("apply Arrow versioned batch zset updates");
+                        let materialized = versioned
+                            .materialize()
+                            .await
+                            .expect("materialize Arrow versioned");
                         black_box(materialized);
                     });
                 });

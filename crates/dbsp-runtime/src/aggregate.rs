@@ -10,7 +10,7 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::IndexedBatchZSet;
+use crate::collections::LegacyIndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::aggregate::{AggregateOp, AggregateSpec};
@@ -81,7 +81,8 @@ impl DbspAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for aggregate")?;
-        let index = IndexedBatchZSet::new(table.clone(), format!("aggregate_index_{aggregate_id}"));
+        let index =
+            LegacyIndexedBatchZSet::new(table.clone(), format!("aggregate_index_{aggregate_id}"));
 
         let aggregate_op = Arc::new(AsyncMutex::new(AggregateOp::new(
             state,

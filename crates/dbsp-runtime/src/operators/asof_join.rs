@@ -10,7 +10,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedBatchZSet;
+use crate::collections::LegacyIndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -67,8 +67,8 @@ where
 {
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
-    pub left_index: IndexedBatchZSet<K, L>,
-    pub right_index: IndexedBatchZSet<K, R>,
+    pub left_index: LegacyIndexedBatchZSet<K, L>,
+    pub right_index: LegacyIndexedBatchZSet<K, R>,
     pub left_key: JoinKeyExtractor<L, K>,
     pub right_key: JoinKeyExtractor<R, K>,
     pub left_ts: TimestampExtractor<L, TS>,
@@ -126,8 +126,8 @@ where
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
+        left_index: LegacyIndexedBatchZSet<K, L>,
+        right_index: LegacyIndexedBatchZSet<K, R>,
         left_key: JoinKeyExtractor<L, K>,
         right_key: JoinKeyExtractor<R, K>,
         left_ts: TimestampExtractor<L, TS>,
@@ -726,8 +726,8 @@ mod tests {
             .await
             .expect("output zset");
 
-        let left_index = IndexedBatchZSet::new(table.clone(), "asof_left_index");
-        let right_index = IndexedBatchZSet::new(table.clone(), "asof_right_index");
+        let left_index = LegacyIndexedBatchZSet::new(table.clone(), "asof_left_index");
+        let right_index = LegacyIndexedBatchZSet::new(table.clone(), "asof_right_index");
 
         let left_key = Arc::new(|row: &Row| Some(row.0));
         let right_key = Arc::new(|row: &Row| Some(row.0));
