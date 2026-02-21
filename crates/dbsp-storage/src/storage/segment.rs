@@ -98,6 +98,25 @@ pub struct ArrowSegmentStore {
     segment_prefix: Vec<u8>,
 }
 
+pub fn encode_segment_envelope(
+    schema: SchemaRef,
+    batches: &[RecordBatch],
+    stats: SegmentWriteStats,
+) -> Result<(Vec<u8>, SegmentMetadata)> {
+    let payload = encode_record_batches(schema, batches).context("encode Arrow segment data")?;
+    let row_count = row_count(batches)?;
+    let metadata = SegmentMetadata {
+        row_count,
+        byte_size: usize_to_u64(payload.len())?,
+        min_key_hash: stats.min_key_hash,
+        max_key_hash: stats.max_key_hash,
+        tombstone_ratio: stats.tombstone_ratio,
+    };
+    let envelope = SegmentEnvelope { metadata, payload };
+    let encoded = encoding::encode(&envelope).context("encode Arrow segment envelope")?;
+    Ok((encoded, envelope.metadata))
+}
+
 impl ArrowSegmentStore {
     pub fn new(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
         let namespace = namespace.into();
@@ -115,23 +134,12 @@ impl ArrowSegmentStore {
         batches: &[RecordBatch],
         stats: SegmentWriteStats,
     ) -> Result<SegmentMetadata> {
-        let payload =
-            encode_record_batches(schema, batches).context("encode Arrow segment data")?;
-        let row_count = row_count(batches)?;
-        let metadata = SegmentMetadata {
-            row_count,
-            byte_size: usize_to_u64(payload.len())?,
-            min_key_hash: stats.min_key_hash,
-            max_key_hash: stats.max_key_hash,
-            tombstone_ratio: stats.tombstone_ratio,
-        };
-        let envelope = SegmentEnvelope { metadata, payload };
-        let encoded = encoding::encode(&envelope).context("encode Arrow segment envelope")?;
+        let (encoded, metadata) = encode_segment_envelope(schema, batches, stats)?;
         self.table
             .put(&self.segment_key(segment_id), &encoded)
             .await
             .with_context(|| format!("persist Arrow segment {segment_id}"))?;
-        Ok(envelope.metadata)
+        Ok(metadata)
     }
 
     pub async fn read_segment(&self, segment_id: u64) -> Result<Option<ArrowSegment>> {

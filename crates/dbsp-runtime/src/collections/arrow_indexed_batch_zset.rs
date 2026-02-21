@@ -1,13 +1,13 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{BinaryBuilder, Int64Builder};
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -18,16 +18,38 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator, decode, encode};
-use crate::storage::segment::{ArrowSegmentStore, SegmentWriteStats};
+use crate::storage::segment::{ArrowSegmentStore, SegmentWriteStats, encode_segment_envelope};
 
 use super::indexed_batch_zset::{ApplyDeltaMetrics, RangeKey};
+
+const LOOKUP_CACHE_SHARDS: usize = 64;
+const LOOKUP_CACHE_CAPACITY_PER_SHARD: usize = 2048;
+const SEGMENT_CACHE_SHARDS: usize = 64;
+const SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 128;
+
+type FastMap<K, V> = FastHashMap<K, V, RandomState>;
+type FastSet<T> = FastHashSet<T, RandomState>;
+type ValueWeightMap = FastMap<Vec<u8>, i64>;
+
+struct CachedSegment {
+    values: Vec<Vec<u8>>,
+}
+
+impl CachedSegment {
+    fn value_bytes(&self, row_index: u32) -> Result<&[u8]> {
+        self.values
+            .get(row_index as usize)
+            .map(|bytes| bytes.as_slice())
+            .ok_or_else(|| anyhow!("row index {row_index} out of bounds for cached segment"))
+    }
+}
 
 pub struct IndexedBatchZSet<K, V>
 where
     K: Archive
         + Clone
         + Eq
-        + Hash
+        + std::hash::Hash
         + Send
         + Sync
         + 'static
@@ -36,7 +58,7 @@ where
     V: Archive
         + Clone
         + Eq
-        + Hash
+        + std::hash::Hash
         + Send
         + Sync
         + 'static
@@ -52,6 +74,8 @@ where
     reverse_enabled: bool,
     range_enabled: bool,
     segment_sequence_lock: AsyncMutex<()>,
+    lookup_cache_shards: Vec<Mutex<FastMap<Vec<u8>, ValueWeightMap>>>,
+    segment_cache_shards: Vec<Mutex<FastMap<u64, Arc<CachedSegment>>>>,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -60,7 +84,7 @@ where
     K: Archive
         + Clone
         + Eq
-        + Hash
+        + std::hash::Hash
         + Send
         + Sync
         + 'static
@@ -69,7 +93,7 @@ where
     V: Archive
         + Clone
         + Eq
-        + Hash
+        + std::hash::Hash
         + Send
         + Sync
         + 'static
@@ -134,6 +158,8 @@ where
             reverse_enabled,
             range_enabled,
             segment_sequence_lock: AsyncMutex::new(()),
+            lookup_cache_shards: make_mutex_shards(LOOKUP_CACHE_SHARDS),
+            segment_cache_shards: make_mutex_shards(SEGMENT_CACHE_SHARDS),
             _marker: PhantomData,
         }
     }
@@ -176,7 +202,10 @@ where
         I: IntoIterator<Item = (K, V, i64)>,
     {
         let mut metrics = ApplyDeltaMetrics::default();
-        let mut encoded_rows = Vec::new();
+        let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
+        let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
+        let mut key_postings: FastMap<Vec<u8>, Vec<(u32, i64)>> = FastMap::default();
+        let mut reverse_postings: FastMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = FastMap::default();
         let mut min_hash = u64::MAX;
         let mut max_hash = 0_u64;
         let mut tombstones = 0_usize;
@@ -190,6 +219,23 @@ where
 
             let key_bytes = encode(&key).context("encode Arrow-index key")?;
             let value_bytes = encode(&value).context("encode Arrow-index value")?;
+            let row_index = u32::try_from(encoded_rows.len())
+                .map_err(|_| anyhow!("row index overflow while indexing segment rows"))?;
+
+            key_postings
+                .entry(key_bytes.clone())
+                .or_default()
+                .push((row_index, delta));
+            if self.reverse_enabled {
+                reverse_postings
+                    .entry(value_bytes.clone())
+                    .or_default()
+                    .push((key_bytes.clone(), delta));
+            }
+
+            let key_updates = touched_updates.entry(key_bytes.clone()).or_default();
+            *key_updates.entry(value_bytes.clone()).or_insert(0) += delta;
+
             let key_hash = hash_bytes(&key_bytes);
             min_hash = min_hash.min(key_hash);
             max_hash = max_hash.max(key_hash);
@@ -203,41 +249,62 @@ where
             return Ok(metrics);
         }
 
-        let segment_id = self.next_segment_id().await?;
+        for updates in touched_updates.values_mut() {
+            updates.retain(|_, weight| *weight != 0);
+        }
+
         let batch = self.record_batch_from_rows(&encoded_rows)?;
         let tombstone_ratio = tombstones as f64 / encoded_rows.len() as f64;
-        self.segment_store
-            .write_segment(
-                segment_id,
-                Arc::clone(&self.schema),
-                &[batch],
-                SegmentWriteStats::new(min_hash, max_hash, tombstone_ratio)
-                    .context("build Arrow-index segment stats")?,
-            )
-            .await
-            .with_context(|| format!("write Arrow-index segment {segment_id}"))?;
+        let stats = SegmentWriteStats::new(min_hash, max_hash, tombstone_ratio)
+            .context("build Arrow-index segment stats")?;
+        let (segment_bytes, _) = encode_segment_envelope(Arc::clone(&self.schema), &[batch], stats)
+            .context("encode Arrow-index segment envelope")?;
 
+        let _segment_guard = self.segment_sequence_lock.lock().await;
         let mut write_batch = WriteBatch::new();
-        for (row_index, (key_bytes, value_bytes, _)) in encoded_rows.iter().enumerate() {
-            let row_index = u32::try_from(row_index)
-                .map_err(|_| anyhow!("row index overflow while indexing segment rows"))?;
-            let key = self
-                .index_key(key_bytes, segment_id, row_index)
-                .context("build Arrow-index key")?;
-            write_batch.put(key, Vec::new());
+        let segment_id = self.read_next_segment_id().await?;
+        write_batch.put(
+            self.segment_sequence_key.clone(),
+            segment_id.saturating_add(1).to_be_bytes().to_vec(),
+        );
 
-            if self.reverse_enabled {
-                let reverse_key = self
-                    .reverse_key(value_bytes, key_bytes, segment_id, row_index)
+        write_batch.put(
+            self.segment_store.key_for_segment(segment_id),
+            segment_bytes,
+        );
+        for (key_bytes, postings) in key_postings {
+            let key = self
+                .index_key(&key_bytes, segment_id)
+                .context("build Arrow-index key")?;
+            let value = encode_index_postings(&postings);
+            write_batch.put(key, value);
+        }
+
+        if self.reverse_enabled {
+            for (value_bytes, postings) in reverse_postings {
+                let key = self
+                    .reverse_key(&value_bytes, segment_id)
                     .context("build Arrow-index reverse key")?;
-                write_batch.put(reverse_key, Vec::new());
+                let value = encode_reverse_postings(&postings)?;
+                write_batch.put(key, value);
             }
         }
 
         self.table
             .write_batch(write_batch)
             .await
-            .context("persist Arrow-index secondary keys")?;
+            .context("persist Arrow-index segment and postings")?;
+
+        self.insert_segment_cache(
+            segment_id,
+            Arc::new(CachedSegment {
+                values: encoded_rows
+                    .iter()
+                    .map(|(_, value_bytes, _)| value_bytes.clone())
+                    .collect(),
+            }),
+        )?;
+        self.apply_lookup_cache_updates(&touched_updates)?;
 
         metrics.coalesced_records = metrics.non_zero_input_records;
         metrics.persisted_records = encoded_rows.len();
@@ -246,35 +313,40 @@ where
 
     pub async fn values_for_key(&self, key: &K) -> Result<Vec<(V, i64)>> {
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
+        if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
+            return self.decode_value_weights(cached);
+        }
+
         let refs = self.segment_refs_for_key(&key_bytes).await?;
+        let mut aggregate: ValueWeightMap = FastMap::default();
 
-        let mut aggregate = HashMap::<Vec<u8>, i64>::new();
-        for (segment_id, row_indexes) in refs {
+        for (segment_id, postings) in refs {
             let segment = self
-                .segment_store
-                .read_segment(segment_id)
+                .segment_for_id(segment_id)
                 .await
-                .with_context(|| format!("read Arrow-index segment {segment_id}"))?
-                .ok_or_else(|| anyhow!("missing Arrow-index segment {segment_id}"))?;
-
-            for row_index in row_indexes {
-                let (_row_key, row_value, row_delta) = row_for_index(&segment.batches, row_index)
+                .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
+            for (row_index, delta) in postings {
+                let value_bytes = segment
+                    .value_bytes(row_index)
                     .with_context(|| {
-                    format!("read Arrow-index row {row_index} from segment {segment_id}")
-                })?;
-                *aggregate.entry(row_value).or_insert(0) += row_delta;
+                        format!("load row {row_index} from Arrow-index segment {segment_id}")
+                    })?
+                    .to_vec();
+                let next = aggregate
+                    .get(&value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&value_bytes);
+                } else {
+                    aggregate.insert(value_bytes, next);
+                }
             }
         }
 
-        let mut values = Vec::with_capacity(aggregate.len());
-        for (value_bytes, weight) in aggregate {
-            if weight == 0 {
-                continue;
-            }
-            let value = decode::<V>(&value_bytes).context("decode Arrow-index value bytes")?;
-            values.push((value, weight));
-        }
-        Ok(values)
+        self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
+        self.decode_value_weights(aggregate)
     }
 
     pub async fn keys_for_value(&self, value: &V) -> Result<Vec<(K, i64)>> {
@@ -284,30 +356,25 @@ where
 
         let value_bytes = encode(value).context("encode Arrow-index reverse lookup value")?;
         let refs = self.segment_refs_for_value(&value_bytes).await?;
+        let mut aggregate: FastMap<Vec<u8>, i64> = FastMap::default();
 
-        let mut aggregate = HashMap::<Vec<u8>, i64>::new();
-        for (segment_id, key_row_refs) in refs {
-            let segment = self
-                .segment_store
-                .read_segment(segment_id)
-                .await
-                .with_context(|| format!("read Arrow-index segment {segment_id}"))?
-                .ok_or_else(|| anyhow!("missing Arrow-index segment {segment_id}"))?;
-
-            for (key_bytes, row_index) in key_row_refs {
-                let (_row_key, _row_value, row_delta) = row_for_index(&segment.batches, row_index)
-                    .with_context(|| {
-                        format!("read Arrow-index row {row_index} from segment {segment_id}")
-                    })?;
-                *aggregate.entry(key_bytes).or_insert(0) += row_delta;
+        for key_deltas in refs.into_values() {
+            for (key_bytes, delta) in key_deltas {
+                let next = aggregate
+                    .get(&key_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&key_bytes);
+                } else {
+                    aggregate.insert(key_bytes, next);
+                }
             }
         }
 
         let mut keys = Vec::with_capacity(aggregate.len());
         for (key_bytes, weight) in aggregate {
-            if weight == 0 {
-                continue;
-            }
             let key = decode::<K>(&key_bytes).context("decode Arrow-index key bytes")?;
             keys.push((key, weight));
         }
@@ -328,14 +395,14 @@ where
             return Ok(Vec::new());
         }
 
-        let mut unique_keys = HashSet::new();
         let entries = self
             .table
             .scan_prefix(&self.index_prefix, &ScanOptions::default())
             .await
             .context("scan Arrow-index entries for range lookup")?;
+        let mut unique_keys: FastSet<Vec<u8>> = FastSet::default();
         for (entry_key, _) in entries {
-            let (key_bytes, _, _) = self
+            let (key_bytes, _) = self
                 .decode_index_key(&entry_key)
                 .context("decode Arrow-index key during range lookup")?;
             unique_keys.insert(key_bytes);
@@ -361,7 +428,7 @@ where
             .list_segment_ids()
             .await
             .context("list Arrow-index segments")?;
-        let mut aggregate = HashMap::<(Vec<u8>, Vec<u8>), i64>::new();
+        let mut aggregate: FastMap<(Vec<u8>, Vec<u8>), i64> = FastMap::default();
 
         for segment_id in segment_ids {
             let Some(segment) = self
@@ -372,6 +439,7 @@ where
             else {
                 continue;
             };
+
             for batch in &segment.batches {
                 let key_col = batch
                     .column(0)
@@ -393,16 +461,22 @@ where
                     let key_bytes = key_col.value(idx).to_vec();
                     let value_bytes = value_col.value(idx).to_vec();
                     let delta = delta_col.value(idx);
-                    *aggregate.entry((key_bytes, value_bytes)).or_insert(0) += delta;
+                    let next = aggregate
+                        .get(&(key_bytes.clone(), value_bytes.clone()))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(delta);
+                    if next == 0 {
+                        aggregate.remove(&(key_bytes, value_bytes));
+                    } else {
+                        aggregate.insert((key_bytes, value_bytes), next);
+                    }
                 }
             }
         }
 
         let mut out = Vec::with_capacity(aggregate.len());
         for ((key_bytes, value_bytes), weight) in aggregate {
-            if weight == 0 {
-                continue;
-            }
             let key = decode::<K>(&key_bytes).context("decode key bytes while listing entries")?;
             let value =
                 decode::<V>(&value_bytes).context("decode value bytes while listing entries")?;
@@ -430,7 +504,10 @@ where
         Ok(entries.len())
     }
 
-    async fn segment_refs_for_key(&self, key_bytes: &[u8]) -> Result<HashMap<u64, Vec<u32>>> {
+    async fn segment_refs_for_key(
+        &self,
+        key_bytes: &[u8],
+    ) -> Result<FastMap<u64, Vec<(u32, i64)>>> {
         let entries = self
             .table
             .scan_prefix(
@@ -442,12 +519,14 @@ where
             .await
             .context("scan Arrow-index key prefix")?;
 
-        let mut refs = HashMap::<u64, Vec<u32>>::new();
-        for (entry_key, _) in entries {
-            let (_decoded_key, segment_id, row_index) = self
+        let mut refs: FastMap<u64, Vec<(u32, i64)>> = FastMap::default();
+        for (entry_key, entry_value) in entries {
+            let (_key, segment_id) = self
                 .decode_index_key(&entry_key)
-                .context("decode Arrow-index key entry")?;
-            refs.entry(segment_id).or_default().push(row_index);
+                .context("decode Arrow-index key")?;
+            refs.entry(segment_id)
+                .or_default()
+                .extend(decode_index_postings(&entry_value)?);
         }
         Ok(refs)
     }
@@ -455,7 +534,7 @@ where
     async fn segment_refs_for_value(
         &self,
         value_bytes: &[u8],
-    ) -> Result<HashMap<u64, Vec<(Vec<u8>, u32)>>> {
+    ) -> Result<FastMap<u64, Vec<(Vec<u8>, i64)>>> {
         let entries = self
             .table
             .scan_prefix(
@@ -467,35 +546,28 @@ where
             .await
             .context("scan Arrow-index reverse prefix")?;
 
-        let mut refs = HashMap::<u64, Vec<(Vec<u8>, u32)>>::new();
-        for (entry_key, _) in entries {
-            let (_value, key, segment_id, row_index) = self
+        let mut refs: FastMap<u64, Vec<(Vec<u8>, i64)>> = FastMap::default();
+        for (entry_key, entry_value) in entries {
+            let (_value, segment_id) = self
                 .decode_reverse_key(&entry_key)
                 .context("decode Arrow-index reverse key")?;
-            refs.entry(segment_id).or_default().push((key, row_index));
+            refs.entry(segment_id)
+                .or_default()
+                .extend(decode_reverse_postings(&entry_value)?);
         }
         Ok(refs)
     }
 
-    async fn next_segment_id(&self) -> Result<u64> {
-        let _guard = self.segment_sequence_lock.lock().await;
-        let current = match self
+    async fn read_next_segment_id(&self) -> Result<u64> {
+        match self
             .table
             .get(&self.segment_sequence_key)
             .await
             .context("read Arrow-index next segment id")?
         {
-            Some(bytes) => {
-                decode_u64_payload(&bytes).context("decode Arrow-index next segment id")?
-            }
-            None => 1,
-        };
-        let next = current.saturating_add(1);
-        self.table
-            .put(&self.segment_sequence_key, &next.to_be_bytes())
-            .await
-            .context("store Arrow-index next segment id")?;
-        Ok(current)
+            Some(bytes) => decode_u64_payload(&bytes),
+            None => Ok(1),
+        }
     }
 
     fn record_batch_from_rows(&self, rows: &[(Vec<u8>, Vec<u8>, i64)]) -> Result<RecordBatch> {
@@ -534,29 +606,19 @@ where
         Ok(prefix)
     }
 
-    fn index_key(&self, key_bytes: &[u8], segment_id: u64, row_index: u32) -> Result<Vec<u8>> {
+    fn index_key(&self, key_bytes: &[u8], segment_id: u64) -> Result<Vec<u8>> {
         let mut key = self.index_prefix_for_key(key_bytes)?;
         key.extend_from_slice(&segment_id.to_be_bytes());
-        key.extend_from_slice(&row_index.to_be_bytes());
         Ok(key)
     }
 
-    fn reverse_key(
-        &self,
-        value_bytes: &[u8],
-        key_bytes: &[u8],
-        segment_id: u64,
-        row_index: u32,
-    ) -> Result<Vec<u8>> {
+    fn reverse_key(&self, value_bytes: &[u8], segment_id: u64) -> Result<Vec<u8>> {
         let mut key = self.reverse_prefix_for_value(value_bytes)?;
-        key.extend_from_slice(&encode_len(key_bytes.len())?);
-        key.extend_from_slice(key_bytes);
         key.extend_from_slice(&segment_id.to_be_bytes());
-        key.extend_from_slice(&row_index.to_be_bytes());
         Ok(key)
     }
 
-    fn decode_index_key(&self, key: &[u8]) -> Result<(Vec<u8>, u64, u32)> {
+    fn decode_index_key(&self, key: &[u8]) -> Result<(Vec<u8>, u64)> {
         if !key.starts_with(&self.index_prefix) {
             return Err(anyhow!("Arrow-index key missing prefix"));
         }
@@ -575,10 +637,6 @@ where
             .get(cursor..cursor + 8)
             .ok_or_else(|| anyhow!("Arrow-index key missing segment id"))?;
         cursor += 8;
-        let row_index_bytes = key
-            .get(cursor..cursor + 4)
-            .ok_or_else(|| anyhow!("Arrow-index key missing row index"))?;
-        cursor += 4;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index key has trailing bytes"));
         }
@@ -586,11 +644,10 @@ where
         Ok((
             key_bytes,
             u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-            u32::from_be_bytes(row_index_bytes.try_into().unwrap()),
         ))
     }
 
-    fn decode_reverse_key(&self, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u64, u32)> {
+    fn decode_reverse_key(&self, key: &[u8]) -> Result<(Vec<u8>, u64)> {
         if !key.starts_with(&self.reverse_prefix) {
             return Err(anyhow!("Arrow-index reverse key missing prefix"));
         }
@@ -605,77 +662,223 @@ where
             .to_vec();
         cursor = value_end;
 
-        let key_len = read_len(key, &mut cursor)?;
-        let key_end = cursor
-            .checked_add(key_len)
-            .ok_or_else(|| anyhow!("Arrow-index reverse key length overflow"))?;
-        let key_bytes = key
-            .get(cursor..key_end)
-            .ok_or_else(|| anyhow!("Arrow-index reverse key truncated"))?
-            .to_vec();
-        cursor = key_end;
-
         let segment_bytes = key
             .get(cursor..cursor + 8)
             .ok_or_else(|| anyhow!("Arrow-index reverse key missing segment id"))?;
         cursor += 8;
-        let row_index_bytes = key
-            .get(cursor..cursor + 4)
-            .ok_or_else(|| anyhow!("Arrow-index reverse key missing row index"))?;
-        cursor += 4;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index reverse key has trailing bytes"));
         }
 
         Ok((
             value_bytes,
-            key_bytes,
             u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-            u32::from_be_bytes(row_index_bytes.try_into().unwrap()),
         ))
+    }
+
+    fn lookup_cache_for_key(&self, key_bytes: &[u8]) -> Result<Option<ValueWeightMap>> {
+        let shard = shard_for_bytes(key_bytes, self.lookup_cache_shards.len());
+        let guard = self.lookup_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index lookup cache shard poisoned"))?;
+        Ok(guard.get(key_bytes).cloned())
+    }
+
+    fn store_lookup_cache_for_key(&self, key_bytes: &[u8], state: &ValueWeightMap) -> Result<()> {
+        let shard = shard_for_bytes(key_bytes, self.lookup_cache_shards.len());
+        let mut guard = self.lookup_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index lookup cache shard poisoned"))?;
+        if guard.len() >= LOOKUP_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(key_bytes) {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(key_bytes.to_vec(), state.clone());
+        Ok(())
+    }
+
+    fn apply_lookup_cache_updates(&self, updates: &FastMap<Vec<u8>, ValueWeightMap>) -> Result<()> {
+        for (key_bytes, key_updates) in updates {
+            let shard = shard_for_bytes(key_bytes, self.lookup_cache_shards.len());
+            let mut guard = self.lookup_cache_shards[shard]
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index lookup cache shard poisoned"))?;
+            let Some(state) = guard.get_mut(key_bytes) else {
+                continue;
+            };
+            for (value_bytes, delta) in key_updates {
+                let next = state
+                    .get(value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*delta);
+                if next == 0 {
+                    state.remove(value_bytes);
+                } else {
+                    state.insert(value_bytes.clone(), next);
+                }
+            }
+            if state.is_empty() {
+                guard.remove(key_bytes);
+            }
+        }
+        Ok(())
+    }
+
+    async fn segment_for_id(&self, segment_id: u64) -> Result<Arc<CachedSegment>> {
+        if let Some(cached) = self.cached_segment_for_id(segment_id)? {
+            return Ok(cached);
+        }
+
+        let Some(segment) = self
+            .segment_store
+            .read_segment(segment_id)
+            .await
+            .with_context(|| format!("read Arrow-index segment {segment_id}"))?
+        else {
+            return Err(anyhow!("missing Arrow-index segment {segment_id}"));
+        };
+
+        let mut values = Vec::new();
+        for batch in &segment.batches {
+            let value_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| anyhow!("invalid Arrow-index value column type"))?;
+            for row in 0..batch.num_rows() {
+                values.push(value_col.value(row).to_vec());
+            }
+        }
+
+        let cached = Arc::new(CachedSegment { values });
+        self.insert_segment_cache(segment_id, Arc::clone(&cached))?;
+        Ok(cached)
+    }
+
+    fn cached_segment_for_id(&self, segment_id: u64) -> Result<Option<Arc<CachedSegment>>> {
+        let shard = self.segment_cache_shard(segment_id);
+        let guard = self.segment_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index segment cache shard poisoned"))?;
+        Ok(guard.get(&segment_id).cloned())
+    }
+
+    fn insert_segment_cache(&self, segment_id: u64, segment: Arc<CachedSegment>) -> Result<()> {
+        let shard = self.segment_cache_shard(segment_id);
+        let mut guard = self.segment_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index segment cache shard poisoned"))?;
+        if guard.len() >= SEGMENT_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(&segment_id) {
+            if let Some(evict_key) = guard.keys().next().copied() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(segment_id, segment);
+        Ok(())
+    }
+
+    fn segment_cache_shard(&self, segment_id: u64) -> usize {
+        (segment_id as usize) % self.segment_cache_shards.len()
+    }
+
+    fn decode_value_weights(&self, aggregate: ValueWeightMap) -> Result<Vec<(V, i64)>> {
+        let mut values = Vec::with_capacity(aggregate.len());
+        for (value_bytes, weight) in aggregate {
+            if weight == 0 {
+                continue;
+            }
+            let value = decode::<V>(&value_bytes).context("decode Arrow-index value bytes")?;
+            values.push((value, weight));
+        }
+        Ok(values)
     }
 }
 
+fn make_mutex_shards<T: Default>(shard_count: usize) -> Vec<Mutex<T>> {
+    (0..shard_count).map(|_| Mutex::new(T::default())).collect()
+}
+
+fn shard_for_bytes(bytes: &[u8], shard_count: usize) -> usize {
+    if shard_count == 0 {
+        return 0;
+    }
+    (hash_bytes(bytes) as usize) % shard_count
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = ahash::AHasher::default();
     hasher.write(bytes);
     hasher.finish()
 }
 
-fn row_for_index(batches: &[RecordBatch], row_index: u32) -> Result<(Vec<u8>, Vec<u8>, i64)> {
-    let mut remaining = row_index as usize;
-    for batch in batches {
-        if remaining >= batch.num_rows() {
-            remaining -= batch.num_rows();
-            continue;
-        }
+fn encode_index_postings(postings: &[(u32, i64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + postings.len() * (4 + 8));
+    out.extend_from_slice(&(postings.len() as u32).to_be_bytes());
+    for (row_index, delta) in postings {
+        out.extend_from_slice(&row_index.to_be_bytes());
+        out.extend_from_slice(&delta.to_be_bytes());
+    }
+    out
+}
 
-        let key_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| anyhow!("invalid Arrow-index key column type"))?;
-        let value_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| anyhow!("invalid Arrow-index value column type"))?;
-        let delta_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| anyhow!("invalid Arrow-index delta column type"))?;
+fn decode_index_postings(bytes: &[u8]) -> Result<Vec<(u32, i64)>> {
+    let mut cursor = 0;
+    let count = read_u32(bytes, &mut cursor).context("decode index postings count")? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let row_index = read_u32(bytes, &mut cursor).context("decode index posting row index")?;
+        let delta = read_i64(bytes, &mut cursor).context("decode index posting delta")?;
+        out.push((row_index, delta));
+    }
+    if cursor != bytes.len() {
+        return Err(anyhow!("index postings payload has trailing bytes"));
+    }
+    Ok(out)
+}
 
-        return Ok((
-            key_col.value(remaining).to_vec(),
-            value_col.value(remaining).to_vec(),
-            delta_col.value(remaining),
-        ));
+fn encode_reverse_postings(postings: &[(Vec<u8>, i64)]) -> Result<Vec<u8>> {
+    let mut capacity: usize = 4;
+    for (key_bytes, _) in postings {
+        capacity = capacity
+            .checked_add(4)
+            .and_then(|v| v.checked_add(key_bytes.len()))
+            .and_then(|v| v.checked_add(8))
+            .ok_or_else(|| anyhow!("reverse postings size overflow"))?;
     }
 
-    Err(anyhow!(
-        "row index {row_index} out of bounds for Arrow-index segment"
-    ))
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&(postings.len() as u32).to_be_bytes());
+    for (key_bytes, delta) in postings {
+        out.extend_from_slice(&encode_len(key_bytes.len())?);
+        out.extend_from_slice(key_bytes);
+        out.extend_from_slice(&delta.to_be_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_reverse_postings(bytes: &[u8]) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut cursor = 0;
+    let count = read_u32(bytes, &mut cursor).context("decode reverse postings count")? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = read_len(bytes, &mut cursor).context("decode reverse posting key length")?;
+        let key_end = cursor
+            .checked_add(key_len)
+            .ok_or_else(|| anyhow!("reverse posting key length overflow"))?;
+        let key_bytes = bytes
+            .get(cursor..key_end)
+            .ok_or_else(|| anyhow!("reverse posting key truncated"))?
+            .to_vec();
+        cursor = key_end;
+        let delta = read_i64(bytes, &mut cursor).context("decode reverse posting delta")?;
+        out.push((key_bytes, delta));
+    }
+    if cursor != bytes.len() {
+        return Err(anyhow!("reverse postings payload has trailing bytes"));
+    }
+    Ok(out)
 }
 
 fn encode_len(len: usize) -> Result<[u8; 4]> {
@@ -694,6 +897,28 @@ fn read_len(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
     Ok(u32::from_be_bytes(chunk.try_into().unwrap()) as usize)
 }
 
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("Arrow-index u32 overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("Arrow-index u32 truncated"))?;
+    *cursor = end;
+    Ok(u32::from_be_bytes(chunk.try_into().unwrap()))
+}
+
+fn read_i64(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("Arrow-index i64 overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("Arrow-index i64 truncated"))?;
+    *cursor = end;
+    Ok(i64::from_be_bytes(chunk.try_into().unwrap()))
+}
+
 fn decode_u64_payload(bytes: &[u8]) -> Result<u64> {
     let chunk = bytes
         .get(0..8)
@@ -707,6 +932,7 @@ mod tests {
 
     use object_store::memory::InMemory;
     use slatedb::Db;
+    use slatedb::config::ScanOptions;
 
     use crate::storage::SlateTable;
 
@@ -730,6 +956,27 @@ mod tests {
         let mut values = index.values_for_key(&1).await.expect("lookup key");
         values.sort_unstable();
         assert_eq!(values, vec![(11, 2)]);
+    }
+
+    #[tokio::test]
+    async fn arrow_indexed_cache_stays_consistent_across_updates() {
+        let table = build_table("arrow-indexed-cache").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(table, "arrow_indexed_cache");
+        index
+            .apply_deltas(vec![(1, 10, 1), (1, 11, 1)])
+            .await
+            .expect("seed deltas");
+        let mut first = index.values_for_key(&1).await.expect("seed cache");
+        first.sort_unstable();
+        assert_eq!(first, vec![(10, 1), (11, 1)]);
+
+        index
+            .apply_deltas(vec![(1, 10, -1), (1, 12, 3)])
+            .await
+            .expect("apply cache updates");
+        let mut second = index.values_for_key(&1).await.expect("read updated cache");
+        second.sort_unstable();
+        assert_eq!(second, vec![(11, 1), (12, 3)]);
     }
 
     #[tokio::test]
@@ -762,5 +1009,25 @@ mod tests {
             .expect("range lookup");
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 20, 2), (3, 30, 3)]);
+    }
+
+    #[tokio::test]
+    async fn arrow_indexed_writes_one_posting_per_key_per_segment() {
+        let table = build_table("arrow-indexed-postings").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "arrow_indexed_postings");
+        index
+            .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (1, 12, 1), (2, 20, 1)])
+            .await
+            .expect("apply deltas");
+
+        let key_bytes = crate::storage::encoding::encode(&1_i64).expect("encode key");
+        let prefix = index
+            .index_prefix_for_key(&key_bytes)
+            .expect("build postings prefix");
+        let entries = table
+            .scan_prefix(&prefix, &ScanOptions::default())
+            .await
+            .expect("scan postings entries");
+        assert_eq!(entries.len(), 1, "expected one key+segment posting record");
     }
 }
