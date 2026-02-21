@@ -1,10 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
+use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -160,14 +162,49 @@ struct OverlayEntry<V> {
     delta: i64,
 }
 
+#[derive(Debug)]
+struct L0Segment {
+    bytes: Vec<u8>,
+    blob_start: usize,
+    offsets: Vec<u32>,
+}
+
+impl L0Segment {
+    fn value_bytes(&self, row_index: u32) -> Result<&[u8]> {
+        let idx = row_index as usize;
+        if idx + 1 >= self.offsets.len() {
+            return Err(anyhow!(
+                "row index {row_index} out of bounds for segment (len={})",
+                self.offsets.len().saturating_sub(1)
+            ));
+        }
+        let start = self.blob_start + self.offsets[idx] as usize;
+        let end = self.blob_start + self.offsets[idx + 1] as usize;
+        self.bytes
+            .get(start..end)
+            .ok_or_else(|| anyhow!("segment row slice out of bounds"))
+    }
+}
+
 const L0_ENTRY_V2: u8 = 2;
 const L0_ENTRY_V3_ID: u8 = 3;
+const L0_ENTRY_V4_SEGMENT_REF: u8 = 4;
+const L0_SEGMENT_V1: u8 = 1;
 const INDEXED_STATE_SHARDS: usize = 64;
 const DEFAULT_KEY_LOCAL_COMPACTION_THRESHOLD: usize = 0;
+const VALUE_ID_CACHE_CAPACITY_PER_SHARD: usize = 4096;
+const VALUE_DATA_CACHE_CAPACITY_PER_SHARD: usize = 4096;
+const VALUE_DECODE_CACHE_CAPACITY_PER_SHARD: usize = 4096;
+const L0_SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 256;
+const ADAPTIVE_COALESCE_THRESHOLD: usize = 512;
+const ADAPTIVE_COALESCE_SAMPLE: usize = 256;
+
+type FastMap<K, V> = FastHashMap<K, V, RandomState>;
+type FastSet<T> = FastHashSet<T, RandomState>;
 
 #[derive(Default)]
 struct KeyLookupState {
-    aggregate_by_id: HashMap<u64, i64>,
+    aggregate_by_value_bytes: HashMap<Vec<u8>, i64>,
     last_l0_sequence: u64,
     initialized_from_l1: bool,
 }
@@ -204,6 +241,8 @@ where
     table: Arc<dyn KeyValueTable>,
     namespace: String,
     l0_prefix: Vec<u8>,
+    l0_segment_prefix: Vec<u8>,
+    l0_segment_refcount_prefix: Vec<u8>,
     l1_prefix: Vec<u8>,
     l1_id_prefix: Vec<u8>,
     l0_active_prefix: Vec<u8>,
@@ -217,9 +256,12 @@ where
     key_lookup_state_shards: Vec<Mutex<HashMap<Vec<u8>, Arc<Mutex<KeyLookupState>>>>>,
     known_active_key_shards: Vec<Mutex<HashSet<Vec<u8>>>>,
     value_id_cache_shards: Vec<Mutex<HashMap<Vec<u8>, u64>>>,
-    value_decode_cache_shards: Vec<Mutex<HashMap<u64, V>>>,
+    value_data_cache_shards: Vec<Mutex<HashMap<u64, Vec<u8>>>>,
+    value_decode_cache_shards: Vec<Mutex<HashMap<Vec<u8>, V>>>,
+    l0_segment_cache_shards: Vec<Mutex<HashMap<u64, Arc<L0Segment>>>>,
     key_local_compaction_threshold: usize,
     value_intern_lock: AsyncMutex<()>,
+    l0_segment_ref_lock: AsyncMutex<()>,
     marker: PhantomData<(K, V)>,
 }
 
@@ -309,6 +351,12 @@ where
         let mut l0_prefix = base.clone();
         l0_prefix.extend_from_slice(b"l0/");
 
+        let mut l0_segment_prefix = base.clone();
+        l0_segment_prefix.extend_from_slice(b"l0_seg/");
+
+        let mut l0_segment_refcount_prefix = base.clone();
+        l0_segment_refcount_prefix.extend_from_slice(b"l0_seg_ref/");
+
         let mut l1_prefix = base.clone();
         l1_prefix.extend_from_slice(b"l1/");
 
@@ -337,6 +385,8 @@ where
             table,
             namespace,
             l0_prefix,
+            l0_segment_prefix,
+            l0_segment_refcount_prefix,
             l1_prefix,
             l1_id_prefix,
             l0_active_prefix,
@@ -350,9 +400,12 @@ where
             key_lookup_state_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
             known_active_key_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
             value_id_cache_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
+            value_data_cache_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
             value_decode_cache_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
+            l0_segment_cache_shards: make_mutex_shards(INDEXED_STATE_SHARDS),
             key_local_compaction_threshold,
             value_intern_lock: AsyncMutex::new(()),
+            l0_segment_ref_lock: AsyncMutex::new(()),
             marker: PhantomData,
         }
     }
@@ -412,53 +465,104 @@ where
         I: IntoIterator<Item = (K, V, i64)>,
     {
         let mut metrics = ApplyDeltaMetrics::default();
-        let mut coalesced: HashMap<(K, V), i64> = HashMap::new();
+
+        let mut non_zero_updates: Vec<(K, V, i64)> = Vec::new();
         for (key, value, delta) in deltas {
             metrics.input_records = metrics.input_records.saturating_add(1);
             if delta == 0 {
                 continue;
             }
             metrics.non_zero_input_records = metrics.non_zero_input_records.saturating_add(1);
-            *coalesced.entry((key, value)).or_insert(0) += delta;
+            non_zero_updates.push((key, value, delta));
         }
-        metrics.coalesced_records = coalesced.len();
+        if non_zero_updates.is_empty() {
+            return Ok(metrics);
+        }
+
+        let use_coalescing = Self::should_use_coalescing(&non_zero_updates);
+        let use_l0_segment_refs = !use_coalescing;
+        let mut coalesced: FastMap<(K, V), i64> = FastMap::default();
+        if use_coalescing {
+            coalesced.reserve(non_zero_updates.len());
+            for (key, value, delta) in non_zero_updates.drain(..) {
+                *coalesced.entry((key, value)).or_insert(0) += delta;
+            }
+            metrics.coalesced_records = coalesced.len();
+        } else {
+            // No coalescing: treat each input as an independent L0 record.
+            metrics.coalesced_records = non_zero_updates.len();
+        }
 
         let mut next_seq = self.next_sequence().await?;
+        let segment_id = use_l0_segment_refs.then_some(next_seq);
         let mut batch = WriteBatch::new();
         let mut wrote = false;
 
-        let mut active_keys: HashSet<Vec<u8>> = HashSet::new();
-        let mut lookup_cache_updates: HashMap<Vec<u8>, Vec<(u64, i64, u64)>> = HashMap::new();
-        let mut touched_key_append_counts: HashMap<Vec<u8>, usize> = HashMap::new();
-        for ((key, value), delta) in coalesced {
-            if delta == 0 {
-                continue;
+        let mut active_keys: FastSet<Vec<u8>> = FastSet::default();
+        let mut touched_key_append_counts: FastMap<Vec<u8>, usize> = FastMap::default();
+        let mut lookup_cache_updates_bytes: FastMap<Vec<u8>, Vec<(Vec<u8>, i64, u64)>> =
+            FastMap::default();
+        let mut lookup_cache_updates_rowrefs: FastMap<Vec<u8>, Vec<(u32, i64, u64)>> =
+            FastMap::default();
+        let mut segment_values: Vec<Vec<u8>> = Vec::new();
+        if segment_id.is_some() {
+            segment_values = Vec::with_capacity(metrics.coalesced_records);
+        }
+
+        if use_coalescing {
+            for ((key, value), delta) in coalesced {
+                if delta == 0 {
+                    continue;
+                }
+                self.write_l0_record_with_optional_segment(
+                    &mut batch,
+                    &mut next_seq,
+                    segment_id,
+                    &mut segment_values,
+                    &mut wrote,
+                    &mut metrics,
+                    &mut active_keys,
+                    &mut lookup_cache_updates_bytes,
+                    &mut lookup_cache_updates_rowrefs,
+                    &mut touched_key_append_counts,
+                    key,
+                    value,
+                    delta,
+                )?;
             }
-            let key_bytes = encode(&key).context("encode batch-index key")?;
-            let value_bytes = encode(&value).context("encode batch-index value")?;
-            let value_id = self
-                .intern_value_bytes(&value_bytes)
-                .await
-                .context("intern batch-index value id")?;
-            active_keys.insert(key_bytes.clone());
-            let entry_bytes = encode_l0_payload_id(value_id, delta);
-            let assigned_sequence = next_seq;
-            let l0_key = self
-                .l0_overlay_key(&key_bytes, assigned_sequence)
-                .context("build batch-index L0 key")?;
-            batch.put(l0_key, entry_bytes);
-            next_seq = next_seq.saturating_add(1);
-            wrote = true;
-            metrics.persisted_records = metrics.persisted_records.saturating_add(1);
-            lookup_cache_updates
-                .entry(key_bytes.clone())
-                .or_default()
-                .push((value_id, delta, assigned_sequence));
-            *touched_key_append_counts.entry(key_bytes).or_insert(0) += 1;
+        } else {
+            for (key, value, delta) in non_zero_updates {
+                self.write_l0_record_with_optional_segment(
+                    &mut batch,
+                    &mut next_seq,
+                    segment_id,
+                    &mut segment_values,
+                    &mut wrote,
+                    &mut metrics,
+                    &mut active_keys,
+                    &mut lookup_cache_updates_bytes,
+                    &mut lookup_cache_updates_rowrefs,
+                    &mut touched_key_append_counts,
+                    key,
+                    value,
+                    delta,
+                )?;
+            }
+        }
+
+        if let Some(segment_id) = segment_id {
+            if wrote {
+                let payload = encode_l0_segment_v1(&segment_values)?;
+                batch.put(self.l0_segment_key(segment_id), payload);
+                batch.put(
+                    self.l0_segment_refcount_key(segment_id),
+                    (segment_values.len() as u64).to_be_bytes().to_vec(),
+                );
+            }
         }
 
         if wrote {
-            let keys_to_mark = self.mark_new_active_keys(active_keys)?;
+            let keys_to_mark = self.mark_new_active_keys(active_keys.into_iter())?;
             for key_bytes in keys_to_mark {
                 batch.put(
                     self.active_key(&key_bytes)
@@ -472,12 +576,145 @@ where
                 .await
                 .context("persist batch-index L0 deltas")?;
 
-            self.apply_lookup_cache_updates(&lookup_cache_updates)?;
-            self.maybe_compact_hot_keys(touched_key_append_counts)
+            if segment_id.is_some() {
+                self.apply_lookup_cache_updates_rowrefs(
+                    &lookup_cache_updates_rowrefs,
+                    &mut segment_values,
+                )?;
+            } else {
+                self.apply_lookup_cache_updates(&lookup_cache_updates_bytes)?;
+            }
+            self.maybe_compact_hot_keys(touched_key_append_counts.into_iter())
                 .await?;
         }
 
         Ok(metrics)
+    }
+
+    fn should_use_coalescing(updates: &[(K, V, i64)]) -> bool {
+        if updates.len() < ADAPTIVE_COALESCE_THRESHOLD {
+            return true;
+        }
+        let sample = updates.len().min(ADAPTIVE_COALESCE_SAMPLE);
+        let mut fingerprints = Vec::with_capacity(sample);
+        for (key, value, _) in updates.iter().take(sample) {
+            let mut hasher = DefaultHasher::new();
+            (key, value).hash(&mut hasher);
+            fingerprints.push(hasher.finish());
+        }
+        fingerprints.sort_unstable();
+        for window in fingerprints.windows(2) {
+            if window[0] == window[1] {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn write_l0_record_with_optional_segment(
+        &self,
+        batch: &mut WriteBatch,
+        next_seq: &mut u64,
+        segment_id: Option<u64>,
+        segment_values: &mut Vec<Vec<u8>>,
+        wrote: &mut bool,
+        metrics: &mut ApplyDeltaMetrics,
+        active_keys: &mut FastSet<Vec<u8>>,
+        lookup_cache_updates_bytes: &mut FastMap<Vec<u8>, Vec<(Vec<u8>, i64, u64)>>,
+        lookup_cache_updates_rowrefs: &mut FastMap<Vec<u8>, Vec<(u32, i64, u64)>>,
+        touched_key_append_counts: &mut FastMap<Vec<u8>, usize>,
+        key: K,
+        value: V,
+        delta: i64,
+    ) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+
+        let key_bytes = encode(&key).context("encode batch-index key")?;
+        active_keys.insert(key_bytes.clone());
+        let assigned_sequence = *next_seq;
+
+        let entry_bytes = if let Some(segment_id) = segment_id {
+            let value_bytes = encode(&value).context("encode batch-index value")?;
+            let row_index = u32::try_from(segment_values.len())
+                .map_err(|_| anyhow!("segment row index overflow"))?;
+            segment_values.push(value_bytes);
+            lookup_cache_updates_rowrefs
+                .entry(key_bytes.clone())
+                .or_default()
+                .push((row_index, delta, assigned_sequence));
+            encode_l0_payload_v4_segment_ref(segment_id, row_index, delta)
+        } else {
+            let value_bytes = encode(&value).context("encode batch-index value")?;
+            let entry_bytes = encode_l0_payload_v2(&value_bytes, delta);
+            lookup_cache_updates_bytes
+                .entry(key_bytes.clone())
+                .or_default()
+                .push((value_bytes, delta, assigned_sequence));
+            entry_bytes
+        };
+
+        let l0_key = self
+            .l0_overlay_key(&key_bytes, assigned_sequence)
+            .context("build batch-index L0 key")?;
+        batch.put(l0_key, entry_bytes);
+        *next_seq = next_seq.saturating_add(1);
+        *wrote = true;
+        metrics.persisted_records = metrics.persisted_records.saturating_add(1);
+        *touched_key_append_counts.entry(key_bytes).or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn apply_lookup_cache_updates_rowrefs(
+        &self,
+        updates: &FastMap<Vec<u8>, Vec<(u32, i64, u64)>>,
+        segment_values: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        for (key_bytes, key_updates) in updates {
+            let shard = self.shard_for_bytes(key_bytes);
+            let state_handle = {
+                let guard = self.key_lookup_state_shards[shard]
+                    .lock()
+                    .map_err(|_| anyhow!("batch-index key lookup shard poisoned"))?;
+                guard.get(key_bytes).cloned()
+            };
+            let Some(state) = state_handle else {
+                continue;
+            };
+            let mut state_guard = state
+                .lock()
+                .map_err(|_| anyhow!("batch-index key lookup state poisoned"))?;
+            if !state_guard.initialized_from_l1 {
+                continue;
+            }
+            for (row_index, delta, sequence) in key_updates {
+                let idx = *row_index as usize;
+                let value_bytes = segment_values
+                    .get_mut(idx)
+                    .ok_or_else(|| anyhow!("segment row index {row_index} out of bounds"))?;
+                let value_bytes = std::mem::take(value_bytes);
+                if value_bytes.is_empty() {
+                    return Err(anyhow!("segment row {row_index} already consumed"));
+                }
+
+                let next = state_guard
+                    .aggregate_by_value_bytes
+                    .get(&value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*delta);
+                if next == 0 {
+                    state_guard.aggregate_by_value_bytes.remove(&value_bytes);
+                } else {
+                    state_guard
+                        .aggregate_by_value_bytes
+                        .insert(value_bytes, next);
+                }
+                state_guard.last_l0_sequence = state_guard.last_l0_sequence.max(*sequence);
+            }
+        }
+        Ok(())
     }
 
     pub async fn keys_for_value(&self, value: &V) -> Result<Vec<(K, i64)>> {
@@ -546,61 +783,64 @@ where
                 .sequence_from_l0_key(&entry_key)
                 .context("decode batch-index L0 sequence for key lookup")?;
             let (decoded_value, delta) = decode_l0_payload::<V>(&entry_bytes)?;
-            let value_id = match decoded_value {
-                DecodedL0Value::Id(id) => id,
-                DecodedL0Value::Encoded(bytes) => self
-                    .intern_value_bytes(&bytes)
+            let value_bytes = match decoded_value {
+                DecodedL0Value::Id(id) => self
+                    .value_bytes_for_id(id)
                     .await
-                    .context("intern L0 v2 value during lookup")?,
+                    .with_context(|| format!("load value bytes for id {id} during lookup"))?,
+                DecodedL0Value::SegmentRef {
+                    segment_id,
+                    row_index,
+                } => self
+                    .value_bytes_for_segment_ref(segment_id, row_index)
+                    .await
+                    .with_context(|| {
+                        format!("load value bytes for segment {segment_id} row {row_index} during lookup")
+                    })?,
+                DecodedL0Value::Encoded(bytes) => bytes,
                 DecodedL0Value::Decoded(value) => {
-                    let bytes = encode(&value).context("encode legacy L0 value during lookup")?;
-                    self.intern_value_bytes(&bytes)
-                        .await
-                        .context("intern legacy L0 value during lookup")?
+                    encode(&value).context("encode legacy L0 value during lookup")?
                 }
             };
-            updates.push((sequence, value_id, delta));
+            updates.push((sequence, value_bytes, delta));
         }
 
-        let id_weight_pairs: Vec<(u64, i64)> = {
+        let value_weight_pairs: Vec<(Vec<u8>, i64)> = {
             let mut guard = state
                 .lock()
                 .map_err(|_| anyhow!("batch-index key lookup state poisoned"))?;
             let mut max_seen_sequence = guard.last_l0_sequence;
-            for (sequence, value_id, delta) in updates {
+            for (sequence, value_bytes, delta) in updates {
                 if sequence <= guard.last_l0_sequence {
                     continue;
                 }
                 let next = guard
-                    .aggregate_by_id
-                    .get(&value_id)
+                    .aggregate_by_value_bytes
+                    .get(&value_bytes)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(delta);
                 if next == 0 {
-                    guard.aggregate_by_id.remove(&value_id);
+                    guard.aggregate_by_value_bytes.remove(&value_bytes);
                 } else {
-                    guard.aggregate_by_id.insert(value_id, next);
+                    guard.aggregate_by_value_bytes.insert(value_bytes, next);
                 }
                 max_seen_sequence = max_seen_sequence.max(sequence);
             }
             guard.last_l0_sequence = max_seen_sequence;
             guard
-                .aggregate_by_id
+                .aggregate_by_value_bytes
                 .iter()
-                .map(|(value_id, weight)| (*value_id, *weight))
+                .map(|(value_bytes, weight)| (value_bytes.clone(), *weight))
                 .collect()
         };
 
-        let mut output = Vec::with_capacity(id_weight_pairs.len());
-        for (value_id, weight) in id_weight_pairs {
+        let mut output = Vec::with_capacity(value_weight_pairs.len());
+        for (value_bytes, weight) in value_weight_pairs {
             if weight == 0 {
                 continue;
             }
-            let value = self
-                .value_for_id(value_id)
-                .await
-                .with_context(|| format!("decode value for id {value_id}"))?;
+            let value = self.decode_value_bytes_cached(&value_bytes)?;
             output.push((value, weight));
         }
         Ok(output)
@@ -628,14 +868,14 @@ where
         if guard.initialized_from_l1 {
             return Ok(());
         }
-        guard.aggregate_by_id = seeded;
+        guard.aggregate_by_value_bytes = seeded;
         guard.last_l0_sequence = 0;
         guard.initialized_from_l1 = true;
         Ok(())
     }
 
-    async fn seed_lookup_state_from_l1(&self, key_bytes: &[u8]) -> Result<HashMap<u64, i64>> {
-        let mut aggregate_by_id = HashMap::new();
+    async fn seed_lookup_state_from_l1(&self, key_bytes: &[u8]) -> Result<HashMap<Vec<u8>, i64>> {
+        let mut aggregate_by_value_bytes = HashMap::new();
 
         let l1_id_entries = self
             .table
@@ -651,8 +891,12 @@ where
             let value_id = self
                 .value_id_from_l1_id_key(&entry_key)
                 .context("decode value id from L1-id key")?;
+            let value_bytes = self
+                .value_bytes_for_id(value_id)
+                .await
+                .with_context(|| format!("load value bytes for id {value_id} during seed"))?;
             let weight = decode_weight(&entry_value)?;
-            *aggregate_by_id.entry(value_id).or_insert(0) += weight;
+            *aggregate_by_value_bytes.entry(value_bytes).or_insert(0) += weight;
         }
 
         let l1_legacy_entries = self
@@ -669,16 +913,14 @@ where
             let value_bytes = self
                 .value_bytes_from_l1_key(&entry_key)
                 .context("decode legacy L1 value bytes")?;
-            let value_id = self
-                .intern_value_bytes(value_bytes)
-                .await
-                .context("intern legacy L1 value during lookup seed")?;
             let weight = decode_weight(&entry_value)?;
-            *aggregate_by_id.entry(value_id).or_insert(0) += weight;
+            *aggregate_by_value_bytes
+                .entry(value_bytes.to_vec())
+                .or_insert(0) += weight;
         }
 
-        aggregate_by_id.retain(|_, weight| *weight != 0);
-        Ok(aggregate_by_id)
+        aggregate_by_value_bytes.retain(|_, weight| *weight != 0);
+        Ok(aggregate_by_value_bytes)
     }
 
     fn lookup_state_for_key(&self, key_bytes: &[u8]) -> Result<Arc<Mutex<KeyLookupState>>> {
@@ -693,7 +935,7 @@ where
 
     fn apply_lookup_cache_updates(
         &self,
-        updates: &HashMap<Vec<u8>, Vec<(u64, i64, u64)>>,
+        updates: &FastMap<Vec<u8>, Vec<(Vec<u8>, i64, u64)>>,
     ) -> Result<()> {
         for (key_bytes, key_updates) in updates {
             let shard = self.shard_for_bytes(key_bytes);
@@ -712,17 +954,19 @@ where
             if !state_guard.initialized_from_l1 {
                 continue;
             }
-            for (value_id, delta, sequence) in key_updates {
+            for (value_bytes, delta, sequence) in key_updates {
                 let next = state_guard
-                    .aggregate_by_id
-                    .get(value_id)
+                    .aggregate_by_value_bytes
+                    .get(value_bytes)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(*delta);
                 if next == 0 {
-                    state_guard.aggregate_by_id.remove(value_id);
+                    state_guard.aggregate_by_value_bytes.remove(value_bytes);
                 } else {
-                    state_guard.aggregate_by_id.insert(*value_id, next);
+                    state_guard
+                        .aggregate_by_value_bytes
+                        .insert(value_bytes.clone(), next);
                 }
                 state_guard.last_l0_sequence = state_guard.last_l0_sequence.max(*sequence);
             }
@@ -730,7 +974,10 @@ where
         Ok(())
     }
 
-    fn mark_new_active_keys(&self, keys: HashSet<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+    fn mark_new_active_keys<I>(&self, keys: I) -> Result<Vec<Vec<u8>>>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
         let mut pending = Vec::new();
         for key_bytes in keys {
             let shard = self.shard_for_bytes(&key_bytes);
@@ -744,10 +991,10 @@ where
         Ok(pending)
     }
 
-    async fn maybe_compact_hot_keys(
-        &self,
-        touched_key_append_counts: HashMap<Vec<u8>, usize>,
-    ) -> Result<()> {
+    async fn maybe_compact_hot_keys<I>(&self, touched_key_append_counts: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (Vec<u8>, usize)>,
+    {
         if self.key_local_compaction_threshold == 0 {
             return Ok(());
         }
@@ -776,6 +1023,15 @@ where
         Ok(())
     }
 
+    fn reset_lookup_state_for_key(&self, key_bytes: &[u8]) -> Result<()> {
+        let shard = self.shard_for_bytes(key_bytes);
+        self.key_lookup_state_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("batch-index key lookup shard poisoned"))?
+            .remove(key_bytes);
+        Ok(())
+    }
+
     fn shard_for_bytes(&self, key_bytes: &[u8]) -> usize {
         let mut hasher = DefaultHasher::new();
         use std::hash::Hasher;
@@ -783,8 +1039,8 @@ where
         (hasher.finish() as usize) % self.key_lookup_state_shards.len()
     }
 
-    fn value_cache_shard(&self, value_id: u64) -> usize {
-        (value_id as usize) % self.value_decode_cache_shards.len()
+    fn value_data_cache_shard(&self, value_id: u64) -> usize {
+        (value_id as usize) % self.value_data_cache_shards.len()
     }
 
     fn value_id_cache_shard(&self, value_bytes: &[u8]) -> usize {
@@ -792,6 +1048,10 @@ where
         use std::hash::Hasher;
         hasher.write(value_bytes);
         (hasher.finish() as usize) % self.value_id_cache_shards.len()
+    }
+
+    fn l0_segment_cache_shard(&self, segment_id: u64) -> usize {
+        (segment_id as usize) % self.l0_segment_cache_shards.len()
     }
 
     fn cached_value_id_for_bytes(&self, value_bytes: &[u8]) -> Result<Option<u64>> {
@@ -804,28 +1064,243 @@ where
 
     fn insert_value_id_cache(&self, value_bytes: &[u8], value_id: u64) -> Result<()> {
         let shard = self.value_id_cache_shard(value_bytes);
-        self.value_id_cache_shards[shard]
+        let mut guard = self.value_id_cache_shards[shard]
             .lock()
-            .map_err(|_| anyhow!("batch-index value-id cache shard poisoned"))?
-            .insert(value_bytes.to_vec(), value_id);
+            .map_err(|_| anyhow!("batch-index value-id cache shard poisoned"))?;
+        if guard.len() >= VALUE_ID_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(value_bytes) {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(value_bytes.to_vec(), value_id);
         Ok(())
     }
 
-    fn cached_value_for_id(&self, value_id: u64) -> Result<Option<V>> {
-        let shard = self.value_cache_shard(value_id);
-        let guard = self.value_decode_cache_shards[shard]
+    fn cached_value_bytes_for_id(&self, value_id: u64) -> Result<Option<Vec<u8>>> {
+        let shard = self.value_data_cache_shard(value_id);
+        let guard = self.value_data_cache_shards[shard]
             .lock()
-            .map_err(|_| anyhow!("batch-index value cache shard poisoned"))?;
+            .map_err(|_| anyhow!("batch-index value-data cache shard poisoned"))?;
         Ok(guard.get(&value_id).cloned())
     }
 
-    fn insert_value_decode_cache(&self, value_id: u64, value: V) -> Result<()> {
-        let shard = self.value_cache_shard(value_id);
-        self.value_decode_cache_shards[shard]
+    fn insert_value_data_cache(&self, value_id: u64, value_bytes: &[u8]) -> Result<()> {
+        let shard = self.value_data_cache_shard(value_id);
+        let mut guard = self.value_data_cache_shards[shard]
             .lock()
-            .map_err(|_| anyhow!("batch-index value cache shard poisoned"))?
-            .insert(value_id, value);
+            .map_err(|_| anyhow!("batch-index value-data cache shard poisoned"))?;
+        if guard.len() >= VALUE_DATA_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(&value_id) {
+            if let Some(evict_key) = guard.keys().next().copied() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(value_id, value_bytes.to_vec());
         Ok(())
+    }
+
+    fn cached_decoded_value_for_bytes(&self, value_bytes: &[u8]) -> Result<Option<V>> {
+        let shard = self.value_id_cache_shard(value_bytes);
+        let guard = self.value_decode_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("batch-index value decode cache shard poisoned"))?;
+        Ok(guard.get(value_bytes).cloned())
+    }
+
+    fn insert_decoded_value_cache(&self, value_bytes: &[u8], value: V) -> Result<()> {
+        let shard = self.value_id_cache_shard(value_bytes);
+        let mut guard = self.value_decode_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("batch-index value decode cache shard poisoned"))?;
+        if guard.len() >= VALUE_DECODE_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(value_bytes)
+        {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(value_bytes.to_vec(), value);
+        Ok(())
+    }
+
+    fn decode_value_bytes_cached(&self, value_bytes: &[u8]) -> Result<V> {
+        if let Some(cached) = self.cached_decoded_value_for_bytes(value_bytes)? {
+            return Ok(cached);
+        }
+        let decoded = decode::<V>(value_bytes).context("decode value bytes from lookup state")?;
+        self.insert_decoded_value_cache(value_bytes, decoded.clone())?;
+        Ok(decoded)
+    }
+
+    fn cached_l0_segment_for_id(&self, segment_id: u64) -> Result<Option<Arc<L0Segment>>> {
+        let shard = self.l0_segment_cache_shard(segment_id);
+        let guard = self.l0_segment_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("batch-index L0 segment cache shard poisoned"))?;
+        Ok(guard.get(&segment_id).cloned())
+    }
+
+    fn insert_l0_segment_cache(&self, segment_id: u64, segment: Arc<L0Segment>) -> Result<()> {
+        let shard = self.l0_segment_cache_shard(segment_id);
+        let mut guard = self.l0_segment_cache_shards[shard]
+            .lock()
+            .map_err(|_| anyhow!("batch-index L0 segment cache shard poisoned"))?;
+        if guard.len() >= L0_SEGMENT_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(&segment_id) {
+            if let Some(evict_key) = guard.keys().next().copied() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(segment_id, segment);
+        Ok(())
+    }
+
+    async fn l0_segment_for_id(&self, segment_id: u64) -> Result<Arc<L0Segment>> {
+        if let Some(cached) = self.cached_l0_segment_for_id(segment_id)? {
+            return Ok(cached);
+        }
+        let Some(bytes) = self
+            .table
+            .get(&self.l0_segment_key(segment_id))
+            .await
+            .context("read L0 segment payload")?
+        else {
+            return Err(anyhow!("missing L0 segment payload for id {segment_id}"));
+        };
+        let len = bytes.len();
+        let decoded = decode_l0_segment(bytes).with_context(|| {
+            format!("decode L0 segment payload for id {segment_id} (len={len})")
+        })?;
+        let decoded = Arc::new(decoded);
+        self.insert_l0_segment_cache(segment_id, Arc::clone(&decoded))?;
+        Ok(decoded)
+    }
+
+    async fn value_bytes_for_segment_ref(
+        &self,
+        segment_id: u64,
+        row_index: u32,
+    ) -> Result<Vec<u8>> {
+        let segment = self
+            .l0_segment_for_id(segment_id)
+            .await
+            .with_context(|| format!("load L0 segment {segment_id}"))?;
+        Ok(segment.value_bytes(row_index)?.to_vec())
+    }
+
+    async fn value_bytes_for_id(&self, value_id: u64) -> Result<Vec<u8>> {
+        if let Some(value_bytes) = self.cached_value_bytes_for_id(value_id)? {
+            return Ok(value_bytes);
+        }
+        let Some(value_bytes) = self
+            .table
+            .get(&self.value_data_key(value_id))
+            .await
+            .context("read value bytes by id")?
+        else {
+            return Err(anyhow!("missing value bytes for id {value_id}"));
+        };
+        self.insert_value_id_cache(&value_bytes, value_id)?;
+        self.insert_value_data_cache(value_id, &value_bytes)?;
+        Ok(value_bytes)
+    }
+
+    async fn intern_value_bytes_batch(
+        &self,
+        payloads: Vec<Vec<u8>>,
+    ) -> Result<HashMap<Vec<u8>, u64>> {
+        if payloads.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut resolved: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut pending = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+
+        for value_bytes in payloads {
+            if !seen.insert(value_bytes.clone()) {
+                continue;
+            }
+
+            if let Some(value_id) = self.cached_value_id_for_bytes(&value_bytes)? {
+                resolved.insert(value_bytes, value_id);
+                continue;
+            }
+
+            let lookup_key = self
+                .value_id_lookup_key(&value_bytes)
+                .context("build value-id lookup key for batch intern")?;
+            if let Some(existing) = self
+                .table
+                .get(&lookup_key)
+                .await
+                .context("read value-id lookup entry for batch intern")?
+            {
+                let value_id = decode_u64_payload(&existing)?;
+                self.insert_value_id_cache(&value_bytes, value_id)?;
+                self.insert_value_data_cache(value_id, &value_bytes)?;
+                resolved.insert(value_bytes, value_id);
+            } else {
+                pending.push(value_bytes);
+            }
+        }
+
+        if pending.is_empty() {
+            return Ok(resolved);
+        }
+
+        let _guard = self.value_intern_lock.lock().await;
+        let mut missing = Vec::new();
+        for value_bytes in pending {
+            let lookup_key = self
+                .value_id_lookup_key(&value_bytes)
+                .context("rebuild value-id lookup key for batch intern under lock")?;
+            if let Some(existing) = self
+                .table
+                .get(&lookup_key)
+                .await
+                .context("re-read value-id lookup entry for batch intern under lock")?
+            {
+                let value_id = decode_u64_payload(&existing)?;
+                self.insert_value_id_cache(&value_bytes, value_id)?;
+                self.insert_value_data_cache(value_id, &value_bytes)?;
+                resolved.insert(value_bytes, value_id);
+            } else {
+                missing.push(value_bytes);
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(resolved);
+        }
+
+        let mut next_value_id = self.next_value_id().await?;
+        let mut batch = WriteBatch::new();
+        let mut assigned = Vec::with_capacity(missing.len());
+        for value_bytes in missing {
+            let value_id = next_value_id;
+            next_value_id = next_value_id.saturating_add(1);
+            batch.put(
+                self.value_id_lookup_key(&value_bytes)
+                    .context("build value-id lookup key for batch write")?,
+                value_id.to_be_bytes().to_vec(),
+            );
+            batch.put(self.value_data_key(value_id), value_bytes.clone());
+            assigned.push((value_bytes, value_id));
+        }
+        batch.put(
+            self.value_seq_key.clone(),
+            next_value_id.to_be_bytes().to_vec(),
+        );
+        self.table
+            .write_batch(batch)
+            .await
+            .context("persist batched value-id dictionary entries")?;
+
+        for (value_bytes, value_id) in assigned {
+            self.insert_value_id_cache(&value_bytes, value_id)?;
+            self.insert_value_data_cache(value_id, &value_bytes)?;
+            resolved.insert(value_bytes, value_id);
+        }
+
+        Ok(resolved)
     }
 
     async fn intern_value_bytes(&self, value_bytes: &[u8]) -> Result<u64> {
@@ -844,6 +1319,7 @@ where
         {
             let value_id = decode_u64_payload(&existing)?;
             self.insert_value_id_cache(value_bytes, value_id)?;
+            self.insert_value_data_cache(value_id, value_bytes)?;
             return Ok(value_id);
         }
 
@@ -856,6 +1332,7 @@ where
         {
             let value_id = decode_u64_payload(&existing)?;
             self.insert_value_id_cache(value_bytes, value_id)?;
+            self.insert_value_data_cache(value_id, value_bytes)?;
             return Ok(value_id);
         }
 
@@ -873,25 +1350,17 @@ where
             .context("persist value-id dictionary entry")?;
 
         self.insert_value_id_cache(value_bytes, value_id)?;
+        self.insert_value_data_cache(value_id, value_bytes)?;
         Ok(value_id)
     }
 
     async fn value_for_id(&self, value_id: u64) -> Result<V> {
-        if let Some(value) = self.cached_value_for_id(value_id)? {
-            return Ok(value);
-        }
-        let Some(value_bytes) = self
-            .table
-            .get(&self.value_data_key(value_id))
+        let value_bytes = self
+            .value_bytes_for_id(value_id)
             .await
-            .context("read value bytes by id")?
-        else {
-            return Err(anyhow!("missing value bytes for id {value_id}"));
-        };
-        self.insert_value_id_cache(&value_bytes, value_id)?;
-        let value = decode::<V>(&value_bytes).context("decode value bytes by id")?;
-        self.insert_value_decode_cache(value_id, value.clone())?;
-        Ok(value)
+            .with_context(|| format!("load value bytes for id {value_id}"))?;
+        self.decode_value_bytes_cached(&value_bytes)
+            .with_context(|| format!("decode value bytes for id {value_id}"))
     }
 
     async fn next_value_id(&self) -> Result<u64> {
@@ -995,6 +1464,22 @@ where
             let (decoded_value, delta) = decode_l0_payload::<V>(&entry_value)?;
             let value_id = match decoded_value {
                 DecodedL0Value::Id(id) => id,
+                DecodedL0Value::SegmentRef {
+                    segment_id,
+                    row_index,
+                } => {
+                    let bytes = self
+                        .value_bytes_for_segment_ref(segment_id, row_index)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "load value bytes for segment {segment_id} row {row_index} while materializing entries"
+                            )
+                        })?;
+                    self.intern_value_bytes(&bytes)
+                        .await
+                        .context("intern L0 v4 segment-ref value while materializing entries")?
+                }
                 DecodedL0Value::Encoded(bytes) => self
                     .intern_value_bytes(&bytes)
                     .await
@@ -1089,6 +1574,8 @@ where
         }
 
         let mut delta_by_id: HashMap<u64, i64> = HashMap::new();
+        let mut l0_payload_deltas: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut segment_deletes: HashMap<u64, u64> = HashMap::new();
         let mut l0_keys = Vec::with_capacity(key_l0_entries.len());
         let mut max_seen_sequence = watermark;
         for (entry_key, entry_value) in key_l0_entries {
@@ -1096,21 +1583,34 @@ where
                 .sequence_from_l0_key(&entry_key)
                 .context("decode L0 sequence during key-local compaction")?;
             let (decoded_value, delta) = decode_l0_payload::<V>(&entry_value)?;
-            let value_id = match decoded_value {
-                DecodedL0Value::Id(id) => id,
-                DecodedL0Value::Encoded(bytes) => self
-                    .intern_value_bytes(&bytes)
-                    .await
-                    .context("intern L0 v2 value during compaction")?,
+            match decoded_value {
+                DecodedL0Value::Id(id) => {
+                    *delta_by_id.entry(id).or_insert(0) += delta;
+                }
+                DecodedL0Value::SegmentRef {
+                    segment_id,
+                    row_index,
+                } => {
+                    let bytes = self
+                        .value_bytes_for_segment_ref(segment_id, row_index)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "load value bytes for segment {segment_id} row {row_index} during compaction"
+                            )
+                        })?;
+                    l0_payload_deltas.push((bytes, delta));
+                    *segment_deletes.entry(segment_id).or_insert(0) += 1;
+                }
+                DecodedL0Value::Encoded(bytes) => {
+                    l0_payload_deltas.push((bytes, delta));
+                }
                 DecodedL0Value::Decoded(value) => {
                     let bytes =
                         encode(&value).context("encode legacy L0 value during compaction")?;
-                    self.intern_value_bytes(&bytes)
-                        .await
-                        .context("intern legacy L0 value during compaction")?
+                    l0_payload_deltas.push((bytes, delta));
                 }
-            };
-            *delta_by_id.entry(value_id).or_insert(0) += delta;
+            }
             l0_keys.push(entry_key);
             max_seen_sequence = max_seen_sequence.max(sequence);
         }
@@ -1137,6 +1637,7 @@ where
         }
 
         let mut existing_legacy_l1_keys = Vec::new();
+        let mut legacy_l1_payload_weights: Vec<(Vec<u8>, i64)> = Vec::new();
         let l1_legacy_entries = self
             .table
             .scan_prefix(
@@ -1151,13 +1652,42 @@ where
             let value_bytes = self
                 .value_bytes_from_l1_key(&entry_key)
                 .context("decode legacy L1 value bytes during compaction")?;
-            let value_id = self
-                .intern_value_bytes(value_bytes)
-                .await
-                .context("intern legacy L1 value during compaction")?;
             let weight = decode_weight(&entry_value)?;
-            *merged_weights_by_id.entry(value_id).or_insert(0) += weight;
+            legacy_l1_payload_weights.push((value_bytes.to_vec(), weight));
             existing_legacy_l1_keys.push(entry_key);
+        }
+
+        let mut payloads_to_normalize =
+            Vec::with_capacity(l0_payload_deltas.len() + legacy_l1_payload_weights.len());
+        payloads_to_normalize.extend(
+            l0_payload_deltas
+                .iter()
+                .map(|(value_bytes, _)| value_bytes.clone()),
+        );
+        payloads_to_normalize.extend(
+            legacy_l1_payload_weights
+                .iter()
+                .map(|(value_bytes, _)| value_bytes.clone()),
+        );
+        let normalized_ids_by_payload = self
+            .intern_value_bytes_batch(payloads_to_normalize)
+            .await
+            .context("batch normalize payload bytes to value ids during compaction")?;
+
+        for (value_bytes, delta) in l0_payload_deltas {
+            let value_id = normalized_ids_by_payload
+                .get(&value_bytes)
+                .copied()
+                .ok_or_else(|| anyhow!("missing normalized id for L0 payload during compaction"))?;
+            *delta_by_id.entry(value_id).or_insert(0) += delta;
+        }
+
+        for (value_bytes, weight) in legacy_l1_payload_weights {
+            let value_id = normalized_ids_by_payload
+                .get(&value_bytes)
+                .copied()
+                .ok_or_else(|| anyhow!("missing normalized id for L1 payload during compaction"))?;
+            *merged_weights_by_id.entry(value_id).or_insert(0) += weight;
         }
 
         for (value_id, delta) in delta_by_id {
@@ -1187,10 +1717,42 @@ where
                 .context("build compaction watermark key")?,
             max_seen_sequence.to_be_bytes().to_vec(),
         );
-        self.table
-            .write_batch(batch)
-            .await
-            .context("persist key-local compaction output")?;
+
+        if !segment_deletes.is_empty() {
+            // Serialize segment refcount updates to avoid losing decrements across concurrent compactions.
+            let _guard = self.l0_segment_ref_lock.lock().await;
+            for (segment_id, deleted) in segment_deletes {
+                let refcount_key = self.l0_segment_refcount_key(segment_id);
+                let Some(existing) = self
+                    .table
+                    .get(&refcount_key)
+                    .await
+                    .context("read L0 segment refcount")?
+                else {
+                    continue;
+                };
+                let current =
+                    decode_u64_payload(&existing).context("decode L0 segment refcount")?;
+                let new = current.saturating_sub(deleted);
+                if new == 0 {
+                    batch.delete(refcount_key);
+                    batch.delete(self.l0_segment_key(segment_id));
+                } else {
+                    batch.put(refcount_key, new.to_be_bytes().to_vec());
+                }
+            }
+            self.table
+                .write_batch(batch)
+                .await
+                .context("persist key-local compaction output")?;
+        } else {
+            self.table
+                .write_batch(batch)
+                .await
+                .context("persist key-local compaction output")?;
+        }
+        self.reset_lookup_state_for_key(key_bytes)
+            .context("reset lookup state after key-local compaction")?;
         Ok(l0_keys.len())
     }
 
@@ -1280,6 +1842,18 @@ where
         key.extend_from_slice(&encode_len(key_bytes.len())?);
         key.extend_from_slice(key_bytes);
         Ok(key)
+    }
+
+    fn l0_segment_key(&self, segment_id: u64) -> Vec<u8> {
+        let mut key = self.l0_segment_prefix.clone();
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        key
+    }
+
+    fn l0_segment_refcount_key(&self, segment_id: u64) -> Vec<u8> {
+        let mut key = self.l0_segment_refcount_prefix.clone();
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        key
     }
 
     fn l0_overlay_key(&self, key_bytes: &[u8], sequence: u64) -> Result<Vec<u8>> {
@@ -1526,7 +2100,6 @@ fn encode_weight(weight: i64) -> Vec<u8> {
     weight.to_be_bytes().to_vec()
 }
 
-#[cfg(test)]
 fn encode_l0_payload_v2(value_bytes: &[u8], delta: i64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + 8 + value_bytes.len());
     payload.push(L0_ENTRY_V2);
@@ -1535,16 +2108,98 @@ fn encode_l0_payload_v2(value_bytes: &[u8], delta: i64) -> Vec<u8> {
     payload
 }
 
-fn encode_l0_payload_id(value_id: u64, delta: i64) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + 8 + 8);
-    payload.push(L0_ENTRY_V3_ID);
+fn encode_l0_payload_v4_segment_ref(segment_id: u64, row_index: u32, delta: i64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 8 + 8 + 4);
+    payload.push(L0_ENTRY_V4_SEGMENT_REF);
     payload.extend_from_slice(&delta.to_be_bytes());
-    payload.extend_from_slice(&value_id.to_be_bytes());
+    payload.extend_from_slice(&segment_id.to_be_bytes());
+    payload.extend_from_slice(&row_index.to_be_bytes());
     payload
+}
+
+fn encode_l0_segment_v1(values: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many rows for L0 segment"))?;
+    let mut offsets: Vec<u32> = Vec::with_capacity(values.len() + 1);
+    offsets.push(0);
+    let mut total: u32 = 0;
+    for value in values {
+        let len = u32::try_from(value.len()).map_err(|_| anyhow!("L0 segment row too large"))?;
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("L0 segment size overflow"))?;
+        offsets.push(total);
+    }
+
+    let mut out = Vec::with_capacity(1 + 4 + offsets.len() * 4 + total as usize);
+    out.push(L0_SEGMENT_V1);
+    out.extend_from_slice(&count.to_be_bytes());
+    for offset in offsets {
+        out.extend_from_slice(&offset.to_be_bytes());
+    }
+    for value in values {
+        out.extend_from_slice(value);
+    }
+    Ok(out)
+}
+
+fn decode_l0_segment(bytes: Vec<u8>) -> Result<L0Segment> {
+    let (tag, rest) = bytes
+        .split_first()
+        .ok_or_else(|| anyhow!("empty L0 segment payload"))?;
+    if *tag != L0_SEGMENT_V1 {
+        return Err(anyhow!("unknown L0 segment tag: {tag:#04x}"));
+    }
+    if rest.len() < 4 {
+        return Err(anyhow!("truncated L0 segment header"));
+    }
+    let count = u32::from_be_bytes(rest[0..4].try_into().unwrap()) as usize;
+    let offsets_bytes = (count + 1)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("L0 segment offsets overflow"))?;
+    let header_len = 1 + 4 + offsets_bytes;
+    if bytes.len() < header_len {
+        return Err(anyhow!(
+            "truncated L0 segment offsets: need {header_len} bytes, got {}",
+            bytes.len()
+        ));
+    }
+
+    let mut offsets = Vec::with_capacity(count + 1);
+    let mut cursor = 1 + 4;
+    for _ in 0..(count + 1) {
+        let chunk = bytes
+            .get(cursor..cursor + 4)
+            .ok_or_else(|| anyhow!("truncated L0 segment offset"))?;
+        offsets.push(u32::from_be_bytes(chunk.try_into().unwrap()));
+        cursor += 4;
+    }
+    for window in offsets.windows(2) {
+        if window[0] > window[1] {
+            return Err(anyhow!("non-monotonic L0 segment offsets"));
+        }
+    }
+    let blob_start = header_len;
+    let blob_len = bytes.len() - blob_start;
+    let expected = *offsets
+        .last()
+        .ok_or_else(|| anyhow!("missing L0 segment offset terminator"))?
+        as usize;
+    if expected != blob_len {
+        return Err(anyhow!(
+            "L0 segment blob length mismatch: expected {expected} bytes, got {blob_len}"
+        ));
+    }
+
+    Ok(L0Segment {
+        bytes,
+        blob_start,
+        offsets,
+    })
 }
 
 enum DecodedL0Value<V> {
     Id(u64),
+    SegmentRef { segment_id: u64, row_index: u32 },
     Encoded(Vec<u8>),
     Decoded(V),
 }
@@ -1582,6 +2237,31 @@ where
             .ok_or_else(|| anyhow!("invalid batch-index L0 v2 payload body"))?;
         let delta = i64::from_be_bytes(delta_bytes.try_into().unwrap());
         return Ok((DecodedL0Value::Encoded(value_bytes.to_vec()), delta));
+    }
+
+    if bytes.first().copied() == Some(L0_ENTRY_V4_SEGMENT_REF) {
+        let delta_bytes = bytes
+            .get(1..9)
+            .ok_or_else(|| anyhow!("invalid batch-index L0 v4 payload delta"))?;
+        let segment_id_bytes = bytes
+            .get(9..17)
+            .ok_or_else(|| anyhow!("invalid batch-index L0 v4 payload segment id"))?;
+        let row_index_bytes = bytes
+            .get(17..21)
+            .ok_or_else(|| anyhow!("invalid batch-index L0 v4 payload row index"))?;
+        if bytes.len() != 21 {
+            return Err(anyhow!("invalid batch-index L0 v4 payload size"));
+        }
+        let delta = i64::from_be_bytes(delta_bytes.try_into().unwrap());
+        let segment_id = u64::from_be_bytes(segment_id_bytes.try_into().unwrap());
+        let row_index = u32::from_be_bytes(row_index_bytes.try_into().unwrap());
+        return Ok((
+            DecodedL0Value::SegmentRef {
+                segment_id,
+                row_index,
+            },
+            delta,
+        ));
     }
 
     let entry: OverlayEntry<V> = decode(bytes).context("decode batch-index L0 legacy entry")?;
@@ -1633,6 +2313,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_deltas_does_not_intern_values_on_write_path() {
+        let table = build_table("indexed_batch_no_write_intern").await;
+        let index =
+            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_no_write_intern");
+
+        index
+            .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (2, 20, 1)])
+            .await
+            .expect("apply deltas without foreground interning");
+
+        let value_id_entries = table
+            .scan_prefix(&index.value_id_prefix, &ScanOptions::default())
+            .await
+            .expect("scan value-id entries");
+        assert!(
+            value_id_entries.is_empty(),
+            "write path should not persist value-id lookups"
+        );
+
+        let value_data_entries = table
+            .scan_prefix(&index.value_data_prefix, &ScanOptions::default())
+            .await
+            .expect("scan value payload entries");
+        assert!(
+            value_data_entries.is_empty(),
+            "write path should not persist value-data entries"
+        );
+
+        let value_seq = table
+            .get(&index.value_seq_key)
+            .await
+            .expect("read value sequence key");
+        assert!(
+            value_seq.is_none(),
+            "write path should not advance dictionary sequence"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_deltas_coalescing_matches_non_coalesced_behavior() {
         let coalesced_table = build_table("indexed_batch_coalesced").await;
         let coalesced =
@@ -1680,6 +2399,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adaptive_coalescing_detects_duplicates_in_large_batch() {
+        let mut updates = Vec::new();
+        for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 64) {
+            updates.push((1_i64, (idx / 2) as i64, 1_i64));
+        }
+
+        assert!(
+            IndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
+            "large batches with obvious duplicates should keep coalescing enabled"
+        );
+    }
+
+    #[test]
+    fn adaptive_coalescing_skips_when_no_duplicates_observed() {
+        let mut updates = Vec::new();
+        for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 64) {
+            updates.push((1_i64, idx as i64, 1_i64));
+        }
+
+        assert!(
+            !IndexedBatchZSet::<i64, i64>::should_use_coalescing(&updates),
+            "large batches with unique pairs should skip coalescing when safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_unique_batch_uses_segment_ref_l0_layout() {
+        let table = build_table("indexed_batch_segment_ref_layout").await;
+        let index =
+            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_segment_ref_layout");
+
+        let mut updates = Vec::new();
+        for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 32) {
+            let key = (idx as i64) % 8;
+            updates.push((key, idx as i64, 1_i64));
+        }
+        index
+            .apply_deltas(updates)
+            .await
+            .expect("apply large unique batch");
+
+        let key_bytes = encode_storage(&0_i64).expect("encode key");
+        let l0_entries = table
+            .scan_prefix(
+                &index
+                    .l0_prefix_for_key(&key_bytes)
+                    .expect("build key-local L0 prefix"),
+                &ScanOptions::default(),
+            )
+            .await
+            .expect("scan key-local L0 entries");
+        assert!(
+            l0_entries
+                .iter()
+                .all(|(_, value)| value.first().copied() == Some(L0_ENTRY_V4_SEGMENT_REF)),
+            "expected segment-ref L0 payloads for large unique batch"
+        );
+
+        let segment_entries = table
+            .scan_prefix(&index.l0_segment_prefix, &ScanOptions::default())
+            .await
+            .expect("scan L0 segment payload entries");
+        assert_eq!(segment_entries.len(), 1, "expected one segment payload");
+
+        let segment_ref_entries = table
+            .scan_prefix(&index.l0_segment_refcount_prefix, &ScanOptions::default())
+            .await
+            .expect("scan L0 segment refcount entries");
+        assert_eq!(
+            segment_ref_entries.len(),
+            1,
+            "expected one segment refcount"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_deletes_unreferenced_segments() {
+        let table = build_table("indexed_batch_segment_gc").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_segment_gc");
+
+        let mut updates = Vec::new();
+        for idx in 0..(ADAPTIVE_COALESCE_THRESHOLD + 32) {
+            let key = (idx as i64) % 8;
+            updates.push((key, idx as i64, 1_i64));
+        }
+        index
+            .apply_deltas(updates)
+            .await
+            .expect("apply large unique batch");
+
+        index.compact_l0_to_l1().await.expect("compact all keys");
+
+        let segment_entries = table
+            .scan_prefix(&index.l0_segment_prefix, &ScanOptions::default())
+            .await
+            .expect("scan L0 segment payload entries after compaction");
+        assert!(
+            segment_entries.is_empty(),
+            "expected compaction to delete unreferenced segments"
+        );
+
+        let segment_ref_entries = table
+            .scan_prefix(&index.l0_segment_refcount_prefix, &ScanOptions::default())
+            .await
+            .expect("scan L0 segment refcount entries after compaction");
+        assert!(
+            segment_ref_entries.is_empty(),
+            "expected compaction to delete segment refcounts"
+        );
+    }
+
     #[tokio::test]
     async fn values_for_key_uses_incremental_l0_cursor_after_cache_seed() {
         let table = build_table("indexed_batch_lookup_cursor").await;
@@ -1718,6 +2549,93 @@ mod tests {
             .await
             .expect("incremental lookup should skip corrupted old entry");
         assert_eq!(second, vec![(10, 2)]);
+    }
+
+    #[tokio::test]
+    async fn values_for_key_cache_cold_and_warm_equivalent() {
+        let table = build_table("indexed_batch_lookup_cache_cold_warm").await;
+        let writer = IndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_lookup_cache_cold_warm",
+        );
+
+        writer
+            .apply_deltas(vec![(1, 10, 2), (1, 11, 1)])
+            .await
+            .expect("write L0 deltas");
+        writer.compact_l0_to_l1().await.expect("compact into L1");
+
+        let reader = IndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_lookup_cache_cold_warm",
+        );
+        let mut cold = reader.values_for_key(&1).await.expect("cold lookup");
+        cold.sort_unstable();
+
+        let mut warm = reader.values_for_key(&1).await.expect("warm lookup");
+        warm.sort_unstable();
+
+        assert_eq!(cold, warm, "cold and warm lookups should match");
+        assert_eq!(warm, vec![(10, 2), (11, 1)]);
+    }
+
+    #[tokio::test]
+    async fn warm_lookup_uses_memory_when_dictionary_bytes_go_missing() {
+        let table = build_table("indexed_batch_lookup_memory_first").await;
+        let writer =
+            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+
+        writer
+            .apply_deltas(vec![(1, 10, 2), (1, 11, 1)])
+            .await
+            .expect("write L0 deltas");
+        writer.compact_l0_to_l1().await.expect("compact into L1");
+
+        let reader =
+            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+        let mut baseline = reader.values_for_key(&1).await.expect("seed warm cache");
+        baseline.sort_unstable();
+
+        let key_bytes = encode_storage(&1_i64).expect("encode key");
+        let l1_id_entries = table
+            .scan_prefix(
+                &reader
+                    .l1_id_prefix_for_key(&key_bytes)
+                    .expect("build L1-id key prefix"),
+                &ScanOptions::default(),
+            )
+            .await
+            .expect("scan L1-id entries");
+        assert!(
+            !l1_id_entries.is_empty(),
+            "expected compacted lookup state to include L1-id entries"
+        );
+        let first_value_id = reader
+            .value_id_from_l1_id_key(&l1_id_entries[0].0)
+            .expect("decode first value id");
+
+        table
+            .delete(&reader.value_data_key(first_value_id))
+            .await
+            .expect("delete dictionary payload for first id");
+
+        let mut warm = reader
+            .values_for_key(&1)
+            .await
+            .expect("warm lookup should use in-memory value bytes");
+        warm.sort_unstable();
+        assert_eq!(warm, baseline);
+
+        let reopened =
+            IndexedBatchZSet::<i64, i64>::new(table.clone(), "indexed_batch_lookup_memory_first");
+        let err = reopened
+            .values_for_key(&1)
+            .await
+            .expect_err("cold restart should fallback to dictionary payload and fail");
+        assert!(
+            format!("{err:#}").contains("missing value bytes for id"),
+            "expected missing dictionary payload error, got: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -2163,6 +3081,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_normalizes_payloads_to_dictionary_ids_in_background() {
+        let table = build_table("indexed_batch_compaction_normalization").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_compaction_normalization",
+        );
+
+        index
+            .apply_deltas(vec![(1, 10, 2), (1, 11, 1)])
+            .await
+            .expect("write payload-based L0 deltas");
+
+        let pre_compaction_dict = table
+            .scan_prefix(&index.value_data_prefix, &ScanOptions::default())
+            .await
+            .expect("scan dictionary payload entries before compaction");
+        assert!(
+            pre_compaction_dict.is_empty(),
+            "foreground writes should not normalize payloads into dictionary ids"
+        );
+
+        index
+            .compact_l0_to_l1()
+            .await
+            .expect("compact and normalize payloads");
+
+        let post_compaction_dict = table
+            .scan_prefix(&index.value_data_prefix, &ScanOptions::default())
+            .await
+            .expect("scan dictionary payload entries after compaction");
+        assert_eq!(
+            post_compaction_dict.len(),
+            2,
+            "compaction should batch-normalize unique payloads into dictionary ids"
+        );
+
+        let key_bytes = encode_storage(&1_i64).expect("encode key");
+        let legacy_entries = table
+            .scan_prefix(
+                &index
+                    .l1_prefix_for_key(&key_bytes)
+                    .expect("build legacy L1 prefix"),
+                &ScanOptions::default(),
+            )
+            .await
+            .expect("scan legacy L1 entries");
+        assert!(
+            legacy_entries.is_empty(),
+            "compaction output should be normalized to id layout"
+        );
+
+        let mut values = index
+            .values_for_key(&1)
+            .await
+            .expect("lookup after compaction normalization");
+        values.sort_unstable();
+        assert_eq!(values, vec![(10, 2), (11, 1)]);
+    }
+
+    #[tokio::test]
     async fn adaptive_hot_key_compaction_triggers_at_threshold() {
         let table = build_table("indexed_batch_adaptive_hot").await;
         let index = IndexedBatchZSet::<i64, i64>::with_hot_key_compaction_threshold(
@@ -2210,6 +3188,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn adaptive_hot_key_compaction_is_disabled_by_default() {
+        let table = build_table("indexed_batch_adaptive_hot_default_off").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_adaptive_hot_default_off",
+        );
+
+        let updates = vec![
+            (1, 200, 1),
+            (1, 201, 1),
+            (1, 202, 1),
+            (1, 203, 1),
+            (1, 204, 1),
+            (1, 205, 1),
+        ];
+        index
+            .apply_deltas(updates)
+            .await
+            .expect("apply hot key updates with default compaction policy");
+
+        let key_bytes = encode_storage(&1_i64).expect("encode key");
+        let l0_entries = table
+            .scan_prefix(
+                &index
+                    .l0_prefix_for_key(&key_bytes)
+                    .expect("build key-local L0 prefix"),
+                &ScanOptions::default(),
+            )
+            .await
+            .expect("scan key-local L0 entries");
+        assert_eq!(
+            l0_entries.len(),
+            6,
+            "default policy should not trigger key-local compaction in foreground writes"
+        );
+
+        let mut values = index
+            .values_for_key(&1)
+            .await
+            .expect("lookup with default compaction policy");
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec![(200, 1), (201, 1), (202, 1), (203, 1), (204, 1), (205, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_writes_and_background_normalization_preserve_semantics() {
+        let table = build_table("indexed_batch_payload_normalization_interplay").await;
+        let index = IndexedBatchZSet::<i64, i64>::new(
+            table.clone(),
+            "indexed_batch_payload_normalization_interplay",
+        );
+
+        index
+            .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (1, 10, -1)])
+            .await
+            .expect("apply first payload wave");
+        let mut first = index
+            .values_for_key(&1)
+            .await
+            .expect("lookup after first payload wave");
+        first.sort_unstable();
+        assert_eq!(first, vec![(11, 1)]);
+
+        index
+            .compact_l0_to_l1()
+            .await
+            .expect("first compaction pass");
+
+        index
+            .apply_deltas(vec![(1, 12, 2), (1, 11, -1), (1, 13, 1)])
+            .await
+            .expect("apply second payload wave");
+        index
+            .compact_l0_to_l1()
+            .await
+            .expect("second compaction pass");
+
+        let mut final_values = index
+            .values_for_key(&1)
+            .await
+            .expect("lookup after normalization passes");
+        final_values.sort_unstable();
+        assert_eq!(final_values, vec![(12, 2), (13, 1)]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_lookup_and_updates_remain_consistent() {
         let table = build_table("indexed_batch_concurrent").await;
@@ -2221,6 +3288,12 @@ mod tests {
             .apply_deltas(vec![(1, 10, 1)])
             .await
             .expect("seed concurrent test");
+        let seeded = index
+            .values_for_key(&1)
+            .await
+            .expect("seed lookup cache for concurrent test");
+        let seeded_total: i64 = seeded.iter().map(|(_, weight)| *weight).sum();
+        assert_eq!(seeded_total, 1);
 
         let writer_index = Arc::clone(&index);
         let writer = tokio::spawn(async move {
@@ -2263,6 +3336,81 @@ mod tests {
             .values_for_key(&1)
             .await
             .expect("final lookup after concurrency run");
+        let total_weight: i64 = final_values.iter().map(|(_, weight)| *weight).sum();
+        assert_eq!(total_weight, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_lookup_updates_and_compaction_remain_consistent() {
+        let table = build_table("indexed_batch_concurrent_compaction").await;
+        let index = Arc::new(IndexedBatchZSet::<i64, i64>::new(
+            table,
+            "indexed_batch_concurrent_compaction",
+        ));
+        index
+            .apply_deltas(vec![(1, 10, 1)])
+            .await
+            .expect("seed concurrent compaction test");
+        let seeded = index
+            .values_for_key(&1)
+            .await
+            .expect("seed lookup cache for concurrent compaction test");
+        let seeded_total: i64 = seeded.iter().map(|(_, weight)| *weight).sum();
+        assert_eq!(seeded_total, 1);
+
+        let writer_index = Arc::clone(&index);
+        let writer = tokio::spawn(async move {
+            let mut ten_active = true;
+            for _ in 0..96 {
+                let updates = if ten_active {
+                    vec![(1, 10, -1), (1, 11, 1)]
+                } else {
+                    vec![(1, 11, -1), (1, 10, 1)]
+                };
+                ten_active = !ten_active;
+                writer_index
+                    .apply_deltas(updates)
+                    .await
+                    .expect("apply concurrent updates with compaction");
+            }
+        });
+
+        let compactor_index = Arc::clone(&index);
+        let compactor = tokio::spawn(async move {
+            for _ in 0..32 {
+                compactor_index
+                    .compact_l0_to_l1()
+                    .await
+                    .expect("run compaction during concurrent traffic");
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let reader_index = Arc::clone(&index);
+            readers.push(tokio::spawn(async move {
+                for _ in 0..96 {
+                    let values = reader_index
+                        .values_for_key(&1)
+                        .await
+                        .expect("concurrent lookup while compaction runs");
+                    let total_weight: i64 = values.iter().map(|(_, weight)| *weight).sum();
+                    assert_eq!(total_weight, 1, "toggle invariant should remain stable");
+                }
+            }));
+        }
+
+        writer.await.expect("join writer task");
+        compactor.await.expect("join compactor task");
+        for reader in readers {
+            reader.await.expect("join reader task");
+        }
+
+        let final_values = index
+            .values_for_key(&1)
+            .await
+            .expect("final lookup after concurrent compaction");
         let total_weight: i64 = final_values.iter().map(|(_, weight)| *weight).sum();
         assert_eq!(total_weight, 1);
     }

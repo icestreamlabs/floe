@@ -14,9 +14,9 @@ pub const CODEC_TAG_RKYV: u8 = 0x00;
 
 pub fn encode<T>(value: &T) -> Result<Vec<u8>>
 where
-    T: Clone + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T: for<'a> RkyvSerialize<RkyvSerializer<'a>>,
 {
-    let aligned = to_bytes::<RkyvError>(&value.clone())
+    let aligned = to_bytes::<RkyvError>(value)
         .map_err(|err| anyhow!("failed to encode value with rkyv: {err}"))?;
     let mut encoded = Vec::with_capacity(1 + aligned.len());
     encoded.push(CODEC_TAG_RKYV);

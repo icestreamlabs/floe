@@ -1782,10 +1782,12 @@ dependencies = [
 name = "dbsp-runtime"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "async-trait",
  "dbsp-storage",
  "futures",
+ "hashbrown 0.15.5",
  "object_store",
  "rkyv 0.8.12",
  "slatedb",

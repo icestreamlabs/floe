@@ -21,6 +21,7 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
+ahash = "0.8"
 arc-swap = "1.7"
 anyhow = "1.0"
 async-recursion = "1.0"
@@ -32,6 +33,7 @@ datafusion = "50.2.0"
 datafusion-common = "50.2.0"
 axum = "0.7"
 futures = "0.3"
+hashbrown = "0.15"
 nexmark = { version = "0.2.0", features = ["serde"] }
 object_store = "0.12.4"
 pgwire = { version = "0.33.0", default-features = false, features = ["server-api"] }

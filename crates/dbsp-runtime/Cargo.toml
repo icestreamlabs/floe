@@ -5,9 +5,11 @@ edition.workspace = true
 
 [dependencies]
 dbsp-storage = { path = "../dbsp-storage" }
+ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+hashbrown = { workspace = true }
 rkyv = { workspace = true }
 slatedb = { workspace = true }
 tokio = { workspace = true }
