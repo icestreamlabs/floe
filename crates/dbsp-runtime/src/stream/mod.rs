@@ -16,4 +16,4 @@ pub use core::Stream;
 pub use cursor::StreamCursor;
 pub use operations::*;
 pub use roles::{DeltaHandleStream, SnapshotHandleStream};
-pub use zset_stream::{StreamRetention, ZSetStream};
+pub use zset_stream::{CompactionSchedulerConfig, StreamRetention, ZSetStream};

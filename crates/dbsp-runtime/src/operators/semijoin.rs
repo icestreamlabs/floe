@@ -10,7 +10,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -69,8 +69,8 @@ where
 {
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
-    pub left_index: IndexedZSet<K, L>,
-    pub right_index: IndexedZSet<K, R>,
+    pub left_index: IndexedBatchZSet<K, L>,
+    pub right_index: IndexedBatchZSet<K, R>,
     pub left_key: JoinKeyExtractor<L, K>,
     pub right_key: JoinKeyExtractor<R, K>,
     pub mode: SemiJoinMode,
@@ -115,8 +115,8 @@ where
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
-        left_index: IndexedZSet<K, L>,
-        right_index: IndexedZSet<K, R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
         left_key: JoinKeyExtractor<L, K>,
         right_key: JoinKeyExtractor<R, K>,
         mode: SemiJoinMode,
@@ -624,8 +624,8 @@ mod tests {
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), "semijoin_output")
             .await
             .expect("output zset");
-        let left_index = IndexedZSet::new(table.clone(), "semijoin_left_index");
-        let right_index = IndexedZSet::new(table.clone(), "semijoin_right_index");
+        let left_index = IndexedBatchZSet::new(table.clone(), "semijoin_left_index");
+        let right_index = IndexedBatchZSet::new(table.clone(), "semijoin_right_index");
 
         let left_key = Arc::new(|row: &Row| Some(row.0));
         let right_key = Arc::new(|row: &Row| Some(row.0));

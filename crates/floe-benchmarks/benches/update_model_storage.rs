@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
@@ -11,10 +12,13 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use dbsp::collections::IndexedZSet;
+use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::encoding::encode;
+use dbsp::storage::gc::{GcPolicy, GcService};
+use dbsp::storage::manifest::{DataManifest, IndexManifest, ManifestStatistics, ManifestStore};
+use dbsp::storage::segment::{ArrowSegmentStore, SegmentWriteStats};
 use dbsp::storage::{KeyValueTable, SlateTable};
 use object_store::memory::InMemory;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -24,6 +28,7 @@ use tokio::runtime::Runtime;
 
 const MODEL_BATCH_SIZES: &[usize] = &[64, 256, 1024];
 const KEY_CARDINALITY_DIVISOR: usize = 8;
+const OVERLAY_DECODE_CACHE_CAPACITY: usize = 256;
 
 static DB_ID: AtomicU64 = AtomicU64::new(0);
 static NS_ID: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +92,19 @@ fn transition_keyed_updates(
         let key = entity % key_cardinality;
         updates.push((key, BenchRow::for_entity(entity, from_phase), -1));
         updates.push((key, BenchRow::for_entity(entity, to_phase), 1));
+    }
+    updates
+}
+
+fn coalescing_probe_updates(batch_size: usize, key_cardinality: i64) -> Vec<(i64, BenchRow, i64)> {
+    let mut updates = Vec::with_capacity(batch_size * 3);
+    for entity in 0..batch_size {
+        let entity = entity as i64;
+        let key = entity % key_cardinality;
+        let row = BenchRow::for_entity(entity, 0);
+        updates.push((key, row.clone(), 1));
+        updates.push((key, row.clone(), -1));
+        updates.push((key, row, 1));
     }
     updates
 }
@@ -291,6 +309,21 @@ fn decode_row_ref_delta(payload: &[u8]) -> (u64, u32, i64) {
     )
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct OverlayLookupMetrics {
+    index_entries_scanned: usize,
+    unique_segments: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    decoded_rows: usize,
+}
+
+#[derive(Debug)]
+struct OverlayLookupResult {
+    values: Vec<(BenchRow, i64)>,
+    metrics: OverlayLookupMetrics,
+}
+
 async fn overlay_append(
     table: Arc<dyn KeyValueTable>,
     schema: SchemaRef,
@@ -315,11 +348,12 @@ async fn overlay_append(
         .expect("write overlay segment");
 }
 
-async fn overlay_lookup(
+async fn overlay_lookup_with_cache(
     table: Arc<dyn KeyValueTable>,
     prefix: &str,
     index_key: i64,
-) -> Vec<(BenchRow, i64)> {
+    segment_cache: &mut OverlayDecodeCache<Vec<(BenchRow, i64)>>,
+) -> OverlayLookupResult {
     let entries = table
         .scan_prefix(
             &overlay_index_prefix(prefix, index_key),
@@ -336,20 +370,27 @@ async fn overlay_lookup(
             .push((row_index, delta));
     }
 
-    let mut segment_cache: HashMap<u64, Vec<(BenchRow, i64)>> = HashMap::new();
+    let mut metrics = OverlayLookupMetrics {
+        index_entries_scanned: refs_by_segment.values().map(Vec::len).sum(),
+        unique_segments: refs_by_segment.len(),
+        ..OverlayLookupMetrics::default()
+    };
     let mut aggregate: HashMap<BenchRow, i64> = HashMap::new();
     for (segment_id, refs) in refs_by_segment {
-        if !segment_cache.contains_key(&segment_id) {
+        let rows = if let Some(cached_rows) = segment_cache.get(segment_id) {
+            metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+            cached_rows
+        } else {
+            metrics.cache_misses = metrics.cache_misses.saturating_add(1);
             let bytes = table
                 .get(&overlay_segment_key(prefix, segment_id))
                 .await
                 .expect("get overlay segment")
                 .expect("missing overlay segment");
-            segment_cache.insert(segment_id, decode_arrow_ipc_delta_batch(&bytes));
-        }
-        let rows = segment_cache
-            .get(&segment_id)
-            .expect("segment cache entry missing");
+            let decoded = decode_arrow_ipc_delta_batch(&bytes);
+            metrics.decoded_rows = metrics.decoded_rows.saturating_add(decoded.len());
+            segment_cache.insert_miss(segment_id, decoded)
+        };
         for (row_index, delta) in refs {
             let (row, _) = rows
                 .get(row_index as usize)
@@ -358,7 +399,57 @@ async fn overlay_lookup(
         }
     }
     aggregate.retain(|_, weight| *weight != 0);
-    aggregate.into_iter().collect()
+    OverlayLookupResult {
+        values: aggregate.into_iter().collect(),
+        metrics,
+    }
+}
+
+async fn overlay_read_amplification(
+    table: Arc<dyn KeyValueTable>,
+    prefix: &str,
+    index_key: i64,
+) -> usize {
+    let entries = table
+        .scan_prefix(
+            &overlay_index_prefix(prefix, index_key),
+            &ScanOptions::default(),
+        )
+        .await
+        .expect("scan overlay index");
+    let mut segment_ids = HashSet::new();
+    for (_, payload) in entries {
+        let (segment_id, _, _) = decode_row_ref_delta(&payload);
+        segment_ids.insert(segment_id);
+    }
+    segment_ids.len().saturating_add(
+        table
+            .scan_prefix(
+                &overlay_index_prefix(prefix, index_key),
+                &ScanOptions::default(),
+            )
+            .await
+            .expect("scan overlay index for entry count")
+            .len(),
+    )
+}
+
+async fn prefix_total_bytes(table: Arc<dyn KeyValueTable>, prefix: &[u8]) -> u64 {
+    let entries = table
+        .scan_prefix(prefix, &ScanOptions::default())
+        .await
+        .expect("scan prefix for byte accounting");
+    entries
+        .iter()
+        .map(|(key, value)| (key.len() + value.len()) as u64)
+        .sum()
+}
+
+async fn versioned_storage_bytes(table: Arc<dyn KeyValueTable>, namespace: &str) -> u64 {
+    let zset_prefix = format!("zset/{namespace}/").into_bytes();
+    let dict_prefix = format!("dict/{namespace}/").into_bytes();
+    prefix_total_bytes(table.clone(), &zset_prefix).await
+        + prefix_total_bytes(table, &dict_prefix).await
 }
 
 fn ledger_segment_key(prefix: &str, segment_id: u64) -> Vec<u8> {
@@ -422,6 +513,34 @@ async fn ledger_materialize(table: Arc<dyn KeyValueTable>, prefix: &str) -> Hash
     aggregate
 }
 
+fn segment_stats_for_deltas(deltas: &[(BenchRow, i64)]) -> SegmentWriteStats {
+    let mut min_hash = u64::MAX;
+    let mut max_hash = 0_u64;
+    let mut tombstones = 0_usize;
+    for (row, delta) in deltas {
+        let hash = row.id as u64;
+        min_hash = min_hash.min(hash);
+        max_hash = max_hash.max(hash);
+        if *delta < 0 {
+            tombstones += 1;
+        }
+    }
+    if deltas.is_empty() {
+        min_hash = 0;
+    }
+    let tombstone_ratio = if deltas.is_empty() {
+        0.0
+    } else {
+        tombstones as f64 / deltas.len() as f64
+    };
+    SegmentWriteStats::new(min_hash, max_hash, tombstone_ratio).expect("segment stats")
+}
+
+fn manifest_stats(segment_count: usize, row_count: usize, total_bytes: u64) -> ManifestStatistics {
+    ManifestStatistics::new(segment_count as u64, row_count as u64, total_bytes, 0.0)
+        .expect("manifest stats")
+}
+
 fn bench_update_model_indexed(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime");
     let schema = delta_schema();
@@ -433,6 +552,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
         let initial = initial_keyed_updates(batch_size, key_cardinality);
         let updates_0_to_1 = transition_keyed_updates(batch_size, key_cardinality, 0, 1);
         let updates_1_to_0 = transition_keyed_updates(batch_size, key_cardinality, 1, 0);
+        let coalescing_probe = coalescing_probe_updates(batch_size, key_cardinality);
         let deltas_0_to_1 = strip_keyed_updates(&updates_0_to_1);
         let arrow_delta_bytes = encode_arrow_ipc_delta_batch(Arc::clone(&schema), &deltas_0_to_1);
         let rkyv_total_bytes = updates_0_to_1
@@ -445,13 +565,110 @@ fn bench_update_model_indexed(c: &mut Criterion) {
             arrow_delta_bytes.len(),
             arrow_delta_bytes.len() as f64 / rkyv_total_bytes as f64,
         );
+        let indexed_amp_table = open_table(&runtime, next_db_name("bench-indexed-amp", batch_size));
+        let indexed_amp_namespace = next_namespace("indexed_amp");
+        let indexed_put_table = open_table(&runtime, next_db_name("bench-indexed-put", batch_size));
+        let indexed_put_namespace = next_namespace("indexed_put");
+        let overlay_amp_table = open_table(&runtime, next_db_name("bench-overlay-amp", batch_size));
+        let overlay_amp_prefix = format!(
+            "bench/overlay-amp/{batch_size}/{}",
+            NS_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let (indexed_read_amp, indexed_put_metrics, overlay_read_amp, cold_lookup, warm_lookup) =
+            runtime.block_on(async {
+                let put_index = IndexedBatchZSet::new(indexed_put_table, indexed_put_namespace);
+                let indexed_put_metrics = put_index
+                    .apply_deltas_with_stats(coalescing_probe.iter().cloned())
+                    .await
+                    .expect("apply coalescing probe updates");
+
+                let index = IndexedBatchZSet::new(indexed_amp_table, indexed_amp_namespace);
+                index
+                    .apply_deltas(initial.iter().cloned())
+                    .await
+                    .expect("seed indexed zset for read amplification");
+                index
+                    .apply_deltas(updates_0_to_1.iter().cloned())
+                    .await
+                    .expect("apply indexed zset updates for read amplification");
+                let indexed_read_amp = index
+                    .estimated_read_amplification_for_key(&0_i64)
+                    .await
+                    .expect("estimate indexed read amplification");
+
+                overlay_append(
+                    overlay_amp_table.clone(),
+                    Arc::clone(&schema),
+                    &overlay_amp_prefix,
+                    1,
+                    &initial,
+                )
+                .await;
+                overlay_append(
+                    overlay_amp_table.clone(),
+                    Arc::clone(&schema),
+                    &overlay_amp_prefix,
+                    2,
+                    &updates_0_to_1,
+                )
+                .await;
+                let mut decode_cache = OverlayDecodeCache::new(OVERLAY_DECODE_CACHE_CAPACITY);
+                let cold_lookup = overlay_lookup_with_cache(
+                    overlay_amp_table.clone(),
+                    &overlay_amp_prefix,
+                    0,
+                    &mut decode_cache,
+                )
+                .await;
+                let warm_lookup = overlay_lookup_with_cache(
+                    overlay_amp_table.clone(),
+                    &overlay_amp_prefix,
+                    0,
+                    &mut decode_cache,
+                )
+                .await;
+                let overlay_read_amp =
+                    overlay_read_amplification(overlay_amp_table, &overlay_amp_prefix, 0).await;
+                (
+                    indexed_read_amp,
+                    indexed_put_metrics,
+                    overlay_read_amp,
+                    cold_lookup.metrics,
+                    warm_lookup.metrics,
+                )
+            });
+        println!(
+            "update_model_read_amp_report,batch_size={batch_size},indexed_read_amp={indexed_read_amp},overlay_read_amp={overlay_read_amp}"
+        );
+        println!(
+            "update_model_put_report,batch_size={batch_size},input_non_zero={},persisted_records={},write_reduction={:.2}",
+            indexed_put_metrics.non_zero_input_records,
+            indexed_put_metrics.persisted_records,
+            if indexed_put_metrics.non_zero_input_records == 0 {
+                0.0
+            } else {
+                indexed_put_metrics.persisted_records as f64
+                    / indexed_put_metrics.non_zero_input_records as f64
+            }
+        );
+        println!(
+            "update_model_overlay_decode_report,batch_size={batch_size},index_entries_cold={},segments_cold={},decoded_rows_cold={},cache_hits_warm={},cache_misses_warm={},decoded_rows_warm={},index_entries_warm={},segments_warm={}",
+            cold_lookup.index_entries_scanned,
+            cold_lookup.unique_segments,
+            cold_lookup.decoded_rows,
+            warm_lookup.cache_hits,
+            warm_lookup.cache_misses,
+            warm_lookup.decoded_rows,
+            warm_lookup.index_entries_scanned,
+            warm_lookup.unique_segments,
+        );
 
         group.bench_function(
             BenchmarkId::new("indexed_zset_apply_toggle", batch_size),
             |b| {
                 let table = open_table(&runtime, next_db_name("bench-indexed-zset", batch_size));
                 let namespace = next_namespace("indexed_zset");
-                let index = IndexedZSet::new(table, namespace);
+                let index = IndexedBatchZSet::new(table, namespace);
                 runtime.block_on(async {
                     index
                         .apply_deltas(initial.iter().cloned())
@@ -482,7 +699,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
             |b| {
                 let table = open_table(&runtime, next_db_name("bench-indexed-hot", batch_size));
                 let namespace = next_namespace("indexed_zset_hot");
-                let index = IndexedZSet::new(table, namespace);
+                let index = IndexedBatchZSet::new(table, namespace);
                 runtime.block_on(async {
                     index
                         .apply_deltas(initial.iter().cloned())
@@ -508,6 +725,55 @@ fn bench_update_model_indexed(c: &mut Criterion) {
                             .values_for_key(&lookup_key)
                             .await
                             .expect("lookup indexed zset key");
+                        black_box(values);
+                    });
+                });
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("indexed_zset_apply_lookup_hot_key_compacted", batch_size),
+            |b| {
+                let table = open_table(
+                    &runtime,
+                    next_db_name("bench-indexed-hot-compacted", batch_size),
+                );
+                let namespace = next_namespace("indexed_zset_hot_compacted");
+                let index = IndexedBatchZSet::new(table.clone(), namespace.clone());
+                let manifest_store = ManifestStore::<IndexManifest>::index(table, namespace);
+                runtime.block_on(async {
+                    index
+                        .apply_deltas(initial.iter().cloned())
+                        .await
+                        .expect("seed indexed zset compacted benchmark");
+                });
+
+                let lookup_key = 0_i64;
+                let mut flip = false;
+                b.iter(|| {
+                    let updates = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    runtime.block_on(async {
+                        index
+                            .apply_deltas(updates.iter().cloned())
+                            .await
+                            .expect("apply indexed zset compacted update");
+                        index
+                            .compact_l0_to_l1()
+                            .await
+                            .expect("compact indexed zset L0->L1");
+                        index
+                            .publish_compacted_manifest(&manifest_store)
+                            .await
+                            .expect("publish compacted manifest");
+                        let values = index
+                            .values_for_key(&lookup_key)
+                            .await
+                            .expect("lookup compacted indexed zset key");
                         black_box(values);
                     });
                 });
@@ -572,6 +838,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
 
                 let lookup_key = 0_i64;
                 let mut flip = false;
+                let mut segment_cache = OverlayDecodeCache::new(OVERLAY_DECODE_CACHE_CAPACITY);
                 b.iter(|| {
                     let updates = if flip {
                         &updates_1_to_0
@@ -579,6 +846,7 @@ fn bench_update_model_indexed(c: &mut Criterion) {
                         &updates_0_to_1
                     };
                     flip = !flip;
+                    segment_cache.invalidate(next_segment_id);
                     runtime.block_on(overlay_append(
                         table.clone(),
                         Arc::clone(&schema),
@@ -588,8 +856,14 @@ fn bench_update_model_indexed(c: &mut Criterion) {
                     ));
                     next_segment_id += 1;
                     runtime.block_on(async {
-                        let values = overlay_lookup(table.clone(), &prefix, lookup_key).await;
-                        black_box(values);
+                        let result = overlay_lookup_with_cache(
+                            table.clone(),
+                            &prefix,
+                            lookup_key,
+                            &mut segment_cache,
+                        )
+                        .await;
+                        black_box(result.values);
                     });
                 });
             },
@@ -612,6 +886,61 @@ fn bench_update_model_versioned(c: &mut Criterion) {
             strip_keyed_updates(&transition_keyed_updates(batch_size, key_cardinality, 0, 1));
         let updates_1_to_0 =
             strip_keyed_updates(&transition_keyed_updates(batch_size, key_cardinality, 1, 0));
+        let versioned_metrics_table =
+            open_table(&runtime, next_db_name("bench-versioned-growth", batch_size));
+        let versioned_metrics_namespace = next_namespace("versioned_growth");
+        let ledger_metrics_table =
+            open_table(&runtime, next_db_name("bench-ledger-growth", batch_size));
+        let ledger_metrics_prefix = format!(
+            "bench/ledger-growth/{batch_size}/{}",
+            NS_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let (versioned_growth_bytes, ledger_growth_bytes) = runtime.block_on(async {
+            let dict = Arc::new(
+                Dictionary::<BenchRow>::with_table(
+                    versioned_metrics_table.clone(),
+                    versioned_metrics_namespace.clone(),
+                    None,
+                )
+                .await
+                .expect("create dictionary for growth metrics"),
+            );
+            let mut versioned = VersionedZSet::new(
+                dict.clone(),
+                versioned_metrics_table.clone(),
+                versioned_metrics_namespace.clone(),
+            )
+            .await
+            .expect("create versioned zset for growth metrics");
+            apply_versioned_deltas(&mut versioned, dict.as_ref(), &initial).await;
+            apply_versioned_deltas(&mut versioned, dict.as_ref(), &updates_0_to_1).await;
+            let versioned_growth_bytes =
+                versioned_storage_bytes(versioned_metrics_table, &versioned_metrics_namespace)
+                    .await;
+
+            ledger_append(
+                ledger_metrics_table.clone(),
+                Arc::clone(&schema),
+                &ledger_metrics_prefix,
+                1,
+                &initial,
+            )
+            .await;
+            ledger_append(
+                ledger_metrics_table.clone(),
+                Arc::clone(&schema),
+                &ledger_metrics_prefix,
+                2,
+                &updates_0_to_1,
+            )
+            .await;
+            let ledger_growth_bytes =
+                prefix_total_bytes(ledger_metrics_table, ledger_metrics_prefix.as_bytes()).await;
+            (versioned_growth_bytes, ledger_growth_bytes)
+        });
+        println!(
+            "update_model_growth_report,batch_size={batch_size},versioned_growth_bytes={versioned_growth_bytes},ledger_growth_bytes={ledger_growth_bytes}"
+        );
 
         group.bench_function(
             BenchmarkId::new("versioned_zset_write_materialize_toggle", batch_size),
@@ -646,6 +975,55 @@ fn bench_update_model_versioned(c: &mut Criterion) {
                     flip = !flip;
                     runtime.block_on(async {
                         apply_versioned_deltas(&mut versioned, dict.as_ref(), updates).await;
+                        let materialized = versioned.materialize().await.expect("materialize");
+                        black_box(materialized);
+                    });
+                });
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new(
+                "versioned_zset_write_materialize_toggle_compacted",
+                batch_size,
+            ),
+            |b| {
+                let table = open_table(
+                    &runtime,
+                    next_db_name("bench-versioned-zset-compacted", batch_size),
+                );
+                let namespace = next_namespace("versioned_zset_compacted");
+                let dict = runtime.block_on(async {
+                    Arc::new(
+                        Dictionary::<BenchRow>::with_table(table.clone(), namespace.clone(), None)
+                            .await
+                            .expect("create dictionary"),
+                    )
+                });
+                let mut versioned = runtime.block_on(async {
+                    VersionedZSet::new(dict.clone(), table.clone(), namespace)
+                        .await
+                        .expect("create versioned zset")
+                });
+                runtime.block_on(apply_versioned_deltas(
+                    &mut versioned,
+                    dict.as_ref(),
+                    &initial,
+                ));
+
+                let mut flip = false;
+                b.iter(|| {
+                    let updates = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    runtime.block_on(async {
+                        apply_versioned_deltas(&mut versioned, dict.as_ref(), updates).await;
+                        if versioned.current_handle().is_some() {
+                            let _ = versioned.compact_current().await.expect("compact current");
+                        }
                         let materialized = versioned.materialize().await.expect("materialize");
                         black_box(materialized);
                     });
@@ -689,6 +1067,172 @@ fn bench_update_model_versioned(c: &mut Criterion) {
                     runtime.block_on(async {
                         let materialized = ledger_materialize(table.clone(), &prefix).await;
                         black_box(materialized);
+                    });
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_update_model_gc_pressure(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("tokio runtime");
+    let schema = delta_schema();
+    let mut group = c.benchmark_group("update_model_gc_pressure");
+
+    for &batch_size in MODEL_BATCH_SIZES {
+        group.throughput(Throughput::Elements(batch_size as u64));
+        let key_cardinality = (batch_size / KEY_CARDINALITY_DIVISOR).max(1) as i64;
+        let initial = strip_keyed_updates(&initial_keyed_updates(batch_size, key_cardinality));
+        let updates_0_to_1 =
+            strip_keyed_updates(&transition_keyed_updates(batch_size, key_cardinality, 0, 1));
+        let updates_1_to_0 =
+            strip_keyed_updates(&transition_keyed_updates(batch_size, key_cardinality, 1, 0));
+
+        let metric_table = open_table(&runtime, next_db_name("bench-gc-metric", batch_size));
+        let metric_namespace = next_namespace("gc_metric");
+        let metric_segment_store =
+            ArrowSegmentStore::new(metric_table.clone(), metric_namespace.clone());
+        let metric_manifest_store =
+            ManifestStore::<DataManifest>::data(metric_table.clone(), metric_namespace.clone());
+        let metric_gc = GcService::new(
+            metric_table.clone(),
+            metric_namespace.clone(),
+            GcPolicy {
+                grace_period: Duration::ZERO,
+            },
+        );
+        let metric_deltas = updates_0_to_1.clone();
+        let metric_sweep = runtime.block_on(async {
+            let batch = deltas_to_record_batch(Arc::clone(&schema), &initial);
+            metric_segment_store
+                .write_segment(
+                    1,
+                    Arc::clone(&schema),
+                    &[batch],
+                    segment_stats_for_deltas(&initial),
+                )
+                .await
+                .expect("write metric seed segment");
+            metric_manifest_store
+                .publish_manifest(&DataManifest {
+                    version: 1,
+                    base: None,
+                    reference_count: 1,
+                    statistics: manifest_stats(1, initial.len(), 0),
+                    segments: vec![1],
+                })
+                .await
+                .expect("publish metric seed manifest");
+
+            let churn_batch = deltas_to_record_batch(Arc::clone(&schema), &metric_deltas);
+            let churn_payload = encode_arrow_ipc_delta_batch(Arc::clone(&schema), &metric_deltas);
+            metric_segment_store
+                .write_segment(
+                    2,
+                    Arc::clone(&schema),
+                    &[churn_batch],
+                    segment_stats_for_deltas(&metric_deltas),
+                )
+                .await
+                .expect("write metric churn segment");
+            metric_manifest_store
+                .publish_manifest(&DataManifest {
+                    version: 2,
+                    base: None,
+                    reference_count: 1,
+                    statistics: manifest_stats(1, metric_deltas.len(), churn_payload.len() as u64),
+                    segments: vec![2],
+                })
+                .await
+                .expect("publish metric churn manifest");
+            metric_gc.sweep_once().await.expect("metric GC sweep")
+        });
+        println!(
+            "update_model_gc_report,batch_size={batch_size},gc_marked={},gc_deleted={}",
+            metric_sweep.marked, metric_sweep.deleted
+        );
+
+        group.bench_function(
+            BenchmarkId::new("gc_manifest_churn_sweep", batch_size),
+            |b| {
+                let table = open_table(&runtime, next_db_name("bench-gc-churn", batch_size));
+                let namespace = next_namespace("gc_churn");
+                let segment_store = ArrowSegmentStore::new(table.clone(), namespace.clone());
+                let manifest_store =
+                    ManifestStore::<DataManifest>::data(table.clone(), namespace.clone());
+                let gc = GcService::new(
+                    table,
+                    namespace,
+                    GcPolicy {
+                        grace_period: Duration::ZERO,
+                    },
+                );
+                let mut segment_id = 1_u64;
+                let mut version = 1_u64;
+                runtime.block_on(async {
+                    let seed_batch = deltas_to_record_batch(Arc::clone(&schema), &initial);
+                    segment_store
+                        .write_segment(
+                            segment_id,
+                            Arc::clone(&schema),
+                            &[seed_batch],
+                            segment_stats_for_deltas(&initial),
+                        )
+                        .await
+                        .expect("write churn seed segment");
+                    manifest_store
+                        .publish_manifest(&DataManifest {
+                            version,
+                            base: None,
+                            reference_count: 1,
+                            statistics: manifest_stats(1, initial.len(), 0),
+                            segments: vec![segment_id],
+                        })
+                        .await
+                        .expect("publish churn seed manifest");
+                });
+
+                let mut flip = false;
+                b.iter(|| {
+                    let deltas = if flip {
+                        &updates_1_to_0
+                    } else {
+                        &updates_0_to_1
+                    };
+                    flip = !flip;
+                    segment_id = segment_id.saturating_add(1);
+                    version = version.saturating_add(1);
+                    runtime.block_on(async {
+                        let churn_batch = deltas_to_record_batch(Arc::clone(&schema), deltas);
+                        let churn_payload =
+                            encode_arrow_ipc_delta_batch(Arc::clone(&schema), deltas);
+                        segment_store
+                            .write_segment(
+                                segment_id,
+                                Arc::clone(&schema),
+                                &[churn_batch],
+                                segment_stats_for_deltas(deltas),
+                            )
+                            .await
+                            .expect("write churn segment");
+                        manifest_store
+                            .publish_manifest(&DataManifest {
+                                version,
+                                base: None,
+                                reference_count: 1,
+                                statistics: manifest_stats(
+                                    1,
+                                    deltas.len(),
+                                    churn_payload.len() as u64,
+                                ),
+                                segments: vec![segment_id],
+                            })
+                            .await
+                            .expect("publish churn manifest");
+                        let sweep = gc.sweep_once().await.expect("run churn sweep");
+                        black_box(sweep.deleted);
                     });
                 });
             },
@@ -778,6 +1322,8 @@ criterion_group!(
     benches,
     bench_update_model_indexed,
     bench_update_model_versioned,
+    bench_update_model_gc_pressure,
     bench_update_model_dictionary
 );
 criterion_main!(benches);
+use floe_benchmarks::overlay_decode_cache::OverlayDecodeCache;

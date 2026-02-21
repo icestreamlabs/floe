@@ -1798,6 +1798,9 @@ name = "dbsp-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
  "lru",
  "object_store",

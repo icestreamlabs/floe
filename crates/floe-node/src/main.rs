@@ -14,7 +14,10 @@ use anyhow::{Context, anyhow};
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
-use dbsp::StreamRetention;
+use dbsp::collections::CompactionPolicy;
+use dbsp::storage::gc::{GcPolicy, GcService};
+use dbsp::storage::{KeyValueTable, SlateTable};
+use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
@@ -79,7 +82,9 @@ impl ConnectorQueue {
     }
 }
 
-use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
+use floe_node_core::executor::{
+    StreamCompactionConfig, StreamGcConfig, available_sources_from_registry, build_dataflows,
+};
 use floe_node_core::source as core_source;
 use floe_node_core::source::SourceRegistry;
 use http_ingest::HttpIngestConfig;
@@ -103,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
             "--kafka-topics is required when --kafka-brokers is set"
         ));
     }
+    let stream_gc = StreamGcConfig {
+        grace_period_ms: run_args.zset_gc_grace_period_ms,
+    };
+    let gc_policy = GcPolicy {
+        grace_period: Duration::from_millis(stream_gc.grace_period_ms),
+    };
 
     let config = if let Some(path) = run_args.config.as_deref() {
         Some(load_config(path)?)
@@ -136,6 +147,29 @@ async fn main() -> anyhow::Result<()> {
         .materialized_views()
         .await
         .context("load persisted materialized views")?;
+    let gc_table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    for metadata in &stored_views {
+        let namespace = floe_executor::namespaces::materialized_view(metadata.name())
+            .with_context(|| {
+                format!(
+                    "derive namespace for materialized view '{}'",
+                    metadata.name()
+                )
+            })?;
+        let gc = GcService::new(gc_table.clone(), namespace.clone(), gc_policy);
+        let (_, recovered_intents) = gc
+            .recover_startup()
+            .await
+            .with_context(|| format!("run startup GC recovery for namespace '{namespace}'"))?;
+        if recovered_intents > 0 {
+            tracing::info!(
+                view = %metadata.name(),
+                namespace = %namespace,
+                recovered_intents,
+                "recovered stale manifest intents during startup"
+            );
+        }
+    }
     for metadata in stored_views {
         let definition = MaterializedViewDefinition::new(
             metadata.name(),
@@ -255,6 +289,69 @@ async fn main() -> anyhow::Result<()> {
         cli::OutputConsolidationMode::Key => ConsolidationMode::ByKey,
     };
     graph_builder.set_output_consolidation_mode(consolidation_mode);
+    let stream_compaction = StreamCompactionConfig {
+        max_chain_len: run_args.zset_compaction_max_chain_len,
+        max_segments: run_args.zset_compaction_max_segments,
+        scheduler_backoff_ticks: run_args.zset_compaction_backoff_ticks,
+        scheduler_max_concurrent_jobs: run_args.zset_compaction_max_concurrent_jobs,
+    };
+    graph_builder
+        .set_stream_compaction(
+            CompactionPolicy {
+                max_chain_len: stream_compaction.max_chain_len,
+                max_segments: stream_compaction.max_segments,
+            },
+            CompactionSchedulerConfig {
+                failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,
+                max_concurrent_jobs: stream_compaction.scheduler_max_concurrent_jobs,
+            },
+        )
+        .await;
+    if run_args.maintenance_paused {
+        graph_builder.pause_maintenance().await;
+        tracing::info!("maintenance started in paused mode");
+    }
+    for namespace in &run_args.maintenance_inspect_namespace {
+        let summary = graph_builder
+            .inspect_namespace_storage(namespace)
+            .await
+            .with_context(|| format!("inspect namespace '{namespace}'"))?;
+        tracing::info!(
+            namespace = %summary.namespace,
+            data_manifest_version = ?summary.data_manifest_version,
+            index_manifest_version = ?summary.index_manifest_version,
+            pinned_handle_count = summary.pinned_handle_count,
+            reachable_data_manifest_count = summary.reachable_data_manifest_count,
+            reachable_index_manifest_count = summary.reachable_index_manifest_count,
+            reachable_segment_count = summary.reachable_segment_count,
+            "namespace storage summary"
+        );
+    }
+    for namespace in &run_args.maintenance_compact_namespace {
+        let compacted = graph_builder
+            .run_namespace_compaction_once(namespace)
+            .await
+            .with_context(|| format!("compact namespace '{namespace}'"))?;
+        tracing::info!(
+            namespace = %namespace,
+            compacted_version = ?compacted,
+            "maintenance compaction request completed"
+        );
+    }
+    for namespace in &run_args.maintenance_gc_namespace {
+        let sweep_stats = graph_builder
+            .run_namespace_gc_once(namespace, gc_policy)
+            .await
+            .with_context(|| format!("run GC sweep for namespace '{namespace}'"))?;
+        tracing::info!(
+            namespace = %namespace,
+            marked = sweep_stats.marked,
+            deleted = sweep_stats.deleted,
+            skipped_reachable = sweep_stats.skipped_reachable,
+            recovered_intents = sweep_stats.recovered_intents,
+            "maintenance GC sweep completed"
+        );
+    }
     let event_watermark = Arc::new(AtomicI64::new(-1));
     let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let graph_cancel = CancellationToken::new();

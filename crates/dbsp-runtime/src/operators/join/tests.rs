@@ -10,7 +10,7 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::Db;
 
 use super::JoinOp;
-use crate::collections::IndexedZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -174,8 +174,8 @@ async fn join_operator_matches_batch_join_over_time() {
         .expect("output");
     let match_sum = Arc::new(|l: &i64, r: &i64| *l == *r);
     let projector = Arc::new(project_sum);
-    let left_index = IndexedZSet::new(table.clone(), "join_left_index");
-    let right_index = IndexedZSet::new(table.clone(), "join_right_index");
+    let left_index = IndexedBatchZSet::new(table.clone(), "join_left_index");
+    let right_index = IndexedBatchZSet::new(table.clone(), "join_right_index");
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
     let integrated_join = RelationState {
@@ -374,8 +374,8 @@ async fn join_operator_handles_negative_deltas() {
             version: 0,
         },
     };
-    let left_index = IndexedZSet::new(table.clone(), "neg_left_index");
-    let right_index = IndexedZSet::new(table.clone(), "neg_right_index");
+    let left_index = IndexedBatchZSet::new(table.clone(), "neg_left_index");
+    let right_index = IndexedBatchZSet::new(table.clone(), "neg_right_index");
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 
@@ -511,8 +511,8 @@ async fn join_operator_skips_null_keys() {
     let output = VersionedZSet::new(out_dict.clone(), table.clone(), "null_output".to_string())
         .await
         .expect("output");
-    let left_index = IndexedZSet::new(table.clone(), "null_left_index");
-    let right_index = IndexedZSet::new(table.clone(), "null_right_index");
+    let left_index = IndexedBatchZSet::new(table.clone(), "null_left_index");
+    let right_index = IndexedBatchZSet::new(table.clone(), "null_right_index");
     let left_key = Arc::new(|value: &Option<i64>| value.clone());
     let right_key = Arc::new(|value: &Option<i64>| value.clone());
 
@@ -639,8 +639,8 @@ async fn join_operator_matches_full_recompute() {
             version: 0,
         },
     };
-    let left_index = IndexedZSet::new(table.clone(), "recompute_left_index");
-    let right_index = IndexedZSet::new(table.clone(), "recompute_right_index");
+    let left_index = IndexedBatchZSet::new(table.clone(), "recompute_left_index");
+    let right_index = IndexedBatchZSet::new(table.clone(), "recompute_right_index");
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 

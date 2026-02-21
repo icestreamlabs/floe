@@ -33,7 +33,7 @@ pub mod vectorized_keys;
 
 pub use barrier_clock::{BarrierClock, StepId};
 pub use context::FloeQueryContext;
-pub use dbsp_bridge::DbspBridge;
+pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{BuildInputs, BuildOutputs, DbspGraphBuilder};
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use dbsp_table_environment::DbspTableEnvironment;

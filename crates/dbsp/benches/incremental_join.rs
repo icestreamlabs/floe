@@ -5,7 +5,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use object_store::memory::InMemory;
 use slatedb::Db;
 
-use dbsp::collections::IndexedZSet;
+use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::join::JoinOp;
@@ -115,8 +115,8 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     let output = VersionedZSet::new(output_dict, table.clone(), "bench_output".to_string())
         .await
         .expect("output zset");
-    let left_index = IndexedZSet::new(table.clone(), "bench_left_index");
-    let right_index = IndexedZSet::new(table.clone(), "bench_right_index");
+    let left_index = IndexedBatchZSet::new(table.clone(), "bench_left_index");
+    let right_index = IndexedBatchZSet::new(table.clone(), "bench_right_index");
 
     let mut op = JoinOp::new(
         left_state,

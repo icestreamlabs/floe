@@ -33,6 +33,118 @@ impl StreamRetention {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionSchedulerConfig {
+    pub failure_backoff_ticks: u64,
+    pub max_concurrent_jobs: usize,
+}
+
+impl Default for CompactionSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            failure_backoff_ticks: 1,
+            max_concurrent_jobs: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactionScheduler {
+    config: CompactionSchedulerConfig,
+    tick: u64,
+    next_allowed_tick: u64,
+    in_flight_jobs: usize,
+}
+
+impl Default for CompactionScheduler {
+    fn default() -> Self {
+        Self {
+            config: CompactionSchedulerConfig::default(),
+            tick: 0,
+            next_allowed_tick: 0,
+            in_flight_jobs: 0,
+        }
+    }
+}
+
+impl CompactionScheduler {
+    fn set_config(&mut self, config: CompactionSchedulerConfig) {
+        self.config = config;
+    }
+
+    fn on_tick(&mut self) {
+        self.tick = self.tick.saturating_add(1);
+    }
+
+    fn try_start(&mut self) -> bool {
+        if self.tick < self.next_allowed_tick {
+            return false;
+        }
+        if self.in_flight_jobs >= self.config.max_concurrent_jobs {
+            return false;
+        }
+        self.in_flight_jobs = self.in_flight_jobs.saturating_add(1);
+        true
+    }
+
+    fn finish_success(&mut self) {
+        self.in_flight_jobs = self.in_flight_jobs.saturating_sub(1);
+    }
+
+    fn finish_failure(&mut self) {
+        self.in_flight_jobs = self.in_flight_jobs.saturating_sub(1);
+        let backoff = self.config.failure_backoff_ticks.max(1);
+        self.next_allowed_tick = self.tick.saturating_add(backoff);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactionScheduler, CompactionSchedulerConfig};
+
+    #[test]
+    fn scheduler_respects_concurrency_limits() {
+        let mut scheduler = CompactionScheduler::default();
+        scheduler.set_config(CompactionSchedulerConfig {
+            failure_backoff_ticks: 1,
+            max_concurrent_jobs: 1,
+        });
+        scheduler.on_tick();
+        assert!(scheduler.try_start());
+        assert!(
+            !scheduler.try_start(),
+            "second job should be blocked by max concurrency"
+        );
+        scheduler.finish_success();
+        assert!(
+            scheduler.try_start(),
+            "job should start again after completion"
+        );
+    }
+
+    #[test]
+    fn scheduler_enforces_failure_backoff() {
+        let mut scheduler = CompactionScheduler::default();
+        scheduler.set_config(CompactionSchedulerConfig {
+            failure_backoff_ticks: 3,
+            max_concurrent_jobs: 1,
+        });
+        scheduler.on_tick();
+        assert!(scheduler.try_start());
+        scheduler.finish_failure();
+
+        scheduler.on_tick();
+        assert!(!scheduler.try_start(), "backoff tick 1 should block");
+        scheduler.on_tick();
+        assert!(!scheduler.try_start(), "backoff tick 2 should block");
+        scheduler.on_tick();
+        assert!(
+            scheduler.try_start(),
+            "scheduler should allow compaction after backoff"
+        );
+    }
+}
+
 pub struct ZSetStream<K>
 where
     K: Archive
@@ -52,6 +164,7 @@ where
     overlay: HashMap<K, i64>,
     retention: StreamRetention,
     compaction: CompactionPolicy,
+    compaction_scheduler: CompactionScheduler,
     retention_window: VecDeque<ZSetHandle>,
     retention_counts: HashMap<u64, usize>,
     current_handle: ZSetHandle,

@@ -11,7 +11,7 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
-use crate::collections::{IndexedZSet, RangeKey};
+use crate::collections::{IndexedBatchZSet, RangeKey};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
@@ -74,8 +74,8 @@ where
 {
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
-    pub left_index: IndexedZSet<KL, L>,
-    pub right_index: IndexedZSet<KR, R>,
+    pub left_index: IndexedBatchZSet<KL, L>,
+    pub right_index: IndexedBatchZSet<KR, R>,
     pub left_key: JoinKeyExtractor<L, KL>,
     pub right_key: JoinKeyExtractor<R, KR>,
     pub range_func: RangeFunc<KL, KR>,
@@ -139,8 +139,8 @@ where
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
-        left_index: IndexedZSet<KL, L>,
-        right_index: IndexedZSet<KR, R>,
+        left_index: IndexedBatchZSet<KL, L>,
+        right_index: IndexedBatchZSet<KR, R>,
         left_key: JoinKeyExtractor<L, KL>,
         right_key: JoinKeyExtractor<R, KR>,
         range_func: RangeFunc<KL, KR>,
@@ -149,6 +149,8 @@ where
         output: VersionedZSet<O>,
         integrated: Option<RelationState<O>>,
     ) -> Self {
+        debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
+        debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
             left_state,
             right_state,
@@ -703,8 +705,8 @@ mod tests {
             .await
             .expect("output zset");
 
-        let left_index = IndexedZSet::new(table.clone(), "range_left_index");
-        let right_index = IndexedZSet::with_range_index(table.clone(), "range_right_index");
+        let left_index = IndexedBatchZSet::new(table.clone(), "range_left_index");
+        let right_index = IndexedBatchZSet::with_range_index(table.clone(), "range_right_index");
 
         let left_key = Arc::new(|row: &Row| Some(row.0));
         let right_key = Arc::new(|row: &Row| Some(row.0));

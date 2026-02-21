@@ -8,6 +8,8 @@ mod helpers;
 mod ingest;
 #[path = "end_to_end_mv/joins.rs"]
 mod joins;
+#[path = "end_to_end_mv/mixed.rs"]
+mod mixed;
 #[path = "end_to_end_mv/nexmark_suite.rs"]
 mod nexmark_suite;
 #[path = "end_to_end_mv/nulls.rs"]

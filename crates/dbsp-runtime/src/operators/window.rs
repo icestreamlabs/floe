@@ -11,7 +11,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -63,7 +63,7 @@ where
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub state: RelationState<(WindowKey<K>, A)>,
-    pub index: IndexedZSet<WindowKey<K>, V>,
+    pub index: IndexedBatchZSet<WindowKey<K>, V>,
     pub table: Arc<dyn KeyValueTable>,
     pub key_extractor: KeyExtractor<V, K>,
     pub time_extractor: TimeExtractor<V>,
@@ -109,7 +109,7 @@ where
 {
     pub fn new(
         state: RelationState<(WindowKey<K>, A)>,
-        index: IndexedZSet<WindowKey<K>, V>,
+        index: IndexedBatchZSet<WindowKey<K>, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
         time_extractor: TimeExtractor<V>,
@@ -130,6 +130,7 @@ where
             allowed_lateness_ms >= 0,
             "allowed lateness must be non-negative"
         );
+        debug_assert_eq!(index.engine_kind(), "indexed_batch");
         Ok(Self {
             state,
             index,
@@ -563,7 +564,7 @@ mod tests {
         .await
         .expect("output zset");
 
-        let index = IndexedZSet::new(table.clone(), "window_index");
+        let index = IndexedBatchZSet::new(table.clone(), "window_index");
         let key_extractor = Arc::new(|row: &Row| Some(*row % 2));
         let time_extractor = Arc::new(|row: &Row| Some(*row));
         let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
@@ -697,7 +698,7 @@ mod tests {
         .await
         .expect("output zset");
 
-        let index = IndexedZSet::new(table.clone(), "window_late_index");
+        let index = IndexedBatchZSet::new(table.clone(), "window_late_index");
         let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
         let time_extractor = Arc::new(|row: &Row| Some(*row));
         let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
@@ -802,7 +803,7 @@ mod tests {
         .await
         .expect("output zset");
 
-        let index = IndexedZSet::new(table.clone(), "window_retract_index");
+        let index = IndexedBatchZSet::new(table.clone(), "window_retract_index");
         let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
         let time_extractor = Arc::new(|row: &Row| Some(*row));
         let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =

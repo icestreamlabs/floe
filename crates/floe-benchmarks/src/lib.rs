@@ -1,1 +1,1 @@
-// Bench-only crate; benchmarks live in the benches/ directory.
+pub mod overlay_decode_cache;

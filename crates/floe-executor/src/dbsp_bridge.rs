@@ -7,21 +7,38 @@ use anyhow::{Context, Result};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use datafusion::arrow::datatypes::SchemaRef;
+use dbsp::collections::CompactionPolicy;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
 use dbsp::storage::dictionary::Dictionary;
+use dbsp::storage::gc::{GcPolicy, GcService, ManifestReachabilityTracker, SweepStats};
+use dbsp::storage::manifest::{DataManifest, IndexManifest, ManifestStore};
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::SnapshotHandleStream;
-use dbsp::{StreamRetention, ZSetStream};
+use dbsp::{CompactionSchedulerConfig, StreamRetention, ZSetStream};
 use slatedb::Db;
 
 use crate::namespaces;
 
 const MV_SCHEMA_SUFFIX: &str = "/meta/schema.json";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceStorageSummary {
+    pub namespace: String,
+    pub data_manifest_version: Option<u64>,
+    pub index_manifest_version: Option<u64>,
+    pub pinned_handle_count: usize,
+    pub reachable_data_manifest_count: usize,
+    pub reachable_index_manifest_count: usize,
+    pub reachable_segment_count: usize,
+}
+
 /// Shared bridge that provisions DBSP-backed views for materialization.
 pub struct DbspBridge {
     table: Arc<dyn KeyValueTable>,
     dictionaries: HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+    stream_compaction_policy: CompactionPolicy,
+    stream_compaction_scheduler: CompactionSchedulerConfig,
+    maintenance_paused: bool,
 }
 
 impl DbspBridge {
@@ -29,7 +46,30 @@ impl DbspBridge {
         Ok(Self {
             table: Arc::new(SlateTable::new(db)),
             dictionaries: HashMap::new(),
+            stream_compaction_policy: CompactionPolicy::default(),
+            stream_compaction_scheduler: CompactionSchedulerConfig::default(),
+            maintenance_paused: false,
         })
+    }
+
+    pub fn set_stream_compaction_policy(&mut self, policy: CompactionPolicy) {
+        self.stream_compaction_policy = policy;
+    }
+
+    pub fn set_stream_compaction_scheduler_config(&mut self, config: CompactionSchedulerConfig) {
+        self.stream_compaction_scheduler = config;
+    }
+
+    pub fn pause_maintenance(&mut self) {
+        self.maintenance_paused = true;
+    }
+
+    pub fn resume_maintenance(&mut self) {
+        self.maintenance_paused = false;
+    }
+
+    pub fn maintenance_paused(&self) -> bool {
+        self.maintenance_paused
     }
 
     async fn dictionary_for(&mut self, namespace: &str) -> Result<Arc<Dictionary<Vec<u8>>>> {
@@ -52,7 +92,10 @@ impl DbspBridge {
     ) -> Result<ZSetStream<Vec<u8>>> {
         let namespace = namespace.into();
         let dict = self.dictionary_for(&namespace).await?;
-        ZSetStream::new(dict, self.table.clone(), namespace, retention).await
+        let mut stream = ZSetStream::new(dict, self.table.clone(), namespace, retention).await?;
+        stream.set_compaction_policy(self.effective_compaction_policy());
+        stream.set_compaction_scheduler_config(self.stream_compaction_scheduler);
+        Ok(stream)
     }
 
     pub async fn new_view(
@@ -71,6 +114,58 @@ impl DbspBridge {
 
     pub fn table(&self) -> Arc<dyn KeyValueTable> {
         self.table.clone()
+    }
+
+    pub async fn compact_namespace_once(&mut self, namespace: &str) -> Result<Option<u64>> {
+        if self.maintenance_paused {
+            return Ok(None);
+        }
+        let dict = self.dictionary_for(namespace).await?;
+        let mut stream = ZSetStream::new(
+            dict,
+            self.table.clone(),
+            namespace.to_string(),
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await?;
+        let Some(_) = stream.versioned().current_handle() else {
+            return Ok(None);
+        };
+        let compacted_version = stream.versioned().compact_current().await?;
+        Ok(Some(compacted_version))
+    }
+
+    pub async fn inspect_namespace_storage(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceStorageSummary> {
+        let data_store = ManifestStore::<DataManifest>::data(self.table.clone(), namespace);
+        let index_store = ManifestStore::<IndexManifest>::index(self.table.clone(), namespace);
+        let tracker = ManifestReachabilityTracker::new(self.table.clone(), namespace);
+
+        let data_manifest_version = data_store.latest_manifest().await?.map(|m| m.version);
+        let index_manifest_version = index_store.latest_manifest().await?.map(|m| m.version);
+        let pins = tracker.list_pins().await?;
+        let reachable = tracker.compute_reachability().await?;
+
+        Ok(NamespaceStorageSummary {
+            namespace: namespace.to_string(),
+            data_manifest_version,
+            index_manifest_version,
+            pinned_handle_count: pins.len(),
+            reachable_data_manifest_count: reachable.data_manifest_versions.len(),
+            reachable_index_manifest_count: reachable.index_manifest_versions.len(),
+            reachable_segment_count: reachable.data_segments.len(),
+        })
+    }
+
+    pub async fn run_namespace_gc_once(
+        &self,
+        namespace: &str,
+        policy: GcPolicy,
+    ) -> Result<SweepStats> {
+        let gc = GcService::new(self.table.clone(), namespace, policy);
+        gc.sweep_once().await
     }
 
     pub async fn save_mv_schema(&self, view_name: &str, schema: SchemaRef) -> Result<()> {
@@ -131,7 +226,17 @@ impl DbspBridge {
             StreamRetention::KeepLast { keep_last: 1 },
         )
         .await?;
+        stream.set_compaction_policy(self.effective_compaction_policy());
+        stream.set_compaction_scheduler_config(self.stream_compaction_scheduler);
         stream.latest_handle().await
+    }
+
+    fn effective_compaction_policy(&self) -> CompactionPolicy {
+        if self.maintenance_paused {
+            CompactionPolicy::disabled()
+        } else {
+            self.stream_compaction_policy
+        }
     }
 }
 

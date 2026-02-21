@@ -4,13 +4,15 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
+use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
-use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind, StreamRetention};
+use dbsp::{CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, StreamRetention};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::dbsp_bridge::DbspBridge;
+use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::delta_consolidation::ConsolidationMode;
 use crate::materialized_view::MaterializedViewRegistry;
@@ -38,6 +40,53 @@ impl DbspGraphBuilder {
 
     pub fn set_output_consolidation_mode(&mut self, mode: ConsolidationMode) {
         self.output_consolidation_mode = mode;
+    }
+
+    pub async fn set_stream_compaction(
+        &mut self,
+        policy: CompactionPolicy,
+        scheduler: CompactionSchedulerConfig,
+    ) {
+        let mut bridge = self.bridge.lock().await;
+        bridge.set_stream_compaction_policy(policy);
+        bridge.set_stream_compaction_scheduler_config(scheduler);
+    }
+
+    pub async fn pause_maintenance(&mut self) {
+        let mut bridge = self.bridge.lock().await;
+        bridge.pause_maintenance();
+    }
+
+    pub async fn resume_maintenance(&mut self) {
+        let mut bridge = self.bridge.lock().await;
+        bridge.resume_maintenance();
+    }
+
+    pub async fn maintenance_paused(&self) -> bool {
+        let bridge = self.bridge.lock().await;
+        bridge.maintenance_paused()
+    }
+
+    pub async fn inspect_namespace_storage(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceStorageSummary> {
+        let bridge = self.bridge.lock().await;
+        bridge.inspect_namespace_storage(namespace).await
+    }
+
+    pub async fn run_namespace_compaction_once(&mut self, namespace: &str) -> Result<Option<u64>> {
+        let mut bridge = self.bridge.lock().await;
+        bridge.compact_namespace_once(namespace).await
+    }
+
+    pub async fn run_namespace_gc_once(
+        &self,
+        namespace: &str,
+        policy: GcPolicy,
+    ) -> Result<SweepStats> {
+        let bridge = self.bridge.lock().await;
+        bridge.run_namespace_gc_once(namespace, policy).await
     }
 
     pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {

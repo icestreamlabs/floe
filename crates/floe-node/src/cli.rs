@@ -85,6 +85,62 @@ pub struct RunArgs {
     #[arg(long = "mv-retain-last", default_value_t = 1, value_parser = parse_nonnegative_usize)]
     pub mv_retain_last: usize,
 
+    /// Max version-chain length before runtime compaction is triggered.
+    #[arg(
+        long = "zset-compaction-max-chain-len",
+        default_value_t = 32,
+        value_parser = parse_positive_usize
+    )]
+    pub zset_compaction_max_chain_len: usize,
+
+    /// Max versioned segment count before runtime compaction is triggered.
+    #[arg(
+        long = "zset-compaction-max-segments",
+        default_value_t = 256,
+        value_parser = parse_positive_usize
+    )]
+    pub zset_compaction_max_segments: usize,
+
+    /// Tick backoff after compaction failures before retrying.
+    #[arg(
+        long = "zset-compaction-backoff-ticks",
+        default_value_t = 1,
+        value_parser = parse_nonnegative_u64
+    )]
+    pub zset_compaction_backoff_ticks: u64,
+
+    /// Max number of runtime compaction jobs allowed in flight per stream.
+    #[arg(
+        long = "zset-compaction-max-concurrent-jobs",
+        default_value_t = 1,
+        value_parser = parse_positive_usize
+    )]
+    pub zset_compaction_max_concurrent_jobs: usize,
+
+    /// Grace period before unreachable manifest/segment artifacts are reclaimed.
+    #[arg(
+        long = "zset-gc-grace-period-ms",
+        default_value_t = 30_000,
+        value_parser = parse_nonnegative_u64
+    )]
+    pub zset_gc_grace_period_ms: u64,
+
+    /// Start with maintenance operations paused.
+    #[arg(long = "maintenance-paused")]
+    pub maintenance_paused: bool,
+
+    /// Inspect manifest/GC reachability state for one or more namespaces on startup.
+    #[arg(long = "maintenance-inspect-namespace")]
+    pub maintenance_inspect_namespace: Vec<String>,
+
+    /// Trigger a one-shot compaction for one or more namespaces on startup.
+    #[arg(long = "maintenance-compact-namespace")]
+    pub maintenance_compact_namespace: Vec<String>,
+
+    /// Trigger a one-shot GC sweep for one or more namespaces on startup.
+    #[arg(long = "maintenance-gc-namespace")]
+    pub maintenance_gc_namespace: Vec<String>,
+
     /// Output delta consolidation mode for materialized view writes.
     #[arg(
         long = "output-consolidation-mode",

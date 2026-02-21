@@ -1,6 +1,10 @@
 pub mod dictionary;
 pub mod encoding;
+pub mod gc;
 pub mod keyspace;
+pub mod manifest;
+pub mod segment;
+pub mod segment_compaction;
 mod table;
 pub mod timestamps;
 pub use table::{KeyValueTable, SlateTable};

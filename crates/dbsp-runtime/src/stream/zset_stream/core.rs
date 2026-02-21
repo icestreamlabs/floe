@@ -20,6 +20,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use super::super::core::stream::Stream;
 use super::super::groups::HandleGroup;
 use super::super::util::collect_values;
+use super::CompactionSchedulerConfig;
 use super::StreamRetention;
 use super::ZSetStream;
 
@@ -91,6 +92,7 @@ where
             overlay: HashMap::new(),
             retention,
             compaction: CompactionPolicy::default(),
+            compaction_scheduler: super::CompactionScheduler::default(),
             retention_window,
             retention_counts,
             current_handle,
@@ -176,6 +178,10 @@ where
 
     pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) {
         self.compaction = policy;
+    }
+
+    pub fn set_compaction_scheduler_config(&mut self, config: CompactionSchedulerConfig) {
+        self.compaction_scheduler.set_config(config);
     }
 
     async fn flush_without_version_update(&mut self) -> Result<(ZSetHandle, ZSetHandle)> {
@@ -356,15 +362,21 @@ where
         }
 
         let mut new_handle = self.versioned.handle_for_version(plan.version);
+        self.compaction_scheduler.on_tick();
         if !self.compaction.is_disabled() {
             let chain_stats = self.versioned.chain_stats().await?;
-            if self.compaction.should_compact(chain_stats) {
+            if self.compaction.should_compact(chain_stats) && self.compaction_scheduler.try_start()
+            {
                 match self.versioned.compact_current().await {
                     Ok(compacted_version) => {
                         new_handle = self.versioned.handle_for_version(compacted_version);
+                        self.compaction_scheduler.finish_success();
                     }
-                    Err(err) if err.to_string().contains("cannot compact empty version") => {}
+                    Err(err) if err.to_string().contains("cannot compact empty version") => {
+                        self.compaction_scheduler.finish_success();
+                    }
                     Err(err) => {
+                        self.compaction_scheduler.finish_failure();
                         return Err(err).context("compact versioned chain");
                     }
                 }

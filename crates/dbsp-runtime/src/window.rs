@@ -11,7 +11,7 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::IndexedZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::window::{WindowAggregateOp, WindowKey};
@@ -89,7 +89,7 @@ impl DbspWindowAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for window aggregate")?;
-        let index = IndexedZSet::new(table.clone(), format!("window_agg_index_{window_id}"));
+        let index = IndexedBatchZSet::new(table.clone(), format!("window_agg_index_{window_id}"));
 
         let window_op = Arc::new(AsyncMutex::new(WindowAggregateOp::new(
             state,

@@ -5,6 +5,38 @@ use floe_executor::dbsp_plan::{CircuitPlan, validate_dbsp_plan};
 use floe_executor::{DbspPlanBuilder, nexmark_config};
 
 use crate::planner::PlannedMaterializedView;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCompactionConfig {
+    pub max_chain_len: usize,
+    pub max_segments: usize,
+    pub scheduler_backoff_ticks: u64,
+    pub scheduler_max_concurrent_jobs: usize,
+}
+
+impl Default for StreamCompactionConfig {
+    fn default() -> Self {
+        Self {
+            max_chain_len: 32,
+            max_segments: 256,
+            scheduler_backoff_ticks: 1,
+            scheduler_max_concurrent_jobs: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamGcConfig {
+    pub grace_period_ms: u64,
+}
+
+impl Default for StreamGcConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_ms: 30_000,
+        }
+    }
+}
 pub fn available_sources_from_registry(
     registry: &crate::source::SourceRegistry,
 ) -> BTreeSet<String> {

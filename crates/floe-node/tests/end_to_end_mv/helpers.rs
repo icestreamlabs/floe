@@ -37,11 +37,12 @@ pub(crate) async fn append_bid(
     bidder: i64,
     price: i64,
 ) -> Result<OuterStreamHandle> {
-    append_row(
+    append_weighted_row(
         outer,
         bridge,
         BID_SOURCE_NAME,
         bid_row(auction, bidder, price),
+        1,
     )
     .await
 }
@@ -55,11 +56,12 @@ pub(crate) async fn append_auction(
     expires_ms: i64,
     item_name: &str,
 ) -> Result<OuterStreamHandle> {
-    append_row(
+    append_weighted_row(
         outer,
         bridge,
         AUCTION_SOURCE_NAME,
         auction_row(auction, seller, category, expires_ms, item_name),
+        1,
     )
     .await
 }
@@ -70,10 +72,20 @@ pub(crate) async fn append_row(
     source: &str,
     row: Vec<ScalarValue>,
 ) -> Result<OuterStreamHandle> {
+    append_weighted_row(outer, bridge, source, row, 1).await
+}
+
+pub(crate) async fn append_weighted_row(
+    outer: &mut OuterStreamRegistry,
+    bridge: &mut DbspBridge,
+    source: &str,
+    row: Vec<ScalarValue>,
+    weight: i64,
+) -> Result<OuterStreamHandle> {
     let writer = outer
         .writer_mut(source)
         .with_context(|| format!("{source} source writer must exist"))?;
-    writer.append(&row, 1)?;
+    writer.append(&row, weight)?;
     let handles = outer.tick_all().await?;
     let handle = handles
         .into_iter()

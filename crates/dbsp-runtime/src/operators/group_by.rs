@@ -10,7 +10,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -54,7 +54,7 @@ where
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub state: RelationState<(K, A)>,
-    pub index: IndexedZSet<K, V>,
+    pub index: IndexedBatchZSet<K, V>,
     pub table: Arc<dyn KeyValueTable>,
     pub key_extractor: KeyExtractor<V, K>,
     pub aggregator: Aggregator<K, V, A>,
@@ -95,12 +95,13 @@ where
 {
     pub fn new(
         state: RelationState<(K, A)>,
-        index: IndexedZSet<K, V>,
+        index: IndexedBatchZSet<K, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
         aggregator: Aggregator<K, V, A>,
         output: VersionedZSet<(K, A)>,
     ) -> Self {
+        debug_assert_eq!(index.engine_kind(), "indexed_batch");
         Self {
             state,
             index,
@@ -496,7 +497,7 @@ mod tests {
         .await
         .expect("output");
 
-        let index = IndexedZSet::new(table.clone(), "group_by_index");
+        let index = IndexedBatchZSet::new(table.clone(), "group_by_index");
         let key_extractor: KeyExtractor<i64, i64> =
             Arc::new(
                 |value: &i64| {
@@ -634,7 +635,7 @@ mod tests {
         )
         .await
         .expect("output");
-        let index = IndexedZSet::new(table.clone(), "group_by_recompute_index");
+        let index = IndexedBatchZSet::new(table.clone(), "group_by_recompute_index");
 
         let key_extractor: KeyExtractor<i64, i64> =
             Arc::new(
