@@ -1,528 +1,94 @@
-# AGENTS.md
+# DBSP Crate Agent Guide
 
-This file provides guidance to coding agents when working with code in this repository.
+This file is guidance for coding agents working in `crates/dbsp`.
 
-## DBSP Crate Overview
+## What This Crate Actually Is
+`dbsp` is a **facade crate**. It primarily re-exports APIs from sibling crates:
 
-This crate implements DBSP (Database Stream Processing) primitives in Rust with SlateDB persistence. It provides the foundational layer for incremental computation through differential dataflow patterns, ported from the Python `pydbsp` implementation.
+- `dbsp-runtime` (stream runtime, operators, handle/ZSet mechanics)
+- `dbsp-storage` (key-value abstractions, dictionary, manifests, segments, GC)
+- `dbsp-circuit` (circuit/plan node types)
+- `dbsp-planner` (DataFusion -> DBSP plan translation)
 
-Feldera is a similar streaming SQL database with the reference implementation of DBSP that has the reference implementation of the DBSP formalism and semantics.
-The Feldera repo is available at /home/jlerche/programming_projects/github.com/feldera/feldera.
+The facade itself is mostly `src/lib.rs` plus Criterion benches in `benches/`.
 
-## Core Principles
+## Where To Make Changes
+If behavior changes are needed, edit the owning crate first:
 
-### Everything is an Abelian Group
-- All stream values live in a group `⟨T, add, neg, identity⟩`
-- Operators **never** use `+` directly—always call the group's `add/neg` methods
-- This keeps all code generic (works with ZSets, LazyZSets, Streams of anything)
-- The trait: `AbelianGroup<T>` in `algebra/mod.rs`
+- Runtime stream semantics/operators: `crates/dbsp-runtime/src/`
+- Persistent storage format/keyspace/manifest/GC: `crates/dbsp-storage/src/storage/`
+- Circuit node definitions and expression/schema types: `crates/dbsp-circuit/src/circuit/`
+- DataFusion planning translation: `crates/dbsp-planner/src/planner/`
+- Facade exports and public API surface: `crates/dbsp/src/lib.rs`
 
-### Streams are Sparse, Piecewise-Constant Timelines
-- Store explicit **non-default events** by timestamp
-- Everything else is implied by a **piecewise-constant default** (tracked as "default change" breakpoints)
-- Reading at time `t` returns:
-  1. The event at `t` if present, else
-  2. The most recent default ≤ `t`
+Do not add major runtime logic directly to `crates/dbsp/src/lib.rs`.
 
-### Freeze Tails After Lifted Ops
-- After operators like lifted `Delay`/`Integrate`, "freeze" the substream by setting its default to its latest value
-- Out-of-frontier reads remain causal without recomputation
+## Public API Surface in This Crate
+`crates/dbsp/src/lib.rs` currently:
 
-### Persist What Matters for Incremental Resumption
-- Persist **logical** state (e.g., ZSet weights, join indexes, accumulators)
-- Circuit can resume without recomputing from scratch
-- Persist full timelines only if you need replay/materialization
+- re-exports planner + circuit node/types (`CircuitPlan`, `DbspNodeKind`, expressions, schema/types),
+- re-exports runtime modules (`stream`, `operators`, `collections`, `handles`, etc.),
+- re-exports storage namespace via `dbsp_storage::storage`.
 
-## Storage Model (SlateDB)
+When modifying exports, check downstream usage in:
+- `crates/floe-executor`
+- `crates/floe-node`
+- `crates/floe-server`
 
-### Single DB, Namespaced Prefixes
-```
-zset/<ns>/<key>                                 -> i64_be_weight
-stream/<ns>/data/<be_i64_ts>                    -> value
-stream/<ns>/default/<be_i64_ts>                 -> default_value
-stream/<ns>/meta/state                          -> { timestamp, identity, default }
-index/<ns>/…                                    -> (join indexes)
-```
+## Core Invariants to Preserve
+These invariants are implemented in runtime/storage crates and must stay consistent when changing DBSP behavior.
 
-### Key Storage Conventions
-- Use **big-endian i64** for timestamps to enable ordered scans
-- One `Arc<Db>` per runtime/circuit
-- Namespace prefixes create logical tables
+1. Handle identity is stable and lightweight.
+- `ZSetHandle` is `{ ns, version }`.
+- `StreamHandle` is `{ ns, frontier }`.
+- Stored stream rows should reference handles, not embedded collection payloads.
 
-### Flushing & Crash Safety
-- Prefer **batched writes** (one atomic flush for `{defaults, data, state}`)
-- If no transactions: write `{defaults, data}` first, then `state` as summary
-- Optional: write an **intent** record before data and clear it after `state` for robust recovery
+2. Stream flushes are intent-guarded.
+- Stream flush writes pending defaults/data/state and an intent key, then clears intent after successful batch write.
+- Committed frontier should only advance after durable flush sequence completes.
 
-### Separation of Concerns
-- Wrap SlateDB with a small **KV/storage trait** (e.g., `get/put/delete/scan_prefix/write_batch`)
-- `ZSet`/`Stream` hold a lightweight **Table handle** (`store + prefix`), not their own DB
-- See `storage/mod.rs` for the trait and `storage/encoding.rs` for serialization helpers
+3. ZSet stream flush can emit both snapshot and delta handles.
+- `ZSetStream::flush_with_delta()` returns `(snapshot_handle, delta_handle)`.
+- Even empty overlays advance stream time consistently.
 
-## Data Structures
+4. Zero-weight entries are pruned.
+- ZSet and delta paths remove or ignore zero-weight entries to avoid state bloat and incorrect identity checks.
 
-### ZSet<K> (Zero-Set)
-**File:** `collections/zset.rs`
+5. Dictionary IDs are stable for persisted keys.
+- Dictionary intern/resolve behavior must remain deterministic and robust to partial writes/recovery.
 
-**Semantics:** Integer-weighted multiset with Abelian group operations
-- `add` merges weights by key
-- `neg` negates all weights
-- `identity` is empty set
-- Remove entries whose weight becomes **zero**
+6. Versioned manifests define layering.
+- Version chains are represented by manifest + segments; retention/compaction/GC must preserve reachable versions.
 
-**API:**
-- `get_weight(key)` - Get weight for a key
-- `set_weight(key, weight)` - Set absolute weight (0 to delete)
-- `add_weight(key, delta)` - Incremental update
-- `contains(key)` - Check presence
-- `items()` - Iterate all non-zero entries
-- `is_identity()` - Check if empty
-- `flush()` - Persist to SlateDB
+## Testing and Validation
+For facade-only changes (re-exports/docs):
+- `cargo test -p dbsp`
 
-**Storage:**
-- `zset/<ns>/<key> → i64_be`
-- Keep a **pending overlay** (in-memory) to read unflushed writes
-- Optional: track a **nonzero-key counter** in metadata for O(1) `is_identity()`
+For runtime/storage behavior changes:
+- `cargo test -p dbsp-runtime stream::tests::core::`
+- `cargo test -p dbsp-runtime operators::join::tests::`
+- `cargo test -p dbsp-storage storage::dictionary::tests::`
 
-### Stream<T> (Temporal Stream)
-**File:** `stream/mod.rs`
+For wider integration confidence:
+- `cargo test --workspace --no-run`
+- `cargo test -p floe-executor`
 
-**Fields:**
-- `timestamp` (frontier)
-- `identity` (true until a non-default event appears)
-- `default` (current default value)
-- **Pending:** `pending_data`, `pending_defaults`, `pending_state`
-- **Caches:** `data_cache` (bounded/LRU), `default_changes` (breakpoints)
+Formatting/lints:
+- `cargo fmt --all`
+- `cargo clippy --workspace -- -D warnings`
 
-**API:**
-- `send(T)` - Append value at new timestamp
-- `set_default(T)` - Change default for future timestamps
-- `get(timestamp)` - Retrieve value at specific time
-- `latest()` - Get most recent value
-- `to_vec()` - Export full timeline
-- `flush()` - Persist pending changes
-- `current_time()` - Get current timestamp
-- `is_identity()` - Check if stream is empty
+## Benchmarks
+The `dbsp` crate owns Criterion benches:
+- `benches/delta_emission.rs`
+- `benches/incremental_join.rs`
+- `benches/materialization_metrics.rs`
 
-**Semantics:**
-- `send(x)` advances time; persist only if `x != default`
-- `set_default(d)` adds a breakpoint at **current** timestamp
-- `get(t)` extends to `t` by sending defaults, returns event-or-default-at-`t`
+Useful commands:
+- `cargo bench -p dbsp --no-run`
+- `cargo bench -p dbsp --bench incremental_join`
 
-**Storage Namespaces:**
-- `stream/<ns>/data/<ts> → T` (non-default events)
-- `stream/<ns>/default/<ts> → T` (default change breakpoints)
-- `stream/<ns>/meta/state → { timestamp, identity, default }`
-- Optional: `last_default_ts` in state to avoid scanning all defaults on cold start
+Benchmarks use in-memory object store + SlateDB and exercise handle materialization and incremental join paths.
 
-## Operators (Shapes & Patterns)
-
-### Linear Operators on Streams
-- **Delay:** `out[t] = in[t-1]` (seed at 0)
-- **Differentiate:** `out[t] = add(in[t], neg(in[t-1]))`
-- **Integrate:** Running sum via feedback delay. **Lifted integrate:** compute to fixpoint, then **set default to latest** (freeze tail)
-
-### Lifted Operators
-- **Lift1(f) / Lift2(f):** Apply `f` over latest inputs once per tick
-- Track input/output **frontiers**
-- Compute only when a new tick is available
-
-### Incrementalization
-**Incrementalize2(f)** for **bilinear** `f`:
-```
-out[t] = f(a[t], b[t])
-      ⊕ f(z¹(I(a))[t], b[t])
-      ⊕ f(a[t], z¹(I(b))[t])
-```
-where `⊕` is group add, `I` is integrate, `z¹` is one-tick delay
-
-### ZSet Joins
-- **Join:** Nested-loop to start; multiply weights, sum by output key, prune zeros
-- **LazyZSet:** Represent as `Vec<ZSet<T>>`; group `add` concatenates; coalesce/equality intentionally expensive—use to avoid materializing big unions prematurely
-
-## What to Persist vs. Recompute
-
-### Must Persist (for incremental resumption)
-- ZSet weights (durable materialized state)
-- Operator state needed for the next tick (e.g., integrator's accumulator, indexes)
-- Minimal stream metadata (`timestamp`, `default`, optional `last_default_ts`)
-
-### Optional (persist if you need replay/materialization/serving)
-- Full stream timelines (non-default events + default breakpoints)
-- Materialized outputs for external queries
-
-## Low Write-Amplification Design
-
-The key to avoiding copies across `ZSet`, `Stream<ZSet>`, and `Stream<Stream<ZSet>>` is **referential storage**:
-
-### ZSet as Layered Versions
-
-**Segments (immutable deltas):**
-```
-zset/<zvid>/seg/<bucket>/<segid> -> bincode(Vec<(KeyID, i64_delta)>)
-```
-
-**Manifest (a version definition):**
-```
-zset/<zvid>/manifest -> bincode({
-  base: Option<ZVid>,                 // parent version to layer on
-  buckets: BTreeMap<u16, Vec<SegId>>, // per-bucket segment chain, newest last
-  stats: Option<...>                  // optional (keys, nonzero, bytes, etc.)
-})
-```
-
-**Optional materialized cache (per bucket):**
-```
-zset/<zvid>/mat/<bucket>/<KeyID> -> i64_weight   // only nonzero
-```
-
-**Write Path:**
-1. Partition changed keys into **buckets** (e.g., `xxhash64(key) % 256`)
-2. For each non-empty bucket, `PUT seg` with just those **deltas**
-3. `PUT manifest` with `base = Some(old_zvid)` and the appended `segid`s
-4. Return `ZSetHandle { zvid, view_ts: None }`
-
-**Effect:** O(Δ) bytes where Δ = #changed keys. No copying of entire ZSets.
-
-### Streams Carry Handles (Tiny)
-
-**Stream of ZSets:**
-```
-stream/<ns>/data/<ts>    -> bincode(ZSetHandle { zvid: ZVid, view_ts: Option<i64> })
-stream/<ns>/default/<ts> -> bincode(ZSetHandle)
-stream/<ns>/meta/state   -> bincode({ timestamp, identity, default: ZSetHandle })
-```
-
-If the ZSet didn't change at time `t`, reuse the same `zvid`. That's **one small write** for the stream row and **zero** writes for the ZSet.
-
-**Stream of Streams of ZSets:**
-```
-stream/<outer_ns>/data/<ts_outer> -> bincode(StreamHandle { ns: "<inner-ns>", frontier: i64 })
-```
-
-### Optional Key Interning
-Shrink segments by mapping keys to `u64` IDs:
-```
-dict/<ns>/k2id/<encoded-K> -> u64_be_key_id
-dict/<ns>/id2k/<u64_be_id> -> <encoded-K>
-dict/<ns>/meta             -> { next_id: u64 }
-```
-
-### Compaction & GC
-- **Compaction:** Merge long per-bucket segment chains into fewer segments
-- **Reference counting:** Keep liveness for each `zvid`:
-  ```
-  ref/<zvid> -> u64_be_refcount
-  ```
-- Increment when referenced; decrement when removed
-- Delete `zset/<zvid>/*` when count hits zero
-
-### Recursion / Fixpoint with Minimal Writes
-```
-recur/<ns>/<epoch>/state/materialized -> (alias to a zvid or a small manifest)
-recur/<ns>/<epoch>/delta/<K>          -> i64_be_weight
-recur/<ns>/<epoch>/meta               -> { iter: u32, stable: bool, zvid: ZVid }
-```
-
-## SlateDB API Reference (v0.8.2)
-
-### Opening & Configuration
-- `Db::open(path, Arc<dyn ObjectStore>)` - Default settings
-- `Db::builder(..).with_settings(Settings)` - Tune flush cadence, TTLs, cache, compaction
-- `Db::resolve_object_store(url)` - Supports s3://, gs://, filesystem, etc.
-
-### Write Path
-- `put`, `put_with_options`, `delete`, `write(WriteBatch)`
-- `WriteOptions.await_durable = true` - Block until durable (default)
-- `PutOptions` - Per-row TTL override
-- `Db::flush()` - Force memtables/WAL to object storage
-
-### Durability & Checkpoints
-- `create_checkpoint(scope, &CheckpointOptions)` - Snapshot manifest
-- `CheckpointScope::All` - Include pending writes
-- `CheckpointScope::Durable` - Only flushed data
-- `snapshot()` - Consistent reads without full checkpoint
-
-### Read Path
-- `DbReader::open(path, object_store, checkpoint_id, DbReaderOptions)` - Read-only workers
-- `get` - Returns `Option<Bytes>`
-- `scan`/`scan_with_options` - Range queries, returns `DbIterator`
-- `ReadOptions` / `ScanOptions` - Control durability filter, dirty reads, read-ahead
-
-### Merge Operations
-- Implement `MergeOperator` for associative combine operations
-- Useful for counters or append-only buffers
-
-## Performance Hygiene
-
-- **Batch flushes** when possible (transactional if available)
-- Use bounded caches (LRU/sliding window) for stream events
-- Avoid full-prefix scans on hot paths
-- Use big-endian timestamp keys for ordered scans
-- Keep default-change lists compact (store latest breakpoint in state)
-- Track metadata like nonzero-key counter, `last_default_ts` to avoid expensive scans
-
-## Testing Checklist
-
-### Group Laws
-- Associativity, commutativity, identity/inverse for each `AbelianGroup<T>` impl (ZSet, Stream)
-
-### Stream Parity
-- Run same sequence of `send`/`set_default` as Python reference
-- Compare `get(t)` for all `t`
-
-### Operator Parity
-- Delay/Differentiate/Integrate/Lift1/Lift2/Incrementalize2 produce same outputs step-by-step
-
-### Crash/Restart
-- Write/flush/reopen ZSets and Streams
-- Verify `current_time`, `latest`, default floor logic, zero-pruning
-- If using intents, verify idempotent recovery
-
-## Module Layout
-
-```
-core/
-  abelian_group.rs
-
-store/
-  kv.rs
-  slate.rs
-  table.rs
-
-zset/
-  zset.rs              // materialized API
-  versioned.rs         // segments, manifests, compaction, refcount
-  addition.rs
-
-stream/
-  stream.rs            // sparse events + default breakpoints + meta/state
-  handle.rs            // ZSetHandle, StreamHandle
-  group.rs
-  ops_linear.rs
-  lift.rs
-
-operators/
-  incrementalize2.rs
-  joins.rs
-  indexes.rs           // optional: posting lists for equi-joins
-
-dict/
-  interning.rs         // optional key-id dictionary
-```
-
-## Current Implementation (crates/dbsp/src/)
-
-### Existing Files
-- `algebra/mod.rs` - `AbelianGroup<T>` trait
-- `collections/zset.rs` - `ZSet<K>` implementation with SlateDB persistence
-- `stream/mod.rs` - `Stream<T>` implementation with sparse storage
-- `storage/mod.rs` - `KeyValueTable` trait
-- `storage/encoding.rs` - rkyv serialization helpers
-
-### Key Types (Rust Sketches)
-
-```rust
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ZSetHandle {
-    pub zvid: [u8; 16],          // ULID/UUID
-    pub view_ts: Option<i64>,    // optional read fence
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ZSetManifest {
-    pub base: Option<[u8; 16]>,
-    pub buckets: BTreeMap<u16, Vec<[u8; 16]>>, // segids, newest last
-    pub stats: Option<ManifestStats>,
-}
-
-pub trait ZSetVersioned<K> {
-    fn commit_delta(&mut self, deltas: impl Iterator<Item=(K, i64)>) -> anyhow::Result<ZSetHandle>;
-    fn compact(&mut self, zvid: [u8; 16], buckets: &[u16]) -> anyhow::Result<[u8; 16]>;
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct StreamHandle {
-    pub ns: String,     // inner stream namespace
-    pub frontier: i64,  // committed timestamp
-}
-```
-
-Here's the properly formatted markdown that you can copy and paste directly into your IDE:
-
-```markdown
-## Indexed ZSet (Join-Optimized Materialized State)
-
-**File:** `zset/indexed.rs` (proposed)
-
-**Semantics:** A ZSet keyed by **primary key** `K`, where each key maps to zero or more **values** `V` with integer weights. Represents DBSP's *indexed zset* form used for GROUP BY and JOIN efficiently.
-
-This enables:
-- Fast lookup of all `(V, z)` for a given `K`
-- Efficient incremental joins (`K` or `V`-keyed posting lists)
-- Prefix-based consolidation on compaction
-
-### Data Model
-
-We extend the existing **composite (K,V) → z** layout so all values for a given key are stored contiguously:
-
-```
-index//data/<key_enc>||<val_enc> -> i64_be_weight
-index//epoch/<key_enc>||<val_enc> -> i64_be_weight (optional per-epoch detail)
-index//meta/state -> { committed_epoch, refcounts(optional) }
-```
-
-- **Zero weight = absent** (delete key)
-- Keys and values use the same codec as normal `ZSet<K>` / `Stream<T>`
-- Composite lexical ordering ensures:
-
-```
-prefix = index//data/<key_enc>|
-prefix scan → all (V, z) pairs for K
-```
-
-Optional: Maintain **secondary posting indexes** for join keys:
-
-```
-index//by_v/<val_enc>||<key_enc> -> i64_be_weight
-```
-
-(Only if you expect frequent joins by value)
-
-### API
-
-Integrated into existing `ZSet<K>` via a specialization:
-
-NOTE: This is just a sketch, you _should_ match `pydbsp` as close as possible
-```rust
-pub trait IndexedZSet<K, V>: AbelianGroup<Self> {
-    fn add_delta(&mut self, k: &K, v: &V, dz: i64) -> anyhow::Result<()>;
-    fn get_weight(&self, k: &K, v: &V) -> anyhow::Result<i64>;
-    fn values_for_key<'a>(
-        &'a self,
-        k: &K,
-    ) -> anyhow::Result<Box<dyn Iterator<Item=(V, i64)> + 'a>>;
-    fn flush(&mut self) -> anyhow::Result<()>;
-}
-```
-
-Internally, this resolves to:
-
-```
-index/<ns>/data/(K,V)  --> weight
-```
-
-Using prefix scans and the existing `KeyValueTable` trait.
-
-### Write Path (Batched Differentials)
-
-* Buffer `(K,V,dz)` changes in-memory — aggregated by key during the same tick
-* Convert `dz + existing_z → new_z`
-* If `new_z == 0`, delete; else put
-* Write through `WriteBatch` atomically with frontier advancement
-
-Frontier commit marker (optional for crash safety):
-
-```
-index/<ns>/meta/state = { committed_epoch }
-```
-
-On restart: ignore rows with `epoch > committed_epoch`.
-
-### Read Path (Prefix Scans)
-
-Efficient for group-by / join:
-
-```rust
-let vals = indexed.values_for_key(&k)?;
-for (v, z) in vals {
-    if z != 0 { ... }   // zero-pruned already by writes/compaction
-}
-```
-
-Reader-visible state = sum of weights at or below frontier.
-
-### Consolidation & Compaction
-
-Merges opposing deltas over time:
-
-* Periodic prefix compaction per key:
-  * Range scan `index/<ns>/data/<k>|*`
-  * Sum duplicates → rewrite single row if nonzero
-* Bound read-amplification by bucket-level manifests (optional)
-* Works with incremental epoch frontier:
-  * Compaction only ≤ stable frontier
-  * Epoch rows may be deleted once frontier passes them
-
-This matches DBSP's consolidation step and avoids explosion of diffs.
-
-### Indexed Join Support
-
-Joins use indexes directly:
-
-```
-R(K → V) ⋈ S(V → W)
-```
-
-Using:
-
-* `R.values_for_key(K)` for K-based join
-* Optional `R.by_v(V)` for V-based join symmetry
-
-Operators in `operators/indexes.rs` can query posted-index namespace in the same manner as `values_for_key`.
-
-### Crash Safety
-
-Atomic diff visibility per batch:
-
-1. Write differential rows (data/epoch as needed)
-2. Write frontier commit marker
-3. Readers ignore rows beyond committed frontier
-
-Add intents only if multiple-step commit appears in future.
-
-### Why This Belongs Here
-
-✅ Based on DBSP formal indexed zset definition  
-✅ Fits existing AbelianGroup semantics (weights and negation)  
-✅ Uses your pending overlay + batched SlateDB writes  
-✅ Prefix scans leverage existing KV abstraction  
-✅ Supports incremental JOIN operators efficiently
-```
-
-## Do's & Don'ts (Amplification Edition)
-
-### Do
-- Store **handles** in streams; store **segments + manifest** for ZSet versions
-- Use **bucket sharding** for ZSet deltas; **batch** per bucket
-- **Version values** with a 1-byte codec tag (future-proof encodings)
-- **Compact** in the background and keep **refcounts** for safe GC
-- For recursion, persist `(zvid, iter, stable)` and write only the **delta** each iteration
-
-### Don't
-- Don't copy a full ZSet into a stream row
-- Don't rewrite a whole ZSet on small updates
-- Don't persist LazyZSet internals—persist the **coalesced** result (or indexes) as needed
-
-## Why This Design Stays Fast
-
-Let `Δ` be the number of changed keys at a tick and `B` the number of touched buckets.
-
-- **Bytes written per update:** `≈ Σ size(seg_b) + |manifest| + |stream_row| = O(Δ) + O(1)`
-- **Nested streams:** Outer/inner stream rows are **tiny handles** (tens of bytes), independent of ZSet size
-- **Recursion:** Each iteration is one small delta segment + one manifest → **linear in change**, not in full state
-
-## Development Commands
-
-Since this is a library crate, testing is the primary development activity:
-
-```bash
-# Run all tests in this crate
-cargo test -p dbsp
-
-# Run with output
-cargo test -p dbsp -- --nocapture
-
-# Run a specific test
-cargo test -p dbsp test_name
-```
+## Reference Context
+For semantic cross-checking, compare with Feldera when needed:
+`/home/jlerche/programming_projects/github.com/feldera/feldera`

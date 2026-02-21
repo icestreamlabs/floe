@@ -10,7 +10,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::LegacyIndexedBatchZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::relation_state::RelationState;
@@ -65,8 +65,8 @@ where
 {
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
-    pub left_index: LegacyIndexedBatchZSet<K, L>,
-    pub right_index: LegacyIndexedBatchZSet<K, R>,
+    pub left_index: IndexedBatchZSet<K, L>,
+    pub right_index: IndexedBatchZSet<K, R>,
     pub left_key: JoinKeyExtractor<L, K>,
     pub right_key: JoinKeyExtractor<R, K>,
     pub predicate: JoinPredicate<L, R>,
@@ -121,8 +121,8 @@ where
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
-        left_index: LegacyIndexedBatchZSet<K, L>,
-        right_index: LegacyIndexedBatchZSet<K, R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
         left_key: JoinKeyExtractor<L, K>,
         right_key: JoinKeyExtractor<R, K>,
         predicate: JoinPredicate<L, R>,

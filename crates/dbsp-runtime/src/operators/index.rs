@@ -9,7 +9,7 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
-use crate::collections::LegacyIndexedBatchZSet;
+use crate::collections::IndexedBatchZSet;
 use crate::handles::ZSetHandle;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -40,7 +40,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub index: LegacyIndexedBatchZSet<K, V>,
+    pub index: IndexedBatchZSet<K, V>,
     pub table: Arc<dyn KeyValueTable>,
     pub key_extractor: KeyExtractor<V, K>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
@@ -68,7 +68,7 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub fn new(
-        index: LegacyIndexedBatchZSet<K, V>,
+        index: IndexedBatchZSet<K, V>,
         table: Arc<dyn KeyValueTable>,
         key_extractor: KeyExtractor<V, K>,
     ) -> Self {
@@ -252,7 +252,7 @@ mod tests {
                 .expect("build input dictionary"),
         );
 
-        let index = LegacyIndexedBatchZSet::new(table.clone(), "arrange_index");
+        let index = IndexedBatchZSet::new(table.clone(), "arrange_index");
         let key_extractor: KeyExtractor<i64, i64> =
             Arc::new(
                 |value: &i64| {
@@ -316,7 +316,7 @@ mod tests {
                 .expect("build input dictionary"),
         );
 
-        let index = LegacyIndexedBatchZSet::new(table.clone(), "arrange_recompute_index");
+        let index = IndexedBatchZSet::new(table.clone(), "arrange_recompute_index");
         let key_extractor: KeyExtractor<i64, i64> =
             Arc::new(
                 |value: &i64| {

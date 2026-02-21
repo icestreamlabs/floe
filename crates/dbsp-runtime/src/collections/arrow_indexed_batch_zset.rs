@@ -120,6 +120,10 @@ where
         Self::new(table, namespace)
     }
 
+    pub fn engine_kind(&self) -> &'static str {
+        "indexed_batch"
+    }
+
     fn build(
         table: Arc<dyn KeyValueTable>,
         namespace: String,
@@ -977,6 +981,26 @@ mod tests {
         let mut second = index.values_for_key(&1).await.expect("read updated cache");
         second.sort_unstable();
         assert_eq!(second, vec![(11, 1), (12, 3)]);
+    }
+
+    #[tokio::test]
+    async fn arrow_indexed_reopen_preserves_persisted_state() {
+        let table = build_table("arrow-indexed-reopen").await;
+        let namespace = "arrow_indexed_reopen";
+        let writer = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
+        writer
+            .apply_deltas(vec![(1, 10, 1), (1, 11, 2), (1, 10, -1), (2, 20, 3)])
+            .await
+            .expect("seed and update Arrow-index state");
+
+        let reader = IndexedBatchZSet::<i64, i64>::new(table, namespace);
+        let mut key_one = reader.values_for_key(&1).await.expect("reopen key lookup");
+        key_one.sort_unstable();
+        assert_eq!(key_one, vec![(11, 2)]);
+
+        let mut key_two = reader.values_for_key(&2).await.expect("reopen key lookup");
+        key_two.sort_unstable();
+        assert_eq!(key_two, vec![(20, 3)]);
     }
 
     #[tokio::test]

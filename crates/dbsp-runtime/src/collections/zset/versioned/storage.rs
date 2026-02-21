@@ -1,7 +1,13 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
+use std::io::Cursor;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -95,7 +101,8 @@ where
         let mut buckets = BTreeMap::new();
         for record in &processed {
             let key = self.segment_key(record.bucket, record.id);
-            let encoded = encoding::encode(record).context("encode versioned segment")?;
+            let encoded =
+                encode_segment_record(record).context("encode versioned segment as Arrow IPC")?;
             batch.put(key, encoded);
             buckets
                 .entry(record.bucket)
@@ -464,7 +471,8 @@ where
             self.table.get(&key).await?.ok_or_else(|| {
                 anyhow!("segment not found for bucket {bucket} segment {segment}")
             })?;
-        encoding::decode(&bytes).context("decode segment record")
+        decode_segment_record(bucket, segment, &bytes)
+            .context("decode versioned segment from Arrow IPC")
     }
 
     pub(super) async fn load_manifest_record(&self, version: u64) -> Result<ZSetVersionManifest> {
@@ -507,4 +515,74 @@ fn encode_manifest(manifest: &ZSetVersionManifest) -> Result<Vec<u8>> {
 
 fn decode_manifest(bytes: &[u8]) -> Result<ZSetVersionManifest> {
     encoding::decode(bytes).context("decode ZSet manifest")
+}
+
+fn segment_delta_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key_id", DataType::UInt64, false),
+        Field::new("delta", DataType::Int64, false),
+    ]))
+}
+
+fn encode_segment_record(record: &SegmentRecord) -> Result<Vec<u8>> {
+    let schema = segment_delta_schema();
+    let key_ids: Vec<u64> = record.deltas.iter().map(|(key_id, _)| *key_id).collect();
+    let deltas: Vec<i64> = record.deltas.iter().map(|(_, delta)| *delta).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(UInt64Array::from(key_ids)) as ArrayRef,
+            Arc::new(Int64Array::from(deltas)) as ArrayRef,
+        ],
+    )
+    .context("build versioned segment Arrow batch")?;
+
+    let mut payload = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut payload, schema.as_ref())
+            .context("create versioned segment Arrow writer")?;
+        writer
+            .write(&batch)
+            .context("write versioned segment Arrow batch")?;
+        writer
+            .finish()
+            .context("finalize versioned segment Arrow writer")?;
+    }
+
+    Ok(payload)
+}
+
+fn decode_segment_record(
+    bucket: u16,
+    segment_id: SegmentId,
+    bytes: &[u8],
+) -> Result<SegmentRecord> {
+    let cursor = Cursor::new(bytes);
+    let mut reader =
+        StreamReader::try_new(cursor, None).context("create versioned segment Arrow reader")?;
+
+    let mut deltas = Vec::new();
+    for batch in &mut reader {
+        let batch = batch.context("read versioned segment Arrow batch")?;
+        let key_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("invalid versioned segment key_id column type"))?;
+        let weights = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("invalid versioned segment delta column type"))?;
+
+        for idx in 0..batch.num_rows() {
+            deltas.push((key_ids.value(idx), weights.value(idx)));
+        }
+    }
+
+    Ok(SegmentRecord {
+        id: segment_id,
+        bucket,
+        deltas,
+    })
 }

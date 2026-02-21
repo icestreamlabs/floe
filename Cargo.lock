@@ -1785,6 +1785,7 @@ dependencies = [
  "ahash 0.8.12",
  "anyhow",
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "dbsp-storage",

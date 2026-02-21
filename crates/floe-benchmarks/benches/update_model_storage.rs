@@ -13,11 +13,10 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
-use dbsp::collections::{IndexedBatchZSet, LegacyIndexedBatchZSet, VersionedBatchZSet};
+use dbsp::collections::{IndexedBatchZSet, VersionedBatchZSet};
 use dbsp::storage::dictionary::Dictionary;
-use dbsp::storage::encoding::encode;
 use dbsp::storage::gc::{GcPolicy, GcService};
-use dbsp::storage::manifest::{DataManifest, IndexManifest, ManifestStatistics, ManifestStore};
+use dbsp::storage::manifest::{DataManifest, ManifestStatistics, ManifestStore};
 use dbsp::storage::segment::{ArrowSegmentStore, SegmentWriteStats};
 use dbsp::storage::{KeyValueTable, SlateTable};
 use object_store::memory::InMemory;
@@ -555,101 +554,106 @@ fn bench_update_model_indexed(c: &mut Criterion) {
         let coalescing_probe = coalescing_probe_updates(batch_size, key_cardinality);
         let deltas_0_to_1 = strip_keyed_updates(&updates_0_to_1);
         let arrow_delta_bytes = encode_arrow_ipc_delta_batch(Arc::clone(&schema), &deltas_0_to_1);
-        let rkyv_total_bytes = updates_0_to_1
-            .iter()
-            .map(|(_, row, _)| encode(row).expect("encode rkyv row").len())
-            .sum::<usize>();
 
         println!(
-            "update_model_size_report,batch_size={batch_size},rkyv_delta_total_bytes={rkyv_total_bytes},arrow_delta_total_bytes={},arrow_over_rkyv={:.2}",
-            arrow_delta_bytes.len(),
-            arrow_delta_bytes.len() as f64 / rkyv_total_bytes as f64,
+            "update_model_size_report,batch_size={batch_size},arrow_delta_total_bytes={}",
+            arrow_delta_bytes.len()
         );
-        let indexed_amp_table = open_table(&runtime, next_db_name("bench-indexed-amp", batch_size));
-        let indexed_amp_namespace = next_namespace("indexed_amp");
-        let indexed_put_table = open_table(&runtime, next_db_name("bench-indexed-put", batch_size));
-        let indexed_put_namespace = next_namespace("indexed_put");
+        let indexed_amp_table = open_table(
+            &runtime,
+            next_db_name("bench-arrow-indexed-amp", batch_size),
+        );
+        let indexed_amp_namespace = next_namespace("arrow_indexed_amp");
+        let indexed_put_table = open_table(
+            &runtime,
+            next_db_name("bench-arrow-indexed-put", batch_size),
+        );
+        let indexed_put_namespace = next_namespace("arrow_indexed_put");
         let overlay_amp_table = open_table(&runtime, next_db_name("bench-overlay-amp", batch_size));
         let overlay_amp_prefix = format!(
             "bench/overlay-amp/{batch_size}/{}",
             NS_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let (indexed_read_amp, indexed_put_metrics, overlay_read_amp, cold_lookup, warm_lookup) =
-            runtime.block_on(async {
-                let put_index =
-                    LegacyIndexedBatchZSet::new(indexed_put_table, indexed_put_namespace);
-                let indexed_put_metrics = put_index
-                    .apply_deltas_with_stats(coalescing_probe.iter().cloned())
-                    .await
-                    .expect("apply coalescing probe updates");
+        let (
+            arrow_indexed_read_amp,
+            arrow_indexed_put_metrics,
+            overlay_read_amp,
+            cold_lookup,
+            warm_lookup,
+        ) = runtime.block_on(async {
+            let put_index = IndexedBatchZSet::new(indexed_put_table, indexed_put_namespace);
+            let indexed_put_metrics = put_index
+                .apply_deltas_with_stats(coalescing_probe.iter().cloned())
+                .await
+                .expect("apply coalescing probe updates");
 
-                let index = LegacyIndexedBatchZSet::new(indexed_amp_table, indexed_amp_namespace);
-                index
-                    .apply_deltas(initial.iter().cloned())
-                    .await
-                    .expect("seed indexed zset for read amplification");
-                index
-                    .apply_deltas(updates_0_to_1.iter().cloned())
-                    .await
-                    .expect("apply indexed zset updates for read amplification");
-                let indexed_read_amp = index
-                    .estimated_read_amplification_for_key(&0_i64)
-                    .await
-                    .expect("estimate indexed read amplification");
+            let index = IndexedBatchZSet::new(indexed_amp_table, indexed_amp_namespace);
+            index
+                .apply_deltas(initial.iter().cloned())
+                .await
+                .expect("seed Arrow-indexed zset for read amplification");
+            index
+                .apply_deltas(updates_0_to_1.iter().cloned())
+                .await
+                .expect("apply Arrow-indexed zset updates for read amplification");
+            let indexed_read_amp = index
+                .estimated_read_amplification_for_key(&0_i64)
+                .await
+                .expect("estimate Arrow-indexed read amplification");
 
-                overlay_append(
-                    overlay_amp_table.clone(),
-                    Arc::clone(&schema),
-                    &overlay_amp_prefix,
-                    1,
-                    &initial,
-                )
-                .await;
-                overlay_append(
-                    overlay_amp_table.clone(),
-                    Arc::clone(&schema),
-                    &overlay_amp_prefix,
-                    2,
-                    &updates_0_to_1,
-                )
-                .await;
-                let mut decode_cache = OverlayDecodeCache::new(OVERLAY_DECODE_CACHE_CAPACITY);
-                let cold_lookup = overlay_lookup_with_cache(
-                    overlay_amp_table.clone(),
-                    &overlay_amp_prefix,
-                    0,
-                    &mut decode_cache,
-                )
-                .await;
-                let warm_lookup = overlay_lookup_with_cache(
-                    overlay_amp_table.clone(),
-                    &overlay_amp_prefix,
-                    0,
-                    &mut decode_cache,
-                )
-                .await;
-                let overlay_read_amp =
-                    overlay_read_amplification(overlay_amp_table, &overlay_amp_prefix, 0).await;
-                (
-                    indexed_read_amp,
-                    indexed_put_metrics,
-                    overlay_read_amp,
-                    cold_lookup.metrics,
-                    warm_lookup.metrics,
-                )
-            });
+            overlay_append(
+                overlay_amp_table.clone(),
+                Arc::clone(&schema),
+                &overlay_amp_prefix,
+                1,
+                &initial,
+            )
+            .await;
+            overlay_append(
+                overlay_amp_table.clone(),
+                Arc::clone(&schema),
+                &overlay_amp_prefix,
+                2,
+                &updates_0_to_1,
+            )
+            .await;
+            let mut decode_cache = OverlayDecodeCache::new(OVERLAY_DECODE_CACHE_CAPACITY);
+            let cold_lookup = overlay_lookup_with_cache(
+                overlay_amp_table.clone(),
+                &overlay_amp_prefix,
+                0,
+                &mut decode_cache,
+            )
+            .await;
+            let warm_lookup = overlay_lookup_with_cache(
+                overlay_amp_table.clone(),
+                &overlay_amp_prefix,
+                0,
+                &mut decode_cache,
+            )
+            .await;
+            let overlay_read_amp =
+                overlay_read_amplification(overlay_amp_table, &overlay_amp_prefix, 0).await;
+            (
+                indexed_read_amp,
+                indexed_put_metrics,
+                overlay_read_amp,
+                cold_lookup.metrics,
+                warm_lookup.metrics,
+            )
+        });
         println!(
-            "update_model_read_amp_report,batch_size={batch_size},indexed_read_amp={indexed_read_amp},overlay_read_amp={overlay_read_amp}"
+            "update_model_read_amp_report,batch_size={batch_size},arrow_indexed_read_amp={arrow_indexed_read_amp},overlay_read_amp={overlay_read_amp}"
         );
         println!(
             "update_model_put_report,batch_size={batch_size},input_non_zero={},persisted_records={},write_reduction={:.2}",
-            indexed_put_metrics.non_zero_input_records,
-            indexed_put_metrics.persisted_records,
-            if indexed_put_metrics.non_zero_input_records == 0 {
+            arrow_indexed_put_metrics.non_zero_input_records,
+            arrow_indexed_put_metrics.persisted_records,
+            if arrow_indexed_put_metrics.non_zero_input_records == 0 {
                 0.0
             } else {
-                indexed_put_metrics.persisted_records as f64
-                    / indexed_put_metrics.non_zero_input_records as f64
+                arrow_indexed_put_metrics.persisted_records as f64
+                    / arrow_indexed_put_metrics.non_zero_input_records as f64
             }
         );
         println!(
@@ -662,74 +666,6 @@ fn bench_update_model_indexed(c: &mut Criterion) {
             warm_lookup.decoded_rows,
             warm_lookup.index_entries_scanned,
             warm_lookup.unique_segments,
-        );
-
-        group.bench_function(
-            BenchmarkId::new("indexed_zset_apply_toggle", batch_size),
-            |b| {
-                let table = open_table(&runtime, next_db_name("bench-indexed-zset", batch_size));
-                let namespace = next_namespace("indexed_zset");
-                let index = LegacyIndexedBatchZSet::new(table, namespace);
-                runtime.block_on(async {
-                    index
-                        .apply_deltas(initial.iter().cloned())
-                        .await
-                        .expect("seed indexed zset");
-                });
-
-                let mut flip = false;
-                b.iter(|| {
-                    let updates = if flip {
-                        &updates_1_to_0
-                    } else {
-                        &updates_0_to_1
-                    };
-                    flip = !flip;
-                    runtime.block_on(async {
-                        index
-                            .apply_deltas(updates.iter().cloned())
-                            .await
-                            .expect("apply indexed zset toggle");
-                    });
-                });
-            },
-        );
-
-        group.bench_function(
-            BenchmarkId::new("indexed_zset_apply_lookup_hot_key", batch_size),
-            |b| {
-                let table = open_table(&runtime, next_db_name("bench-indexed-hot", batch_size));
-                let namespace = next_namespace("indexed_zset_hot");
-                let index = LegacyIndexedBatchZSet::new(table, namespace);
-                runtime.block_on(async {
-                    index
-                        .apply_deltas(initial.iter().cloned())
-                        .await
-                        .expect("seed indexed zset");
-                });
-
-                let lookup_key = 0_i64;
-                let mut flip = false;
-                b.iter(|| {
-                    let updates = if flip {
-                        &updates_1_to_0
-                    } else {
-                        &updates_0_to_1
-                    };
-                    flip = !flip;
-                    runtime.block_on(async {
-                        index
-                            .apply_deltas(updates.iter().cloned())
-                            .await
-                            .expect("apply indexed zset toggle");
-                        let values = index
-                            .values_for_key(&lookup_key)
-                            .await
-                            .expect("lookup indexed zset key");
-                        black_box(values);
-                    });
-                });
-            },
         );
 
         group.bench_function(
@@ -800,55 +736,6 @@ fn bench_update_model_indexed(c: &mut Criterion) {
                             .values_for_key(&lookup_key)
                             .await
                             .expect("lookup Arrow-indexed zset key");
-                        black_box(values);
-                    });
-                });
-            },
-        );
-
-        group.bench_function(
-            BenchmarkId::new("indexed_zset_apply_lookup_hot_key_compacted", batch_size),
-            |b| {
-                let table = open_table(
-                    &runtime,
-                    next_db_name("bench-indexed-hot-compacted", batch_size),
-                );
-                let namespace = next_namespace("indexed_zset_hot_compacted");
-                let index = LegacyIndexedBatchZSet::new(table.clone(), namespace.clone());
-                let manifest_store = ManifestStore::<IndexManifest>::index(table, namespace);
-                runtime.block_on(async {
-                    index
-                        .apply_deltas(initial.iter().cloned())
-                        .await
-                        .expect("seed indexed zset compacted benchmark");
-                });
-
-                let lookup_key = 0_i64;
-                let mut flip = false;
-                b.iter(|| {
-                    let updates = if flip {
-                        &updates_1_to_0
-                    } else {
-                        &updates_0_to_1
-                    };
-                    flip = !flip;
-                    runtime.block_on(async {
-                        index
-                            .apply_deltas(updates.iter().cloned())
-                            .await
-                            .expect("apply indexed zset compacted update");
-                        index
-                            .compact_l0_to_l1()
-                            .await
-                            .expect("compact indexed zset L0->L1");
-                        index
-                            .publish_compacted_manifest(&manifest_store)
-                            .await
-                            .expect("publish compacted manifest");
-                        let values = index
-                            .values_for_key(&lookup_key)
-                            .await
-                            .expect("lookup compacted indexed zset key");
                         black_box(values);
                     });
                 });

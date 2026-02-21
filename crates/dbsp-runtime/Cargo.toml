@@ -8,6 +8,7 @@ dbsp-storage = { path = "../dbsp-storage" }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

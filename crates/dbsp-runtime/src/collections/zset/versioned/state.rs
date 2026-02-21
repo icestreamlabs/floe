@@ -64,11 +64,11 @@ where
         let namespace = namespace.into();
         let mut manifest_prefix = ZSET_PREFIX.as_bytes().to_vec();
         manifest_prefix.extend_from_slice(namespace.as_bytes());
-        manifest_prefix.extend_from_slice(b"/manifest/");
+        manifest_prefix.extend_from_slice(b"/manifest_arrow/");
 
         let mut segment_prefix = ZSET_PREFIX.as_bytes().to_vec();
         segment_prefix.extend_from_slice(namespace.as_bytes());
-        segment_prefix.extend_from_slice(b"/seg/");
+        segment_prefix.extend_from_slice(b"/seg_arrow/");
 
         let mut intent_key = manifest_prefix.clone();
         intent_key.extend_from_slice(b"intent");

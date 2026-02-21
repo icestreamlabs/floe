@@ -16,7 +16,7 @@ pub(crate) async fn assert_manifest_exists(
     namespace: &str,
     version: u64,
 ) -> Result<()> {
-    let mut key = format!("zset/{namespace}/manifest/").into_bytes();
+    let mut key = format!("zset/{namespace}/manifest_arrow/").into_bytes();
     key.extend_from_slice(&version.to_be_bytes());
     let exists = table
         .get(&key)

@@ -159,7 +159,7 @@ mod tests {
             .integrated
             .table()
             .scan_prefix(
-                b"zset/relation-state-update/manifest/",
+                b"zset/relation-state-update/manifest_arrow/",
                 &ScanOptions::default(),
             )
             .await
