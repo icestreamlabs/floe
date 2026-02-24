@@ -2,21 +2,117 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use reqwest::Url;
 use serde::Deserialize;
 
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME, PERSON_SOURCE_NAME};
 use floe_node_core::source::SourceRegistry;
-use floe_sql_parser::{SinkConnector, SinkDefinition};
+use floe_sql_parser::{MaterializedViewDefinition, SinkConnector, SinkDefinition};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default)]
     pub connectors: Vec<ConnectorConfig>,
     #[serde(default)]
+    pub materialized_views: Vec<MaterializedViewConfig>,
+    #[serde(default)]
     pub sinks: Vec<SinkConfig>,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedViewConfig {
+    pub name: String,
+    pub query: String,
+    #[serde(default)]
+    pub if_not_exists: bool,
+}
+
+impl MaterializedViewConfig {
+    pub fn to_definition(&self) -> MaterializedViewDefinition {
+        MaterializedViewDefinition::new(self.name.clone(), self.query.clone(), self.if_not_exists)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputConsolidationModeConfig {
+    AllColumns,
+    Key,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub events_per_second: Option<f64>,
+    #[serde(default)]
+    pub max_events: Option<u64>,
+    #[serde(default)]
+    pub output_consolidation_mode: Option<OutputConsolidationModeConfig>,
+    #[serde(default)]
+    pub ingest_queue_capacity: Option<usize>,
+    #[serde(default)]
+    pub ingest_batch_size: Option<usize>,
+    #[serde(default)]
+    pub ingest_batch_per_source: Option<usize>,
+    #[serde(default)]
+    pub ingest_batch_per_connector: Option<usize>,
+    #[serde(default)]
+    pub mv_retain_last: Option<usize>,
+    #[serde(default)]
+    pub http_host: Option<String>,
+    #[serde(default)]
+    pub kafka_group_id: Option<String>,
+    #[serde(default)]
+    pub kafka_poll_ms: Option<u64>,
+    #[serde(default)]
+    pub kafka_max_messages: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub await_durable: Option<bool>,
+    #[serde(default)]
+    pub slatedb_config: Option<String>,
+    #[serde(default)]
+    pub slatedb_env_prefix: Option<String>,
+    #[serde(default)]
+    pub zset_compaction_max_chain_len: Option<usize>,
+    #[serde(default)]
+    pub zset_compaction_max_segments: Option<usize>,
+    #[serde(default)]
+    pub zset_compaction_backoff_ticks: Option<u64>,
+    #[serde(default)]
+    pub zset_compaction_max_concurrent_jobs: Option<usize>,
+    #[serde(default)]
+    pub zset_gc_grace_period_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub inspect_namespace: Vec<String>,
+    #[serde(default)]
+    pub compact_namespace: Vec<String>,
+    #[serde(default)]
+    pub gc_namespace: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConnectorConfig {
     Kafka {
@@ -83,6 +179,7 @@ pub enum ConnectorConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SinkConfig {
     Kafka {
@@ -174,12 +271,14 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<NodeConfig> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    match ext.as_str() {
+    let config = match ext.as_str() {
         "toml" => toml::from_str(&contents).context("parse toml config"),
         "yaml" | "yml" => serde_yaml::from_str(&contents).context("parse yaml config"),
         "json" => serde_json::from_str(&contents).context("parse json config"),
         _ => parse_config_fallback(&contents),
-    }
+    }?;
+    validate_node_config(&config).context("validate node config")?;
+    Ok(config)
 }
 
 fn parse_config_fallback(contents: &str) -> Result<NodeConfig> {
@@ -190,6 +289,369 @@ fn parse_config_fallback(contents: &str) -> Result<NodeConfig> {
         return Ok(config);
     }
     toml::from_str(contents).context("parse config (tried json, yaml, toml)")
+}
+
+fn validate_node_config(config: &NodeConfig) -> Result<()> {
+    let mut seen_mv_names = HashSet::new();
+    for (index, mv) in config.materialized_views.iter().enumerate() {
+        ensure_non_empty(&mv.name, &format!("materialized_views[{index}].name"))?;
+        ensure_non_empty(&mv.query, &format!("materialized_views[{index}].query"))?;
+        if !seen_mv_names.insert(mv.name.clone()) {
+            bail!(
+                "duplicate materialized view name '{}' in materialized_views[{index}]",
+                mv.name
+            );
+        }
+    }
+    for (index, connector) in config.connectors.iter().enumerate() {
+        validate_connector(connector, index)?;
+    }
+    for (index, sink) in config.sinks.iter().enumerate() {
+        validate_sink(sink, index)?;
+    }
+    validate_runtime_config(&config.runtime)?;
+    validate_storage_config(&config.storage)?;
+    validate_maintenance_config(&config.maintenance)?;
+    Ok(())
+}
+
+fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
+    if let Some(rate) = runtime.events_per_second
+        && rate <= 0.0
+    {
+        bail!("runtime.events_per_second must be greater than 0");
+    }
+    if let Some(max_events) = runtime.max_events
+        && max_events == 0
+    {
+        bail!("runtime.max_events must be greater than 0");
+    }
+    ensure_optional_positive_usize(
+        runtime.ingest_queue_capacity,
+        "runtime.ingest_queue_capacity",
+    )?;
+    ensure_optional_positive_usize(runtime.ingest_batch_size, "runtime.ingest_batch_size")?;
+    ensure_optional_positive_usize(
+        runtime.ingest_batch_per_source,
+        "runtime.ingest_batch_per_source",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.ingest_batch_per_connector,
+        "runtime.ingest_batch_per_connector",
+    )?;
+    ensure_optional_non_empty(runtime.http_host.as_deref(), "runtime.http_host")?;
+    ensure_optional_non_empty(runtime.kafka_group_id.as_deref(), "runtime.kafka_group_id")?;
+    ensure_optional_positive_u64(runtime.kafka_poll_ms, "runtime.kafka_poll_ms")?;
+    ensure_optional_positive_usize(runtime.kafka_max_messages, "runtime.kafka_max_messages")?;
+    Ok(())
+}
+
+fn validate_storage_config(storage: &StorageConfig) -> Result<()> {
+    ensure_optional_non_empty(storage.slatedb_config.as_deref(), "storage.slatedb_config")?;
+    ensure_optional_non_empty(
+        storage.slatedb_env_prefix.as_deref(),
+        "storage.slatedb_env_prefix",
+    )?;
+    ensure_optional_positive_usize(
+        storage.zset_compaction_max_chain_len,
+        "storage.zset_compaction_max_chain_len",
+    )?;
+    ensure_optional_positive_usize(
+        storage.zset_compaction_max_segments,
+        "storage.zset_compaction_max_segments",
+    )?;
+    ensure_optional_positive_usize(
+        storage.zset_compaction_max_concurrent_jobs,
+        "storage.zset_compaction_max_concurrent_jobs",
+    )?;
+    ensure_optional_positive_u64(
+        storage.zset_gc_grace_period_ms,
+        "storage.zset_gc_grace_period_ms",
+    )?;
+    Ok(())
+}
+
+fn validate_maintenance_config(maintenance: &MaintenanceConfig) -> Result<()> {
+    for (index, namespace) in maintenance.inspect_namespace.iter().enumerate() {
+        ensure_non_empty(
+            namespace,
+            &format!("maintenance.inspect_namespace[{index}]"),
+        )?;
+    }
+    for (index, namespace) in maintenance.compact_namespace.iter().enumerate() {
+        ensure_non_empty(
+            namespace,
+            &format!("maintenance.compact_namespace[{index}]"),
+        )?;
+    }
+    for (index, namespace) in maintenance.gc_namespace.iter().enumerate() {
+        ensure_non_empty(namespace, &format!("maintenance.gc_namespace[{index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
+    match connector {
+        ConnectorConfig::Kafka {
+            name,
+            brokers,
+            topics,
+            group_id,
+            default_source,
+            poll_ms: _,
+            max_messages_per_tick,
+        } => {
+            ensure_non_empty(brokers, &format!("connectors[{index}].brokers"))?;
+            if topics.is_empty() {
+                bail!("connectors[{index}].topics must not be empty");
+            }
+            for (topic_index, topic) in topics.iter().enumerate() {
+                ensure_non_empty(topic, &format!("connectors[{index}].topics[{topic_index}]"))?;
+            }
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            ensure_optional_non_empty(
+                group_id.as_deref(),
+                &format!("connectors[{index}].group_id"),
+            )?;
+            ensure_optional_non_empty(
+                default_source.as_deref(),
+                &format!("connectors[{index}].default_source"),
+            )?;
+            ensure_optional_positive_usize(
+                *max_messages_per_tick,
+                &format!("connectors[{index}].max_messages_per_tick"),
+            )?;
+        }
+        ConnectorConfig::File {
+            name,
+            path,
+            default_source,
+        } => {
+            ensure_non_empty(path, &format!("connectors[{index}].path"))?;
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            ensure_optional_non_empty(
+                default_source.as_deref(),
+                &format!("connectors[{index}].default_source"),
+            )?;
+        }
+        ConnectorConfig::Http {
+            name,
+            host,
+            port,
+            default_source,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            ensure_optional_non_empty(host.as_deref(), &format!("connectors[{index}].host"))?;
+            if *port == 0 {
+                bail!("connectors[{index}].port must be greater than 0");
+            }
+            ensure_optional_non_empty(
+                default_source.as_deref(),
+                &format!("connectors[{index}].default_source"),
+            )?;
+        }
+        ConnectorConfig::Generator {
+            name,
+            events_per_second,
+            max_events,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            if let Some(rate) = events_per_second
+                && *rate <= 0.0
+            {
+                bail!("connectors[{index}].events_per_second must be greater than 0");
+            }
+            if let Some(limit) = max_events
+                && *limit == 0
+            {
+                bail!("connectors[{index}].max_events must be greater than 0");
+            }
+        }
+        ConnectorConfig::ObjectStore {
+            name,
+            url,
+            default_source,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            ensure_non_empty(url, &format!("connectors[{index}].url"))?;
+            Url::parse(url).with_context(|| {
+                format!("connectors[{index}].url must be a valid URL (found '{url}')")
+            })?;
+            ensure_optional_non_empty(
+                default_source.as_deref(),
+                &format!("connectors[{index}].default_source"),
+            )?;
+        }
+        ConnectorConfig::PostgresCdc {
+            name,
+            connection,
+            slot,
+            poll_ms: _,
+            max_changes,
+            default_schema,
+            include_tables,
+            include_schema_in_source: _,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
+            ensure_non_empty(connection, &format!("connectors[{index}].connection"))?;
+            Url::parse(connection).with_context(|| {
+                format!(
+                    "connectors[{index}].connection must be a valid postgres URL (found '{connection}')"
+                )
+            })?;
+            ensure_non_empty(slot, &format!("connectors[{index}].slot"))?;
+            ensure_optional_positive_usize(
+                *max_changes,
+                &format!("connectors[{index}].max_changes"),
+            )?;
+            ensure_optional_non_empty(
+                default_schema.as_deref(),
+                &format!("connectors[{index}].default_schema"),
+            )?;
+            if let Some(tables) = include_tables {
+                if tables.is_empty() {
+                    bail!("connectors[{index}].include_tables must not be empty");
+                }
+                for (table_index, table) in tables.iter().enumerate() {
+                    ensure_non_empty(
+                        table,
+                        &format!("connectors[{index}].include_tables[{table_index}]"),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
+    match sink {
+        SinkConfig::Kafka {
+            name,
+            brokers,
+            topic,
+            mv,
+            with_snapshot: _,
+            as_of: _,
+            batch_rows,
+            batch_bytes,
+            queue_capacity,
+            retry_max_attempts,
+            retry_base_ms,
+            retry_max_backoff_ms,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("sinks[{index}].name"))?;
+            ensure_non_empty(brokers, &format!("sinks[{index}].brokers"))?;
+            ensure_non_empty(topic, &format!("sinks[{index}].topic"))?;
+            ensure_non_empty(mv, &format!("sinks[{index}].mv"))?;
+            ensure_optional_positive_usize(*batch_rows, &format!("sinks[{index}].batch_rows"))?;
+            ensure_optional_positive_usize(*batch_bytes, &format!("sinks[{index}].batch_bytes"))?;
+            ensure_optional_positive_usize(
+                *queue_capacity,
+                &format!("sinks[{index}].queue_capacity"),
+            )?;
+            ensure_optional_positive_usize(
+                *retry_max_attempts,
+                &format!("sinks[{index}].retry_max_attempts"),
+            )?;
+            ensure_optional_positive_u64(*retry_base_ms, &format!("sinks[{index}].retry_base_ms"))?;
+            ensure_optional_positive_u64(
+                *retry_max_backoff_ms,
+                &format!("sinks[{index}].retry_max_backoff_ms"),
+            )?;
+        }
+        SinkConfig::File {
+            name,
+            path,
+            mv,
+            with_snapshot: _,
+            as_of: _,
+            append: _,
+            batch_rows,
+            batch_bytes,
+            queue_capacity,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("sinks[{index}].name"))?;
+            ensure_non_empty(path, &format!("sinks[{index}].path"))?;
+            ensure_non_empty(mv, &format!("sinks[{index}].mv"))?;
+            ensure_optional_positive_usize(*batch_rows, &format!("sinks[{index}].batch_rows"))?;
+            ensure_optional_positive_usize(*batch_bytes, &format!("sinks[{index}].batch_bytes"))?;
+            ensure_optional_positive_usize(
+                *queue_capacity,
+                &format!("sinks[{index}].queue_capacity"),
+            )?;
+        }
+        SinkConfig::Http {
+            name,
+            url,
+            mv,
+            with_snapshot: _,
+            as_of: _,
+            batch_size,
+            batch_rows,
+            batch_bytes,
+            queue_capacity,
+            retry_max_attempts,
+            retry_base_ms,
+            retry_max_backoff_ms,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("sinks[{index}].name"))?;
+            ensure_non_empty(url, &format!("sinks[{index}].url"))?;
+            Url::parse(url).with_context(|| {
+                format!("sinks[{index}].url must be a valid URL (found '{url}')")
+            })?;
+            ensure_non_empty(mv, &format!("sinks[{index}].mv"))?;
+            ensure_optional_positive_usize(*batch_size, &format!("sinks[{index}].batch_size"))?;
+            ensure_optional_positive_usize(*batch_rows, &format!("sinks[{index}].batch_rows"))?;
+            ensure_optional_positive_usize(*batch_bytes, &format!("sinks[{index}].batch_bytes"))?;
+            ensure_optional_positive_usize(
+                *queue_capacity,
+                &format!("sinks[{index}].queue_capacity"),
+            )?;
+            ensure_optional_positive_usize(
+                *retry_max_attempts,
+                &format!("sinks[{index}].retry_max_attempts"),
+            )?;
+            ensure_optional_positive_u64(*retry_base_ms, &format!("sinks[{index}].retry_base_ms"))?;
+            ensure_optional_positive_u64(
+                *retry_max_backoff_ms,
+                &format!("sinks[{index}].retry_max_backoff_ms"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_non_empty(value: &str, field_path: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field_path} must not be empty");
+    }
+    Ok(())
+}
+
+fn ensure_optional_non_empty(value: Option<&str>, field_path: &str) -> Result<()> {
+    if let Some(value) = value {
+        ensure_non_empty(value, field_path)?;
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_usize(value: Option<usize>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value == 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_u64(value: Option<u64>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value == 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
 }
 
 pub fn normalize_connectors(connectors: Vec<ConnectorConfig>) -> Result<Vec<ConnectorSpec>> {
@@ -297,6 +759,15 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
         name: definition.name().to_string(),
         config,
     })
+}
+
+pub fn materialized_view_definitions_from_config(
+    views: &[MaterializedViewConfig],
+) -> Vec<MaterializedViewDefinition> {
+    views
+        .iter()
+        .map(MaterializedViewConfig::to_definition)
+        .collect()
 }
 
 pub fn apply_connector_properties(registry: &mut SourceRegistry, connectors: &[ConnectorSpec]) {
@@ -606,5 +1077,143 @@ mod tests {
             }
             other => panic!("expected HTTP sink config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validation_rejects_empty_kafka_topics() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Kafka {
+                name: Some("kafka_ingest".to_string()),
+                brokers: "localhost:9092".to_string(),
+                topics: vec![],
+                group_id: Some("floe".to_string()),
+                default_source: Some("nexmark_bid".to_string()),
+                poll_ms: Some(100),
+                max_messages_per_tick: Some(64),
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("connectors[0].topics must not be empty")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_object_store_url() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::ObjectStore {
+                name: None,
+                url: "not a url".to_string(),
+                default_source: Some("nexmark_bid".to_string()),
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("connectors[0].url must be a valid URL")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_http_sink_url() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Generator {
+                name: None,
+                events_per_second: Some(1.0),
+                max_events: None,
+            }],
+            sinks: vec![SinkConfig::Http {
+                name: Some("sink_http".to_string()),
+                url: "://missing-scheme".to_string(),
+                mv: "mv_bid".to_string(),
+                with_snapshot: Some(true),
+                as_of: None,
+                batch_size: Some(1),
+                batch_rows: None,
+                batch_bytes: None,
+                queue_capacity: None,
+                retry_max_attempts: None,
+                retry_base_ms: None,
+                retry_max_backoff_ms: None,
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(err.to_string().contains("sinks[0].url must be a valid URL"));
+    }
+
+    #[test]
+    fn load_config_accepts_materialized_views_and_runtime_sections() {
+        let input = r#"
+            [[connectors]]
+            type = "generator"
+
+            [[materialized_views]]
+            name = "mv_cfg"
+            query = "SELECT * FROM nexmark_bid"
+
+            [runtime]
+            ingest_batch_size = 128
+            mv_retain_last = 5
+
+            [storage]
+            await_durable = true
+            zset_compaction_max_chain_len = 64
+
+            [maintenance]
+            paused = true
+            inspect_namespace = ["mv::mv_cfg"]
+        "#;
+        let config: NodeConfig = toml::from_str(input).expect("parse toml");
+        assert_eq!(config.materialized_views.len(), 1);
+        assert_eq!(config.runtime.ingest_batch_size, Some(128));
+        assert_eq!(config.storage.await_durable, Some(true));
+        assert_eq!(config.maintenance.paused, Some(true));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_materialized_view_names() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Generator {
+                name: None,
+                events_per_second: Some(1.0),
+                max_events: None,
+            }],
+            materialized_views: vec![
+                MaterializedViewConfig {
+                    name: "mv_dup".to_string(),
+                    query: "SELECT 1".to_string(),
+                    if_not_exists: false,
+                },
+                MaterializedViewConfig {
+                    name: "mv_dup".to_string(),
+                    query: "SELECT 2".to_string(),
+                    if_not_exists: false,
+                },
+            ],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate materialized view name 'mv_dup'")
+        );
+    }
+
+    #[test]
+    fn materialized_view_definitions_from_config_maps_fields() {
+        let config_views = vec![MaterializedViewConfig {
+            name: "mv_cfg".to_string(),
+            query: "SELECT * FROM nexmark_bid".to_string(),
+            if_not_exists: true,
+        }];
+        let definitions = materialized_view_definitions_from_config(&config_views);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name(), "mv_cfg");
+        assert_eq!(definitions[0].query(), "SELECT * FROM nexmark_bid");
+        assert!(definitions[0].if_not_exists());
     }
 }

@@ -201,10 +201,10 @@ impl ExecutionPlan for DynamicStateExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
-        if let Some(idx) = partition {
-            if idx != 0 {
-                return internal_err!("Invalid partition index {idx} for DynamicStateExec");
-            }
+        if let Some(idx) = partition
+            && idx != 0
+        {
+            return internal_err!("Invalid partition index {idx} for DynamicStateExec");
         }
 
         let snapshot = self.snapshot_batches();

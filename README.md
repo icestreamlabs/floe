@@ -32,6 +32,8 @@ Optional inputs:
   `cargo run -- run --kafka-brokers localhost:9092 --kafka-topics nexmark_bid`
 - Connector config file (TOML/YAML/JSON):
   `cargo run -- run --config /path/to/connectors.toml`
+- Validate config + SQL planning without startup side effects:
+  `cargo run -- run --config /path/to/connectors.toml --dry-run`
 
 Runtime configuration:
 
@@ -44,13 +46,22 @@ Observability:
 
 - When the HTTP ingest server is enabled, it also exposes `/metrics` and
   `/healthz` on the same host/port.
+- `/healthz` returns `200` only when:
+  - the process is running,
+  - the executor loop is still alive,
+  - storage initialization is healthy.
 - Default tracing schema (span names + fields) for correlation:
   - `ingest_decode`: `epoch`, `raw_batch_size`, `decoded_rows`, `latency_ms`
   - `connector_tick`: `epoch`, `watermark`, `tick_latency_ms`
-  - `dbsp_write`: `graph_id`, `view`, `version`, `latency_ms`
+  - `dbsp_write`: `graph_id`, `view`, `namespace`, `version`, `latency_ms`
   - `tail_emit`: `mv`, `version`, `mode`, `rows`
   Correlation: `connector_tick.epoch` aligns with `dbsp_write.version` for MV
   updates produced by that ingest tick.
+- Key Prometheus counters:
+  - `floe_ingest_ticks_total{result=...}`
+  - `floe_mv_updates_total`
+  - `floe_tail_rows_total`
+  - `floe_runtime_errors_total{component=...}`
 
 ### Storage tuning (SlateDB)
 
@@ -61,6 +72,7 @@ cache settings via:
   - `--slatedb-flush-interval-ms 250`
   - `--slatedb-compaction-max-sst-bytes 268435456`
   - `--slatedb-compaction-max-concurrent 2`
+  - `--slatedb-await-durable`
   - `--slatedb-cache-dir /tmp/floe-slate-cache --slatedb-cache-max-bytes 1073741824`
 - A settings file: `--slatedb-config /path/to/SlateDb.toml` (or `FLOE_SLATEDB_CONFIG`)
 - Environment variables: `SLATEDB_FLUSH_INTERVAL=250ms` (prefix configurable via
@@ -118,3 +130,11 @@ cargo test
 cargo fmt
 cargo clippy -- -D warnings
 ```
+
+Additional operational documentation:
+
+- `docs/production_readiness.md`: production exit checklist and quick operator runbook.
+- `docs/runtime_config.md`: config-first schema, precedence rules, and examples.
+- `docs/storage_data_directory.md`: `FLOE_DATA_DIR` behavior and safe reset procedure.
+- `docs/operator_runbook.md`: production-like startup/restart/troubleshooting guide.
+- Canonical full validation sequence: `scripts/validate_workspace.sh`.

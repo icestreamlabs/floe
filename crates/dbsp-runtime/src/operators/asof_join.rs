@@ -408,7 +408,7 @@ where
             if let Some(key) = (self.left_key)(row) {
                 left_keyed
                     .entry(key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((row.clone(), *weight));
             }
         }
@@ -421,7 +421,7 @@ where
             if let Some(key) = (self.right_key)(row) {
                 right_keyed
                     .entry(key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((row.clone(), *weight));
             }
         }

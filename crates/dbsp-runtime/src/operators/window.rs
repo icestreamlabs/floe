@@ -107,6 +107,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: RelationState<(WindowKey<K>, A)>,
         index: IndexedBatchZSet<WindowKey<K>, V>,
@@ -358,10 +359,10 @@ where
             if event_ts < 0 {
                 continue;
             }
-            if let Some(cutoff) = cutoff {
-                if event_ts < cutoff {
-                    continue;
-                }
+            if let Some(cutoff) = cutoff
+                && event_ts < cutoff
+            {
+                continue;
             }
             if let Some(key) = (self.key_extractor)(row) {
                 for (window_start, window_end) in self.windows_for(event_ts) {
@@ -372,7 +373,7 @@ where
                     };
                     keyed_deltas
                         .entry(window_key)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push((row.clone(), *weight));
                 }
             }

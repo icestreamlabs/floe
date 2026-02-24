@@ -12,6 +12,14 @@ static MV_UPDATE_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("register floe_mv_update_latency_ms")
 });
 
+static MV_UPDATES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "floe_mv_updates_total",
+        "Total number of materialized view updates applied"
+    )
+    .expect("register floe_mv_updates_total")
+});
+
 static TAIL_THROUGHPUT_ROWS: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "floe_tail_rows_total",
@@ -101,6 +109,10 @@ pub(crate) fn observe_mv_update_latency_ms(latency_ms: u64) {
     MV_UPDATE_LATENCY_MS.observe(latency_ms as f64);
 }
 
+pub(crate) fn inc_mv_updates() {
+    MV_UPDATES_TOTAL.inc();
+}
+
 pub(crate) fn observe_delta_consolidation(stats: ConsolidationStats, latency_ms: u64) {
     DELTA_CONSOLIDATION_LATENCY_MS.observe(latency_ms as f64);
     DELTA_CONSOLIDATION_ROWS_IN.observe(stats.input_rows as f64);
@@ -120,6 +132,7 @@ pub(crate) fn inc_tail_rows(count: usize) {
 
 pub(crate) fn init() {
     let _ = &*MV_UPDATE_LATENCY_MS;
+    let _ = &*MV_UPDATES_TOTAL;
     let _ = &*TAIL_THROUGHPUT_ROWS;
     let _ = &*DELTA_BATCH_ROWS;
     let _ = &*DELTA_BATCH_BYTES;

@@ -43,7 +43,7 @@ pub(super) struct PreparedStatement {
 
 #[derive(Clone, Debug)]
 enum PreparedStatementKind {
-    Query(Statement),
+    Query(Box<Statement>),
     Management(ManagementStatement),
 }
 
@@ -151,7 +151,7 @@ impl FloeExtendedQueryParser {
         }
 
         Ok(PreparedStatement {
-            kind: PreparedStatementKind::Query(statement),
+            kind: PreparedStatementKind::Query(Box::new(statement)),
             result_fields: fields,
             referenced_views: deduped,
             parameter_count,
@@ -310,7 +310,7 @@ fn render_sql_with_params(
         decoded.push(value);
     }
 
-    let mut statement = statement.clone();
+    let mut statement = statement.as_ref().clone();
     substitute_placeholders(&mut statement, &decoded)?;
     Ok(statement.to_string())
 }

@@ -76,11 +76,12 @@ impl<T> OverlayDecodeCache<T> {
 
     fn insert_value(&mut self, segment_id: u64, value: T) -> Arc<T> {
         self.touch_clock = self.touch_clock.saturating_add(1);
-        if self.capacity > 0 && self.entries.len() >= self.capacity {
-            if let Some(evicted) = self.select_lru_segment_id() {
-                self.entries.remove(&evicted);
-                self.stats.evictions = self.stats.evictions.saturating_add(1);
-            }
+        if self.capacity > 0
+            && self.entries.len() >= self.capacity
+            && let Some(evicted) = self.select_lru_segment_id()
+        {
+            self.entries.remove(&evicted);
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
         }
 
         let value = Arc::new(value);

@@ -269,7 +269,7 @@ where
         let segment_id = self.read_next_segment_id().await?;
         write_batch.put(
             self.segment_sequence_key.clone(),
-            segment_id.saturating_add(1).to_be_bytes().to_vec(),
+            segment_id.saturating_add(1).to_be_bytes(),
         );
 
         write_batch.put(
@@ -693,10 +693,11 @@ where
         let mut guard = self.lookup_cache_shards[shard]
             .lock()
             .map_err(|_| anyhow!("Arrow-index lookup cache shard poisoned"))?;
-        if guard.len() >= LOOKUP_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(key_bytes) {
-            if let Some(evict_key) = guard.keys().next().cloned() {
-                guard.remove(&evict_key);
-            }
+        if guard.len() >= LOOKUP_CACHE_CAPACITY_PER_SHARD
+            && !guard.contains_key(key_bytes)
+            && let Some(evict_key) = guard.keys().next().cloned()
+        {
+            guard.remove(&evict_key);
         }
         guard.insert(key_bytes.to_vec(), state.clone());
         Ok(())
@@ -774,10 +775,11 @@ where
         let mut guard = self.segment_cache_shards[shard]
             .lock()
             .map_err(|_| anyhow!("Arrow-index segment cache shard poisoned"))?;
-        if guard.len() >= SEGMENT_CACHE_CAPACITY_PER_SHARD && !guard.contains_key(&segment_id) {
-            if let Some(evict_key) = guard.keys().next().copied() {
-                guard.remove(&evict_key);
-            }
+        if guard.len() >= SEGMENT_CACHE_CAPACITY_PER_SHARD
+            && !guard.contains_key(&segment_id)
+            && let Some(evict_key) = guard.keys().next().copied()
+        {
+            guard.remove(&evict_key);
         }
         guard.insert(segment_id, segment);
         Ok(())

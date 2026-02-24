@@ -3,19 +3,29 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use floe_node_core::tail_client::{TailConfig, build_tail_sql};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Floe node entrypoint", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Floe node entrypoint",
+    long_about = "Run and tail a single-node streaming SQL runtime.",
+    after_long_help = "Examples:\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n  floe-node run --config ./floe.toml\n  floe-node tail --mv mv\n  floe-node tail --sql \"TAIL mv WITH (SNAPSHOT)\""
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     Run(RunArgs),
     Tail(TailArgs),
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "Examples:\n  # Generator + MV\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n\n  # File ingest + MV\n  floe-node run --input-file ./events.jsonl --input-source nexmark_bid --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n\n  # Kafka ingest + MV\n  floe-node run --kafka-brokers localhost:9092 --kafka-topics nexmark_bid --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n\n  # Config-first startup\n  floe-node run --config ./floe.toml\n\n  # Validate only (no connectors/server)\n  floe-node run --config ./floe.toml --dry-run"
+)]
 pub struct RunArgs {
     /// Number of events to emit every second from the Nexmark generator.
     #[arg(
@@ -36,6 +46,10 @@ pub struct RunArgs {
     /// Connector configuration file (TOML/YAML/JSON).
     #[arg(long = "config")]
     pub config: Option<String>,
+
+    /// Validate config + SQL planning and exit without running connectors/server.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 
     /// SlateDB settings file (TOML/YAML/JSON). Overrides SLATEDB_ env settings.
     #[arg(long = "slatedb-config")]
@@ -64,6 +78,10 @@ pub struct RunArgs {
     /// SlateDB compactor max concurrent compactions.
     #[arg(long = "slatedb-compaction-max-concurrent", value_parser = parse_positive_usize)]
     pub slatedb_compaction_max_concurrent: Option<usize>,
+
+    /// Wait for SlateDB writes to be durable before acknowledging writes.
+    #[arg(long = "slatedb-await-durable")]
+    pub slatedb_await_durable: bool,
 
     /// Enable SlateDB object-store cache at this local directory.
     #[arg(long = "slatedb-cache-dir")]
@@ -227,6 +245,9 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "Examples:\n  # Tail by materialized view name\n  floe-node tail --mv mv_bid\n\n  # Tail by explicit SQL\n  floe-node tail --sql \"TAIL mv_bid WITH (SNAPSHOT)\"\n\n  # Tail from a specific version\n  floe-node tail --mv mv_bid --as-of 42 --with-snapshot"
+)]
 pub struct TailArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
@@ -312,4 +333,36 @@ fn parse_nonnegative_u64(value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| "value must be a non-negative integer".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn run_help_includes_examples() {
+        let mut cmd = Cli::command();
+        let run = cmd
+            .find_subcommand_mut("run")
+            .expect("run subcommand should exist");
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("Generator + MV"));
+        assert!(help.contains("File ingest + MV"));
+        assert!(help.contains("Kafka ingest + MV"));
+        assert!(help.contains("Config-first startup"));
+    }
+
+    #[test]
+    fn tail_help_includes_examples() {
+        let mut cmd = Cli::command();
+        let tail = cmd
+            .find_subcommand_mut("tail")
+            .expect("tail subcommand should exist");
+        let help = tail.render_long_help().to_string();
+        assert!(help.contains("Tail by materialized view name"));
+        assert!(help.contains("Tail by explicit SQL"));
+        assert!(help.contains("--as-of 42 --with-snapshot"));
+    }
 }

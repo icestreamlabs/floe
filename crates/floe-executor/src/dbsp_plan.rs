@@ -119,21 +119,18 @@ pub fn validate_dbsp_plan(
             }
         }
 
-        match &circuit_node.kind {
-            DbspNodeKind::Join(join) => {
-                let left_width = join.left_schema.len();
-                let right_width = join.right_schema.len();
-                let output_width = join.output_schema.len();
-                if left_width + right_width != output_width {
-                    bail!(
-                        "node {node_id} (Join) output width mismatch: {} + {} ≠ {}",
-                        left_width,
-                        right_width,
-                        output_width
-                    );
-                }
+        if let DbspNodeKind::Join(join) = &circuit_node.kind {
+            let left_width = join.left_schema.len();
+            let right_width = join.right_schema.len();
+            let output_width = join.output_schema.len();
+            if left_width + right_width != output_width {
+                bail!(
+                    "node {node_id} (Join) output width mismatch: {} + {} ≠ {}",
+                    left_width,
+                    right_width,
+                    output_width
+                );
             }
-            _ => {}
         }
     }
 

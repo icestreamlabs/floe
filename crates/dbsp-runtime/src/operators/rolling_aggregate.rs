@@ -287,14 +287,14 @@ where
         self.buffer.push_back(delta_map.clone());
 
         let mut net_delta = delta_map;
-        if self.buffer.len() > self.window_size {
-            if let Some(evicted) = self.buffer.pop_front() {
-                for (row, weight) in evicted {
-                    let entry = net_delta.entry(row.clone()).or_insert(0);
-                    *entry -= weight;
-                    if *entry == 0 {
-                        net_delta.remove(&row);
-                    }
+        if self.buffer.len() > self.window_size
+            && let Some(evicted) = self.buffer.pop_front()
+        {
+            for (row, weight) in evicted {
+                let entry = net_delta.entry(row.clone()).or_insert(0);
+                *entry -= weight;
+                if *entry == 0 {
+                    net_delta.remove(&row);
                 }
             }
         }
@@ -311,7 +311,7 @@ where
             if let Some(key) = (self.key_extractor)(row) {
                 keyed_deltas
                     .entry(key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((row.clone(), *weight));
             }
         }

@@ -180,10 +180,11 @@ fn parse_wal2json_payload(
         } else {
             table.to_string()
         };
-        if let Some(allowed) = include_tables {
-            if !allowed.contains(&source) && !allowed.contains(table) {
-                continue;
-            }
+        if let Some(allowed) = include_tables
+            && !allowed.contains(&source)
+            && !allowed.contains(table)
+        {
+            continue;
         }
 
         let names = change

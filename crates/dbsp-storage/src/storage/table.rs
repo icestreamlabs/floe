@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -47,16 +48,38 @@ pub trait KeyValueTable: Send + Sync {
 
 pub struct SlateTable {
     db: Arc<Db>,
+    await_durable: bool,
 }
+
+static DEFAULT_AWAIT_DURABLE: AtomicBool = AtomicBool::new(false);
 
 impl SlateTable {
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self {
+            db,
+            await_durable: Self::default_await_durable(),
+        }
     }
 
-    fn write_options() -> WriteOptions {
+    pub fn with_await_durable(db: Arc<Db>, await_durable: bool) -> Self {
+        Self { db, await_durable }
+    }
+
+    pub fn set_default_await_durable(await_durable: bool) {
+        DEFAULT_AWAIT_DURABLE.store(await_durable, Ordering::Relaxed);
+    }
+
+    pub fn default_await_durable() -> bool {
+        DEFAULT_AWAIT_DURABLE.load(Ordering::Relaxed)
+    }
+
+    pub fn await_durable_enabled(&self) -> bool {
+        self.await_durable
+    }
+
+    fn write_options(&self) -> WriteOptions {
         WriteOptions {
-            await_durable: false,
+            await_durable: self.await_durable,
         }
     }
 }
@@ -73,7 +96,7 @@ impl KeyValueTable for SlateTable {
 
     async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db
-            .write_with_options(batch, &Self::write_options())
+            .write_with_options(batch, &self.write_options())
             .await
             .map_err(map_slate_err)
     }
@@ -142,5 +165,29 @@ mod tests {
 
         timestamps_to_insert.sort();
         assert_eq!(observed, timestamps_to_insert);
+    }
+
+    #[tokio::test]
+    async fn explicit_await_durable_mode_is_configurable() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("storage-durable-mode", store)
+                .await
+                .expect("open SlateDB"),
+        );
+
+        let durable = SlateTable::with_await_durable(db.clone(), true);
+        assert!(durable.await_durable_enabled());
+        durable
+            .put(b"durable/key", b"value")
+            .await
+            .expect("durable write");
+
+        let buffered = SlateTable::with_await_durable(db, false);
+        assert!(!buffered.await_durable_enabled());
+        buffered
+            .put(b"buffered/key", b"value")
+            .await
+            .expect("buffered write");
     }
 }

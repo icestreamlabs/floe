@@ -29,6 +29,15 @@ static INGEST_TICK_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("register floe_ingest_tick_latency_ms")
 });
 
+static INGEST_TICKS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_ingest_ticks_total",
+        "Total number of successful ingest ticks",
+        &["result"]
+    )
+    .expect("register floe_ingest_ticks_total")
+});
+
 static SINK_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_sink_queue_depth",
@@ -56,6 +65,15 @@ static SINK_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register floe_sink_failures_total")
 });
 
+static RUNTIME_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_runtime_errors_total",
+        "Total runtime errors by component",
+        &["component"]
+    )
+    .expect("register floe_runtime_errors_total")
+});
+
 pub(crate) fn record_ingest_queue_depth(depth: usize) {
     INGEST_QUEUE_DEPTH.set(depth as i64);
 }
@@ -66,6 +84,10 @@ pub(crate) fn observe_decode_latency_ms(latency_ms: u64) {
 
 pub(crate) fn observe_tick_latency_ms(latency_ms: u64) {
     INGEST_TICK_LATENCY_MS.observe(latency_ms as f64);
+}
+
+pub(crate) fn inc_ingest_tick(result: &str) {
+    INGEST_TICKS_TOTAL.with_label_values(&[result]).inc();
 }
 
 pub(crate) fn record_sink_queue_depth(sink: &str, depth: usize) {
@@ -82,11 +104,17 @@ pub(crate) fn inc_sink_failure(sink: &str, transport: &str) {
     SINK_FAILURES.with_label_values(&[sink, transport]).inc();
 }
 
+pub(crate) fn inc_runtime_error(component: &str) {
+    RUNTIME_ERRORS.with_label_values(&[component]).inc();
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
     let _ = &*INGEST_TICK_LATENCY_MS;
+    let _ = &*INGEST_TICKS_TOTAL;
     let _ = &*SINK_QUEUE_DEPTH;
     let _ = &*SINK_VERSION_LAG;
     let _ = &*SINK_FAILURES;
+    let _ = &*RUNTIME_ERRORS;
 }

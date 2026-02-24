@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result, ensure};
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -19,12 +22,21 @@ pub struct HttpIngestConfig {
     pub host: String,
     pub port: u16,
     pub default_source: Option<String>,
+    pub health: Option<HttpIngestHealth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpIngestHealth {
+    pub executor_running: Arc<AtomicBool>,
+    pub storage_reachable: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 struct HttpIngestState {
     sender: SourceEventSender,
     default_source: Option<String>,
+    cancel: CancellationToken,
+    health: Option<HttpIngestHealth>,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +52,8 @@ pub async fn run_http_ingest(
     let state = HttpIngestState {
         sender,
         default_source: config.default_source,
+        cancel: cancel.clone(),
+        health: config.health,
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -85,8 +99,32 @@ async fn ingest(
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn healthz() -> StatusCode {
-    StatusCode::OK
+async fn healthz(State(state): State<HttpIngestState>) -> impl IntoResponse {
+    let process_alive = !state.cancel.is_cancelled();
+    let executor_alive = state
+        .health
+        .as_ref()
+        .map(|health| health.executor_running.load(Ordering::Relaxed))
+        .unwrap_or(true);
+    let storage_reachable = state
+        .health
+        .as_ref()
+        .map(|health| health.storage_reachable.load(Ordering::Relaxed))
+        .unwrap_or(true);
+
+    let status = if process_alive && executor_alive && storage_reachable {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "process_alive": process_alive,
+            "executor_alive": executor_alive,
+            "storage_reachable": storage_reachable,
+        })),
+    )
 }
 
 async fn metrics() -> impl IntoResponse {
@@ -166,6 +204,8 @@ mod tests {
         let state = HttpIngestState {
             sender: tx,
             default_source: Some("nexmark_bid".to_string()),
+            cancel: CancellationToken::new(),
+            health: None,
         };
         let app = Router::new()
             .route("/ingest", post(ingest))
@@ -183,5 +223,29 @@ mod tests {
 
         let event = rx.recv().await.expect("event");
         assert_eq!(event.source(), "nexmark_bid");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_unavailable_when_executor_stops() {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = HttpIngestState {
+            sender: tx,
+            default_source: Some("nexmark_bid".to_string()),
+            cancel: CancellationToken::new(),
+            health: Some(HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(false)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+            }),
+        };
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .with_state(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

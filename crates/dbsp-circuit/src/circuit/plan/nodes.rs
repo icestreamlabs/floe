@@ -460,6 +460,14 @@ impl GroupKeyExpr {
     }
 }
 
+type AggregateSpec = (
+    DbspAggregateFunction,
+    Option<Expr>,
+    Option<Expr>,
+    bool,
+    Option<String>,
+);
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct DbspAggregateNode {
@@ -473,13 +481,7 @@ impl DbspAggregateNode {
     pub fn try_new(
         input_schema: Arc<RowSchema>,
         group_keys: Vec<(Expr, Option<String>)>,
-        aggregates: Vec<(
-            DbspAggregateFunction,
-            Option<Expr>,
-            Option<Expr>,
-            bool,
-            Option<String>,
-        )>,
+        aggregates: Vec<AggregateSpec>,
     ) -> Result<Self> {
         let mut group_exprs = Vec::with_capacity(group_keys.len());
         let mut fields = Vec::new();

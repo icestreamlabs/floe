@@ -84,6 +84,8 @@ impl DbspGraphBuilder {
         let mut upstream_stream = handle_stream.stream();
         let mut dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
         let graph_id = self.graph_id().to_string();
+        let view_namespace = crate::namespaces::materialized_view(view_name)
+            .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
         if view_frontier < upstream_frontier {
             for ts in (view_frontier + 1)..=upstream_frontier {
                 let update_start = Instant::now();
@@ -91,6 +93,7 @@ impl DbspGraphBuilder {
                     "dbsp_write",
                     graph_id = %graph_id,
                     view = %view_name,
+                    namespace = %view_namespace,
                     version = ts,
                 );
                 let _enter = update_span.enter();
@@ -114,12 +117,14 @@ impl DbspGraphBuilder {
                 mv_latest.insert(view_name.to_string(), (ts, snapshot_handle));
                 let latency_ms = update_start.elapsed().as_millis() as u64;
                 metrics::observe_mv_update_latency_ms(latency_ms);
+                metrics::inc_mv_updates();
                 tracing::debug!(latency_ms, "materialized view update applied");
             }
         }
 
         let bridge_clone = Arc::clone(&self.bridge);
         let view_label = view_name.to_string();
+        let view_namespace_label = view_namespace.clone();
         let task_label = format!("materialize-view:{view_label}");
         let task_events = task_events.clone();
         let cancel = cancel.clone();
@@ -138,6 +143,7 @@ impl DbspGraphBuilder {
                                     "dbsp_write",
                                     graph_id = %graph_id,
                                     view = %view_label,
+                                    namespace = %view_namespace_label,
                                     version = ts,
                                 );
                                 let _enter = update_span.enter();
@@ -172,6 +178,7 @@ impl DbspGraphBuilder {
                                         registry_clone.publish_version(ts, snapshot_handle);
                                         let latency_ms = update_start.elapsed().as_millis() as u64;
                                         metrics::observe_mv_update_latency_ms(latency_ms);
+                                        metrics::inc_mv_updates();
                                         tracing::debug!(
                                             latency_ms,
                                             "materialized view update applied"
@@ -182,6 +189,7 @@ impl DbspGraphBuilder {
                                         {
                                             tracing::info!(
                                                 view = %view_label,
+                                                namespace = %view_namespace_label,
                                                 version = ts,
                                                 "materialized view advanced"
                                             );

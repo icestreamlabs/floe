@@ -19,6 +19,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{compute_delta, delta_zset_handle};
 
+type PartitionKeyFn<K, P> = Arc<dyn Fn(&K) -> Option<P> + Send + Sync>;
+type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
+
 /// Top-N operator that applies row-number semantics: it counts multiplicity and
 /// supports OFFSET, matching ORDER BY/LIMIT/OFFSET behavior.
 pub struct TopNOp<K, P, O>
@@ -46,8 +49,8 @@ where
     order_index: Option<BTreeMap<(P, O, K), i64>>,
     row_partition_cache: HashMap<K, Option<P>>,
     row_order_cache: HashMap<K, Option<O>>,
-    partition_key: Arc<dyn Fn(&K) -> Option<P> + Send + Sync>,
-    order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
+    partition_key: PartitionKeyFn<K, P>,
+    order_key: OrderKeyFn<K, O>,
     limit: usize,
     offset: usize,
 }
@@ -71,8 +74,8 @@ where
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<K>,
-        partition_key: Arc<dyn Fn(&K) -> Option<P> + Send + Sync>,
-        order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
+        partition_key: PartitionKeyFn<K, P>,
+        order_key: OrderKeyFn<K, O>,
         limit: usize,
         offset: usize,
     ) -> Self {
@@ -357,7 +360,7 @@ where
         if let Some(input_cache) = self.input_cache.as_mut() {
             for (key, _old_weight, new_weight, _partition_key, _order_key) in &cache_updates {
                 if *new_weight == 0 {
-                    input_cache.remove(&key);
+                    input_cache.remove(key);
                 } else {
                     input_cache.insert(key.clone(), *new_weight);
                 }

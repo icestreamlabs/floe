@@ -197,10 +197,8 @@ fn validate_schema(schema: &SchemaRef, mode: ConsolidationMode) -> DFResult<()> 
         return internal_err!("{} column must be Int64", WEIGHT_COLUMN_NAME);
     }
 
-    if mode == ConsolidationMode::ByKey {
-        if schema.index_of(KEY_COLUMN_NAME).is_err() {
-            return internal_err!("missing {} column", KEY_COLUMN_NAME);
-        }
+    if mode == ConsolidationMode::ByKey && schema.index_of(KEY_COLUMN_NAME).is_err() {
+        return internal_err!("missing {} column", KEY_COLUMN_NAME);
     }
 
     Ok(())

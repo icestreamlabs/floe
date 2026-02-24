@@ -51,6 +51,8 @@ struct PlannedNode {
     schema: Arc<RowSchema>,
 }
 
+type RowNumberSpec = (String, Vec<Expr>, Vec<ExprSort>);
+
 impl<'cfg> PlannerContext<'cfg> {
     fn new(config: &'cfg PlannerConfig) -> Self {
         Self {
@@ -509,10 +511,7 @@ impl<'cfg> PlannerContext<'cfg> {
         ))
     }
 
-    fn parse_row_number_spec(
-        &self,
-        expr: &Expr,
-    ) -> Result<Option<(String, Vec<Expr>, Vec<ExprSort>)>, PlannerError> {
+    fn parse_row_number_spec(&self, expr: &Expr) -> Result<Option<RowNumberSpec>, PlannerError> {
         let (alias, window) = match expr {
             Expr::Alias(alias) => {
                 let Expr::WindowFunction(window) = alias.expr.as_ref() else {

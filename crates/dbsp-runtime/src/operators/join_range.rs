@@ -447,10 +447,7 @@ where
             if !left_entries.is_empty() {
                 let mut left_by_key: HashMap<KL, Vec<(L, i64)>> = HashMap::new();
                 for (key, row, weight) in left_entries {
-                    left_by_key
-                        .entry(key)
-                        .or_insert_with(Vec::new)
-                        .push((row, weight));
+                    left_by_key.entry(key).or_default().push((row, weight));
                 }
 
                 let mut left_ranges = Vec::with_capacity(left_by_key.len());

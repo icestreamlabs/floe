@@ -116,3 +116,39 @@ async fn checkpoint_restart_recovers_exact_version() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn start_run_shutdown_restart_processes_new_ticks() -> Result<()> {
+    let catalog = Arc::new(SlateCatalog::in_memory().await?);
+    let view_sql = "CREATE MATERIALIZED VIEW mv_lifecycle AS \
+         SELECT auction, bidder, price FROM nexmark_bid WHERE price > 0";
+
+    {
+        let mut first =
+            MvTestHarness::new_with_catalog(Arc::clone(&catalog), "mv_lifecycle", view_sql).await?;
+        append_bid(&mut first.outer, &mut first.ingestion_bridge, 1, 10, 100).await?;
+        wait_for_version(&first.mv_registry, &first.view_name, 1).await?;
+    }
+
+    let mut restarted =
+        MvTestHarness::new_with_catalog(Arc::clone(&catalog), "mv_lifecycle", view_sql).await?;
+    append_bid(
+        &mut restarted.outer,
+        &mut restarted.ingestion_bridge,
+        2,
+        11,
+        200,
+    )
+    .await?;
+    wait_for_version(&restarted.mv_registry, &restarted.view_name, 2).await?;
+
+    let (session, _) = restarted.session_with_view().await?;
+    let df = session
+        .sql("SELECT auction, bidder, price FROM mv_lifecycle ORDER BY auction")
+        .await?;
+    let batches = df.collect().await?;
+    let rows = int_rows(&batches);
+    assert_eq!(rows, vec![vec![1, 10, 100], vec![2, 11, 200]]);
+
+    Ok(())
+}

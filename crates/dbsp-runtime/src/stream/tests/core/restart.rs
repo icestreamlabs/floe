@@ -35,6 +35,56 @@ async fn stream_restart_persists_frontier_and_defaults() {
 }
 
 #[tokio::test]
+async fn stream_restart_recovers_committed_flush_with_lingering_intent() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+    let mut stream = Stream::new(db.clone(), "restart_stream_lingering_intent", group.clone())
+        .await
+        .expect("create stream");
+
+    stream.send(1).await.expect("send t1");
+    stream.flush().await.expect("flush t1");
+    stream.send(7).await.expect("send t2");
+
+    let intent_key = stream.encode_intent_key();
+    let mut batch = WriteBatch::new();
+    assert!(
+        stream
+            .flush_data_into(&mut batch)
+            .expect("flush data into staged batch"),
+        "expected staged data for t2"
+    );
+    let committed_ts = stream
+        .flush_state_into(&mut batch)
+        .expect("flush state into staged batch")
+        .expect("staged committed timestamp");
+    assert_eq!(committed_ts, 2);
+    batch.put(intent_key.clone(), vec![1]);
+    stream
+        .table()
+        .write_batch(batch)
+        .await
+        .expect("persist staged stream flush without cleanup");
+
+    let mut reopened = Stream::new(db, "restart_stream_lingering_intent", group)
+        .await
+        .expect("reopen stream");
+    assert_eq!(reopened.current_time(), 2);
+    assert_eq!(reopened.committed_frontier(), 2);
+    assert_eq!(reopened.get(1).await.expect("get t1"), 1);
+    assert_eq!(reopened.get(2).await.expect("get t2"), 7);
+    assert!(
+        reopened
+            .table()
+            .get(&intent_key)
+            .await
+            .expect("get lingering intent after reopen")
+            .is_none(),
+        "intent key should be cleared on reopen"
+    );
+}
+
+#[tokio::test]
 async fn zset_stream_restart_persists_frontier_and_defaults() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));

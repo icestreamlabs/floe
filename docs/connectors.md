@@ -100,6 +100,8 @@ Floe can load connector and sink definitions from a config file:
 
 - `--config path/to/connectors.toml`
 - Supported formats: TOML, YAML, JSON
+- Full schema reference (including `materialized_views`, `runtime`, `storage`,
+  and `maintenance`): `docs/runtime_config.md`
 
 Example (TOML):
 
@@ -128,6 +130,23 @@ mv = "mv_bid_passthrough"
 path = "/tmp/mv_bid.jsonl"
 with_snapshot = true
 ```
+
+### Merge and Precedence Rules
+
+When multiple inputs are provided, Floe applies deterministic precedence:
+
+1. Connector and sink definitions in `--config` are the base runtime input.
+2. `CREATE MATERIALIZED VIEW` and `CREATE SINK` statements from `--mv-query`
+   are applied after config parsing.
+3. Existing persisted materialized views are loaded first, then config/SQL
+   updates are applied in process startup order.
+
+Operational notes:
+
+- If `--config` is present, connector creation flags (`--http-port`,
+  `--kafka-brokers`, `--kafka-topics`, `--input-file`) are ignored.
+- Runtime/storage knobs (for example `--slatedb-*`, `--zset-*`,
+  `--mv-retain-last`) still apply when `--config` is used.
 
 Connector config fields are mapped into `SourceDefinition` properties for
 introspection (e.g., `connector.kafka.brokers`, `connector.generator.events_per_second`).

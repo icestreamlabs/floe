@@ -279,3 +279,81 @@ impl DbspView {
         self.zset.handle_stream()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    async fn build_bridge(name: &str) -> DbspBridge {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
+        DbspBridge::new(db).await.expect("create bridge")
+    }
+
+    #[tokio::test]
+    async fn maintenance_pause_resume_controls_one_shot_compaction() {
+        let mut bridge = build_bridge("bridge-maintenance-pause").await;
+        bridge.set_stream_compaction_policy(CompactionPolicy {
+            max_chain_len: 1,
+            max_segments: 1,
+        });
+
+        let namespace = "mv_maint_pause";
+        let mut stream = bridge
+            .new_stream(
+                namespace.to_string(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("create stream");
+        stream.add_delta(b"k1".to_vec(), 1);
+        stream.flush().await.expect("flush v1");
+        stream.add_delta(b"k2".to_vec(), 1);
+        stream.flush().await.expect("flush v2");
+
+        bridge.pause_maintenance();
+        assert!(bridge.maintenance_paused());
+        let skipped = bridge
+            .compact_namespace_once(namespace)
+            .await
+            .expect("compact while paused");
+        assert!(
+            skipped.is_none(),
+            "compaction one-shot should no-op while maintenance is paused"
+        );
+
+        bridge.resume_maintenance();
+        assert!(!bridge.maintenance_paused());
+        let compacted = bridge
+            .compact_namespace_once(namespace)
+            .await
+            .expect("compact after resume");
+        assert!(
+            compacted.is_some(),
+            "compaction one-shot should execute when maintenance is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_one_shot_gc_runs_in_paused_mode() {
+        let mut bridge = build_bridge("bridge-maintenance-gc").await;
+        let namespace = "mv_maint_gc";
+        let mut stream = bridge
+            .new_stream(
+                namespace.to_string(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("create stream");
+        stream.add_delta(b"k".to_vec(), 1);
+        stream.flush().await.expect("flush");
+
+        bridge.pause_maintenance();
+        let stats = bridge
+            .run_namespace_gc_once(namespace, GcPolicy::default())
+            .await
+            .expect("run one-shot gc while paused");
+        assert_eq!(stats.recovered_intents, 0);
+    }
+}

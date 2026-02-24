@@ -48,23 +48,12 @@ impl Default for CompactionSchedulerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CompactionScheduler {
     config: CompactionSchedulerConfig,
     tick: u64,
     next_allowed_tick: u64,
     in_flight_jobs: usize,
-}
-
-impl Default for CompactionScheduler {
-    fn default() -> Self {
-        Self {
-            config: CompactionSchedulerConfig::default(),
-            tick: 0,
-            next_allowed_tick: 0,
-            in_flight_jobs: 0,
-        }
-    }
 }
 
 impl CompactionScheduler {

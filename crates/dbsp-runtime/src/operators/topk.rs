@@ -19,6 +19,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{compute_delta, delta_zset_handle};
 
+type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
+
 /// Top-K operator that keeps the first `k` distinct rows by order key,
 /// preserving their weights (including negative weights).
 pub struct TopKOp<K, O>
@@ -44,7 +46,7 @@ where
     // In-memory ordering index for top-k distinct semantics; rebuilt on restart.
     order_index: Option<BTreeMap<(O, K), i64>>,
     row_order_cache: HashMap<K, Option<O>>,
-    order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
+    order_key: OrderKeyFn<K, O>,
     limit: usize,
 }
 
@@ -66,7 +68,7 @@ where
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<K>,
-        order_key: Arc<dyn Fn(&K) -> Option<O> + Send + Sync>,
+        order_key: OrderKeyFn<K, O>,
         limit: usize,
     ) -> Self {
         Self {
@@ -141,13 +143,11 @@ where
         }
 
         let mut output = HashMap::new();
-        let mut count = 0usize;
-        for ((_order_key, row), weight) in order_index.iter() {
+        for (count, ((_order_key, row), weight)) in order_index.iter().enumerate() {
             if count >= self.limit {
                 break;
             }
             output.insert(row.clone(), *weight);
-            count += 1;
         }
         output
     }

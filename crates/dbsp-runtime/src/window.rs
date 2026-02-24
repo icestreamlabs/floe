@@ -32,6 +32,7 @@ pub struct DbspWindowAggregate {
 }
 
 impl DbspWindowAggregate {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new<K, V, A, FKey, FAgg, FTime>(
         input: &DeltaHandleStream,
         key_extractor: FKey,

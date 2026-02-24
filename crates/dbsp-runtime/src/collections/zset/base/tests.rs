@@ -463,8 +463,9 @@ async fn recovers_version_intent_on_reopen() {
         .await
         .expect("create version");
 
+    let versioned_intent = versioned.intent_key_bytes().to_vec();
     let mut batch = WriteBatch::new();
-    batch.put(versioned.intent_key_bytes(), vec![1]);
+    batch.put(versioned_intent.clone(), vec![1]);
     table
         .write_batch(batch)
         .await
@@ -474,4 +475,88 @@ async fn recovers_version_intent_on_reopen() {
         .await
         .expect("reopen versioned zset");
     assert!(reopened.manifest().is_some());
+    assert!(
+        reopened
+            .table()
+            .get(&versioned_intent)
+            .await
+            .expect("get lingering intent after reopen")
+            .is_none(),
+        "intent key should be cleared during reopen"
+    );
+    let materialized = reopened.materialize().await.expect("materialize reopened");
+    assert_eq!(materialized.get("y"), Some(&5));
+}
+
+#[tokio::test]
+async fn orphan_segment_write_is_not_visible_after_reopen() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "vz_orphan_segment", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut versioned =
+        VersionedZSet::new(dict.clone(), table.clone(), "vz_orphan_segment".to_string())
+            .await
+            .expect("create versioned zset");
+
+    let id = dict
+        .intern(&"base".to_string())
+        .await
+        .expect("intern base key");
+    versioned
+        .create_version(vec![SegmentRecord {
+            id: 1,
+            bucket: 0,
+            deltas: vec![(id, 3)],
+        }])
+        .await
+        .expect("create base version");
+
+    let segment_prefix = versioned.segment_prefix_bytes().to_vec();
+    let segments = table
+        .scan_range(prefix_bounds(&segment_prefix), &ScanOptions::default())
+        .await
+        .expect("scan persisted segments");
+    assert_eq!(segments.len(), 1, "expected one persisted segment");
+    let (existing_segment_key, existing_segment_payload) = &segments[0];
+    let bucket_offset = segment_prefix.len();
+    let bucket = u16::from_be_bytes(
+        existing_segment_key[bucket_offset..bucket_offset + 2]
+            .try_into()
+            .expect("bucket bytes"),
+    );
+    let mut orphan_segment_key = segment_prefix.clone();
+    orphan_segment_key.extend_from_slice(&bucket.to_be_bytes());
+    orphan_segment_key.push(b'/');
+    orphan_segment_key.extend_from_slice(&9_999_u64.to_be_bytes());
+    table
+        .put(&orphan_segment_key, existing_segment_payload)
+        .await
+        .expect("write orphan segment payload");
+
+    let reopened = VersionedZSet::new(dict, table.clone(), "vz_orphan_segment".to_string())
+        .await
+        .expect("reopen versioned zset");
+    let materialized = reopened.materialize().await.expect("materialize reopened");
+    assert_eq!(materialized.get("base"), Some(&3));
+    assert!(
+        materialized.get("orphan").is_none(),
+        "orphan segment must not become visible without a manifest reference"
+    );
+
+    let stats = reopened.chain_stats().await.expect("version chain stats");
+    assert_eq!(stats.version_count, 1);
+    assert_eq!(stats.segment_count, 1);
+    assert!(
+        table
+            .get(&orphan_segment_key)
+            .await
+            .expect("get orphan segment key")
+            .is_some(),
+        "orphan segment bytes may exist physically but must stay unreachable"
+    );
 }

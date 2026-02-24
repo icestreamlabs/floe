@@ -166,17 +166,14 @@ where
             self.manifest_key(version),
             encoding::encode(&manifest).context("encode versioned Arrow manifest")?,
         );
-        write_batch.put(
-            self.current_version_key.clone(),
-            version.to_be_bytes().to_vec(),
-        );
+        write_batch.put(self.current_version_key.clone(), version.to_be_bytes());
         write_batch.put(
             self.next_version_key.clone(),
-            version.saturating_add(1).to_be_bytes().to_vec(),
+            version.saturating_add(1).to_be_bytes(),
         );
         write_batch.put(
             self.next_segment_id_key.clone(),
-            segment_id.saturating_add(1).to_be_bytes().to_vec(),
+            segment_id.saturating_add(1).to_be_bytes(),
         );
         self.table
             .write_batch(write_batch)

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -153,24 +154,39 @@ pub fn spawn_sinks(
     query: FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     cancel: CancellationToken,
+    runtime_failure: Arc<StdMutex<Option<String>>>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
     for sink in sinks {
         let ctx = query.clone();
         let registry = registry.clone();
         let cancel = cancel.clone();
+        let runtime_failure = Arc::clone(&runtime_failure);
         handles.push(tokio::spawn(async move {
             let name = sink.name.clone();
-            if let Err(err) = run_sink(sink, ctx, registry, cancel).await {
+            if let Err(err) = run_sink(sink, ctx, registry, cancel.clone()).await {
                 if is_tail_canceled_error(&err) {
                     tracing::info!(sink = %name, "sink canceled");
                 } else {
                     tracing::error!(sink = %name, error = %err, "sink failed");
+                    record_runtime_failure(
+                        &runtime_failure,
+                        format!("sink '{name}' failed: {err}"),
+                    );
+                    cancel.cancel();
                 }
             }
         }));
     }
     handles
+}
+
+fn record_runtime_failure(state: &Arc<StdMutex<Option<String>>>, message: String) {
+    metrics::inc_runtime_error("sink");
+    let mut guard = state.lock().expect("runtime failure lock poisoned");
+    if guard.is_none() {
+        *guard = Some(message);
+    }
 }
 
 async fn run_sink(
@@ -292,6 +308,7 @@ async fn run_sink(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_kafka_sink(
     sink_name: &str,
     query: &FloeQueryContext,
@@ -350,6 +367,7 @@ async fn run_kafka_sink(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_file_sink(
     sink_name: &str,
     query: &FloeQueryContext,
@@ -393,6 +411,7 @@ async fn run_file_sink(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_http_sink(
     sink_name: &str,
     query: &FloeQueryContext,
@@ -651,6 +670,7 @@ async fn run_http_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_kafka_buffer(
     sink_name: &str,
     producer: &FutureProducer,
@@ -696,6 +716,7 @@ async fn flush_file_buffer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_http_buffer(
     sink_name: &str,
     client: &Client,

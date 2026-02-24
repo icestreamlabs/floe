@@ -24,13 +24,13 @@ impl ColumnType {
     }
 
     pub fn matches_value(&self, value: &RowValue) -> bool {
-        match (self, value) {
-            (ColumnType::Int64, RowValue::Int64(_)) => true,
-            (ColumnType::Bool, RowValue::Bool(_)) => true,
-            (ColumnType::Utf8, RowValue::Utf8(_)) => true,
-            (ColumnType::TimestampMillis, RowValue::TimestampMillis(_)) => true,
-            _ => false,
-        }
+        matches!(
+            (self, value),
+            (ColumnType::Int64, RowValue::Int64(_))
+                | (ColumnType::Bool, RowValue::Bool(_))
+                | (ColumnType::Utf8, RowValue::Utf8(_))
+                | (ColumnType::TimestampMillis, RowValue::TimestampMillis(_))
+        )
     }
 }
 

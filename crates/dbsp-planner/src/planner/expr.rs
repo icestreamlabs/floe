@@ -9,6 +9,13 @@ use dbsp_circuit::circuit::plan::DbspAggregateFunction;
 use super::error::PlannerError;
 
 type JoinKeysAndResidual = (Vec<(Expr, Expr)>, Option<Expr>);
+pub(super) type AggregateExprSpec = (
+    DbspAggregateFunction,
+    Option<Expr>,
+    Option<Expr>,
+    bool,
+    Option<String>,
+);
 
 pub(super) fn normalize_expr(expr: Expr) -> Result<Expr, PlannerError> {
     expr.transform_up(|expr| match expr {
@@ -84,18 +91,7 @@ fn is_wildcard_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Wildcard { .. })
 }
 
-pub(super) fn map_aggregate_expr(
-    expr: &Expr,
-) -> Result<
-    (
-        DbspAggregateFunction,
-        Option<Expr>,
-        Option<Expr>,
-        bool,
-        Option<String>,
-    ),
-    PlannerError,
-> {
+pub(super) fn map_aggregate_expr(expr: &Expr) -> Result<AggregateExprSpec, PlannerError> {
     match expr {
         Expr::Alias(alias) => {
             let (function, arg, filter, distinct, existing_alias) =
