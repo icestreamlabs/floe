@@ -17,7 +17,7 @@ datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }
 parking_lot = "0.12"
 rkyv = { workspace = true }
-arrow-ipc = "56.2.0"
+arrow-ipc = "57.1.0"
 object_store = { workspace = true }
 slatedb = { workspace = true }
 

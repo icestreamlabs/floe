@@ -26,7 +26,7 @@ pub(super) fn encode_stream_row(
         let data_type = batch.schema().field(col_idx).data_type().clone();
         encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
     }
-    encoder.finish()
+    Ok(encoder.take_row())
 }
 
 pub(super) fn encode_arrow_value(

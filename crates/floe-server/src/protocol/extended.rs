@@ -3,9 +3,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::Sink;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::ExtendedQueryHandler;
 use pgwire::api::results::{
     DescribePortalResponse, DescribeStatementResponse, FieldFormat, Response,
@@ -85,7 +84,7 @@ impl FloeExtendedQueryParser {
     pub(super) async fn prepare_statement(
         &self,
         sql: &str,
-        parameter_types: &[PgType],
+        parameter_types: &[Option<PgType>],
     ) -> PgWireResult<PreparedStatement> {
         if let Some(statement) = parse_management_statement(sql) {
             let schema = management_result_schema(&statement);
@@ -135,10 +134,7 @@ impl FloeExtendedQueryParser {
             .sql(sql)
             .await
             .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
-        let df_schema_ref = dataframe.schema();
-        let df_schema_owned = (*df_schema_ref).clone();
-        let arrow_schema: Schema = df_schema_owned.into();
-        let schema_ref: SchemaRef = Arc::new(arrow_schema);
+        let schema_ref = Arc::new(dataframe.schema().as_arrow().clone());
         let fields = Arc::new(arrow_schema_to_field_info(&schema_ref)?);
 
         let placeholder_indices = collect_placeholder_indices(&statement)?;
@@ -146,7 +142,7 @@ impl FloeExtendedQueryParser {
         let mut bound_param_types = vec![PgType::UNKNOWN; parameter_count];
         for (idx, ty) in parameter_types.iter().enumerate() {
             if idx < bound_param_types.len() {
-                bound_param_types[idx] = ty.clone();
+                bound_param_types[idx] = ty.clone().unwrap_or(PgType::UNKNOWN);
             }
         }
 
@@ -168,12 +164,24 @@ impl QueryParser for FloeExtendedQueryParser {
         &self,
         _client: &C,
         sql: &str,
-        parameter_types: &[PgType],
+        parameter_types: &[Option<PgType>],
     ) -> PgWireResult<PreparedStatement>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
         self.prepare_statement(sql, parameter_types).await
+    }
+
+    fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<PgType>> {
+        Ok(stmt.parameter_types())
+    }
+
+    fn get_result_schema(
+        &self,
+        stmt: &Self::Statement,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<pgwire::api::results::FieldInfo>> {
+        Ok(stmt.result_fields().as_ref().clone())
     }
 }
 

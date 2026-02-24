@@ -107,7 +107,7 @@ fn encode_tail_row(
         let data_type = batch.batch.schema().field(col_idx).data_type().clone();
         encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
     }
-    encoder.finish()
+    Ok(encoder.take_row())
 }
 
 pub(super) fn detect_single_tail_statement(query: &str) -> Option<&str> {

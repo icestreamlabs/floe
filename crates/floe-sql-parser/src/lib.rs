@@ -175,6 +175,8 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
             temporary,
             to,
             params,
+            secure,
+            name_before_not_exists,
         } => {
             if !materialized {
                 return Err(anyhow!("expected CREATE MATERIALIZED VIEW statement"));
@@ -194,6 +196,8 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
                 || with_no_schema_binding
                 || to.is_some()
                 || params.is_some()
+                || secure
+                || name_before_not_exists
             {
                 return Err(anyhow!(
                     "unsupported CREATE MATERIALIZED VIEW options are present"

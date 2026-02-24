@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
+arrow-pg = { workspace = true }
 futures = { workspace = true }
 pgwire = { workspace = true }
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
@@ -22,7 +23,7 @@ slatedb = { workspace = true }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
-arrow-buffer = "56.2.0"
-arrow-data = "56.2.0"
+arrow-buffer = "57.1.0"
+arrow-data = "57.1.0"
 dbsp = { path = "../dbsp" }
 slatedb = { workspace = true }

@@ -9,7 +9,7 @@ floe-core = { path = "../floe-core" }
 floe-storage = { path = "../floe-storage" }
 dbsp = { path = "../dbsp" }
 floe-sql-parser = { path = "../floe-sql-parser" }
-arrow-ipc = "56.2.0"
+arrow-ipc = "57.1.0"
 anyhow = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }

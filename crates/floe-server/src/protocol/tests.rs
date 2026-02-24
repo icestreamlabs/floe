@@ -181,7 +181,7 @@ async fn extended_handler_renders_bound_sql() {
     let stored = Arc::new(StoredStatement::new(
         "stmt".into(),
         prepared.clone(),
-        vec![PgType::INT8],
+        vec![Some(PgType::INT8)],
     ));
     let bind = Bind::new(
         Some("portal".into()),
