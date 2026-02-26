@@ -1,12 +1,13 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow_pg::datatypes::df::encode_dataframe;
 use async_trait::async_trait;
-use datafusion::dataframe::DataFrame;
 use floe_executor::tail::{execute_tail, parse_tail_sql, tail_output_schema};
 use futures::Sink;
 use pgwire::api::ClientInfo;
 use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::portal::Format;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::error::{PgWireError, PgWireResult};
@@ -16,7 +17,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{FloeServerState, build_query_response_stream};
+use crate::execution::FloeServerState;
 use crate::management::{detect_single_management_statement, handle_management_statement};
 use crate::sql::extract_tables_from_query;
 use crate::tail::{TailResponseStream, detect_single_tail_statement};
@@ -87,7 +88,7 @@ impl FloeQueryHandler {
         Ok(())
     }
 
-    async fn plan_sql(&self, sql: &str) -> PgWireResult<DataFrame> {
+    async fn plan_sql(&self, sql: &str) -> PgWireResult<datafusion::dataframe::DataFrame> {
         self.state
             .query
             .session()
@@ -99,11 +100,7 @@ impl FloeQueryHandler {
     pub(super) async fn execute_sql_streaming(&self, sql: &str) -> PgWireResult<Response> {
         self.state.ensure_materialized_views_in_sql(sql).await?;
         let df = self.plan_sql(sql).await?;
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
-        let response = build_query_response_stream(stream).await?;
+        let response = encode_dataframe(df, &Format::UnifiedText, None).await?;
         Ok(Response::Query(response))
     }
 }

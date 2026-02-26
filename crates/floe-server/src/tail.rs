@@ -86,6 +86,7 @@ fn encode_tail_row(
     batch: &TailBatch,
     row_idx: usize,
 ) -> PgWireResult<DataRow> {
+    let fields = Arc::clone(&schema);
     let mut encoder = DataRowEncoder::new(schema);
     let op = batch
         .ops
@@ -102,10 +103,18 @@ fn encode_tail_row(
     encoder.encode_field(&Some(batch.version))?;
     encoder.encode_field(&Some(i64::from(op)))?;
     encoder.encode_field(&time)?;
+    let batch_schema = batch.batch.schema();
+    let field_offset = 3usize;
     for col_idx in 0..batch.batch.num_columns() {
         let array = batch.batch.column(col_idx);
-        let data_type = batch.batch.schema().field(col_idx).data_type().clone();
-        encode_arrow_value(array.as_ref(), row_idx, &data_type, &mut encoder)?;
+        let field = batch_schema.field(col_idx);
+        let pg_field = fields.get(col_idx + field_offset).ok_or_else(|| {
+            user_error(format!(
+                "TAIL schema missing field metadata for column index {}",
+                col_idx + field_offset
+            ))
+        })?;
+        encode_arrow_value(array, field.as_ref(), pg_field, row_idx, &mut encoder)?;
     }
     Ok(encoder.take_row())
 }

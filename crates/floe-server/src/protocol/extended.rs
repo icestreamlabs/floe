@@ -1,14 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow_pg::datatypes::df::{deserialize_parameters, encode_dataframe};
+use arrow_pg::datatypes::into_pg_type;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::LogicalPlan;
 use futures::Sink;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::ExtendedQueryHandler;
-use pgwire::api::results::{
-    DescribePortalResponse, DescribeStatementResponse, FieldFormat, Response,
-};
+use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore};
@@ -19,15 +21,12 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::execution::{FloeServerState, build_query_response};
+use crate::execution::FloeServerState;
 use crate::management::{
     ManagementStatement, handle_management_statement, management_result_schema,
     parse_management_statement,
 };
-use crate::sql::{
-    collect_placeholder_indices, decode_parameter_value, ensure_select_statement,
-    extract_tables_from_query, substitute_placeholders,
-};
+use crate::sql::{ensure_select_statement, extract_tables_from_query};
 use crate::types::arrow_schema_to_field_info;
 use crate::user_error;
 
@@ -36,13 +35,12 @@ pub(super) struct PreparedStatement {
     kind: PreparedStatementKind,
     result_fields: Arc<Vec<pgwire::api::results::FieldInfo>>,
     referenced_views: Vec<String>,
-    parameter_count: usize,
     param_types: Vec<PgType>,
 }
 
 #[derive(Clone, Debug)]
 enum PreparedStatementKind {
-    Query(Box<Statement>),
+    Query { plan: LogicalPlan },
     Management(ManagementStatement),
 }
 
@@ -53,10 +51,6 @@ impl PreparedStatement {
 
     pub(super) fn referenced_views(&self) -> &[String] {
         &self.referenced_views
-    }
-
-    pub(super) fn parameter_count(&self) -> usize {
-        self.parameter_count
     }
 
     pub(super) fn parameter_types(&self) -> Vec<PgType> {
@@ -93,7 +87,6 @@ impl FloeExtendedQueryParser {
                 kind: PreparedStatementKind::Management(statement),
                 result_fields: fields,
                 referenced_views: Vec::new(),
-                parameter_count: 0,
                 param_types: Vec::new(),
             });
         }
@@ -136,21 +129,16 @@ impl FloeExtendedQueryParser {
             .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
         let schema_ref = Arc::new(dataframe.schema().as_arrow().clone());
         let fields = Arc::new(arrow_schema_to_field_info(&schema_ref)?);
-
-        let placeholder_indices = collect_placeholder_indices(&statement)?;
-        let parameter_count = placeholder_indices.iter().copied().max().unwrap_or(0);
-        let mut bound_param_types = vec![PgType::UNKNOWN; parameter_count];
-        for (idx, ty) in parameter_types.iter().enumerate() {
-            if idx < bound_param_types.len() {
-                bound_param_types[idx] = ty.clone().unwrap_or(PgType::UNKNOWN);
-            }
-        }
+        let logical_plan = dataframe.into_unoptimized_plan();
+        let inferred_parameter_types = logical_plan
+            .get_parameter_types()
+            .map_err(|err| user_error(format!("DataFusion parameter inference error: {err}")))?;
+        let bound_param_types = infer_parameter_types(&inferred_parameter_types, parameter_types)?;
 
         Ok(PreparedStatement {
-            kind: PreparedStatementKind::Query(Box::new(statement)),
+            kind: PreparedStatementKind::Query { plan: logical_plan },
             result_fields: fields,
             referenced_views: deduped,
-            parameter_count,
             param_types: bound_param_types,
         })
     }
@@ -198,11 +186,37 @@ impl FloeExtendedHandler {
         }
     }
 
-    pub(super) fn render_portal_sql(
+    pub(super) async fn execute_portal_query(
         &self,
         portal: &Portal<PreparedStatement>,
-    ) -> PgWireResult<String> {
-        render_sql_with_params(&portal.statement.statement, portal)
+    ) -> PgWireResult<Response> {
+        let PreparedStatementKind::Query { plan } = portal.statement.statement.kind() else {
+            return Err(user_error("expected query statement"));
+        };
+        let inferred_types = plan
+            .get_parameter_types()
+            .map_err(|err| user_error(format!("DataFusion parameter inference error: {err}")))?;
+        let param_values = deserialize_parameters(portal, &ordered_param_types(&inferred_types))?;
+        let plan_with_values = plan
+            .clone()
+            .replace_params_with_values(&param_values)
+            .map_err(|err| user_error(format!("DataFusion parameter binding error: {err}")))?;
+        let optimized = self
+            .state
+            .query
+            .session()
+            .state()
+            .optimize(&plan_with_values)
+            .map_err(|err| user_error(format!("DataFusion optimization error: {err}")))?;
+        let dataframe = self
+            .state
+            .query
+            .session()
+            .execute_logical_plan(optimized)
+            .await
+            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
+        let response = encode_dataframe(dataframe, &portal.result_column_format, None).await?;
+        Ok(Response::Query(response))
     }
 }
 
@@ -268,57 +282,34 @@ impl ExtendedQueryHandler for FloeExtendedHandler {
         for view in portal.statement.statement.referenced_views() {
             self.state.ensure_materialized_view_registered(view).await?;
         }
-
-        let sql = self.render_portal_sql(portal)?;
-        self.state.ensure_materialized_views_in_sql(&sql).await?;
-        let dataframe = self
-            .state
-            .query
-            .session()
-            .sql(&sql)
-            .await
-            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|err| user_error(format!("DataFusion execution error: {err}")))?;
-        let response = build_query_response(batches)?;
-        Ok(Response::Query(response))
+        self.execute_portal_query(portal).await
     }
 }
 
-fn render_sql_with_params(
-    prepared: &PreparedStatement,
-    portal: &Portal<PreparedStatement>,
-) -> PgWireResult<String> {
-    let PreparedStatementKind::Query(statement) = prepared.kind() else {
-        return Err(user_error(
-            "management statements do not support parameters",
-        ));
-    };
-    let expected = prepared.parameter_count();
-    if portal.parameter_len() != expected {
-        return Err(user_error(format!(
-            "expected {expected} parameter(s) but received {}",
-            portal.parameter_len()
-        )));
+fn infer_parameter_types(
+    inferred_types: &HashMap<String, Option<DataType>>,
+    client_types: &[Option<PgType>],
+) -> PgWireResult<Vec<PgType>> {
+    let mut result = Vec::new();
+    for inferred in ordered_param_types(inferred_types) {
+        let ty = match inferred {
+            Some(data_type) => into_pg_type(data_type)?,
+            None => PgType::UNKNOWN,
+        };
+        result.push(ty);
     }
-
-    let mut decoded = Vec::with_capacity(expected);
-    for idx in 0..expected {
-        let format = portal.parameter_format.format_for(idx);
-        if matches!(format, FieldFormat::Binary) {
-            return Err(user_error("binary parameters are not supported"));
+    for (idx, ty) in client_types.iter().enumerate() {
+        if idx < result.len()
+            && let Some(ty) = ty
+        {
+            result[idx] = ty.clone();
         }
-        let raw_value = portal
-            .parameters
-            .get(idx)
-            .ok_or_else(|| user_error("missing parameter value"))?;
-        let value = decode_parameter_value(raw_value.as_ref(), format)?;
-        decoded.push(value);
     }
+    Ok(result)
+}
 
-    let mut statement = statement.as_ref().clone();
-    substitute_placeholders(&mut statement, &decoded)?;
-    Ok(statement.to_string())
+fn ordered_param_types(types: &HashMap<String, Option<DataType>>) -> Vec<Option<&DataType>> {
+    let mut ordered = types.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    ordered.into_iter().map(|(_, ty)| ty.as_ref()).collect()
 }

@@ -1,13 +1,7 @@
-use core::ops::ControlFlow;
 use std::collections::HashSet;
 
-use bytes::Bytes;
-use pgwire::api::results::FieldFormat;
 use pgwire::error::PgWireResult;
-use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor, Value,
-    ValueWithSpan, visit_expressions, visit_expressions_mut,
-};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor};
 
 use floe_executor::namespaces;
 
@@ -26,96 +20,6 @@ fn is_select_expr(expr: &SetExpr) -> bool {
         SetExpr::SetOperation { left, right, .. } => is_select_expr(left) && is_select_expr(right),
         SetExpr::Query(query) => is_select_expr(&query.body),
         _ => false,
-    }
-}
-
-pub(crate) fn collect_placeholder_indices(statement: &Statement) -> PgWireResult<Vec<usize>> {
-    let mut indices = Vec::new();
-    let result = visit_expressions(statement, |expr| {
-        if let Expr::Value(ValueWithSpan {
-            value: Value::Placeholder(name),
-            ..
-        }) = expr
-        {
-            match parse_placeholder_index(name) {
-                Ok(idx) => indices.push(idx),
-                Err(err) => return ControlFlow::Break(err),
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    match result {
-        ControlFlow::Continue(_) => Ok(indices),
-        ControlFlow::Break(err) => Err(err),
-    }
-}
-
-fn parse_placeholder_index(name: &str) -> PgWireResult<usize> {
-    let trimmed = name.trim_start_matches(['$', '?']);
-    if trimmed.is_empty() {
-        return Err(user_error(format!("invalid placeholder '{name}'")));
-    }
-    let idx = trimmed
-        .parse::<usize>()
-        .map_err(|_| user_error(format!("invalid placeholder '{name}'")))?;
-    if idx == 0 {
-        return Err(user_error(format!("invalid placeholder '{name}'")));
-    }
-    Ok(idx)
-}
-
-pub(crate) fn decode_parameter_value(
-    raw: Option<&Bytes>,
-    _format: FieldFormat,
-) -> PgWireResult<ValueWithSpan> {
-    match raw {
-        None => Ok(Value::Null.with_empty_span()),
-        Some(bytes) => {
-            let text = std::str::from_utf8(bytes.as_ref())
-                .map_err(|_| user_error("parameter values must be valid UTF-8"))?;
-            Ok(string_to_value(text).with_empty_span())
-        }
-    }
-}
-
-fn string_to_value(input: &str) -> Value {
-    if input.parse::<i64>().is_ok() || input.parse::<f64>().is_ok() {
-        Value::Number(input.to_string(), false)
-    } else if input.eq_ignore_ascii_case("true") {
-        Value::Boolean(true)
-    } else if input.eq_ignore_ascii_case("false") {
-        Value::Boolean(false)
-    } else {
-        Value::SingleQuotedString(input.to_string())
-    }
-}
-
-pub(crate) fn substitute_placeholders(
-    statement: &mut Statement,
-    values: &[ValueWithSpan],
-) -> PgWireResult<()> {
-    let result = visit_expressions_mut(statement, |expr| {
-        if let Expr::Value(ValueWithSpan {
-            value: Value::Placeholder(name),
-            ..
-        }) = expr
-        {
-            let idx = match parse_placeholder_index(name) {
-                Ok(idx) => idx,
-                Err(err) => return ControlFlow::Break(err),
-            };
-            if idx == 0 || idx > values.len() {
-                return ControlFlow::Break(user_error(format!(
-                    "placeholder {name} has no bound value"
-                )));
-            }
-            *expr = Expr::Value(values[idx - 1].clone());
-        }
-        ControlFlow::Continue(())
-    });
-    match result {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(err) => Err(err),
     }
 }
 

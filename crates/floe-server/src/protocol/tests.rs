@@ -166,16 +166,19 @@ async fn extended_parser_tracks_referenced_mvs_and_parameters() {
         .prepare_statement("SELECT * FROM mv_test WHERE auction > $1", &[])
         .await
         .expect("prepared");
-    assert_eq!(prepared.parameter_count(), 1);
+    assert_eq!(prepared.parameter_types(), vec![PgType::INT8]);
     assert_eq!(prepared.referenced_views(), &["mv_test"]);
 }
 
 #[tokio::test]
-async fn extended_handler_renders_bound_sql() {
-    let state = state_with_single_mv().await;
+async fn extended_handler_executes_bound_parameters() {
+    let (state, _) = streaming_state_with_rows(&[10, 20]).await;
     let parser = FloeExtendedQueryParser::new(Arc::clone(&state));
     let prepared = parser
-        .prepare_statement("SELECT auction FROM mv_test WHERE auction > $1", &[])
+        .prepare_statement(
+            &format!("SELECT value FROM {STREAM_VIEW_NAME} WHERE value > $1 ORDER BY value"),
+            &[],
+        )
         .await
         .expect("prepared");
     let stored = Arc::new(StoredStatement::new(
@@ -192,10 +195,22 @@ async fn extended_handler_renders_bound_sql() {
     );
     let portal = Portal::try_new(&bind, Arc::clone(&stored)).expect("portal");
     let handler = FloeExtendedHandler::new(state);
-    let sql = handler.render_portal_sql(&portal).expect("rendered SQL");
-    assert!(
-        sql.contains("WHERE auction > 100"),
-        "unexpected rendered SQL: {sql}"
+    let response = handler
+        .execute_portal_query(&portal)
+        .await
+        .expect("execute portal query");
+    let Response::Query(mut query) = response else {
+        panic!("expected query response");
+    };
+    let rows_stream = query.data_rows();
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(decode_text_row(row.expect("row")));
+    }
+    assert_eq!(
+        rows.len(),
+        0,
+        "bound filter should exclude all rows for >100"
     );
 }
 
