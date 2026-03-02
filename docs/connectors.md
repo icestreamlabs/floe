@@ -217,3 +217,6 @@ Execution semantics:
   - `floe_sink_queue_depth{sink=...}`
   - `floe_sink_version_lag{sink=...}`
   - `floe_sink_failures_total{sink=...,transport=...}`
+  - `floe_sink_retries_total{sink=...,transport=...}`
+
+For explicit GA delivery guarantees and limitations, see `docs/ga_contract.md`.

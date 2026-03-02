@@ -26,9 +26,17 @@ pub struct HttpIngestConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct HttpAdminConfig {
+    pub host: String,
+    pub port: u16,
+    pub health: HttpIngestHealth,
+}
+
+#[derive(Debug, Clone)]
 pub struct HttpIngestHealth {
     pub executor_running: Arc<AtomicBool>,
     pub storage_reachable: Arc<AtomicBool>,
+    pub runtime_ready: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -37,6 +45,12 @@ struct HttpIngestState {
     default_source: Option<String>,
     cancel: CancellationToken,
     health: Option<HttpIngestHealth>,
+}
+
+#[derive(Clone)]
+struct HttpAdminState {
+    cancel: CancellationToken,
+    health: HttpIngestHealth,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +71,7 @@ pub async fn run_http_ingest(
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/ingest", post(ingest))
         .route("/metrics", get(metrics))
         .with_state(state);
@@ -71,6 +86,29 @@ pub async fn run_http_ingest(
         })
         .await
         .context("run http ingest server")?;
+    Ok(())
+}
+
+pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken) -> Result<()> {
+    let state = HttpAdminState {
+        cancel: cancel.clone(),
+        health: config.health,
+    };
+    let app = Router::new()
+        .route("/healthz", get(admin_healthz))
+        .route("/readyz", get(admin_readyz))
+        .route("/metrics", get(metrics))
+        .with_state(state);
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind admin http server {addr}"))?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            cancel.cancelled().await;
+        })
+        .await
+        .context("run admin http server")?;
     Ok(())
 }
 
@@ -101,6 +139,21 @@ async fn ingest(
 
 async fn healthz(State(state): State<HttpIngestState>) -> impl IntoResponse {
     let process_alive = !state.cancel.is_cancelled();
+    let status = if process_alive {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "process_alive": process_alive,
+        })),
+    )
+}
+
+async fn readyz(State(state): State<HttpIngestState>) -> impl IntoResponse {
+    let process_alive = !state.cancel.is_cancelled();
     let executor_alive = state
         .health
         .as_ref()
@@ -111,8 +164,13 @@ async fn healthz(State(state): State<HttpIngestState>) -> impl IntoResponse {
         .as_ref()
         .map(|health| health.storage_reachable.load(Ordering::Relaxed))
         .unwrap_or(true);
+    let runtime_ready = state
+        .health
+        .as_ref()
+        .map(|health| health.runtime_ready.load(Ordering::Relaxed))
+        .unwrap_or(true);
 
-    let status = if process_alive && executor_alive && storage_reachable {
+    let status = if process_alive && executor_alive && storage_reachable && runtime_ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -123,6 +181,43 @@ async fn healthz(State(state): State<HttpIngestState>) -> impl IntoResponse {
             "process_alive": process_alive,
             "executor_alive": executor_alive,
             "storage_reachable": storage_reachable,
+            "runtime_ready": runtime_ready,
+        })),
+    )
+}
+
+async fn admin_healthz(State(state): State<HttpAdminState>) -> impl IntoResponse {
+    let process_alive = !state.cancel.is_cancelled();
+    let status = if process_alive {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "process_alive": process_alive,
+        })),
+    )
+}
+
+async fn admin_readyz(State(state): State<HttpAdminState>) -> impl IntoResponse {
+    let process_alive = !state.cancel.is_cancelled();
+    let executor_alive = state.health.executor_running.load(Ordering::Relaxed);
+    let storage_reachable = state.health.storage_reachable.load(Ordering::Relaxed);
+    let runtime_ready = state.health.runtime_ready.load(Ordering::Relaxed);
+    let status = if process_alive && executor_alive && storage_reachable && runtime_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "process_alive": process_alive,
+            "executor_alive": executor_alive,
+            "storage_reachable": storage_reachable,
+            "runtime_ready": runtime_ready,
         })),
     )
 }
@@ -235,14 +330,23 @@ mod tests {
             health: Some(HttpIngestHealth {
                 executor_running: Arc::new(AtomicBool::new(false)),
                 storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
             }),
         };
         let app = Router::new()
             .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz))
             .with_state(state);
         let request = Request::builder()
             .method("GET")
             .uri("/healthz")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/readyz")
             .body(Body::empty())
             .expect("request");
         let response = app.oneshot(request).await.expect("response");

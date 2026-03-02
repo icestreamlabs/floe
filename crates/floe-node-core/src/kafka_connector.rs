@@ -3,14 +3,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::BorrowedMessage;
+use rdkafka::{Offset, TopicPartitionList};
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
-use floe_core::source::{SourceDefinition, SourceEvent};
+use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 
 #[derive(Debug, Clone)]
 pub struct KafkaConnectorConfig {
@@ -20,12 +22,27 @@ pub struct KafkaConnectorConfig {
     pub default_source: Option<String>,
     pub poll_timeout: Duration,
     pub max_messages_per_tick: usize,
+    pub commit_offsets_rx: Option<watch::Receiver<KafkaOffsetCommit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaTopicPartitionOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KafkaOffsetCommit {
+    pub tick_id: u64,
+    pub offsets: Vec<KafkaTopicPartitionOffset>,
 }
 
 pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     definitions: Vec<SourceDefinition>,
     consumer: Option<StreamConsumer>,
+    last_committed_tick_id: u64,
 }
 
 impl KafkaConnector {
@@ -43,6 +60,7 @@ impl KafkaConnector {
             config,
             definitions,
             consumer: None,
+            last_committed_tick_id: 0,
         })
     }
 
@@ -102,11 +120,14 @@ impl KafkaConnector {
         };
 
         for event in &events {
-            ctx.sender().send(event.clone()).await.with_context(|| {
-                format!(
-                    "failed to enqueue kafka event for source {}",
-                    event.source()
-                )
+            let event = event.clone().with_resume_token(SourceResumeToken::Kafka {
+                topic: message.topic().to_string(),
+                partition: message.partition(),
+                offset: message.offset(),
+            });
+            let source_name = event.source().to_string();
+            ctx.sender().send(event).await.with_context(|| {
+                format!("failed to enqueue kafka event for source {}", source_name)
             })?;
         }
         Ok(events.len())
@@ -132,7 +153,7 @@ impl Connector for KafkaConnector {
         client_config
             .set("bootstrap.servers", &self.config.brokers)
             .set("group.id", &self.config.group_id)
-            .set("enable.auto.commit", "true")
+            .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest");
         let consumer: StreamConsumer = client_config.create().context("create kafka consumer")?;
         let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
@@ -176,6 +197,8 @@ impl Connector for KafkaConnector {
                 Err(_) => break,
             }
         }
+
+        self.commit_offsets_if_requested().await?;
 
         if emitted > 0 {
             Ok(ConnectorTick::Emitted(emitted))
@@ -221,4 +244,52 @@ fn parse_event(value: Value, default_source: Option<&str>, topic: &str) -> Resul
 
     let source = default_source.unwrap_or(topic);
     Ok(SourceEvent::new(source, value))
+}
+
+impl KafkaConnector {
+    async fn commit_offsets_if_requested(&mut self) -> Result<()> {
+        let Some(consumer) = self.consumer.as_ref() else {
+            return Ok(());
+        };
+        let Some(receiver) = self.config.commit_offsets_rx.as_mut() else {
+            return Ok(());
+        };
+
+        let mut latest_commit = None;
+        while receiver.has_changed().unwrap_or(false) {
+            latest_commit = Some(receiver.borrow_and_update().clone());
+        }
+        let Some(commit) = latest_commit else {
+            return Ok(());
+        };
+        if commit.tick_id <= self.last_committed_tick_id {
+            return Ok(());
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        let mut has_offsets = false;
+        for entry in &commit.offsets {
+            if !self.config.topics.iter().any(|topic| topic == &entry.topic) {
+                continue;
+            }
+            let next_offset = entry.offset.saturating_add(1);
+            tpl.add_partition_offset(&entry.topic, entry.partition, Offset::Offset(next_offset))
+                .with_context(|| {
+                    format!(
+                        "set kafka commit offset for {}[{}] at tick {}",
+                        entry.topic, entry.partition, commit.tick_id
+                    )
+                })?;
+            has_offsets = true;
+        }
+        if !has_offsets {
+            return Ok(());
+        }
+
+        consumer
+            .commit(&tpl, CommitMode::Sync)
+            .context("commit kafka offsets after tick commit")?;
+        self.last_committed_tick_id = commit.tick_id;
+        Ok(())
+    }
 }

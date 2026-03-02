@@ -8,6 +8,7 @@ floe-executor = { path = "../floe-executor" }
 floe-node-core = { path = "../floe-node-core" }
 floe-server = { path = "../floe-server" }
 floe-storage = { path = "../floe-storage" }
+floe-core = { path = "../floe-core" }
 dbsp = { path = "../dbsp" }
 anyhow = { workspace = true }
 datafusion = { workspace = true }

@@ -1,4 +1,4 @@
-pub use floe_core::source::{SourceDefinition, SourceEvent, SourceRegistry};
+pub use floe_core::source::{SourceDefinition, SourceEvent, SourceRegistry, SourceResumeToken};
 use tokio::sync::mpsc;
 
 pub type SourceEventSender = mpsc::Sender<SourceEvent>;

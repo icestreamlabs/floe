@@ -159,6 +159,17 @@ async fn extended_parser_rejects_non_select() {
 }
 
 #[tokio::test]
+async fn extended_parser_accepts_bootstrap_show_query() {
+    let state = state_with_single_mv().await;
+    let parser = FloeExtendedQueryParser::new(state);
+    let prepared = parser
+        .prepare_statement("SHOW transaction_isolation", &[])
+        .await
+        .expect("bootstrap show query should parse");
+    assert!(prepared.referenced_views().is_empty());
+}
+
+#[tokio::test]
 async fn extended_parser_tracks_referenced_mvs_and_parameters() {
     let state = state_with_single_mv().await;
     let parser = FloeExtendedQueryParser::new(Arc::clone(&state));

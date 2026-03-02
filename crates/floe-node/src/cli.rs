@@ -80,8 +80,14 @@ pub struct RunArgs {
     pub slatedb_compaction_max_concurrent: Option<usize>,
 
     /// Wait for SlateDB writes to be durable before acknowledging writes.
-    #[arg(long = "slatedb-await-durable")]
-    pub slatedb_await_durable: bool,
+    /// Defaults to true when not set (GA-safe default).
+    #[arg(
+        long = "slatedb-await-durable",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub slatedb_await_durable: Option<bool>,
 
     /// Enable SlateDB object-store cache at this local directory.
     #[arg(long = "slatedb-cache-dir")]

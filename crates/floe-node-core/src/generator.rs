@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceEvent};
+use floe_core::source::{
+    SourceColumn, SourceDataType, SourceDefinition, SourceEvent, SourceResumeToken,
+};
 use nexmark::EventGenerator;
 use nexmark::config::NexmarkConfig;
 use nexmark::event::Event;
@@ -85,7 +87,7 @@ impl Connector for NexmarkConnector {
         let event = generator
             .next()
             .context("nexmark generator produced no event")?;
-        forward_event(ctx.sender(), &event).await?;
+        forward_event(ctx.sender(), &event, self.emitted).await?;
         self.emitted = self.emitted.saturating_add(1);
 
         if let Some(limit) = self.config.max_events
@@ -123,13 +125,15 @@ pub async fn run(config: Config, sender: SourceEventSender) -> Result<()> {
     run_connector(&mut connector, &ctx, CancellationToken::new()).await
 }
 
-async fn forward_event(sender: &SourceEventSender, event: &Event) -> Result<()> {
+async fn forward_event(sender: &SourceEventSender, event: &Event, position: u64) -> Result<()> {
     match event {
-        Event::Person(person) => send_payload(sender, PERSON_SOURCE_NAME, person, "person").await,
-        Event::Auction(auction) => {
-            send_payload(sender, AUCTION_SOURCE_NAME, auction, "auction").await
+        Event::Person(person) => {
+            send_payload(sender, PERSON_SOURCE_NAME, person, "person", position).await
         }
-        Event::Bid(bid) => send_payload(sender, BID_SOURCE_NAME, bid, "bid").await,
+        Event::Auction(auction) => {
+            send_payload(sender, AUCTION_SOURCE_NAME, auction, "auction", position).await
+        }
+        Event::Bid(bid) => send_payload(sender, BID_SOURCE_NAME, bid, "bid", position).await,
     }
 }
 
@@ -138,14 +142,17 @@ async fn send_payload<T>(
     source: &str,
     payload: &T,
     entity: &str,
+    position: u64,
 ) -> Result<()>
 where
     T: Serialize,
 {
     let json = serde_json::to_value(payload)
         .with_context(|| format!("failed to serialize {entity} event"))?;
+    let event =
+        SourceEvent::new(source, json).with_resume_token(SourceResumeToken::Generator { position });
     sender
-        .send(SourceEvent::new(source, json))
+        .send(event)
         .await
         .map_err(|err| anyhow!("failed to enqueue event for source {source}: {err}"))?;
     Ok(())

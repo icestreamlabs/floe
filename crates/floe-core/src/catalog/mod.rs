@@ -39,6 +39,8 @@ pub struct ColumnDefinition {
     name: String,
     data_type: ColumnType,
     primary_key: bool,
+    #[serde(default)]
+    nullable: bool,
 }
 
 impl ColumnDefinition {
@@ -47,10 +49,20 @@ impl ColumnDefinition {
     }
 
     pub fn new_typed(name: impl Into<String>, data_type: ColumnType, primary_key: bool) -> Self {
+        Self::new_typed_nullable(name, data_type, false, primary_key)
+    }
+
+    pub fn new_typed_nullable(
+        name: impl Into<String>,
+        data_type: ColumnType,
+        nullable: bool,
+        primary_key: bool,
+    ) -> Self {
         Self {
             name: name.into(),
             data_type,
             primary_key,
+            nullable: nullable && !primary_key,
         }
     }
 
@@ -64,6 +76,10 @@ impl ColumnDefinition {
 
     pub fn is_primary_key(&self) -> bool {
         self.primary_key
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
     }
 }
 
@@ -130,7 +146,13 @@ impl TableDefinition {
         let fields: Vec<Field> = self
             .columns
             .iter()
-            .map(|column| Field::new(column.name(), column.data_type().arrow_type(), false))
+            .map(|column| {
+                Field::new(
+                    column.name(),
+                    column.data_type().arrow_type(),
+                    column.nullable(),
+                )
+            })
             .collect();
         SchemaRef::new(Schema::new(fields))
     }
@@ -223,5 +245,21 @@ mod tests {
         let table = serde_json::from_str::<TableDefinition>(json).expect("valid table");
         assert_eq!(table.name(), "ok");
         assert_eq!(table.columns().len(), 1);
+    }
+
+    #[test]
+    fn preserves_nullable_column_metadata() {
+        let table = TableDefinition::new(
+            "nullable_cols",
+            vec![
+                ColumnDefinition::new_typed("id", ColumnType::Int64, true),
+                ColumnDefinition::new_typed_nullable("note", ColumnType::Utf8, true, false),
+            ],
+        )
+        .expect("valid table");
+        let encoded = serde_json::to_string(&table).expect("serialize");
+        let decoded = serde_json::from_str::<TableDefinition>(&encoded).expect("deserialize");
+        assert!(!decoded.columns()[0].nullable());
+        assert!(decoded.columns()[1].nullable());
     }
 }

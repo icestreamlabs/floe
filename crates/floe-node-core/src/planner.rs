@@ -262,6 +262,7 @@ pub(crate) fn to_camel_case(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
     use floe_sql_parser::parse_materialized_view;
 
     use super::*;
@@ -383,5 +384,35 @@ mod tests {
             );
             assert_eq!(plan.definition().name(), *name);
         }
+    }
+
+    #[tokio::test]
+    async fn plans_catalog_table_from_registry() {
+        let mut registry = SourceRegistry::new();
+        registry.register(
+            SourceDefinition::new(
+                "orders",
+                vec![
+                    SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                    SourceColumn::new_nullable("note", SourceDataType::Utf8, true),
+                ],
+            )
+            .expect("source definition"),
+        );
+
+        let definition =
+            parse_materialized_view("CREATE MATERIALIZED VIEW mv_orders AS SELECT id FROM orders")
+                .expect("parse mv");
+
+        let planned = plan_materialized_views(&registry, &[definition])
+            .await
+            .expect("plan mv");
+
+        assert_eq!(planned.len(), 1);
+        let logical_plan = planned[0].logical_plan().display_indent().to_string();
+        assert!(
+            logical_plan.contains("orders"),
+            "logical plan was: {logical_plan}"
+        );
     }
 }

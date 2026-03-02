@@ -19,6 +19,9 @@ use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{CompactionSchedulerConfig, StreamRetention};
+use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
+use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
+use floe_executor::checkpoint::{CheckpointManager, MaterializedViewTickVersion, TickCommit};
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
@@ -27,7 +30,9 @@ use floe_executor::{
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
 use floe_node_core::generator;
-use floe_node_core::kafka_connector::{KafkaConnector, KafkaConnectorConfig};
+use floe_node_core::kafka_connector::{
+    KafkaConnector, KafkaConnectorConfig, KafkaOffsetCommit, KafkaTopicPartitionOffset,
+};
 use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreConnectorConfig};
 use floe_node_core::planner::{
     PlannedMaterializedView, camel_case_schema, plan_materialized_views,
@@ -35,13 +40,17 @@ use floe_node_core::planner::{
 use floe_node_core::postgres_cdc_connector::{PostgresCdcConnector, PostgresCdcConnectorConfig};
 use floe_node_core::tail_client;
 use floe_server as server;
-use floe_sql_parser::{FloeStatement, MaterializedViewDefinition, parse_floe_program};
+use floe_sql_parser::{
+    CreateTableDefinition, FloeStatement, MaterializedViewDefinition, SqlColumnType,
+    parse_floe_program,
+};
 use floe_storage::MaterializedViewMetadata;
 use futures::future::select_all;
 use slatedb::config::{CompactorOptions, Settings};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +84,10 @@ const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INGEST_BATCH_SIZE: usize = 256;
 const DEFAULT_INGEST_BATCH_PER_SOURCE: usize = 64;
 const DEFAULT_INGEST_BATCH_PER_CONNECTOR: usize = 64;
+const DEFAULT_ADMIN_PORT: u16 = 8081;
+const CHECKPOINT_GRAPH_ID: &str = "floe_runtime";
+const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
+const ADMIN_PORT_ENV: &str = "FLOE_ADMIN_PORT";
 
 struct ConnectorQueue {
     name: String,
@@ -104,7 +117,7 @@ use floe_node_core::executor::{
 };
 use floe_node_core::source as core_source;
 use floe_node_core::source::SourceRegistry;
-use http_ingest::{HttpIngestConfig, HttpIngestHealth};
+use http_ingest::{HttpAdminConfig, HttpIngestConfig, HttpIngestHealth};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -138,7 +151,8 @@ async fn main() -> anyhow::Result<()> {
             "--kafka-topics is required when --kafka-brokers is set"
         ));
     }
-    SlateTable::set_default_await_durable(run_args.slatedb_await_durable);
+    let awaited_durable = run_args.slatedb_await_durable.unwrap_or(true);
+    SlateTable::set_default_await_durable(awaited_durable);
     let stream_gc = StreamGcConfig {
         grace_period_ms: run_args.zset_gc_grace_period_ms,
     };
@@ -171,8 +185,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(floe_node_core::generator::definitions()?);
-    apply_connector_properties(&mut source_registry, &connector_specs);
-    let available_sources = available_sources_from_registry(&source_registry);
 
     let slate_settings = load_slatedb_settings(&run_args)?;
     let storage = if run_args.dry_run {
@@ -236,6 +248,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(sql_program) = run_args.mv_query.as_deref() {
         for statement in parse_floe_program(sql_program)? {
             match statement {
+                FloeStatement::CreateTable(definition) => {
+                    let table = table_definition_from_sql(&definition)?;
+                    if let Some(storage) = storage.as_ref() {
+                        storage.upsert_table(table.clone()).await.with_context(|| {
+                            format!("persist table definition '{}'", table.name())
+                        })?;
+                    }
+                    source_registry.register(source_definition_from_table(&table)?);
+                }
                 FloeStatement::CreateMaterializedView(definition) => {
                     upsert_materialized_view_definition(
                         &mut materialized_view_map,
@@ -258,6 +279,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)?;
+
+    if let Some(storage) = storage.as_ref() {
+        for table in storage
+            .tables()
+            .await
+            .context("load persisted table definitions")?
+        {
+            source_registry.register(source_definition_from_table(&table)?);
+        }
+    }
+    apply_connector_properties(&mut source_registry, &connector_specs);
+    let available_sources = available_sources_from_registry(&source_registry);
 
     let mut materialized_views: Vec<MaterializedViewDefinition> =
         materialized_view_map.into_values().collect();
@@ -305,6 +338,13 @@ async fn main() -> anyhow::Result<()> {
     }
     let storage = storage.expect("storage initialized when not in dry-run");
     let db = storage.db();
+    let checkpoint_table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let checkpoint_manager = CheckpointManager::new(CHECKPOINT_GRAPH_ID, checkpoint_table)
+        .await
+        .context("initialize tick checkpoint manager")?;
+    if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
+        metrics::record_last_committed_tick(tick_commit.tick_id);
+    }
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
         OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
@@ -342,7 +382,9 @@ async fn main() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
-    let consolidation_mode = match run_args.output_consolidation_mode {
+    let output_mode =
+        resolve_output_consolidation_mode(run_args.output_consolidation_mode, &source_registry);
+    let consolidation_mode = match output_mode {
         cli::OutputConsolidationMode::AllColumns => ConsolidationMode::ByAllColumns,
         cli::OutputConsolidationMode::Key => ConsolidationMode::ByKey,
     };
@@ -413,7 +455,12 @@ async fn main() -> anyhow::Result<()> {
     let event_watermark = Arc::new(AtomicI64::new(-1));
     let executor_running = Arc::new(AtomicBool::new(true));
     let storage_reachable = Arc::new(AtomicBool::new(true));
+    let runtime_ready = Arc::new(AtomicBool::new(false));
     let runtime_cancel = CancellationToken::new();
+    let ingest_cancel = CancellationToken::new();
+    let sink_cancel = CancellationToken::new();
+    let service_cancel = CancellationToken::new();
+    let shutdown_signal = CancellationToken::new();
     let runtime_failure = Arc::new(StdMutex::new(None::<String>));
     let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let graph_cancel = runtime_cancel.clone();
@@ -496,18 +543,57 @@ async fn main() -> anyhow::Result<()> {
     let max_batch_per_source = run_args.ingest_batch_per_source;
     let max_batch_per_connector = run_args.ingest_batch_per_connector;
 
-    let connector_cancel = runtime_cancel.clone();
+    let runtime_cancel_for_propagation = runtime_cancel.clone();
+    let ingest_cancel_for_propagation = ingest_cancel.clone();
+    let sink_cancel_for_propagation = sink_cancel.clone();
+    let service_cancel_for_propagation = service_cancel.clone();
+    let cancellation_propagation_handle: JoinHandle<()> = tokio::spawn(async move {
+        runtime_cancel_for_propagation.cancelled().await;
+        ingest_cancel_for_propagation.cancel();
+        sink_cancel_for_propagation.cancel();
+        service_cancel_for_propagation.cancel();
+    });
+
+    let admin_port = std::env::var(ADMIN_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_ADMIN_PORT);
+    let admin_health = HttpIngestHealth {
+        executor_running: Arc::clone(&executor_running),
+        storage_reachable: Arc::clone(&storage_reachable),
+        runtime_ready: Arc::clone(&runtime_ready),
+    };
+    let admin_config = HttpAdminConfig {
+        host: run_args.http_host.clone(),
+        port: admin_port,
+        health: admin_health,
+    };
+    let admin_cancel = service_cancel.clone();
+    let runtime_cancel_for_admin = runtime_cancel.clone();
+    let failure_for_admin = Arc::clone(&runtime_failure);
+    let admin_handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(err) = http_ingest::run_admin_server(admin_config, admin_cancel.clone()).await {
+            tracing::error!(error = %err, "admin HTTP server failed");
+            record_runtime_failure(
+                &failure_for_admin,
+                format!("admin HTTP server failed: {err}"),
+            );
+            runtime_cancel_for_admin.cancel();
+        }
+    });
     let connector_count = connector_specs.len();
     let per_connector_queue_capacity = (queue_capacity / connector_count).max(1);
 
     let mut connector_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut connector_queues: Vec<ConnectorQueue> = Vec::new();
+    let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
 
     for connector in connector_specs {
         let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
         connector_queues.push(ConnectorQueue::new(connector.name.clone(), receiver));
-        let cancel = connector_cancel.clone();
+        let cancel = ingest_cancel.clone();
+        let runtime_cancel = runtime_cancel.clone();
         let failure_state = Arc::clone(&runtime_failure);
         match connector.config {
             ConnectorConfig::Http {
@@ -523,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
                     health: Some(HttpIngestHealth {
                         executor_running: Arc::clone(&executor_running),
                         storage_reachable: Arc::clone(&storage_reachable),
+                        runtime_ready: Arc::clone(&runtime_ready),
                     }),
                 };
                 let failure_state = Arc::clone(&failure_state);
@@ -535,7 +622,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("HTTP ingest connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -552,6 +639,8 @@ async fn main() -> anyhow::Result<()> {
                 let poll_timeout = Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms));
                 let max_messages_per_tick =
                     max_messages_per_tick.unwrap_or(run_args.kafka_max_messages);
+                let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
+                kafka_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {
@@ -562,6 +651,7 @@ async fn main() -> anyhow::Result<()> {
                         default_source,
                         poll_timeout,
                         max_messages_per_tick,
+                        commit_offsets_rx: Some(commit_rx),
                     };
                     let mut connector = match KafkaConnector::new(config, definitions) {
                         Ok(connector) => connector,
@@ -571,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                                 &failure_state,
                                 format!("Kafka connector config invalid: {err}"),
                             );
-                            cancel.cancel();
+                            runtime_cancel.cancel();
                             return;
                         }
                     };
@@ -582,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("Kafka connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -606,7 +696,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("File connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -632,7 +722,7 @@ async fn main() -> anyhow::Result<()> {
                                     &failure_state,
                                     format!("Nexmark connector config invalid: {err}"),
                                 );
-                                cancel.cancel();
+                                runtime_cancel.cancel();
                                 return;
                             }
                         };
@@ -643,7 +733,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("Nexmark connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -667,7 +757,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("Object store connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -705,7 +795,7 @@ async fn main() -> anyhow::Result<()> {
                                 &failure_state,
                                 format!("Postgres CDC connector config invalid: {err}"),
                             );
-                            cancel.cancel();
+                            runtime_cancel.cancel();
                             return;
                         }
                     };
@@ -716,7 +806,7 @@ async fn main() -> anyhow::Result<()> {
                             &failure_state,
                             format!("Postgres CDC connector failed: {err}"),
                         );
-                        cancel.cancel();
+                        runtime_cancel.cancel();
                     }
                 }));
             }
@@ -726,13 +816,56 @@ async fn main() -> anyhow::Result<()> {
     let decoder_for_task = Arc::clone(&decoder_registry);
     let watermark_for_task = Arc::clone(&event_watermark);
     let mv_for_task = Arc::clone(&mv_registry);
+    let kafka_commit_senders_for_task = kafka_commit_senders;
     let executor_running_for_task = Arc::clone(&executor_running);
-    let executor_cancel = connector_cancel.clone();
+    let failure_for_executor = Arc::clone(&runtime_failure);
+    let tracked_mv_names: Vec<String> = planned_materialized_views
+        .iter()
+        .map(|plan| plan.definition().name().to_string())
+        .collect();
+    let executor_cancel = runtime_cancel.clone();
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut connector_queues = connector_queues;
+        let mut checkpoint_manager = checkpoint_manager;
         let mut next_connector = 0usize;
         let mut epoch: u64 = 0;
-        loop {
+        let mut last_mv_versions: HashMap<String, u64> = HashMap::new();
+        let mut committed_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
+        let mut latest_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
+        let mut mv_last_update_at_ms: HashMap<String, u64> = tracked_mv_names
+            .iter()
+            .map(|view| (view.clone(), current_unix_time_ms()))
+            .collect();
+        let mut last_checkpoint_commit_at = Instant::now();
+        let pre_tick_commit_delay_ms = std::env::var("FLOE_TEST_PRE_TICK_COMMIT_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if let Some(existing_commit) = checkpoint_manager.latest_tick_commit() {
+            metrics::record_last_committed_tick(existing_commit.tick_id);
+            epoch = existing_commit.tick_id;
+            for mv_version in &existing_commit.mv_versions {
+                last_mv_versions.insert(mv_version.view.clone(), mv_version.version);
+                mv_last_update_at_ms.insert(
+                    mv_version.view.clone(),
+                    existing_commit.committed_at_unix_ms,
+                );
+            }
+            for offset in &existing_commit.source_offsets {
+                let key = (offset.source.clone(), offset.partition);
+                committed_source_offsets.insert(key.clone(), offset.offset);
+                latest_source_offsets.insert(key, offset.offset);
+                metrics::record_source_offset_lag(&offset.source, offset.partition, 0);
+            }
+            let now_ms = current_unix_time_ms();
+            let age_secs = now_ms.saturating_sub(existing_commit.committed_at_unix_ms) / 1_000;
+            metrics::record_checkpoint_age_seconds(age_secs);
+            record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
+        }
+        'executor: loop {
+            let now_ms = current_unix_time_ms();
+            metrics::record_checkpoint_age_seconds(last_checkpoint_commit_at.elapsed().as_secs());
+            record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
             if executor_cancel.is_cancelled() {
                 break;
             }
@@ -780,6 +913,8 @@ async fn main() -> anyhow::Result<()> {
             let decode_start = Instant::now();
             let mut decoded_rows = Vec::with_capacity(batch_len);
             let mut decoded_counts: HashMap<String, usize> = HashMap::new();
+            let mut tick_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
+            let mut tick_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
             let mut batch_max_event_ts: Option<u64> = None;
             let decode_span = tracing::debug_span!(
                 "ingest_decode",
@@ -789,9 +924,25 @@ async fn main() -> anyhow::Result<()> {
             let _decode_guard = decode_span.enter();
             for event in batch {
                 let source_name = event.source().to_string();
-                let decoder = match decoder_for_task.get(&source_name) {
-                    Some(decoder) => decoder,
-                    None => continue,
+                if let Some((partition, offset)) = event_resume_offset(event.resume_token()) {
+                    let entry = tick_source_offsets
+                        .entry((source_name.clone(), partition))
+                        .or_insert(0);
+                    *entry = (*entry).max(offset);
+                }
+                if let Some((topic, partition, offset)) = event_kafka_offset(event.resume_token()) {
+                    let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
+                    *entry = (*entry).max(offset);
+                }
+                let decoder = match lookup_decoder_for_source(&decoder_for_task, &source_name) {
+                    Ok(decoder) => decoder,
+                    Err(err) => {
+                        let message = err.to_string();
+                        tracing::error!(source = %source_name, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    }
                 };
                 let (row, event_ts) = match decoder.decode(&event) {
                     Ok(result) => result,
@@ -812,6 +963,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
             metrics::observe_decode_latency_ms(decode_latency_ms);
+            metrics::observe_tick_phase_latency_ms("decode", decode_latency_ms);
             tracing::debug!(
                 decoded_rows = decoded_rows.len(),
                 latency_ms = decode_latency_ms,
@@ -874,15 +1026,107 @@ async fn main() -> anyhow::Result<()> {
                 watermark = watermark_for_task.load(Ordering::Relaxed),
             );
             let _tick_guard = tick_span.enter();
+            if pre_tick_commit_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
+            }
             // Advance frontier for all sources this epoch, even if they had no rows.
+            let tick_all_start = Instant::now();
             if let Err(err) = registry.tick_all().await {
+                metrics::observe_tick_phase_latency_ms(
+                    "state_write",
+                    tick_all_start.elapsed().as_millis() as u64,
+                );
                 tracing::error!(epoch, error = %err, "failed to tick outer streams");
                 metrics::inc_ingest_tick("error");
+                continue;
             } else if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
+                metrics::observe_tick_phase_latency_ms(
+                    "state_write",
+                    tick_all_start.elapsed().as_millis() as u64,
+                );
                 tracing::debug!(epoch, "advanced all source frontiers");
                 metrics::inc_ingest_tick("ok");
             } else {
+                metrics::observe_tick_phase_latency_ms(
+                    "state_write",
+                    tick_all_start.elapsed().as_millis() as u64,
+                );
                 metrics::inc_ingest_tick("ok");
+            }
+            drop(registry);
+            for ((source, partition), offset) in &tick_source_offsets {
+                let key = (source.clone(), *partition);
+                let latest_entry = latest_source_offsets.entry(key.clone()).or_insert(0);
+                *latest_entry = (*latest_entry).max(*offset);
+                let committed_offset = committed_source_offsets.get(&key).copied().unwrap_or(0);
+                metrics::record_source_offset_lag(
+                    source.as_str(),
+                    *partition,
+                    latest_entry.saturating_sub(committed_offset),
+                );
+            }
+            for ((source, partition), offset) in &tick_source_offsets {
+                checkpoint_manager.update_partition_offset(source.as_str(), *partition, *offset);
+            }
+            let frontier = watermark_for_task
+                .load(Ordering::Relaxed)
+                .max(0)
+                .try_into()
+                .unwrap_or(0_u64);
+            let mv_versions = collect_mv_versions_for_commit(&mv_for_task, &mut last_mv_versions);
+            let tick_commit = TickCommit::new(
+                epoch,
+                frontier,
+                checkpoint_manager.snapshot_offsets(),
+                mv_versions.clone(),
+            );
+            let committed_at_ms = tick_commit.committed_at_unix_ms;
+            let checkpoint_write_start = Instant::now();
+            if let Err(err) = checkpoint_manager.persist_tick_commit(tick_commit).await {
+                metrics::observe_tick_phase_latency_ms(
+                    "checkpoint_write",
+                    checkpoint_write_start.elapsed().as_millis() as u64,
+                );
+                tracing::error!(epoch, error = %err, "failed to persist tick commit");
+                record_runtime_failure(
+                    &failure_for_executor,
+                    format!("failed to persist tick commit {epoch}: {err}"),
+                );
+                executor_cancel.cancel();
+                break;
+            }
+            metrics::observe_tick_phase_latency_ms(
+                "checkpoint_write",
+                checkpoint_write_start.elapsed().as_millis() as u64,
+            );
+            for ((source, partition), offset) in &tick_source_offsets {
+                let key = (source.clone(), *partition);
+                let committed_entry = committed_source_offsets.entry(key.clone()).or_insert(0);
+                *committed_entry = (*committed_entry).max(*offset);
+                let latest_offset = latest_source_offsets.get(&key).copied().unwrap_or(*offset);
+                metrics::record_source_offset_lag(
+                    source.as_str(),
+                    *partition,
+                    latest_offset.saturating_sub(*committed_entry),
+                );
+            }
+            for mv_version in &mv_versions {
+                mv_last_update_at_ms.insert(mv_version.view.clone(), committed_at_ms);
+            }
+            record_mv_freshness_metrics(&mv_last_update_at_ms, current_unix_time_ms());
+            metrics::record_last_committed_tick(epoch);
+            metrics::record_checkpoint_age_seconds(0);
+            last_checkpoint_commit_at = Instant::now();
+            if !tick_kafka_offsets.is_empty() && !kafka_commit_senders_for_task.is_empty() {
+                let kafka_commit_start = Instant::now();
+                let commit = build_kafka_offset_commit(epoch, &tick_kafka_offsets);
+                for sender in &kafka_commit_senders_for_task {
+                    let _ = sender.send(commit.clone());
+                }
+                metrics::observe_tick_phase_latency_ms(
+                    "kafka_commit_notify",
+                    kafka_commit_start.elapsed().as_millis() as u64,
+                );
             }
             let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
             metrics::observe_tick_latency_ms(tick_latency_ms);
@@ -908,6 +1152,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        let final_frontier = watermark_for_task
+            .load(Ordering::Relaxed)
+            .max(0)
+            .try_into()
+            .unwrap_or(0_u64);
+        let outer_registry = outer_for_task.lock().await;
+        if let Err(err) = checkpoint_manager
+            .persist_snapshot(final_frontier, mv_for_task.as_ref(), &outer_registry)
+            .await
+        {
+            tracing::warn!(error = %err, "best-effort final checkpoint persistence failed");
+        }
         executor_running_for_task.store(false, Ordering::Relaxed);
     });
 
@@ -923,45 +1179,119 @@ async fn main() -> anyhow::Result<()> {
     register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
         .await
         .context("register materialized view tables")?;
+    runtime_ready.store(true, Ordering::Relaxed);
 
     let sink_handles = sinks::spawn_sinks(
         sink_specs,
         query.clone(),
         Arc::clone(&mv_registry),
-        connector_cancel.clone(),
+        sink_cancel.clone(),
+        runtime_cancel.clone(),
         Arc::clone(&runtime_failure),
     );
 
-    let signal_cancel = connector_cancel.clone();
+    let signal_cancel = runtime_cancel.clone();
+    let signal_ingest_cancel = ingest_cancel.clone();
+    let signal_shutdown = shutdown_signal.clone();
     let signal_handle = tokio::spawn(async move {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                match signal {
-                    Ok(()) => tracing::info!("shutdown signal received"),
-                    Err(err) => tracing::error!(error = %err, "failed to listen for shutdown signal"),
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to listen for SIGTERM");
+                    signal_cancel.cancel();
+                    return;
                 }
-                signal_cancel.cancel();
+            };
+
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    match signal {
+                        Ok(()) => tracing::info!("shutdown signal received"),
+                        Err(err) => tracing::error!(error = %err, "failed to listen for Ctrl-C"),
+                    }
+                    signal_ingest_cancel.cancel();
+                    signal_shutdown.cancel();
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received");
+                    signal_ingest_cancel.cancel();
+                    signal_shutdown.cancel();
+                }
+                _ = signal_cancel.cancelled() => {}
             }
-            _ = signal_cancel.cancelled() => {}
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    match signal {
+                        Ok(()) => tracing::info!("shutdown signal received"),
+                        Err(err) => tracing::error!(error = %err, "failed to listen for Ctrl-C"),
+                    }
+                    signal_ingest_cancel.cancel();
+                    signal_shutdown.cancel();
+                }
+                _ = signal_cancel.cancelled() => {}
+            }
         }
     });
 
     let query_for_server = query.clone();
     let mv_for_server = Arc::clone(&mv_registry);
-    let server_cancel = connector_cancel.clone();
+    let server_cancel = service_cancel.clone();
+    let runtime_cancel_for_server = runtime_cancel.clone();
     let failure_for_server = Arc::clone(&runtime_failure);
-    let server_handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        let result =
-            server::run_with_shutdown(query_for_server, mv_for_server, server_cancel.clone()).await;
-        if let Err(err) = &result {
-            record_runtime_failure(&failure_for_server, format!("pgwire server failed: {err}"));
-            server_cancel.cancel();
-        }
-        result
-    });
+    let disable_pgwire = std::env::var("FLOE_DISABLE_PGWIRE")
+        .ok()
+        .map(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    let server_handle: JoinHandle<anyhow::Result<()>> = if disable_pgwire {
+        tracing::warn!("pgwire server disabled by FLOE_DISABLE_PGWIRE");
+        tokio::spawn(async move {
+            server_cancel.cancelled().await;
+            Ok(())
+        })
+    } else {
+        tokio::spawn(async move {
+            let result =
+                server::run_with_shutdown(query_for_server, mv_for_server, server_cancel.clone())
+                    .await;
+            if let Err(err) = &result {
+                record_runtime_failure(&failure_for_server, format!("pgwire server failed: {err}"));
+                runtime_cancel_for_server.cancel();
+            }
+            result
+        })
+    };
 
-    connector_cancel.cancelled().await;
-    connector_cancel.cancel();
+    tokio::select! {
+        _ = runtime_cancel.cancelled() => {}
+        _ = shutdown_signal.cancelled() => {}
+    }
+    let graceful_shutdown = shutdown_signal.is_cancelled() && !runtime_cancel.is_cancelled();
+    let mut executor_handle = Some(executor_handle);
+    if graceful_shutdown {
+        ingest_cancel.cancel();
+        if let Some(handle) = executor_handle.take()
+            && let Err(err) = handle.await
+            && !err.is_cancelled()
+        {
+            tracing::error!(
+                error = %err,
+                "executor task joined with error during graceful shutdown"
+            );
+        }
+    }
+    sink_cancel.cancel();
+    service_cancel.cancel();
+    runtime_cancel.cancel();
+    ingest_cancel.cancel();
     drop(task_event_tx);
 
     for handle in connector_handles {
@@ -980,7 +1310,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Err(err) = executor_handle.await
+    if let Err(err) = admin_handle.await
+        && !err.is_cancelled()
+    {
+        tracing::error!(error = %err, "admin HTTP server task joined with error");
+    }
+
+    if let Some(handle) = executor_handle.take()
+        && let Err(err) = handle.await
         && !err.is_cancelled()
     {
         tracing::error!(error = %err, "executor task joined with error");
@@ -1001,6 +1338,11 @@ async fn main() -> anyhow::Result<()> {
         && !err.is_cancelled()
     {
         tracing::error!(error = %err, "signal task joined with error");
+    }
+    if let Err(err) = cancellation_propagation_handle.await
+        && !err.is_cancelled()
+    {
+        tracing::error!(error = %err, "cancellation propagation task joined with error");
     }
 
     if let Some(message) = runtime_failure
@@ -1089,10 +1431,8 @@ fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &NodeConfig) {
         }
     }
 
-    if !args.slatedb_await_durable {
-        if let Some(await_durable) = storage.await_durable {
-            args.slatedb_await_durable = await_durable;
-        }
+    if args.slatedb_await_durable.is_none() {
+        args.slatedb_await_durable = storage.await_durable;
     }
     if args.slatedb_config.is_none() {
         args.slatedb_config = storage.slatedb_config.clone();
@@ -1392,6 +1732,83 @@ fn merge_sql_sinks(
     Ok(())
 }
 
+fn table_definition_from_sql(
+    definition: &CreateTableDefinition,
+) -> anyhow::Result<TableDefinition> {
+    let columns = definition
+        .columns()
+        .iter()
+        .map(|column| {
+            let data_type = match column.data_type() {
+                SqlColumnType::Int64 => ColumnType::Int64,
+                SqlColumnType::Bool => ColumnType::Bool,
+                SqlColumnType::Utf8 => ColumnType::Utf8,
+                SqlColumnType::TimestampMillis => ColumnType::TimestampMillis,
+            };
+            ColumnDefinition::new_typed_nullable(
+                column.name(),
+                data_type,
+                column.nullable(),
+                column.primary_key(),
+            )
+        })
+        .collect();
+    TableDefinition::new(definition.name(), columns)
+}
+
+fn source_definition_from_table(table: &TableDefinition) -> anyhow::Result<SourceDefinition> {
+    let columns = table
+        .columns()
+        .iter()
+        .map(|column| {
+            let data_type = match column.data_type() {
+                ColumnType::Int64 => SourceDataType::Int64,
+                ColumnType::Bool => SourceDataType::Bool,
+                ColumnType::Utf8 => SourceDataType::Utf8,
+                ColumnType::TimestampMillis => SourceDataType::TimestampMillis,
+            };
+            SourceColumn::new_nullable(column.name(), data_type, column.nullable())
+        })
+        .collect();
+    let mut definition = SourceDefinition::new(table.name(), columns)?;
+    let primary_key = table
+        .columns()
+        .iter()
+        .find(|column| column.is_primary_key())
+        .ok_or_else(|| anyhow!("table '{}' has no primary key column", table.name()))?;
+    definition.set_property(SOURCE_PRIMARY_KEY_PROPERTY, primary_key.name());
+    Ok(definition)
+}
+
+fn source_definition_has_primary_key(definition: &SourceDefinition) -> bool {
+    definition.property(SOURCE_PRIMARY_KEY_PROPERTY).is_some()
+}
+
+fn lookup_decoder_for_source<'a>(
+    decoders: &'a HashMap<String, SourceRowDecoder>,
+    source_name: &str,
+) -> anyhow::Result<&'a SourceRowDecoder> {
+    decoders
+        .get(source_name)
+        .ok_or_else(|| anyhow!("received event for unknown source '{source_name}'"))
+}
+
+fn resolve_output_consolidation_mode(
+    requested: cli::OutputConsolidationMode,
+    source_registry: &SourceRegistry,
+) -> cli::OutputConsolidationMode {
+    if requested == cli::OutputConsolidationMode::AllColumns
+        && source_registry
+            .definitions()
+            .iter()
+            .any(source_definition_has_primary_key)
+    {
+        cli::OutputConsolidationMode::Key
+    } else {
+        requested
+    }
+}
+
 fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;
@@ -1406,6 +1823,110 @@ fn record_runtime_failure(state: &Arc<StdMutex<Option<String>>>, message: String
     let mut guard = state.lock().expect("runtime failure lock poisoned");
     if guard.is_none() {
         *guard = Some(message);
+    }
+}
+
+fn collect_mv_versions_for_commit(
+    registry: &Arc<MaterializedViewRegistry>,
+    last_versions: &mut HashMap<String, u64>,
+) -> Vec<MaterializedViewTickVersion> {
+    let mut committed = Vec::new();
+    for handle in registry.handles() {
+        let Some(frontier) = handle.latest_version() else {
+            continue;
+        };
+        if frontier < 0 {
+            continue;
+        }
+        let Some(zset_handle) = handle.handle_for_version(frontier) else {
+            continue;
+        };
+        let view = handle.name().to_string();
+        let version = zset_handle.version;
+        let entry = last_versions.entry(view.clone()).or_insert(0);
+        if version > *entry {
+            committed.push(MaterializedViewTickVersion { view, version });
+            *entry = version;
+        }
+    }
+    committed.sort_by(|left, right| left.view.cmp(&right.view));
+    committed
+}
+
+fn record_mv_freshness_metrics(last_update_at_ms: &HashMap<String, u64>, now_ms: u64) {
+    for (view, last_update_ms) in last_update_at_ms {
+        let age_seconds = now_ms.saturating_sub(*last_update_ms) / 1_000;
+        metrics::record_mv_freshness_seconds(view, age_seconds);
+    }
+}
+
+fn event_resume_offset(token: Option<&core_source::SourceResumeToken>) -> Option<(u32, u64)> {
+    match token? {
+        core_source::SourceResumeToken::Kafka {
+            partition, offset, ..
+        } => {
+            let partition = u32::try_from(*partition).ok()?;
+            let offset = u64::try_from(*offset).ok()?;
+            Some((partition, offset))
+        }
+        core_source::SourceResumeToken::PostgresCdc { lsn, .. } => {
+            parse_postgres_lsn(lsn).map(|offset| (0, offset))
+        }
+        core_source::SourceResumeToken::File { cursor }
+        | core_source::SourceResumeToken::Generator { position: cursor }
+        | core_source::SourceResumeToken::ObjectStore { cursor } => Some((0, *cursor)),
+    }
+}
+
+fn event_kafka_offset(
+    token: Option<&core_source::SourceResumeToken>,
+) -> Option<(String, i32, i64)> {
+    match token? {
+        core_source::SourceResumeToken::Kafka {
+            topic,
+            partition,
+            offset,
+        } => Some((topic.clone(), *partition, *offset)),
+        _ => None,
+    }
+}
+
+fn build_kafka_offset_commit(
+    tick_id: u64,
+    offsets: &HashMap<(String, i32), i64>,
+) -> KafkaOffsetCommit {
+    let mut entries: Vec<KafkaTopicPartitionOffset> = offsets
+        .iter()
+        .map(|((topic, partition), offset)| KafkaTopicPartitionOffset {
+            topic: topic.clone(),
+            partition: *partition,
+            offset: *offset,
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then(left.partition.cmp(&right.partition))
+    });
+    KafkaOffsetCommit {
+        tick_id,
+        offsets: entries,
+    }
+}
+
+fn parse_postgres_lsn(lsn: &str) -> Option<u64> {
+    let (left, right) = lsn.trim().split_once('/')?;
+    let high = u64::from_str_radix(left, 16).ok()?;
+    let low = u64::from_str_radix(right, 16).ok()?;
+    Some((high << 32) | low)
+}
+
+fn current_unix_time_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().try_into().unwrap_or(u64::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -1531,6 +2052,7 @@ fn build_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_sql_parser::parse_floe_statement;
     use serde_json::json;
 
     fn default_run_args() -> cli::RunArgs {
@@ -1547,7 +2069,7 @@ mod tests {
             slatedb_max_unflushed_bytes: None,
             slatedb_compaction_max_sst_bytes: None,
             slatedb_compaction_max_concurrent: None,
-            slatedb_await_durable: false,
+            slatedb_await_durable: None,
             slatedb_cache_dir: None,
             slatedb_cache_max_bytes: None,
             slatedb_cache_part_bytes: None,
@@ -1822,7 +2344,7 @@ mod tests {
         assert_eq!(args.kafka_group_id, "cfg-group");
         assert_eq!(args.kafka_poll_ms, 250);
         assert_eq!(args.kafka_max_messages, 1024);
-        assert!(args.slatedb_await_durable);
+        assert_eq!(args.slatedb_await_durable, Some(true));
         assert_eq!(args.slatedb_config.as_deref(), Some("/tmp/slatedb.toml"));
         assert_eq!(args.slatedb_env_prefix.as_deref(), Some("CFG_"));
         assert_eq!(args.zset_compaction_max_chain_len, 99);
@@ -1849,7 +2371,7 @@ mod tests {
         args.output_consolidation_mode = cli::OutputConsolidationMode::Key;
         args.ingest_batch_size = 999;
         args.maintenance_paused = true;
-        args.slatedb_await_durable = true;
+        args.slatedb_await_durable = Some(true);
 
         let config = NodeConfig {
             runtime: config::RuntimeConfig {
@@ -1878,7 +2400,84 @@ mod tests {
         );
         assert_eq!(args.ingest_batch_size, 999);
         assert!(args.maintenance_paused);
-        assert!(args.slatedb_await_durable);
+        assert_eq!(args.slatedb_await_durable, Some(true));
+    }
+
+    #[test]
+    fn table_definition_from_sql_preserves_primary_key_and_nullability() {
+        let statement = parse_floe_statement(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, note TEXT, enabled BOOL NOT NULL, created_at TIMESTAMP)",
+        )
+        .expect("parse create table");
+        let FloeStatement::CreateTable(definition) = statement else {
+            panic!("expected create table statement");
+        };
+        let table = table_definition_from_sql(&definition).expect("table definition");
+        assert_eq!(table.name(), "orders");
+        assert_eq!(table.columns().len(), 4);
+        assert_eq!(table.primary_key_index(), 0);
+        assert!(!table.columns()[0].nullable());
+        assert!(table.columns()[1].nullable());
+        assert!(!table.columns()[2].nullable());
+        assert!(table.columns()[3].nullable());
+    }
+
+    #[test]
+    fn source_definition_from_table_sets_pk_property() {
+        let statement = parse_floe_statement(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT, active BOOL)",
+        )
+        .expect("parse create table");
+        let FloeStatement::CreateTable(definition) = statement else {
+            panic!("expected create table statement");
+        };
+        let table = table_definition_from_sql(&definition).expect("table definition");
+        let source = source_definition_from_table(&table).expect("source definition");
+        assert_eq!(source.name(), "users");
+        assert_eq!(source.property(SOURCE_PRIMARY_KEY_PROPERTY), Some("id"));
+        assert!(source_definition_has_primary_key(&source));
+        assert!(!source.columns()[0].nullable());
+        assert!(source.columns()[1].nullable());
+    }
+
+    #[test]
+    fn resolve_output_consolidation_mode_defaults_to_key_when_pk_present() {
+        let statement = parse_floe_statement("CREATE TABLE users (id BIGINT PRIMARY KEY)")
+            .expect("parse create table");
+        let FloeStatement::CreateTable(definition) = statement else {
+            panic!("expected create table statement");
+        };
+        let table = table_definition_from_sql(&definition).expect("table definition");
+        let source = source_definition_from_table(&table).expect("source definition");
+        let mut registry = SourceRegistry::new();
+        registry.register(source);
+
+        assert_eq!(
+            resolve_output_consolidation_mode(cli::OutputConsolidationMode::AllColumns, &registry),
+            cli::OutputConsolidationMode::Key
+        );
+    }
+
+    #[test]
+    fn resolve_output_consolidation_mode_keeps_all_columns_without_pk() {
+        let mut registry = SourceRegistry::new();
+        registry.extend(generator::definitions().expect("generator definitions"));
+
+        assert_eq!(
+            resolve_output_consolidation_mode(cli::OutputConsolidationMode::AllColumns, &registry),
+            cli::OutputConsolidationMode::AllColumns
+        );
+    }
+
+    #[test]
+    fn lookup_decoder_for_source_rejects_unknown_source() {
+        let decoders: HashMap<String, SourceRowDecoder> = HashMap::new();
+        let err = lookup_decoder_for_source(&decoders, "missing_source")
+            .expect_err("unknown source should fail");
+        assert!(
+            err.to_string()
+                .contains("received event for unknown source 'missing_source'")
+        );
     }
 }
 
@@ -1931,6 +2530,7 @@ async fn register_source_tables(
             definition.name(),
             definition.name(),
             schema,
+            definition.property(SOURCE_PRIMARY_KEY_PROPERTY),
         )?;
         session
             .register_table(definition.name(), Arc::new(provider))
@@ -1943,6 +2543,7 @@ async fn register_source_tables(
                 short_name,
                 definition.name(),
                 alias_schema,
+                definition.property(SOURCE_PRIMARY_KEY_PROPERTY),
             )?;
             session
                 .register_table(short_name, Arc::new(alias_provider))

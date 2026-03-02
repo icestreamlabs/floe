@@ -153,18 +153,20 @@ pub fn spawn_sinks(
     sinks: Vec<SinkSpec>,
     query: FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
-    cancel: CancellationToken,
+    tail_cancel: CancellationToken,
+    runtime_cancel: CancellationToken,
     runtime_failure: Arc<StdMutex<Option<String>>>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
     for sink in sinks {
         let ctx = query.clone();
         let registry = registry.clone();
-        let cancel = cancel.clone();
+        let tail_cancel = tail_cancel.clone();
+        let runtime_cancel = runtime_cancel.clone();
         let runtime_failure = Arc::clone(&runtime_failure);
         handles.push(tokio::spawn(async move {
             let name = sink.name.clone();
-            if let Err(err) = run_sink(sink, ctx, registry, cancel.clone()).await {
+            if let Err(err) = run_sink(sink, ctx, registry, tail_cancel.clone()).await {
                 if is_tail_canceled_error(&err) {
                     tracing::info!(sink = %name, "sink canceled");
                 } else {
@@ -173,7 +175,7 @@ pub fn spawn_sinks(
                         &runtime_failure,
                         format!("sink '{name}' failed: {err}"),
                     );
-                    cancel.cancel();
+                    runtime_cancel.cancel();
                 }
             }
         }));
@@ -763,6 +765,7 @@ async fn send_kafka_with_retry(
                     metrics::inc_sink_failure(sink_name, "kafka");
                     return Err(anyhow!("kafka sink delivery failed after retries: {err}"));
                 }
+                metrics::inc_sink_retry(sink_name, "kafka");
                 tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
             }
         }
@@ -799,6 +802,7 @@ async fn post_http_batch_with_retry(
                     metrics::inc_sink_failure(sink_name, "http");
                     return Err(anyhow!("http sink request failed after retries: {err}"));
                 }
+                metrics::inc_sink_retry(sink_name, "http");
                 tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
             }
         }

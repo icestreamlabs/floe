@@ -44,12 +44,14 @@ Runtime configuration:
 
 Observability:
 
-- When the HTTP ingest server is enabled, it also exposes `/metrics` and
-  `/healthz` on the same host/port.
-- `/healthz` returns `200` only when:
-  - the process is running,
-  - the executor loop is still alive,
-  - storage initialization is healthy.
+- Floe always runs an admin server exposing `/healthz`, `/readyz`, and
+  `/metrics`.
+- Admin host defaults to `--http-host`; admin port defaults to `8081`
+  (`FLOE_ADMIN_PORT` overrides).
+- `/healthz` reports process liveness.
+- `/readyz` reports process + executor + storage + runtime readiness.
+- If HTTP ingest is enabled, `/healthz`, `/readyz`, and `/metrics` are also
+  available on the ingest server.
 - Default tracing schema (span names + fields) for correlation:
   - `ingest_decode`: `epoch`, `raw_batch_size`, `decoded_rows`, `latency_ms`
   - `connector_tick`: `epoch`, `watermark`, `tick_latency_ms`
@@ -59,8 +61,8 @@ Observability:
   updates produced by that ingest tick.
 - Key Prometheus counters:
   - `floe_ingest_ticks_total{result=...}`
-  - `floe_mv_updates_total`
-  - `floe_tail_rows_total`
+  - `floe_source_offset_lag{source=...,partition=...}`
+  - `floe_mv_freshness_seconds{view=...}`
   - `floe_runtime_errors_total{component=...}`
 
 ### Storage tuning (SlateDB)
@@ -137,4 +139,7 @@ Additional operational documentation:
 - `docs/runtime_config.md`: config-first schema, precedence rules, and examples.
 - `docs/storage_data_directory.md`: `FLOE_DATA_DIR` behavior and safe reset procedure.
 - `docs/operator_runbook.md`: production-like startup/restart/troubleshooting guide.
+- `docs/ga_contract.md`: connector/sink delivery guarantees and GA limitations.
+- `docs/supported_features.md`: explicit SQL/connectors/sinks support matrix.
+- `docs/local_deploy.md`: local compose deploy (Kafka + Postgres + Floe).
 - Canonical full validation sequence: `scripts/validate_workspace.sh`.

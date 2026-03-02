@@ -2107,6 +2107,7 @@ dependencies = [
  "clap",
  "datafusion",
  "dbsp",
+ "floe-core",
  "floe-executor",
  "floe-node-core",
  "floe-server",

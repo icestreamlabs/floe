@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
+use tokio_postgres::NoTls;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -16,7 +17,7 @@ const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
 #[tokio::test]
 async fn smoke_generator_mv_emits_tail_rows() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
-    let pg_port = find_unused_port()?;
+    let pg_port = 0;
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("generator_sink.jsonl");
     let config_path = temp_dir.path().join("generator.toml");
@@ -32,6 +33,9 @@ path = "{}"
 mv = "mv_smoke"
 with_snapshot = true
 append = true
+
+[storage]
+await_durable = false
 "#,
         sink_path.to_string_lossy()
     );
@@ -57,7 +61,7 @@ append = true
 #[tokio::test]
 async fn smoke_restart_recovers_snapshot_and_new_updates() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
-    let pg_port = find_unused_port()?;
+    let pg_port = 0;
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("restart_sink.jsonl");
@@ -110,7 +114,7 @@ append = true
 #[tokio::test]
 async fn smoke_crash_restart_recovers_and_processes_new_ticks() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
-    let pg_port = find_unused_port()?;
+    let pg_port = 0;
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("crash_sink.jsonl");
@@ -160,20 +164,159 @@ append = true
     Ok(())
 }
 
+#[tokio::test]
+async fn smoke_sigterm_restart_recovers_and_processes_new_ticks() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let pg_port = find_unused_port()?;
+    let http_port = find_unused_port()?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("sigterm_restart.toml");
+    let config = format!(
+        r#"
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = {http_port}
+default_source = "nexmark_bid"
+"#
+    );
+    std::fs::write(&config_path, config).context("write sigterm config")?;
+    let http_addr = format!("http://127.0.0.1:{http_port}");
+
+    let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    post_bid(&http_addr, 14, 74, 174).await?;
+    wait_for_auction_count_at_least(pg_port, 14, 1).await?;
+    stop_child(&mut first, "TERM").await;
+
+    let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    wait_for_auction_count_at_least(pg_port, 14, 1).await?;
+    post_bid(&http_addr, 15, 75, 175).await?;
+    wait_for_auction_count_at_least(pg_port, 15, 1).await?;
+    stop_child(&mut restarted, "INT").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smoke_crash_restart_keeps_mv_queryable() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let pg_port = find_unused_port()?;
+    let http_port = find_unused_port()?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("crash_queryable.toml");
+    let config = format!(
+        r#"
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = {http_port}
+default_source = "nexmark_bid"
+"#
+    );
+    std::fs::write(&config_path, config).context("write crash config")?;
+    let http_addr = format!("http://127.0.0.1:{http_port}");
+
+    let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    post_bid(&http_addr, 21, 121, 210).await?;
+    wait_for_mv_count_at_least(pg_port, 1).await?;
+    stop_child(&mut first, "KILL").await;
+
+    let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    wait_for_mv_count_at_least(pg_port, 1).await?;
+    post_bid(&http_addr, 22, 122, 220).await?;
+    wait_for_mv_count_at_least(pg_port, 2).await?;
+    stop_child(&mut restarted, "INT").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smoke_crash_between_ingest_and_tick_commit_loses_uncommitted_tick() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let pg_port = find_unused_port()?;
+    let http_port = find_unused_port()?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("crash_pre_commit.toml");
+    let config = format!(
+        r#"
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = {http_port}
+default_source = "nexmark_bid"
+"#
+    );
+    std::fs::write(&config_path, config).context("write crash config")?;
+    let http_addr = format!("http://127.0.0.1:{http_port}");
+
+    let mut first = spawn_node_with_env(
+        &config_path,
+        &data_dir,
+        pg_port,
+        Some(MV_SQL),
+        &[(
+            "FLOE_TEST_PRE_TICK_COMMIT_DELAY_MS".to_string(),
+            "3000".to_string(),
+        )],
+    )
+    .await?;
+    wait_for_healthz(&http_addr).await?;
+    post_bid(&http_addr, 30, 130, 300).await?;
+    sleep(Duration::from_millis(200)).await;
+    stop_child(&mut first, "KILL").await;
+
+    let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    sleep(Duration::from_millis(300)).await;
+    let precommit_count = query_auction_count(pg_port, 30).await?;
+    assert_eq!(
+        precommit_count, 0,
+        "rows ingested before tick commit should not survive hard crash in the pre-commit window"
+    );
+
+    post_bid(&http_addr, 31, 131, 310).await?;
+    wait_for_auction_count_at_least(pg_port, 31, 1).await?;
+    stop_child(&mut restarted, "INT").await;
+
+    Ok(())
+}
+
 async fn spawn_node(
     config_path: &Path,
     data_dir: &Path,
     pg_port: u16,
     mv_sql: Option<&str>,
 ) -> Result<Child> {
+    spawn_node_with_env(config_path, data_dir, pg_port, mv_sql, &[]).await
+}
+
+async fn spawn_node_with_env(
+    config_path: &Path,
+    data_dir: &Path,
+    pg_port: u16,
+    mv_sql: Option<&str>,
+    extra_env: &[(String, String)],
+) -> Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
-    cmd.env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"))
-        .env("FLOE_DATA_DIR", data_dir)
+    if pg_port > 0 {
+        cmd.env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"));
+    } else {
+        cmd.env("FLOE_DISABLE_PGWIRE", "1");
+    }
+    cmd.env("FLOE_DATA_DIR", data_dir)
+        .env("FLOE_ADMIN_PORT", "0")
         .arg("run")
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     if let Some(sql) = mv_sql {
         cmd.arg("--mv-query").arg(sql);
     }
@@ -240,6 +383,71 @@ async fn wait_for_rows_matching(
         sleep(Duration::from_millis(100)).await;
     }
     bail!("predicate did not match rows in {}", path.to_string_lossy())
+}
+
+async fn wait_for_mv_count_at_least(pg_port: u16, min_count: i64) -> Result<i64> {
+    for _ in 0..80 {
+        match query_mv_count(pg_port).await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!("timed out waiting for mv_smoke row count >= {min_count}");
+}
+
+async fn wait_for_auction_count_at_least(
+    pg_port: u16,
+    auction: i64,
+    min_count: i64,
+) -> Result<i64> {
+    for _ in 0..80 {
+        match query_auction_count(pg_port, auction).await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!("timed out waiting for auction {auction} row count >= {min_count}");
+}
+
+async fn query_mv_count(pg_port: u16) -> Result<i64> {
+    let dsn = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to pgwire endpoint")?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM mv_smoke", &[])
+        .await
+        .context("query mv_smoke count")?;
+    let count: i64 = row.try_get(0).context("decode row count")?;
+    drop(client);
+    connection_task.abort();
+    let _ = connection_task.await;
+    Ok(count)
+}
+
+async fn query_auction_count(pg_port: u16, auction: i64) -> Result<i64> {
+    let dsn = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to pgwire endpoint")?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM mv_smoke WHERE auction = $1",
+            &[&auction],
+        )
+        .await
+        .with_context(|| format!("query mv_smoke count for auction {auction}"))?;
+    let count: i64 = row.try_get(0).context("decode auction row count")?;
+    drop(client);
+    connection_task.abort();
+    let _ = connection_task.await;
+    Ok(count)
 }
 
 async fn read_rows(path: &Path) -> Result<Vec<Value>> {

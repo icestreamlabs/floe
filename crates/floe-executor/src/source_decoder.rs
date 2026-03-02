@@ -34,10 +34,13 @@ impl SourceRowDecoder {
         let mut row = Vec::with_capacity(self.definition.columns().len());
         let mut event_ts = None;
         for column in self.definition.columns() {
-            let value = object
-                .get(column.name())
-                .with_context(|| format!("missing field '{}' in source payload", column.name()))?;
-            let scalar = convert_value(column.data_type(), value)?;
+            let scalar = match object.get(column.name()) {
+                Some(value) => convert_value(column.data_type(), value, column.nullable())?,
+                None if column.nullable() => null_scalar(column.data_type()),
+                None => {
+                    bail!("missing field '{}' in source payload", column.name());
+                }
+            };
             if event_ts.is_none()
                 && matches!(column.data_type(), SourceDataType::TimestampMillis)
                 && let ScalarValue::TimestampMillisecond(Some(ms), _) = scalar
@@ -51,7 +54,13 @@ impl SourceRowDecoder {
     }
 }
 
-fn convert_value(data_type: &SourceDataType, value: &Value) -> Result<ScalarValue> {
+fn convert_value(data_type: &SourceDataType, value: &Value, nullable: bool) -> Result<ScalarValue> {
+    if value.is_null() {
+        if nullable {
+            return Ok(null_scalar(data_type));
+        }
+        bail!("null value violates non-nullable column");
+    }
     match data_type {
         SourceDataType::Int64 => {
             let number = value
@@ -77,6 +86,15 @@ fn convert_value(data_type: &SourceDataType, value: &Value) -> Result<ScalarValu
                 .with_context(|| format!("expected integer timestamp, found {value}"))?;
             Ok(ScalarValue::TimestampMillisecond(Some(number), None))
         }
+    }
+}
+
+fn null_scalar(data_type: &SourceDataType) -> ScalarValue {
+    match data_type {
+        SourceDataType::Int64 => ScalarValue::Int64(None),
+        SourceDataType::Utf8 => ScalarValue::Utf8(None),
+        SourceDataType::Bool => ScalarValue::Boolean(None),
+        SourceDataType::TimestampMillis => ScalarValue::TimestampMillisecond(None, None),
     }
 }
 
@@ -157,5 +175,61 @@ mod tests {
         assert_eq!(row[0], ScalarValue::Int64(Some(1)));
         assert_eq!(row[1], ScalarValue::Boolean(Some(true)));
         assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn rejects_missing_required_column() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new("orders", json!({"id": 1}));
+        let err = decoder
+            .decode(&event)
+            .expect_err("missing price should fail");
+        assert!(err.to_string().contains("missing field 'price'"));
+    }
+
+    #[test]
+    fn rejects_wrong_column_type() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![SourceColumn::new_nullable(
+                "id",
+                SourceDataType::Int64,
+                false,
+            )],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new("orders", json!({"id": "oops"}));
+        let err = decoder
+            .decode(&event)
+            .expect_err("type mismatch should fail");
+        assert!(err.to_string().contains("expected integer value"));
+    }
+
+    #[test]
+    fn rejects_null_for_non_nullable_column() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note", SourceDataType::Utf8, true),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new("orders", json!({"id": null, "note": null}));
+        let err = decoder.decode(&event).expect_err("null id should fail");
+        assert!(
+            err.to_string()
+                .contains("null value violates non-nullable column")
+        );
     }
 }

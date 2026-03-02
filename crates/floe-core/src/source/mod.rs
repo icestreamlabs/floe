@@ -34,13 +34,24 @@ impl SourceDataType {
 pub struct SourceColumn {
     name: String,
     data_type: SourceDataType,
+    #[serde(default = "default_nullable")]
+    nullable: bool,
 }
 
 impl SourceColumn {
     pub fn new(name: impl Into<String>, data_type: SourceDataType) -> Self {
+        Self::new_nullable(name, data_type, true)
+    }
+
+    pub fn new_nullable(
+        name: impl Into<String>,
+        data_type: SourceDataType,
+        nullable: bool,
+    ) -> Self {
         Self {
             name: name.into(),
             data_type,
+            nullable,
         }
     }
 
@@ -50,6 +61,10 @@ impl SourceColumn {
 
     pub fn data_type(&self) -> &SourceDataType {
         &self.data_type
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
     }
 }
 
@@ -96,7 +111,13 @@ impl SourceDefinition {
         let fields: Vec<Field> = self
             .columns
             .iter()
-            .map(|column| Field::new(column.name(), column.data_type().arrow_type(), true))
+            .map(|column| {
+                Field::new(
+                    column.name(),
+                    column.data_type().arrow_type(),
+                    column.nullable(),
+                )
+            })
             .collect();
         SchemaRef::new(Schema::new(fields))
     }
@@ -109,6 +130,10 @@ impl SourceDefinition {
     pub fn set_property(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.properties.insert(key.into(), value.into());
     }
+}
+
+fn default_nullable() -> bool {
+    true
 }
 
 #[derive(Default, Debug, Clone)]
@@ -160,6 +185,31 @@ impl SourceRegistry {
 pub struct SourceEvent {
     source: String,
     payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_token: Option<SourceResumeToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceResumeToken {
+    Kafka {
+        topic: String,
+        partition: i32,
+        offset: i64,
+    },
+    PostgresCdc {
+        lsn: String,
+        txid: Option<u64>,
+    },
+    File {
+        cursor: u64,
+    },
+    Generator {
+        position: u64,
+    },
+    ObjectStore {
+        cursor: u64,
+    },
 }
 
 impl SourceEvent {
@@ -167,6 +217,7 @@ impl SourceEvent {
         Self {
             source: source.into(),
             payload,
+            resume_token: None,
         }
     }
 
@@ -176,6 +227,15 @@ impl SourceEvent {
 
     pub fn payload(&self) -> &Value {
         &self.payload
+    }
+
+    pub fn resume_token(&self) -> Option<&SourceResumeToken> {
+        self.resume_token.as_ref()
+    }
+
+    pub fn with_resume_token(mut self, resume_token: SourceResumeToken) -> Self {
+        self.resume_token = Some(resume_token);
+        self
     }
 
     pub fn into_payload(self) -> Value {

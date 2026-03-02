@@ -6,6 +6,7 @@ semantics for materialized views and TAIL.
 ## Supported Statements
 
 - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [WITH (<options>)] AS <select>`
+- `CREATE TABLE <name> (<columns...>, PRIMARY KEY (...))`
 - `CREATE SINK <sink_name> FROM <mv_name> WITH (<options>)`
 - `TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]`
 - `SELECT ... FROM <materialized_view>` (read-only queries via pgwire)
@@ -15,6 +16,7 @@ semantics for materialized views and TAIL.
 - Floe accepts SQL program text with multiple semicolon-separated statements.
 - Statement order is preserved and processed in-order.
 - `--mv-query` accepts SQL programs containing:
+  - `CREATE TABLE`
   - `CREATE MATERIALIZED VIEW`
   - `CREATE SINK`
 - `TAIL` remains a query-time statement and is not valid in `--mv-query`.

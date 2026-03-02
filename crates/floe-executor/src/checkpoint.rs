@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use dbsp::handles::ZSetHandle;
@@ -109,7 +110,7 @@ pub struct MaterializedViewCheckpointEntry {
     pub frontier: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceOffset {
     pub source: String,
     pub partition: u32,
@@ -125,6 +126,40 @@ pub struct SourceStreamCheckpointEntry {
     pub frontier: i64,
     pub partition: u32,
     pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedViewTickVersion {
+    pub view: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TickCommit {
+    pub tick_id: u64,
+    pub frontier: Timestamp,
+    #[serde(default)]
+    pub source_offsets: Vec<SourceOffset>,
+    #[serde(default)]
+    pub mv_versions: Vec<MaterializedViewTickVersion>,
+    pub committed_at_unix_ms: u64,
+}
+
+impl TickCommit {
+    pub fn new(
+        tick_id: u64,
+        frontier: Timestamp,
+        source_offsets: Vec<SourceOffset>,
+        mv_versions: Vec<MaterializedViewTickVersion>,
+    ) -> Self {
+        Self {
+            tick_id,
+            frontier,
+            source_offsets,
+            mv_versions,
+            committed_at_unix_ms: current_unix_time_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,7 +237,7 @@ impl CheckpointStore {
         batch.put(latest_key, manifest.id.to_be_bytes());
 
         for offset in &manifest.source_offsets {
-            let key = self.offset_key(&offset.source);
+            let key = self.offset_key(&offset.source, offset.partition);
             let mut value = Vec::with_capacity(8 + 4);
             value.extend_from_slice(&offset.partition.to_be_bytes());
             value.extend_from_slice(&offset.offset.to_be_bytes());
@@ -213,6 +248,39 @@ impl CheckpointStore {
             .write_batch(batch)
             .await
             .context("persist checkpoint manifest batch")
+    }
+
+    pub async fn persist_tick_commit(&self, commit: &TickCommit) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        let commit_key = self.tick_commit_key(commit.tick_id);
+        let serialized = serde_json::to_vec(commit).context("serialize tick commit to JSON")?;
+        batch.put(commit_key, serialized);
+        let latest_key = self.latest_tick_commit_key();
+        batch.put(latest_key, commit.tick_id.to_be_bytes());
+        self.table
+            .write_batch(batch)
+            .await
+            .context("persist tick commit batch")
+    }
+
+    pub async fn load_latest_tick_commit(&self) -> Result<Option<TickCommit>> {
+        let latest_key = self.latest_tick_commit_key();
+        let Some(latest_bytes) = self.table.get(&latest_key).await? else {
+            return Ok(None);
+        };
+        if latest_bytes.len() != 8 {
+            bail!("corrupt latest tick commit key for graph {}", self.graph_id);
+        }
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&latest_bytes);
+        let tick_id = u64::from_be_bytes(id_bytes);
+        let commit_key = self.tick_commit_key(tick_id);
+        let data = self.table.get(&commit_key).await?.with_context(|| {
+            format!("tick commit entry {tick_id} missing for {}", self.graph_id)
+        })?;
+        let commit: TickCommit =
+            serde_json::from_slice(&data).context("decode tick commit from JSON")?;
+        Ok(Some(commit))
     }
 
     pub async fn load_latest(&self) -> Result<Option<CheckpointManifest>> {
@@ -251,8 +319,28 @@ impl CheckpointStore {
         format!("{}/{}/latest", CHECKPOINT_PREFIX, self.graph_id).into_bytes()
     }
 
-    fn offset_key(&self, source: &str) -> Vec<u8> {
-        format!("{}/{}/offsets/{}", CHECKPOINT_PREFIX, self.graph_id, source).into_bytes()
+    fn offset_key(&self, source: &str, partition: u32) -> Vec<u8> {
+        format!(
+            "{}/{}/offsets/{}/{}",
+            CHECKPOINT_PREFIX, self.graph_id, source, partition
+        )
+        .into_bytes()
+    }
+
+    fn tick_commit_key(&self, tick_id: u64) -> Vec<u8> {
+        format!(
+            "{}/{}/tick_commits/{:020}",
+            CHECKPOINT_PREFIX, self.graph_id, tick_id
+        )
+        .into_bytes()
+    }
+
+    fn latest_tick_commit_key(&self) -> Vec<u8> {
+        format!(
+            "{}/{}/tick_commits/latest",
+            CHECKPOINT_PREFIX, self.graph_id
+        )
+        .into_bytes()
     }
 
     pub fn table(&self) -> Arc<dyn KeyValueTable> {
@@ -264,8 +352,9 @@ pub struct CheckpointManager {
     graph_id: String,
     store: CheckpointStore,
     next_id: u64,
-    offsets: HashMap<String, u64>,
+    partition_offsets: HashMap<(String, u32), u64>,
     latest_manifest: Option<CheckpointManifest>,
+    latest_tick_commit: Option<TickCommit>,
 }
 
 impl CheckpointManager {
@@ -287,11 +376,12 @@ impl CheckpointManager {
             }
             None => store.load_latest().await?,
         };
-        let (next_id, offsets) = if let Some(ref manifest) = latest_manifest {
+        let latest_tick_commit = store.load_latest_tick_commit().await?;
+        let (next_id, partition_offsets) = if let Some(ref manifest) = latest_manifest {
             let offsets = manifest
                 .source_offsets
                 .iter()
-                .map(|offset| (offset.source.clone(), offset.offset))
+                .map(|offset| ((offset.source.clone(), offset.partition), offset.offset))
                 .collect();
             (manifest.id.saturating_add(1), offsets)
         } else {
@@ -302,8 +392,9 @@ impl CheckpointManager {
             graph_id,
             store,
             next_id,
-            offsets,
+            partition_offsets,
             latest_manifest,
+            latest_tick_commit,
         })
     }
 
@@ -312,7 +403,15 @@ impl CheckpointManager {
     }
 
     pub fn update_offset(&mut self, source: &str, offset: u64) {
-        self.offsets.insert(source.to_string(), offset);
+        self.update_partition_offset(source, 0, offset);
+    }
+
+    pub fn update_partition_offset(&mut self, source: &str, partition: u32, offset: u64) {
+        let entry = self
+            .partition_offsets
+            .entry((source.to_string(), partition))
+            .or_insert(0);
+        *entry = (*entry).max(offset);
     }
 
     pub async fn persist(
@@ -351,7 +450,7 @@ impl CheckpointManager {
             source_offsets: self.snapshot_offsets(),
             operator_states: Vec::new(),
             materialized_views: materialized_view_entries(mv_registry),
-            outer_streams: outer_stream_entries(outer_registry, &self.offsets),
+            outer_streams: outer_stream_entries(outer_registry, &self.latest_offsets()),
         };
         manifest.ensure_dbsp_payload();
         self.store.persist(&manifest).await?;
@@ -361,18 +460,36 @@ impl CheckpointManager {
     }
 
     pub fn snapshot_offsets(&self) -> Vec<SourceOffset> {
-        self.offsets
+        let mut offsets: Vec<SourceOffset> = self
+            .partition_offsets
             .iter()
-            .map(|(source, offset)| SourceOffset {
+            .map(|((source, partition), offset)| SourceOffset {
                 source: source.clone(),
-                partition: 0,
+                partition: *partition,
                 offset: *offset,
             })
-            .collect()
+            .collect();
+        offsets.sort_by(|left, right| {
+            left.source
+                .cmp(&right.source)
+                .then(left.partition.cmp(&right.partition))
+        });
+        offsets
     }
 
-    pub fn latest_offsets(&self) -> &HashMap<String, u64> {
-        &self.offsets
+    pub fn latest_offsets(&self) -> HashMap<String, u64> {
+        let mut merged = HashMap::new();
+        for ((source, _partition), offset) in &self.partition_offsets {
+            let entry = merged.entry(source.clone()).or_insert(0);
+            *entry = (*entry).max(*offset);
+        }
+        merged
+    }
+
+    pub async fn persist_tick_commit(&mut self, commit: TickCommit) -> Result<()> {
+        self.store.persist_tick_commit(&commit).await?;
+        self.latest_tick_commit = Some(commit);
+        Ok(())
     }
 
     pub fn store(&self) -> &CheckpointStore {
@@ -381,6 +498,10 @@ impl CheckpointManager {
 
     pub fn latest_manifest(&self) -> Option<&CheckpointManifest> {
         self.latest_manifest.as_ref()
+    }
+
+    pub fn latest_tick_commit(&self) -> Option<&TickCommit> {
+        self.latest_tick_commit.as_ref()
     }
 }
 
@@ -429,6 +550,13 @@ fn checkpoint_entry_from_state(
     }
 }
 
+fn current_unix_time_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().try_into().unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
+}
+
 pub async fn recover_materialized_views(
     manifest: &CheckpointManifest,
     registry: &MaterializedViewRegistry,
@@ -463,4 +591,67 @@ pub async fn recover_materialized_views(
         registry.update_watermark_all(manifest.watermark);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbsp::storage::SlateTable;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+
+    async fn checkpoint_manager(graph_id: &str) -> CheckpointManager {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open(format!("checkpoint-{graph_id}"), store)
+                .await
+                .expect("db"),
+        );
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+        CheckpointManager::new(graph_id.to_string(), table)
+            .await
+            .expect("checkpoint manager")
+    }
+
+    #[tokio::test]
+    async fn tick_commit_roundtrips_via_store() {
+        let mut manager = checkpoint_manager("tick-roundtrip").await;
+        manager.update_partition_offset("nexmark_bid", 0, 42);
+        let commit = TickCommit::new(
+            7,
+            123,
+            manager.snapshot_offsets(),
+            vec![MaterializedViewTickVersion {
+                view: "mv_bid".to_string(),
+                version: 9,
+            }],
+        );
+        manager
+            .persist_tick_commit(commit.clone())
+            .await
+            .expect("persist tick commit");
+
+        let reloaded = CheckpointManager::new("tick-roundtrip", manager.store().table())
+            .await
+            .expect("reload checkpoint manager");
+        assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
+    }
+
+    #[tokio::test]
+    async fn snapshot_offsets_tracks_partitions() {
+        let mut manager = checkpoint_manager("partition-offsets").await;
+        manager.update_partition_offset("topic_a", 1, 11);
+        manager.update_partition_offset("topic_a", 0, 7);
+        manager.update_partition_offset("topic_a", 1, 9);
+        manager.update_partition_offset("topic_a", 1, 15);
+
+        let offsets = manager.snapshot_offsets();
+        assert_eq!(offsets.len(), 2);
+        assert!(offsets.iter().any(|entry| {
+            entry.source == "topic_a" && entry.partition == 0 && entry.offset == 7
+        }));
+        assert!(offsets.iter().any(|entry| {
+            entry.source == "topic_a" && entry.partition == 1 && entry.offset == 15
+        }));
+    }
 }

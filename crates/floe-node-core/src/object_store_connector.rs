@@ -8,7 +8,7 @@ use url::Url;
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::event_parser::parse_event_line;
 use crate::source::SourceEventSender;
-use floe_core::source::{SourceDefinition, SourceEvent};
+use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConnectorConfig {
@@ -69,7 +69,9 @@ impl Connector for ObjectStoreConnector {
             .get(self.cursor)
             .cloned()
             .context("object store connector cursor out of bounds")?;
+        let cursor = u64::try_from(self.cursor).unwrap_or(u64::MAX);
         self.cursor = self.cursor.saturating_add(1);
+        let event = event.with_resume_token(SourceResumeToken::ObjectStore { cursor });
         ctx.sender()
             .send(event)
             .await

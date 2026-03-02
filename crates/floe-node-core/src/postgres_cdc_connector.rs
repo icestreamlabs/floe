@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
-use floe_core::source::{SourceDefinition, SourceEvent};
+use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 
 #[derive(Debug, Clone)]
 pub struct PostgresCdcConnectorConfig {
@@ -102,7 +102,7 @@ impl Connector for PostgresCdcConnector {
             .context("postgres cdc connector is not initialized")?;
         let rows = client
             .query(
-                "SELECT data FROM pg_logical_slot_get_changes($1, NULL, $2)",
+                "SELECT lsn::text, xid, data FROM pg_logical_slot_get_changes($1, NULL, $2)",
                 &[&self.config.slot, &(self.config.max_changes as i64)],
             )
             .await
@@ -110,7 +110,9 @@ impl Connector for PostgresCdcConnector {
 
         let mut emitted = 0usize;
         for row in rows {
-            let payload: String = row.try_get(0).context("read logical slot payload")?;
+            let lsn: String = row.try_get(0).context("read logical slot lsn")?;
+            let txid: Option<i64> = row.try_get(1).context("read logical slot txid")?;
+            let payload: String = row.try_get(2).context("read logical slot payload")?;
             let events = match parse_wal2json_payload(
                 &payload,
                 &self.config,
@@ -123,6 +125,11 @@ impl Connector for PostgresCdcConnector {
                 }
             };
             for event in events {
+                let txid = txid.and_then(|value| u64::try_from(value).ok());
+                let event = event.with_resume_token(SourceResumeToken::PostgresCdc {
+                    lsn: lsn.clone(),
+                    txid,
+                });
                 ctx.sender()
                     .send(event)
                     .await

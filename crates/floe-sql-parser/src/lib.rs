@@ -1,10 +1,13 @@
 use anyhow::{Result, anyhow};
-use sqlparser::ast::{ObjectName, Statement};
+use sqlparser::ast::{
+    ColumnOption, DataType, Expr, ObjectName, OrderByExpr, Statement, TableConstraint,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloeStatement {
+    CreateTable(CreateTableDefinition),
     CreateMaterializedView(MaterializedViewDefinition),
     CreateSink(SinkDefinition),
     Tail {
@@ -12,6 +15,87 @@ pub enum FloeStatement {
         with_snapshot: bool,
         as_of: Option<i64>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableDefinition {
+    name: String,
+    columns: Vec<CreateTableColumnDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableColumnDefinition {
+    name: String,
+    data_type: SqlColumnType,
+    nullable: bool,
+    primary_key: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlColumnType {
+    Int64,
+    Bool,
+    Utf8,
+    TimestampMillis,
+}
+
+impl CreateTableDefinition {
+    pub fn new(name: impl Into<String>, columns: Vec<CreateTableColumnDefinition>) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(anyhow!("table name cannot be empty"));
+        }
+        if columns.is_empty() {
+            return Err(anyhow!("table {name} must declare at least one column"));
+        }
+        let pk_count = columns.iter().filter(|column| column.primary_key).count();
+        if pk_count != 1 {
+            return Err(anyhow!(
+                "table {name} must declare exactly one primary key column"
+            ));
+        }
+        Ok(Self { name, columns })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn columns(&self) -> &[CreateTableColumnDefinition] {
+        &self.columns
+    }
+}
+
+impl CreateTableColumnDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        data_type: SqlColumnType,
+        nullable: bool,
+        primary_key: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            nullable,
+            primary_key,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &SqlColumnType {
+        &self.data_type
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+
+    pub fn primary_key(&self) -> bool {
+        self.primary_key
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +210,11 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
             statements.push(FloeStatement::CreateSink(definition));
             continue;
         }
+        if starts_with_keyword(normalized, "CREATE TABLE") {
+            let definition = parse_create_table(normalized)?;
+            statements.push(FloeStatement::CreateTable(definition));
+            continue;
+        }
         if starts_with_keyword(normalized, "CREATE") {
             let definition = parse_materialized_view(normalized)?;
             statements.push(FloeStatement::CreateMaterializedView(definition));
@@ -218,6 +307,149 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
         }
         _ => Err(anyhow!("expected CREATE MATERIALIZED VIEW statement")),
     }
+}
+
+pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
+    let normalized = normalize_sql(sql)?;
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, normalized)
+        .map_err(|err| anyhow!("failed to parse create table statement: {err}"))?;
+    if statements.len() != 1 {
+        return Err(anyhow!(
+            "CREATE TABLE definition cannot contain multiple statements"
+        ));
+    }
+    let statement = statements.remove(0);
+    let Statement::CreateTable(create_table) = statement else {
+        return Err(anyhow!("expected CREATE TABLE statement"));
+    };
+    if create_table.or_replace
+        || create_table.temporary
+        || create_table.external
+        || create_table.dynamic
+        || create_table.global.is_some()
+        || create_table.transient
+        || create_table.volatile
+        || create_table.iceberg
+    {
+        return Err(anyhow!("unsupported CREATE TABLE modifiers are present"));
+    }
+    if create_table.query.is_some() || create_table.like.is_some() || create_table.clone.is_some() {
+        return Err(anyhow!(
+            "CREATE TABLE AS/LIKE/CLONE forms are not supported by Floe"
+        ));
+    }
+    if create_table.columns.is_empty() {
+        return Err(anyhow!("CREATE TABLE must declare at least one column"));
+    }
+    if create_table.if_not_exists {
+        return Err(anyhow!(
+            "CREATE TABLE IF NOT EXISTS is not yet supported in Floe SQL programs"
+        ));
+    }
+
+    let table_name = object_name_to_string(&create_table.name)?;
+    let mut pk_names = primary_key_columns(&create_table.constraints)?;
+    let mut columns = Vec::with_capacity(create_table.columns.len());
+    for column in &create_table.columns {
+        let name = column.name.value.clone();
+        let mut nullable = true;
+        let mut primary_key = false;
+        for option in &column.options {
+            match &option.option {
+                ColumnOption::NotNull => nullable = false,
+                ColumnOption::Null => nullable = true,
+                ColumnOption::Unique { is_primary, .. } if *is_primary => {
+                    primary_key = true;
+                    nullable = false;
+                }
+                _ => {}
+            }
+        }
+        if pk_names.contains(&name) {
+            primary_key = true;
+            nullable = false;
+        }
+        let data_type = parse_table_column_type(&column.data_type, &table_name, &name)?;
+        columns.push(CreateTableColumnDefinition::new(
+            name,
+            data_type,
+            nullable,
+            primary_key,
+        ));
+    }
+    if !pk_names.is_empty() {
+        pk_names.retain(|pk_name| columns.iter().all(|column| column.name() != pk_name));
+        if !pk_names.is_empty() {
+            return Err(anyhow!(
+                "primary key columns not declared in table {}: {}",
+                table_name,
+                pk_names.join(", ")
+            ));
+        }
+    }
+    CreateTableDefinition::new(table_name, columns)
+}
+
+fn primary_key_columns(constraints: &[TableConstraint]) -> Result<Vec<String>> {
+    let mut primary_key_columns = Vec::new();
+    for constraint in constraints {
+        if let TableConstraint::PrimaryKey { columns, .. } = constraint {
+            for column in columns {
+                primary_key_columns.push(primary_key_column_name(&column.column)?);
+            }
+        }
+    }
+    if primary_key_columns.len() > 1 {
+        return Err(anyhow!(
+            "Floe currently supports exactly one primary key column"
+        ));
+    }
+    Ok(primary_key_columns)
+}
+
+fn primary_key_column_name(column: &OrderByExpr) -> Result<String> {
+    match &column.expr {
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|part| part.value.clone())
+            .ok_or_else(|| anyhow!("primary key identifier cannot be empty")),
+        other => Err(anyhow!(
+            "unsupported primary key expression '{other}'; expected a column identifier"
+        )),
+    }
+}
+
+fn parse_table_column_type(
+    data_type: &DataType,
+    table_name: &str,
+    column_name: &str,
+) -> Result<SqlColumnType> {
+    let parsed = match data_type {
+        DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::Int8(_)
+        | DataType::Int64 => SqlColumnType::Int64,
+        DataType::Boolean | DataType::Bool => SqlColumnType::Bool,
+        DataType::Varchar(_)
+        | DataType::Char(_)
+        | DataType::Character(_)
+        | DataType::Text
+        | DataType::String(_) => SqlColumnType::Utf8,
+        DataType::Timestamp(_, _) | DataType::Datetime(_) | DataType::TimestampNtz => {
+            SqlColumnType::TimestampMillis
+        }
+        other => {
+            return Err(anyhow!(
+                "unsupported type '{other}' for column '{}' in table '{}'; supported: INT64, BOOL, UTF8/TEXT, TIMESTAMP",
+                column_name,
+                table_name
+            ));
+        }
+    };
+    Ok(parsed)
 }
 
 fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
@@ -765,6 +997,36 @@ mod tests {
             }
             other => panic!("expected CREATE SINK statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_create_table_statement() {
+        let stmt = parse_floe_statement(
+            "CREATE TABLE bids (id BIGINT PRIMARY KEY, price BIGINT NOT NULL, channel TEXT)",
+        )
+        .expect("parse table");
+        match stmt {
+            FloeStatement::CreateTable(definition) => {
+                assert_eq!(definition.name(), "bids");
+                assert_eq!(definition.columns().len(), 3);
+                let id = &definition.columns()[0];
+                assert_eq!(id.name(), "id");
+                assert_eq!(id.data_type(), &SqlColumnType::Int64);
+                assert!(!id.nullable());
+                assert!(id.primary_key());
+            }
+            other => panic!("expected CREATE TABLE statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_create_table_rejects_unsupported_type() {
+        let err =
+            parse_floe_statement("CREATE TABLE bids (id UUID PRIMARY KEY)").expect_err("error");
+        assert!(
+            err.to_string()
+                .contains("unsupported type 'UUID' for column 'id'")
+        );
     }
 
     #[test]

@@ -1,23 +1,22 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::datasource::memory::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::scalar::ScalarValue;
 use dbsp::handles::ZSetHandleView;
 
-use crate::encoding::decode_projected_row_key;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
-use crate::stream_types::Row;
+use crate::table_provider::SnapshotScanExec;
 
 use super::MV_VERSION_COLUMN;
 use super::filters::{extract_mv_version_filter, parse_mv_version_expr};
-use super::helpers::{append_mv_version_field, append_row_with_diff, build_scalar_batches};
+use super::helpers::{append_mv_version_field, build_batches_from_encoded_snapshot};
 
 pub struct MaterializedViewTableProvider {
     registry: Arc<MaterializedViewRegistry>,
@@ -47,24 +46,42 @@ impl MaterializedViewTableProvider {
         }
     }
 
-    async fn build_batches(&self, as_of_version: Option<u64>) -> DFResult<Vec<RecordBatch>> {
-        let (rows, version) = self.load_rows(as_of_version).await?;
-        let rows = self.attach_version_column(rows, version);
-        build_scalar_batches(rows, self.schema.clone())
-            .map_err(|err| DataFusionError::Execution(err.to_string()))
+    async fn build_batches(
+        &self,
+        as_of_version: Option<u64>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DFResult<(
+        datafusion::arrow::datatypes::SchemaRef,
+        Vec<datafusion::arrow::record_batch::RecordBatch>,
+    )> {
+        let (snapshot, version) = self.load_snapshot(as_of_version).await?;
+        build_batches_from_encoded_snapshot(
+            snapshot,
+            self.schema.clone(),
+            projection,
+            limit,
+            Some(version),
+            |_| true,
+        )
     }
 
     #[cfg(test)]
     pub async fn build_batches_for_test(&self) -> DFResult<Vec<RecordBatch>> {
-        self.build_batches(None).await
+        let (_, batches) = self.build_batches(None, None, None).await?;
+        Ok(batches)
     }
 
     #[cfg(test)]
     pub async fn build_batches_at_version(&self, version: u64) -> DFResult<Vec<RecordBatch>> {
-        self.build_batches(Some(version)).await
+        let (_, batches) = self.build_batches(Some(version), None, None).await?;
+        Ok(batches)
     }
 
-    async fn load_rows(&self, as_of_version: Option<u64>) -> DFResult<(Vec<Row>, u64)> {
+    async fn load_snapshot(
+        &self,
+        as_of_version: Option<u64>,
+    ) -> DFResult<(HashMap<Vec<u8>, i64>, u64)> {
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "materialized view '{}' is not registered",
@@ -77,26 +94,26 @@ impl MaterializedViewTableProvider {
                 view = %self.view_name,
                 "materialized view has no DBSP state when loading rows"
             );
-            return Ok((Vec::new(), 0));
+            return Ok((HashMap::new(), 0));
         };
         let target_version = as_of_version.unwrap_or(state.version());
-        let rows = self
+        let snapshot = self
             .materialize_dbsp_rows(state, Some(target_version))
             .await?;
         tracing::info!(
             view = %self.view_name,
             version = target_version,
-            rows = rows.len(),
+            rows = snapshot.len(),
             "materialized view loaded rows"
         );
-        Ok((rows, target_version))
+        Ok((snapshot, target_version))
     }
 
     async fn materialize_dbsp_rows(
         &self,
         state: DbspPersistedState,
         as_of_version: Option<u64>,
-    ) -> DFResult<Vec<Row>> {
+    ) -> DFResult<HashMap<Vec<u8>, i64>> {
         let target_version = as_of_version.unwrap_or(state.version());
         let handle_view = ZSetHandleView::new(
             state.dictionary(),
@@ -115,30 +132,7 @@ impl MaterializedViewTableProvider {
             snapshot_len = snapshot.len(),
             "materialize dbsp rows"
         );
-        let mut rows = Vec::new();
-        for (key, diff) in snapshot {
-            let decoded = decode_projected_row_key(&key)
-                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-            append_row_with_diff(&mut rows, decoded, diff)?;
-        }
-        Ok(rows)
-    }
-
-    fn attach_version_column(&self, rows: Vec<Row>, version: u64) -> Vec<Row> {
-        let schema_has_mv_version = self
-            .schema
-            .fields()
-            .iter()
-            .any(|field| field.name() == MV_VERSION_COLUMN);
-        if !schema_has_mv_version {
-            return rows;
-        }
-        rows.into_iter()
-            .map(|mut row| {
-                row.push(ScalarValue::UInt64(Some(version)));
-                row
-            })
-            .collect()
+        Ok(snapshot)
     }
 }
 
@@ -182,17 +176,14 @@ impl TableProvider for MaterializedViewTableProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (as_of_version, passthrough_filters) = extract_mv_version_filter(filters);
-        let batches = self.build_batches(as_of_version).await?;
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
-        // Always expose full schema (including __mv_version) regardless of projection pushdown.
-        mem_table
-            .scan(state, projection, &passthrough_filters, limit)
-            .await
+        let (as_of_version, _passthrough_filters) = extract_mv_version_filter(filters);
+        let (projected_schema, batches) =
+            self.build_batches(as_of_version, projection, limit).await?;
+        Ok(Arc::new(SnapshotScanExec::new(projected_schema, batches)))
     }
 }

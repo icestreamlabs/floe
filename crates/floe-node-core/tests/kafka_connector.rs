@@ -53,6 +53,7 @@ async fn kafka_connector_ingests_messages() {
         default_source: None,
         poll_timeout: Duration::from_millis(200),
         max_messages_per_tick: 16,
+        commit_offsets_rx: None,
     };
     let mut connector = KafkaConnector::new(config, Vec::new()).expect("connector config");
     let ctx = ConnectorContext::new(tx);
