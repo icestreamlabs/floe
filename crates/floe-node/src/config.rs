@@ -75,6 +75,8 @@ pub struct RuntimeConfig {
     pub kafka_poll_ms: Option<u64>,
     #[serde(default)]
     pub kafka_max_messages: Option<usize>,
+    #[serde(default)]
+    pub watermark_idle_source_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -128,6 +130,8 @@ pub enum ConnectorConfig {
         poll_ms: Option<u64>,
         #[serde(default)]
         max_messages_per_tick: Option<usize>,
+        #[serde(default)]
+        format: Option<String>,
     },
     File {
         #[serde(default)]
@@ -204,6 +208,12 @@ pub enum SinkConfig {
         retry_base_ms: Option<u64>,
         #[serde(default)]
         retry_max_backoff_ms: Option<u64>,
+        #[serde(default)]
+        transactional_id: Option<String>,
+        #[serde(default)]
+        checkpoint_topic: Option<String>,
+        #[serde(default)]
+        checkpoint_partition: Option<i32>,
     },
     File {
         #[serde(default)]
@@ -216,6 +226,8 @@ pub enum SinkConfig {
         as_of: Option<i64>,
         #[serde(default)]
         append: Option<bool>,
+        #[serde(default)]
+        effectively_once: Option<bool>,
         #[serde(default)]
         batch_rows: Option<usize>,
         #[serde(default)]
@@ -343,6 +355,10 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
     ensure_optional_non_empty(runtime.kafka_group_id.as_deref(), "runtime.kafka_group_id")?;
     ensure_optional_positive_u64(runtime.kafka_poll_ms, "runtime.kafka_poll_ms")?;
     ensure_optional_positive_usize(runtime.kafka_max_messages, "runtime.kafka_max_messages")?;
+    ensure_optional_positive_u64(
+        runtime.watermark_idle_source_ms,
+        "runtime.watermark_idle_source_ms",
+    )?;
     Ok(())
 }
 
@@ -400,6 +416,7 @@ fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
             default_source,
             poll_ms: _,
             max_messages_per_tick,
+            format,
         } => {
             ensure_non_empty(brokers, &format!("connectors[{index}].brokers"))?;
             if topics.is_empty() {
@@ -421,6 +438,12 @@ fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
                 *max_messages_per_tick,
                 &format!("connectors[{index}].max_messages_per_tick"),
             )?;
+            if let Some(format) = format {
+                let normalized = format.to_ascii_lowercase();
+                if normalized != "floe_json" && normalized != "debezium_json" {
+                    bail!("connectors[{index}].format must be one of: floe_json, debezium_json");
+                }
+            }
         }
         ConnectorConfig::File {
             name,
@@ -539,6 +562,9 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
             retry_max_attempts,
             retry_base_ms,
             retry_max_backoff_ms,
+            transactional_id,
+            checkpoint_topic,
+            checkpoint_partition,
         } => {
             ensure_optional_non_empty(name.as_deref(), &format!("sinks[{index}].name"))?;
             ensure_non_empty(brokers, &format!("sinks[{index}].brokers"))?;
@@ -559,6 +585,19 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
                 *retry_max_backoff_ms,
                 &format!("sinks[{index}].retry_max_backoff_ms"),
             )?;
+            ensure_optional_non_empty(
+                transactional_id.as_deref(),
+                &format!("sinks[{index}].transactional_id"),
+            )?;
+            ensure_optional_non_empty(
+                checkpoint_topic.as_deref(),
+                &format!("sinks[{index}].checkpoint_topic"),
+            )?;
+            if let Some(partition) = checkpoint_partition
+                && *partition < 0
+            {
+                bail!("sinks[{index}].checkpoint_partition must be >= 0");
+            }
         }
         SinkConfig::File {
             name,
@@ -567,6 +606,7 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
             with_snapshot: _,
             as_of: _,
             append: _,
+            effectively_once: _,
             batch_rows,
             batch_bytes,
             queue_capacity,
@@ -728,6 +768,9 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             retry_max_attempts: None,
             retry_base_ms: None,
             retry_max_backoff_ms: None,
+            transactional_id: None,
+            checkpoint_topic: None,
+            checkpoint_partition: None,
         },
         SinkConnector::File { path, append } => SinkConfig::File {
             name: Some(definition.name().to_string()),
@@ -736,6 +779,7 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
             append: *append,
+            effectively_once: None,
             batch_rows: None,
             batch_bytes: None,
             queue_capacity: None,
@@ -873,6 +917,7 @@ impl ConnectorSpec {
                 default_source,
                 poll_ms,
                 max_messages_per_tick,
+                format,
                 ..
             } => {
                 let mut props = Vec::new();
@@ -892,6 +937,9 @@ impl ConnectorSpec {
                         "max_messages_per_tick".to_string(),
                         max_messages.to_string(),
                     ));
+                }
+                if let Some(format) = format {
+                    props.push(("format".to_string(), format.clone()));
                 }
                 props
             }
@@ -1017,6 +1065,7 @@ mod tests {
                 default_source: None,
                 poll_ms: None,
                 max_messages_per_tick: None,
+                format: None,
             },
             ConnectorConfig::Kafka {
                 name: None,
@@ -1026,6 +1075,7 @@ mod tests {
                 default_source: None,
                 poll_ms: None,
                 max_messages_per_tick: None,
+                format: None,
             },
         ];
         let specs = normalize_connectors(configs).expect("normalize");
@@ -1090,6 +1140,7 @@ mod tests {
                 default_source: Some("nexmark_bid".to_string()),
                 poll_ms: Some(100),
                 max_messages_per_tick: Some(64),
+                format: None,
             }],
             ..NodeConfig::default()
         };
@@ -1114,6 +1165,44 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("connectors[0].url must be a valid URL")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unknown_kafka_format() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Kafka {
+                name: Some("kafka_ingest".to_string()),
+                brokers: "localhost:9092".to_string(),
+                topics: vec!["events".to_string()],
+                group_id: Some("floe".to_string()),
+                default_source: Some("nexmark_bid".to_string()),
+                poll_ms: Some(100),
+                max_messages_per_tick: Some(64),
+                format: Some("bad_format".to_string()),
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("connectors[0].format must be one of")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_non_positive_watermark_idle_source_ms() {
+        let config = NodeConfig {
+            runtime: RuntimeConfig {
+                watermark_idle_source_ms: Some(0),
+                ..RuntimeConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("runtime.watermark_idle_source_ms must be greater than 0")
         );
     }
 
@@ -1143,6 +1232,40 @@ mod tests {
         };
         let err = validate_node_config(&config).expect_err("validation should fail");
         assert!(err.to_string().contains("sinks[0].url must be a valid URL"));
+    }
+
+    #[test]
+    fn validation_rejects_negative_kafka_checkpoint_partition() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Generator {
+                name: None,
+                events_per_second: Some(1.0),
+                max_events: None,
+            }],
+            sinks: vec![SinkConfig::Kafka {
+                name: Some("sink_kafka".to_string()),
+                brokers: "localhost:9092".to_string(),
+                topic: "out".to_string(),
+                mv: "mv_bid".to_string(),
+                with_snapshot: Some(false),
+                as_of: None,
+                batch_rows: Some(1),
+                batch_bytes: None,
+                queue_capacity: None,
+                retry_max_attempts: None,
+                retry_base_ms: None,
+                retry_max_backoff_ms: None,
+                transactional_id: Some("tx-1".to_string()),
+                checkpoint_topic: Some("out_checkpoint".to_string()),
+                checkpoint_partition: Some(-1),
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("sinks[0].checkpoint_partition must be >= 0")
+        );
     }
 
     #[test]

@@ -326,9 +326,11 @@ impl<'cfg> PlannerContext<'cfg> {
         let join_type = match join.join_type {
             JoinType::Inner => DbspJoinType::Inner,
             JoinType::Left => DbspJoinType::LeftOuter,
+            JoinType::Right => DbspJoinType::RightOuter,
+            JoinType::Full => DbspJoinType::FullOuter,
             other => {
                 return Err(PlannerError::UnsupportedJoin(format!(
-                    "unsupported join type {other:?}; only INNER and LEFT OUTER joins are supported"
+                    "unsupported join type {other:?}; only INNER/LEFT/RIGHT/FULL OUTER joins are supported"
                 )));
             }
         };
@@ -362,9 +364,9 @@ impl<'cfg> PlannerContext<'cfg> {
         }
 
         let residual = combine_filters(residuals);
-        if matches!(join_type, DbspJoinType::LeftOuter) && residual.is_some() {
+        if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
             return Err(PlannerError::UnsupportedJoin(
-                "LEFT OUTER joins currently require pure equi-join predicates".to_string(),
+                "OUTER joins currently require pure equi-join predicates".to_string(),
             ));
         }
 
@@ -719,6 +721,28 @@ impl<'cfg> PlannerContext<'cfg> {
                 };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Hopping { size_ms, slide_ms },
+                    time_expr,
+                    input_schema,
+                    allowed_lateness_ms,
+                )?;
+                Ok(Some(spec))
+            }
+            "session" => {
+                if !matches!(func.args.len(), 2 | 3) {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "SESSION requires (time_expr, gap_ms[, allowed_lateness_ms]) arguments"
+                            .to_string(),
+                    ));
+                }
+                let time_expr = normalize_expr(func.args[0].clone())?;
+                let gap_ms = self.parse_window_arg(&func.args[1])?;
+                let allowed_lateness_ms = if func.args.len() == 3 {
+                    self.parse_window_arg(&func.args[2])?
+                } else {
+                    0
+                };
+                let spec = DbspWindowSpec::try_new(
+                    DbspWindowPolicy::Session { gap_ms },
                     time_expr,
                     input_schema,
                     allowed_lateness_ms,

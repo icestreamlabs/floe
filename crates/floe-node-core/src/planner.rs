@@ -169,6 +169,15 @@ fn planner_udfs() -> Vec<ScalarUDF> {
             Arc::clone(&passthrough_ts),
         ),
         passthrough_window_udf(
+            "session",
+            vec![
+                vec![ts.clone(), DataType::Int64],
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ],
+            ts.clone(),
+            Arc::clone(&passthrough_ts),
+        ),
+        passthrough_window_udf(
             "tumble_start",
             vec![
                 vec![ts.clone(), DataType::Int64],
@@ -459,6 +468,31 @@ mod tests {
         let logical_plan = planned[0].logical_plan().display_indent().to_string();
         assert!(
             logical_plan.contains("orders"),
+            "logical plan was: {logical_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plans_session_window_grouping_query() {
+        let mut registry = SourceRegistry::new();
+        registry.extend(crate::generator::definitions().expect("definitions"));
+
+        let definition = parse_materialized_view(
+            "CREATE MATERIALIZED VIEW mv_session AS \
+             SELECT bidder, COUNT(*) AS bid_count \
+             FROM bid \
+             GROUP BY bidder, SESSION(\"dateTime\", 5000, 1000)",
+        )
+        .expect("parse mv");
+
+        let planned = plan_materialized_views(&registry, &[definition])
+            .await
+            .expect("plan mv");
+
+        assert_eq!(planned.len(), 1);
+        let logical_plan = planned[0].logical_plan().display_indent().to_string();
+        assert!(
+            logical_plan.contains("Aggregate"),
             "logical plan was: {logical_plan}"
         );
     }

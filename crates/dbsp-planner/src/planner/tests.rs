@@ -77,6 +77,13 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
         ],
         Volatility::Immutable,
     );
+    let session_sig = Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![ts.clone(), DataType::Int64]),
+            TypeSignature::Exact(vec![ts.clone(), DataType::Int64, DataType::Int64]),
+        ],
+        Volatility::Immutable,
+    );
     ctx.register_udf(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
         "tumble",
         tumble_sig,
@@ -86,6 +93,12 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     ctx.register_udf(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
         "hop",
         hop_sig,
+        ts.clone(),
+        Arc::clone(&passthrough_ts),
+    )));
+    ctx.register_udf(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        "session",
+        session_sig,
         ts,
         passthrough_ts,
     )));
@@ -259,6 +272,108 @@ fn plans_left_outer_join_with_nullable_right_columns() {
                 .output_schema
                 .field(right_start + 1)
                 .expect("right-side name field");
+            assert!(right_name_field.nullable);
+        }
+        other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
+fn plans_right_outer_join_with_nullable_left_columns() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Right,
+            (
+                vec![qualified(auction, "seller")],
+                vec![qualified(person, "id")],
+            ),
+            None,
+        )
+        .unwrap()
+        .project(vec![
+            col(qualified(auction, "id")),
+            col(qualified(person, "name")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    let join_id = *root.inputs.first().expect("project input");
+    let join_node = circuit_plan.node(join_id).expect("join node");
+    match &join_node.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(matches!(join.join_type, DbspJoinType::RightOuter));
+            let left_id_field = join.output_schema.field(0).expect("left-side id field");
+            assert!(left_id_field.nullable);
+        }
+        other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
+fn plans_full_outer_join_with_nullable_both_sides() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Full,
+            (
+                vec![qualified(auction, "seller")],
+                vec![qualified(person, "id")],
+            ),
+            None,
+        )
+        .unwrap()
+        .project(vec![
+            col(qualified(auction, "id")),
+            col(qualified(person, "name")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    let join_id = *root.inputs.first().expect("project input");
+    let join_node = circuit_plan.node(join_id).expect("join node");
+    match &join_node.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(matches!(join.join_type, DbspJoinType::FullOuter));
+            let left_id_field = join.output_schema.field(0).expect("left-side id field");
+            let right_start = join.left_schema.len();
+            let right_name_field = join
+                .output_schema
+                .field(right_start + 1)
+                .expect("right-side name field");
+            assert!(left_id_field.nullable);
             assert!(right_name_field.nullable);
         }
         other => panic!("expected join node, found {other:?}"),
@@ -565,6 +680,42 @@ async fn plans_tumble_grouping_with_allowed_lateness() {
     });
     let window = window.expect("expected WindowAggregate node");
     assert_eq!(window.window.allowed_lateness_ms, 750);
+}
+
+#[tokio::test]
+async fn plans_session_grouping_as_window_aggregate() {
+    let sql = "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    match &window.window.policy {
+        dbsp_circuit::circuit::plan::DbspWindowPolicy::Session { gap_ms } => {
+            assert_eq!(*gap_ms, 5_000);
+        }
+        other => panic!("expected session window, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plans_session_grouping_with_allowed_lateness() {
+    let sql = "SELECT bidder, COUNT(*) AS bid_count \
+        FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000, 1200)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.window.allowed_lateness_ms, 1_200);
 }
 
 #[tokio::test]

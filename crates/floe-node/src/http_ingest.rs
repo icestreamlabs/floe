@@ -10,9 +10,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use prometheus::{Encoder, TextEncoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use floe_node_core::source::{SourceEvent, SourceEventSender};
@@ -37,6 +38,22 @@ pub struct HttpIngestHealth {
     pub executor_running: Arc<AtomicBool>,
     pub storage_reachable: Arc<AtomicBool>,
     pub runtime_ready: Arc<AtomicBool>,
+    pub watermark_debug: Option<Arc<RwLock<WatermarkDebugState>>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WatermarkDebugSourceState {
+    pub source: String,
+    pub watermark_ms: i64,
+    pub idle: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WatermarkDebugState {
+    pub global_watermark_ms: Option<i64>,
+    pub policy: String,
+    pub updated_at_unix_ms: u64,
+    pub sources: Vec<WatermarkDebugSourceState>,
 }
 
 #[derive(Clone)]
@@ -72,6 +89,7 @@ pub async fn run_http_ingest(
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/debug/watermarks", get(debug_watermarks_ingest))
         .route("/ingest", post(ingest))
         .route("/metrics", get(metrics))
         .with_state(state);
@@ -97,6 +115,7 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
     let app = Router::new()
         .route("/healthz", get(admin_healthz))
         .route("/readyz", get(admin_readyz))
+        .route("/debug/watermarks", get(debug_watermarks_admin))
         .route("/metrics", get(metrics))
         .with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
@@ -222,6 +241,37 @@ async fn admin_readyz(State(state): State<HttpAdminState>) -> impl IntoResponse 
     )
 }
 
+async fn debug_watermarks_ingest(State(state): State<HttpIngestState>) -> impl IntoResponse {
+    let Some(health) = state.health else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "watermark debug state unavailable"})),
+        )
+            .into_response();
+    };
+    let Some(shared) = health.watermark_debug else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "watermark debug state unavailable"})),
+        )
+            .into_response();
+    };
+    let snapshot = shared.read().await.clone();
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
+async fn debug_watermarks_admin(State(state): State<HttpAdminState>) -> impl IntoResponse {
+    let Some(shared) = &state.health.watermark_debug else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "watermark debug state unavailable"})),
+        )
+            .into_response();
+    };
+    let snapshot = shared.read().await.clone();
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
 async fn metrics() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
@@ -331,6 +381,7 @@ mod tests {
                 executor_running: Arc::new(AtomicBool::new(false)),
                 storage_reachable: Arc::new(AtomicBool::new(true)),
                 runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
             }),
         };
         let app = Router::new()
@@ -351,5 +402,41 @@ mod tests {
             .expect("request");
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn debug_watermarks_returns_snapshot() {
+        let (tx, _rx) = mpsc::channel(1);
+        let snapshot = Arc::new(RwLock::new(WatermarkDebugState {
+            global_watermark_ms: Some(42),
+            policy: "min_active_sources".to_string(),
+            updated_at_unix_ms: 7,
+            sources: vec![WatermarkDebugSourceState {
+                source: "s1".to_string(),
+                watermark_ms: 42,
+                idle: false,
+            }],
+        }));
+        let state = HttpIngestState {
+            sender: tx,
+            default_source: Some("nexmark_bid".to_string()),
+            cancel: CancellationToken::new(),
+            health: Some(HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: Some(snapshot),
+            }),
+        };
+        let app = Router::new()
+            .route("/debug/watermarks", get(debug_watermarks_ingest))
+            .with_state(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/debug/watermarks")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -14,6 +14,23 @@ use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector
 use crate::source::SourceEventSender;
 use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaMessageFormat {
+    FloeJson,
+    DebeziumJson,
+}
+
+impl KafkaMessageFormat {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(|format| format.to_ascii_lowercase()) {
+            None => Ok(Self::FloeJson),
+            Some(format) if format == "floe_json" => Ok(Self::FloeJson),
+            Some(format) if format == "debezium_json" => Ok(Self::DebeziumJson),
+            Some(other) => anyhow::bail!("unsupported kafka message format '{other}'"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KafkaConnectorConfig {
     pub brokers: String,
@@ -22,6 +39,7 @@ pub struct KafkaConnectorConfig {
     pub default_source: Option<String>,
     pub poll_timeout: Duration,
     pub max_messages_per_tick: usize,
+    pub message_format: Option<String>,
     pub commit_offsets_rx: Option<watch::Receiver<KafkaOffsetCommit>>,
 }
 
@@ -40,6 +58,7 @@ pub struct KafkaOffsetCommit {
 
 pub struct KafkaConnector {
     config: KafkaConnectorConfig,
+    message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
     consumer: Option<StreamConsumer>,
     last_committed_tick_id: u64,
@@ -56,8 +75,10 @@ impl KafkaConnector {
             config.max_messages_per_tick > 0,
             "kafka max messages per tick must be positive"
         );
+        let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
         Ok(Self {
             config,
+            message_format,
             definitions,
             consumer: None,
             last_committed_tick_id: 0,
@@ -105,6 +126,8 @@ impl KafkaConnector {
             value,
             self.config.default_source.as_deref(),
             message.topic(),
+            self.message_format,
+            message.key(),
         ) {
             Ok(events) => events,
             Err(err) => {
@@ -220,7 +243,13 @@ fn parse_events(
     value: Value,
     default_source: Option<&str>,
     topic: &str,
+    format: KafkaMessageFormat,
+    message_key: Option<&[u8]>,
 ) -> Result<Vec<SourceEvent>> {
+    if matches!(format, KafkaMessageFormat::DebeziumJson) {
+        return parse_debezium_events(value, default_source, topic, message_key);
+    }
+
     match value {
         Value::Array(items) => {
             ensure!(!items.is_empty(), "event array must not be empty");
@@ -247,6 +276,66 @@ fn parse_event(value: Value, default_source: Option<&str>, topic: &str) -> Resul
 
     let source = default_source.unwrap_or(topic);
     Ok(SourceEvent::new(source, value))
+}
+
+fn parse_debezium_events(
+    value: Value,
+    default_source: Option<&str>,
+    topic: &str,
+    message_key: Option<&[u8]>,
+) -> Result<Vec<SourceEvent>> {
+    let object = value
+        .as_object()
+        .context("debezium payload must be a JSON object")?;
+    let payload = object
+        .get("payload")
+        .context("debezium payload missing 'payload' field")?;
+    if payload.is_null() {
+        return Ok(Vec::new());
+    }
+    let payload_obj = payload
+        .as_object()
+        .context("debezium 'payload' must be an object")?;
+    let op = payload_obj
+        .get("op")
+        .and_then(Value::as_str)
+        .context("debezium payload missing string 'op'")?;
+
+    let source = default_source.unwrap_or(topic);
+    let mut row = match op {
+        "c" | "u" => payload_obj
+            .get("after")
+            .and_then(Value::as_object)
+            .cloned()
+            .context("debezium upsert payload missing object 'after'")?,
+        "r" => payload_obj
+            .get("after")
+            .and_then(Value::as_object)
+            .cloned()
+            .context("debezium snapshot payload missing object 'after'")?,
+        "d" => payload_obj
+            .get("before")
+            .and_then(Value::as_object)
+            .cloned()
+            .context("debezium delete payload missing object 'before'")?,
+        "t" => return Ok(Vec::new()),
+        other => anyhow::bail!("unsupported debezium op '{other}'"),
+    };
+
+    let floe_op = match op {
+        "d" => "delete",
+        "r" => "snapshot",
+        _ => "upsert",
+    };
+    row.insert("__floe_op".to_string(), Value::from(floe_op));
+
+    if let Some(key_bytes) = message_key
+        && let Ok(key_value) = serde_json::from_slice::<Value>(key_bytes)
+    {
+        row.insert("__floe_key".to_string(), key_value);
+    }
+
+    Ok(vec![SourceEvent::new(source, Value::Object(row))])
 }
 
 impl KafkaConnector {
@@ -301,5 +390,81 @@ fn kafka_message_timestamp_ms(message: &BorrowedMessage<'_>) -> Option<u64> {
     match message.timestamp() {
         Timestamp::NotAvailable => None,
         Timestamp::CreateTime(value) | Timestamp::LogAppendTime(value) => u64::try_from(value).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_debezium_upsert_maps_after_payload() {
+        let payload = json!({
+            "payload": {
+                "op": "u",
+                "before": {"id": 1, "name": "old"},
+                "after": {"id": 1, "name": "new"}
+            }
+        });
+        let events = parse_events(
+            payload,
+            Some("public.users"),
+            "dbz",
+            KafkaMessageFormat::DebeziumJson,
+            Some(br#"{"id":1}"#),
+        )
+        .expect("parse debezium");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "public.users");
+        assert_eq!(
+            events[0].payload().get("__floe_op").and_then(Value::as_str),
+            Some("upsert")
+        );
+        assert_eq!(
+            events[0].payload().get("name").and_then(Value::as_str),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn parse_debezium_delete_maps_before_payload() {
+        let payload = json!({
+            "payload": {
+                "op": "d",
+                "before": {"id": 7, "name": "gone"},
+                "after": null
+            }
+        });
+        let events = parse_events(
+            payload,
+            Some("public.users"),
+            "dbz",
+            KafkaMessageFormat::DebeziumJson,
+            None,
+        )
+        .expect("parse debezium");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload().get("__floe_op").and_then(Value::as_str),
+            Some("delete")
+        );
+        assert_eq!(
+            events[0].payload().get("id").and_then(Value::as_i64),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn parse_floe_json_still_supports_source_data_wrapper() {
+        let payload = json!({"source": "nexmark_bid", "data": {"auction": 1}});
+        let events = parse_events(payload, None, "topic", KafkaMessageFormat::FloeJson, None)
+            .expect("parse floe json");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "nexmark_bid");
+        assert_eq!(
+            events[0].payload().get("auction").and_then(Value::as_i64),
+            Some(1)
+        );
     }
 }

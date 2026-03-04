@@ -43,6 +43,21 @@ static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register floe_window_state_entries")
 });
 
+static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "floe_window_state_limit_exceeded_total",
+        "Number of times window aggregate state exceeded configured FLOE_WINDOW_STATE_MAX_ENTRIES limit",
+    )
+    .expect("register floe_window_state_limit_exceeded_total")
+});
+
+static WINDOW_STATE_LIMIT: LazyLock<Option<usize>> = LazyLock::new(|| {
+    std::env::var("FLOE_WINDOW_STATE_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+});
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WindowKey<K> {
     pub start: i64,
@@ -531,6 +546,16 @@ where
 
         if let Some(aggregate_cache) = self.aggregate_cache.as_ref() {
             WINDOW_STATE_ENTRIES.set(i64::try_from(aggregate_cache.len()).unwrap_or(i64::MAX));
+            if let Some(limit) = *WINDOW_STATE_LIMIT
+                && aggregate_cache.len() > limit
+            {
+                WINDOW_STATE_LIMIT_EXCEEDED_TOTAL.inc();
+                tracing::warn!(
+                    current_entries = aggregate_cache.len(),
+                    limit,
+                    "window aggregate state exceeds configured limit"
+                );
+            }
         }
 
         if aggregate_updates.is_empty() {

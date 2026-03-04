@@ -2053,6 +2053,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "floe-connector-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "floe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "floe-core"
 version = "0.1.0"
 dependencies = [

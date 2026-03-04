@@ -135,6 +135,15 @@ pub struct MaterializedViewTickVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SinkCursor {
+    pub sink: String,
+    pub mv_name: String,
+    pub last_emitted_mv_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TickCommit {
     pub tick_id: u64,
     pub frontier: Timestamp,
@@ -142,6 +151,8 @@ pub struct TickCommit {
     pub source_offsets: Vec<SourceOffset>,
     #[serde(default)]
     pub mv_versions: Vec<MaterializedViewTickVersion>,
+    #[serde(default)]
+    pub sink_cursors: Vec<SinkCursor>,
     pub committed_at_unix_ms: u64,
 }
 
@@ -151,12 +162,14 @@ impl TickCommit {
         frontier: Timestamp,
         source_offsets: Vec<SourceOffset>,
         mv_versions: Vec<MaterializedViewTickVersion>,
+        sink_cursors: Vec<SinkCursor>,
     ) -> Self {
         Self {
             tick_id,
             frontier,
             source_offsets,
             mv_versions,
+            sink_cursors,
             committed_at_unix_ms: current_unix_time_ms(),
         }
     }
@@ -178,6 +191,8 @@ pub struct CheckpointManifest {
     pub materialized_views: Vec<MaterializedViewCheckpointEntry>,
     #[serde(default)]
     pub outer_streams: Vec<SourceStreamCheckpointEntry>,
+    #[serde(default)]
+    pub sink_cursors: Vec<SinkCursor>,
 }
 
 impl CheckpointManifest {
@@ -355,6 +370,7 @@ pub struct CheckpointManager {
     partition_offsets: HashMap<(String, u32), u64>,
     latest_manifest: Option<CheckpointManifest>,
     latest_tick_commit: Option<TickCommit>,
+    sink_cursors: HashMap<String, SinkCursor>,
 }
 
 impl CheckpointManager {
@@ -388,6 +404,22 @@ impl CheckpointManager {
             (1, HashMap::new())
         };
 
+        let sink_cursors = if let Some(ref commit) = latest_tick_commit {
+            commit
+                .sink_cursors
+                .iter()
+                .map(|cursor| (cursor.sink.clone(), cursor.clone()))
+                .collect()
+        } else if let Some(ref manifest) = latest_manifest {
+            manifest
+                .sink_cursors
+                .iter()
+                .map(|cursor| (cursor.sink.clone(), cursor.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         Ok(Self {
             graph_id,
             store,
@@ -395,6 +427,7 @@ impl CheckpointManager {
             partition_offsets,
             latest_manifest,
             latest_tick_commit,
+            sink_cursors,
         })
     }
 
@@ -429,6 +462,7 @@ impl CheckpointManager {
             operator_states: Vec::new(),
             materialized_views: Vec::new(),
             outer_streams: Vec::new(),
+            sink_cursors: self.snapshot_sink_cursors(),
         };
         self.store.persist(&manifest).await?;
         self.next_id = self.next_id.saturating_add(1);
@@ -451,6 +485,7 @@ impl CheckpointManager {
             operator_states: Vec::new(),
             materialized_views: materialized_view_entries(mv_registry),
             outer_streams: outer_stream_entries(outer_registry, &self.latest_offsets()),
+            sink_cursors: self.snapshot_sink_cursors(),
         };
         manifest.ensure_dbsp_payload();
         self.store.persist(&manifest).await?;
@@ -488,8 +523,47 @@ impl CheckpointManager {
 
     pub async fn persist_tick_commit(&mut self, commit: TickCommit) -> Result<()> {
         self.store.persist_tick_commit(&commit).await?;
+        for cursor in &commit.sink_cursors {
+            self.sink_cursors
+                .insert(cursor.sink.clone(), cursor.clone());
+        }
         self.latest_tick_commit = Some(commit);
         Ok(())
+    }
+
+    pub fn update_sink_cursor(
+        &mut self,
+        sink: &str,
+        mv_name: &str,
+        last_emitted_mv_version: i64,
+        row_index: Option<u64>,
+    ) {
+        if last_emitted_mv_version < 0 {
+            return;
+        }
+        let entry = self
+            .sink_cursors
+            .entry(sink.to_string())
+            .or_insert_with(|| SinkCursor {
+                sink: sink.to_string(),
+                mv_name: mv_name.to_string(),
+                last_emitted_mv_version,
+                row_index,
+            });
+        if last_emitted_mv_version > entry.last_emitted_mv_version
+            || (last_emitted_mv_version == entry.last_emitted_mv_version
+                && row_index.unwrap_or(0) > entry.row_index.unwrap_or(0))
+        {
+            entry.mv_name = mv_name.to_string();
+            entry.last_emitted_mv_version = last_emitted_mv_version;
+            entry.row_index = row_index;
+        }
+    }
+
+    pub fn snapshot_sink_cursors(&self) -> Vec<SinkCursor> {
+        let mut cursors: Vec<SinkCursor> = self.sink_cursors.values().cloned().collect();
+        cursors.sort_by(|left, right| left.sink.cmp(&right.sink));
+        cursors
     }
 
     pub fn store(&self) -> &CheckpointStore {
@@ -625,6 +699,12 @@ mod tests {
                 view: "mv_bid".to_string(),
                 version: 9,
             }],
+            vec![SinkCursor {
+                sink: "kafka_out".to_string(),
+                mv_name: "mv_bid".to_string(),
+                last_emitted_mv_version: 9,
+                row_index: None,
+            }],
         );
         manager
             .persist_tick_commit(commit.clone())
@@ -635,6 +715,7 @@ mod tests {
             .await
             .expect("reload checkpoint manager");
         assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
+        assert_eq!(reloaded.snapshot_sink_cursors(), commit.sink_cursors);
     }
 
     #[tokio::test]
@@ -652,6 +733,38 @@ mod tests {
         }));
         assert!(offsets.iter().any(|entry| {
             entry.source == "topic_a" && entry.partition == 1 && entry.offset == 15
+        }));
+    }
+
+    #[tokio::test]
+    async fn sink_cursor_state_roundtrips_and_is_monotonic() {
+        let mut manager = checkpoint_manager("sink-cursors").await;
+        manager.update_sink_cursor("sink_a", "mv_bid", 7, Some(3));
+        manager.update_sink_cursor("sink_a", "mv_bid", 7, Some(1));
+        manager.update_sink_cursor("sink_a", "mv_bid", 8, None);
+        manager.update_sink_cursor("sink_b", "mv_bid", 2, None);
+
+        let commit = TickCommit::new(
+            2,
+            100,
+            manager.snapshot_offsets(),
+            Vec::new(),
+            manager.snapshot_sink_cursors(),
+        );
+        manager
+            .persist_tick_commit(commit.clone())
+            .await
+            .expect("persist sink cursor commit");
+
+        let reloaded = CheckpointManager::new("sink-cursors", manager.store().table())
+            .await
+            .expect("reload checkpoint manager");
+        let cursors = reloaded.snapshot_sink_cursors();
+        assert_eq!(cursors, commit.sink_cursors);
+        assert!(cursors.iter().any(|cursor| {
+            cursor.sink == "sink_a"
+                && cursor.last_emitted_mv_version == 8
+                && cursor.row_index.is_none()
         }));
     }
 }

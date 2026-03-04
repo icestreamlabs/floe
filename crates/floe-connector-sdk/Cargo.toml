@@ -1,0 +1,11 @@
+[package]
+name = "floe-connector-sdk"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+floe-core = { path = "../floe-core" }

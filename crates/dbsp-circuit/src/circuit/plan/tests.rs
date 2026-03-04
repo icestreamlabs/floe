@@ -88,6 +88,51 @@ fn left_outer_join_marks_right_columns_nullable() {
 }
 
 #[test]
+fn right_outer_join_marks_left_columns_nullable() {
+    let left = base_schema();
+    let right = RowSchema::try_new(vec![
+        Field::new("rid", DbspScalarType::Int64, false),
+        Field::new("rname", DbspScalarType::Utf8, false),
+    ])
+    .expect("right");
+    let join = DbspJoinNode::try_new(
+        DbspJoinType::RightOuter,
+        left.clone(),
+        right,
+        vec![(col("id"), col("rid"))],
+        None,
+    )
+    .expect("right join");
+    let left_id = join.output_schema.field(0).expect("left id field");
+    assert!(left_id.nullable);
+}
+
+#[test]
+fn full_outer_join_marks_both_sides_nullable() {
+    let left = base_schema();
+    let right = RowSchema::try_new(vec![
+        Field::new("rid", DbspScalarType::Int64, false),
+        Field::new("rname", DbspScalarType::Utf8, false),
+    ])
+    .expect("right");
+    let join = DbspJoinNode::try_new(
+        DbspJoinType::FullOuter,
+        left.clone(),
+        right,
+        vec![(col("id"), col("rid"))],
+        None,
+    )
+    .expect("full outer join");
+    let left_id = join.output_schema.field(0).expect("left id field");
+    let right_name = join
+        .output_schema
+        .field(left.len() + 1)
+        .expect("right name field");
+    assert!(left_id.nullable);
+    assert!(right_name.nullable);
+}
+
+#[test]
 fn aggregate_output_schema_combines_keys_and_aggs() {
     let schema = base_schema();
     let agg = DbspAggregateNode::try_new(

@@ -156,6 +156,8 @@ impl DbspSelectNode {
 pub enum DbspJoinType {
     Inner,
     LeftOuter,
+    RightOuter,
+    FullOuter,
 }
 
 #[derive(Clone, Debug)]
@@ -263,7 +265,15 @@ impl DbspJoinNode {
 
         for field in left.fields().iter() {
             existing.insert(field.name.clone());
-            fields.push(field.clone());
+            let nullable = match join_type {
+                DbspJoinType::Inner | DbspJoinType::LeftOuter => field.nullable,
+                DbspJoinType::RightOuter | DbspJoinType::FullOuter => true,
+            };
+            fields.push(Field::new(
+                field.name.clone(),
+                field.data_type.clone(),
+                nullable,
+            ));
         }
 
         for field in right.fields().iter() {
@@ -276,7 +286,8 @@ impl DbspJoinNode {
             existing.insert(name.clone());
             let nullable = match join_type {
                 DbspJoinType::Inner => field.nullable,
-                DbspJoinType::LeftOuter => true,
+                DbspJoinType::LeftOuter | DbspJoinType::FullOuter => true,
+                DbspJoinType::RightOuter => field.nullable,
             };
             fields.push(Field::new(name, field.data_type.clone(), nullable));
         }
@@ -546,6 +557,7 @@ impl DbspAggregateNode {
 pub enum DbspWindowPolicy {
     Tumbling { size_ms: i64 },
     Hopping { size_ms: i64, slide_ms: i64 },
+    Session { gap_ms: i64 },
 }
 
 impl DbspWindowPolicy {
@@ -562,6 +574,11 @@ impl DbspWindowPolicy {
                 }
                 if size_ms % slide_ms != 0 {
                     bail!("window size must be a multiple of slide")
+                }
+            }
+            DbspWindowPolicy::Session { gap_ms } => {
+                if *gap_ms <= 0 {
+                    bail!("session window gap must be positive")
                 }
             }
         }

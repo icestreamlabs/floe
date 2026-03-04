@@ -21,7 +21,9 @@ use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
-use floe_executor::checkpoint::{CheckpointManager, MaterializedViewTickVersion, TickCommit};
+use floe_executor::checkpoint::{
+    CheckpointManager, MaterializedViewTickVersion, SinkCursor, TickCommit,
+};
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
@@ -345,6 +347,7 @@ async fn main() -> anyhow::Result<()> {
     let checkpoint_manager = CheckpointManager::new(CHECKPOINT_GRAPH_ID, checkpoint_table)
         .await
         .context("initialize tick checkpoint manager")?;
+    let initial_sink_cursors = checkpoint_manager.snapshot_sink_cursors();
     if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
         metrics::record_last_committed_tick(tick_commit.tick_id);
     }
@@ -545,6 +548,9 @@ async fn main() -> anyhow::Result<()> {
     let max_batch = run_args.ingest_batch_size;
     let max_batch_per_source = run_args.ingest_batch_per_source;
     let max_batch_per_connector = run_args.ingest_batch_per_connector;
+    let configured_watermark_idle_source_ms = config
+        .as_ref()
+        .and_then(|cfg| cfg.runtime.watermark_idle_source_ms);
 
     let runtime_cancel_for_propagation = runtime_cancel.clone();
     let ingest_cancel_for_propagation = ingest_cancel.clone();
@@ -561,10 +567,15 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_ADMIN_PORT);
+    let watermark_debug = Arc::new(tokio::sync::RwLock::new(http_ingest::WatermarkDebugState {
+        policy: "min_active_sources".to_string(),
+        ..http_ingest::WatermarkDebugState::default()
+    }));
     let admin_health = HttpIngestHealth {
         executor_running: Arc::clone(&executor_running),
         storage_reachable: Arc::clone(&storage_reachable),
         runtime_ready: Arc::clone(&runtime_ready),
+        watermark_debug: Some(Arc::clone(&watermark_debug)),
     };
     let admin_config = HttpAdminConfig {
         host: run_args.http_host.clone(),
@@ -592,6 +603,12 @@ async fn main() -> anyhow::Result<()> {
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
+    let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
+    let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
+        .iter()
+        .cloned()
+        .map(|cursor| (cursor.sink.clone(), cursor))
+        .collect();
 
     for connector in connector_specs {
         let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
@@ -614,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
                         executor_running: Arc::clone(&executor_running),
                         storage_reachable: Arc::clone(&storage_reachable),
                         runtime_ready: Arc::clone(&runtime_ready),
+                        watermark_debug: Some(Arc::clone(&watermark_debug)),
                     }),
                 };
                 let failure_state = Arc::clone(&failure_state);
@@ -637,6 +655,7 @@ async fn main() -> anyhow::Result<()> {
                 default_source,
                 poll_ms,
                 max_messages_per_tick,
+                format,
                 ..
             } => {
                 let group_id = group_id.unwrap_or_else(|| run_args.kafka_group_id.clone());
@@ -655,6 +674,7 @@ async fn main() -> anyhow::Result<()> {
                         default_source,
                         poll_timeout,
                         max_messages_per_tick,
+                        message_format: format,
                         commit_offsets_rx: Some(commit_rx),
                     };
                     let mut connector = match KafkaConnector::new(config, definitions) {
@@ -825,6 +845,8 @@ async fn main() -> anyhow::Result<()> {
     let mv_for_task = Arc::clone(&mv_registry);
     let kafka_commit_senders_for_task = kafka_commit_senders;
     let postgres_cdc_commit_senders_for_task = postgres_cdc_commit_senders;
+    let mut sink_checkpoint_rx_for_task = sink_checkpoint_rx;
+    let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -854,7 +876,9 @@ async fn main() -> anyhow::Result<()> {
         let watermark_idle_source_ms = std::env::var("FLOE_WATERMARK_IDLE_SOURCE_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_WATERMARK_IDLE_SOURCE_MS);
+            .unwrap_or(
+                configured_watermark_idle_source_ms.unwrap_or(DEFAULT_WATERMARK_IDLE_SOURCE_MS),
+            );
         let watermark_idle_timeout = Duration::from_millis(watermark_idle_source_ms);
         if let Some(existing_commit) = checkpoint_manager.latest_tick_commit() {
             metrics::record_last_committed_tick(existing_commit.tick_id);
@@ -878,9 +902,25 @@ async fn main() -> anyhow::Result<()> {
             let age_secs = now_ms.saturating_sub(existing_commit.committed_at_unix_ms) / 1_000;
             metrics::record_checkpoint_age_seconds(age_secs);
             metrics::record_watermark_lag_ms(now_ms.saturating_sub(existing_commit.frontier));
+            metrics::record_global_watermark_ms(
+                i64::try_from(existing_commit.frontier).unwrap_or(i64::MAX),
+            );
             record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
         }
         'executor: loop {
+            loop {
+                match sink_checkpoint_rx_for_task.try_recv() {
+                    Ok(cursor) => {
+                        checkpoint_manager.update_sink_cursor(
+                            &cursor.sink,
+                            &cursor.mv_name,
+                            cursor.last_emitted_mv_version,
+                            cursor.row_index,
+                        );
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
             let now_ms = current_unix_time_ms();
             metrics::record_checkpoint_age_seconds(last_checkpoint_commit_at.elapsed().as_secs());
             record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
@@ -1045,6 +1085,7 @@ async fn main() -> anyhow::Result<()> {
             for (source, max_event_ts) in tick_source_max_event_ts {
                 let watermark_entry = source_watermarks.entry(source.clone()).or_insert(i64::MIN);
                 *watermark_entry = (*watermark_entry).max(max_event_ts);
+                metrics::record_source_watermark_ms(&source, *watermark_entry);
                 source_last_seen_at.insert(source, now_instant);
             }
             if let Some(global_candidate) = compute_global_watermark(
@@ -1059,11 +1100,32 @@ async fn main() -> anyhow::Result<()> {
                     watermark_for_task.store(next, Ordering::Relaxed);
                 }
                 if next >= 0 {
+                    metrics::record_global_watermark_ms(next);
                     mv_for_task.update_watermark_all(next as u64);
                     let now_ms = current_unix_time_ms();
                     let watermark_ms = u64::try_from(next).unwrap_or(u64::MAX);
                     metrics::record_watermark_lag_ms(now_ms.saturating_sub(watermark_ms));
                 }
+            }
+            {
+                let mut debug_state = watermark_debug_for_task.write().await;
+                debug_state.updated_at_unix_ms = current_unix_time_ms();
+                let global = watermark_for_task.load(Ordering::Relaxed);
+                debug_state.global_watermark_ms = (global >= 0).then_some(global);
+                let mut sources = Vec::with_capacity(source_watermarks.len());
+                for (source, watermark) in &source_watermarks {
+                    let idle = source_last_seen_at
+                        .get(source)
+                        .map(|last| now_instant.duration_since(*last) >= watermark_idle_timeout)
+                        .unwrap_or(true);
+                    sources.push(http_ingest::WatermarkDebugSourceState {
+                        source: source.clone(),
+                        watermark_ms: *watermark,
+                        idle,
+                    });
+                }
+                sources.sort_by(|left, right| left.source.cmp(&right.source));
+                debug_state.sources = sources;
             }
             let tick_start = Instant::now();
             let tick_span = tracing::info_span!(
@@ -1125,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
                 frontier,
                 checkpoint_manager.snapshot_offsets(),
                 mv_versions.clone(),
+                checkpoint_manager.snapshot_sink_cursors(),
             );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
             let checkpoint_write_start = Instant::now();
@@ -1242,6 +1305,8 @@ async fn main() -> anyhow::Result<()> {
         sink_specs,
         query.clone(),
         Arc::clone(&mv_registry),
+        sink_resume_cursors,
+        Some(sink_checkpoint_tx),
         sink_cancel.clone(),
         runtime_cancel.clone(),
         Arc::clone(&runtime_failure),
@@ -1686,6 +1751,7 @@ fn connectors_from_cli(args: &cli::RunArgs) -> Vec<ConnectorConfig> {
             default_source: args.kafka_default_source.clone(),
             poll_ms: Some(args.kafka_poll_ms),
             max_messages_per_tick: Some(args.kafka_max_messages),
+            format: None,
         });
     }
     if let Some(path) = args.input_file.clone() {
@@ -2272,6 +2338,7 @@ mod tests {
                 with_snapshot: Some(false),
                 as_of: None,
                 append: Some(true),
+                effectively_once: None,
                 batch_rows: None,
                 batch_bytes: None,
                 queue_capacity: None,
@@ -2298,6 +2365,7 @@ mod tests {
                 with_snapshot: Some(false),
                 as_of: None,
                 append: Some(true),
+                effectively_once: None,
                 batch_rows: None,
                 batch_bytes: None,
                 queue_capacity: None,
@@ -2418,6 +2486,7 @@ mod tests {
                 kafka_group_id: Some("cfg-group".to_string()),
                 kafka_poll_ms: Some(250),
                 kafka_max_messages: Some(1024),
+                watermark_idle_source_ms: Some(45_000),
             },
             storage: config::StorageConfig {
                 await_durable: Some(true),
