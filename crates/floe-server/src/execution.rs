@@ -7,12 +7,16 @@ use futures::stream;
 use pgwire::api::portal::Format;
 use pgwire::api::results::QueryResponse;
 use pgwire::error::PgWireResult;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use tokio::sync::Mutex;
 
 use datafusion::arrow::record_batch::RecordBatch;
 
-use super::sql::mv_identifiers_in_sql;
-use super::user_error;
+use super::sql::{extract_tables_from_query, is_system_catalog_relation, unqualified_table_name};
+use super::{parse_error, undefined_table_error};
+use crate::catalog_shim::refresh_catalog_shim;
 
 pub(crate) struct FloeServerState {
     pub(crate) query: FloeQueryContext,
@@ -44,17 +48,34 @@ impl FloeServerState {
         )
         .await
         .map_err(|err| {
-            user_error(format!(
+            undefined_table_error(format!(
                 "materialized view '{name}' is not available: {err}"
             ))
         })
     }
 
     pub(crate) async fn ensure_materialized_views_in_sql(&self, sql: &str) -> PgWireResult<()> {
-        for view in mv_identifiers_in_sql(sql) {
-            self.ensure_materialized_view_registered(&view).await?;
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql)
+            .map_err(|err| parse_error(format!("SQL parse error: {err}")))?;
+        for statement in statements {
+            if let Statement::Query(query) = statement {
+                let mut names = Vec::new();
+                extract_tables_from_query(&query, &mut names);
+                for view in names {
+                    if is_system_catalog_relation(&view) {
+                        continue;
+                    }
+                    self.ensure_materialized_view_registered(unqualified_table_name(&view))
+                        .await?;
+                }
+            }
         }
         Ok(())
+    }
+
+    pub(crate) async fn refresh_catalog_shims(&self) -> PgWireResult<()> {
+        refresh_catalog_shim(self).await
     }
 }
 

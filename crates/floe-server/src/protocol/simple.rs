@@ -19,11 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::execution::FloeServerState;
 use crate::management::{detect_single_management_statement, handle_management_statement};
-use crate::protocol::bootstrap::rewrite_bootstrap_sql;
-use crate::sql::extract_tables_from_query;
+use crate::protocol::bootstrap::{detect_noop_session_command, rewrite_bootstrap_sql};
+use crate::sql::{extract_tables_from_query, is_system_catalog_relation, unqualified_table_name};
 use crate::tail::{TailResponseStream, detect_single_tail_statement};
 use crate::types::arrow_schema_to_field_info;
-use crate::user_error;
+use crate::{feature_not_supported_error, parse_error, planner_error, user_error};
 
 pub(super) struct FloeQueryHandler {
     state: Arc<FloeServerState>,
@@ -41,14 +41,20 @@ impl FloeQueryHandler {
 
     pub(super) async fn execute_statement(&self, statement: Statement) -> PgWireResult<Response> {
         match statement {
-            Statement::CreateTable(_) => Err(user_error(
+            Statement::CreateTable(_) => Err(feature_not_supported_error(
                 "CREATE TABLE is not supported via the Floe pgwire endpoint",
             )),
-            Statement::Insert(_) => Err(user_error(
+            Statement::Insert(_) => Err(feature_not_supported_error(
                 "INSERT is not supported; materialized views are read-only",
             )),
+            Statement::Set(_) => Ok(Response::Execution(Tag::new("SET"))),
+            Statement::StartTransaction { .. } => Ok(Response::Execution(Tag::new("BEGIN"))),
+            Statement::Commit { .. } => Ok(Response::Execution(Tag::new("COMMIT"))),
+            Statement::Rollback { .. } => Ok(Response::Execution(Tag::new("ROLLBACK"))),
             Statement::Query(query) => self.handle_select(&query).await,
-            other => Err(user_error(format!("unsupported statement: {other}"))),
+            other => Err(feature_not_supported_error(format!(
+                "unsupported statement: {other}"
+            ))),
         }
     }
 
@@ -82,8 +88,11 @@ impl FloeQueryHandler {
         let mut names = Vec::new();
         extract_tables_from_query(query, &mut names);
         for table in names {
+            if is_system_catalog_relation(&table) {
+                continue;
+            }
             self.state
-                .ensure_materialized_view_registered(&table)
+                .ensure_materialized_view_registered(unqualified_table_name(&table))
                 .await?;
         }
         Ok(())
@@ -95,10 +104,11 @@ impl FloeQueryHandler {
             .session()
             .sql(sql)
             .await
-            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))
+            .map_err(|err| planner_error(format!("DataFusion planning error: {err}")))
     }
 
     pub(super) async fn execute_sql_streaming(&self, sql: &str) -> PgWireResult<Response> {
+        self.state.refresh_catalog_shims().await?;
         self.state.ensure_materialized_views_in_sql(sql).await?;
         let df = self.plan_sql(sql).await?;
         let response = encode_dataframe(df, &Format::UnifiedText, None).await?;
@@ -136,6 +146,9 @@ impl SimpleQueryHandler for FloeQueryHandler {
             let response = handle_management_statement(self.state.as_ref(), &statement).await?;
             return Ok(vec![response]);
         }
+        if let Some(tag) = detect_noop_session_command(query) {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        }
         if let Some(rewritten) = rewrite_bootstrap_sql(query) {
             let response = self.execute_sql_streaming(&rewritten).await?;
             return Ok(vec![response]);
@@ -143,7 +156,7 @@ impl SimpleQueryHandler for FloeQueryHandler {
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, query)
-            .map_err(|err| user_error(format!("SQL parse error: {err}")))?;
+            .map_err(|err| parse_error(format!("SQL parse error: {err}")))?;
 
         let mut responses = Vec::with_capacity(statements.len());
         for statement in statements {

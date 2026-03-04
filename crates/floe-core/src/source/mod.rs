@@ -187,6 +187,8 @@ pub struct SourceEvent {
     payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_token: Option<SourceResumeToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_time_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +200,8 @@ pub enum SourceResumeToken {
         offset: i64,
     },
     PostgresCdc {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot: Option<String>,
         lsn: String,
         txid: Option<u64>,
     },
@@ -218,6 +222,7 @@ impl SourceEvent {
             source: source.into(),
             payload,
             resume_token: None,
+            event_time_ms: None,
         }
     }
 
@@ -235,6 +240,15 @@ impl SourceEvent {
 
     pub fn with_resume_token(mut self, resume_token: SourceResumeToken) -> Self {
         self.resume_token = Some(resume_token);
+        self
+    }
+
+    pub fn event_time_ms(&self) -> Option<u64> {
+        self.event_time_ms
+    }
+
+    pub fn with_event_time_ms(mut self, event_time_ms: u64) -> Self {
+        self.event_time_ms = Some(event_time_ms);
         self
     }
 

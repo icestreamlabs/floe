@@ -413,21 +413,8 @@ impl DbspExpression {
     }
 
     fn validate_like_pattern(pattern: &str) -> Result<()> {
-        if pattern.contains('_') {
-            bail!("LIKE patterns may not use '_' wildcards yet");
-        }
-
-        let percent_count = pattern.matches('%').count();
-        if percent_count == 0 {
-            return Ok(());
-        }
-        if percent_count == 1 && (pattern.starts_with('%') || pattern.ends_with('%')) {
-            return Ok(());
-        }
-        bail!(
-            "LIKE only supports prefix or suffix wildcards (pattern '{}')",
-            pattern
-        )
+        let _ = pattern;
+        Ok(())
     }
 
     pub fn data_type(&self) -> &DbspScalarType {

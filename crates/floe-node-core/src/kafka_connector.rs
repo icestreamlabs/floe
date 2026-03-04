@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::BorrowedMessage;
+use rdkafka::message::{BorrowedMessage, Timestamp};
 use rdkafka::{Offset, TopicPartitionList};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -120,11 +120,14 @@ impl KafkaConnector {
         };
 
         for event in &events {
-            let event = event.clone().with_resume_token(SourceResumeToken::Kafka {
+            let mut event = event.clone().with_resume_token(SourceResumeToken::Kafka {
                 topic: message.topic().to_string(),
                 partition: message.partition(),
                 offset: message.offset(),
             });
+            if let Some(event_time_ms) = kafka_message_timestamp_ms(message) {
+                event = event.with_event_time_ms(event_time_ms);
+            }
             let source_name = event.source().to_string();
             ctx.sender().send(event).await.with_context(|| {
                 format!("failed to enqueue kafka event for source {}", source_name)
@@ -291,5 +294,12 @@ impl KafkaConnector {
             .context("commit kafka offsets after tick commit")?;
         self.last_committed_tick_id = commit.tick_id;
         Ok(())
+    }
+}
+
+fn kafka_message_timestamp_ms(message: &BorrowedMessage<'_>) -> Option<u64> {
+    match message.timestamp() {
+        Timestamp::NotAvailable => None,
+        Timestamp::CreateTime(value) | Timestamp::LogAppendTime(value) => u64::try_from(value).ok(),
     }
 }

@@ -155,6 +155,7 @@ impl DbspSelectNode {
 #[derive(Clone, Debug)]
 pub enum DbspJoinType {
     Inner,
+    LeftOuter,
 }
 
 #[derive(Clone, Debug)]
@@ -232,13 +233,15 @@ impl DbspJoinNode {
         }
 
         let residual = if let Some(expr) = residual {
-            let combined_schema = Self::combined_schema(left_schema.clone(), right_schema.clone())?;
+            let combined_schema =
+                Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
             Some(DbspExpression::analyze(expr, combined_schema)?)
         } else {
             None
         };
 
-        let output_schema = Self::combined_schema(left_schema.clone(), right_schema.clone())?;
+        let output_schema =
+            Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
 
         Ok(Self {
             join_type,
@@ -250,7 +253,11 @@ impl DbspJoinNode {
         })
     }
 
-    fn combined_schema(left: Arc<RowSchema>, right: Arc<RowSchema>) -> Result<Arc<RowSchema>> {
+    fn combined_schema(
+        left: Arc<RowSchema>,
+        right: Arc<RowSchema>,
+        join_type: &DbspJoinType,
+    ) -> Result<Arc<RowSchema>> {
         let mut fields = Vec::with_capacity(left.len() + right.len());
         let mut existing = HashSet::new();
 
@@ -267,7 +274,11 @@ impl DbspJoinNode {
                 suffix += 1;
             }
             existing.insert(name.clone());
-            fields.push(Field::new(name, field.data_type.clone(), field.nullable));
+            let nullable = match join_type {
+                DbspJoinType::Inner => field.nullable,
+                DbspJoinType::LeftOuter => true,
+            };
+            fields.push(Field::new(name, field.data_type.clone(), nullable));
         }
 
         RowSchema::try_new(fields)

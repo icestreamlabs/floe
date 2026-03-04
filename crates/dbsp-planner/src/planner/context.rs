@@ -323,12 +323,15 @@ impl<'cfg> PlannerContext<'cfg> {
         &mut self,
         join: &datafusion::logical_expr::logical_plan::Join,
     ) -> Result<PlannedNode, PlannerError> {
-        if join.join_type != JoinType::Inner {
-            return Err(PlannerError::UnsupportedJoin(format!(
-                "only inner joins are supported (found {:?})",
-                join.join_type
-            )));
-        }
+        let join_type = match join.join_type {
+            JoinType::Inner => DbspJoinType::Inner,
+            JoinType::Left => DbspJoinType::LeftOuter,
+            other => {
+                return Err(PlannerError::UnsupportedJoin(format!(
+                    "unsupported join type {other:?}; only INNER and LEFT OUTER joins are supported"
+                )));
+            }
+        };
 
         let left = self.plan_node(&join.left)?;
         let right = self.plan_node(&join.right)?;
@@ -359,9 +362,14 @@ impl<'cfg> PlannerContext<'cfg> {
         }
 
         let residual = combine_filters(residuals);
+        if matches!(join_type, DbspJoinType::LeftOuter) && residual.is_some() {
+            return Err(PlannerError::UnsupportedJoin(
+                "LEFT OUTER joins currently require pure equi-join predicates".to_string(),
+            ));
+        }
 
         let join_node = DbspJoinNode::try_new(
-            DbspJoinType::Inner,
+            join_type,
             left.schema.clone(),
             right.schema.clone(),
             key_pairs,
@@ -673,35 +681,47 @@ impl<'cfg> PlannerContext<'cfg> {
         let name = func.name().to_ascii_lowercase();
         match name.as_str() {
             "tumble" => {
-                if func.args.len() != 2 {
+                if !matches!(func.args.len(), 2 | 3) {
                     return Err(PlannerError::UnsupportedPlan(
-                        "TUMBLE requires (time_expr, size_ms) arguments".to_string(),
+                        "TUMBLE requires (time_expr, size_ms[, allowed_lateness_ms]) arguments"
+                            .to_string(),
                     ));
                 }
                 let time_expr = normalize_expr(func.args[0].clone())?;
                 let size_ms = self.parse_window_arg(&func.args[1])?;
+                let allowed_lateness_ms = if func.args.len() == 3 {
+                    self.parse_window_arg(&func.args[2])?
+                } else {
+                    0
+                };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Tumbling { size_ms },
                     time_expr,
                     input_schema,
-                    0,
+                    allowed_lateness_ms,
                 )?;
                 Ok(Some(spec))
             }
             "hop" => {
-                if func.args.len() != 3 {
+                if !matches!(func.args.len(), 3 | 4) {
                     return Err(PlannerError::UnsupportedPlan(
-                        "HOP requires (time_expr, slide_ms, size_ms) arguments".to_string(),
+                        "HOP requires (time_expr, slide_ms, size_ms[, allowed_lateness_ms]) arguments"
+                            .to_string(),
                     ));
                 }
                 let time_expr = normalize_expr(func.args[0].clone())?;
                 let slide_ms = self.parse_window_arg(&func.args[1])?;
                 let size_ms = self.parse_window_arg(&func.args[2])?;
+                let allowed_lateness_ms = if func.args.len() == 4 {
+                    self.parse_window_arg(&func.args[3])?
+                } else {
+                    0
+                };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Hopping { size_ms, slide_ms },
                     time_expr,
                     input_schema,
-                    0,
+                    allowed_lateness_ms,
                 )?;
                 Ok(Some(spec))
             }

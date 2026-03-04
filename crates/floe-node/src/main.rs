@@ -37,7 +37,9 @@ use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreCo
 use floe_node_core::planner::{
     PlannedMaterializedView, camel_case_schema, plan_materialized_views,
 };
-use floe_node_core::postgres_cdc_connector::{PostgresCdcConnector, PostgresCdcConnectorConfig};
+use floe_node_core::postgres_cdc_connector::{
+    PostgresCdcCommit, PostgresCdcConnector, PostgresCdcConnectorConfig, PostgresSlotCommit,
+};
 use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
@@ -88,6 +90,7 @@ const DEFAULT_ADMIN_PORT: u16 = 8081;
 const CHECKPOINT_GRAPH_ID: &str = "floe_runtime";
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const ADMIN_PORT_ENV: &str = "FLOE_ADMIN_PORT";
+const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
 
 struct ConnectorQueue {
     name: String,
@@ -587,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
     let mut connector_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut connector_queues: Vec<ConnectorQueue> = Vec::new();
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
+    let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
 
     for connector in connector_specs {
@@ -775,6 +779,8 @@ async fn main() -> anyhow::Result<()> {
                 let max_changes = max_changes.unwrap_or(1000);
                 let default_schema = default_schema.unwrap_or_else(|| "public".to_string());
                 let include_schema_in_source = include_schema_in_source.unwrap_or(false);
+                let (commit_tx, commit_rx) = watch::channel(PostgresCdcCommit::default());
+                postgres_cdc_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {
@@ -786,6 +792,7 @@ async fn main() -> anyhow::Result<()> {
                         default_schema,
                         include_tables,
                         include_schema_in_source,
+                        commit_lsn_rx: Some(commit_rx),
                     };
                     let mut connector = match PostgresCdcConnector::new(config, definitions) {
                         Ok(connector) => connector,
@@ -817,6 +824,7 @@ async fn main() -> anyhow::Result<()> {
     let watermark_for_task = Arc::clone(&event_watermark);
     let mv_for_task = Arc::clone(&mv_registry);
     let kafka_commit_senders_for_task = kafka_commit_senders;
+    let postgres_cdc_commit_senders_for_task = postgres_cdc_commit_senders;
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -837,13 +845,22 @@ async fn main() -> anyhow::Result<()> {
             .map(|view| (view.clone(), current_unix_time_ms()))
             .collect();
         let mut last_checkpoint_commit_at = Instant::now();
+        let mut source_watermarks: HashMap<String, i64> = HashMap::new();
+        let mut source_last_seen_at: HashMap<String, Instant> = HashMap::new();
         let pre_tick_commit_delay_ms = std::env::var("FLOE_TEST_PRE_TICK_COMMIT_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        let watermark_idle_source_ms = std::env::var("FLOE_WATERMARK_IDLE_SOURCE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WATERMARK_IDLE_SOURCE_MS);
+        let watermark_idle_timeout = Duration::from_millis(watermark_idle_source_ms);
         if let Some(existing_commit) = checkpoint_manager.latest_tick_commit() {
             metrics::record_last_committed_tick(existing_commit.tick_id);
             epoch = existing_commit.tick_id;
+            let restored_watermark = i64::try_from(existing_commit.frontier).unwrap_or(i64::MAX);
+            watermark_for_task.store(restored_watermark.max(0), Ordering::Relaxed);
             for mv_version in &existing_commit.mv_versions {
                 last_mv_versions.insert(mv_version.view.clone(), mv_version.version);
                 mv_last_update_at_ms.insert(
@@ -860,6 +877,7 @@ async fn main() -> anyhow::Result<()> {
             let now_ms = current_unix_time_ms();
             let age_secs = now_ms.saturating_sub(existing_commit.committed_at_unix_ms) / 1_000;
             metrics::record_checkpoint_age_seconds(age_secs);
+            metrics::record_watermark_lag_ms(now_ms.saturating_sub(existing_commit.frontier));
             record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
         }
         'executor: loop {
@@ -915,7 +933,8 @@ async fn main() -> anyhow::Result<()> {
             let mut decoded_counts: HashMap<String, usize> = HashMap::new();
             let mut tick_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
             let mut tick_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
-            let mut batch_max_event_ts: Option<u64> = None;
+            let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
+            let mut tick_source_max_event_ts: HashMap<String, i64> = HashMap::new();
             let decode_span = tracing::debug_span!(
                 "ingest_decode",
                 epoch = pending_epoch,
@@ -933,6 +952,15 @@ async fn main() -> anyhow::Result<()> {
                 if let Some((topic, partition, offset)) = event_kafka_offset(event.resume_token()) {
                     let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
                     *entry = (*entry).max(offset);
+                }
+                if let Some((slot, lsn_value, lsn_text)) = event_postgres_lsn(event.resume_token())
+                {
+                    let entry = tick_postgres_lsns
+                        .entry(slot)
+                        .or_insert_with(|| (lsn_value, lsn_text.clone()));
+                    if lsn_value > entry.0 {
+                        *entry = (lsn_value, lsn_text);
+                    }
                 }
                 let decoder = match lookup_decoder_for_source(&decoder_for_task, &source_name) {
                     Ok(decoder) => decoder,
@@ -955,8 +983,13 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                let event_ts = event.event_time_ms().or(event_ts);
                 if let Some(ts) = event_ts {
-                    batch_max_event_ts = Some(batch_max_event_ts.map_or(ts, |max| max.max(ts)));
+                    let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
+                    let entry = tick_source_max_event_ts
+                        .entry(source_name.clone())
+                        .or_insert(i64::MIN);
+                    *entry = (*entry).max(ts_i64);
                 }
                 *decoded_counts.entry(source_name.clone()).or_insert(0) += 1;
                 decoded_rows.push((source_name, row));
@@ -1008,15 +1041,28 @@ async fn main() -> anyhow::Result<()> {
             }
 
             epoch = pending_epoch;
-            if let Some(batch_watermark) = batch_max_event_ts {
-                let watermark_value = i64::try_from(batch_watermark).unwrap_or(i64::MAX);
+            let now_instant = Instant::now();
+            for (source, max_event_ts) in tick_source_max_event_ts {
+                let watermark_entry = source_watermarks.entry(source.clone()).or_insert(i64::MIN);
+                *watermark_entry = (*watermark_entry).max(max_event_ts);
+                source_last_seen_at.insert(source, now_instant);
+            }
+            if let Some(global_candidate) = compute_global_watermark(
+                &source_watermarks,
+                &source_last_seen_at,
+                now_instant,
+                watermark_idle_timeout,
+            ) {
                 let prev = watermark_for_task.load(Ordering::Relaxed);
-                let next = prev.max(watermark_value);
+                let next = advance_global_watermark(prev, Some(global_candidate));
                 if next != prev {
                     watermark_for_task.store(next, Ordering::Relaxed);
                 }
                 if next >= 0 {
                     mv_for_task.update_watermark_all(next as u64);
+                    let now_ms = current_unix_time_ms();
+                    let watermark_ms = u64::try_from(next).unwrap_or(u64::MAX);
+                    metrics::record_watermark_lag_ms(now_ms.saturating_sub(watermark_ms));
                 }
             }
             let tick_start = Instant::now();
@@ -1126,6 +1172,17 @@ async fn main() -> anyhow::Result<()> {
                 metrics::observe_tick_phase_latency_ms(
                     "kafka_commit_notify",
                     kafka_commit_start.elapsed().as_millis() as u64,
+                );
+            }
+            if !tick_postgres_lsns.is_empty() && !postgres_cdc_commit_senders_for_task.is_empty() {
+                let postgres_commit_start = Instant::now();
+                let commit = build_postgres_cdc_commit(epoch, &tick_postgres_lsns);
+                for sender in &postgres_cdc_commit_senders_for_task {
+                    let _ = sender.send(commit.clone());
+                }
+                metrics::observe_tick_phase_latency_ms(
+                    "postgres_cdc_commit_notify",
+                    postgres_commit_start.elapsed().as_millis() as u64,
                 );
             }
             let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
@@ -1853,6 +1910,29 @@ fn collect_mv_versions_for_commit(
     committed
 }
 
+fn compute_global_watermark(
+    source_watermarks: &HashMap<String, i64>,
+    source_last_seen_at: &HashMap<String, Instant>,
+    now: Instant,
+    idle_timeout: Duration,
+) -> Option<i64> {
+    let mut global: Option<i64> = None;
+    for (source, watermark) in source_watermarks {
+        let Some(last_seen) = source_last_seen_at.get(source) else {
+            continue;
+        };
+        if now.duration_since(*last_seen) > idle_timeout {
+            continue;
+        }
+        global = Some(global.map_or(*watermark, |current| current.min(*watermark)));
+    }
+    global
+}
+
+fn advance_global_watermark(previous: i64, candidate: Option<i64>) -> i64 {
+    candidate.map_or(previous, |value| previous.max(value))
+}
+
 fn record_mv_freshness_metrics(last_update_at_ms: &HashMap<String, u64>, now_ms: u64) {
     for (view, last_update_ms) in last_update_at_ms {
         let age_seconds = now_ms.saturating_sub(*last_update_ms) / 1_000;
@@ -1891,6 +1971,19 @@ fn event_kafka_offset(
     }
 }
 
+fn event_postgres_lsn(
+    token: Option<&core_source::SourceResumeToken>,
+) -> Option<(String, u64, String)> {
+    match token? {
+        core_source::SourceResumeToken::PostgresCdc { slot, lsn, .. } => {
+            let slot = slot.clone().unwrap_or_else(|| "default".to_string());
+            let value = parse_postgres_lsn(lsn)?;
+            Some((slot, value, lsn.clone()))
+        }
+        _ => None,
+    }
+}
+
 fn build_kafka_offset_commit(
     tick_id: u64,
     offsets: &HashMap<(String, i32), i64>,
@@ -1911,6 +2004,24 @@ fn build_kafka_offset_commit(
     KafkaOffsetCommit {
         tick_id,
         offsets: entries,
+    }
+}
+
+fn build_postgres_cdc_commit(
+    tick_id: u64,
+    slots: &HashMap<String, (u64, String)>,
+) -> PostgresCdcCommit {
+    let mut entries: Vec<PostgresSlotCommit> = slots
+        .iter()
+        .map(|(slot, (_, lsn))| PostgresSlotCommit {
+            slot: slot.clone(),
+            lsn: lsn.clone(),
+        })
+        .collect();
+    entries.sort_by(|left, right| left.slot.cmp(&right.slot));
+    PostgresCdcCommit {
+        tick_id,
+        slots: entries,
     }
 }
 
@@ -2478,6 +2589,96 @@ mod tests {
             err.to_string()
                 .contains("received event for unknown source 'missing_source'")
         );
+    }
+
+    #[test]
+    fn build_postgres_cdc_commit_orders_slots() {
+        let mut slots = HashMap::new();
+        slots.insert("z_slot".to_string(), (10_u64, "0/0000000A".to_string()));
+        slots.insert("a_slot".to_string(), (3_u64, "0/00000003".to_string()));
+        let commit = build_postgres_cdc_commit(7, &slots);
+        assert_eq!(commit.tick_id, 7);
+        assert_eq!(commit.slots.len(), 2);
+        assert_eq!(commit.slots[0].slot, "a_slot");
+        assert_eq!(commit.slots[1].slot, "z_slot");
+    }
+
+    #[test]
+    fn event_postgres_lsn_extracts_slot_and_value() {
+        let token = core_source::SourceResumeToken::PostgresCdc {
+            slot: Some("cdc_slot".to_string()),
+            lsn: "16/B3738".to_string(),
+            txid: None,
+        };
+        let (slot, value, lsn) =
+            event_postgres_lsn(Some(&token)).expect("postgres resume token should parse");
+        assert_eq!(slot, "cdc_slot");
+        assert_eq!(lsn, "16/B3738");
+        assert_eq!(value, parse_postgres_lsn("16/B3738").expect("parse lsn"));
+    }
+
+    #[test]
+    fn event_resume_offset_extracts_postgres_lsn() {
+        let token = core_source::SourceResumeToken::PostgresCdc {
+            slot: Some("slot_a".to_string()),
+            lsn: "0/0000002A".to_string(),
+            txid: Some(5),
+        };
+        assert_eq!(
+            event_resume_offset(Some(&token)),
+            Some((0, parse_postgres_lsn("0/0000002A").expect("parse lsn")))
+        );
+    }
+
+    #[test]
+    fn compute_global_watermark_uses_min_of_active_sources() {
+        let now = Instant::now();
+        let mut source_watermarks = HashMap::new();
+        source_watermarks.insert("s1".to_string(), 5_000);
+        source_watermarks.insert("s2".to_string(), 3_000);
+
+        let mut source_last_seen = HashMap::new();
+        source_last_seen.insert("s1".to_string(), now);
+        source_last_seen.insert("s2".to_string(), now);
+
+        assert_eq!(
+            compute_global_watermark(
+                &source_watermarks,
+                &source_last_seen,
+                now,
+                Duration::from_secs(30),
+            ),
+            Some(3_000)
+        );
+    }
+
+    #[test]
+    fn compute_global_watermark_skips_idle_sources() {
+        let now = Instant::now();
+        let mut source_watermarks = HashMap::new();
+        source_watermarks.insert("active".to_string(), 9_000);
+        source_watermarks.insert("idle".to_string(), 1_000);
+
+        let mut source_last_seen = HashMap::new();
+        source_last_seen.insert("active".to_string(), now);
+        source_last_seen.insert("idle".to_string(), now - Duration::from_secs(60));
+
+        assert_eq!(
+            compute_global_watermark(
+                &source_watermarks,
+                &source_last_seen,
+                now,
+                Duration::from_secs(30),
+            ),
+            Some(9_000)
+        );
+    }
+
+    #[test]
+    fn advance_global_watermark_is_monotonic() {
+        assert_eq!(advance_global_watermark(5_000, Some(4_000)), 5_000);
+        assert_eq!(advance_global_watermark(5_000, Some(7_000)), 7_000);
+        assert_eq!(advance_global_watermark(5_000, None), 5_000);
     }
 }
 

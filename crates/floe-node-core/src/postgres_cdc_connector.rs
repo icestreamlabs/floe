@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,19 @@ pub struct PostgresCdcConnectorConfig {
     pub default_schema: String,
     pub include_tables: Option<Vec<String>>,
     pub include_schema_in_source: bool,
+    pub commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresSlotCommit {
+    pub slot: String,
+    pub lsn: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostgresCdcCommit {
+    pub tick_id: u64,
+    pub slots: Vec<PostgresSlotCommit>,
 }
 
 pub struct PostgresCdcConnector {
@@ -28,6 +42,7 @@ pub struct PostgresCdcConnector {
     client: Option<Client>,
     connection_task: Option<JoinHandle<()>>,
     include_tables: Option<HashSet<String>>,
+    last_committed_tick_id: u64,
 }
 
 impl PostgresCdcConnector {
@@ -57,6 +72,7 @@ impl PostgresCdcConnector {
             client: None,
             connection_task: None,
             include_tables,
+            last_committed_tick_id: 0,
         })
     }
 
@@ -96,17 +112,19 @@ impl Connector for PostgresCdcConnector {
     }
 
     async fn tick(&mut self, ctx: &ConnectorContext) -> Result<ConnectorTick> {
+        self.commit_lsn_if_requested().await?;
+
         let client = self
             .client
             .as_ref()
             .context("postgres cdc connector is not initialized")?;
         let rows = client
             .query(
-                "SELECT lsn::text, xid, data FROM pg_logical_slot_get_changes($1, NULL, $2)",
+                "SELECT lsn::text, xid, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
                 &[&self.config.slot, &(self.config.max_changes as i64)],
             )
             .await
-            .context("fetch logical slot changes")?;
+            .context("peek logical slot changes")?;
 
         let mut emitted = 0usize;
         for row in rows {
@@ -127,6 +145,7 @@ impl Connector for PostgresCdcConnector {
             for event in events {
                 let txid = txid.and_then(|value| u64::try_from(value).ok());
                 let event = event.with_resume_token(SourceResumeToken::PostgresCdc {
+                    slot: Some(self.config.slot.clone()),
                     lsn: lsn.clone(),
                     txid,
                 });
@@ -150,6 +169,49 @@ impl Connector for PostgresCdcConnector {
         if let Some(task) = self.connection_task.take() {
             task.abort();
         }
+        Ok(())
+    }
+}
+
+impl PostgresCdcConnector {
+    async fn commit_lsn_if_requested(&mut self) -> Result<()> {
+        let Some(client) = self.client.as_ref() else {
+            return Ok(());
+        };
+        let Some(receiver) = self.config.commit_lsn_rx.as_mut() else {
+            return Ok(());
+        };
+
+        let mut latest_commit = None;
+        while receiver.has_changed().unwrap_or(false) {
+            latest_commit = Some(receiver.borrow_and_update().clone());
+        }
+        let Some(commit) = latest_commit else {
+            return Ok(());
+        };
+        if commit.tick_id <= self.last_committed_tick_id {
+            return Ok(());
+        }
+
+        let Some(target_lsn) = commit
+            .slots
+            .iter()
+            .find(|entry| entry.slot == self.config.slot)
+            .map(|entry| entry.lsn.as_str())
+        else {
+            self.last_committed_tick_id = commit.tick_id;
+            return Ok(());
+        };
+
+        client
+            .query(
+                "SELECT end_lsn::text \
+                 FROM pg_replication_slot_advance($1, $2::pg_lsn) AS advanced(slot_name, end_lsn)",
+                &[&self.config.slot, &target_lsn],
+            )
+            .await
+            .context("advance postgres replication slot after tick commit")?;
+        self.last_committed_tick_id = commit.tick_id;
         Ok(())
     }
 }

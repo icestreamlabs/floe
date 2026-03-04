@@ -1,16 +1,20 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
 use pgwire::error::PgWireResult;
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Ident, ObjectName, Query, SetExpr, Statement, TableFactor};
 
+#[cfg(test)]
 use floe_executor::namespaces;
 
-use super::user_error;
+use super::feature_not_supported_error;
 
 pub(crate) fn ensure_select_statement(statement: &Statement) -> PgWireResult<()> {
     match statement {
         Statement::Query(query) if is_select_expr(&query.body) => Ok(()),
-        _ => Err(user_error("only SELECT statements are supported")),
+        _ => Err(feature_not_supported_error(
+            "only SELECT statements are supported",
+        )),
     }
 }
 
@@ -61,12 +65,29 @@ fn extract_tables_from_table_factor(factor: &TableFactor, names: &mut Vec<String
 }
 
 fn normalize_object_name(name: &ObjectName) -> Option<String> {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|Ident { value, .. }| value.clone())
+    let mut parts = Vec::new();
+    for part in &name.0 {
+        if let Some(Ident { value, .. }) = part.as_ident() {
+            parts.push(value.clone());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("."))
+    }
 }
 
+pub(crate) fn is_system_catalog_relation(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized.starts_with("pg_catalog.") || normalized.starts_with("information_schema.")
+}
+
+pub(crate) fn unqualified_table_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+#[cfg(test)]
 pub(crate) fn mv_identifiers_in_sql(sql: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
@@ -83,6 +104,7 @@ pub(crate) fn mv_identifiers_in_sql(sql: &str) -> Vec<String> {
     names
 }
 
+#[cfg(test)]
 fn normalize_identifier(raw: &str) -> Option<String> {
     let quoted = raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2;
     let inner = if quoted { &raw[1..raw.len() - 1] } else { raw };
@@ -104,6 +126,8 @@ fn normalize_identifier(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
 
     #[test]
     fn detects_mv_identifiers_in_sql() {
@@ -113,5 +137,30 @@ mod tests {
         let mut expected = vec!["mv_orders".to_string(), "mv_Sales".to_string()];
         expected.sort();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn extracts_schema_qualified_table_names() {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT * FROM pg_catalog.pg_matviews UNION ALL SELECT * FROM public.mv_orders",
+        )
+        .expect("parse");
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let mut names = Vec::new();
+        extract_tables_from_query(query, &mut names);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "pg_catalog.pg_matviews".to_string(),
+                "public.mv_orders".to_string()
+            ]
+        );
+        assert!(is_system_catalog_relation("pg_catalog.pg_matviews"));
+        assert_eq!(unqualified_table_name("public.mv_orders"), "mv_orders");
     }
 }

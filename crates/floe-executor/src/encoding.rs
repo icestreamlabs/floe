@@ -7,14 +7,17 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
     buf.extend_from_slice(&count.to_le_bytes());
     for value in columns {
-        if value.is_null() {
-            buf.push(0x00);
-            continue;
-        }
         match value {
+            ScalarValue::Null => {
+                // Backward-compatible untyped NULL marker.
+                buf.push(0x00);
+            }
             ScalarValue::Int64(Some(v)) => {
                 buf.push(0x01);
                 buf.extend_from_slice(&v.to_le_bytes());
+            }
+            ScalarValue::Int64(None) => {
+                buf.push(0x05);
             }
             ScalarValue::Utf8(Some(text)) => {
                 buf.push(0x02);
@@ -24,13 +27,22 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            ScalarValue::Utf8(None) => {
+                buf.push(0x06);
+            }
             ScalarValue::TimestampMillisecond(Some(v), _) => {
                 buf.push(0x03);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+            ScalarValue::TimestampMillisecond(None, _) => {
+                buf.push(0x07);
+            }
             ScalarValue::Boolean(Some(flag)) => {
                 buf.push(0x04);
                 buf.push(if *flag { 1 } else { 0 });
+            }
+            ScalarValue::Boolean(None) => {
+                buf.push(0x08);
             }
             other => return Err(anyhow!("unsupported ScalarValue in MV key: {other:?}")),
         }
@@ -95,6 +107,18 @@ pub fn decode_projected_row_key(bytes: &[u8]) -> Result<Vec<ScalarValue>> {
                 columns.push(ScalarValue::Boolean(Some(flag != 0)));
                 cursor += 1;
             }
+            0x05 => {
+                columns.push(ScalarValue::Int64(None));
+            }
+            0x06 => {
+                columns.push(ScalarValue::Utf8(None));
+            }
+            0x07 => {
+                columns.push(ScalarValue::TimestampMillisecond(None, None));
+            }
+            0x08 => {
+                columns.push(ScalarValue::Boolean(None));
+            }
             _ => return Err(anyhow!("unknown column tag {tag:#x} in MV key")),
         }
     }
@@ -134,6 +158,6 @@ mod tests {
         let row = vec![ScalarValue::Null, ScalarValue::Int64(None)];
         let encoded = encode_projected_row_key(&row).expect("encode");
         let decoded = decode_projected_row_key(&encoded).expect("decode");
-        assert!(decoded.iter().all(|value| value.is_null()));
+        assert_eq!(decoded, row);
     }
 }

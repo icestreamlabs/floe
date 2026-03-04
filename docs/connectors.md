@@ -13,6 +13,13 @@ Connectors implement a simple lifecycle:
 The runtime drives `tick` at the connector's declared interval and stops when the
 connector reports `Finished` or the runtime is cancelled.
 
+Internal lifecycle hooks used by the runtime:
+
+- pre-tick commit notification: connectors can receive barrier commit decisions
+  before polling (for example, Kafka offsets and Postgres CDC LSN advancement).
+- post-checkpoint barrier: commit notifications are sent only after tick state
+  and checkpoint writes are durable.
+
 ## Event Emission
 
 - Connectors send events through the shared `SourceEventSender`.
@@ -20,6 +27,9 @@ connector reports `Finished` or the runtime is cancelled.
   corresponding `SourceDefinition`.
 - A connector should skip emitting events with missing required fields rather
   than sending partial records.
+- Connectors should attach resume metadata in `SourceResumeToken` whenever
+  available (partition/offset/LSN/cursor) and may attach `event_time_ms` when
+  source-native event time is known.
 
 ## Batching Expectations
 
@@ -151,6 +161,13 @@ Operational notes:
 Connector config fields are mapped into `SourceDefinition` properties for
 introspection (e.g., `connector.kafka.brokers`, `connector.generator.events_per_second`).
 
+Validation rules:
+
+- Required string fields must be non-empty (for example `brokers`, `slot`, `url`).
+- Numeric rate/limit fields must be positive when provided.
+- Connector-specific required collections (for example Kafka `topics`) must be
+  non-empty.
+
 ## Object Store Connector
 
 The object store connector reads newline-delimited JSON from an object store
@@ -171,8 +188,9 @@ event payload.
 ## Postgres CDC Connector
 
 The Postgres CDC connector polls a logical replication slot using
-`pg_logical_slot_get_changes` with the `wal2json` output plugin. Only insert
-and update events are emitted (delete events are ignored).
+`pg_logical_slot_peek_changes` with the `wal2json` output plugin and advances
+the slot only after a durable tick-commit barrier. Only insert and update
+events are emitted (delete events are ignored).
 
 Example (TOML):
 

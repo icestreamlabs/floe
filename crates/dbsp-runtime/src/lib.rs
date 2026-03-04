@@ -8,6 +8,7 @@ pub mod join;
 pub mod map;
 pub mod operators;
 pub mod relation_state;
+pub mod semijoin;
 pub mod stream;
 pub mod topk;
 pub mod topn;
@@ -42,6 +43,7 @@ pub use operators::union::UnionOp;
 pub use operators::waterline::WaterlineOp;
 pub use operators::window::{WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
+pub use semijoin::DbspSemiJoin;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, Stream, StreamRetention,
     ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate, incrementalize2, integrate,

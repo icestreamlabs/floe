@@ -6,13 +6,14 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspAggregateExpr, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
+use dbsp::operators::semijoin::SemiJoinMode;
 use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::{
     DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspDistinct, DbspDistinctNode,
-    DbspFilter, DbspJoin, DbspJoinNode, DbspMap, DbspProjectNode, DbspScalarType, DbspSelectNode,
-    DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode, DbspWindowAggregate,
-    DbspWindowAggregateNode, DbspWindowPolicy, RowSchema, WindowKey,
+    DbspFilter, DbspJoin, DbspJoinNode, DbspJoinType, DbspMap, DbspProjectNode, DbspScalarType,
+    DbspSelectNode, DbspSemiJoin, DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode,
+    DbspWindowAggregate, DbspWindowAggregateNode, DbspWindowPolicy, RowSchema, WindowKey,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -285,8 +286,14 @@ impl DbspGraphBuilder {
     ) -> Result<DeltaHandleStream> {
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
+        let join_type = node.join_type.clone();
         let residual = node.residual.clone();
         let output_schema = Arc::clone(&node.output_schema);
+        if matches!(join_type, DbspJoinType::LeftOuter) && residual.is_some() {
+            return Err(anyhow!(
+                "LEFT OUTER joins currently require pure equi-join predicates"
+            ));
+        }
         let graph_id = self.graph_id().to_string();
         let join_events = task_events.clone();
         let join_graph_id = graph_id.clone();
@@ -625,7 +632,183 @@ impl DbspGraphBuilder {
             );
             log_handle_rows("join output snapshot", &handle, &self.bridge).await?;
         }
-        Ok(join.stream())
+        let join_stream = join.stream();
+        if matches!(join_type, DbspJoinType::Inner) {
+            return Ok(join_stream);
+        }
+
+        let antijoin_keys = Arc::new(node.keys.clone());
+        let antijoin_left_exprs = Arc::clone(&antijoin_keys);
+        let antijoin_right_exprs = Arc::clone(&antijoin_keys);
+        let antijoin_left_schema = Arc::clone(&left_schema);
+        let antijoin_right_schema = Arc::clone(&right_schema);
+        let antijoin_left_graph_id = graph_id.clone();
+        let antijoin_right_graph_id = graph_id.clone();
+
+        let antijoin_left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            let left_row = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %antijoin_left_graph_id,
+                        error = %err,
+                        "failed to decode left outer join anti left key"
+                    );
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(antijoin_left_exprs.len());
+            for key in antijoin_left_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.left_expression(),
+                    &left_row,
+                    antijoin_left_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_left_graph_id,
+                            error = %err,
+                            "failed to evaluate left outer join anti left key expression"
+                        );
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            encode_projected_row_key(&key_columns).ok()
+        };
+
+        let antijoin_right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %antijoin_right_graph_id,
+                        error = %err,
+                        "failed to decode left outer join anti right key"
+                    );
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(antijoin_right_exprs.len());
+            for key in antijoin_right_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.right_expression(),
+                    &right_row,
+                    antijoin_right_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_right_graph_id,
+                            error = %err,
+                            "failed to evaluate left outer join anti right key expression"
+                        );
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            encode_projected_row_key(&key_columns).ok()
+        };
+
+        let antijoin_events = task_events.clone();
+        let antijoin_graph_id = graph_id.clone();
+        let antijoin_label = format!("left-outer-antijoin:{graph_id}");
+        let antijoin_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &antijoin_events,
+                &antijoin_graph_id,
+                antijoin_label.clone(),
+                err,
+            );
+        });
+
+        let antijoin = DbspSemiJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+            &left,
+            &right,
+            antijoin_left_key,
+            antijoin_right_key,
+            SemiJoinMode::Anti,
+            Some(antijoin_error_handler),
+        )
+        .await
+        .context("initialize DBSP anti-join for LEFT OUTER join")?;
+
+        let right_fields = right_schema.fields().to_vec();
+        let null_extend_graph_id = graph_id.clone();
+        let null_extend = move |left_bytes: &Vec<u8>| -> Vec<u8> {
+            let mut output = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %null_extend_graph_id,
+                        error = %err,
+                        "failed to decode left outer anti row"
+                    );
+                    return Vec::new();
+                }
+            };
+            for field in &right_fields {
+                output.push(null_scalar_for_dbsp_type(&field.data_type));
+            }
+            match encode_projected_row_key(&output) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %null_extend_graph_id,
+                        error = %err,
+                        "failed to encode null-extended left outer row"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let null_extend_events = task_events.clone();
+        let null_extend_error_graph_id = graph_id.clone();
+        let null_extend_label = format!("left-outer-null-extend:{graph_id}");
+        let null_extend_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &null_extend_events,
+                &null_extend_error_graph_id,
+                null_extend_label.clone(),
+                err,
+            );
+        });
+
+        let null_extended = DbspMap::new::<Vec<u8>, Vec<u8>, _>(
+            &antijoin.stream(),
+            null_extend,
+            Some(null_extend_error_handler),
+        )
+        .await
+        .context("initialize null-extension map for LEFT OUTER join")?;
+
+        let left_outer_union_events = task_events.clone();
+        let left_outer_union_graph_id = graph_id.clone();
+        let left_outer_union_label = format!("left-outer-union:{graph_id}");
+        let left_outer_union_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &left_outer_union_events,
+                &left_outer_union_graph_id,
+                left_outer_union_label.clone(),
+                err,
+            );
+        });
+
+        let union_inputs = vec![join_stream, null_extended.stream()];
+        let union = DbspUnion::new::<Vec<u8>>(&union_inputs, Some(left_outer_union_error_handler))
+            .await
+            .context("initialize LEFT OUTER join union")?;
+        Ok(union.stream())
     }
 
     pub(super) async fn compile_aggregate(
@@ -1257,6 +1440,15 @@ async fn log_handle_rows(
         "handle rows"
     );
     Ok(())
+}
+
+fn null_scalar_for_dbsp_type(data_type: &DbspScalarType) -> ScalarValue {
+    match data_type {
+        DbspScalarType::Int64 => ScalarValue::Int64(None),
+        DbspScalarType::Utf8 => ScalarValue::Utf8(None),
+        DbspScalarType::TimestampMillis => ScalarValue::TimestampMillisecond(None, None),
+        DbspScalarType::Bool => ScalarValue::Boolean(None),
+    }
 }
 
 fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {

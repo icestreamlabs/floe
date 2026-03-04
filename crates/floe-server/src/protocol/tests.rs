@@ -11,7 +11,7 @@ use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedView
 use floe_storage::{MaterializedViewMetadata, SlateCatalog};
 use futures::StreamExt;
 use pgwire::api::portal::Portal;
-use pgwire::api::results::Response;
+use pgwire::api::results::{Response, Tag};
 use pgwire::api::stmt::StoredStatement;
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::Bind;
@@ -145,6 +145,30 @@ async fn rejects_insert_over_pgwire() {
 }
 
 #[tokio::test]
+async fn accepts_benign_session_commands_over_simple_protocol() {
+    let state = state_with_single_mv().await;
+    let handler = FloeQueryHandler::new(state);
+    let dialect = PostgreSqlDialect {};
+    for (sql, expected_tag) in [
+        ("SET search_path TO public", "SET"),
+        ("BEGIN", "BEGIN"),
+        ("COMMIT", "COMMIT"),
+        ("ROLLBACK", "ROLLBACK"),
+    ] {
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse");
+        let statement = statements.pop().expect("statement");
+        let response = handler
+            .execute_statement(statement)
+            .await
+            .expect("execute statement");
+        match response {
+            Response::Execution(tag) => assert_eq!(tag, Tag::new(expected_tag)),
+            other => panic!("expected execution response, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn extended_parser_rejects_non_select() {
     let state = state_with_single_mv().await;
     let parser = FloeExtendedQueryParser::new(state);
@@ -170,6 +194,18 @@ async fn extended_parser_accepts_bootstrap_show_query() {
 }
 
 #[tokio::test]
+async fn extended_parser_accepts_noop_session_command() {
+    let state = state_with_single_mv().await;
+    let parser = FloeExtendedQueryParser::new(state);
+    let prepared = parser
+        .prepare_statement("SET search_path TO public", &[])
+        .await
+        .expect("noop session command should parse");
+    assert!(prepared.referenced_views().is_empty());
+    assert!(prepared.result_fields().is_empty());
+}
+
+#[tokio::test]
 async fn extended_parser_tracks_referenced_mvs_and_parameters() {
     let state = state_with_single_mv().await;
     let parser = FloeExtendedQueryParser::new(Arc::clone(&state));
@@ -179,6 +215,30 @@ async fn extended_parser_tracks_referenced_mvs_and_parameters() {
         .expect("prepared");
     assert_eq!(prepared.parameter_types(), vec![PgType::INT8]);
     assert_eq!(prepared.referenced_views(), &["mv_test"]);
+}
+
+#[tokio::test]
+async fn extended_parser_reports_row_description_metadata() {
+    let state = state_with_single_mv().await;
+    let parser = FloeExtendedQueryParser::new(state);
+    let prepared = parser
+        .prepare_statement(
+            "SELECT CAST(auction AS TIMESTAMP) AS ts, \
+             CAST(auction AS TEXT) AS txt, \
+             auction > 10 AS gt \
+             FROM mv_test",
+            &[],
+        )
+        .await
+        .expect("prepared");
+    let fields = prepared.result_fields();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name(), "ts");
+    assert_eq!(fields[0].datatype(), &PgType::TIMESTAMP);
+    assert_eq!(fields[1].name(), "txt");
+    assert_eq!(fields[1].datatype(), &PgType::TEXT);
+    assert_eq!(fields[2].name(), "gt");
+    assert_eq!(fields[2].datatype(), &PgType::BOOL);
 }
 
 #[tokio::test]
@@ -420,6 +480,76 @@ async fn describe_materialized_view_returns_schema_and_metadata() {
     assert_eq!(rows[1][1].as_deref(), Some("flag"));
     assert_eq!(rows[1][2].as_deref(), Some("Boolean"));
     assert_bool_text(rows[1][3].as_deref(), true);
+}
+
+#[tokio::test]
+async fn catalog_shim_exposes_materialized_views_and_columns() {
+    let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+    catalog
+        .upsert_materialized_view(MaterializedViewMetadata::new(
+            "mv_catalog",
+            "SELECT 1 AS id, true AS flag",
+            false,
+        ))
+        .await
+        .expect("persist mv metadata");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("flag", DataType::Boolean, true),
+    ]));
+    catalog
+        .save_materialized_view_schema("mv_catalog", schema)
+        .await
+        .expect("persist mv schema");
+
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let bridge = DbspBridge::new(catalog.db()).await.expect("bridge");
+    let state = Arc::new(FloeServerState::new(query, registry, bridge));
+    let handler = FloeQueryHandler::new(state);
+
+    let response = handler
+        .execute_sql_streaming(
+            "SELECT matviewname, definition FROM pg_catalog.pg_matviews ORDER BY matviewname",
+        )
+        .await
+        .expect("query pg_matviews");
+    let Response::Query(mut query) = response else {
+        panic!("expected query response");
+    };
+    let rows_stream = query.data_rows();
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(decode_text_row(row.expect("row")));
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some("mv_catalog"));
+    assert_eq!(rows[0][1].as_deref(), Some("SELECT 1 AS id, true AS flag"));
+
+    let response = handler
+        .execute_sql_streaming(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'mv_catalog' \
+             ORDER BY ordinal_position",
+        )
+        .await
+        .expect("query information_schema.columns");
+    let Response::Query(mut query) = response else {
+        panic!("expected query response");
+    };
+    let rows_stream = query.data_rows();
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(decode_text_row(row.expect("row")));
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_deref(), Some("id"));
+    assert_eq!(rows[0][1].as_deref(), Some("int64"));
+    assert_eq!(rows[0][2].as_deref(), Some("NO"));
+    assert_eq!(rows[1][0].as_deref(), Some("flag"));
+    assert_eq!(rows[1][1].as_deref(), Some("boolean"));
+    assert_eq!(rows[1][2].as_deref(), Some("YES"));
 }
 
 fn decode_text_row(mut row: DataRow) -> Vec<Option<String>> {

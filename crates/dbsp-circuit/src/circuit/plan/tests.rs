@@ -65,6 +65,29 @@ fn join_requires_matching_key_types() {
 }
 
 #[test]
+fn left_outer_join_marks_right_columns_nullable() {
+    let left = base_schema();
+    let right = RowSchema::try_new(vec![
+        Field::new("rid", DbspScalarType::Int64, false),
+        Field::new("rname", DbspScalarType::Utf8, false),
+    ])
+    .expect("right");
+    let join = DbspJoinNode::try_new(
+        DbspJoinType::LeftOuter,
+        left.clone(),
+        right,
+        vec![(col("id"), col("rid"))],
+        None,
+    )
+    .expect("left join");
+    let right_name = join
+        .output_schema
+        .field(left.len() + 1)
+        .expect("right name field");
+    assert!(right_name.nullable);
+}
+
+#[test]
 fn aggregate_output_schema_combines_keys_and_aggs() {
     let schema = base_schema();
     let agg = DbspAggregateNode::try_new(
@@ -99,25 +122,25 @@ fn boolean_operations_require_boolean_inputs() {
 }
 
 #[test]
-fn like_only_allows_prefix_or_suffix_wildcards() {
+fn like_supports_general_wildcards_and_rejects_escape() {
     let schema = base_schema();
     let valid = Expr::Like(Like::new(
-        false,
-        Box::new(col("text")),
-        Box::new(lit("foo%")),
-        None,
-        false,
-    ));
-    assert!(DbspExpression::analyze(valid, schema.clone()).is_ok());
-
-    let invalid = Expr::Like(Like::new(
         false,
         Box::new(col("text")),
         Box::new(lit("%foo%")),
         None,
         false,
     ));
-    assert!(DbspExpression::analyze(invalid, schema.clone()).is_err());
+    assert!(DbspExpression::analyze(valid, schema.clone()).is_ok());
+
+    let valid = Expr::Like(Like::new(
+        false,
+        Box::new(col("text")),
+        Box::new(lit("a_b%")),
+        None,
+        false,
+    ));
+    assert!(DbspExpression::analyze(valid, schema.clone()).is_ok());
 
     let escaped = Expr::Like(Like::new(
         false,

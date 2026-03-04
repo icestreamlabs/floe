@@ -1,3 +1,4 @@
+mod catalog_shim;
 mod execution;
 mod management;
 mod protocol;
@@ -134,9 +135,42 @@ pub async fn run_with_shutdown(
 }
 
 pub(crate) fn user_error(message: impl Into<String>) -> PgWireError {
+    internal_error(message)
+}
+
+pub(crate) fn user_error_with_code(code: &'static str, message: impl Into<String>) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".into(),
-        "XX000".into(),
+        code.into(),
         message.into(),
     )))
+}
+
+pub(crate) fn parse_error(message: impl Into<String>) -> PgWireError {
+    user_error_with_code("42601", message)
+}
+
+pub(crate) fn feature_not_supported_error(message: impl Into<String>) -> PgWireError {
+    user_error_with_code("0A000", message)
+}
+
+pub(crate) fn undefined_table_error(message: impl Into<String>) -> PgWireError {
+    user_error_with_code("42P01", message)
+}
+
+pub(crate) fn internal_error(message: impl Into<String>) -> PgWireError {
+    user_error_with_code("XX000", message)
+}
+
+pub(crate) fn planner_error(message: impl Into<String>) -> PgWireError {
+    let message = message.into();
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("table")
+        && (normalized.contains("not found")
+            || normalized.contains("doesn't exist")
+            || normalized.contains("does not exist"))
+    {
+        return undefined_table_error(message);
+    }
+    internal_error(message)
 }

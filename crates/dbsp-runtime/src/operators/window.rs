@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
+use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -24,6 +26,22 @@ use crate::stream::util::delta_zset_handle;
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
+
+static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "floe_window_events_dropped_too_late_total",
+        "Number of input rows dropped by window operators because they arrived beyond allowed lateness",
+    )
+    .expect("register floe_window_events_dropped_too_late_total")
+});
+
+static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "floe_window_state_entries",
+        "Approximate number of active window aggregate entries currently retained",
+    )
+    .expect("register floe_window_state_entries")
+});
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WindowKey<K> {
@@ -172,6 +190,23 @@ where
         Some(watermark.saturating_sub(allowed))
     }
 
+    fn merge_output_delta(
+        updates: &mut HashMap<(WindowKey<K>, A), i64>,
+        key: WindowKey<K>,
+        aggregate: A,
+        weight: i64,
+    ) {
+        if weight == 0 {
+            return;
+        }
+        let pair = (key, aggregate);
+        let entry = updates.entry(pair.clone()).or_insert(0);
+        *entry += weight;
+        if *entry == 0 {
+            updates.remove(&pair);
+        }
+    }
+
     async fn ensure_aggregate_cache(&mut self) -> Result<()> {
         if self.aggregate_cache.is_some() {
             return Ok(());
@@ -206,6 +241,58 @@ where
             }
         }
         merged
+    }
+
+    async fn evict_expired_windows(
+        &mut self,
+        cutoff: Option<i64>,
+        aggregate_updates: &mut HashMap<(WindowKey<K>, A), i64>,
+    ) -> Result<()> {
+        let Some(cutoff) = cutoff else {
+            return Ok(());
+        };
+        self.ensure_aggregate_cache()
+            .await
+            .context("load window aggregate cache for eviction")?;
+        let aggregate_cache = self
+            .aggregate_cache
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing window aggregate cache"))?;
+
+        let expired_keys: Vec<WindowKey<K>> = aggregate_cache
+            .keys()
+            .filter(|key| key.end <= cutoff)
+            .cloned()
+            .collect();
+        if expired_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut index_updates = Vec::new();
+        for key in expired_keys {
+            let Some(old_value) = aggregate_cache.remove(&key) else {
+                continue;
+            };
+            Self::merge_output_delta(aggregate_updates, key.clone(), old_value, -1);
+            let values = self
+                .index
+                .values_for_key(&key)
+                .await
+                .context("load window aggregate values for eviction")?;
+            for (row, weight) in values {
+                if weight != 0 {
+                    index_updates.push((key.clone(), row, -weight));
+                }
+            }
+        }
+
+        if !index_updates.is_empty() {
+            self.index
+                .apply_deltas(index_updates)
+                .await
+                .context("evict expired window aggregate index entries")?;
+        }
+        Ok(())
     }
 
     async fn apply_deltas_to_versioned<T>(
@@ -335,19 +422,11 @@ where
             delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for window aggregate")?;
-
-        if delta_values.is_empty() {
-            return Ok(None);
-        }
-
         let delta_map = self.coalesce_deltas(delta_values);
-        if delta_map.is_empty() {
-            return Ok(None);
-        }
-
         let cutoff = self.watermark_cutoff();
 
         let mut keyed_deltas: HashMap<WindowKey<K>, Vec<(V, i64)>> = HashMap::new();
+        let mut dropped_too_late = 0_u64;
         for (row, weight) in &delta_map {
             if *weight == 0 {
                 continue;
@@ -362,6 +441,7 @@ where
             if let Some(cutoff) = cutoff
                 && event_ts < cutoff
             {
+                dropped_too_late = dropped_too_late.saturating_add(weight.unsigned_abs());
                 continue;
             }
             if let Some(key) = (self.key_extractor)(row) {
@@ -378,60 +458,79 @@ where
                 }
             }
         }
-
-        if keyed_deltas.is_empty() {
-            return Ok(None);
+        if dropped_too_late > 0 {
+            WINDOW_DROPPED_TOO_LATE_TOTAL.inc_by(dropped_too_late);
         }
-
-        let affected_keys: HashSet<WindowKey<K>> = keyed_deltas.keys().cloned().collect();
-        let mut index_updates = Vec::new();
-        for (key, entries) in &keyed_deltas {
-            for (row, weight) in entries {
-                index_updates.push((key.clone(), row.clone(), *weight));
-            }
-        }
-
-        self.index
-            .apply_deltas(index_updates)
-            .await
-            .context("update window aggregate index")?;
-
-        self.ensure_aggregate_cache()
-            .await
-            .context("load window aggregate cache")?;
 
         let mut aggregate_updates: HashMap<(WindowKey<K>, A), i64> = HashMap::new();
-        let aggregate_cache = self
-            .aggregate_cache
-            .as_mut()
-            .ok_or_else(|| anyhow!("missing window aggregate cache"))?;
-
-        for key in affected_keys {
-            let values = self
-                .index
-                .values_for_key(&key)
-                .await
-                .context("load window aggregate values")?;
-            let new_value = (self.aggregator)(&key.key, &values);
-            let old_value = aggregate_cache.get(&key).cloned();
-
-            match (old_value, new_value) {
-                (Some(old), Some(new)) if old == new => {}
-                (Some(old), Some(new)) => {
-                    aggregate_updates.insert((key.clone(), old), -1);
-                    aggregate_updates.insert((key.clone(), new.clone()), 1);
-                    aggregate_cache.insert(key.clone(), new);
+        if !keyed_deltas.is_empty() {
+            let affected_keys: HashSet<WindowKey<K>> = keyed_deltas.keys().cloned().collect();
+            let mut index_updates = Vec::new();
+            for (key, entries) in &keyed_deltas {
+                for (row, weight) in entries {
+                    index_updates.push((key.clone(), row.clone(), *weight));
                 }
-                (Some(old), None) => {
-                    aggregate_updates.insert((key.clone(), old), -1);
-                    aggregate_cache.remove(&key);
-                }
-                (None, Some(new)) => {
-                    aggregate_updates.insert((key.clone(), new.clone()), 1);
-                    aggregate_cache.insert(key.clone(), new);
-                }
-                (None, None) => {}
             }
+
+            self.index
+                .apply_deltas(index_updates)
+                .await
+                .context("update window aggregate index")?;
+
+            self.ensure_aggregate_cache()
+                .await
+                .context("load window aggregate cache")?;
+
+            let aggregate_cache = self
+                .aggregate_cache
+                .as_mut()
+                .ok_or_else(|| anyhow!("missing window aggregate cache"))?;
+
+            for key in affected_keys {
+                let values = self
+                    .index
+                    .values_for_key(&key)
+                    .await
+                    .context("load window aggregate values")?;
+                let new_value = (self.aggregator)(&key.key, &values);
+                let old_value = aggregate_cache.get(&key).cloned();
+
+                match (old_value, new_value) {
+                    (Some(old), Some(new)) if old == new => {}
+                    (Some(old), Some(new)) => {
+                        Self::merge_output_delta(&mut aggregate_updates, key.clone(), old, -1);
+                        Self::merge_output_delta(
+                            &mut aggregate_updates,
+                            key.clone(),
+                            new.clone(),
+                            1,
+                        );
+                        aggregate_cache.insert(key.clone(), new);
+                    }
+                    (Some(old), None) => {
+                        Self::merge_output_delta(&mut aggregate_updates, key.clone(), old, -1);
+                        aggregate_cache.remove(&key);
+                    }
+                    (None, Some(new)) => {
+                        Self::merge_output_delta(
+                            &mut aggregate_updates,
+                            key.clone(),
+                            new.clone(),
+                            1,
+                        );
+                        aggregate_cache.insert(key.clone(), new);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+
+        self.evict_expired_windows(cutoff, &mut aggregate_updates)
+            .await
+            .context("evict expired windows")?;
+
+        if let Some(aggregate_cache) = self.aggregate_cache.as_ref() {
+            WINDOW_STATE_ENTRIES.set(i64::try_from(aggregate_cache.len()).unwrap_or(i64::MAX));
         }
 
         if aggregate_updates.is_empty() {
@@ -774,6 +873,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_aggregate_accepts_out_of_order_events_within_lateness() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let input_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "window_ooo_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<(WindowKey<i64>, i64)>::with_table(
+                table.clone(),
+                "window_ooo_output",
+                None,
+            )
+            .await
+            .expect("output dict"),
+        );
+
+        let state = RelationState::empty(table.clone(), "window_ooo_state".to_string())
+            .await
+            .expect("window state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "window_ooo_output".to_string(),
+        )
+        .await
+        .expect("output zset");
+
+        let index = IndexedBatchZSet::new(table.clone(), "window_ooo_index");
+        let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
+        let time_extractor = Arc::new(|row: &Row| Some(*row));
+        let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
+            Arc::new(|_key, values| {
+                let mut count = 0i64;
+                for (_row, weight) in values {
+                    count += *weight;
+                }
+                (count != 0).then_some(count)
+            });
+        let watermark = Arc::new(AtomicI64::new(5_000));
+
+        let mut op = WindowAggregateOp::new(
+            state,
+            index,
+            table.clone(),
+            key_extractor,
+            time_extractor,
+            aggregator,
+            output,
+            1_000,
+            1_000,
+            500,
+            watermark,
+        )
+        .expect("window aggregate op");
+
+        // 5_200 arrives before 4_600; both are >= watermark - allowed_lateness (4_500).
+        let handle = stage_version(
+            input_dict,
+            table.clone(),
+            "window_ooo_input",
+            &[(5_200, 1), (4_600, 1)],
+        )
+        .await;
+        let out = op
+            .on_step(1, &[handle])
+            .await
+            .expect("window step")
+            .expect("non-empty output");
+
+        let mut cache = HashMap::new();
+        cache.insert("window_ooo_output".to_string(), output_dict);
+        let materialized =
+            materialize_zset_handle::<(WindowKey<i64>, i64)>(table.clone(), &mut cache, &out)
+                .await
+                .expect("materialize output");
+
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(
+            materialized.get(&(
+                WindowKey {
+                    start: 4_000,
+                    end: 5_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            materialized.get(&(
+                WindowKey {
+                    start: 5_000,
+                    end: 6_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
     async fn window_aggregate_ignores_too_late_retractions_after_window_close() {
         let db = build_db().await;
         let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
@@ -861,7 +1065,127 @@ mod tests {
             &[(1_000, -1)],
         )
         .await;
-        let out2 = op.on_step(2, &[retract]).await.expect("window step");
-        assert!(out2.is_none(), "late retraction should not produce output");
+        let out2 = op
+            .on_step(2, &[retract])
+            .await
+            .expect("window step")
+            .expect("eviction output");
+        let out2_materialized =
+            materialize_zset_handle::<(WindowKey<i64>, i64)>(table.clone(), &mut cache, &out2)
+                .await
+                .expect("materialize output");
+        assert_eq!(
+            out2_materialized.get(&(
+                WindowKey {
+                    start: 1_000,
+                    end: 2_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&-1)
+        );
+    }
+
+    #[tokio::test]
+    async fn window_aggregate_evicts_expired_windows_on_watermark_advance() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let input_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "window_evict_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<(WindowKey<i64>, i64)>::with_table(
+                table.clone(),
+                "window_evict_output",
+                None,
+            )
+            .await
+            .expect("output dict"),
+        );
+
+        let state = RelationState::empty(table.clone(), "window_evict_state".to_string())
+            .await
+            .expect("window state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "window_evict_output".to_string(),
+        )
+        .await
+        .expect("output zset");
+        let index = IndexedBatchZSet::new(table.clone(), "window_evict_index");
+        let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
+        let time_extractor = Arc::new(|row: &Row| Some(*row));
+        let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
+            Arc::new(|_key, values| {
+                let mut count = 0_i64;
+                for (_row, weight) in values {
+                    count += *weight;
+                }
+                (count != 0).then_some(count)
+            });
+        let watermark = Arc::new(AtomicI64::new(-1));
+
+        let mut op = WindowAggregateOp::new(
+            state,
+            index,
+            table.clone(),
+            key_extractor,
+            time_extractor,
+            aggregator,
+            output,
+            1_000,
+            1_000,
+            0,
+            Arc::clone(&watermark),
+        )
+        .expect("window aggregate op");
+
+        let first = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "window_evict_input",
+            &[(1_000, 1)],
+        )
+        .await;
+        let _ = op
+            .on_step(1, &[first])
+            .await
+            .expect("window step")
+            .expect("non-empty output");
+
+        watermark.store(3_000, Ordering::Relaxed);
+        let empty_handle = ZSetHandle {
+            ns: "window_evict_input".to_string(),
+            version: 0,
+        };
+        let out = op
+            .on_step(2, &[empty_handle])
+            .await
+            .expect("window step")
+            .expect("eviction output");
+
+        let mut cache = HashMap::new();
+        cache.insert("window_evict_output".to_string(), output_dict);
+        let materialized =
+            materialize_zset_handle::<(WindowKey<i64>, i64)>(table.clone(), &mut cache, &out)
+                .await
+                .expect("materialize output");
+
+        assert_eq!(
+            materialized.get(&(
+                WindowKey {
+                    start: 1_000,
+                    end: 2_000,
+                    key: 0
+                },
+                1
+            )),
+            Some(&-1)
+        );
     }
 }

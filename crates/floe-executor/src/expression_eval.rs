@@ -670,16 +670,38 @@ fn and_bool_opt(lhs: Option<bool>, rhs: Option<bool>) -> Option<bool> {
 }
 
 fn matches_like(value: &str, pattern: &str) -> bool {
-    if !pattern.contains('%') {
-        return value == pattern;
+    let value_chars = value.chars().collect::<Vec<_>>();
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let m = value_chars.len();
+    let n = pattern_chars.len();
+
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+    for j in 1..=n {
+        if pattern_chars[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
     }
-    if let Some(stripped) = pattern.strip_prefix('%') {
-        return value.ends_with(stripped);
+
+    for i in 1..=m {
+        for j in 1..=n {
+            match pattern_chars[j - 1] {
+                '%' => {
+                    // '%' matches zero characters (dp[i][j-1]) or one more character (dp[i-1][j]).
+                    dp[i][j] = dp[i][j - 1] || dp[i - 1][j];
+                }
+                '_' => {
+                    // '_' matches exactly one character.
+                    dp[i][j] = dp[i - 1][j - 1];
+                }
+                literal => {
+                    dp[i][j] = dp[i - 1][j - 1] && value_chars[i - 1] == literal;
+                }
+            }
+        }
     }
-    if let Some(stripped) = pattern.strip_suffix('%') {
-        return value.starts_with(stripped);
-    }
-    false
+
+    dp[m][n]
 }
 
 fn resolve_column(schema: &RowSchema, column: &Column) -> Result<usize> {
@@ -700,7 +722,7 @@ mod tests {
     use datafusion::functions::expr_fn;
     use datafusion::logical_expr::expr::{InList, ScalarFunction};
     use datafusion::logical_expr::expr_fn::create_udf;
-    use datafusion::logical_expr::{Between, Expr as DfExpr, Operator, TryCast};
+    use datafusion::logical_expr::{Between, Expr as DfExpr, Like, Operator, TryCast};
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility};
     use dbsp::circuit::schema::{Field, RowSchema};
     use dbsp::circuit::types::DbspScalarType;
@@ -855,6 +877,44 @@ mod tests {
             vec![ScalarValue::Utf8(Some("hi".to_string()))],
         );
         assert_eq!(value, ScalarValue::Int64(Some(2)));
+    }
+
+    #[test]
+    fn like_supports_percent_and_underscore_wildcards() {
+        assert!(matches_like("foobarbaz", "%bar%"));
+        assert!(matches_like("abcz", "a_c%"));
+        assert!(matches_like("a💡c", "a_c"));
+        assert!(matches_like("", "%"));
+        assert!(!matches_like("abc", "a_d%"));
+        assert!(!matches_like("ac", "a_c"));
+    }
+
+    #[test]
+    fn like_expression_uses_general_pattern_matching() {
+        let schema = schema(vec![("txt", DbspScalarType::Utf8)]);
+        let expr = DfExpr::Like(Like::new(
+            false,
+            Box::new(col("txt")),
+            Box::new(DfExpr::Literal(
+                ScalarValue::Utf8(Some("a_c%".to_string())),
+                None,
+            )),
+            None,
+            false,
+        ));
+        let value = eval(
+            expr.clone(),
+            Arc::clone(&schema),
+            vec![ScalarValue::Utf8(Some("abchello".to_string()))],
+        );
+        assert_eq!(value, ScalarValue::Boolean(Some(true)));
+
+        let value = eval(
+            expr,
+            schema,
+            vec![ScalarValue::Utf8(Some("ac".to_string()))],
+        );
+        assert_eq!(value, ScalarValue::Boolean(Some(false)));
     }
 
     #[test]

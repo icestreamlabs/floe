@@ -5,9 +5,9 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::logical_expr::expr_fn::create_udf;
+use datafusion::logical_expr::expr_fn::{SimpleScalarUDF, create_udf};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Volatility,
+    ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
@@ -94,6 +94,24 @@ fn register_nexmark_udfs(ctx: &SessionContext) {
     }
 }
 
+fn passthrough_window_udf(
+    name: &str,
+    signatures: Vec<Vec<DataType>>,
+    return_type: DataType,
+    fun: ScalarFunctionImplementation,
+) -> ScalarUDF {
+    let signature = Signature::one_of(
+        signatures.into_iter().map(TypeSignature::Exact).collect(),
+        Volatility::Immutable,
+    );
+    ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        name,
+        signature,
+        return_type,
+        fun,
+    ))
+}
+
 fn planner_udfs() -> Vec<ScalarUDF> {
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
@@ -127,53 +145,82 @@ fn planner_udfs() -> Vec<ScalarUDF> {
 
     let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
     vec![
-        create_udf(
+        passthrough_window_udf(
             "tumble",
-            vec![ts.clone(), DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64],
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "hop",
-            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+                vec![
+                    ts.clone(),
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "tumble_start",
-            vec![ts.clone(), DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64],
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "tumble_end",
-            vec![ts.clone(), DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64],
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "hop_start",
-            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+                vec![
+                    ts.clone(),
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "hop_end",
-            vec![ts.clone(), DataType::Int64, DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+                vec![
+                    ts.clone(),
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
-        create_udf(
+        passthrough_window_udf(
             "tumble_rowtime",
-            vec![ts.clone(), DataType::Int64],
+            vec![
+                vec![ts.clone(), DataType::Int64],
+                vec![ts.clone(), DataType::Int64, DataType::Int64],
+            ],
             ts.clone(),
-            Volatility::Immutable,
             Arc::clone(&passthrough_ts),
         ),
         create_udf(

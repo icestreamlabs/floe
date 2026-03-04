@@ -1841,6 +1841,7 @@ dependencies = [
  "futures",
  "hashbrown 0.15.5",
  "object_store",
+ "prometheus",
  "rkyv 0.8.12",
  "slatedb",
  "tokio",

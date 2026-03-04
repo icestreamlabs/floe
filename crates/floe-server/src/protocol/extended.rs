@@ -26,10 +26,13 @@ use crate::management::{
     ManagementStatement, handle_management_statement, management_result_schema,
     parse_management_statement,
 };
-use crate::protocol::bootstrap::rewrite_bootstrap_sql;
-use crate::sql::{ensure_select_statement, extract_tables_from_query};
+use crate::protocol::bootstrap::{detect_noop_session_command, rewrite_bootstrap_sql};
+use crate::sql::{
+    ensure_select_statement, extract_tables_from_query, is_system_catalog_relation,
+    unqualified_table_name,
+};
 use crate::types::arrow_schema_to_field_info;
-use crate::user_error;
+use crate::{parse_error, planner_error, user_error};
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedStatement {
@@ -43,6 +46,7 @@ pub(super) struct PreparedStatement {
 enum PreparedStatementKind {
     Query { plan: LogicalPlan },
     Management(ManagementStatement),
+    Noop { tag: String },
 }
 
 impl PreparedStatement {
@@ -81,6 +85,16 @@ impl FloeExtendedQueryParser {
         sql: &str,
         parameter_types: &[Option<PgType>],
     ) -> PgWireResult<PreparedStatement> {
+        if let Some(tag) = detect_noop_session_command(sql) {
+            return Ok(PreparedStatement {
+                kind: PreparedStatementKind::Noop {
+                    tag: tag.to_string(),
+                },
+                result_fields: Arc::new(Vec::new()),
+                referenced_views: Vec::new(),
+                param_types: Vec::new(),
+            });
+        }
         if let Some(statement) = parse_management_statement(sql) {
             let schema = management_result_schema(&statement);
             let fields = Arc::new(arrow_schema_to_field_info(&schema)?);
@@ -94,7 +108,7 @@ impl FloeExtendedQueryParser {
         let rewritten_sql = rewrite_bootstrap_sql(sql).unwrap_or_else(|| sql.trim().to_string());
 
         let mut statements = Parser::parse_sql(&self.dialect, &rewritten_sql)
-            .map_err(|err| user_error(format!("SQL parse error: {err}")))?;
+            .map_err(|err| parse_error(format!("SQL parse error: {err}")))?;
         if statements.len() != 1 {
             return Err(user_error(
                 "extended protocol supports a single statement per Parse",
@@ -112,8 +126,12 @@ impl FloeExtendedQueryParser {
         let mut deduped = Vec::new();
         let mut seen = HashSet::new();
         for name in referenced {
-            if seen.insert(name.clone()) {
-                deduped.push(name);
+            if is_system_catalog_relation(&name) {
+                continue;
+            }
+            let unqualified = unqualified_table_name(&name).to_string();
+            if seen.insert(unqualified.clone()) {
+                deduped.push(unqualified);
             }
         }
 
@@ -121,6 +139,7 @@ impl FloeExtendedQueryParser {
             self.state.ensure_materialized_view_registered(view).await?;
         }
 
+        self.state.refresh_catalog_shims().await?;
         self.state
             .ensure_materialized_views_in_sql(&rewritten_sql)
             .await?;
@@ -130,7 +149,7 @@ impl FloeExtendedQueryParser {
             .session()
             .sql(&rewritten_sql)
             .await
-            .map_err(|err| user_error(format!("DataFusion planning error: {err}")))?;
+            .map_err(|err| planner_error(format!("DataFusion planning error: {err}")))?;
         let schema_ref = Arc::new(dataframe.schema().as_arrow().clone());
         let fields = Arc::new(arrow_schema_to_field_info(&schema_ref)?);
         let logical_plan = dataframe.into_unoptimized_plan();
@@ -282,7 +301,13 @@ impl ExtendedQueryHandler for FloeExtendedHandler {
         if let PreparedStatementKind::Management(statement) = portal.statement.statement.kind() {
             return handle_management_statement(self.state.as_ref(), statement).await;
         }
+        if let PreparedStatementKind::Noop { tag } = portal.statement.statement.kind() {
+            return Ok(Response::Execution(pgwire::api::results::Tag::new(
+                tag.as_str(),
+            )));
+        }
 
+        self.state.refresh_catalog_shims().await?;
         for view in portal.statement.statement.referenced_views() {
             self.state.ensure_materialized_view_registered(view).await?;
         }

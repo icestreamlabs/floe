@@ -73,6 +73,14 @@ static SOURCE_OFFSET_LAG: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register floe_source_offset_lag")
 });
 
+static WATERMARK_LAG_MS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "floe_watermark_lag_ms",
+        "Difference between wall-clock time and current global watermark in milliseconds",
+    )
+    .expect("register floe_watermark_lag_ms")
+});
+
 static MV_FRESHNESS_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_mv_freshness_seconds",
@@ -164,6 +172,10 @@ pub(crate) fn record_source_offset_lag(source: &str, partition: u32, lag: u64) {
         .set(i64::try_from(lag).unwrap_or(i64::MAX));
 }
 
+pub(crate) fn record_watermark_lag_ms(lag_ms: u64) {
+    WATERMARK_LAG_MS.set(i64::try_from(lag_ms).unwrap_or(i64::MAX));
+}
+
 pub(crate) fn record_mv_freshness_seconds(view: &str, age_seconds: u64) {
     MV_FRESHNESS_SECONDS
         .with_label_values(&[view])
@@ -201,6 +213,7 @@ pub(crate) fn init() {
     let _ = &*LAST_COMMITTED_TICK;
     let _ = &*CHECKPOINT_AGE_SECONDS;
     let _ = &*SOURCE_OFFSET_LAG;
+    let _ = &*WATERMARK_LAG_MS;
     let _ = &*MV_FRESHNESS_SECONDS;
     let _ = &*SINK_QUEUE_DEPTH;
     let _ = &*SINK_VERSION_LAG;

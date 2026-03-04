@@ -5,16 +5,16 @@ use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
 use datafusion::logical_expr::expr::WildcardOptions;
-use datafusion::logical_expr::expr_fn::create_udf;
+use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
 use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, JoinType, LogicalPlanBuilder, ScalarFunctionImplementation, TableSource,
-    Volatility, col, lit,
+    ColumnarValue, Expr, JoinType, LogicalPlanBuilder, ScalarFunctionImplementation, ScalarUDF,
+    Signature, TableSource, TypeSignature, Volatility, col, lit,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
-use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspNodeKind};
+use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspJoinType, DbspNodeKind};
 use dbsp_circuit::circuit::tables::TableDescriptor;
 
 use super::expr::map_aggregate_expr;
@@ -58,20 +58,37 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
         },
     );
     let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
-    ctx.register_udf(create_udf(
+    let tumble_sig = Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![ts.clone(), DataType::Int64]),
+            TypeSignature::Exact(vec![ts.clone(), DataType::Int64, DataType::Int64]),
+        ],
+        Volatility::Immutable,
+    );
+    let hop_sig = Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![ts.clone(), DataType::Int64, DataType::Int64]),
+            TypeSignature::Exact(vec![
+                ts.clone(),
+                DataType::Int64,
+                DataType::Int64,
+                DataType::Int64,
+            ]),
+        ],
+        Volatility::Immutable,
+    );
+    ctx.register_udf(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
         "tumble",
-        vec![ts.clone(), DataType::Int64],
+        tumble_sig,
         ts.clone(),
-        Volatility::Immutable,
         Arc::clone(&passthrough_ts),
-    ));
-    ctx.register_udf(create_udf(
+    )));
+    ctx.register_udf(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
         "hop",
-        vec![ts.clone(), DataType::Int64, DataType::Int64],
+        hop_sig,
         ts,
-        Volatility::Immutable,
         passthrough_ts,
-    ));
+    )));
 
     ctx.state()
         .create_logical_plan(sql)
@@ -197,6 +214,58 @@ fn plans_inner_join() {
 }
 
 #[test]
+fn plans_left_outer_join_with_nullable_right_columns() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Left,
+            (
+                vec![qualified(auction, "seller")],
+                vec![qualified(person, "id")],
+            ),
+            None,
+        )
+        .unwrap()
+        .project(vec![
+            col(qualified(auction, "id")),
+            col(qualified(person, "name")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    let join_id = *root.inputs.first().expect("project input");
+    let join_node = circuit_plan.node(join_id).expect("join node");
+    match &join_node.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(matches!(join.join_type, DbspJoinType::LeftOuter));
+            let right_start = join.left_schema.len();
+            let right_name_field = join
+                .output_schema
+                .field(right_start + 1)
+                .expect("right-side name field");
+            assert!(right_name_field.nullable);
+        }
+        other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
 fn plans_multi_column_join() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
@@ -251,6 +320,56 @@ fn plans_distinct() {
     let circuit_plan = planner.plan(&plan).expect("plan");
     let root = circuit_plan.node(circuit_plan.root).unwrap();
     assert!(matches!(root.kind, DbspNodeKind::Distinct(_)));
+}
+
+#[test]
+fn plans_multi_column_distinct() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "auction")),
+            col(qualified(bid, "bidder")),
+        ])
+        .unwrap()
+        .distinct()
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    assert!(matches!(root.kind, DbspNodeKind::Distinct(_)));
+}
+
+#[test]
+fn plans_aggregate_over_distinct_subquery() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let distinct = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "auction")),
+            col(qualified(bid, "bidder")),
+        ])
+        .unwrap()
+        .distinct()
+        .unwrap()
+        .build()
+        .unwrap();
+    let plan = LogicalPlanBuilder::from(distinct)
+        .aggregate(Vec::<Expr>::new(), vec![count(col("auction"))])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Aggregate(_)));
+    let input = *root.inputs.first().expect("aggregate input");
+    let distinct_node = circuit_plan.node(input).expect("distinct input");
+    assert!(matches!(distinct_node.kind, DbspNodeKind::Distinct(_)));
 }
 
 #[test]
@@ -396,6 +515,22 @@ async fn plans_hop_grouping_as_window_aggregate() {
 }
 
 #[tokio::test]
+async fn plans_hop_grouping_with_allowed_lateness() {
+    let sql = "SELECT auction, COUNT(*) AS num \
+        FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000, 1500)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.window.allowed_lateness_ms, 1_500);
+}
+
+#[tokio::test]
 async fn plans_tumble_grouping_as_window_aggregate() {
     let sql = "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, TUMBLE(\"dateTime\", 10000)";
     let plan = sql_plan(sql).await;
@@ -414,6 +549,22 @@ async fn plans_tumble_grouping_as_window_aggregate() {
         }
         other => panic!("expected tumbling window, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn plans_tumble_grouping_with_allowed_lateness() {
+    let sql = "SELECT bidder, COUNT(*) AS bid_count \
+        FROM bid GROUP BY bidder, TUMBLE(\"dateTime\", 10000, 750)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.window.allowed_lateness_ms, 750);
 }
 
 #[tokio::test]

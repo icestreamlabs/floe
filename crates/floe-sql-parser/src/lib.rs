@@ -976,6 +976,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_postgres_style_qualified_materialized_view_name() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS public.\"MyView\" AS SELECT \"dateTime\" FROM bid";
+        let mv = parse_materialized_view(sql).expect("parse mv");
+        assert_eq!(mv.name, "public.MyView");
+        assert_eq!(mv.query, "SELECT \"dateTime\" FROM bid");
+        assert!(mv.if_not_exists);
+    }
+
+    #[test]
     fn parse_create_sink_statement() {
         let stmt = parse_floe_statement(
             "CREATE SINK out_bid FROM mv_bid WITH (type = 'http', url = 'http://localhost:8080', batch_size = 32, with_snapshot = true, as_of = 42)",
