@@ -133,6 +133,16 @@ cargo fmt
 cargo clippy -- -D warnings
 ```
 
+Repo hygiene checker:
+
+```bash
+bash scripts/repo_hygiene.sh
+```
+
+Policy details and exception process:
+
+- `reports/REPO_HYGIENE_POLICY.md`
+
 Additional operational documentation:
 
 - `docs/production_readiness.md`: production exit checklist and quick operator runbook.
