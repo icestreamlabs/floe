@@ -1,4 +1,10 @@
 use super::*;
+use futures::future::join_all;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static KAFKA_SINK_FLUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const KAFKA_SINK_FLUSH_LOG_EVERY: u64 = 256;
+const KAFKA_NON_TX_IN_FLIGHT_LIMIT: usize = 1024;
 
 #[derive(Clone)]
 pub(super) struct KafkaEosConfig {
@@ -204,6 +210,9 @@ pub(super) async fn flush_kafka_buffer(
     checkpoint_tx: &Option<mpsc::UnboundedSender<SinkCursor>>,
     kafka_eos: Option<&KafkaEosConfig>,
 ) -> Result<()> {
+    let flush_start = std::time::Instant::now();
+    let rows_in_flush = buffer.len();
+    let bytes_in_flush = *buffer_bytes;
     let mut flushed_version = flush_version.unwrap_or(-1);
     for row in buffer.iter() {
         flushed_version = flushed_version.max(row.version);
@@ -227,9 +236,7 @@ pub(super) async fn flush_kafka_buffer(
         )
         .await?;
     } else {
-        for row in buffer.iter() {
-            send_kafka_with_retry(sink_name, producer, topic, &row.payload, retry_policy).await?;
-        }
+        send_kafka_batch_with_retry(sink_name, producer, topic, buffer, retry_policy).await?;
     }
     buffer.clear();
     *buffer_bytes = 0;
@@ -243,6 +250,26 @@ pub(super) async fn flush_kafka_buffer(
                 last_emitted_mv_version: flushed_version,
                 row_index: None,
             },
+        );
+    }
+    let flush_seq = KAFKA_SINK_FLUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if flush_seq < 16 || flush_seq.is_multiple_of(KAFKA_SINK_FLUSH_LOG_EVERY) {
+        let flush_reason = if flush_version.is_some() {
+            "version"
+        } else {
+            "batch_or_drain"
+        };
+        tracing::info!(
+            sink = %sink_name,
+            mv = %mv_name,
+            flush_seq,
+            flush_reason,
+            rows = rows_in_flush,
+            bytes = bytes_in_flush,
+            flushed_version,
+            transactional = kafka_eos.is_some(),
+            latency_ms = flush_start.elapsed().as_millis() as u64,
+            "kafka sink flush metrics"
         );
     }
     Ok(())
@@ -428,26 +455,70 @@ pub(super) async fn load_latest_kafka_checkpoint(
     Ok(latest.map(|(_, cursor)| cursor))
 }
 
-pub(super) async fn send_kafka_with_retry(
+pub(super) async fn send_kafka_batch_with_retry(
     sink_name: &str,
     producer: &FutureProducer,
     topic: &str,
-    payload: &str,
+    rows: &[SinkRecord],
     retry_policy: RetryPolicy,
 ) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending: Vec<usize> = (0..rows.len()).collect();
+    let mut last_error = String::new();
+
     for attempt in 0..retry_policy.max_attempts {
-        let record = FutureRecord::<(), _>::to(topic).payload(payload);
-        match producer.send(record, Duration::from_secs(0)).await {
-            Ok(_) => return Ok(()),
-            Err((err, _message)) => {
-                if attempt + 1 == retry_policy.max_attempts {
-                    metrics::inc_sink_failure(sink_name, "kafka");
-                    return Err(anyhow!("kafka sink delivery failed after retries: {err}"));
+        let mut retry_rows = Vec::new();
+        for chunk in pending.chunks(KAFKA_NON_TX_IN_FLIGHT_LIMIT) {
+            let mut deliveries = Vec::with_capacity(chunk.len());
+            for row_idx in chunk {
+                let row = &rows[*row_idx];
+                let record = FutureRecord::<(), _>::to(topic).payload(&row.payload);
+                match producer.send_result(record) {
+                    Ok(delivery_future) => deliveries.push((*row_idx, delivery_future)),
+                    Err((err, _message)) => {
+                        last_error = err.to_string();
+                        retry_rows.push(*row_idx);
+                    }
                 }
-                metrics::inc_sink_retry(sink_name, "kafka");
-                tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+            }
+
+            for (row_idx, delivery) in join_all(
+                deliveries
+                    .into_iter()
+                    .map(|(row_idx, delivery)| async move { (row_idx, delivery.await) }),
+            )
+            .await
+            {
+                match delivery {
+                    Ok(Ok(_)) => {}
+                    Ok(Err((err, _message))) => {
+                        last_error = err.to_string();
+                        retry_rows.push(row_idx);
+                    }
+                    Err(err) => {
+                        last_error = err.to_string();
+                        retry_rows.push(row_idx);
+                    }
+                }
             }
         }
+        if retry_rows.is_empty() {
+            return Ok(());
+        }
+        if attempt + 1 == retry_policy.max_attempts {
+            metrics::inc_sink_failure(sink_name, "kafka");
+            return Err(anyhow!(
+                "kafka sink delivery failed after retries (pending_rows={}): {}",
+                retry_rows.len(),
+                last_error
+            ));
+        }
+        metrics::inc_sink_retry(sink_name, "kafka");
+        pending = retry_rows;
+        tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
     }
     unreachable!("retry loop should return or fail");
 }

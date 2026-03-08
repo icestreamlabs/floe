@@ -35,6 +35,8 @@ const DEFAULT_RETRY_BASE_MS: u64 = 100;
 const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 5_000;
 const DEFAULT_KAFKA_CHECKPOINT_PARTITION: i32 = 0;
 const DEFAULT_KAFKA_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
+const TAIL_BATCH_LOG_SAMPLE_EVERY: u64 = 256;
+static TAIL_BATCH_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 mod file_backend;
 mod http_backend;
@@ -364,6 +366,16 @@ async fn stream_tail_into_queue(
         let batch = batch?;
         let schema = batch.batch.schema();
         let version = batch.version;
+        let row_count = batch.batch.num_rows();
+        let seq = TAIL_BATCH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
+        if seq < 16 || seq.is_multiple_of(TAIL_BATCH_LOG_SAMPLE_EVERY) {
+            tracing::info!(
+                batch_seq = seq,
+                version,
+                rows = row_count,
+                "sink tail batch observed"
+            );
+        }
         for row_idx in 0..batch.batch.num_rows() {
             let json = tail_row_to_json(&batch, row_idx, &schema)?;
             let payload = serde_json::to_string(&json).context("serialize sink row")?;

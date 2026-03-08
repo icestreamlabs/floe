@@ -466,6 +466,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     });
     let connector_count = connector_specs.len();
     let per_connector_queue_capacity = (queue_capacity / connector_count).max(1);
+    tracing::info!(
+        connector_count,
+        queue_capacity,
+        per_connector_queue_capacity,
+        max_batch,
+        max_batch_per_source,
+        max_batch_per_connector,
+        "resolved ingest execution limits"
+    );
 
     let mut connector_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut connector_queues: Vec<ConnectorQueue> = Vec::new();
@@ -1003,6 +1012,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 watermark = watermark_for_task.load(Ordering::Relaxed),
             );
             let _tick_guard = tick_span.enter();
+            if epoch <= 8 || epoch % 128 == 0 {
+                tracing::info!(
+                    epoch,
+                    batch_size = batch_len,
+                    decoded_rows = decoded_rows_len,
+                    "tick begin"
+                );
+            }
             if pre_tick_commit_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
@@ -1029,6 +1046,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     tick_all_start.elapsed().as_millis() as u64,
                 );
                 metrics::inc_ingest_tick("ok");
+            }
+            let state_write_latency_ms = tick_all_start.elapsed().as_millis() as u64;
+            if epoch <= 8 || epoch % 128 == 0 {
+                tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
             drop(registry);
             for ((source, partition), offset) in &tick_source_offsets {
@@ -1077,6 +1098,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 "checkpoint_write",
                 checkpoint_write_start.elapsed().as_millis() as u64,
             );
+            let checkpoint_write_latency_ms = checkpoint_write_start.elapsed().as_millis() as u64;
+            if epoch <= 8 || epoch % 128 == 0 {
+                tracing::info!(
+                    epoch,
+                    checkpoint_write_latency_ms,
+                    "tick checkpoint_write completed"
+                );
+            }
             for ((source, partition), offset) in &tick_source_offsets {
                 let key = (source.clone(), *partition);
                 let committed_entry = committed_source_offsets.entry(key.clone()).or_insert(0);
@@ -1133,7 +1162,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     batch_size = batch_len,
                     pending = queue_depth,
                     decoded_rows = decoded_rows_len,
+                    max_batch,
+                    max_batch_per_source,
+                    max_batch_per_connector,
                     decode_latency_ms,
+                    state_write_latency_ms,
+                    checkpoint_write_latency_ms,
                     tick_latency_ms,
                     per_source = ?decoded_counts,
                     per_connector = ?per_connector_counts,

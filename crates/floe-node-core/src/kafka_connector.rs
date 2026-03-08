@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;
@@ -13,6 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
 use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
+
+static KAFKA_CONNECTOR_TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KafkaMessageFormat {
@@ -225,6 +229,18 @@ impl Connector for KafkaConnector {
         }
 
         self.commit_offsets_if_requested().await?;
+
+        if KAFKA_CONNECTOR_TICK_LOG_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(KAFKA_CONNECTOR_TICK_LOG_EVERY)
+        {
+            tracing::info!(
+                emitted,
+                max_messages_per_tick = self.config.max_messages_per_tick,
+                poll_timeout_ms = self.config.poll_timeout.as_millis() as u64,
+                "kafka connector tick metrics"
+            );
+        }
 
         if emitted > 0 {
             Ok(ConnectorTick::Emitted(emitted))
