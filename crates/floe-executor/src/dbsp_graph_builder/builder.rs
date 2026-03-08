@@ -24,6 +24,32 @@ pub struct DbspGraphBuilder {
     ns: GraphNamespace,
     pub(super) watermark: Arc<AtomicI64>,
     output_consolidation_mode: ConsolidationMode,
+    pub(super) mv_flush_coalescing: MvFlushCoalescingConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MvFlushCoalescingConfig {
+    pub max_pending_deltas: usize,
+    pub max_pending_versions: Option<usize>,
+    pub max_pending_rows: Option<usize>,
+    pub max_pending_bytes: Option<usize>,
+    pub max_delay_ms: Option<u64>,
+    pub flush_on_catchup_boundary: bool,
+    pub flush_on_shutdown: bool,
+}
+
+impl Default for MvFlushCoalescingConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_deltas: 1,
+            max_pending_versions: None,
+            max_pending_rows: None,
+            max_pending_bytes: None,
+            max_delay_ms: None,
+            flush_on_catchup_boundary: true,
+            flush_on_shutdown: true,
+        }
+    }
 }
 
 impl DbspGraphBuilder {
@@ -35,11 +61,20 @@ impl DbspGraphBuilder {
             ns: GraphNamespace::default(),
             watermark: Arc::new(AtomicI64::new(-1)),
             output_consolidation_mode: ConsolidationMode::ByAllColumns,
+            mv_flush_coalescing: MvFlushCoalescingConfig::default(),
         })
     }
 
     pub fn set_output_consolidation_mode(&mut self, mode: ConsolidationMode) {
         self.output_consolidation_mode = mode;
+    }
+
+    pub fn set_mv_flush_coalescing(&mut self, config: MvFlushCoalescingConfig) {
+        let mut sanitized = config;
+        if sanitized.max_pending_deltas == 0 {
+            sanitized.max_pending_deltas = 1;
+        }
+        self.mv_flush_coalescing = sanitized;
     }
 
     pub async fn set_stream_compaction(
@@ -189,20 +224,48 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Project(project) => {
                 let input_idx = first_input(node, "project")?;
-                let upstream = self
-                    .compile_node(
-                        plan,
-                        input_idx,
-                        outer_streams,
-                        cancel,
-                        task_events,
-                        built,
-                        mv_registry,
-                        mv_latest,
-                        mv_retention,
-                    )
-                    .await?;
-                self.compile_map(project, upstream, task_events).await?
+                if let Some(select_input_idx) = fuseable_select_input(plan, node_idx, input_idx)? {
+                    let select = match &plan
+                        .node(input_idx)
+                        .with_context(|| {
+                            anyhow!("select node {input_idx} missing from circuit plan")
+                        })?
+                        .kind
+                    {
+                        DbspNodeKind::Select(select) => select.clone(),
+                        _ => unreachable!("fuseable_select_input guarantees select node"),
+                    };
+                    let upstream = self
+                        .compile_node(
+                            plan,
+                            select_input_idx,
+                            outer_streams,
+                            cancel,
+                            task_events,
+                            built,
+                            mv_registry,
+                            mv_latest,
+                            mv_retention,
+                        )
+                        .await?;
+                    self.compile_filter_map(&select, project, upstream, task_events)
+                        .await?
+                } else {
+                    let upstream = self
+                        .compile_node(
+                            plan,
+                            input_idx,
+                            outer_streams,
+                            cancel,
+                            task_events,
+                            built,
+                            mv_registry,
+                            mv_latest,
+                            mv_retention,
+                        )
+                        .await?;
+                    self.compile_map(project, upstream, task_events).await?
+                }
             }
             DbspNodeKind::Join(join) => {
                 let (left_idx, right_idx) = join_inputs(node)?;
@@ -417,4 +480,37 @@ fn join_inputs(node: &CircuitNode) -> Result<(usize, usize)> {
         bail!("join node requires two inputs");
     }
     Ok((node.inputs[0], node.inputs[1]))
+}
+
+fn fuseable_select_input(
+    plan: &CircuitPlan,
+    project_node_idx: usize,
+    input_idx: usize,
+) -> Result<Option<usize>> {
+    let select_node = match plan.node(input_idx) {
+        Some(node) => node,
+        None => return Ok(None),
+    };
+    let DbspNodeKind::Select(_) = &select_node.kind else {
+        return Ok(None);
+    };
+    if !has_single_consumer(plan, input_idx) {
+        return Ok(None);
+    }
+    first_input(select_node, "select")
+        .map(Some)
+        .with_context(|| {
+            anyhow!(
+                "project node {project_node_idx} has fuseable select input {input_idx} without an upstream source"
+            )
+        })
+}
+
+fn has_single_consumer(plan: &CircuitPlan, node_idx: usize) -> bool {
+    plan.nodes()
+        .iter()
+        .flat_map(|node| node.inputs.iter())
+        .filter(|&&input| input == node_idx)
+        .count()
+        == 1
 }

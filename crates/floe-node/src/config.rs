@@ -77,6 +77,27 @@ pub struct RuntimeConfig {
     pub kafka_max_messages: Option<usize>,
     #[serde(default)]
     pub watermark_idle_source_ms: Option<u64>,
+    #[serde(default)]
+    pub mv_flush: MvFlushConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MvFlushConfig {
+    #[serde(default)]
+    pub max_pending_deltas: Option<usize>,
+    #[serde(default)]
+    pub max_pending_versions: Option<usize>,
+    #[serde(default)]
+    pub max_pending_rows: Option<usize>,
+    #[serde(default)]
+    pub max_pending_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub flush_on_catchup_boundary: Option<bool>,
+    #[serde(default)]
+    pub flush_on_shutdown: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -438,6 +459,25 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("runtime.watermark_idle_source_ms must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_non_positive_mv_flush_max_pending_deltas() {
+        let config = NodeConfig {
+            runtime: RuntimeConfig {
+                mv_flush: MvFlushConfig {
+                    max_pending_deltas: Some(0),
+                    ..MvFlushConfig::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("runtime.mv_flush.max_pending_deltas must be greater than 0")
         );
     }
 

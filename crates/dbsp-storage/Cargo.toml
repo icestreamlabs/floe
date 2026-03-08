@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+futures = { workspace = true }
 lru = "0.12"
 rkyv = { workspace = true }
 slatedb = { workspace = true }

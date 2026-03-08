@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::ArrayRef;
@@ -126,7 +126,14 @@ impl SinkQueueTracker {
     }
 
     fn on_enqueue(&self, version: i64) {
-        let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        self.on_enqueue_many(1, version);
+    }
+
+    fn on_enqueue_many(&self, count: usize, version: i64) {
+        if count == 0 {
+            return;
+        }
+        let depth = self.queued.fetch_add(count, Ordering::Relaxed) + count;
         metrics::record_sink_queue_depth(&self.sink_name, depth);
         self.latest_enqueued_version
             .fetch_max(version, Ordering::Relaxed);
@@ -134,8 +141,15 @@ impl SinkQueueTracker {
     }
 
     fn on_dequeue(&self) {
-        let prev = self.queued.fetch_sub(1, Ordering::Relaxed);
-        let depth = prev.saturating_sub(1);
+        self.on_dequeue_many(1);
+    }
+
+    fn on_dequeue_many(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let prev = self.queued.fetch_sub(count, Ordering::Relaxed);
+        let depth = prev.saturating_sub(count);
         metrics::record_sink_queue_depth(&self.sink_name, depth);
         self.update_lag();
     }
@@ -162,7 +176,7 @@ struct SinkRecord {
 }
 
 enum SinkEvent {
-    Row(SinkRecord),
+    Rows(Vec<SinkRecord>),
     Flush { version: i64 },
 }
 
@@ -363,6 +377,7 @@ async fn stream_tail_into_queue(
     tracker: Arc<SinkQueueTracker>,
 ) -> Result<()> {
     while let Some(batch) = stream.next().await {
+        let batch_start = Instant::now();
         let batch = batch?;
         let schema = batch.batch.schema();
         let version = batch.version;
@@ -376,21 +391,28 @@ async fn stream_tail_into_queue(
                 "sink tail batch observed"
             );
         }
+        let convert_start = Instant::now();
+        let mut rows = Vec::with_capacity(batch.batch.num_rows());
         for row_idx in 0..batch.batch.num_rows() {
             let json = tail_row_to_json(&batch, row_idx, &schema)?;
             let payload = serde_json::to_string(&json).context("serialize sink row")?;
-            let event = SinkEvent::Row(SinkRecord {
+            rows.push(SinkRecord {
                 version,
                 row_idx: u64::try_from(row_idx).unwrap_or(u64::MAX),
                 json,
                 byte_len: payload.len(),
                 payload,
             });
+        }
+        let convert_latency_ms = convert_start.elapsed().as_millis() as u64;
+        let enqueue_start = Instant::now();
+        if !rows.is_empty() {
+            let row_count = rows.len();
             sender
-                .send(event)
+                .send(SinkEvent::Rows(rows))
                 .await
                 .map_err(|_| anyhow!("sink queue consumer stopped"))?;
-            tracker.on_enqueue(version);
+            tracker.on_enqueue_many(row_count, version);
         }
 
         sender
@@ -398,6 +420,19 @@ async fn stream_tail_into_queue(
             .await
             .map_err(|_| anyhow!("sink queue consumer stopped"))?;
         tracker.on_enqueue(version);
+        let enqueue_latency_ms = enqueue_start.elapsed().as_millis() as u64;
+        let batch_latency_ms = batch_start.elapsed().as_millis() as u64;
+        if seq < 16 || seq.is_multiple_of(TAIL_BATCH_LOG_SAMPLE_EVERY) {
+            tracing::info!(
+                batch_seq = seq,
+                version,
+                rows = row_count,
+                convert_latency_ms,
+                enqueue_latency_ms,
+                batch_latency_ms,
+                "sink tail batch conversion metrics"
+            );
+        }
     }
     Ok(())
 }
@@ -579,13 +614,13 @@ mod tests {
                 .await
         });
 
-        tx.send(SinkEvent::Row(SinkRecord {
+        tx.send(SinkEvent::Rows(vec![SinkRecord {
             version: 9,
             row_idx: 0,
             json: serde_json::json!({"auction": 9}),
             payload: "{\"auction\":9}".to_string(),
             byte_len: 13,
-        }))
+        }]))
         .await
         .expect("send row");
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -729,13 +764,13 @@ mod tests {
             .await
         });
 
-        tx.send(SinkEvent::Row(SinkRecord {
+        tx.send(SinkEvent::Rows(vec![SinkRecord {
             version: 12,
             row_idx: 0,
             json: serde_json::json!({"auction": 12}),
             payload: "{\"auction\":12}".to_string(),
             byte_len: 14,
-        }))
+        }]))
         .await
         .expect("send row");
         tokio::time::sleep(Duration::from_millis(25)).await;

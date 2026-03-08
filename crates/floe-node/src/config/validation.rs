@@ -56,6 +56,26 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         runtime.watermark_idle_source_ms,
         "runtime.watermark_idle_source_ms",
     )?;
+    ensure_optional_positive_usize(
+        runtime.mv_flush.max_pending_deltas,
+        "runtime.mv_flush.max_pending_deltas",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.mv_flush.max_pending_versions,
+        "runtime.mv_flush.max_pending_versions",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.mv_flush.max_pending_rows,
+        "runtime.mv_flush.max_pending_rows",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.mv_flush.max_pending_bytes,
+        "runtime.mv_flush.max_pending_bytes",
+    )?;
+    ensure_optional_positive_u64(
+        runtime.mv_flush.max_delay_ms,
+        "runtime.mv_flush.max_delay_ms",
+    )?;
     Ok(())
 }
 

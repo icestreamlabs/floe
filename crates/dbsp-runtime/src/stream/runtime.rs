@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::handles::ZSetHandle;
 use anyhow::{Context, Result, anyhow};
@@ -19,6 +20,11 @@ pub trait DeltaOperator: Send {
         ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>>;
+
+    /// Stable operator identifier for runtime diagnostics.
+    fn operator_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 pub type PipelineExecFut = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -145,13 +151,47 @@ impl PipelineBuilder {
 impl Pipeline {
     pub async fn step_once(&mut self) -> anyhow::Result<i64> {
         let (ts, mut current) = self.runtime.next_handles().await?;
-        for op in &mut self.operators {
-            if let Some(out) = op.on_step(ts, &current).await? {
+        let pipeline_start = Instant::now();
+        for (operator_index, op) in self.operators.iter_mut().enumerate() {
+            let operator_name = op.operator_name();
+            let input_count = current.len();
+            let input_versions: Vec<u64> = current.iter().map(|handle| handle.version).collect();
+            let op_start = Instant::now();
+            let output = op.on_step(ts, &current).await?;
+            let operator_elapsed_ms = op_start.elapsed().as_millis() as u64;
+
+            if let Some(out) = output {
+                tracing::debug!(
+                    ts,
+                    operator_index,
+                    operator = operator_name,
+                    input_count,
+                    ?input_versions,
+                    output_ns = %out.ns,
+                    output_version = out.version,
+                    operator_elapsed_ms,
+                    "pipeline operator step emitted output"
+                );
                 current = vec![out];
             } else {
+                tracing::debug!(
+                    ts,
+                    operator_index,
+                    operator = operator_name,
+                    input_count,
+                    ?input_versions,
+                    operator_elapsed_ms,
+                    "pipeline operator step emitted no output; stopping pipeline for timestamp"
+                );
                 break;
             }
         }
+        tracing::debug!(
+            ts,
+            pipeline_operator_count = self.operators.len(),
+            pipeline_elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+            "pipeline step completed"
+        );
         Ok(ts)
     }
 }

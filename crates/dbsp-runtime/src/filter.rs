@@ -61,7 +61,7 @@ impl DbspFilter {
             .await
             .context("create output zset for filter")?;
 
-        let filter_op = Arc::new(AsyncMutex::new(FilterOp::new(
+        let filter_op = Arc::new(AsyncMutex::new(FilterOp::new_without_integrated_state(
             Arc::new(predicate),
             state,
             table.clone(),

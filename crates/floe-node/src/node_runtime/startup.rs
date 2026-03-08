@@ -126,6 +126,24 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     }
 }
 
+pub(super) fn mv_flush_coalescing_config(config: &MvFlushConfig) -> MvFlushCoalescingConfig {
+    let mut out = MvFlushCoalescingConfig::default();
+    if let Some(max_pending_deltas) = config.max_pending_deltas {
+        out.max_pending_deltas = max_pending_deltas;
+    }
+    out.max_pending_versions = config.max_pending_versions;
+    out.max_pending_rows = config.max_pending_rows;
+    out.max_pending_bytes = config.max_pending_bytes;
+    out.max_delay_ms = config.max_delay_ms;
+    if let Some(flush_on_catchup_boundary) = config.flush_on_catchup_boundary {
+        out.flush_on_catchup_boundary = flush_on_catchup_boundary;
+    }
+    if let Some(flush_on_shutdown) = config.flush_on_shutdown {
+        out.flush_on_shutdown = flush_on_shutdown;
+    }
+    out
+}
+
 pub(super) async fn upsert_materialized_view_definition(
     materialized_view_map: &mut HashMap<String, MaterializedViewDefinition>,
     definition: MaterializedViewDefinition,

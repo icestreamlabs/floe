@@ -10,7 +10,7 @@ pub mod circuit {
 }
 
 pub use dbsp_runtime::{
-    aggregate, algebra, collections, distinct, filter, handles, join, map, operators,
+    aggregate, algebra, collections, distinct, filter, filter_map, handles, join, map, operators,
     relation_state, semijoin, stream, topk, topn, union, window,
 };
 pub use dbsp_storage::storage;
@@ -30,6 +30,7 @@ pub use circuit::{
 pub use collections::{ZSet, h};
 pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
+pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
 pub use map::DbspMap;

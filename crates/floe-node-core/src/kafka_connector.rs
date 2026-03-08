@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;

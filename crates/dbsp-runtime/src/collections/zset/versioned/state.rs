@@ -34,8 +34,8 @@ impl CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            max_chain_len: 32,
-            max_segments: 256,
+            max_chain_len: 512,
+            max_segments: 4096,
         }
     }
 }

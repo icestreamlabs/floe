@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -230,82 +230,54 @@ where
     }
 
     pub async fn delta_iter_with_dict(&self, version: u64) -> Result<Vec<(K, i64)>> {
-        const LOCAL_LRU_CAPACITY: usize = 256;
-
-        struct LocalLru<K> {
-            capacity: usize,
-            order: VecDeque<u64>,
-            values: HashMap<u64, K>,
-        }
-
-        impl<K: Clone> LocalLru<K> {
-            fn new(capacity: usize) -> Self {
-                Self {
-                    capacity,
-                    order: VecDeque::new(),
-                    values: HashMap::new(),
-                }
-            }
-
-            fn get(&mut self, key: u64) -> Option<K> {
-                let value = self.values.get(&key)?.clone();
-                if let Some(pos) = self.order.iter().position(|id| *id == key) {
-                    self.order.remove(pos);
-                }
-                self.order.push_back(key);
-                Some(value)
-            }
-
-            fn insert(&mut self, key: u64, value: K) {
-                if self.capacity == 0 {
-                    return;
-                }
-                if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    self.values.entry(key)
-                {
-                    entry.insert(value);
-                    if let Some(pos) = self.order.iter().position(|id| *id == key) {
-                        self.order.remove(pos);
-                    }
-                    self.order.push_back(key);
-                    return;
-                }
-                if self.values.len() == self.capacity
-                    && let Some(evicted) = self.order.pop_front()
-                {
-                    self.values.remove(&evicted);
-                }
-                self.order.push_back(key);
-                self.values.insert(key, value);
-            }
-        }
-
         if version == 0 {
             return Ok(Vec::new());
         }
 
         let manifest = self.load_manifest_record(version).await?;
-        let mut deltas = Vec::new();
-        let mut cache = LocalLru::new(LOCAL_LRU_CAPACITY);
+        let mut entries = Vec::new();
+        let mut resolved_by_id: HashMap<u64, K> = HashMap::new();
 
         for (bucket, segments) in manifest.buckets {
             for segment_id in segments {
                 let record = self.load_segment(bucket, segment_id).await?;
-                for (key_id, delta) in record.deltas {
-                    let key = if let Some(value) = cache.get(key_id) {
-                        value
-                    } else {
-                        let resolved = self
-                            .dict
-                            .resolve(key_id)
-                            .await
-                            .context("resolve key while iterating delta layer")?;
-                        cache.insert(key_id, resolved.clone());
-                        resolved
-                    };
-                    deltas.push((key, delta));
-                }
+                entries.extend(record.deltas);
             }
+        }
+
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut missing_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for (key_id, _) in &entries {
+            if resolved_by_id.contains_key(key_id) {
+                continue;
+            }
+            if seen.insert(*key_id) {
+                missing_ids.push(*key_id);
+            }
+        }
+
+        if !missing_ids.is_empty() {
+            let resolved = self
+                .dict
+                .resolve_many(&missing_ids)
+                .await
+                .context("resolve keys while iterating delta layer")?;
+            for (key_id, key) in missing_ids.into_iter().zip(resolved) {
+                resolved_by_id.insert(key_id, key);
+            }
+        }
+
+        let mut deltas = Vec::with_capacity(entries.len());
+        for (key_id, delta) in entries {
+            let key = resolved_by_id
+                .get(&key_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("resolved key {key_id} missing from local cache"))?;
+            deltas.push((key, delta));
         }
 
         Ok(deltas)

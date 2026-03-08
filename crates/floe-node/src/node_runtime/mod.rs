@@ -20,8 +20,8 @@ use floe_executor::checkpoint::{
 };
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
-    MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry, SourceRowDecoder,
-    SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
+    MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
+    OuterStreamRegistry, SourceRowDecoder, SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
@@ -53,8 +53,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    ConnectorConfig, NodeConfig, OutputConsolidationModeConfig, SinkConfig, SinkSpec,
-    apply_connector_properties, load_config, materialized_view_definitions_from_config,
+    ConnectorConfig, MvFlushConfig, NodeConfig, OutputConsolidationModeConfig, SinkConfig,
+    SinkSpec, apply_connector_properties, load_config, materialized_view_definitions_from_config,
     normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
 use crate::{cli, config, http_ingest, metrics, sinks};
@@ -70,8 +70,8 @@ const SLATEDB_ENV_PREFIX_ENV: &str = "FLOE_SLATEDB_ENV_PREFIX";
 const DEFAULT_SLATEDB_ENV_PREFIX: &str = "SLATEDB_";
 const DEFAULT_EVENTS_PER_SECOND: f64 = 10.0;
 const DEFAULT_MV_RETAIN_LAST: usize = 1;
-const DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN: usize = 32;
-const DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS: usize = 256;
+const DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN: usize = 512;
+const DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS: usize = 4096;
 const DEFAULT_ZSET_COMPACTION_BACKOFF_TICKS: u64 = 1;
 const DEFAULT_ZSET_COMPACTION_MAX_CONCURRENT_JOBS: usize = 1;
 const DEFAULT_ZSET_GC_GRACE_PERIOD_MS: u64 = 30_000;

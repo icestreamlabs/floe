@@ -257,6 +257,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
+    if let Some(config) = config.as_ref() {
+        graph_builder.set_mv_flush_coalescing(mv_flush_coalescing_config(&config.runtime.mv_flush));
+    }
     let output_mode =
         resolve_output_consolidation_mode(run_args.output_consolidation_mode, &source_registry);
     let consolidation_mode = match output_mode {
@@ -724,6 +727,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let kafka_commit_senders_for_task = kafka_commit_senders;
     let postgres_cdc_commit_senders_for_task = postgres_cdc_commit_senders;
     let mut sink_checkpoint_rx_for_task = sink_checkpoint_rx;
+    const MAX_SINK_CURSOR_UPDATES_PER_ITER: usize = 4096;
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
@@ -786,7 +790,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             record_mv_freshness_metrics(&mv_last_update_at_ms, now_ms);
         }
         'executor: loop {
-            loop {
+            for _ in 0..MAX_SINK_CURSOR_UPDATES_PER_ITER {
                 match sink_checkpoint_rx_for_task.try_recv() {
                     Ok(cursor) => {
                         checkpoint_manager.update_sink_cursor(

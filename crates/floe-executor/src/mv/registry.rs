@@ -206,6 +206,16 @@ impl MaterializedViewHandle {
             .expect("materialized view version lock poisoned")
     }
 
+    pub fn next_version_after(&self, version: i64) -> Option<i64> {
+        self.versions
+            .read()
+            .expect("materialized view versions lock poisoned")
+            .keys()
+            .copied()
+            .filter(|candidate| *candidate > version)
+            .min()
+    }
+
     pub fn version_time(&self, version: i64) -> Option<i64> {
         self.version_times
             .read()

@@ -1857,6 +1857,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "futures",
  "lru",
  "object_store",
  "rand 0.8.5",

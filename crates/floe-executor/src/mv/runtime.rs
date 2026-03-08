@@ -6,6 +6,7 @@ use super::registry::MaterializedViewHandle;
 
 pub trait MaterializedView: Send + Sync {
     fn latest_version(&self) -> Option<i64>;
+    fn next_version_after(&self, version: i64) -> Option<i64>;
     fn subscribe_versions(&self) -> watch::Receiver<Option<i64>>;
     fn handle_for(&self, version: i64) -> Result<ZSetHandleView<Vec<u8>>>;
     fn version_time(&self, version: i64) -> Option<i64>;
@@ -14,6 +15,10 @@ pub trait MaterializedView: Send + Sync {
 impl MaterializedView for MaterializedViewHandle {
     fn latest_version(&self) -> Option<i64> {
         MaterializedViewHandle::latest_version(self)
+    }
+
+    fn next_version_after(&self, version: i64) -> Option<i64> {
+        MaterializedViewHandle::next_version_after(self, version)
     }
 
     fn subscribe_versions(&self) -> watch::Receiver<Option<i64>> {

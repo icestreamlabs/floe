@@ -82,30 +82,39 @@ pub(super) async fn run_file_worker(
     let mut buffer_bytes = 0usize;
 
     while let Some(event) = rx.recv().await {
-        tracker.on_dequeue();
         match event {
-            SinkEvent::Row(row) => {
-                buffer_bytes += row.byte_len;
-                buffer.push(row);
-                if batch_policy.should_flush(buffer.len(), buffer_bytes) {
-                    let flushed_version =
-                        buffer.iter().map(|entry| entry.version).max().unwrap_or(-1);
-                    flush_file_buffer(&mut file, &mut buffer, &mut buffer_bytes, &tracker, None)
+            SinkEvent::Rows(rows) => {
+                tracker.on_dequeue_many(rows.len());
+                for row in rows {
+                    buffer_bytes += row.byte_len;
+                    buffer.push(row);
+                    if batch_policy.should_flush(buffer.len(), buffer_bytes) {
+                        let flushed_version =
+                            buffer.iter().map(|entry| entry.version).max().unwrap_or(-1);
+                        flush_file_buffer(
+                            &mut file,
+                            &mut buffer,
+                            &mut buffer_bytes,
+                            &tracker,
+                            None,
+                        )
                         .await?;
-                    if flushed_version >= 0 {
-                        publish_sink_cursor(
-                            &checkpoint_tx,
-                            SinkCursor {
-                                sink: sink_name.to_string(),
-                                mv_name: mv_name.to_string(),
-                                last_emitted_mv_version: flushed_version,
-                                row_index: None,
-                            },
-                        );
+                        if flushed_version >= 0 {
+                            publish_sink_cursor(
+                                &checkpoint_tx,
+                                SinkCursor {
+                                    sink: sink_name.to_string(),
+                                    mv_name: mv_name.to_string(),
+                                    last_emitted_mv_version: flushed_version,
+                                    row_index: None,
+                                },
+                            );
+                        }
                     }
                 }
             }
             SinkEvent::Flush { version } => {
+                tracker.on_dequeue();
                 flush_file_buffer(
                     &mut file,
                     &mut buffer,
@@ -154,10 +163,13 @@ pub(super) async fn run_file_worker_effectively_once(
     let mut pending = Vec::new();
 
     while let Some(event) = rx.recv().await {
-        tracker.on_dequeue();
         match event {
-            SinkEvent::Row(row) => pending.push(row),
+            SinkEvent::Rows(rows) => {
+                tracker.on_dequeue_many(rows.len());
+                pending.extend(rows);
+            }
             SinkEvent::Flush { version } => {
+                tracker.on_dequeue();
                 let mut rows = Vec::new();
                 let mut retained = Vec::new();
                 for row in pending.drain(..) {

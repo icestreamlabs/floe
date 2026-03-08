@@ -112,7 +112,7 @@ pub struct RunArgs {
     /// Max version-chain length before runtime compaction is triggered.
     #[arg(
         long = "zset-compaction-max-chain-len",
-        default_value_t = 32,
+        default_value_t = 512,
         value_parser = parse_positive_usize
     )]
     pub zset_compaction_max_chain_len: usize,
@@ -120,7 +120,7 @@ pub struct RunArgs {
     /// Max versioned segment count before runtime compaction is triggered.
     #[arg(
         long = "zset-compaction-max-segments",
-        default_value_t = 256,
+        default_value_t = 4096,
         value_parser = parse_positive_usize
     )]
     pub zset_compaction_max_segments: usize,

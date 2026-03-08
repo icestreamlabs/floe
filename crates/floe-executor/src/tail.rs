@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::array::ArrayRef;
@@ -27,6 +29,10 @@ use floe_sql_parser::{FloeStatement, parse_floe_statement};
 pub type SessionCtx = SessionContext;
 
 pub type PgResult<T> = Result<T>;
+const TAIL_STREAM_CHANNEL_CAPACITY_DEFAULT: usize = 256;
+const TAIL_MAX_CATCHUP_VERSIONS_DEFAULT: i64 = 32;
+const TAIL_DELTA_LOG_SAMPLE_EVERY: usize = 128;
+static TAIL_DELTA_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub struct TailBatch {
@@ -140,7 +146,7 @@ where
         )
     })?;
 
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = mpsc::channel(tail_stream_channel_capacity());
     let mv_for_task = Arc::clone(&mv);
     let schema_for_task = Arc::clone(&base_schema);
     let params_for_task = params.clone();
@@ -204,6 +210,7 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     let mut version_rx = mv.subscribe_versions();
     let latest = mv.latest_version();
     let mut last_emitted;
+    let max_catchup_versions = tail_max_catchup_versions();
 
     if let Some(as_of_version) = as_of {
         let _ = mv.handle_for(as_of_version)?;
@@ -223,9 +230,23 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     loop {
         let latest_now = mv.latest_version().unwrap_or(last_emitted);
         if latest_now > last_emitted {
-            for version in last_emitted + 1..=latest_now {
-                emit_delta(mv.as_ref(), &schema, &mv_name, version, tx).await?;
-                last_emitted = version;
+            let mut emitted = 0_i64;
+            while emitted < max_catchup_versions {
+                let Some(next_version) = mv.next_version_after(last_emitted) else {
+                    break;
+                };
+                if next_version > latest_now {
+                    break;
+                }
+                emit_delta(mv.as_ref(), &schema, &mv_name, next_version, tx).await?;
+                last_emitted = next_version;
+                emitted += 1;
+            }
+            if mv
+                .next_version_after(last_emitted)
+                .is_some_and(|next_version| next_version <= latest_now)
+            {
+                tokio::task::yield_now().await;
             }
             continue;
         }
@@ -242,6 +263,22 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     }
 
     Ok(())
+}
+
+fn tail_stream_channel_capacity() -> usize {
+    std::env::var("FLOE_TAIL_CHANNEL_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TAIL_STREAM_CHANNEL_CAPACITY_DEFAULT)
+}
+
+fn tail_max_catchup_versions() -> i64 {
+    std::env::var("FLOE_TAIL_MAX_CATCHUP_VERSIONS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TAIL_MAX_CATCHUP_VERSIONS_DEFAULT)
 }
 
 async fn emit_version<M: MaterializedView>(
@@ -280,8 +317,12 @@ async fn emit_delta<M: MaterializedView>(
     version: i64,
     tx: &mut mpsc::Sender<PgResult<TailBatch>>,
 ) -> PgResult<()> {
+    let delta_start = Instant::now();
     let version_time = mv.version_time(version);
+    let materialize_start = Instant::now();
     let batches = materialize_delta_batches(mv, Arc::clone(schema), version, version_time).await?;
+    let materialize_ms = materialize_start.elapsed().as_millis() as u64;
+    let row_count: usize = batches.iter().map(|batch| batch.batch.num_rows()).sum();
     let emit_span = tracing::debug_span!(
         "tail_emit",
         mv = %mv_name,
@@ -297,6 +338,18 @@ async fn emit_delta<M: MaterializedView>(
         }
         metrics::inc_tail_rows(row_count);
         tracing::debug!(rows = row_count, "tail batch emitted");
+    }
+    let total_ms = delta_start.elapsed().as_millis() as u64;
+    let seq = TAIL_DELTA_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if seq < 16 || seq.is_multiple_of(TAIL_DELTA_LOG_SAMPLE_EVERY) {
+        tracing::info!(
+            mv = %mv_name,
+            version,
+            rows = row_count,
+            materialize_ms,
+            total_ms,
+            "tail delta emit metrics"
+        );
     }
     Ok(())
 }
@@ -319,10 +372,34 @@ async fn materialize_delta_batches<M: MaterializedView>(
     version: i64,
     version_time: Option<i64>,
 ) -> PgResult<Vec<TailBatch>> {
+    let total_start = Instant::now();
+    let handle_start = Instant::now();
     let handle = mv.handle_for(version)?;
+    let handle_ms = handle_start.elapsed().as_millis() as u64;
+    let delta_iter_start = Instant::now();
     let deltas = handle.delta_iter().await?;
+    let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
+    let rows_decode_start = Instant::now();
     let rows = rows_from_delta(deltas)?;
-    build_tail_batches(rows, schema, version_time)
+    let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
+    let rows_len = rows.len();
+    let batch_build_start = Instant::now();
+    let batches = build_tail_batches(rows, schema, version_time)?;
+    let batch_build_ms = batch_build_start.elapsed().as_millis() as u64;
+    let total_ms = total_start.elapsed().as_millis() as u64;
+    if version <= 8 || total_ms >= 1000 {
+        tracing::info!(
+            version,
+            rows = rows_len,
+            handle_ms,
+            delta_iter_ms,
+            rows_decode_ms,
+            batch_build_ms,
+            total_ms,
+            "tail delta materialize breakdown"
+        );
+    }
+    Ok(batches)
 }
 
 fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<(Row, i16)>> {

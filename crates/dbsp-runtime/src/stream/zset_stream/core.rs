@@ -250,41 +250,41 @@ where
         &mut self,
         overlay: HashMap<K, i64>,
     ) -> Result<(ZSetHandle, ZSetHandle)> {
+        let flush_start = std::time::Instant::now();
         let dict = self.versioned.dictionary();
-        let mut dict_batch = dict.batch();
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let delta_dict = self.delta_versioned.dictionary();
-        let mut delta_dict_batch = delta_dict.batch();
         let mut delta_buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        for (key, delta) in &overlay {
-            if *delta == 0 {
-                continue;
-            }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging overlay")?;
+        let staged: Vec<(&K, i64)> = overlay
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
+            .collect();
+
+        let intern_main_start = std::time::Instant::now();
+        let ids = dict
+            .intern_many_values(staged.iter().map(|(key, _)| *key))
+            .await
+            .context("intern keys while staging overlay")?;
+        for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
+        let intern_main_ms = intern_main_start.elapsed().as_millis() as u64;
 
-        for (key, delta) in &overlay {
-            if *delta == 0 {
-                continue;
-            }
-            let delta_id = delta_dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging delta overlay")?;
+        let intern_delta_start = std::time::Instant::now();
+        let delta_ids = delta_dict
+            .intern_many_values(staged.iter().map(|(key, _)| *key))
+            .await
+            .context("intern keys while staging delta overlay")?;
+        for ((_, delta), delta_id) in staged.iter().zip(delta_ids.into_iter()) {
             delta_buckets
                 .entry(bucket_for(delta_id))
                 .or_default()
                 .push((delta_id, *delta));
         }
-        drop(dict_batch);
-        drop(delta_dict_batch);
+        let intern_delta_ms = intern_delta_start.elapsed().as_millis() as u64;
 
         let mut segments = Vec::new();
         for (bucket, mut deltas) in buckets {
@@ -355,6 +355,7 @@ where
             .write_batch(cleanup_versions)
             .await
             .context("clear version intents")?;
+        let persist_versions_ms = flush_start.elapsed().as_millis() as u64;
 
         self.versioned.apply_version_plan(&plan);
         if let Some(delta_plan) = &delta_plan {
@@ -429,6 +430,7 @@ where
             .write_batch(cleanup_streams)
             .await
             .context("clear stream intents")?;
+        let persist_streams_ms = flush_start.elapsed().as_millis() as u64;
 
         self.current_handle = new_handle.clone();
         self.delta_current_handle = delta_handle.clone();
@@ -455,6 +457,17 @@ where
             delta_handle.clone(),
         );
         self.apply_delta_retention(delta_releases).await?;
+
+        tracing::debug!(
+            namespace = %self.namespace(),
+            overlay_rows = overlay.len(),
+            intern_main_ms,
+            intern_delta_ms,
+            persist_versions_ms,
+            persist_streams_ms,
+            total_flush_ms = flush_start.elapsed().as_millis() as u64,
+            "zset flush breakdown"
+        );
 
         Ok((new_handle, delta_handle))
     }

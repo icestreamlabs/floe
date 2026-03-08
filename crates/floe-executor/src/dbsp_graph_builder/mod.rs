@@ -3,4 +3,4 @@ mod compile;
 mod eval;
 mod materialize;
 
-pub use builder::{BuildInputs, BuildOutputs, DbspGraphBuilder};
+pub use builder::{BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig};

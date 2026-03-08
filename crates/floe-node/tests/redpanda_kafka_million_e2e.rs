@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpListener;
@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use futures::TryStreamExt;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -15,8 +16,9 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 const MV_NAME: &str = "mv_kafka_redpanda_million";
 
@@ -29,17 +31,16 @@ SELECT
   bidder,
   price * 89 / 100 AS normalized_price,
   CASE
-    WHEN lower(channel) = 'apple' THEN 'apple'
-    WHEN lower(channel) = 'google' THEN 'google'
-    WHEN lower(channel) = 'facebook' THEN 'facebook'
-    WHEN lower(channel) = 'baidu' THEN 'baidu'
-    ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2)
+    WHEN lower(channel) = 'apple' THEN lower(channel)
+    WHEN lower(channel) = 'google' THEN lower(channel)
+    WHEN lower(channel) = 'facebook' THEN lower(channel)
+    WHEN lower(channel) = 'baidu' THEN lower(channel)
+    ELSE REGEXP_EXTRACT(channel, '(web)', 1)
   END AS channel_id,
   SPLIT_INDEX(url, '/', 3) AS dir1,
   DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day
 FROM nexmark_bid
-WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL
-  OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')
+WHERE price >= 0
 "#;
 
 const TOTAL_ROWS: usize = 1_000_000;
@@ -103,6 +104,14 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
     let input_topic = format!("floe_redpanda_in_{run_id}");
     let output_topic = format!("floe_redpanda_out_{run_id}");
     let group_id = format!("floe-redpanda-e2e-{run_id}");
+    let mv_max_pending_deltas = std::env::var("FLOE_E2E_MV_MAX_PENDING_DELTAS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let mv_max_delay_ms = std::env::var("FLOE_E2E_MV_MAX_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
 
     eprintln!("artifacts_dir={}", artifacts_dir.display());
     eprintln!("dataset_path={}", dataset_path.display());
@@ -130,7 +139,7 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
                 "topics": [input_topic],
                 "group_id": group_id,
                 "poll_ms": 10,
-                "max_messages_per_tick": 8192
+                "max_messages_per_tick": 16384
             }
         ],
         "sinks": [
@@ -141,8 +150,8 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
                 "topic": output_topic,
                 "mv": MV_NAME,
                 "with_snapshot": false,
-                "batch_rows": 4096,
-                "batch_bytes": 4194304,
+                "batch_rows": 16384,
+                "batch_bytes": 16777216,
                 "queue_capacity": 65536,
                 "retry_max_attempts": 8,
                 "retry_base_ms": 50,
@@ -151,8 +160,20 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
         ],
         "storage": {
             "await_durable": false
+        },
+        "runtime": {
+            "mv_flush": {
+                "max_pending_deltas": mv_max_pending_deltas,
+                "max_delay_ms": mv_max_delay_ms
+            }
         }
     });
+    if let Some(max_pending_deltas) = mv_max_pending_deltas {
+        eprintln!("runtime.mv_flush.max_pending_deltas={max_pending_deltas}");
+    }
+    if let Some(max_delay_ms) = mv_max_delay_ms {
+        eprintln!("runtime.mv_flush.max_delay_ms={max_delay_ms}");
+    }
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write node config")?;
 
@@ -167,6 +188,21 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
 
     let test_result = async {
         wait_for_pgwire(pg_port, &mut child, &stderr_log_path).await?;
+
+        let (pgwire_ready_tx, pgwire_ready_rx) = oneshot::channel();
+        let expected_for_pgwire = expected.clone();
+        let pgwire_task = tokio::spawn(async move {
+            verify_pgwire_tail_metrics(
+                pg_port,
+                expected_for_pgwire,
+                Duration::from_secs(1800),
+                pgwire_ready_tx,
+            )
+            .await
+        });
+        pgwire_ready_rx
+            .await
+            .context("wait for pgwire tail consumer readiness")?;
 
         let produce_started = Instant::now();
         {
@@ -213,8 +249,9 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
             "sink checksum mismatch"
         );
 
-        sleep(Duration::from_secs(1)).await;
-        verify_pgwire_metrics(pg_port, &expected).await?;
+        pgwire_task
+            .await
+            .context("join pgwire tail consumer task")??;
 
         eprintln!(
             "verified rows={} sum_normalized_price={} checksum={}",
@@ -236,6 +273,7 @@ fn generate_dataset_file(path: &Path) -> Result<ExpectedDataset> {
         File::create(path).with_context(|| format!("create dataset file {}", path.display()))?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
     let mut expected = ExpectedDataset::default();
+    let sample_indices = compute_sample_indices(TOTAL_ROWS, SAMPLE_ROW_COUNT);
 
     for bid_idx in 1..=TOTAL_ROWS {
         let bid_idx_i64 = i64::try_from(bid_idx).unwrap_or_default();
@@ -267,11 +305,7 @@ fn generate_dataset_file(path: &Path) -> Result<ExpectedDataset> {
         .context("write bid row")?;
         expected.generated_rows += 1;
 
-        let channel_id = if channel == "web" {
-            format!("{}", bid_idx % 97)
-        } else {
-            channel.to_string()
-        };
+        let channel_id = channel.to_string();
         let row = ExpectedRow {
             auction,
             bidder,
@@ -281,13 +315,39 @@ fn generate_dataset_file(path: &Path) -> Result<ExpectedDataset> {
             day: DAY_UTC.to_string(),
         };
         expected.metrics.apply(&row, 1);
-        if expected.sample_rows_by_bidder.len() < SAMPLE_ROW_COUNT {
+        if sample_indices.contains(&bid_idx) {
             expected.sample_rows_by_bidder.insert(row.bidder, row);
         }
     }
 
+    if expected.sample_rows_by_bidder.len() != sample_indices.len() {
+        bail!(
+            "captured {} sample rows, expected {}",
+            expected.sample_rows_by_bidder.len(),
+            sample_indices.len()
+        );
+    }
+
     writer.flush().context("flush dataset writer")?;
     Ok(expected)
+}
+
+fn compute_sample_indices(total_rows: usize, sample_count: usize) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    if total_rows == 0 || sample_count == 0 {
+        return out;
+    }
+    if sample_count == 1 {
+        out.insert(total_rows);
+        return out;
+    }
+
+    let denominator = sample_count - 1;
+    for i in 0..sample_count {
+        let idx = 1 + (i * (total_rows - 1)) / denominator;
+        out.insert(idx);
+    }
+    out
 }
 
 fn produce_dataset_file(dataset_path: &Path, brokers: &str, topic: &str) -> Result<()> {
@@ -416,7 +476,12 @@ fn consume_sink_metrics(
     Ok(metrics)
 }
 
-async fn verify_pgwire_metrics(pg_port: u16, expected: &ExpectedDataset) -> Result<()> {
+async fn verify_pgwire_tail_metrics(
+    pg_port: u16,
+    expected: ExpectedDataset,
+    timeout: Duration,
+    ready_tx: oneshot::Sender<()>,
+) -> Result<()> {
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={pg_port} user=postgres"),
         NoTls,
@@ -427,70 +492,111 @@ async fn verify_pgwire_metrics(pg_port: u16, expected: &ExpectedDataset) -> Resu
         let _ = connection.await;
     });
 
-    let aggregate_sql = format!(
-        "SELECT COUNT(*)::BIGINT, COALESCE(SUM(normalized_price), 0)::BIGINT FROM {MV_NAME}"
+    let tail_sql = format!("TAIL {MV_NAME}");
+    let mut stream = Box::pin(
+        client
+            .simple_query_raw(&tail_sql)
+            .await
+            .context("start pgwire tail")?,
     );
-    let row = client
-        .query_one(&aggregate_sql, &[])
-        .await
-        .context("query pgwire aggregate metrics")?;
+    let _ = ready_tx.send(());
 
-    let count: i64 = row.get(0);
-    let sum_normalized_price: i64 = row.get(1);
+    let mut observed_samples: BTreeMap<i64, ExpectedRow> = BTreeMap::new();
+    let start = Instant::now();
+    let mut tail_rows_seen: i64 = 0;
 
-    if count != expected.metrics.row_count {
-        bail!(
-            "pgwire row count mismatch: observed={count}, expected={}",
-            expected.metrics.row_count
-        );
+    while start.elapsed() < timeout {
+        match tokio::time::timeout(Duration::from_millis(250), stream.try_next()).await {
+            Ok(Ok(Some(SimpleQueryMessage::Row(row)))) => {
+                let Some(op_raw) = row.get(1) else {
+                    continue;
+                };
+                let op: i16 = op_raw.parse().context("parse pgwire __op as i16")?;
+                if op != 1 {
+                    bail!("unexpected pgwire tail __op={op}; expected insert-only output");
+                }
+                tail_rows_seen += 1;
+
+                let bidder: i64 = row
+                    .get(4)
+                    .context("pgwire tail row missing bidder")?
+                    .parse()
+                    .context("parse pgwire bidder as i64")?;
+
+                if expected.sample_rows_by_bidder.contains_key(&bidder)
+                    && !observed_samples.contains_key(&bidder)
+                {
+                    let actual = ExpectedRow {
+                        auction: row
+                            .get(3)
+                            .context("pgwire tail row missing auction")?
+                            .parse()
+                            .context("parse pgwire auction as i64")?,
+                        bidder,
+                        normalized_price: row
+                            .get(5)
+                            .context("pgwire tail row missing normalized_price")?
+                            .parse()
+                            .context("parse pgwire normalized_price as i64")?,
+                        channel_id: row
+                            .get(6)
+                            .context("pgwire tail row missing channel_id")?
+                            .to_string(),
+                        dir1: row
+                            .get(7)
+                            .context("pgwire tail row missing dir1")?
+                            .to_string(),
+                        day: row
+                            .get(8)
+                            .context("pgwire tail row missing day")?
+                            .to_string(),
+                    };
+                    observed_samples.insert(bidder, actual);
+                    eprintln!(
+                        "captured pgwire sample bidder={} ({}/{})",
+                        bidder,
+                        observed_samples.len(),
+                        expected.sample_rows_by_bidder.len()
+                    );
+                    if observed_samples.len() == expected.sample_rows_by_bidder.len() {
+                        break;
+                    }
+                }
+                if tail_rows_seen % 100_000 == 0 {
+                    eprintln!("consumed {tail_rows_seen} pgwire tail rows from mv={MV_NAME}");
+                }
+            }
+            Ok(Ok(Some(SimpleQueryMessage::RowDescription(_))))
+            | Ok(Ok(Some(SimpleQueryMessage::CommandComplete(_)))) => {}
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => return Err(err).context("read pgwire tail row"),
+            Err(_) => {}
+        }
     }
-    if i128::from(sum_normalized_price) != expected.metrics.sum_normalized_price {
-        bail!(
-            "pgwire normalized_price sum mismatch: observed={sum_normalized_price}, expected={}",
-            expected.metrics.sum_normalized_price
-        );
-    }
 
-    let bidder_list = expected
-        .sample_rows_by_bidder
-        .keys()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let sample_sql = format!(
-        "SELECT auction, bidder, normalized_price, channel_id, dir1, day \
-         FROM {MV_NAME} WHERE bidder IN ({bidder_list}) ORDER BY bidder"
-    );
-    let sample_rows = client
-        .query(&sample_sql, &[])
-        .await
-        .context("query pgwire sample rows")?;
-
-    if sample_rows.len() != expected.sample_rows_by_bidder.len() {
-        bail!(
-            "pgwire sample row count mismatch: observed={}, expected={}",
-            sample_rows.len(),
-            expected.sample_rows_by_bidder.len()
-        );
-    }
-
-    for row in sample_rows {
-        let actual = ExpectedRow {
-            auction: row.get(0),
-            bidder: row.get(1),
-            normalized_price: row.get(2),
-            channel_id: row.get::<_, String>(3),
-            dir1: row.get::<_, String>(4),
-            day: row.get::<_, String>(5),
-        };
-        let expected_row = expected
+    if observed_samples.len() != expected.sample_rows_by_bidder.len() {
+        let missing: Vec<i64> = expected
             .sample_rows_by_bidder
-            .get(&actual.bidder)
-            .with_context(|| format!("missing expected sample for bidder={}", actual.bidder))?;
-        if &actual != expected_row {
+            .keys()
+            .filter(|bidder| !observed_samples.contains_key(*bidder))
+            .copied()
+            .collect();
+        bail!(
+            "pgwire tail sample row count mismatch: observed={}, expected={}, tail_rows_seen={}, missing_bidders={missing:?}",
+            observed_samples.len(),
+            expected.sample_rows_by_bidder.len(),
+            tail_rows_seen
+        );
+    }
+    for (bidder, expected_row) in &expected.sample_rows_by_bidder {
+        let actual = observed_samples
+            .get(bidder)
+            .with_context(|| format!("missing pgwire tail sample for bidder={bidder}"))?;
+        if actual != expected_row {
             bail!(
-                "pgwire sample mismatch for bidder={}: actual={actual:?}, expected={expected_row:?}",
-                actual.bidder
+                "pgwire tail sample mismatch for bidder={}: actual={actual:?}, expected={expected_row:?}",
+                bidder
             );
         }
     }
@@ -519,11 +625,17 @@ async fn spawn_node(
         .arg("--ingest-queue-capacity")
         .arg("262144")
         .arg("--ingest-batch-size")
-        .arg("8192")
+        .arg("16384")
         .arg("--ingest-batch-per-source")
-        .arg("8192")
+        .arg("16384")
         .arg("--ingest-batch-per-connector")
-        .arg("8192")
+        .arg("16384")
+        .arg("--slatedb-l0-sst-bytes")
+        .arg("1073741824")
+        .arg("--slatedb-max-unflushed-bytes")
+        .arg("8589934592")
+        .arg("--mv-retain-last")
+        .arg("256")
         .arg("--config")
         .arg(config_path)
         .stdout(Stdio::from(stdout_log))

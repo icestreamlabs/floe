@@ -69,7 +69,7 @@ impl DbspMap {
             .await
             .context("create output zset for map")?;
 
-        let map_op = Arc::new(AsyncMutex::new(MapOp::new(
+        let map_op = Arc::new(AsyncMutex::new(MapOp::new_without_integrated_state(
             Arc::new(projector),
             state,
             table.clone(),

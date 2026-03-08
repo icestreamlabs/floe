@@ -28,6 +28,13 @@ where
 {
     async fn intern(&self, key: &K) -> Result<u64>;
     async fn resolve(&self, id: u64) -> Result<K>;
+    async fn resolve_many(&self, ids: &[u64]) -> Result<Vec<K>> {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            resolved.push(self.resolve(*id).await?);
+        }
+        Ok(resolved)
+    }
     async fn lookup(&self, key: &K) -> Result<Option<u64>>;
 }
 

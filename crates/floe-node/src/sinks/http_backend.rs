@@ -71,28 +71,31 @@ pub(super) async fn run_http_worker(
     let mut buffer_bytes = 0usize;
 
     while let Some(event) = rx.recv().await {
-        tracker.on_dequeue();
         match event {
-            SinkEvent::Row(row) => {
-                buffer_bytes += row.byte_len;
-                buffer.push(row);
-                if batch_policy.should_flush(buffer.len(), buffer_bytes) {
-                    flush_http_buffer(
-                        sink_name,
-                        mv_name,
-                        client,
-                        url,
-                        &mut buffer,
-                        &mut buffer_bytes,
-                        retry_policy,
-                        &tracker,
-                        None,
-                        &checkpoint_tx,
-                    )
-                    .await?;
+            SinkEvent::Rows(rows) => {
+                tracker.on_dequeue_many(rows.len());
+                for row in rows {
+                    buffer_bytes += row.byte_len;
+                    buffer.push(row);
+                    if batch_policy.should_flush(buffer.len(), buffer_bytes) {
+                        flush_http_buffer(
+                            sink_name,
+                            mv_name,
+                            client,
+                            url,
+                            &mut buffer,
+                            &mut buffer_bytes,
+                            retry_policy,
+                            &tracker,
+                            None,
+                            &checkpoint_tx,
+                        )
+                        .await?;
+                    }
                 }
             }
             SinkEvent::Flush { version } => {
+                tracker.on_dequeue();
                 flush_http_buffer(
                     sink_name,
                     mv_name,

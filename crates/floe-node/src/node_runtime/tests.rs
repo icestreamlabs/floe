@@ -257,6 +257,7 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             kafka_poll_ms: Some(250),
             kafka_max_messages: Some(1024),
             watermark_idle_source_ms: Some(45_000),
+            mv_flush: config::MvFlushConfig::default(),
         },
         storage: config::StorageConfig {
             await_durable: Some(true),
@@ -351,6 +352,28 @@ fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     assert_eq!(args.ingest_batch_size, 999);
     assert!(args.maintenance_paused);
     assert_eq!(args.slatedb_await_durable, Some(true));
+}
+
+#[test]
+fn mv_flush_coalescing_config_maps_optional_fields() {
+    let config = config::MvFlushConfig {
+        max_pending_deltas: Some(8),
+        max_pending_versions: Some(16),
+        max_pending_rows: Some(1_000),
+        max_pending_bytes: Some(2_000),
+        max_delay_ms: Some(250),
+        flush_on_catchup_boundary: Some(false),
+        flush_on_shutdown: Some(false),
+    };
+
+    let mapped = mv_flush_coalescing_config(&config);
+    assert_eq!(mapped.max_pending_deltas, 8);
+    assert_eq!(mapped.max_pending_versions, Some(16));
+    assert_eq!(mapped.max_pending_rows, Some(1_000));
+    assert_eq!(mapped.max_pending_bytes, Some(2_000));
+    assert_eq!(mapped.max_delay_ms, Some(250));
+    assert!(!mapped.flush_on_catchup_boundary);
+    assert!(!mapped.flush_on_shutdown);
 }
 
 #[test]

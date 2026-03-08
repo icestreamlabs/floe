@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -44,6 +45,7 @@ where
     pub state: RelationState<R>,
     pub table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
+    persist_integrated_state: bool,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
 }
 
@@ -74,11 +76,31 @@ where
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<R>,
     ) -> Self {
+        Self::new_with_integrated_state(projector, state, table, output, true)
+    }
+
+    pub fn new_without_integrated_state(
+        projector: Arc<dyn Fn(&K) -> R + Send + Sync>,
+        state: RelationState<R>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<R>,
+    ) -> Self {
+        Self::new_with_integrated_state(projector, state, table, output, false)
+    }
+
+    fn new_with_integrated_state(
+        projector: Arc<dyn Fn(&K) -> R + Send + Sync>,
+        state: RelationState<R>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<R>,
+        persist_integrated_state: bool,
+    ) -> Self {
         Self {
             projector,
             state,
             table,
             output,
+            persist_integrated_state,
             dict_cache: HashMap::new(),
         }
     }
@@ -88,23 +110,31 @@ where
         deltas: &HashMap<R, i64>,
         base: Option<u64>,
     ) -> Result<ZSetHandle> {
+        let staged: Vec<(&R, i64)> = deltas
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
+            .collect();
+        if staged.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
+            }
+            return Ok(versioned.handle_for_version(0));
+        }
+
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
-        for (key, delta) in deltas {
-            if *delta == 0 {
-                continue;
-            }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging map delta")?;
+        let ids = dict
+            .intern_many_values(staged.iter().map(|(key, _)| *key))
+            .await
+            .context("intern keys while staging map delta")?;
+        for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {
@@ -118,15 +148,6 @@ where
                 bucket,
                 deltas: bucket_deltas,
             });
-        }
-
-        if segments.is_empty() {
-            if base.is_some()
-                && let Some(handle) = versioned.current_handle()
-            {
-                return Ok(handle);
-            }
-            return Ok(versioned.handle_for_version(0));
         }
 
         let mut batch = WriteBatch::new();
@@ -178,19 +199,24 @@ where
 {
     async fn on_step(
         &mut self,
-        _ts: i64,
+        ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
-        let delta_handle = inputs
+        let total_start = Instant::now();
+        let input_handle = inputs
             .first()
             .cloned()
             .context("map operator requires one input delta handle")?;
 
+        let load_start = Instant::now();
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &input_handle)
                 .await
                 .context("load input delta for map")?;
+        let input_delta_rows = delta_values.len();
+        let load_ms = load_start.elapsed().as_millis() as u64;
 
+        let project_start = Instant::now();
         let mut projected: HashMap<R, i64> = HashMap::new();
         for (key, weight) in delta_values {
             let projected_key = (self.projector)(&key);
@@ -200,8 +226,21 @@ where
                 projected.remove(&projected_key);
             }
         }
+        let project_ms = project_start.elapsed().as_millis() as u64;
+        let output_delta_rows = projected.len();
 
         if projected.is_empty() {
+            tracing::debug!(
+                ts,
+                input_ns = %input_handle.ns,
+                input_version = input_handle.version,
+                input_delta_rows,
+                output_delta_rows,
+                load_ms,
+                project_ms,
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "map operator timing (no output)"
+            );
             return Ok(None);
         }
 
@@ -210,16 +249,47 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
-        let new_integrated_handle =
-            Self::apply_deltas_to_versioned(&mut self.state.integrated, &projected, base_version)
-                .await
-                .context("update integrated map state")?;
-        self.state.update_handle(new_integrated_handle);
+        let (integrated_apply_ms, integrated_version) = if self.persist_integrated_state {
+            let integrated_apply_start = Instant::now();
+            let new_integrated_handle = Self::apply_deltas_to_versioned(
+                &mut self.state.integrated,
+                &projected,
+                base_version,
+            )
+            .await
+            .context("update integrated map state")?;
+            let integrated_apply_ms = integrated_apply_start.elapsed().as_millis() as u64;
+            let integrated_version = new_integrated_handle.version;
+            self.state.update_handle(new_integrated_handle);
+            (integrated_apply_ms, Some(integrated_version))
+        } else {
+            (0, None)
+        };
 
-        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &projected, None)
+        let output_apply_start = Instant::now();
+        let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &projected, None)
             .await
             .context("persist map delta output")?;
-        Ok(Some(delta_handle))
+        let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            ts,
+            input_ns = %input_handle.ns,
+            input_version = input_handle.version,
+            input_delta_rows,
+            output_delta_rows,
+            base_version = ?base_version,
+            integrated_version = ?integrated_version,
+            persist_integrated_state = self.persist_integrated_state,
+            output_ns = %self.output.namespace(),
+            output_version = output_handle.version,
+            load_ms,
+            project_ms,
+            integrated_apply_ms,
+            output_apply_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "map operator timing"
+        );
+        Ok(Some(output_handle))
     }
 }
 
