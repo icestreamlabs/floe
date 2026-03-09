@@ -5,7 +5,12 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::scalar::ScalarValue;
 use floe_executor::FloeQueryContext;
@@ -484,6 +489,62 @@ fn tail_row_to_json(
 }
 
 fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
+    if array.is_null(row_idx) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx) as f64));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx).to_string()));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx).to_string()));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+
     let scalar = ScalarValue::try_from_array(array, row_idx)?;
     Ok(scalar_to_json(&scalar))
 }
