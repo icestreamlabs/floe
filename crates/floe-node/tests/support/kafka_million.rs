@@ -124,6 +124,17 @@ pub(crate) struct MillionQuerySpec {
     pub(crate) sample_match_field: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SinkMode {
+    WithKafkaSink,
+    NoSink,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TailVerifyMode {
+    SamplesOnly,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BidInput {
     pub(crate) auction: i64,
@@ -186,6 +197,17 @@ impl BidInput {
 }
 
 pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> Result<()> {
+    run_redpanda_kafka_million_test_impl(spec, SinkMode::WithKafkaSink).await
+}
+
+pub(crate) async fn run_redpanda_kafka_million_no_sink_test(spec: MillionQuerySpec) -> Result<()> {
+    run_redpanda_kafka_million_test_impl(spec, SinkMode::NoSink).await
+}
+
+async fn run_redpanda_kafka_million_test_impl(
+    spec: MillionQuerySpec,
+    sink_mode: SinkMode,
+) -> Result<()> {
     let brokers =
         std::env::var("FLOE_REDPANDA_BROKERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
     let run_id = SystemTime::now()
@@ -245,7 +267,9 @@ pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> R
 
     eprintln!("artifacts_dir={}", artifacts_dir.display());
     eprintln!("dataset_path={}", dataset_path.display());
-    eprintln!("brokers={brokers} input_topic={input_topic} output_topic={output_topic}");
+    eprintln!(
+        "brokers={brokers} input_topic={input_topic} output_topic={output_topic} sink_mode={sink_mode:?}"
+    );
 
     let expected = {
         let dataset_path = dataset_path.clone();
@@ -261,6 +285,24 @@ pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> R
         );
     }
 
+    let sinks = match sink_mode {
+        SinkMode::WithKafkaSink => vec![serde_json::json!({
+            "type": "kafka",
+            "name": "kafka_sink_million",
+            "brokers": brokers.clone(),
+            "topic": output_topic.clone(),
+            "mv": spec.mv_name,
+            "with_snapshot": false,
+            "batch_rows": sink_batch_rows,
+            "batch_bytes": 16777216,
+            "queue_capacity": 65536,
+            "retry_max_attempts": 8,
+            "retry_base_ms": 50,
+            "retry_max_backoff_ms": 1000
+        })],
+        SinkMode::NoSink => Vec::new(),
+    };
+
     let config = serde_json::json!({
         "connectors": [
             {
@@ -272,22 +314,7 @@ pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> R
                 "max_messages_per_tick": connector_max_messages_per_tick
             }
         ],
-        "sinks": [
-            {
-                "type": "kafka",
-                "name": "kafka_sink_million",
-                "brokers": brokers,
-                "topic": output_topic,
-                "mv": spec.mv_name,
-                "with_snapshot": false,
-                "batch_rows": sink_batch_rows,
-                "batch_bytes": 16777216,
-                "queue_capacity": 65536,
-                "retry_max_attempts": 8,
-                "retry_base_ms": 50,
-                "retry_max_backoff_ms": 1000
-            }
-        ],
+        "sinks": sinks,
         "storage": {
             "await_durable": false
         },
@@ -307,7 +334,9 @@ pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> R
         eprintln!("runtime.mv_flush.max_delay_ms={max_delay_ms}");
     }
     eprintln!("connector.max_messages_per_tick={connector_max_messages_per_tick}");
-    eprintln!("sink.batch_rows={sink_batch_rows}");
+    if matches!(sink_mode, SinkMode::WithKafkaSink) {
+        eprintln!("sink.batch_rows={sink_batch_rows}");
+    }
     eprintln!("run.ingest_batch_size={ingest_batch_size}");
     eprintln!("run.ingest_batch_per_source={ingest_batch_per_source}");
     eprintln!("run.ingest_batch_per_connector={ingest_batch_per_connector}");
@@ -333,70 +362,102 @@ pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> R
     let test_result = async {
         wait_for_pgwire(pg_port, &mut child, &stderr_log_path).await?;
 
-        let (pgwire_ready_tx, pgwire_ready_rx) = oneshot::channel();
-        let expected_for_pgwire = expected.clone();
-        let pgwire_task = tokio::spawn(async move {
-            verify_pgwire_tail_samples(
-                pg_port,
-                spec.mv_name,
-                spec.output_fields,
-                spec.sample_match_field,
-                expected_for_pgwire,
-                Duration::from_secs(1800),
-                pgwire_ready_tx,
-            )
-            .await
-        });
-        pgwire_ready_rx
-            .await
-            .context("wait for pgwire tail consumer readiness")?;
+        match sink_mode {
+            SinkMode::WithKafkaSink => {
+                let (pgwire_ready_tx, pgwire_ready_rx) = oneshot::channel();
+                let expected_for_pgwire = expected.clone();
+                let pgwire_task = tokio::spawn(async move {
+                    verify_pgwire_tail(
+                        pg_port,
+                        spec.mv_name,
+                        spec.output_fields,
+                        spec.sample_match_field,
+                        expected_for_pgwire,
+                        TailVerifyMode::SamplesOnly,
+                        Duration::from_secs(1800),
+                        pgwire_ready_tx,
+                    )
+                    .await
+                });
+                pgwire_ready_rx
+                    .await
+                    .context("wait for pgwire tail consumer readiness")?;
 
-        let produce_started = Instant::now();
-        {
-            let dataset_path = dataset_path.clone();
-            let brokers = brokers.clone();
-            let input_topic = input_topic.clone();
-            tokio::task::spawn_blocking(move || {
-                produce_dataset_file(&dataset_path, &brokers, &input_topic)
-            })
-            .await
-            .context("join kafka producer task")??;
-        }
-        eprintln!(
-            "kafka production completed in {:?}",
-            produce_started.elapsed()
-        );
+                let produce_started = Instant::now();
+                {
+                    let dataset_path = dataset_path.clone();
+                    let brokers = brokers.clone();
+                    let input_topic = input_topic.clone();
+                    tokio::task::spawn_blocking(move || {
+                        produce_dataset_file(&dataset_path, &brokers, &input_topic)
+                    })
+                    .await
+                    .context("join kafka producer task")??;
+                }
+                eprintln!(
+                    "kafka production completed in {:?}",
+                    produce_started.elapsed()
+                );
 
-        let observed_sink = {
-            let brokers = brokers.clone();
-            let output_topic = output_topic.clone();
-            let expected_row_count = expected.metrics.row_count;
-            let output_fields = spec.output_fields;
-            tokio::task::spawn_blocking(move || {
-                consume_sink_metrics(
-                    &brokers,
-                    &output_topic,
-                    output_fields,
-                    expected_row_count,
+                let observed_sink = {
+                    let brokers = brokers.clone();
+                    let output_topic = output_topic.clone();
+                    let expected_row_count = expected.metrics.row_count;
+                    let output_fields = spec.output_fields;
+                    tokio::task::spawn_blocking(move || {
+                        consume_sink_metrics(
+                            &brokers,
+                            &output_topic,
+                            output_fields,
+                            expected_row_count,
+                            Duration::from_secs(1800),
+                        )
+                    })
+                    .await
+                    .context("join sink consumer task")??
+                };
+
+                assert_eq!(
+                    observed_sink.row_count, expected.metrics.row_count,
+                    "sink row count mismatch"
+                );
+                assert_eq!(
+                    observed_sink.checksum, expected.metrics.checksum,
+                    "sink checksum mismatch"
+                );
+
+                pgwire_task
+                    .await
+                    .context("join pgwire tail consumer task")??;
+            }
+            SinkMode::NoSink => {
+                let produce_started = Instant::now();
+                {
+                    let dataset_path = dataset_path.clone();
+                    let brokers = brokers.clone();
+                    let input_topic = input_topic.clone();
+                    tokio::task::spawn_blocking(move || {
+                        produce_dataset_file(&dataset_path, &brokers, &input_topic)
+                    })
+                    .await
+                    .context("join kafka producer task")??;
+                }
+                eprintln!(
+                    "kafka production completed in {:?}",
+                    produce_started.elapsed()
+                );
+
+                verify_mv_snapshot_count_and_samples(
+                    pg_port,
+                    spec.mv_name,
+                    spec.output_fields,
+                    spec.sample_match_field,
+                    expected.clone(),
                     Duration::from_secs(1800),
                 )
-            })
-            .await
-            .context("join sink consumer task")??
-        };
-
-        assert_eq!(
-            observed_sink.row_count, expected.metrics.row_count,
-            "sink row count mismatch"
-        );
-        assert_eq!(
-            observed_sink.checksum, expected.metrics.checksum,
-            "sink checksum mismatch"
-        );
-
-        pgwire_task
-            .await
-            .context("join pgwire tail consumer task")??;
+                .await?;
+            }
+        }
 
         eprintln!(
             "verified rows={} checksum={}",
@@ -636,12 +697,13 @@ fn consume_sink_metrics(
     Ok(metrics)
 }
 
-async fn verify_pgwire_tail_samples(
+async fn verify_pgwire_tail(
     pg_port: u16,
     mv_name: &str,
     output_fields: &'static [FieldSpec],
     sample_match_field: &'static str,
     expected: ExpectedDataset,
+    verify_mode: TailVerifyMode,
     timeout: Duration,
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
@@ -669,7 +731,6 @@ async fn verify_pgwire_tail_samples(
     let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
     let start = Instant::now();
     let mut tail_rows_seen: usize = 0;
-
     while start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(250), stream.try_next()).await {
             Ok(Ok(Some(SimpleQueryMessage::Row(row)))) => {
@@ -702,6 +763,11 @@ async fn verify_pgwire_tail_samples(
                 }
                 if tail_rows_seen % 100_000 == 0 {
                     eprintln!("consumed {tail_rows_seen} pgwire tail rows from mv={mv_name}");
+                }
+                if matches!(verify_mode, TailVerifyMode::SamplesOnly)
+                    && observed_samples.len() == expected.sample_rows_by_key.len()
+                {
+                    break;
                 }
             }
             Ok(Ok(Some(SimpleQueryMessage::RowDescription(_))))
@@ -742,6 +808,157 @@ async fn verify_pgwire_tail_samples(
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(())
+}
+
+async fn verify_mv_snapshot_count_and_samples(
+    pg_port: u16,
+    mv_name: &str,
+    output_fields: &'static [FieldSpec],
+    sample_match_field: &'static str,
+    expected: ExpectedDataset,
+    timeout: Duration,
+) -> Result<()> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+        NoTls,
+    )
+    .await
+    .context("connect to pgwire for no-sink verification")?;
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let expected_rows = usize::try_from(expected.metrics.row_count)
+        .context("expected row count must be non-negative and fit usize")?;
+    let start = Instant::now();
+    loop {
+        let observed_rows = query_mv_count(&client, mv_name).await?;
+        if observed_rows == expected_rows {
+            break;
+        }
+        if observed_rows > expected_rows {
+            bail!(
+                "mv row count exceeded expected: observed={}, expected={}",
+                observed_rows,
+                expected_rows
+            );
+        }
+        if start.elapsed() >= timeout {
+            bail!(
+                "mv row count did not reach expected within timeout: observed={}, expected={}",
+                observed_rows,
+                expected_rows
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    let sample_field_idx = sample_field_index(output_fields, sample_match_field)?;
+    let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
+    if !expected.sample_rows_by_key.is_empty() {
+        let sample_field_kind = output_fields
+            .get(sample_field_idx)
+            .map(|field| field.kind)
+            .with_context(|| format!("sample field index {} out of bounds", sample_field_idx))?;
+        let sample_in_list =
+            build_sql_in_list(expected.sample_rows_by_key.keys(), sample_field_kind)
+                .context("build sample IN list")?;
+        let select_fields = output_fields
+            .iter()
+            .map(|field| field.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sample_sql = format!(
+            "SELECT {select_fields} FROM {mv_name} WHERE {sample_match_field} IN ({sample_in_list})"
+        );
+        let messages = client
+            .simple_query(&sample_sql)
+            .await
+            .with_context(|| format!("query sample rows from {mv_name}"))?;
+        for message in messages {
+            if let SimpleQueryMessage::Row(row) = message {
+                let parsed = row_from_query_row(&row, output_fields)?;
+                let key =
+                    expected_value_key(parsed.values.get(sample_field_idx).with_context(|| {
+                        format!(
+                            "sample field index {} out of bounds while parsing query row",
+                            sample_field_idx
+                        )
+                    })?);
+                observed_samples.insert(key, parsed);
+            }
+        }
+    }
+
+    if observed_samples.len() != expected.sample_rows_by_key.len() {
+        let missing: Vec<String> = expected
+            .sample_rows_by_key
+            .keys()
+            .filter(|key| !observed_samples.contains_key(*key))
+            .cloned()
+            .collect();
+        bail!(
+            "sample row count mismatch after no-sink verification: observed={}, expected={}, missing_keys={missing:?}",
+            observed_samples.len(),
+            expected.sample_rows_by_key.len()
+        );
+    }
+    for (key, expected_row) in &expected.sample_rows_by_key {
+        let actual = observed_samples
+            .get(key)
+            .with_context(|| format!("missing sample row for key={key}"))?;
+        if actual != expected_row {
+            bail!(
+                "sample mismatch for key={}: actual={actual:?}, expected={expected_row:?}",
+                key
+            );
+        }
+    }
+
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    Ok(())
+}
+
+async fn query_mv_count(client: &tokio_postgres::Client, mv_name: &str) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) AS row_count FROM {mv_name}");
+    let messages = client
+        .simple_query(&sql)
+        .await
+        .with_context(|| format!("query row count for {mv_name}"))?;
+    for message in messages {
+        if let SimpleQueryMessage::Row(row) = message {
+            let raw = row.get(0).context("COUNT(*) query missing first column")?;
+            let count = raw
+                .parse::<usize>()
+                .with_context(|| format!("parse COUNT(*) result '{raw}' as usize"))?;
+            return Ok(count);
+        }
+    }
+    bail!("COUNT(*) query returned no rows for {mv_name}")
+}
+
+fn build_sql_in_list<'a, I>(keys: I, field_kind: FieldKind) -> Result<String>
+where
+    I: Iterator<Item = &'a String>,
+{
+    let mut values = Vec::new();
+    for key in keys {
+        let value = match field_kind {
+            FieldKind::Int64 => {
+                let parsed = key
+                    .parse::<i64>()
+                    .with_context(|| format!("parse sample key '{key}' as i64"))?;
+                parsed.to_string()
+            }
+            FieldKind::String => format!("'{}'", key.replace('\'', "''")),
+        };
+        values.push(value);
+    }
+    if values.is_empty() {
+        bail!("sample key set is empty");
+    }
+    Ok(values.join(", "))
 }
 
 async fn spawn_node(
@@ -859,9 +1076,24 @@ fn row_from_pgwire(
     row: &tokio_postgres::SimpleQueryRow,
     output_fields: &[FieldSpec],
 ) -> Result<ExpectedRow> {
+    row_from_query_row_at_offset(row, output_fields, 3)
+}
+
+fn row_from_query_row(
+    row: &tokio_postgres::SimpleQueryRow,
+    output_fields: &[FieldSpec],
+) -> Result<ExpectedRow> {
+    row_from_query_row_at_offset(row, output_fields, 0)
+}
+
+fn row_from_query_row_at_offset(
+    row: &tokio_postgres::SimpleQueryRow,
+    output_fields: &[FieldSpec],
+    base_offset: usize,
+) -> Result<ExpectedRow> {
     let mut values = Vec::with_capacity(output_fields.len());
     for (idx, field) in output_fields.iter().enumerate() {
-        let value_idx = idx + 3;
+        let value_idx = idx + base_offset;
         let raw = row
             .get(value_idx)
             .with_context(|| format!("pgwire tail row missing {}", field.name))?;
