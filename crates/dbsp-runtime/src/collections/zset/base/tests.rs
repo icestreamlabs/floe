@@ -297,7 +297,7 @@ async fn compacts_versioned_zset() {
         )
         .await
         .expect("scan segments after compaction");
-    assert_eq!(segments_after.len(), 1);
+    assert_eq!(segments_after.len(), 2);
 
     let view_after = versioned
         .materialize()
@@ -310,9 +310,9 @@ async fn compacts_versioned_zset() {
         .await
         .expect("reopen");
     let manifest = reopened.manifest().expect("manifest present");
-    assert_eq!(manifest.buckets.len(), 1);
+    assert_eq!(manifest.buckets.len(), 2);
     let total_segments: usize = manifest.buckets.values().map(|v| v.len()).sum();
-    assert_eq!(total_segments, 1);
+    assert_eq!(total_segments, 2);
     let view_reopen = reopened.materialize().await.expect("materialize reopened");
     assert_eq!(view_reopen.get("a"), Some(&4));
     assert_eq!(view_reopen.get("b"), Some(&6));

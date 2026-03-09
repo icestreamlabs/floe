@@ -206,6 +206,7 @@ impl DbspGraphBuilder {
         let flush_cfg = self.mv_flush_coalescing;
         tracing::info!(
             view = %view_name,
+            enabled = flush_cfg.enabled,
             max_pending_deltas = flush_cfg.max_pending_deltas,
             max_pending_versions = ?flush_cfg.max_pending_versions,
             max_pending_rows = ?flush_cfg.max_pending_rows,
@@ -533,10 +534,16 @@ impl DbspGraphBuilder {
                 if diff == 0 {
                     continue;
                 }
-                let entry = merged.entry(key.clone()).or_insert(0);
-                *entry += diff;
-                if *entry == 0 {
-                    merged.remove(&key);
+                match merged.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        *entry.get_mut() += diff;
+                        if *entry.get() == 0 {
+                            entry.remove();
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(diff);
+                    }
                 }
             }
             if !merged.is_empty() {

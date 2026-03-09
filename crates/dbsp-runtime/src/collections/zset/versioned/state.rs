@@ -19,15 +19,20 @@ impl CompactionPolicy {
         Self {
             max_chain_len: usize::MAX,
             max_segments: usize::MAX,
+            max_bucket_segments: usize::MAX,
         }
     }
 
     pub fn is_disabled(self) -> bool {
-        self.max_chain_len == usize::MAX && self.max_segments == usize::MAX
+        self.max_chain_len == usize::MAX
+            && self.max_segments == usize::MAX
+            && self.max_bucket_segments == usize::MAX
     }
 
     pub fn should_compact(self, stats: VersionChainStats) -> bool {
-        stats.version_count >= self.max_chain_len || stats.segment_count >= self.max_segments
+        stats.version_count >= self.max_chain_len
+            || stats.segment_count >= self.max_segments
+            || stats.max_bucket_segment_count >= self.max_bucket_segments
     }
 }
 
@@ -36,7 +41,28 @@ impl Default for CompactionPolicy {
         Self {
             max_chain_len: 512,
             max_segments: 4096,
+            max_bucket_segments: 512,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactionPolicy, VersionChainStats};
+
+    #[test]
+    fn compaction_policy_triggers_on_bucket_depth() {
+        let policy = CompactionPolicy {
+            max_chain_len: usize::MAX,
+            max_segments: usize::MAX,
+            max_bucket_segments: 3,
+        };
+        let stats = VersionChainStats {
+            version_count: 1,
+            segment_count: 2,
+            max_bucket_segment_count: 3,
+        };
+        assert!(policy.should_compact(stats));
     }
 }
 
@@ -157,8 +183,30 @@ where
         self.load_manifest_record(version).await
     }
 
+    #[cfg(test)]
     pub(crate) fn intent_key_bytes(&self) -> &[u8] {
         &self.intent_key
+    }
+
+    pub(crate) async fn adopt_persisted_version(&mut self, version: u64) -> Result<()> {
+        if version == 0 {
+            self.current_version = 0;
+            self.manifest = None;
+            return Ok(());
+        }
+
+        let manifest = self.load_manifest_record(version).await?;
+        let next_segment_id = manifest
+            .buckets
+            .values()
+            .flat_map(|segments| segments.iter().copied())
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(1);
+        self.current_version = version;
+        self.next_segment_id = self.next_segment_id.max(next_segment_id);
+        self.manifest = Some(manifest);
+        Ok(())
     }
 
     pub(super) fn allocate_segment_id(&mut self) -> SegmentId {

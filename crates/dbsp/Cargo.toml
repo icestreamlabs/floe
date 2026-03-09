@@ -13,6 +13,7 @@ dbsp-storage = { path = "../dbsp-storage" }
 criterion = "0.5"
 object_store = { workspace = true }
 rand = "0.8"
+rkyv = { workspace = true }
 slatedb = { workspace = true }
 tokio = { workspace = true }
 

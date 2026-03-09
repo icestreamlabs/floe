@@ -34,6 +34,29 @@ pub(crate) const ZSET_SUM_PREFIX: &str = "zset_sum/";
 pub(crate) const ZSET_INTEGRAL_PREFIX: &str = "zset_integral/";
 pub(crate) const ZSET_INTEGRAL_STREAM_PREFIX: &str = "stream_zset_integral/";
 pub(crate) const DELTA_LIFTED_JOIN_STREAM_PREFIX: &str = "stream_delta_lifted_join/";
+pub(crate) const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
+
+fn dictionary_namespace_for_handle(ns: &str) -> &str {
+    ns.strip_suffix(DELTA_NAMESPACE_SUFFIX).unwrap_or(ns)
+}
+
+pub(crate) fn delta_handle_namespace(namespace: &str) -> String {
+    format!("{namespace}{DELTA_NAMESPACE_SUFFIX}")
+}
+
+pub(crate) async fn open_delta_handle_stream(
+    input: &Stream<ZSetHandle>,
+) -> Result<Stream<ZSetHandle>> {
+    let delta_namespace = delta_handle_namespace(input.namespace());
+    let default_hint = ZSetHandle {
+        ns: delta_namespace.clone(),
+        version: 0,
+    };
+    let group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(default_hint));
+    Stream::with_table(input.table(), delta_namespace, group)
+        .await
+        .context("open companion delta handle stream")
+}
 
 pub(crate) async fn collect_values<T>(stream: &Stream<T>, up_to: i64) -> Result<Vec<T>>
 where
@@ -175,15 +198,16 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let dict = if let Some(existing) = cache.get(&handle.ns) {
+    let dict_ns = dictionary_namespace_for_handle(&handle.ns);
+    let dict = if let Some(existing) = cache.get(dict_ns) {
         existing.clone()
     } else {
         let dictionary = Arc::new(
-            Dictionary::with_table(table.clone(), handle.ns.clone(), None)
+            Dictionary::with_table(table.clone(), dict_ns.to_string(), None)
                 .await
                 .context("open dictionary for ZSet handle")?,
         );
-        cache.insert(handle.ns.clone(), dictionary.clone());
+        cache.insert(dict_ns.to_string(), dictionary.clone());
         dictionary
     };
 
@@ -213,15 +237,16 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let dict = if let Some(existing) = cache.get(&handle.ns) {
+    let dict_ns = dictionary_namespace_for_handle(&handle.ns);
+    let dict = if let Some(existing) = cache.get(dict_ns) {
         existing.clone()
     } else {
         let dictionary = Arc::new(
-            Dictionary::with_table(table.clone(), handle.ns.clone(), None)
+            Dictionary::with_table(table.clone(), dict_ns.to_string(), None)
                 .await
                 .context("open dictionary for ZSet handle")?,
         );
-        cache.insert(handle.ns.clone(), dictionary.clone());
+        cache.insert(dict_ns.to_string(), dictionary.clone());
         dictionary
     };
 

@@ -5,9 +5,7 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::tests::common::build_db;
 use crate::stream::{StreamRetention, ZSetStream};
-use slatedb::config::ScanOptions;
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn zset_stream_compacts_and_releases_versions() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
@@ -28,6 +26,7 @@ async fn zset_stream_compacts_and_releases_versions() {
     zset.set_compaction_policy(CompactionPolicy {
         max_chain_len: 2,
         max_segments: 4,
+        max_bucket_segments: 3,
     });
 
     zset.add_delta(b"a".to_vec(), 1);
@@ -37,17 +36,20 @@ async fn zset_stream_compacts_and_releases_versions() {
     zset.add_delta(b"c".to_vec(), 1);
     zset.flush().await.expect("flush t3");
 
+    loop {
+        let stats = zset.versioned().chain_stats().await.expect("chain stats");
+        if stats.version_count == 1 {
+            break;
+        }
+        let _ = zset
+            .wait_for_background_compaction()
+            .await
+            .expect("wait for background compaction");
+        zset.flush().await.expect("drive background compaction");
+    }
+
     let stats = zset.versioned().chain_stats().await.expect("chain stats");
     assert_eq!(stats.version_count, 1);
-
-    let manifests = table
-        .scan_prefix(
-            zset.versioned().manifest_prefix_bytes(),
-            &ScanOptions::default(),
-        )
-        .await
-        .expect("scan manifests");
-    assert_eq!(manifests.len(), 1);
 
     let view = zset
         .latest_view()

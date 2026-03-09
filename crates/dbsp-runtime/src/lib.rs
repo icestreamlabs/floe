@@ -7,6 +7,7 @@ pub mod filter_map;
 pub mod handles;
 pub mod join;
 pub mod map;
+mod metrics;
 pub mod operators;
 pub mod relation_state;
 pub mod semijoin;

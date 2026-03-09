@@ -57,13 +57,6 @@ where
             .await
             .context("persist versioned ZSet manifest")?;
 
-        let mut clear_intent = WriteBatch::new();
-        clear_intent.delete(self.intent_key.clone());
-        self.table
-            .write_batch(clear_intent)
-            .await
-            .context("clear versioned intent")?;
-
         self.apply_version_plan(&plan);
 
         Ok(plan.version)
@@ -95,8 +88,6 @@ where
         if processed.is_empty() {
             return Err(anyhow!("no deltas to persist in version"));
         }
-
-        batch.put(self.intent_key.clone(), vec![1]);
 
         let mut buckets = BTreeMap::new();
         for record in &processed {
@@ -155,15 +146,16 @@ where
 
         let mut version_count = 0;
         let mut segment_count = 0;
+        let mut bucket_segment_counts: BTreeMap<u16, usize> = BTreeMap::new();
         let mut current = self.manifest.clone();
 
         while let Some(manifest) = current {
             version_count += 1;
-            segment_count += manifest
-                .buckets
-                .values()
-                .map(|segments| segments.len())
-                .sum::<usize>();
+            for (bucket, segments) in &manifest.buckets {
+                let count = segments.len();
+                segment_count += count;
+                *bucket_segment_counts.entry(*bucket).or_insert(0) += count;
+            }
             if let Some(base_version) = manifest.base {
                 current = Some(self.load_manifest_record(base_version).await?);
             } else {
@@ -171,9 +163,11 @@ where
             }
         }
 
+        let max_bucket_segment_count = bucket_segment_counts.values().copied().max().unwrap_or(0);
         Ok(VersionChainStats {
             version_count,
             segment_count,
+            max_bucket_segment_count,
         })
     }
 
@@ -348,7 +342,7 @@ where
     }
 
     pub(super) async fn refresh_state(&mut self) -> Result<()> {
-        if let Some(intent_bytes) = self.table.get(&self.intent_key).await?
+        if let Some(intent_bytes) = self.table.get_bytes(&self.intent_key).await?
             && !intent_bytes.is_empty()
         {
             self.table
@@ -359,7 +353,7 @@ where
 
         let entries = self
             .table
-            .scan_range(
+            .scan_range_bytes(
                 prefix_bounds(&self.manifest_prefix),
                 &ScanOptions::default(),
             )
@@ -408,10 +402,10 @@ where
             let key = self.manifest_key(v);
             let bytes = self
                 .table
-                .get(&key)
+                .get_bytes(&key)
                 .await?
                 .ok_or_else(|| anyhow!("manifest version {v} not found"))?;
-            let manifest = decode_manifest(&bytes)?;
+            let manifest = decode_manifest(bytes.as_ref())?;
             chain.push(v);
             manifests.push(manifest.clone());
             current = manifest.base;
@@ -437,13 +431,17 @@ where
         Ok(aggregate)
     }
 
-    async fn load_segment(&self, bucket: u16, segment: SegmentId) -> Result<SegmentRecord> {
+    pub(super) async fn load_segment(
+        &self,
+        bucket: u16,
+        segment: SegmentId,
+    ) -> Result<SegmentRecord> {
         let key = self.segment_key(bucket, segment);
         let bytes =
-            self.table.get(&key).await?.ok_or_else(|| {
+            self.table.get_bytes(&key).await?.ok_or_else(|| {
                 anyhow!("segment not found for bucket {bucket} segment {segment}")
             })?;
-        decode_segment_record(bucket, segment, &bytes)
+        decode_segment_record(bucket, segment, bytes.as_ref())
             .context("decode versioned segment from Arrow IPC")
     }
 
@@ -451,10 +449,10 @@ where
         let key = self.manifest_key(version);
         let bytes = self
             .table
-            .get(&key)
+            .get_bytes(&key)
             .await?
             .ok_or_else(|| anyhow!("manifest version {version} not found"))?;
-        decode_manifest(&bytes)
+        decode_manifest(bytes.as_ref())
     }
 
     async fn store_manifest(&self, version: u64, manifest: &ZSetVersionManifest) -> Result<()> {

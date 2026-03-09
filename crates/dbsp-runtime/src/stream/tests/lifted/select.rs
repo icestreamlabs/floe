@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::CompactionPolicy;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
@@ -120,4 +121,71 @@ async fn lifted_select_zset_stream_emits_updates_after_build() {
         .await
         .unwrap();
     assert_eq!(materialized.get("keep-me"), Some(&1));
+}
+
+#[tokio::test]
+async fn lifted_select_handles_compaction_noop_without_replaying_snapshot() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_select_compaction", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut source = ZSetStream::new(
+        dict,
+        table.clone(),
+        "lifted_select_compaction",
+        StreamRetention::KeepLast { keep_last: 3 },
+    )
+    .await
+    .expect("create source stream");
+    source.set_compaction_policy(CompactionPolicy {
+        max_chain_len: 1,
+        max_segments: 1,
+        max_bucket_segments: 1,
+    });
+
+    let derived =
+        lifted_select_zset_stream::<String, _>(&source.handle_stream(), |value: &String| {
+            value.starts_with('k')
+        })
+        .await
+        .expect("build lifted select");
+
+    let mut cursor = StreamCursor::new(derived);
+    let _ = cursor.snapshot().await.expect("initial snapshot");
+
+    source.add_delta("keep".to_string(), 1);
+    source.flush().await.expect("flush t1");
+    let (_ts1, h1) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("wait for t1")
+        .expect("t1 handle");
+
+    let _ = source
+        .wait_for_background_compaction()
+        .await
+        .expect("wait for compaction");
+    source.flush().await.expect("flush t2 noop");
+    let (_ts2, h2) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("wait for t2")
+        .expect("t2 handle");
+
+    let mut cache = HashMap::new();
+    let t1 = materialize_zset_handle::<String>(table.clone(), &mut cache, &h1)
+        .await
+        .expect("materialize t1");
+    let t2 = materialize_zset_handle::<String>(table.clone(), &mut cache, &h2)
+        .await
+        .expect("materialize t2");
+
+    assert_eq!(t1.get("keep"), Some(&1));
+    assert_eq!(
+        t2.get("keep"),
+        Some(&1),
+        "noop tick should not double-count"
+    );
 }

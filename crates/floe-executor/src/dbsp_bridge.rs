@@ -20,6 +20,13 @@ use slatedb::Db;
 use crate::namespaces;
 
 const MV_SCHEMA_SUFFIX: &str = "/meta/schema.json";
+const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
+
+fn dictionary_namespace(namespace: &str) -> &str {
+    namespace
+        .strip_suffix(DELTA_NAMESPACE_SUFFIX)
+        .unwrap_or(namespace)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceStorageSummary {
@@ -73,11 +80,13 @@ impl DbspBridge {
     }
 
     async fn dictionary_for(&mut self, namespace: &str) -> Result<Arc<Dictionary<Vec<u8>>>> {
-        match self.dictionaries.entry(namespace.to_string()) {
+        let dict_namespace = dictionary_namespace(namespace);
+        match self.dictionaries.entry(dict_namespace.to_string()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
             Entry::Vacant(entry) => {
                 let dict = Arc::new(
-                    Dictionary::with_table(self.table.clone(), namespace.to_string(), None).await?,
+                    Dictionary::with_table(self.table.clone(), dict_namespace.to_string(), None)
+                        .await?,
                 );
                 Ok(entry.insert(dict).clone())
             }
@@ -297,6 +306,7 @@ mod tests {
         bridge.set_stream_compaction_policy(CompactionPolicy {
             max_chain_len: 1,
             max_segments: 1,
+            max_bucket_segments: 1,
         });
 
         let namespace = "mv_maint_pause";

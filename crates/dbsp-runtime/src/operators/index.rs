@@ -11,6 +11,7 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::collections::IndexedBatchZSet;
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -156,10 +157,16 @@ where
             return Ok(None);
         }
 
+        let persist_start = std::time::Instant::now();
         self.index
             .apply_deltas(updates)
             .await
             .context("apply arranged index deltas")?;
+        metrics::observe_operator_persistence_latency_ms(
+            "index",
+            "arrangement",
+            persist_start.elapsed().as_millis() as u64,
+        );
 
         Ok(None)
     }

@@ -16,11 +16,11 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
     LIFTED_SELECT_STREAM_PREFIX, LIFTED_SELECT_ZSET_PREFIX, build_derived_stream, collect_values,
-    compute_delta, next_lifted_zset_namespace,
+    next_lifted_zset_namespace, open_delta_handle_stream,
 };
 use crate::stream::{Stream, StreamCursor, StreamRetention, ZSetStream};
 
-use super::helpers::{materialize_zset_with_retry, publish_handle};
+use super::helpers::{delta_for_snapshot_step_with_retry, publish_handle};
 
 pub async fn lifted_select_zset_stream<K, P>(
     input: &Stream<ZSetHandle>,
@@ -55,20 +55,24 @@ where
         build_derived_stream(table.clone(), handle_group, LIFTED_SELECT_STREAM_PREFIX).await?;
 
     let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
-    let mut previous: HashMap<K, i64> = HashMap::new();
+    let delta_input = open_delta_handle_stream(input).await?;
     let mut initialized = false;
     let mut writer = result_stream.clone();
     let predicate: Arc<P> = Arc::new(predicate);
 
     let handles = collect_values(input, input.current_time()).await?;
-    for handle in handles {
+    let delta_handles = collect_values(&delta_input, input.current_time()).await?;
+    let mut previous_input_handle: Option<ZSetHandle> = None;
+    for (index, handle) in handles.iter().enumerate() {
+        let candidate_delta = delta_handles.get(index);
         let output_handle = select_handle(
             table.clone(),
             &predicate,
             &mut dict_cache,
-            &mut previous,
             &mut zset_stream,
-            &handle,
+            handle,
+            &mut previous_input_handle,
+            candidate_delta,
         )
         .await?;
         publish_handle(&mut writer, output_handle, &mut initialized).await?;
@@ -79,20 +83,33 @@ where
     let mut cursor = StreamCursor::new(input.clone());
     tokio::spawn(async move {
         let mut dict_cache = dict_cache;
-        let mut previous = previous;
         let mut zset_stream = zset_stream;
+        let mut delta_input = delta_input;
         let mut writer = writer;
         let mut initialized = initialized;
+        let mut previous_input_handle = previous_input_handle;
         loop {
             match cursor.next().await {
-                Ok((_, handle)) => {
+                Ok((ts, handle)) => {
+                    let delta_handle = match delta_input.get(ts).await {
+                        Ok(handle) => Some(handle),
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                timestamp = ts,
+                                "lifted select delta stream lookup failed; falling back to handle namespace"
+                            );
+                            None
+                        }
+                    };
                     match select_handle(
                         table.clone(),
                         &predicate,
                         &mut dict_cache,
-                        &mut previous,
                         &mut zset_stream,
                         &handle,
+                        &mut previous_input_handle,
+                        delta_handle.as_ref(),
                     )
                     .await
                     {
@@ -135,9 +152,10 @@ async fn select_handle<K, P>(
     table: Arc<dyn KeyValueTable>,
     predicate: &Arc<P>,
     dict_cache: &mut HashMap<String, Arc<Dictionary<K>>>,
-    previous: &mut HashMap<K, i64>,
     zset_stream: &mut ZSetStream<K>,
-    handle: &ZSetHandle,
+    snapshot_handle: &ZSetHandle,
+    previous_snapshot: &mut Option<ZSetHandle>,
+    candidate_delta_handle: Option<&ZSetHandle>,
 ) -> Result<ZSetHandle>
 where
     K: Archive
@@ -151,21 +169,28 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     P: Fn(&K) -> bool + Send + Sync + 'static,
 {
-    let materialized = materialize_zset_with_retry::<K>(table, dict_cache, handle).await?;
-
-    let mut filtered = HashMap::new();
-    for (key, weight) in materialized {
-        if predicate(&key) && weight != 0 {
-            filtered.insert(key, weight);
+    let deltas = delta_for_snapshot_step_with_retry::<K>(
+        table,
+        dict_cache,
+        snapshot_handle,
+        previous_snapshot.as_ref(),
+        candidate_delta_handle,
+    )
+    .await?;
+    *previous_snapshot = Some(snapshot_handle.clone());
+    let mut filtered_deltas: HashMap<K, i64> = HashMap::new();
+    for (key, delta) in deltas {
+        if delta == 0 || !predicate(&key) {
+            continue;
         }
+        *filtered_deltas.entry(key).or_insert(0) += delta;
     }
+    filtered_deltas.retain(|_, delta| *delta != 0);
 
-    let deltas = compute_delta(previous, &filtered);
-    zset_stream.add_deltas(deltas);
+    zset_stream.add_deltas(filtered_deltas.into_iter());
     let handle = zset_stream
         .flush()
         .await
         .context("flush lifted select result")?;
-    *previous = filtered;
     Ok(handle)
 }

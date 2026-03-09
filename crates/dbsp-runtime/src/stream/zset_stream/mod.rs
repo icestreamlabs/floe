@@ -8,8 +8,9 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::task::JoinHandle;
 
-use crate::collections::zset::{CompactionPolicy, VersionedZSet};
+use crate::collections::zset::{CompactionPolicy, SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
@@ -54,6 +55,12 @@ pub(crate) struct CompactionScheduler {
     tick: u64,
     next_allowed_tick: u64,
     in_flight_jobs: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompactionResult {
+    pub(crate) source_version: u64,
+    pub(crate) segments: Vec<SegmentRecord>,
 }
 
 impl CompactionScheduler {
@@ -160,4 +167,5 @@ where
     delta_retention_window: VecDeque<ZSetHandle>,
     delta_retention_counts: HashMap<u64, usize>,
     delta_current_handle: ZSetHandle,
+    pending_compaction: Option<JoinHandle<anyhow::Result<CompactionResult>>>,
 }

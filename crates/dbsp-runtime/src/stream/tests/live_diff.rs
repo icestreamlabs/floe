@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::collections::CompactionPolicy;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
+use crate::stream::cursor::StreamCursor;
+use crate::stream::operations::basic::differentiate_zset_stream_live;
 use crate::stream::tests::common::build_db;
 use crate::stream::util::{collect_values, materialize_zset_handle};
 use crate::stream::zset_stream::{StreamRetention, ZSetStream};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn live_diff_emits_empty_delta_for_noop_ticks() {
@@ -63,4 +68,63 @@ async fn live_diff_emits_empty_delta_for_noop_ticks() {
     assert_eq!(h1, HashMap::from([(b"a".to_vec(), 1)]));
     assert_eq!(h2, HashMap::from([(b"b".to_vec(), 1)]));
     assert!(h3.is_empty(), "noop tick should emit empty delta");
+}
+
+#[tokio::test]
+async fn live_differentiate_stream_emits_empty_on_compaction_noop_tick() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "live_diff_operator_input", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut source = ZSetStream::new(
+        dict,
+        table.clone(),
+        "live_diff_operator_input".to_string(),
+        StreamRetention::KeepLast { keep_last: 4 },
+    )
+    .await
+    .expect("create zset stream");
+    source.set_compaction_policy(CompactionPolicy {
+        max_chain_len: 1,
+        max_segments: 1,
+        max_bucket_segments: 1,
+    });
+
+    let derived = differentiate_zset_stream_live::<Vec<u8>>(&source.handle_stream())
+        .await
+        .expect("build live differentiate stream");
+    let mut cursor = StreamCursor::new(derived);
+    let _ = cursor.snapshot().await.expect("initial snapshot");
+
+    source.add_delta(b"a".to_vec(), 1);
+    source.flush().await.expect("flush t1");
+    let (_ts1, h1) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("wait for t1")
+        .expect("t1 handle");
+
+    let _ = source
+        .wait_for_background_compaction()
+        .await
+        .expect("wait for compaction");
+    source.flush().await.expect("flush t2 noop");
+    let (_ts2, h2) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("wait for t2")
+        .expect("t2 handle");
+
+    let mut cache = HashMap::new();
+    let t1 = materialize_zset_handle::<Vec<u8>>(table.clone(), &mut cache, &h1)
+        .await
+        .expect("materialize t1");
+    let t2 = materialize_zset_handle::<Vec<u8>>(table.clone(), &mut cache, &h2)
+        .await
+        .expect("materialize t2");
+
+    assert_eq!(t1, HashMap::from([(b"a".to_vec(), 1)]));
+    assert!(t2.is_empty(), "noop tick must emit empty delta");
 }

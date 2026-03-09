@@ -112,6 +112,35 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
+    let mv_flush_enabled = mv_max_pending_deltas.is_some() || mv_max_delay_ms.is_some();
+    let connector_max_messages_per_tick = std::env::var("FLOE_E2E_CONNECTOR_MAX_MESSAGES_PER_TICK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_384);
+    let sink_batch_rows = std::env::var("FLOE_E2E_SINK_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_384);
+    let ingest_batch_size = std::env::var("FLOE_E2E_INGEST_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_384);
+    let ingest_batch_per_source = std::env::var("FLOE_E2E_INGEST_BATCH_PER_SOURCE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_384);
+    let ingest_batch_per_connector = std::env::var("FLOE_E2E_INGEST_BATCH_PER_CONNECTOR")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_384);
+    let slatedb_flush_interval_ms = std::env::var("FLOE_E2E_SLATEDB_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
 
     eprintln!("artifacts_dir={}", artifacts_dir.display());
     eprintln!("dataset_path={}", dataset_path.display());
@@ -139,7 +168,7 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
                 "topics": [input_topic],
                 "group_id": group_id,
                 "poll_ms": 10,
-                "max_messages_per_tick": 16384
+                "max_messages_per_tick": connector_max_messages_per_tick
             }
         ],
         "sinks": [
@@ -150,7 +179,7 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
                 "topic": output_topic,
                 "mv": MV_NAME,
                 "with_snapshot": false,
-                "batch_rows": 16384,
+                "batch_rows": sink_batch_rows,
                 "batch_bytes": 16777216,
                 "queue_capacity": 65536,
                 "retry_max_attempts": 8,
@@ -163,16 +192,26 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
         },
         "runtime": {
             "mv_flush": {
+                "enabled": mv_flush_enabled,
                 "max_pending_deltas": mv_max_pending_deltas,
                 "max_delay_ms": mv_max_delay_ms
             }
         }
     });
+    eprintln!("runtime.mv_flush.enabled={mv_flush_enabled}");
     if let Some(max_pending_deltas) = mv_max_pending_deltas {
         eprintln!("runtime.mv_flush.max_pending_deltas={max_pending_deltas}");
     }
     if let Some(max_delay_ms) = mv_max_delay_ms {
         eprintln!("runtime.mv_flush.max_delay_ms={max_delay_ms}");
+    }
+    eprintln!("connector.max_messages_per_tick={connector_max_messages_per_tick}");
+    eprintln!("sink.batch_rows={sink_batch_rows}");
+    eprintln!("run.ingest_batch_size={ingest_batch_size}");
+    eprintln!("run.ingest_batch_per_source={ingest_batch_per_source}");
+    eprintln!("run.ingest_batch_per_connector={ingest_batch_per_connector}");
+    if let Some(flush_interval_ms) = slatedb_flush_interval_ms {
+        eprintln!("run.slatedb_flush_interval_ms={flush_interval_ms}");
     }
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write node config")?;
@@ -183,6 +222,10 @@ async fn redpanda_kafka_million_row_e2e() -> Result<()> {
         Some(MV_SQL),
         &stdout_log_path,
         &stderr_log_path,
+        ingest_batch_size,
+        ingest_batch_per_source,
+        ingest_batch_per_connector,
+        slatedb_flush_interval_ms,
     )
     .await?;
 
@@ -612,6 +655,10 @@ async fn spawn_node(
     mv_sql: Option<&str>,
     stdout_log_path: &Path,
     stderr_log_path: &Path,
+    ingest_batch_size: usize,
+    ingest_batch_per_source: usize,
+    ingest_batch_per_connector: usize,
+    slatedb_flush_interval_ms: Option<u64>,
 ) -> Result<Child> {
     let stdout_log = File::create(stdout_log_path)
         .with_context(|| format!("create {}", stdout_log_path.display()))?;
@@ -625,11 +672,11 @@ async fn spawn_node(
         .arg("--ingest-queue-capacity")
         .arg("262144")
         .arg("--ingest-batch-size")
-        .arg("16384")
+        .arg(ingest_batch_size.to_string())
         .arg("--ingest-batch-per-source")
-        .arg("16384")
+        .arg(ingest_batch_per_source.to_string())
         .arg("--ingest-batch-per-connector")
-        .arg("16384")
+        .arg(ingest_batch_per_connector.to_string())
         .arg("--slatedb-l0-sst-bytes")
         .arg("1073741824")
         .arg("--slatedb-max-unflushed-bytes")
@@ -640,6 +687,10 @@ async fn spawn_node(
         .arg(config_path)
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
+    if let Some(flush_interval_ms) = slatedb_flush_interval_ms {
+        cmd.arg("--slatedb-flush-interval-ms")
+            .arg(flush_interval_ms.to_string());
+    }
     if let Some(sql) = mv_sql {
         cmd.arg("--mv-query").arg(sql);
     }

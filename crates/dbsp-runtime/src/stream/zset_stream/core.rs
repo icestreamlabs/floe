@@ -1,8 +1,9 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
@@ -11,8 +12,9 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::zset::{CompactionPolicy, SegmentRecord, VersionedZSet};
+use crate::collections::zset::{CompactionPolicy, SegmentRecord, VersionWritePlan, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics::{self, FlushWriteMetrics};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -20,11 +22,13 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use super::super::core::stream::Stream;
 use super::super::groups::HandleGroup;
 use super::super::util::collect_values;
-use super::CompactionSchedulerConfig;
 use super::StreamRetention;
 use super::ZSetStream;
+use super::{CompactionResult, CompactionSchedulerConfig};
 
 const DELTA_SUFFIX: &str = "/delta";
+const MAX_WRITE_BATCH_CALLS_WITHOUT_OVERLAY: u64 = 1;
+const MAX_WRITE_BATCH_CALLS_WITH_OVERLAY: u64 = 1;
 
 impl<K> ZSetStream<K>
 where
@@ -46,14 +50,13 @@ where
     ) -> Result<Self> {
         let namespace = namespace.into();
         let delta_namespace = format!("{namespace}{DELTA_SUFFIX}");
-        let versioned = VersionedZSet::new(dict, table.clone(), namespace.clone()).await?;
-        let delta_dict = Arc::new(
-            Dictionary::with_table(table.clone(), delta_namespace.clone(), None)
-                .await
-                .context("create delta dictionary for zset stream")?,
-        );
-        let delta_versioned =
-            VersionedZSet::new(delta_dict, table.clone(), delta_namespace.clone()).await?;
+        let mut versioned = VersionedZSet::new(dict, table.clone(), namespace.clone()).await?;
+        let mut delta_versioned = VersionedZSet::new(
+            versioned.dictionary(),
+            table.clone(),
+            delta_namespace.clone(),
+        )
+        .await?;
         let default_hint = ZSetHandle {
             ns: namespace.clone(),
             version: 0,
@@ -83,6 +86,14 @@ where
             .unwrap_or(delta_default_handle.clone());
         let (delta_retention_window, delta_retention_counts) =
             initialize_retention(&delta_history, retention.window_size());
+        versioned
+            .adopt_persisted_version(current_handle.version)
+            .await
+            .context("align visible snapshot version on open")?;
+        delta_versioned
+            .adopt_persisted_version(delta_current_handle.version)
+            .await
+            .context("align visible delta version on open")?;
 
         Ok(Self {
             stream,
@@ -99,6 +110,7 @@ where
             delta_retention_window,
             delta_retention_counts,
             delta_current_handle,
+            pending_compaction: None,
         })
     }
 
@@ -184,8 +196,136 @@ where
         self.compaction_scheduler.set_config(config);
     }
 
+    async fn complete_background_compaction(
+        &mut self,
+        handle: tokio::task::JoinHandle<anyhow::Result<CompactionResult>>,
+    ) -> Result<()> {
+        match handle.await {
+            Ok(Ok(result)) => {
+                self.compaction_scheduler.finish_success();
+                if self.versioned.current_handle().map(|handle| handle.version)
+                    == Some(result.source_version)
+                {
+                    self.versioned
+                        .create_version_with_base(result.segments, None)
+                        .await
+                        .context("persist completed background compaction")?;
+                }
+            }
+            Ok(Err(err)) => {
+                self.compaction_scheduler.finish_failure();
+                tracing::warn!(
+                    namespace = %self.namespace(),
+                    error = %err,
+                    "background compaction failed"
+                );
+            }
+            Err(err) => {
+                self.compaction_scheduler.finish_failure();
+                tracing::warn!(
+                    namespace = %self.namespace(),
+                    error = %err,
+                    "background compaction task join failed"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn poll_background_compaction(&mut self) -> Result<()> {
+        let Some(handle) = self.pending_compaction.as_ref() else {
+            return Ok(());
+        };
+        if !handle.is_finished() {
+            return Ok(());
+        }
+
+        let handle = self
+            .pending_compaction
+            .take()
+            .ok_or_else(|| anyhow!("missing background compaction handle"))?;
+        self.complete_background_compaction(handle).await
+    }
+
+    async fn schedule_background_compaction(&mut self) -> Result<()> {
+        if self.compaction.is_disabled() || self.pending_compaction.is_some() {
+            return Ok(());
+        }
+
+        let Some(source_version) = self.versioned.current_handle().map(|handle| handle.version)
+        else {
+            return Ok(());
+        };
+
+        let chain_stats = self.versioned.chain_stats().await?;
+        if !self.compaction.should_compact(chain_stats) || !self.compaction_scheduler.try_start() {
+            return Ok(());
+        }
+
+        let table = self.versioned.table();
+        let namespace = self.namespace().to_string();
+        self.pending_compaction = Some(tokio::spawn(async move {
+            let dict = Arc::new(
+                Dictionary::<K>::with_table(table.clone(), namespace.clone(), None)
+                    .await
+                    .context("open dictionary for background compaction")?,
+            );
+            let mut versioned =
+                VersionedZSet::<K>::open_for_handle(dict, table, namespace.clone(), source_version)
+                    .await
+                    .context("open versioned state for background compaction")?;
+            let segments = versioned
+                .compact_current_detached_segments()
+                .await
+                .context("compact versioned chain in background")?;
+            Ok(CompactionResult {
+                source_version,
+                segments,
+            })
+        }));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_background_compaction(&mut self) -> Result<bool> {
+        let Some(handle) = self.pending_compaction.take() else {
+            return Ok(false);
+        };
+        match handle.await {
+            Ok(Ok(result)) => {
+                self.compaction_scheduler.finish_success();
+                if self.versioned.current_handle().map(|handle| handle.version)
+                    == Some(result.source_version)
+                {
+                    self.versioned
+                        .create_version_with_base(result.segments, None)
+                        .await
+                        .context("persist completed background compaction")?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Ok(Err(err)) => {
+                self.compaction_scheduler.finish_failure();
+                Err(err).context("background compaction failed")
+            }
+            Err(err) => {
+                self.compaction_scheduler.finish_failure();
+                Err(anyhow!(err)).context("background compaction task join failed")
+            }
+        }
+    }
+
     async fn flush_without_version_update(&mut self) -> Result<(ZSetHandle, ZSetHandle)> {
-        let handle = self.current_handle.clone();
+        self.compaction_scheduler.on_tick();
+        self.poll_background_compaction().await?;
+        let mut write_metrics = FlushWriteMetrics::default();
+        let handle = self
+            .versioned
+            .current_handle()
+            .unwrap_or_else(|| self.current_handle.clone());
         let delta_handle = self.delta_versioned.handle_for_version(0);
         self.stream
             .send(handle.clone())
@@ -197,32 +337,21 @@ where
             .context("advance delta stream without deltas")?;
 
         let mut batch = WriteBatch::new();
-        let stream_intent = self.stream.encode_intent_key();
-        let delta_stream_intent = self.delta_stream.encode_intent_key();
-        let (dirty, committed_ts) = flush_stream_into_batch(&mut self.stream, &mut batch)?;
-        let (delta_dirty, delta_committed_ts) =
+        let (dirty, committed_ts, stream_keys) =
+            flush_stream_into_batch(&mut self.stream, &mut batch)?;
+        let (delta_dirty, delta_committed_ts, delta_stream_keys) =
             flush_stream_into_batch(&mut self.delta_stream, &mut batch)?;
         let dirty = dirty || delta_dirty;
         if dirty {
             let committed_ts = committed_ts
                 .or(delta_committed_ts)
                 .ok_or_else(|| anyhow!("stream flush missing committed timestamp"))?;
-            batch.put(stream_intent.clone(), vec![1]);
-            batch.put(delta_stream_intent.clone(), vec![1]);
+            write_metrics.record_write_batch(stream_keys + delta_stream_keys);
             self.versioned
                 .table()
                 .write_batch(batch)
                 .await
                 .context("persist stream state")?;
-
-            let mut cleanup = WriteBatch::new();
-            cleanup.delete(stream_intent.clone());
-            cleanup.delete(delta_stream_intent.clone());
-            self.versioned
-                .table()
-                .write_batch(cleanup)
-                .await
-                .context("clear stream intent")?;
             self.stream.commit_frontier(committed_ts);
             self.delta_stream.commit_frontier(committed_ts);
         }
@@ -243,6 +372,9 @@ where
         self.apply_delta_retention(delta_releases).await?;
         self.current_handle = handle.clone();
         self.delta_current_handle = delta_handle.clone();
+        self.schedule_background_compaction().await?;
+        assert_flush_write_batch_bound(self.namespace(), false, write_metrics);
+        metrics::observe_flush_write_metrics(write_metrics);
         Ok((handle, delta_handle))
     }
 
@@ -251,63 +383,33 @@ where
         overlay: HashMap<K, i64>,
     ) -> Result<(ZSetHandle, ZSetHandle)> {
         let flush_start = std::time::Instant::now();
+        self.compaction_scheduler.on_tick();
+        self.poll_background_compaction().await?;
+        let mut write_metrics = FlushWriteMetrics::default();
         let dict = self.versioned.dictionary();
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let delta_dict = self.delta_versioned.dictionary();
-        let mut delta_buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let staged: Vec<(&K, i64)> = overlay
-            .iter()
-            .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
-            .collect();
+        let mut buckets: AHashMap<u16, Vec<(u64, i64)>> = AHashMap::new();
 
         let intern_main_start = std::time::Instant::now();
         let ids = dict
-            .intern_many_values(staged.iter().map(|(key, _)| *key))
+            .intern_many_values(
+                overlay
+                    .iter()
+                    .filter_map(|(key, delta)| (*delta != 0).then_some(key)),
+            )
             .await
             .context("intern keys while staging overlay")?;
-        for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
+        for ((_, delta), id) in overlay
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
+            .zip(ids.into_iter())
+        {
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
         }
         let intern_main_ms = intern_main_start.elapsed().as_millis() as u64;
 
-        let intern_delta_start = std::time::Instant::now();
-        let delta_ids = delta_dict
-            .intern_many_values(staged.iter().map(|(key, _)| *key))
-            .await
-            .context("intern keys while staging delta overlay")?;
-        for ((_, delta), delta_id) in staged.iter().zip(delta_ids.into_iter()) {
-            delta_buckets
-                .entry(bucket_for(delta_id))
-                .or_default()
-                .push((delta_id, *delta));
-        }
-        let intern_delta_ms = intern_delta_start.elapsed().as_millis() as u64;
-
         let mut segments = Vec::new();
-        for (bucket, mut deltas) in buckets {
-            deltas.retain(|(_, delta)| *delta != 0);
-            if deltas.is_empty() {
-                continue;
-            }
-            deltas.sort_by_key(|(id, _)| *id);
+        for (bucket, deltas) in buckets {
             segments.push(SegmentRecord {
-                id: 0,
-                bucket,
-                deltas,
-            });
-        }
-
-        let mut delta_segments = Vec::new();
-        for (bucket, mut deltas) in delta_buckets {
-            deltas.retain(|(_, delta)| *delta != 0);
-            if deltas.is_empty() {
-                continue;
-            }
-            deltas.sort_by_key(|(id, _)| *id);
-            delta_segments.push(SegmentRecord {
                 id: 0,
                 bucket,
                 deltas,
@@ -318,11 +420,9 @@ where
             return self.flush_without_version_update().await;
         }
 
-        let base = if self.current_handle.version == 0 {
-            None
-        } else {
-            Some(self.current_handle.version)
-        };
+        let delta_segments = segments.clone();
+
+        let base = self.versioned.current_handle().map(|handle| handle.version);
 
         let mut batch = WriteBatch::new();
         let plan = self
@@ -340,55 +440,18 @@ where
                     .context("schedule delta version update")?,
             )
         };
-
-        self.versioned
-            .table()
-            .write_batch(batch)
-            .await
-            .context("write versioned updates")?;
-
-        let mut cleanup_versions = WriteBatch::new();
-        cleanup_versions.delete(self.versioned.intent_key_bytes());
-        cleanup_versions.delete(self.delta_versioned.intent_key_bytes());
-        self.versioned
-            .table()
-            .write_batch(cleanup_versions)
-            .await
-            .context("clear version intents")?;
-        let persist_versions_ms = flush_start.elapsed().as_millis() as u64;
-
-        self.versioned.apply_version_plan(&plan);
-        if let Some(delta_plan) = &delta_plan {
-            self.delta_versioned.apply_version_plan(delta_plan);
-        }
-
-        let mut new_handle = self.versioned.handle_for_version(plan.version);
-        self.compaction_scheduler.on_tick();
-        if !self.compaction.is_disabled() {
-            let chain_stats = self.versioned.chain_stats().await?;
-            if self.compaction.should_compact(chain_stats) && self.compaction_scheduler.try_start()
-            {
-                match self.versioned.compact_current().await {
-                    Ok(compacted_version) => {
-                        new_handle = self.versioned.handle_for_version(compacted_version);
-                        self.compaction_scheduler.finish_success();
-                    }
-                    Err(err) if err.to_string().contains("cannot compact empty version") => {
-                        self.compaction_scheduler.finish_success();
-                    }
-                    Err(err) => {
-                        self.compaction_scheduler.finish_failure();
-                        return Err(err).context("compact versioned chain");
-                    }
-                }
-            }
-        }
+        let staged_version_keys = version_write_key_count(&plan)
+            + delta_plan
+                .as_ref()
+                .map(version_write_key_count)
+                .unwrap_or_default();
 
         let delta_handle = if let Some(delta_plan) = &delta_plan {
             self.delta_versioned.handle_for_version(delta_plan.version)
         } else {
             self.delta_versioned.handle_for_version(0)
         };
+        let new_handle = self.versioned.handle_for_version(plan.version);
 
         self.stream
             .send(new_handle.clone())
@@ -402,35 +465,25 @@ where
             self.stream.set_default_in_place(new_handle.clone());
         }
 
-        let stream_intent = self.stream.encode_intent_key();
-        let delta_stream_intent = self.delta_stream.encode_intent_key();
-        let mut stream_batch = WriteBatch::new();
-        let (stream_dirty, committed_ts) =
-            flush_stream_into_batch(&mut self.stream, &mut stream_batch)?;
-        if stream_dirty {
-            stream_batch.put(stream_intent.clone(), vec![1]);
-        }
-        let (delta_dirty, delta_committed_ts) =
-            flush_stream_into_batch(&mut self.delta_stream, &mut stream_batch)?;
-        if delta_dirty {
-            stream_batch.put(delta_stream_intent.clone(), vec![1]);
-        }
+        let (stream_dirty, committed_ts, stream_keys) =
+            flush_stream_into_batch(&mut self.stream, &mut batch)?;
+        let (delta_dirty, delta_committed_ts, delta_stream_keys) =
+            flush_stream_into_batch(&mut self.delta_stream, &mut batch)?;
+        let stream_batch_keys = stream_keys + delta_stream_keys;
 
+        write_metrics.record_write_batch(staged_version_keys + stream_batch_keys);
         self.versioned
             .table()
-            .write_batch(stream_batch)
+            .write_batch(batch)
             .await
-            .context("write stream updates")?;
-
-        let mut cleanup_streams = WriteBatch::new();
-        cleanup_streams.delete(stream_intent.clone());
-        cleanup_streams.delete(delta_stream_intent.clone());
-        self.versioned
-            .table()
-            .write_batch(cleanup_streams)
-            .await
-            .context("clear stream intents")?;
+            .context("write coalesced flush updates")?;
+        let persist_versions_ms = flush_start.elapsed().as_millis() as u64;
         let persist_streams_ms = flush_start.elapsed().as_millis() as u64;
+
+        self.versioned.apply_version_plan(&plan);
+        if let Some(delta_plan) = &delta_plan {
+            self.delta_versioned.apply_version_plan(delta_plan);
+        }
 
         self.current_handle = new_handle.clone();
         self.delta_current_handle = delta_handle.clone();
@@ -457,12 +510,16 @@ where
             delta_handle.clone(),
         );
         self.apply_delta_retention(delta_releases).await?;
+        self.schedule_background_compaction().await?;
 
+        assert_flush_write_batch_bound(self.namespace(), true, write_metrics);
+        metrics::observe_flush_write_metrics(write_metrics);
         tracing::debug!(
             namespace = %self.namespace(),
             overlay_rows = overlay.len(),
             intern_main_ms,
-            intern_delta_ms,
+            write_batch_calls = write_metrics.write_batch_calls,
+            keys_written = write_metrics.keys_written,
             persist_versions_ms,
             persist_streams_ms,
             total_flush_ms = flush_start.elapsed().as_millis() as u64,
@@ -496,19 +553,13 @@ where
 fn flush_stream_into_batch(
     stream: &mut Stream<ZSetHandle>,
     batch: &mut WriteBatch,
-) -> Result<(bool, Option<i64>)> {
-    let mut dirty = false;
-    if stream.flush_defaults_into(batch)? {
-        dirty = true;
-    }
-    if stream.flush_data_into(batch)? {
-        dirty = true;
-    }
+) -> Result<(bool, Option<i64>, usize)> {
+    let default_writes = stream.flush_defaults_into(batch)?;
+    let data_writes = stream.flush_data_into(batch)?;
     let committed_ts = stream.flush_state_into(batch)?;
-    if committed_ts.is_some() {
-        dirty = true;
-    }
-    Ok((dirty, committed_ts))
+    let state_writes = usize::from(committed_ts.is_some());
+    let writes = default_writes + data_writes + state_writes;
+    Ok((writes > 0, committed_ts, writes))
 }
 
 fn record_handle(
@@ -523,6 +574,7 @@ fn record_handle(
             return releases;
         }
 
+        *counts.entry(handle.version).or_insert(0) += 1;
         if window.len() >= limit
             && let Some(evicted) = window.pop_front()
             && let Some(count) = counts.get_mut(&evicted.version)
@@ -536,8 +588,6 @@ fn record_handle(
                 *count -= 1;
             }
         }
-
-        *counts.entry(handle.version).or_insert(0) += 1;
         window.push_back(handle);
     }
     releases
@@ -565,4 +615,40 @@ fn initialize_retention(
 
 fn bucket_for(id: u64) -> u16 {
     (id >> 48) as u16
+}
+
+fn version_write_key_count(plan: &VersionWritePlan) -> usize {
+    plan.manifest
+        .buckets
+        .values()
+        .map(std::vec::Vec::len)
+        .sum::<usize>()
+        + usize::from(plan.manifest.base.is_some())
+        + 1
+}
+
+fn assert_flush_write_batch_bound(namespace: &str, has_overlay: bool, metrics: FlushWriteMetrics) {
+    let max_calls = if has_overlay {
+        MAX_WRITE_BATCH_CALLS_WITH_OVERLAY
+    } else {
+        MAX_WRITE_BATCH_CALLS_WITHOUT_OVERLAY
+    };
+
+    if metrics.write_batch_calls > max_calls {
+        tracing::warn!(
+            namespace,
+            has_overlay,
+            write_batch_calls = metrics.write_batch_calls,
+            keys_written = metrics.keys_written,
+            max_write_batch_calls = max_calls,
+            "dbsp flush write-batch bound exceeded"
+        );
+    }
+
+    debug_assert!(
+        metrics.write_batch_calls <= max_calls,
+        "dbsp flush for namespace '{namespace}' exceeded write-batch bound: {} > {}",
+        metrics.write_batch_calls,
+        max_calls
+    );
 }

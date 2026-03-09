@@ -66,6 +66,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_intent_key(&self) -> Vec<u8> {
         self.core.encode_intent_key()
     }

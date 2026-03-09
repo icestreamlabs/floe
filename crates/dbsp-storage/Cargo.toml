@@ -5,10 +5,12 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+ahash = { workspace = true }
 async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 lru = "0.12"
 rkyv = { workspace = true }

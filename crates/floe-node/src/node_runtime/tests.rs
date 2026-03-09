@@ -357,6 +357,7 @@ fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
 #[test]
 fn mv_flush_coalescing_config_maps_optional_fields() {
     let config = config::MvFlushConfig {
+        enabled: Some(true),
         max_pending_deltas: Some(8),
         max_pending_versions: Some(16),
         max_pending_rows: Some(1_000),
@@ -367,6 +368,7 @@ fn mv_flush_coalescing_config_maps_optional_fields() {
     };
 
     let mapped = mv_flush_coalescing_config(&config);
+    assert!(mapped.enabled);
     assert_eq!(mapped.max_pending_deltas, 8);
     assert_eq!(mapped.max_pending_versions, Some(16));
     assert_eq!(mapped.max_pending_rows, Some(1_000));
@@ -374,6 +376,17 @@ fn mv_flush_coalescing_config_maps_optional_fields() {
     assert_eq!(mapped.max_delay_ms, Some(250));
     assert!(!mapped.flush_on_catchup_boundary);
     assert!(!mapped.flush_on_shutdown);
+}
+
+#[test]
+fn mv_flush_coalescing_defaults_to_disabled() {
+    let mapped = mv_flush_coalescing_config(&config::MvFlushConfig::default());
+    assert!(!mapped.enabled);
+    assert_eq!(mapped.max_pending_deltas, 1);
+    assert_eq!(mapped.max_pending_versions, None);
+    assert_eq!(mapped.max_pending_rows, None);
+    assert_eq!(mapped.max_pending_bytes, None);
+    assert_eq!(mapped.max_delay_ms, None);
 }
 
 #[test]

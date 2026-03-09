@@ -15,8 +15,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
     ZSET_INTEGRAL_PREFIX, ZSET_INTEGRAL_STREAM_PREFIX, build_derived_stream, collect_values,
-    compute_delta, materialize_zset_handle, next_lifted_zset_namespace, push_value_in_place,
-    resolve_apply_handle_op, set_default_in_place,
+    delta_handle_namespace, delta_zset_handle, next_lifted_zset_namespace,
+    open_delta_handle_stream, push_value_in_place, resolve_apply_handle_op, set_default_in_place,
 };
 use crate::stream::{Stream, StreamRetention, ZSetStream};
 
@@ -59,6 +59,8 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let handles = collect_values(stream, stream.current_time()).await?;
+    let delta_stream = open_delta_handle_stream(stream).await?;
+    let delta_handles = collect_values(&delta_stream, stream.current_time()).await?;
     let table = stream.table();
     let namespace = next_lifted_zset_namespace(ZSET_INTEGRAL_PREFIX);
     let dict = Arc::new(
@@ -71,32 +73,26 @@ where
         .context("create aggregator for integrated zset stream")?;
 
     let mut caches: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
-    let mut previous_state: HashMap<K, i64> = HashMap::new();
-    let mut integral_state: HashMap<K, i64> = HashMap::new();
-    let mut last_integral_state: HashMap<K, i64> = HashMap::new();
     let mut result_handles = Vec::with_capacity(handles.len());
+    let mut previous_handle: Option<ZSetHandle> = None;
 
-    for handle in handles {
-        let state = materialize_zset_handle::<K>(table.clone(), &mut caches, &handle)
-            .await
-            .context("materialize zset state for integration")?;
-        let deltas = compute_delta(&previous_state, &state);
-        previous_state = state;
-
-        for (key, weight) in deltas {
-            let entry = integral_state.entry(key).or_insert(0);
-            *entry = (*entry).saturating_add(weight);
-        }
-        integral_state.retain(|_, weight| *weight != 0);
-
-        let integral_delta = compute_delta(&last_integral_state, &integral_state);
-        aggregator.add_deltas(integral_delta);
+    for (index, handle) in handles.iter().enumerate() {
+        let deltas = resolve_step_deltas::<K>(
+            table.clone(),
+            &mut caches,
+            handle,
+            previous_handle.as_ref(),
+            delta_handles.get(index),
+        )
+        .await
+        .context("resolve zset deltas for integration")?;
+        previous_handle = Some(handle.clone());
+        aggregator.add_deltas(deltas);
         let handle = aggregator
             .flush()
             .await
             .context("flush integrated zset stream")?;
         result_handles.push(handle);
-        last_integral_state = integral_state.clone();
     }
 
     let default_handle = result_handles
@@ -122,4 +118,53 @@ where
 
     result_stream.flush().await?;
     Ok(result_stream)
+}
+
+async fn resolve_step_deltas<K>(
+    table: Arc<dyn crate::storage::KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    snapshot_handle: &ZSetHandle,
+    previous_snapshot: Option<&ZSetHandle>,
+    candidate_delta: Option<&ZSetHandle>,
+) -> Result<Vec<(K, i64)>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    if previous_snapshot == Some(snapshot_handle) {
+        return Ok(Vec::new());
+    }
+
+    let expected_ns = delta_handle_namespace(&snapshot_handle.ns);
+    if let Some(candidate) = candidate_delta
+        && candidate.ns == expected_ns
+    {
+        return delta_zset_handle::<K>(table, cache, candidate)
+            .await
+            .context("read candidate integration delta handle");
+    }
+
+    let fallback = ZSetHandle {
+        ns: expected_ns,
+        version: snapshot_handle.version,
+    };
+    match delta_zset_handle::<K>(table, cache, &fallback).await {
+        Ok(deltas) => Ok(deltas),
+        Err(err) if is_missing_manifest(&err) => Ok(Vec::new()),
+        Err(err) => Err(err).context("read fallback integration delta handle"),
+    }
+}
+
+fn is_missing_manifest(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("manifest version")
+        || message.contains("not found for namespace")
+        || message.contains("not found")
 }

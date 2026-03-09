@@ -278,6 +278,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             CompactionPolicy {
                 max_chain_len: stream_compaction.max_chain_len,
                 max_segments: stream_compaction.max_segments,
+                max_bucket_segments: stream_compaction.max_segments,
             },
             CompactionSchedulerConfig {
                 failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use futures::future::try_join_all;
@@ -16,7 +17,7 @@ use super::super::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidat
 use super::super::keyspace::{self, namespace_prefix};
 use super::super::{KeyValueTable, SlateTable};
 use super::batch::DictionaryBatch;
-use super::cache::{BatchOverlay, Cache};
+use super::cache::{BatchOverlay, Cache, SharedKey};
 use super::codec::{compress_value, decode_id, decompress_value, encode_id};
 use super::{HashFn, KeyIntern};
 
@@ -24,7 +25,6 @@ const K2ID_PREFIX: &[u8] = b"k2id/";
 const ID2K_PREFIX: &[u8] = b"id2k/";
 const META_NEXT_ID: &[u8] = b"meta/next_id";
 const RESOLVE_MANY_FETCH_CHUNK: usize = 256;
-
 #[allow(dead_code)]
 pub struct Dictionary<K>
 where
@@ -37,7 +37,7 @@ where
     meta_key: Vec<u8>,
     next_id: AtomicU64,
     cache: Mutex<Cache>,
-    seen_hashes: Mutex<std::collections::HashSet<u64>>,
+    seen_hashes: Mutex<AHashSet<u64>>,
     fast_path_fresh: bool,
     hash_fn: HashFn,
     _marker: std::marker::PhantomData<K>,
@@ -73,7 +73,7 @@ where
         meta_key.extend_from_slice(META_NEXT_ID);
 
         let next_value = table
-            .get(&meta_key)
+            .get_bytes(&meta_key)
             .await?
             .map(|bytes| decode_id(bytes.as_ref()))
             .transpose()?;
@@ -88,7 +88,7 @@ where
             meta_key,
             next_id: AtomicU64::new(next_id),
             cache: Mutex::new(Cache::new()),
-            seen_hashes: Mutex::new(std::collections::HashSet::new()),
+            seen_hashes: Mutex::new(AHashSet::new()),
             fast_path_fresh,
             hash_fn: hash_fn.unwrap_or_else(|| Arc::new(xxh3_64)),
             _marker: std::marker::PhantomData,
@@ -123,54 +123,88 @@ where
         (self.hash_fn)(key)
     }
 
+    fn encode_k2id_key_into(&self, out: &mut Vec<u8>, hash: u64, slot: u16) {
+        out.clear();
+        out.reserve(self.k2id_prefix.len() + 10);
+        out.extend_from_slice(&self.k2id_prefix);
+        out.extend_from_slice(&hash.to_be_bytes());
+        out.extend_from_slice(&slot.to_be_bytes());
+    }
+
     pub(super) fn k2id_key(&self, hash: u64, slot: u16) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.k2id_prefix.len() + 10);
-        key.extend_from_slice(&self.k2id_prefix);
-        key.extend_from_slice(&hash.to_be_bytes());
-        key.extend_from_slice(&slot.to_be_bytes());
+        self.encode_k2id_key_into(&mut key, hash, slot);
         key
+    }
+
+    fn encode_id2k_key_into(&self, out: &mut Vec<u8>, id: u64) {
+        out.clear();
+        out.reserve(self.id2k_prefix.len() + 8);
+        out.extend_from_slice(&self.id2k_prefix);
+        out.extend_from_slice(&id.to_be_bytes());
     }
 
     pub(super) fn id2k_key(&self, id: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
-        key.extend_from_slice(&self.id2k_prefix);
-        key.extend_from_slice(&id.to_be_bytes());
+        self.encode_id2k_key_into(&mut key, id);
         key
+    }
+
+    fn next_probe_slot(slot: u16) -> Option<u16> {
+        (slot != u16::MAX).then_some(slot + 1)
+    }
+
+    async fn first_free_slot(&self, hash: u64) -> Result<u16> {
+        let mut slot = 0u16;
+        let mut key_buf = Vec::with_capacity(self.k2id_prefix.len() + 10);
+        loop {
+            self.encode_k2id_key_into(&mut key_buf, hash, slot);
+            if self.table.get_bytes(&key_buf).await?.is_none() {
+                return Ok(slot);
+            }
+
+            slot = Self::next_probe_slot(slot)
+                .ok_or_else(|| anyhow!("dictionary full: all probe slots occupied for hash"))?;
+        }
     }
 
     async fn lookup_existing_id(&self, encoded_key: &[u8]) -> Result<Option<u64>> {
         let hash = self.hash(encoded_key);
+        let mut slot = 0u16;
+        let mut k2id_key_buf = Vec::with_capacity(self.k2id_prefix.len() + 10);
+        let mut id2k_key_buf = Vec::with_capacity(self.id2k_prefix.len() + 8);
+        loop {
+            self.encode_k2id_key_into(&mut k2id_key_buf, hash, slot);
+            let Some(id_bytes) = self.table.get_bytes(&k2id_key_buf).await? else {
+                return Ok(None);
+            };
+            let id = decode_id(id_bytes.as_ref())?;
 
-        for slot in 0..=u16::MAX {
-            let k2id_key = self.k2id_key(hash, slot);
-            match self.table.get(&k2id_key).await? {
-                Some(bytes) => {
-                    let id = decode_id(&bytes)?;
+            self.encode_id2k_key_into(&mut id2k_key_buf, id);
+            if let Some(stored) = self.table.get_bytes(&id2k_key_buf).await? {
+                let decoded = decompress_value(stored.as_ref())?;
+                let matches = decoded.as_slice() == encoded_key;
 
-                    if let Some(stored) = self.table.get(&self.id2k_key(id)).await? {
-                        let decoded = decompress_value(&stored)?;
-                        let matches = decoded.as_slice() == encoded_key;
+                let mut cache = self.cache.lock().unwrap();
+                cache.remember(decoded, id);
+                drop(cache);
 
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.remember(decoded, id);
-                        drop(cache);
-
-                        if matches {
-                            let mut cache = self.cache.lock().unwrap();
-                            cache.remember(encoded_key.to_vec(), id);
-                            return Ok(Some(id));
-                        }
-                    } else {
-                        self.table.delete(&k2id_key).await?;
-                    }
+                if matches {
+                    return Ok(Some(id));
                 }
-                None => return Ok(None),
+            } else {
+                // If the reverse mapping is missing, clear the stale forward pointer.
+                self.table.delete(&k2id_key_buf).await?;
+                return Ok(None);
             }
+
+            slot = match Self::next_probe_slot(slot) {
+                Some(next) => next,
+                None => break,
+            };
         }
 
-        Err(anyhow!(
-            "exhausted dictionary slots while probing for existing key"
-        ))
+        Ok(None)
     }
 
     async fn persist_mapping(
@@ -270,14 +304,19 @@ where
             return Ok(Vec::new());
         }
 
-        let mut resolved = std::collections::HashMap::<Vec<u8>, u64>::new();
-        let mut pending = Vec::<(Vec<u8>, u64, u64, u16)>::new();
-        let mut pending_slots = std::collections::HashSet::<(u64, u16)>::new();
+        let mut resolved = AHashMap::<u64, Vec<(usize, u64)>>::with_capacity(encoded_keys.len());
+        let mut pending = Vec::<(Vec<u8>, u64, u64, u16)>::with_capacity(encoded_keys.len());
+        let mut next_slot_by_hash = AHashMap::<u64, u16>::new();
         let mut output = Vec::with_capacity(encoded_keys.len());
 
-        for encoded in &encoded_keys {
-            if let Some(id) = resolved.get(encoded).copied() {
-                output.push(id);
+        for (index, encoded) in encoded_keys.iter().enumerate() {
+            let resolved_hash = self.hash(encoded);
+            if let Some(entries) = resolved.get(&resolved_hash)
+                && let Some((_, id)) = entries
+                    .iter()
+                    .find(|(resolved_index, _)| encoded_keys[*resolved_index].as_slice() == encoded)
+            {
+                output.push(*id);
                 continue;
             }
 
@@ -289,7 +328,7 @@ where
                     cache.is_negative(encoded)
                 };
                 if should_allocate || self.fast_path_fresh {
-                    self.reserve_in_batch(encoded, &mut pending, &mut pending_slots)
+                    self.reserve_in_batch(encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
                 } else if let Some(existing) = self.lookup_existing_id(encoded).await? {
                     let mut cache = self.cache.lock().unwrap();
@@ -300,12 +339,12 @@ where
                         let mut cache = self.cache.lock().unwrap();
                         cache.remember_negative(encoded);
                     }
-                    self.reserve_in_batch(encoded, &mut pending, &mut pending_slots)
+                    self.reserve_in_batch(encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
                 }
             };
 
-            resolved.insert(encoded.clone(), id);
+            resolved.entry(resolved_hash).or_default().push((index, id));
             output.push(id);
         }
 
@@ -335,37 +374,36 @@ where
         &self,
         encoded_key: &[u8],
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
-        pending_slots: &mut std::collections::HashSet<(u64, u16)>,
+        next_slot_by_hash: &mut AHashMap<u64, u16>,
     ) -> Result<u64> {
         let hash = self.hash(encoded_key);
-        if self.fast_path_fresh && !pending_slots.contains(&(hash, 0)) {
+        let next_slot = match next_slot_by_hash.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let loaded = self.first_free_slot(hash).await?;
+                entry.insert(loaded)
+            }
+        };
+
+        if self.fast_path_fresh && *next_slot == 0 {
             let can_use_slot_zero = {
                 let mut seen = self.seen_hashes.lock().unwrap();
                 seen.insert(hash)
             };
             if can_use_slot_zero {
                 let id = self.reserve_id();
-                pending_slots.insert((hash, 0));
+                *next_slot = 1;
                 pending.push((encoded_key.to_vec(), id, hash, 0));
                 return Ok(id);
             }
         }
-        for slot in 0..=u16::MAX {
-            if pending_slots.contains(&(hash, slot)) {
-                continue;
-            }
-            let k2id_key = self.k2id_key(hash, slot);
-            if self.table.get(&k2id_key).await?.is_none() {
-                let id = self.reserve_id();
-                pending_slots.insert((hash, slot));
-                pending.push((encoded_key.to_vec(), id, hash, slot));
-                return Ok(id);
-            }
-        }
 
-        Err(anyhow!(
-            "dictionary full: all probe slots occupied for hash"
-        ))
+        let slot = *next_slot;
+        let id = self.reserve_id();
+        *next_slot = Self::next_probe_slot(slot)
+            .ok_or_else(|| anyhow!("dictionary full: all probe slots occupied for hash"))?;
+        pending.push((encoded_key.to_vec(), id, hash, slot));
+        Ok(id)
     }
 
     pub async fn resolve_many_ids(&self, ids: &[u64]) -> Result<Vec<K>> {
@@ -373,10 +411,9 @@ where
             return Ok(Vec::new());
         }
 
-        let mut encoded_by_id: std::collections::HashMap<u64, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut encoded_by_id: AHashMap<u64, SharedKey> = AHashMap::with_capacity(ids.len());
         let mut missing_ids = Vec::new();
-        let mut seen_missing = std::collections::HashSet::new();
+        let mut seen_missing = AHashSet::with_capacity(ids.len());
 
         {
             let mut cache = self.cache.lock().unwrap();
@@ -393,30 +430,32 @@ where
         }
 
         if !missing_ids.is_empty() {
-            let mut freshly_resolved = Vec::with_capacity(missing_ids.len());
             for chunk in missing_ids.chunks(RESOLVE_MANY_FETCH_CHUNK) {
-                let fetched = try_join_all(chunk.iter().copied().map(|id| async move {
-                    let key = self.id2k_key(id);
-                    let bytes = self.table.get(&key).await?;
+                let mut id2k_keys = Vec::with_capacity(chunk.len());
+                for &id in chunk {
+                    let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
+                    self.encode_id2k_key_into(&mut key, id);
+                    id2k_keys.push((id, key));
+                }
+                let fetched = try_join_all(id2k_keys.into_iter().map(|(id, key)| async move {
+                    let bytes = self.table.get_bytes(&key).await?;
                     Ok::<_, anyhow::Error>((id, bytes))
                 }))
                 .await?;
 
                 for (id, bytes) in fetched {
                     let bytes = bytes.ok_or_else(|| anyhow!("no key found for id {id}"))?;
-                    let decoded = decompress_value(&bytes)?;
-                    freshly_resolved.push((id, decoded.clone()));
-                    encoded_by_id.insert(id, decoded);
+                    let decoded = decompress_value(bytes.as_ref())?;
+                    let shared = {
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.remember(decoded, id)
+                    };
+                    encoded_by_id.insert(id, shared);
                 }
-            }
-
-            let mut cache = self.cache.lock().unwrap();
-            for (id, key) in freshly_resolved {
-                cache.remember(key, id);
             }
         }
 
-        let mut decoded_by_id = std::collections::HashMap::new();
+        let mut decoded_by_id = AHashMap::with_capacity(encoded_by_id.len());
         for id in ids {
             if decoded_by_id.contains_key(id) {
                 continue;
@@ -424,8 +463,8 @@ where
             let encoded = encoded_by_id
                 .get(id)
                 .ok_or_else(|| anyhow!("no key found for id {id}"))?;
-            let decoded =
-                encoding::decode(encoded).context("unable to decode dictionary value in batch")?;
+            let decoded = encoding::decode(encoded.as_ref())
+                .context("unable to decode dictionary value in batch")?;
             decoded_by_id.insert(*id, decoded);
         }
 
@@ -446,7 +485,8 @@ where
         overlay: Option<&mut BatchOverlay>,
     ) -> Result<u64> {
         let hash = self.hash(&encoded_key);
-        if self.fast_path_fresh {
+        let first_free_slot = self.first_free_slot(hash).await?;
+        if self.fast_path_fresh && first_free_slot == 0 {
             let can_use_slot_zero = {
                 let mut seen = self.seen_hashes.lock().unwrap();
                 seen.insert(hash)
@@ -467,27 +507,18 @@ where
             }
         }
 
-        for slot in 0..=u16::MAX {
-            let k2id_key = self.k2id_key(hash, slot);
-            if self.table.get(&k2id_key).await?.is_none() {
-                let id = self.reserve_id();
-                self.persist_mapping(encoded_key.clone(), id, hash, slot)
-                    .await?;
-                {
-                    let mut cache = self.cache.lock().unwrap();
-                    cache.clear_negative(&encoded_key);
-                }
-                if let Some(overlay) = overlay {
-                    overlay.clear_negative(&encoded_key);
-                    overlay.remember_positive(encoded_key.clone(), id);
-                }
-                return Ok(id);
-            }
+        let id = self.reserve_id();
+        self.persist_mapping(encoded_key.clone(), id, hash, first_free_slot)
+            .await?;
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.clear_negative(&encoded_key);
         }
-
-        Err(anyhow!(
-            "dictionary full: all probe slots occupied for hash"
-        ))
+        if let Some(overlay) = overlay {
+            overlay.clear_negative(&encoded_key);
+            overlay.remember_positive(encoded_key.clone(), id);
+        }
+        Ok(id)
     }
 }
 
@@ -514,20 +545,20 @@ where
             } {
                 bytes
             } else {
-                let key = self.id2k_key(id);
+                let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
+                self.encode_id2k_key_into(&mut key, id);
                 let bytes = self
                     .table
-                    .get(&key)
+                    .get_bytes(&key)
                     .await?
                     .ok_or_else(|| anyhow!("no key found for id {id}"))?;
-                let decoded = decompress_value(&bytes)?;
+                let decoded = decompress_value(bytes.as_ref())?;
                 let mut cache = self.cache.lock().unwrap();
-                cache.remember(decoded.clone(), id);
-                decoded
+                cache.remember(decoded, id)
             }
         };
 
-        encoding::decode(&encoded).context("unable to decode dictionary value")
+        encoding::decode(encoded.as_ref()).context("unable to decode dictionary value")
     }
 
     async fn resolve_many(&self, ids: &[u64]) -> Result<Vec<K>> {

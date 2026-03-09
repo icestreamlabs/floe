@@ -25,28 +25,15 @@ where
 {
     pub async fn flush(&mut self) -> Result<()> {
         let mut batch = WriteBatch::new();
-        let mut dirty = false;
-        if self.flush_defaults_into(&mut batch)? {
-            dirty = true;
-        }
-        if self.flush_data_into(&mut batch)? {
-            dirty = true;
-        }
+        let default_writes = self.flush_defaults_into(&mut batch)?;
+        let data_writes = self.flush_data_into(&mut batch)?;
         let committed_ts = self.flush_state_into(&mut batch)?;
-        if committed_ts.is_some() {
-            dirty = true;
-        }
+        let dirty = default_writes > 0 || data_writes > 0 || committed_ts.is_some();
 
         if dirty {
             let committed_ts =
                 committed_ts.ok_or_else(|| anyhow!("stream flush missing committed timestamp"))?;
-            let intent_key = self.encode_intent_key();
-            batch.put(intent_key.clone(), vec![1]);
             self.core.table.write_batch(batch).await?;
-
-            let mut cleanup = WriteBatch::new();
-            cleanup.delete(intent_key);
-            self.core.table.write_batch(cleanup).await?;
 
             self.notify_committed_frontier(committed_ts);
         }
@@ -58,16 +45,17 @@ where
         Ok(())
     }
 
-    pub(crate) fn flush_data_into(&mut self, batch: &mut WriteBatch) -> Result<bool> {
+    pub(crate) fn flush_data_into(&mut self, batch: &mut WriteBatch) -> Result<usize> {
         let pending = {
             let mut state = self.write_state();
             if state.pending_data.is_empty() {
-                return Ok(false);
+                return Ok(0);
             }
             let mut pending_map = BTreeMap::new();
             std::mem::swap(&mut pending_map, &mut state.pending_data);
             pending_map
         };
+        let writes = pending.len();
 
         for (timestamp, value) in pending {
             let key = self.core.encode_data_key(timestamp)?;
@@ -75,19 +63,20 @@ where
             batch.put(key, encoded);
         }
 
-        Ok(true)
+        Ok(writes)
     }
 
-    pub(crate) fn flush_defaults_into(&mut self, batch: &mut WriteBatch) -> Result<bool> {
+    pub(crate) fn flush_defaults_into(&mut self, batch: &mut WriteBatch) -> Result<usize> {
         let pending = {
             let mut state = self.write_state();
             if state.pending_defaults.is_empty() {
-                return Ok(false);
+                return Ok(0);
             }
             let mut pending_map = BTreeMap::new();
             std::mem::swap(&mut pending_map, &mut state.pending_defaults);
             pending_map
         };
+        let writes = pending.len();
 
         for (timestamp, value) in pending {
             let key = self.core.encode_default_key(timestamp)?;
@@ -98,7 +87,7 @@ where
             state.last_default_ts = state.last_default_ts.max(timestamp);
         }
 
-        Ok(true)
+        Ok(writes)
     }
 
     pub(crate) fn flush_state_into(&mut self, batch: &mut WriteBatch) -> Result<Option<i64>> {

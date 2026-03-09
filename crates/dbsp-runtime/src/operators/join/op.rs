@@ -13,6 +13,7 @@ use slatedb::WriteBatch;
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -209,6 +210,7 @@ where
         versioned: &mut VersionedZSet<T>,
         deltas: &HashMap<T, i64>,
         base: Option<u64>,
+        state_label: &'static str,
     ) -> Result<ZSetHandle>
     where
         T: Archive
@@ -223,21 +225,23 @@ where
     {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
+        let mut keyed_deltas: Vec<(&T, i64)> = Vec::new();
         for (key, delta) in deltas {
             if *delta == 0 {
                 continue;
             }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging join delta")?;
+            keyed_deltas.push((key, *delta));
+        }
+        let ids = dict
+            .intern_many_values(keyed_deltas.iter().map(|(key, _)| *key))
+            .await
+            .context("batch intern keys while staging join delta")?;
+        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {
@@ -262,6 +266,7 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
+        let persist_start = std::time::Instant::now();
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -274,15 +279,12 @@ where
             .await
             .context("write join version update")?;
 
-        let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes());
-        versioned
-            .table()
-            .write_batch(cleanup)
-            .await
-            .context("clear join intent")?;
-
         versioned.apply_version_plan(&plan);
+        metrics::observe_operator_persistence_latency_ms(
+            "join",
+            state_label,
+            persist_start.elapsed().as_millis() as u64,
+        );
         Ok(versioned.handle_for_version(plan.version))
     }
 }
@@ -401,44 +403,22 @@ where
         }
         delta_join.retain(|_, w| *w != 0);
 
-        let left_base = self
-            .left_state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_left_handle = Self::apply_deltas_to_versioned(
-            &mut self.left_state.integrated,
-            &left_delta,
-            left_base,
-        )
-        .await
-        .context("update left integrated state")?;
-        self.left_state.update_handle(new_left_handle);
-
-        let right_base = self
-            .right_state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_right_handle = Self::apply_deltas_to_versioned(
-            &mut self.right_state.integrated,
-            &right_delta,
-            right_base,
-        )
-        .await
-        .context("update right integrated state")?;
-        self.right_state.update_handle(new_right_handle);
-
         let mut left_updates = Vec::new();
         for (key, entries) in &left_keyed {
             for (row, weight) in entries {
                 left_updates.push((key.clone(), row.clone(), *weight));
             }
         }
+        let left_index_persist_start = std::time::Instant::now();
         self.left_index
             .apply_deltas(left_updates)
             .await
             .context("update left join index")?;
+        metrics::observe_operator_persistence_latency_ms(
+            "join",
+            "left_index",
+            left_index_persist_start.elapsed().as_millis() as u64,
+        );
 
         let mut right_updates = Vec::new();
         for (key, entries) in &right_keyed {
@@ -446,10 +426,16 @@ where
                 right_updates.push((key.clone(), row.clone(), *weight));
             }
         }
+        let right_index_persist_start = std::time::Instant::now();
         self.right_index
             .apply_deltas(right_updates)
             .await
             .context("update right join index")?;
+        metrics::observe_operator_persistence_latency_ms(
+            "join",
+            "right_index",
+            right_index_persist_start.elapsed().as_millis() as u64,
+        );
 
         if delta_join.is_empty() {
             return Ok(None);
@@ -460,16 +446,21 @@ where
                 .integrated
                 .current_handle()
                 .map(|handle| handle.version);
-            let new_integrated_handle =
-                Self::apply_deltas_to_versioned(&mut integrated.integrated, &delta_join, base)
-                    .await
-                    .context("update integrated join state")?;
+            let new_integrated_handle = Self::apply_deltas_to_versioned(
+                &mut integrated.integrated,
+                &delta_join,
+                base,
+                "integrated_output",
+            )
+            .await
+            .context("update integrated join state")?;
             integrated.update_handle(new_integrated_handle);
         }
 
-        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &delta_join, None)
-            .await
-            .context("persist join delta output")?;
+        let delta_handle =
+            Self::apply_deltas_to_versioned(&mut self.output, &delta_join, None, "output")
+                .await
+                .context("persist join delta output")?;
         Ok(Some(delta_handle))
     }
 }

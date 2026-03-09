@@ -149,6 +149,7 @@ impl SlateCatalog {
         self.db
             .put(&key, encoded)
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
             .with_context(|| format!("failed to persist table definition {}", definition.name()))
     }
@@ -161,6 +162,7 @@ impl SlateCatalog {
         self.db
             .put(&key, encoded)
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
             .with_context(|| format!("failed to write table definition {}", definition.name()))
     }
@@ -195,6 +197,7 @@ impl SlateCatalog {
         self.db
             .put(key, archived.bytes())
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
             .context("failed to insert row")
     }
@@ -226,6 +229,7 @@ impl SlateCatalog {
         self.db
             .put(&key, encoded)
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
             .with_context(|| {
                 format!(
@@ -270,6 +274,7 @@ impl SlateCatalog {
         self.db
             .put(&key, payload)
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
             .with_context(|| format!("persist schema for materialized view '{name}'"))
     }

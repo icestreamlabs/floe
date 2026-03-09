@@ -29,6 +29,7 @@ pub struct DbspGraphBuilder {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MvFlushCoalescingConfig {
+    pub enabled: bool,
     pub max_pending_deltas: usize,
     pub max_pending_versions: Option<usize>,
     pub max_pending_rows: Option<usize>,
@@ -41,6 +42,7 @@ pub struct MvFlushCoalescingConfig {
 impl Default for MvFlushCoalescingConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             max_pending_deltas: 1,
             max_pending_versions: None,
             max_pending_rows: None,

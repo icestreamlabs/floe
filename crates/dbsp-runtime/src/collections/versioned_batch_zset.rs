@@ -259,21 +259,21 @@ where
     async fn load_manifest(&self, version: u64) -> Result<VersionManifest> {
         let bytes = self
             .table
-            .get(&self.manifest_key(version))
+            .get_bytes(&self.manifest_key(version))
             .await
             .context("read versioned Arrow manifest")?
             .ok_or_else(|| anyhow!("missing versioned Arrow manifest {version}"))?;
-        encoding::decode(&bytes).context("decode versioned Arrow manifest")
+        encoding::decode(bytes.as_ref()).context("decode versioned Arrow manifest")
     }
 
     async fn read_u64_or_default(&self, key: &[u8], default: u64) -> Result<u64> {
         match self
             .table
-            .get(key)
+            .get_bytes(key)
             .await
             .with_context(|| format!("read versioned Arrow meta key len={}", key.len()))?
         {
-            Some(bytes) => decode_u64_payload(&bytes),
+            Some(bytes) => decode_u64_payload(bytes.as_ref()),
             None => Ok(default),
         }
     }

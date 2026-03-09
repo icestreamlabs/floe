@@ -13,6 +13,7 @@ use slatedb::WriteBatch;
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -154,6 +155,7 @@ where
         versioned: &mut VersionedZSet<T>,
         deltas: &HashMap<T, i64>,
         base: Option<u64>,
+        state_label: &'static str,
     ) -> Result<ZSetHandle>
     where
         T: Archive
@@ -168,21 +170,23 @@ where
     {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
+        let mut keyed_deltas: Vec<(&T, i64)> = Vec::new();
         for (key, delta) in deltas {
             if *delta == 0 {
                 continue;
             }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging group-by delta")?;
+            keyed_deltas.push((key, *delta));
+        }
+        let ids = dict
+            .intern_many_values(keyed_deltas.iter().map(|(key, _)| *key))
+            .await
+            .context("batch intern keys while staging group-by delta")?;
+        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {
@@ -207,6 +211,7 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
+        let persist_start = std::time::Instant::now();
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -219,15 +224,12 @@ where
             .await
             .context("write group-by version update")?;
 
-        let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes());
-        versioned
-            .table()
-            .write_batch(cleanup)
-            .await
-            .context("clear group-by intent")?;
-
         versioned.apply_version_plan(&plan);
+        metrics::observe_operator_persistence_latency_ms(
+            "group_by",
+            state_label,
+            persist_start.elapsed().as_millis() as u64,
+        );
         Ok(versioned.handle_for_version(plan.version))
     }
 }
@@ -303,10 +305,16 @@ where
             return Ok(None);
         }
 
+        let index_persist_start = std::time::Instant::now();
         self.index
             .apply_deltas(updates)
             .await
             .context("update group-by index")?;
+        metrics::observe_operator_persistence_latency_ms(
+            "group_by",
+            "index",
+            index_persist_start.elapsed().as_millis() as u64,
+        );
 
         self.ensure_aggregate_cache()
             .await
@@ -362,6 +370,7 @@ where
             &mut self.state.integrated,
             &output_deltas,
             base_version,
+            "integrated",
         )
         .await
         .context("update group-by integrated state")?;
@@ -377,9 +386,10 @@ where
             }
         }
 
-        let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None)
-            .await
-            .context("persist group-by delta output")?;
+        let delta_handle =
+            Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
+                .await
+                .context("persist group-by delta output")?;
         Ok(Some(delta_handle))
     }
 }

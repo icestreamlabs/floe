@@ -78,7 +78,7 @@ where
 
     pub(super) async fn clear_intent(&self) -> Result<()> {
         let intent_key = self.encode_intent_key();
-        if self.table.get(&intent_key).await?.is_some() {
+        if self.table.get_bytes(&intent_key).await?.is_some() {
             let mut batch = WriteBatch::new();
             batch.delete(intent_key);
             self.table.write_batch(batch).await?;
@@ -89,7 +89,7 @@ where
     pub(super) async fn load_default_changes(&self) -> Result<BTreeMap<i64, T>> {
         let entries = self
             .table
-            .scan_prefix(self.default_prefix.as_slice(), &ScanOptions::default())
+            .scan_prefix_bytes(self.default_prefix.as_slice(), &ScanOptions::default())
             .await?;
 
         let mut changes = BTreeMap::new();

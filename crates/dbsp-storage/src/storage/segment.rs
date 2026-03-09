@@ -145,7 +145,7 @@ impl ArrowSegmentStore {
     pub async fn read_segment(&self, segment_id: u64) -> Result<Option<ArrowSegment>> {
         let Some(bytes) = self
             .table
-            .get(&self.segment_key(segment_id))
+            .get_bytes(&self.segment_key(segment_id))
             .await
             .with_context(|| format!("read Arrow segment {segment_id}"))?
         else {
@@ -153,7 +153,7 @@ impl ArrowSegmentStore {
         };
 
         let envelope: SegmentEnvelope =
-            encoding::decode(&bytes).context("decode Arrow segment envelope")?;
+            encoding::decode(bytes.as_ref()).context("decode Arrow segment envelope")?;
         let (schema, batches) =
             decode_record_batches(&envelope.payload).context("decode Arrow segment payload")?;
 

@@ -9,7 +9,7 @@ use dbsp::relation_state::RelationState;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::runtime::DeltaOperator;
-use dbsp::stream::util::materialize_zset_handle;
+use dbsp::stream::util::delta_zset_handle;
 
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 
@@ -40,22 +40,19 @@ impl MvSinkOp {
     async fn apply_deltas_to_versioned(
         dictionary: Arc<Dictionary<Vec<u8>>>,
         versioned: &mut VersionedZSet<Vec<u8>>,
-        deltas: &HashMap<Vec<u8>, i64>,
+        deltas: Vec<(Vec<u8>, i64)>,
     ) -> Result<ZSetHandle> {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let mut dict_batch = dictionary.batch();
         for (key, delta) in deltas {
-            if *delta == 0 {
+            if delta == 0 {
                 continue;
             }
             let id = dict_batch
-                .intern(key)
+                .intern(&key)
                 .await
                 .context("intern key while staging mv sink delta")?;
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
         }
         drop(dict_batch);
 
@@ -101,13 +98,10 @@ impl DeltaOperator for MvSinkOp {
             .cloned()
             .context("mv sink operator requires one input delta handle")?;
 
-        let delta_map = materialize_zset_handle::<Vec<u8>>(
-            self.table.clone(),
-            &mut self.dict_cache,
-            &delta_handle,
-        )
-        .await
-        .context("materialize mv sink delta")?;
+        let delta_map =
+            delta_zset_handle::<Vec<u8>>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+                .await
+                .context("delta iterate mv sink delta")?;
 
         if delta_map.is_empty() {
             return Ok(None);
@@ -115,7 +109,7 @@ impl DeltaOperator for MvSinkOp {
 
         let dict = self.state.dictionary();
         let new_handle =
-            Self::apply_deltas_to_versioned(dict, &mut self.state.integrated, &delta_map)
+            Self::apply_deltas_to_versioned(dict, &mut self.state.integrated, delta_map)
                 .await
                 .context("update materialized view state")?;
         self.state.update_handle(new_handle.clone());

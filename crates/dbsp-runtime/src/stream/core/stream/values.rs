@@ -75,9 +75,9 @@ where
             }
 
             if let Some(key) = fetch_key {
-                if let Some(bytes) = self.core.table.get(&key).await? {
-                    let value: T =
-                        encoding::decode(&bytes).context("unable to decode stream value")?;
+                if let Some(bytes) = self.core.table.get_bytes(&key).await? {
+                    let value: T = encoding::decode(bytes.as_ref())
+                        .context("unable to decode stream value")?;
                     {
                         let mut state = self.write_state();
                         state.data_cache.insert(timestamp, value.clone());

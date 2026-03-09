@@ -10,7 +10,7 @@ use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::StreamCursor;
-use dbsp::stream::util::materialize_zset_handle;
+use dbsp::stream::util::delta_zset_handle;
 use dbsp::{DbspDistinct, DbspFilter, DbspJoin, DbspMap, DeltaHandleStream};
 use tokio_util::sync::CancellationToken;
 
@@ -413,9 +413,9 @@ async fn apply_delta_handle_to_view(
     cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
     delta_handle: &ZSetHandle,
 ) -> Result<ZSetHandle> {
-    let deltas = materialize_zset_handle::<Vec<u8>>(table, cache, delta_handle)
+    let deltas = delta_zset_handle::<Vec<u8>>(table, cache, delta_handle)
         .await
-        .context("materialize delta handle for view")?;
+        .context("delta iterate handle for view")?;
     if !deltas.is_empty() {
         view.add_deltas(deltas);
     }

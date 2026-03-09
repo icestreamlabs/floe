@@ -125,7 +125,7 @@ where
 
         if let Some(id) = self.dict.lookup(key).await? {
             let encoded_key = self.encode_id(id);
-            if let Some(bytes) = self.table.get(&encoded_key).await? {
+            if let Some(bytes) = self.table.get_bytes(&encoded_key).await? {
                 let weight = decode_weight(bytes.as_ref())?;
                 self.cache.insert(key.clone(), weight);
                 return Ok(weight);
@@ -175,15 +175,16 @@ where
                     let value = encode_weight(weight);
                     batch.put(self.encode_id(id), value);
                     self.cache.insert(key, weight);
+                    dirty = true;
                 }
                 PendingValue::Delete => {
                     if let Some(id) = self.dict.lookup(&key).await? {
                         batch.delete(self.encode_id(id));
+                        dirty = true;
                     }
                     self.cache.remove(&key);
                 }
             }
-            dirty = true;
         }
 
         if dirty {

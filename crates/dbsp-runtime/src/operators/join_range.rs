@@ -85,6 +85,7 @@ where
     output: VersionedZSet<O>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
+    left_key_cache: Option<HashMap<KL, HashMap<L, i64>>>,
 }
 
 impl<L, R, O, KL, KR> JoinRangeOp<L, R, O, KL, KR>
@@ -165,6 +166,7 @@ where
             output,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
+            left_key_cache: None,
         }
     }
 
@@ -262,21 +264,23 @@ where
     {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
+        let mut keyed_deltas: Vec<(&T, i64)> = Vec::new();
         for (key, delta) in deltas {
             if *delta == 0 {
                 continue;
             }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging range join delta")?;
+            keyed_deltas.push((key, *delta));
+        }
+        let ids = dict
+            .intern_many_values(keyed_deltas.iter().map(|(key, _)| *key))
+            .await
+            .context("batch intern keys while staging range join delta")?;
+        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {
@@ -313,20 +317,58 @@ where
             .await
             .context("write range join version update")?;
 
-        let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes());
-        versioned
-            .table()
-            .write_batch(cleanup)
-            .await
-            .context("clear range join intent")?;
-
         versioned.apply_version_plan(&plan);
         Ok(versioned.handle_for_version(plan.version))
     }
 
     fn range_contains(key_bytes: &[u8], lower: &[u8], upper: &[u8]) -> bool {
         key_bytes >= lower && key_bytes < upper
+    }
+
+    async fn ensure_left_key_cache(&mut self) -> Result<()> {
+        if self.left_key_cache.is_some() {
+            return Ok(());
+        }
+
+        let entries = self
+            .left_index
+            .entries()
+            .await
+            .context("load left range index into cache")?;
+        let mut cache: HashMap<KL, HashMap<L, i64>> = HashMap::new();
+        for (key, row, weight) in entries {
+            if weight == 0 {
+                continue;
+            }
+            cache.entry(key).or_default().insert(row, weight);
+        }
+        self.left_key_cache = Some(cache);
+        Ok(())
+    }
+
+    fn apply_left_keyed_updates_to_cache(&mut self, left_keyed: &HashMap<KL, Vec<(L, i64)>>) {
+        let Some(cache) = self.left_key_cache.as_mut() else {
+            return;
+        };
+
+        for (key, entries) in left_keyed {
+            let bucket = cache.entry(key.clone()).or_default();
+            for (row, weight) in entries {
+                let next = bucket
+                    .get(row)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*weight);
+                if next == 0 {
+                    bucket.remove(row);
+                } else {
+                    bucket.insert(row.clone(), next);
+                }
+            }
+            if bucket.is_empty() {
+                cache.remove(key);
+            }
+        }
     }
 }
 
@@ -439,32 +481,31 @@ where
         }
 
         if !right_keyed.is_empty() {
-            let left_entries = self
-                .left_index
-                .entries()
+            self.ensure_left_key_cache()
                 .await
-                .context("scan left index for range join")?;
-            if !left_entries.is_empty() {
-                let mut left_by_key: HashMap<KL, Vec<(L, i64)>> = HashMap::new();
-                for (key, row, weight) in left_entries {
-                    left_by_key.entry(key).or_default().push((row, weight));
-                }
-
-                let mut left_ranges = Vec::with_capacity(left_by_key.len());
-                for (key, entries) in &left_by_key {
-                    let (lower, upper) = (self.range_func)(key);
-                    let lower_bytes = lower.encode_range_key();
-                    let upper_bytes = upper.encode_range_key();
-                    left_ranges.push((lower_bytes, upper_bytes, entries));
-                }
-
+                .context("prepare left range-join key cache")?;
+            if let Some(left_cache) = self.left_key_cache.as_ref() {
                 for (right_key, right_entries) in &right_keyed {
                     let right_bytes = right_key.encode_range_key();
-                    for (lower_bytes, upper_bytes, left_entries) in &left_ranges {
-                        if !Self::range_contains(&right_bytes, lower_bytes, upper_bytes) {
+                    for (left_key, left_rows) in left_cache {
+                        let (lower, upper) = (self.range_func)(left_key);
+                        let lower_bytes = lower.encode_range_key();
+                        let upper_bytes = upper.encode_range_key();
+                        if !Self::range_contains(&right_bytes, &lower_bytes, &upper_bytes) {
                             continue;
                         }
-                        self.join_entries(left_entries, right_entries, &mut delta_join);
+                        for (left_row, left_weight) in left_rows {
+                            if *left_weight == 0 {
+                                continue;
+                            }
+                            for (right_row, right_weight) in right_entries {
+                                if *right_weight == 0 {
+                                    continue;
+                                }
+                                let out = (self.projector)(left_row, right_row);
+                                *delta_join.entry(out).or_insert(0) += *left_weight * *right_weight;
+                            }
+                        }
                     }
                 }
             }
@@ -492,34 +533,6 @@ where
 
         delta_join.retain(|_, w| *w != 0);
 
-        let left_base = self
-            .left_state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_left_handle = Self::apply_deltas_to_versioned(
-            &mut self.left_state.integrated,
-            &left_delta,
-            left_base,
-        )
-        .await
-        .context("update left integrated state")?;
-        self.left_state.update_handle(new_left_handle);
-
-        let right_base = self
-            .right_state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_right_handle = Self::apply_deltas_to_versioned(
-            &mut self.right_state.integrated,
-            &right_delta,
-            right_base,
-        )
-        .await
-        .context("update right integrated state")?;
-        self.right_state.update_handle(new_right_handle);
-
         let mut left_updates = Vec::new();
         for (key, entries) in &left_keyed {
             for (row, weight) in entries {
@@ -531,6 +544,7 @@ where
                 .apply_deltas(left_updates)
                 .await
                 .context("update left range join index")?;
+            self.apply_left_keyed_updates_to_cache(&left_keyed);
         }
 
         let mut right_updates = Vec::new();
@@ -804,5 +818,93 @@ mod tests {
 
             prev_output = output_now;
         }
+    }
+
+    #[tokio::test]
+    async fn range_join_uses_arranged_state_as_canonical_persisted_input() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let left_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "range_canonical_left_stream", None)
+                .await
+                .expect("left dict"),
+        );
+        let right_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), "range_canonical_right_stream", None)
+                .await
+                .expect("right dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<Out>::with_table(table.clone(), "range_canonical_output", None)
+                .await
+                .expect("output dict"),
+        );
+
+        let left_state =
+            RelationState::empty(table.clone(), "range_canonical_left_state".to_string())
+                .await
+                .expect("left state");
+        let right_state =
+            RelationState::empty(table.clone(), "range_canonical_right_state".to_string())
+                .await
+                .expect("right state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "range_canonical_output".to_string(),
+        )
+        .await
+        .expect("output zset");
+
+        let mut op = JoinRangeOp::new(
+            left_state,
+            right_state,
+            IndexedBatchZSet::new(table.clone(), "range_canonical_left_index"),
+            IndexedBatchZSet::with_range_index(table.clone(), "range_canonical_right_index"),
+            Arc::new(|row: &Row| Some(row.0)),
+            Arc::new(|row: &Row| Some(row.0)),
+            Arc::new(|key: &i64| (*key - 1, *key + 2)),
+            Arc::new(|left: &Row, right: &Row| (left.1, right.1)),
+            table.clone(),
+            output,
+            None,
+        );
+
+        let left_handle = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "range_canonical_left_stream",
+            &[((2, 20), 1)],
+        )
+        .await;
+        let right_handle = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "range_canonical_right_stream",
+            &[((2, 200), 1)],
+        )
+        .await;
+        let out_handle = op
+            .on_step(1, &[left_handle, right_handle])
+            .await
+            .expect("run range join")
+            .expect("range join output");
+
+        assert!(
+            op.left_state.integrated.current_handle().is_none(),
+            "left relation snapshots should not be persisted on the range-join critical path"
+        );
+        assert!(
+            op.right_state.integrated.current_handle().is_none(),
+            "right relation snapshots should not be persisted on the range-join critical path"
+        );
+
+        let mut cache = HashMap::new();
+        cache.insert("range_canonical_output".to_string(), output_dict);
+        let materialized = materialize_zset_handle::<Out>(table, &mut cache, &out_handle)
+            .await
+            .expect("materialize range join output");
+        assert_eq!(materialized.get(&(20, 200)), Some(&1));
     }
 }

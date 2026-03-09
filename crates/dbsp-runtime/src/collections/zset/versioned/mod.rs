@@ -19,12 +19,14 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 pub struct CompactionPolicy {
     pub max_chain_len: usize,
     pub max_segments: usize,
+    pub max_bucket_segments: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VersionChainStats {
     pub version_count: usize,
     pub segment_count: usize,
+    pub max_bucket_segment_count: usize,
 }
 
 #[allow(dead_code)]

@@ -128,6 +128,10 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
 
 pub(super) fn mv_flush_coalescing_config(config: &MvFlushConfig) -> MvFlushCoalescingConfig {
     let mut out = MvFlushCoalescingConfig::default();
+    out.enabled = config.enabled.unwrap_or(false);
+    if !out.enabled {
+        return out;
+    }
     if let Some(max_pending_deltas) = config.max_pending_deltas {
         out.max_pending_deltas = max_pending_deltas;
     }

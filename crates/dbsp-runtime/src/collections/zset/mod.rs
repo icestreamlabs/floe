@@ -6,6 +6,7 @@ use std::ops::Range;
 
 pub use base::ZSet;
 pub use derived::{h, join, project, select};
+pub(crate) use versioned::VersionWritePlan;
 pub use versioned::{
     CompactionPolicy, SegmentId, SegmentRecord, VersionChainStats, VersionedZSet,
     ZSetVersionManifest,

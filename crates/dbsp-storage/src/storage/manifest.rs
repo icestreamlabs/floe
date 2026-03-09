@@ -162,7 +162,7 @@ where
     pub async fn recover_publish_intent(&self) -> Result<IntentRecoveryOutcome> {
         let Some(intent_bytes) = self
             .table
-            .get(&self.intent_key)
+            .get_bytes(&self.intent_key)
             .await
             .context("read manifest intent key")?
         else {
@@ -170,7 +170,7 @@ where
         };
 
         let intent: ManifestIntent =
-            encoding::decode(&intent_bytes).context("decode manifest intent key")?;
+            encoding::decode(intent_bytes.as_ref()).context("decode manifest intent key")?;
         let manifest_exists = self
             .load_manifest(intent.version)
             .await
@@ -194,20 +194,20 @@ where
         let key = self.manifest_key(version);
         let Some(bytes) = self
             .table
-            .get(&key)
+            .get_bytes(&key)
             .await
             .with_context(|| format!("read manifest version {version}"))?
         else {
             return Ok(None);
         };
-        let manifest = encoding::decode::<M>(&bytes).context("decode manifest record")?;
+        let manifest = encoding::decode::<M>(bytes.as_ref()).context("decode manifest record")?;
         Ok(Some(manifest))
     }
 
     pub async fn latest_manifest(&self) -> Result<Option<M>> {
         let entries = self
             .table
-            .scan_range(
+            .scan_range_bytes(
                 prefix_bounds(&self.manifest_prefix),
                 &ScanOptions::default(),
             )
@@ -225,7 +225,7 @@ where
             {
                 latest_version = Some(version);
                 latest_manifest = Some(
-                    encoding::decode::<M>(&bytes)
+                    encoding::decode::<M>(bytes.as_ref())
                         .with_context(|| format!("decode manifest version {version}"))?,
                 );
             }
@@ -245,21 +245,21 @@ where
     pub async fn pending_intent_version(&self) -> Result<Option<u64>> {
         let Some(intent_bytes) = self
             .table
-            .get(&self.intent_key)
+            .get_bytes(&self.intent_key)
             .await
             .context("read manifest intent key")?
         else {
             return Ok(None);
         };
         let intent: ManifestIntent =
-            encoding::decode(&intent_bytes).context("decode manifest intent key")?;
+            encoding::decode(intent_bytes.as_ref()).context("decode manifest intent key")?;
         Ok(Some(intent.version))
     }
 
     pub async fn list_versions(&self) -> Result<Vec<u64>> {
         let entries = self
             .table
-            .scan_range(
+            .scan_range_bytes(
                 prefix_bounds(&self.manifest_prefix),
                 &ScanOptions::default(),
             )

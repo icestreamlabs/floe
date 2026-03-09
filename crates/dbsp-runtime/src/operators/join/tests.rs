@@ -719,3 +719,104 @@ async fn join_operator_matches_full_recompute() {
         full_join = recompute;
     }
 }
+
+#[tokio::test]
+async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_canonical_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_canonical_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+
+    let left_state = RelationState::empty(table.clone(), "join_canonical_left_state".to_string())
+        .await
+        .expect("left state");
+    let right_state = RelationState::empty(table.clone(), "join_canonical_right_state".to_string())
+        .await
+        .expect("right state");
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_canonical_output", None)
+            .await
+            .expect("output dict"),
+    );
+    let output = VersionedZSet::new(
+        out_dict.clone(),
+        table.clone(),
+        "join_canonical_output".to_string(),
+    )
+    .await
+    .expect("output zset");
+
+    let mut op = JoinOp::new(
+        left_state,
+        right_state,
+        IndexedBatchZSet::new(table.clone(), "join_canonical_left_index"),
+        IndexedBatchZSet::new(table.clone(), "join_canonical_right_index"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        output,
+        None,
+    );
+
+    let left_delta = stage_version(
+        left_dict.clone(),
+        table.clone(),
+        "join_canonical_left_stream",
+        &[(7, 1)],
+    )
+    .await;
+    let right_delta = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "join_canonical_right_stream",
+        &[(7, 1)],
+    )
+    .await;
+    let out = op
+        .on_step(1, &[left_delta, right_delta])
+        .await
+        .expect("join step")
+        .expect("join output");
+
+    assert!(
+        op.left_state.integrated.current_handle().is_none(),
+        "left relation snapshots should not be persisted on the join critical path"
+    );
+    assert!(
+        op.right_state.integrated.current_handle().is_none(),
+        "right relation snapshots should not be persisted on the join critical path"
+    );
+
+    let mut left_entries = op
+        .left_index
+        .values_for_key(&7)
+        .await
+        .expect("left index lookup");
+    left_entries.sort_unstable();
+    assert_eq!(left_entries, vec![(7, 1)]);
+
+    let mut right_entries = op
+        .right_index
+        .values_for_key(&7)
+        .await
+        .expect("right index lookup");
+    right_entries.sort_unstable();
+    assert_eq!(right_entries, vec![(7, 1)]);
+
+    let mut cache = HashMap::new();
+    cache.insert("join_canonical_output".to_string(), out_dict);
+    let materialized = materialize_zset_handle::<i64>(table, &mut cache, &out)
+        .await
+        .expect("materialize join delta");
+    assert_eq!(materialized.get(&14), Some(&1));
+}

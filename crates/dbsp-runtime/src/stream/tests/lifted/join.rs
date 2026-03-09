@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::CompactionPolicy;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
@@ -278,4 +279,96 @@ async fn lifted_join_covers_each_delta_term() {
         .await
         .unwrap();
     assert!(map.contains_key(&(30, 300)), "ΔR⋈ΔS term missing");
+}
+
+#[tokio::test]
+async fn lifted_join_handles_compaction_noop_without_replaying_snapshot() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_join_compact_left", None)
+            .await
+            .expect("build left dictionary"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_join_compact_right", None)
+            .await
+            .expect("build right dictionary"),
+    );
+
+    let mut left = ZSetStream::new(
+        left_dict,
+        table.clone(),
+        "lifted_join_compact_left",
+        StreamRetention::KeepLast { keep_last: 3 },
+    )
+    .await
+    .expect("create left stream");
+    let mut right = ZSetStream::new(
+        right_dict,
+        table.clone(),
+        "lifted_join_compact_right",
+        StreamRetention::KeepLast { keep_last: 3 },
+    )
+    .await
+    .expect("create right stream");
+    left.set_compaction_policy(CompactionPolicy {
+        max_chain_len: 1,
+        max_segments: 1,
+        max_bucket_segments: 1,
+    });
+    right.set_compaction_policy(CompactionPolicy {
+        max_chain_len: 1,
+        max_segments: 1,
+        max_bucket_segments: 1,
+    });
+
+    let derived = lifted_join_zset_stream::<i64, i64, (i64, i64), _, _>(
+        &left.handle_stream(),
+        &right.handle_stream(),
+        |l, r| l == r,
+        |l, r| (*l, *r),
+    )
+    .await
+    .expect("build lifted join");
+
+    let mut cursor = StreamCursor::new(derived);
+    let _ = cursor.snapshot().await.expect("initial join snapshot");
+
+    left.add_delta(9_i64, 1);
+    left.flush().await.expect("flush left t1");
+
+    right.add_delta(9_i64, 1);
+    right.flush().await.expect("flush right t1");
+    let (_ts_join, joined_handle) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("join update wait")
+        .expect("join update");
+
+    let _ = left
+        .wait_for_background_compaction()
+        .await
+        .expect("wait left compaction");
+    let _ = right
+        .wait_for_background_compaction()
+        .await
+        .expect("wait right compaction");
+
+    left.flush().await.expect("flush left noop");
+    right.flush().await.expect("flush right noop");
+    let (_ts_noop, noop_handle) = timeout(Duration::from_secs(1), cursor.next())
+        .await
+        .expect("noop update wait")
+        .expect("noop update");
+
+    let mut cache = HashMap::new();
+    let joined = materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache, &joined_handle)
+        .await
+        .expect("materialize joined handle");
+    let noop = materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache, &noop_handle)
+        .await
+        .expect("materialize noop");
+
+    assert_eq!(joined.get(&(9, 9)), Some(&1));
+    assert_eq!(noop.get(&(9, 9)), Some(&1));
 }

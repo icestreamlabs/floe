@@ -1,12 +1,47 @@
 use std::sync::Arc;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::zset::SegmentRecord;
 use crate::storage::dictionary::Dictionary;
+use crate::storage::dictionary::KeyIntern;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::core::stream::Stream;
 use crate::stream::tests::common::{IntegerGroup, build_db};
 use crate::stream::{StreamRetention, ZSetStream};
 use slatedb::WriteBatch;
+
+fn bucket_for(id: u64) -> u16 {
+    (id >> 48) as u16
+}
+
+async fn encode_segments(
+    dict: Arc<Dictionary<Vec<u8>>>,
+    deltas: &[(Vec<u8>, i64)],
+) -> Vec<SegmentRecord> {
+    let mut buckets = std::collections::BTreeMap::<u16, Vec<(u64, i64)>>::new();
+    for (key, delta) in deltas {
+        if *delta == 0 {
+            continue;
+        }
+        let id = dict.intern(key).await.expect("intern restart test key");
+        buckets
+            .entry(bucket_for(id))
+            .or_default()
+            .push((id, *delta));
+    }
+
+    buckets
+        .into_iter()
+        .map(|(bucket, mut deltas)| {
+            deltas.sort_by_key(|(id, _)| *id);
+            SegmentRecord {
+                id: 0,
+                bucket,
+                deltas,
+            }
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn stream_restart_persists_frontier_and_defaults() {
@@ -51,7 +86,8 @@ async fn stream_restart_recovers_committed_flush_with_lingering_intent() {
     assert!(
         stream
             .flush_data_into(&mut batch)
-            .expect("flush data into staged batch"),
+            .expect("flush data into staged batch")
+            > 0,
         "expected staged data for t2"
     );
     let committed_ts = stream
@@ -144,6 +180,132 @@ async fn zset_stream_restart_persists_frontier_and_defaults() {
     assert_eq!(ts_delta, 2);
     assert_eq!(latest_delta.version, delta_version);
     assert_eq!(delta_stream.default_value().version, 0);
+}
+
+#[tokio::test]
+async fn zset_stream_restart_ignores_unpublished_version_manifest() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let namespace = "restart_zset_unpublished_version";
+
+    let visible_version = {
+        let dict = Arc::new(
+            Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
+                .await
+                .expect("dictionary"),
+        );
+        let mut zset = ZSetStream::new(
+            dict,
+            table.clone(),
+            namespace.to_string(),
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("create zset stream");
+        zset.add_delta(vec![1], 1);
+        let handle = zset.flush().await.expect("flush visible version");
+
+        let segments = encode_segments(zset.versioned().dictionary(), &[(vec![2], 1)]).await;
+        zset.versioned()
+            .create_version_with_base(segments, Some(handle.version))
+            .await
+            .expect("persist unpublished version");
+
+        handle.version
+    };
+
+    let dict = Arc::new(
+        Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
+            .await
+            .expect("dictionary"),
+    );
+    let reopened = ZSetStream::new(
+        dict,
+        table.clone(),
+        namespace.to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("reopen zset stream");
+
+    let mut snapshot_stream = reopened.handle_stream();
+    let (_, latest) = snapshot_stream
+        .latest_with_ts()
+        .await
+        .expect("latest visible handle");
+    assert_eq!(latest.version, visible_version);
+
+    let view = reopened
+        .latest_view()
+        .materialize()
+        .await
+        .expect("materialize visible snapshot");
+    assert_eq!(view.get(vec![1].as_slice()), Some(&1));
+    assert_eq!(view.get(vec![2].as_slice()), None);
+}
+
+#[tokio::test]
+async fn zset_stream_restart_ignores_unwritten_staged_version() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let namespace = "restart_zset_staged_version";
+
+    let visible_version = {
+        let dict = Arc::new(
+            Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
+                .await
+                .expect("dictionary"),
+        );
+        let mut zset = ZSetStream::new(
+            dict,
+            table.clone(),
+            namespace.to_string(),
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("create zset stream");
+        zset.add_delta(vec![1], 1);
+        let handle = zset.flush().await.expect("flush visible version");
+
+        let segments = encode_segments(zset.versioned().dictionary(), &[(vec![3], 1)]).await;
+        let mut batch = WriteBatch::new();
+        zset.versioned()
+            .enqueue_version_with_base(segments, Some(handle.version), 0, &mut batch)
+            .await
+            .expect("stage unpublished version");
+        drop(batch);
+
+        handle.version
+    };
+
+    let dict = Arc::new(
+        Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
+            .await
+            .expect("dictionary"),
+    );
+    let reopened = ZSetStream::new(
+        dict,
+        table.clone(),
+        namespace.to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("reopen zset stream");
+
+    let mut snapshot_stream = reopened.handle_stream();
+    let (_, latest) = snapshot_stream
+        .latest_with_ts()
+        .await
+        .expect("latest visible handle");
+    assert_eq!(latest.version, visible_version);
+
+    let view = reopened
+        .latest_view()
+        .materialize()
+        .await
+        .expect("materialize staged snapshot");
+    assert_eq!(view.get(vec![1].as_slice()), Some(&1));
+    assert_eq!(view.get(vec![3].as_slice()), None);
 }
 
 #[tokio::test]

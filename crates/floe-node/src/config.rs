@@ -85,6 +85,8 @@ pub struct RuntimeConfig {
 #[serde(deny_unknown_fields)]
 pub struct MvFlushConfig {
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub max_pending_deltas: Option<usize>,
     #[serde(default)]
     pub max_pending_versions: Option<usize>,

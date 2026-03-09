@@ -32,6 +32,17 @@ const OVERLAY_DECODE_CACHE_CAPACITY: usize = 256;
 static DB_ID: AtomicU64 = AtomicU64::new(0);
 static NS_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(feature = "allocator-mimalloc", feature = "allocator-jemalloc"))]
+compile_error!("enable at most one allocator feature");
+
+#[cfg(feature = "allocator-mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "allocator-jemalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 struct BenchRow {
     id: i64,

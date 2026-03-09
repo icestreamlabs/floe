@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::Bytes;
 use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, WriteBatch};
 
@@ -17,13 +18,32 @@ pub fn prefix_bounds(prefix: &[u8]) -> Range<Vec<u8>> {
 
 #[async_trait]
 pub trait KeyValueTable: Send + Sync {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>>;
     async fn write_batch(&self, batch: WriteBatch) -> Result<()>;
+    async fn scan_range_bytes(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>>;
+
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_bytes(key)
+            .await
+            .map(|opt| opt.map(|value| value.to_vec()))
+    }
+
     async fn scan_range(
         &self,
         range: Range<Vec<u8>>,
         options: &ScanOptions,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_range_bytes(range, options).await.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .collect()
+        })
+    }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
@@ -43,6 +63,14 @@ pub trait KeyValueTable: Send + Sync {
         options: &ScanOptions,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_range(prefix_bounds(prefix), options).await
+    }
+
+    async fn scan_prefix_bytes(
+        &self,
+        prefix: &[u8],
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_range_bytes(prefix_bounds(prefix), options).await
     }
 }
 
@@ -86,26 +114,23 @@ impl SlateTable {
 
 #[async_trait]
 impl KeyValueTable for SlateTable {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db
-            .get(key)
-            .await
-            .map(|opt| opt.map(|value| value.to_vec()))
-            .map_err(map_slate_err)
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.db.get(key).await.map_err(map_slate_err)
     }
 
     async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db
             .write_with_options(batch, &self.write_options())
             .await
+            .map(|_| ())
             .map_err(map_slate_err)
     }
 
-    async fn scan_range(
+    async fn scan_range_bytes(
         &self,
         range: Range<Vec<u8>>,
         options: &ScanOptions,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         let mut iter = self
             .db
             .scan_with_options(range, options)
@@ -114,7 +139,7 @@ impl KeyValueTable for SlateTable {
 
         let mut entries = Vec::new();
         while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
-            entries.push((kv.key.to_vec(), kv.value.to_vec()));
+            entries.push((kv.key, kv.value));
         }
         Ok(entries)
     }

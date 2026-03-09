@@ -379,14 +379,6 @@ where
             .await
             .context("write window aggregate update")?;
 
-        let mut cleanup = WriteBatch::new();
-        cleanup.delete(versioned.intent_key_bytes());
-        versioned
-            .table()
-            .write_batch(cleanup)
-            .await
-            .context("clear window aggregate intent")?;
-
         versioned.apply_version_plan(&plan);
         Ok(versioned.handle_for_version(plan.version))
     }

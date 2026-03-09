@@ -72,13 +72,14 @@ where
 
         stream.core.clear_intent().await?;
 
-        if let Some(bytes) = stream.table().get(&stream.core.state_key).await? {
+        if let Some(bytes) = stream.table().get_bytes(&stream.core.state_key).await? {
             let (timestamp, identity, default, last_default_ts) =
-                if let Ok(tuple) = encoding::decode::<(i64, bool, T, i64)>(&bytes) {
+                if let Ok(tuple) = encoding::decode::<(i64, bool, T, i64)>(bytes.as_ref()) {
                     tuple
                 } else {
-                    let (timestamp, identity, default) = encoding::decode::<(i64, bool, T)>(&bytes)
-                        .context("unable to decode legacy stream state")?;
+                    let (timestamp, identity, default) =
+                        encoding::decode::<(i64, bool, T)>(bytes.as_ref())
+                            .context("unable to decode legacy stream state")?;
                     (timestamp, identity, default, timestamp)
                 };
             {

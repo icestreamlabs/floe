@@ -88,7 +88,7 @@ async fn arrow_indexed_range_scan_filters_keys() {
     let table = build_table("arrow-indexed-range").await;
     let index = IndexedBatchZSet::<i64, i64>::with_range_index(table, "arrow_indexed_range");
     index
-        .apply_deltas(vec![(1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)])
+        .apply_deltas_with_range(vec![(1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)])
         .await
         .expect("apply deltas");
 
@@ -98,6 +98,26 @@ async fn arrow_indexed_range_scan_filters_keys() {
         .expect("range lookup");
     rows.sort_unstable();
     assert_eq!(rows, vec![(2, 20, 2), (3, 30, 3)]);
+}
+
+#[tokio::test]
+async fn arrow_indexed_range_scan_rejects_legacy_layout() {
+    let table = build_table("arrow-indexed-range-legacy").await;
+    let index =
+        IndexedBatchZSet::<i64, i64>::with_range_index(table.clone(), "arrow_indexed_range_legacy");
+    index
+        .apply_deltas(vec![(1, 10, 1), (2, 20, 1)])
+        .await
+        .expect("apply legacy deltas");
+
+    let err = index
+        .values_for_key_range(&1, &3)
+        .await
+        .expect_err("legacy range layout should require rebuild");
+    assert!(
+        err.to_string().contains("legacy layout"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
