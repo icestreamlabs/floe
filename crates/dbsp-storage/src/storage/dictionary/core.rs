@@ -377,6 +377,21 @@ where
         next_slot_by_hash: &mut AHashMap<u64, u16>,
     ) -> Result<u64> {
         let hash = self.hash(encoded_key);
+        if self.fast_path_fresh
+            && let std::collections::hash_map::Entry::Vacant(entry) = next_slot_by_hash.entry(hash)
+        {
+            let can_use_slot_zero = {
+                let mut seen = self.seen_hashes.lock().unwrap();
+                seen.insert(hash)
+            };
+            if can_use_slot_zero {
+                let id = self.reserve_id();
+                entry.insert(1);
+                pending.push((encoded_key.to_vec(), id, hash, 0));
+                return Ok(id);
+            }
+        }
+
         let next_slot = match next_slot_by_hash.entry(hash) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -384,19 +399,6 @@ where
                 entry.insert(loaded)
             }
         };
-
-        if self.fast_path_fresh && *next_slot == 0 {
-            let can_use_slot_zero = {
-                let mut seen = self.seen_hashes.lock().unwrap();
-                seen.insert(hash)
-            };
-            if can_use_slot_zero {
-                let id = self.reserve_id();
-                *next_slot = 1;
-                pending.push((encoded_key.to_vec(), id, hash, 0));
-                return Ok(id);
-            }
-        }
 
         let slot = *next_slot;
         let id = self.reserve_id();
