@@ -7,6 +7,7 @@ use rdkafka::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{BorrowedMessage, Timestamp};
 use rdkafka::{Offset, TopicPartitionList};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -112,27 +113,36 @@ impl KafkaConnector {
                 return Ok(0);
             }
         };
-        let value: Value = match serde_json::from_slice(payload) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    topic = message.topic(),
-                    partition = message.partition(),
-                    offset = message.offset(),
-                    error = %err,
-                    "failed to decode kafka message json"
-                );
-                return Ok(0);
+        let events = match self.message_format {
+            KafkaMessageFormat::FloeJson => parse_floe_json_events(
+                payload,
+                self.config.default_source.as_deref(),
+                message.topic(),
+            ),
+            KafkaMessageFormat::DebeziumJson => {
+                let value: Value = match serde_json::from_slice(payload) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            topic = message.topic(),
+                            partition = message.partition(),
+                            offset = message.offset(),
+                            error = %err,
+                            "failed to decode kafka message json"
+                        );
+                        return Ok(0);
+                    }
+                };
+                parse_debezium_events(
+                    value,
+                    self.config.default_source.as_deref(),
+                    message.topic(),
+                    message.key(),
+                )
             }
         };
 
-        let events = match parse_events(
-            value,
-            self.config.default_source.as_deref(),
-            message.topic(),
-            self.message_format,
-            message.key(),
-        ) {
+        let events = match events {
             Ok(events) => events,
             Err(err) => {
                 tracing::warn!(
@@ -255,43 +265,58 @@ impl Connector for KafkaConnector {
     }
 }
 
-fn parse_events(
-    value: Value,
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FloeJsonMessage {
+    Single(FloeJsonEvent),
+    Batch(Vec<FloeJsonEvent>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FloeJsonEvent {
+    Wrapped { source: String, data: Value },
+    Payload(Value),
+}
+
+fn parse_floe_json_events(
+    payload: &[u8],
     default_source: Option<&str>,
     topic: &str,
-    format: KafkaMessageFormat,
-    message_key: Option<&[u8]>,
 ) -> Result<Vec<SourceEvent>> {
-    if matches!(format, KafkaMessageFormat::DebeziumJson) {
-        return parse_debezium_events(value, default_source, topic, message_key);
-    }
+    let message: FloeJsonMessage =
+        serde_json::from_slice(payload).context("floe json payload must be valid json")?;
 
-    match value {
-        Value::Array(items) => {
-            ensure!(!items.is_empty(), "event array must not be empty");
-            let mut events = Vec::with_capacity(items.len());
-            for item in items {
-                events.push(parse_event(item, default_source, topic)?);
-            }
-            Ok(events)
+    match message {
+        FloeJsonMessage::Single(event) => {
+            Ok(vec![parse_floe_json_event(event, default_source, topic)?])
         }
-        other => Ok(vec![parse_event(other, default_source, topic)?]),
+        FloeJsonMessage::Batch(events) => {
+            ensure!(!events.is_empty(), "event array must not be empty");
+            let mut parsed = Vec::with_capacity(events.len());
+            for event in events {
+                parsed.push(parse_floe_json_event(event, default_source, topic)?);
+            }
+            Ok(parsed)
+        }
     }
 }
 
-fn parse_event(value: Value, default_source: Option<&str>, topic: &str) -> Result<SourceEvent> {
-    let object = value
-        .as_object()
-        .context("event payload must be a JSON object")?;
-
-    if let (Some(source), Some(payload)) = (object.get("source"), object.get("data")) {
-        let source = source.as_str().context("event source must be a string")?;
-        ensure!(payload.is_object(), "event payload must be an object");
-        return Ok(SourceEvent::new(source, payload.clone()));
+fn parse_floe_json_event(
+    event: FloeJsonEvent,
+    default_source: Option<&str>,
+    topic: &str,
+) -> Result<SourceEvent> {
+    match event {
+        FloeJsonEvent::Wrapped { source, data } => {
+            ensure!(data.is_object(), "event payload must be an object");
+            Ok(SourceEvent::new(source, data))
+        }
+        FloeJsonEvent::Payload(payload) => {
+            let source = default_source.unwrap_or(topic);
+            Ok(SourceEvent::new(source, payload))
+        }
     }
-
-    let source = default_source.unwrap_or(topic);
-    Ok(SourceEvent::new(source, value))
 }
 
 fn parse_debezium_events(
@@ -423,14 +448,9 @@ mod tests {
                 "after": {"id": 1, "name": "new"}
             }
         });
-        let events = parse_events(
-            payload,
-            Some("public.users"),
-            "dbz",
-            KafkaMessageFormat::DebeziumJson,
-            Some(br#"{"id":1}"#),
-        )
-        .expect("parse debezium");
+        let events =
+            parse_debezium_events(payload, Some("public.users"), "dbz", Some(br#"{"id":1}"#))
+                .expect("parse debezium");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source(), "public.users");
         assert_eq!(
@@ -452,14 +472,8 @@ mod tests {
                 "after": null
             }
         });
-        let events = parse_events(
-            payload,
-            Some("public.users"),
-            "dbz",
-            KafkaMessageFormat::DebeziumJson,
-            None,
-        )
-        .expect("parse debezium");
+        let events = parse_debezium_events(payload, Some("public.users"), "dbz", None)
+            .expect("parse debezium");
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].payload().get("__floe_op").and_then(Value::as_str),
@@ -473,9 +487,8 @@ mod tests {
 
     #[test]
     fn parse_floe_json_still_supports_source_data_wrapper() {
-        let payload = json!({"source": "nexmark_bid", "data": {"auction": 1}});
-        let events = parse_events(payload, None, "topic", KafkaMessageFormat::FloeJson, None)
-            .expect("parse floe json");
+        let payload = br#"{"source":"nexmark_bid","data":{"auction":1}}"#;
+        let events = parse_floe_json_events(payload, None, "topic").expect("parse floe json");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source(), "nexmark_bid");
         assert_eq!(
