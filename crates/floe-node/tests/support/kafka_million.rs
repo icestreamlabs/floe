@@ -142,6 +142,25 @@ enum TailVerifyMode {
     SamplesOnly,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NoSinkVerifyMode {
+    Full,
+    CountOnly,
+}
+
+impl NoSinkVerifyMode {
+    fn from_env() -> Self {
+        match std::env::var("FLOE_E2E_NO_SINK_VERIFY")
+            .unwrap_or_else(|_| "full".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "count_only" | "count-only" | "count" => Self::CountOnly,
+            _ => Self::Full,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BidInput {
     pub(crate) auction: i64,
@@ -271,6 +290,11 @@ async fn run_redpanda_kafka_million_test_impl(
     let slatedb_flush_interval_ms = std::env::var("FLOE_E2E_SLATEDB_FLUSH_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let no_sink_verify_mode = NoSinkVerifyMode::from_env();
+    let build_samples = !matches!(
+        (sink_mode, no_sink_verify_mode),
+        (SinkMode::NoSink, NoSinkVerifyMode::CountOnly)
+    );
 
     eprintln!("artifacts_dir={}", artifacts_dir.display());
     eprintln!("dataset_path={}", dataset_path.display());
@@ -278,11 +302,17 @@ async fn run_redpanda_kafka_million_test_impl(
         "brokers={brokers} input_topic={input_topic} output_topic={output_topic} sink_mode={sink_mode:?}"
     );
 
+    if matches!(sink_mode, SinkMode::NoSink) {
+        eprintln!("verify.no_sink_mode={no_sink_verify_mode:?}");
+    }
+
     let expected = {
         let dataset_path = dataset_path.clone();
-        tokio::task::spawn_blocking(move || generate_dataset_file(&dataset_path, spec))
-            .await
-            .context("join dataset generation task")??
+        tokio::task::spawn_blocking(move || {
+            generate_dataset_file(&dataset_path, spec, build_samples)
+        })
+        .await
+        .context("join dataset generation task")??
     };
     if expected.generated_rows != TOTAL_ROWS {
         bail!(
@@ -463,6 +493,7 @@ async fn run_redpanda_kafka_million_test_impl(
                     spec.sample_match_field,
                     expected.clone(),
                     Duration::from_secs(1800),
+                    no_sink_verify_mode,
                 )
                 .await?;
 
@@ -508,7 +539,11 @@ async fn run_redpanda_kafka_million_test_impl(
     test_result
 }
 
-fn generate_dataset_file(path: &Path, spec: MillionQuerySpec) -> Result<ExpectedDataset> {
+fn generate_dataset_file(
+    path: &Path,
+    spec: MillionQuerySpec,
+    build_samples: bool,
+) -> Result<ExpectedDataset> {
     let file =
         File::create(path).with_context(|| format!("create dataset file {}", path.display()))?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
@@ -526,6 +561,10 @@ fn generate_dataset_file(path: &Path, spec: MillionQuerySpec) -> Result<Expected
     }
 
     writer.flush().context("flush dataset writer")?;
+
+    if !build_samples {
+        return Ok(expected);
+    }
 
     let sample_ordinals = compute_sample_ordinals(output_rows, spec.sample_selection);
     if sample_ordinals.is_empty() {
@@ -853,6 +892,7 @@ async fn verify_mv_snapshot_count_and_samples(
     sample_match_field: &'static str,
     expected: ExpectedDataset,
     timeout: Duration,
+    verify_mode: NoSinkVerifyMode,
 ) -> Result<NoSinkVerificationTiming> {
     let verify_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
@@ -891,69 +931,74 @@ async fn verify_mv_snapshot_count_and_samples(
     }
     let wait_for_count = count_wait_started.elapsed();
 
-    let sample_field_idx = sample_field_index(output_fields, sample_match_field)?;
-    let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
     let sample_query_started = Instant::now();
-    if !expected.sample_rows_by_key.is_empty() {
-        let sample_field_kind = output_fields
-            .get(sample_field_idx)
-            .map(|field| field.kind)
-            .with_context(|| format!("sample field index {} out of bounds", sample_field_idx))?;
-        let sample_in_list =
-            build_sql_in_list(expected.sample_rows_by_key.keys(), sample_field_kind)
-                .context("build sample IN list")?;
-        let select_fields = output_fields
-            .iter()
-            .map(|field| field.name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sample_sql = format!(
-            "SELECT {select_fields} FROM {mv_name} WHERE {sample_match_field} IN ({sample_in_list})"
-        );
-        let messages = client
-            .simple_query(&sample_sql)
-            .await
-            .with_context(|| format!("query sample rows from {mv_name}"))?;
-        for message in messages {
-            if let SimpleQueryMessage::Row(row) = message {
-                let parsed = row_from_query_row(&row, output_fields)?;
-                let key =
-                    expected_value_key(parsed.values.get(sample_field_idx).with_context(|| {
-                        format!(
-                            "sample field index {} out of bounds while parsing query row",
-                            sample_field_idx
-                        )
-                    })?);
-                observed_samples.insert(key, parsed);
+    if matches!(verify_mode, NoSinkVerifyMode::Full) {
+        let sample_field_idx = sample_field_index(output_fields, sample_match_field)?;
+        let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
+        if !expected.sample_rows_by_key.is_empty() {
+            let sample_field_kind = output_fields
+                .get(sample_field_idx)
+                .map(|field| field.kind)
+                .with_context(|| {
+                    format!("sample field index {} out of bounds", sample_field_idx)
+                })?;
+            let sample_in_list =
+                build_sql_in_list(expected.sample_rows_by_key.keys(), sample_field_kind)
+                    .context("build sample IN list")?;
+            let select_fields = output_fields
+                .iter()
+                .map(|field| field.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sample_sql = format!(
+                "SELECT {select_fields} FROM {mv_name} WHERE {sample_match_field} IN ({sample_in_list})"
+            );
+            let messages = client
+                .simple_query(&sample_sql)
+                .await
+                .with_context(|| format!("query sample rows from {mv_name}"))?;
+            for message in messages {
+                if let SimpleQueryMessage::Row(row) = message {
+                    let parsed = row_from_query_row(&row, output_fields)?;
+                    let key = expected_value_key(
+                        parsed.values.get(sample_field_idx).with_context(|| {
+                            format!(
+                                "sample field index {} out of bounds while parsing query row",
+                                sample_field_idx
+                            )
+                        })?,
+                    );
+                    observed_samples.insert(key, parsed);
+                }
+            }
+        }
+
+        if observed_samples.len() != expected.sample_rows_by_key.len() {
+            let missing: Vec<String> = expected
+                .sample_rows_by_key
+                .keys()
+                .filter(|key| !observed_samples.contains_key(*key))
+                .cloned()
+                .collect();
+            bail!(
+                "sample row count mismatch after no-sink verification: observed={}, expected={}, missing_keys={missing:?}",
+                observed_samples.len(),
+                expected.sample_rows_by_key.len()
+            );
+        }
+        for (key, expected_row) in &expected.sample_rows_by_key {
+            let actual = observed_samples
+                .get(key)
+                .with_context(|| format!("missing sample row for key={key}"))?;
+            if actual != expected_row {
+                bail!(
+                    "sample mismatch for key={}: actual={actual:?}, expected={expected_row:?}",
+                    key
+                );
             }
         }
     }
     let sample_query = sample_query_started.elapsed();
-
-    if observed_samples.len() != expected.sample_rows_by_key.len() {
-        let missing: Vec<String> = expected
-            .sample_rows_by_key
-            .keys()
-            .filter(|key| !observed_samples.contains_key(*key))
-            .cloned()
-            .collect();
-        bail!(
-            "sample row count mismatch after no-sink verification: observed={}, expected={}, missing_keys={missing:?}",
-            observed_samples.len(),
-            expected.sample_rows_by_key.len()
-        );
-    }
-    for (key, expected_row) in &expected.sample_rows_by_key {
-        let actual = observed_samples
-            .get(key)
-            .with_context(|| format!("missing sample row for key={key}"))?;
-        if actual != expected_row {
-            bail!(
-                "sample mismatch for key={}: actual={actual:?}, expected={expected_row:?}",
-                key
-            );
-        }
-    }
 
     connection_handle.abort();
     let _ = connection_handle.await;
