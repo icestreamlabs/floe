@@ -299,6 +299,23 @@ where
         self.intern_many_encoded(encoded_keys).await
     }
 
+    /// Intern a batch of keys that are already unique within the batch.
+    ///
+    /// This skips duplicate-detection bookkeeping in `intern_many_values` and is
+    /// intended for callers that already consolidated their delta by key.
+    pub async fn intern_many_values_unique<'a, I>(&self, keys: I) -> Result<Vec<u64>>
+    where
+        I: IntoIterator<Item = &'a K>,
+        K: 'a,
+    {
+        let mut encoded_keys = Vec::new();
+        for key in keys {
+            encoded_keys
+                .push(encoding::encode(key).context("unable to encode dictionary key in batch")?);
+        }
+        self.intern_many_encoded_unique(encoded_keys).await
+    }
+
     async fn intern_many_encoded(&self, encoded_keys: Vec<Vec<u8>>) -> Result<Vec<u64>> {
         if encoded_keys.is_empty() {
             return Ok(Vec::new());
@@ -328,7 +345,60 @@ where
                     cache.is_negative(encoded)
                 };
                 if should_allocate || self.fast_path_fresh {
-                    self.reserve_in_batch(encoded, &mut pending, &mut next_slot_by_hash)
+                    self.reserve_in_batch(
+                        resolved_hash,
+                        encoded,
+                        &mut pending,
+                        &mut next_slot_by_hash,
+                    )
+                    .await?
+                } else if let Some(existing) = self.lookup_existing_id(encoded).await? {
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.remember(encoded.clone(), existing);
+                    existing
+                } else {
+                    {
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.remember_negative(encoded);
+                    }
+                    self.reserve_in_batch(
+                        resolved_hash,
+                        encoded,
+                        &mut pending,
+                        &mut next_slot_by_hash,
+                    )
+                    .await?
+                }
+            };
+
+            resolved.entry(resolved_hash).or_default().push((index, id));
+            output.push(id);
+        }
+
+        self.flush_pending_batch(pending).await?;
+        Ok(output)
+    }
+
+    async fn intern_many_encoded_unique(&self, encoded_keys: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+        if encoded_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pending = Vec::<(Vec<u8>, u64, u64, u16)>::with_capacity(encoded_keys.len());
+        let mut next_slot_by_hash = AHashMap::<u64, u16>::new();
+        let mut output = Vec::with_capacity(encoded_keys.len());
+
+        for encoded in encoded_keys.iter() {
+            let id = if let Some(existing) = self.lookup_existing_in_cache(encoded) {
+                existing
+            } else {
+                let hash = self.hash(encoded);
+                let should_allocate = {
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.is_negative(encoded)
+                };
+                if should_allocate || self.fast_path_fresh {
+                    self.reserve_in_batch(hash, encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
                 } else if let Some(existing) = self.lookup_existing_id(encoded).await? {
                     let mut cache = self.cache.lock().unwrap();
@@ -339,15 +409,18 @@ where
                         let mut cache = self.cache.lock().unwrap();
                         cache.remember_negative(encoded);
                     }
-                    self.reserve_in_batch(encoded, &mut pending, &mut next_slot_by_hash)
+                    self.reserve_in_batch(hash, encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
                 }
             };
-
-            resolved.entry(resolved_hash).or_default().push((index, id));
             output.push(id);
         }
 
+        self.flush_pending_batch(pending).await?;
+        Ok(output)
+    }
+
+    async fn flush_pending_batch(&self, pending: Vec<(Vec<u8>, u64, u64, u16)>) -> Result<()> {
         if !pending.is_empty() {
             let mut batch = WriteBatch::new();
             for (encoded, id, hash, slot) in &pending {
@@ -367,16 +440,16 @@ where
             }
         }
 
-        Ok(output)
+        Ok(())
     }
 
     async fn reserve_in_batch(
         &self,
+        hash: u64,
         encoded_key: &[u8],
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
         next_slot_by_hash: &mut AHashMap<u64, u16>,
     ) -> Result<u64> {
-        let hash = self.hash(encoded_key);
         if self.fast_path_fresh
             && let std::collections::hash_map::Entry::Vacant(entry) = next_slot_by_hash.entry(hash)
         {
