@@ -400,9 +400,17 @@ impl VectorizedFilterProjectEvaluator {
         if delta_values.is_empty() {
             return Ok(HashMap::new());
         }
+        let identity_projection = self
+            .projection_plan
+            .is_identity(self.input_schema.fields().len());
+        if self.predicate.is_none() && identity_projection {
+            // No predicate and identity projection means this operator is a no-op transform.
+            return Ok(consolidate_encoded_delta(delta_values));
+        }
 
         let mut rows = Vec::with_capacity(delta_values.len());
         let mut weights = Vec::with_capacity(delta_values.len());
+        let mut encoded_rows = identity_projection.then(|| Vec::with_capacity(delta_values.len()));
         for (encoded, weight) in delta_values {
             if weight == 0 {
                 continue;
@@ -411,6 +419,9 @@ impl VectorizedFilterProjectEvaluator {
                 Ok(row) => {
                     rows.push(row);
                     weights.push(weight);
+                    if let Some(encoded_rows) = encoded_rows.as_mut() {
+                        encoded_rows.push(encoded);
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -433,6 +444,22 @@ impl VectorizedFilterProjectEvaluator {
                     return Ok(HashMap::new());
                 }
                 let mut output: HashMap<Vec<u8>, i64> = HashMap::with_capacity(selected.len());
+                if identity_projection {
+                    let Some(encoded_rows) = encoded_rows.as_ref() else {
+                        return Ok(HashMap::new());
+                    };
+                    for idx in selected {
+                        let diff = weights.get(idx).copied().unwrap_or(0);
+                        if diff == 0 {
+                            continue;
+                        }
+                        let Some(encoded) = encoded_rows.get(idx).cloned() else {
+                            continue;
+                        };
+                        apply_weight_delta(&mut output, encoded, diff);
+                    }
+                    return Ok(output);
+                }
                 for idx in selected {
                     let diff = weights.get(idx).copied().unwrap_or(0);
                     if diff == 0 {
@@ -446,11 +473,7 @@ impl VectorizedFilterProjectEvaluator {
                         .map(|column_idx| row[*column_idx].clone())
                         .collect::<Vec<_>>();
                     let encoded = encode_projected_row_key(&projected_row)?;
-                    let entry = output.entry(encoded.clone()).or_insert(0);
-                    *entry += diff;
-                    if *entry == 0 {
-                        output.remove(&encoded);
-                    }
+                    apply_weight_delta(&mut output, encoded, diff);
                 }
                 Ok(output)
             }
@@ -485,11 +508,7 @@ impl VectorizedFilterProjectEvaluator {
                         projected_row.push(ScalarValue::try_from_array(array, idx)?);
                     }
                     let encoded = encode_projected_row_key(&projected_row)?;
-                    let entry = output.entry(encoded.clone()).or_insert(0);
-                    *entry += diff;
-                    if *entry == 0 {
-                        output.remove(&encoded);
-                    }
+                    apply_weight_delta(&mut output, encoded, diff);
                 }
                 Ok(output)
             }
@@ -526,6 +545,18 @@ impl VectorizedFilterProjectEvaluator {
 enum ProjectionPlan {
     ColumnIndices(Arc<Vec<usize>>),
     Physical(Arc<Vec<Arc<dyn PhysicalExpr>>>),
+}
+
+impl ProjectionPlan {
+    fn is_identity(&self, input_width: usize) -> bool {
+        match self {
+            Self::ColumnIndices(indices) => {
+                indices.len() == input_width
+                    && indices.iter().enumerate().all(|(idx, col)| idx == *col)
+            }
+            Self::Physical(_) => false,
+        }
+    }
 }
 
 fn column_projection_indices(
@@ -610,6 +641,37 @@ fn rows_to_record_batch_owned(
         })
         .collect::<Result<_>>()?;
     RecordBatch::try_new(Arc::clone(schema), arrays).context("build vectorized input batch")
+}
+
+fn consolidate_encoded_delta(delta_values: Vec<(Vec<u8>, i64)>) -> HashMap<Vec<u8>, i64> {
+    let mut output: HashMap<Vec<u8>, i64> = HashMap::with_capacity(delta_values.len());
+    for (encoded, diff) in delta_values {
+        if diff == 0 {
+            continue;
+        }
+        apply_weight_delta(&mut output, encoded, diff);
+    }
+    output
+}
+
+fn apply_weight_delta(output: &mut HashMap<Vec<u8>, i64>, encoded: Vec<u8>, diff: i64) {
+    use std::collections::hash_map::Entry;
+
+    match output.entry(encoded) {
+        Entry::Occupied(mut entry) => {
+            let next = *entry.get() + diff;
+            if next == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = next;
+            }
+        }
+        Entry::Vacant(entry) => {
+            if diff != 0 {
+                entry.insert(diff);
+            }
+        }
+    }
 }
 
 fn vectorized_filter_map_enabled() -> bool {
