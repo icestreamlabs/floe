@@ -103,6 +103,13 @@ struct ExpectedDataset {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NoSinkVerificationTiming {
+    wait_for_count: Duration,
+    sample_query: Duration,
+    total: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SampleSelection {
     FirstN(usize),
     EvenlySpaced(usize),
@@ -361,6 +368,7 @@ async fn run_redpanda_kafka_million_test_impl(
 
     let test_result = async {
         wait_for_pgwire(pg_port, &mut child, &stderr_log_path).await?;
+        let execution_started = Instant::now();
 
         match sink_mode {
             SinkMode::WithKafkaSink => {
@@ -442,12 +450,13 @@ async fn run_redpanda_kafka_million_test_impl(
                     .await
                     .context("join kafka producer task")??;
                 }
+                let produce_elapsed = produce_started.elapsed();
                 eprintln!(
                     "kafka production completed in {:?}",
-                    produce_started.elapsed()
+                    produce_elapsed
                 );
 
-                verify_mv_snapshot_count_and_samples(
+                let verify_timing = verify_mv_snapshot_count_and_samples(
                     pg_port,
                     spec.mv_name,
                     spec.output_fields,
@@ -456,9 +465,36 @@ async fn run_redpanda_kafka_million_test_impl(
                     Duration::from_secs(1800),
                 )
                 .await?;
+
+                let ingest_completion = produce_elapsed + verify_timing.wait_for_count;
+                let input_rows_per_sec =
+                    safe_rows_per_sec(TOTAL_ROWS as f64, ingest_completion.as_secs_f64());
+                let output_rows_per_sec = safe_rows_per_sec(
+                    expected.metrics.row_count.max(0) as f64,
+                    ingest_completion.as_secs_f64(),
+                );
+                eprintln!(
+                    "timing.no_sink.ingest_complete_s={:.3} (produce_s={:.3}, post_produce_wait_s={:.3})",
+                    ingest_completion.as_secs_f64(),
+                    produce_elapsed.as_secs_f64(),
+                    verify_timing.wait_for_count.as_secs_f64()
+                );
+                eprintln!(
+                    "timing.no_sink.verification_s={:.3} (sample_query_s={:.3})",
+                    verify_timing.total.as_secs_f64(),
+                    verify_timing.sample_query.as_secs_f64()
+                );
+                eprintln!(
+                    "throughput.no_sink.input_rows_per_sec={:.0} output_rows_per_sec={:.0}",
+                    input_rows_per_sec, output_rows_per_sec
+                );
             }
         }
 
+        eprintln!(
+            "timing.execution.total_s={:.3}",
+            execution_started.elapsed().as_secs_f64()
+        );
         eprintln!(
             "verified rows={} checksum={}",
             expected.metrics.row_count, expected.metrics.checksum
@@ -817,7 +853,8 @@ async fn verify_mv_snapshot_count_and_samples(
     sample_match_field: &'static str,
     expected: ExpectedDataset,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<NoSinkVerificationTiming> {
+    let verify_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={pg_port} user=postgres"),
         NoTls,
@@ -830,7 +867,7 @@ async fn verify_mv_snapshot_count_and_samples(
 
     let expected_rows = usize::try_from(expected.metrics.row_count)
         .context("expected row count must be non-negative and fit usize")?;
-    let start = Instant::now();
+    let count_wait_started = Instant::now();
     loop {
         let observed_rows = query_mv_count(&client, mv_name).await?;
         if observed_rows == expected_rows {
@@ -843,7 +880,7 @@ async fn verify_mv_snapshot_count_and_samples(
                 expected_rows
             );
         }
-        if start.elapsed() >= timeout {
+        if count_wait_started.elapsed() >= timeout {
             bail!(
                 "mv row count did not reach expected within timeout: observed={}, expected={}",
                 observed_rows,
@@ -852,9 +889,11 @@ async fn verify_mv_snapshot_count_and_samples(
         }
         sleep(Duration::from_millis(250)).await;
     }
+    let wait_for_count = count_wait_started.elapsed();
 
     let sample_field_idx = sample_field_index(output_fields, sample_match_field)?;
     let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
+    let sample_query_started = Instant::now();
     if !expected.sample_rows_by_key.is_empty() {
         let sample_field_kind = output_fields
             .get(sample_field_idx)
@@ -889,6 +928,7 @@ async fn verify_mv_snapshot_count_and_samples(
             }
         }
     }
+    let sample_query = sample_query_started.elapsed();
 
     if observed_samples.len() != expected.sample_rows_by_key.len() {
         let missing: Vec<String> = expected
@@ -917,7 +957,11 @@ async fn verify_mv_snapshot_count_and_samples(
 
     connection_handle.abort();
     let _ = connection_handle.await;
-    Ok(())
+    Ok(NoSinkVerificationTiming {
+        wait_for_count,
+        sample_query,
+        total: verify_started.elapsed(),
+    })
 }
 
 async fn query_mv_count(client: &tokio_postgres::Client, mv_name: &str) -> Result<usize> {
@@ -1118,6 +1162,14 @@ fn row_checksum(row: &ExpectedRow) -> i128 {
         };
     }
     acc
+}
+
+fn safe_rows_per_sec(rows: f64, seconds: f64) -> f64 {
+    if seconds <= f64::EPSILON {
+        0.0
+    } else {
+        rows / seconds
+    }
 }
 
 fn sample_field_index(output_fields: &[FieldSpec], sample_match_field: &str) -> Result<usize> {

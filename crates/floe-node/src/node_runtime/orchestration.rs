@@ -283,6 +283,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             CompactionSchedulerConfig {
                 failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,
                 max_concurrent_jobs: stream_compaction.scheduler_max_concurrent_jobs,
+                ..Default::default()
             },
         )
         .await;
