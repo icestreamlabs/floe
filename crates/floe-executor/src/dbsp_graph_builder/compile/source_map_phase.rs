@@ -37,6 +37,36 @@ impl DbspGraphBuilder {
         let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
             report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
         });
+        if vectorized_filter_map_enabled() {
+            match VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema)) {
+                Ok(evaluator) => {
+                    tracing::info!(
+                        graph_id = %graph_id,
+                        "using vectorized filter execution path"
+                    );
+                    let evaluator = Arc::new(evaluator);
+                    let vectorized_graph_id = graph_id.clone();
+                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<HashMap<Vec<u8>, i64>> {
+                        evaluator.transform_delta(&vectorized_graph_id, delta_values)
+                    };
+                    let filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+                        &upstream,
+                        transform,
+                        Some(error_handler.clone()),
+                    )
+                    .await
+                    .context("initialize vectorized DBSP filter")?;
+                    return Ok(filter.stream());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "vectorized filter initialization failed; falling back to scalar path"
+                    );
+                }
+            }
+        }
         let log_graph_id = graph_id.clone();
         let filter_pred = move |bytes: &Vec<u8>| -> bool {
             let row = match decode_projected_row_key(bytes) {
@@ -83,6 +113,39 @@ impl DbspGraphBuilder {
         let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
             report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
         });
+        if vectorized_filter_map_enabled() {
+            match VectorizedFilterProjectEvaluator::for_map(
+                expressions.as_ref(),
+                Arc::clone(&schema),
+            ) {
+                Ok(evaluator) => {
+                    tracing::info!(
+                        graph_id = %graph_id,
+                        "using vectorized map execution path"
+                    );
+                    let evaluator = Arc::new(evaluator);
+                    let vectorized_graph_id = graph_id.clone();
+                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<HashMap<Vec<u8>, i64>> {
+                        evaluator.transform_delta(&vectorized_graph_id, delta_values)
+                    };
+                    let map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+                        &upstream,
+                        transform,
+                        Some(error_handler.clone()),
+                    )
+                    .await
+                    .context("initialize vectorized DBSP map")?;
+                    return Ok(map.stream());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "vectorized map initialization failed; falling back to scalar path"
+                    );
+                }
+            }
+        }
         let log_graph_id = graph_id.clone();
         let projector = move |bytes: &Vec<u8>| -> Vec<u8> {
             let row = match decode_projected_row_key(bytes) {
@@ -144,12 +207,10 @@ impl DbspGraphBuilder {
         let error_handler: RuntimeErrorHandler = Arc::new(move |err| {
             report_graph_task_error(&task_events, &error_graph_id, task_label.clone(), err);
         });
-        let vectorized_enabled = std::env::var("FLOE_VECTORIZED_FILTER_MAP")
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "False"))
-            .unwrap_or(true);
+        let vectorized_enabled = vectorized_filter_map_enabled();
 
         if vectorized_enabled {
-            match VectorizedFilterProjectEvaluator::new(
+            match VectorizedFilterProjectEvaluator::for_filter_map(
                 &predicate,
                 expressions.as_ref(),
                 Arc::clone(&project_schema),
@@ -253,12 +314,12 @@ impl DbspGraphBuilder {
 #[derive(Clone)]
 struct VectorizedFilterProjectEvaluator {
     input_schema: datafusion::arrow::datatypes::SchemaRef,
-    predicate: Arc<dyn PhysicalExpr>,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
     projection_plan: ProjectionPlan,
 }
 
 impl VectorizedFilterProjectEvaluator {
-    fn new(
+    fn for_filter_map(
         predicate: &dbsp::DbspPredicate,
         projections: &[DbspProjectExpr],
         input_schema: Arc<RowSchema>,
@@ -285,7 +346,48 @@ impl VectorizedFilterProjectEvaluator {
         };
         Ok(Self {
             input_schema,
-            predicate,
+            predicate: Some(predicate),
+            projection_plan,
+        })
+    }
+
+    fn for_filter(predicate: &dbsp::DbspPredicate, input_schema: Arc<RowSchema>) -> Result<Self> {
+        let projections = (0..input_schema.len()).collect::<Vec<_>>();
+        let input_schema = input_schema.to_arrow_schema();
+        let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
+            .context("build DataFusion schema for vectorized filter")?;
+        let ctx = SessionContext::new();
+        let predicate = ctx
+            .create_physical_expr(predicate.expression().expr().clone(), &df_schema)
+            .context("compile vectorized filter predicate expression")?;
+        Ok(Self {
+            input_schema,
+            predicate: Some(predicate),
+            projection_plan: ProjectionPlan::ColumnIndices(Arc::new(projections)),
+        })
+    }
+
+    fn for_map(projections: &[DbspProjectExpr], input_schema: Arc<RowSchema>) -> Result<Self> {
+        let column_projection = column_projection_indices(projections, input_schema.as_ref());
+        let input_schema = input_schema.to_arrow_schema();
+        let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
+            .context("build DataFusion schema for vectorized map")?;
+        let ctx = SessionContext::new();
+        let projection_plan = if let Some(indices) = column_projection {
+            ProjectionPlan::ColumnIndices(Arc::new(indices))
+        } else {
+            let projections = projections
+                .iter()
+                .map(|expr| {
+                    ctx.create_physical_expr(expr.expression().expr().clone(), &df_schema)
+                        .context("compile vectorized map projection expression")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ProjectionPlan::Physical(Arc::new(projections))
+        };
+        Ok(Self {
+            input_schema,
+            predicate: None,
             projection_plan,
         })
     }
@@ -395,19 +497,24 @@ impl VectorizedFilterProjectEvaluator {
     }
 
     fn selected_indices(&self, batch: &RecordBatch) -> Result<Vec<usize>> {
-        let predicate = self
-            .predicate
-            .evaluate(batch)
-            .context("evaluate vectorized filter_map predicate")?
-            .into_array(batch.num_rows())
-            .context("materialize vectorized predicate result")?;
-        let bool_array = predicate
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| anyhow!("vectorized predicate did not evaluate to boolean"))?;
-        let mut selected = Vec::new();
-        for idx in 0..bool_array.len() {
-            if bool_array.is_valid(idx) && bool_array.value(idx) {
+        let mut selected = Vec::with_capacity(batch.num_rows());
+        if let Some(predicate) = &self.predicate {
+            let predicate = predicate
+                .evaluate(batch)
+                .context("evaluate vectorized filter_map predicate")?
+                .into_array(batch.num_rows())
+                .context("materialize vectorized predicate result")?;
+            let bool_array = predicate
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("vectorized predicate did not evaluate to boolean"))?;
+            for idx in 0..bool_array.len() {
+                if bool_array.is_valid(idx) && bool_array.value(idx) {
+                    selected.push(idx);
+                }
+            }
+        } else {
+            for idx in 0..batch.num_rows() {
                 selected.push(idx);
             }
         }
@@ -503,4 +610,10 @@ fn rows_to_record_batch_owned(
         })
         .collect::<Result<_>>()?;
     RecordBatch::try_new(Arc::clone(schema), arrays).context("build vectorized input batch")
+}
+
+fn vectorized_filter_map_enabled() -> bool {
+    std::env::var("FLOE_VECTORIZED_FILTER_MAP")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "False"))
+        .unwrap_or(true)
 }
