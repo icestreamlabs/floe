@@ -105,6 +105,41 @@ async fn batch_overlay_reuses_lookup() {
 }
 
 #[tokio::test]
+async fn interns_owned_unique_batch_without_cloning_keys() {
+    let table = build_table().await;
+    let dict = Dictionary::<TestKey>::with_table(table, "owned_unique", None)
+        .await
+        .expect("build dictionary");
+
+    let ids = dict
+        .intern_many_values_unique_owned(vec![
+            TestKey {
+                value: "alpha".to_string(),
+            },
+            TestKey {
+                value: "beta".to_string(),
+            },
+            TestKey {
+                value: "gamma".to_string(),
+            },
+        ])
+        .await
+        .expect("intern owned unique batch");
+
+    assert_eq!(ids.len(), 3);
+
+    let resolved = dict
+        .resolve_many(&ids)
+        .await
+        .expect("resolve owned unique ids");
+    let resolved_values = resolved
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_values, vec!["alpha", "beta", "gamma"]);
+}
+
+#[tokio::test]
 async fn interning_long_key_preserves_short_slate_keys() {
     let table = build_table().await;
     let dict = Dictionary::<TestKey>::with_table(table, "length", None)

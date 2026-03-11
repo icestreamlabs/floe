@@ -1,6 +1,8 @@
 use super::*;
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray};
+use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
+use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::datatypes::Int32Type;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -46,7 +48,7 @@ impl DbspGraphBuilder {
                     );
                     let evaluator = Arc::new(evaluator);
                     let vectorized_graph_id = graph_id.clone();
-                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<HashMap<Vec<u8>, i64>> {
+                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                         evaluator.transform_delta(&vectorized_graph_id, delta_values)
                     };
                     let filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
@@ -125,7 +127,7 @@ impl DbspGraphBuilder {
                     );
                     let evaluator = Arc::new(evaluator);
                     let vectorized_graph_id = graph_id.clone();
-                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<HashMap<Vec<u8>, i64>> {
+                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                         evaluator.transform_delta(&vectorized_graph_id, delta_values)
                     };
                     let map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
@@ -222,7 +224,7 @@ impl DbspGraphBuilder {
                     );
                     let evaluator = Arc::new(evaluator);
                     let vectorized_graph_id = graph_id.clone();
-                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<HashMap<Vec<u8>, i64>> {
+                    let transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                         evaluator.transform_delta(&vectorized_graph_id, delta_values)
                     };
 
@@ -396,16 +398,16 @@ impl VectorizedFilterProjectEvaluator {
         &self,
         graph_id: &str,
         delta_values: Vec<(Vec<u8>, i64)>,
-    ) -> Result<HashMap<Vec<u8>, i64>> {
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
         if delta_values.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
         let identity_projection = self
             .projection_plan
             .is_identity(self.input_schema.fields().len());
         if self.predicate.is_none() && identity_projection {
             // No predicate and identity projection means this operator is a no-op transform.
-            return Ok(consolidate_encoded_delta(delta_values));
+            return consolidate_encoded_delta_batch(delta_values);
         }
 
         let mut rows = Vec::with_capacity(delta_values.len());
@@ -433,7 +435,7 @@ impl VectorizedFilterProjectEvaluator {
             }
         }
         if rows.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
 
         match &self.projection_plan {
@@ -441,12 +443,12 @@ impl VectorizedFilterProjectEvaluator {
                 let batch = rows_to_record_batch_ref(&self.input_schema, &rows)?;
                 let selected = self.selected_indices(&batch)?;
                 if selected.is_empty() {
-                    return Ok(HashMap::new());
+                    return Ok(Vec::new());
                 }
-                let mut output: HashMap<Vec<u8>, i64> = HashMap::with_capacity(selected.len());
+                let mut staged = Vec::with_capacity(selected.len());
                 if identity_projection {
                     let Some(encoded_rows) = encoded_rows.as_ref() else {
-                        return Ok(HashMap::new());
+                        return Ok(Vec::new());
                     };
                     for idx in selected {
                         let diff = weights.get(idx).copied().unwrap_or(0);
@@ -456,9 +458,9 @@ impl VectorizedFilterProjectEvaluator {
                         let Some(encoded) = encoded_rows.get(idx).cloned() else {
                             continue;
                         };
-                        apply_weight_delta(&mut output, encoded, diff);
+                        staged.push((encoded, diff));
                     }
-                    return Ok(output);
+                    return consolidate_encoded_delta_batch(staged);
                 }
                 for idx in selected {
                     let diff = weights.get(idx).copied().unwrap_or(0);
@@ -473,15 +475,15 @@ impl VectorizedFilterProjectEvaluator {
                         .map(|column_idx| row[*column_idx].clone())
                         .collect::<Vec<_>>();
                     let encoded = encode_projected_row_key(&projected_row)?;
-                    apply_weight_delta(&mut output, encoded, diff);
+                    staged.push((encoded, diff));
                 }
-                Ok(output)
+                consolidate_encoded_delta_batch(staged)
             }
             ProjectionPlan::Physical(projections) => {
                 let batch = rows_to_record_batch_owned(&self.input_schema, rows)?;
                 let selected = self.selected_indices(&batch)?;
                 if selected.is_empty() {
-                    return Ok(HashMap::new());
+                    return Ok(Vec::new());
                 }
                 let projection_arrays = projections
                     .iter()
@@ -497,7 +499,7 @@ impl VectorizedFilterProjectEvaluator {
                             })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let mut output: HashMap<Vec<u8>, i64> = HashMap::with_capacity(selected.len());
+                let mut staged = Vec::with_capacity(selected.len());
                 for idx in selected {
                     let diff = weights.get(idx).copied().unwrap_or(0);
                     if diff == 0 {
@@ -508,9 +510,9 @@ impl VectorizedFilterProjectEvaluator {
                         projected_row.push(ScalarValue::try_from_array(array, idx)?);
                     }
                     let encoded = encode_projected_row_key(&projected_row)?;
-                    apply_weight_delta(&mut output, encoded, diff);
+                    staged.push((encoded, diff));
                 }
-                Ok(output)
+                consolidate_encoded_delta_batch(staged)
             }
         }
     }
@@ -643,35 +645,50 @@ fn rows_to_record_batch_owned(
     RecordBatch::try_new(Arc::clone(schema), arrays).context("build vectorized input batch")
 }
 
-fn consolidate_encoded_delta(delta_values: Vec<(Vec<u8>, i64)>) -> HashMap<Vec<u8>, i64> {
-    let mut output: HashMap<Vec<u8>, i64> = HashMap::with_capacity(delta_values.len());
+fn consolidate_encoded_delta_batch(
+    delta_values: Vec<(Vec<u8>, i64)>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    if delta_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut builder = BinaryDictionaryBuilder::<Int32Type>::new();
+    let mut deltas_by_dictionary_index: Vec<i64> = Vec::new();
+
     for (encoded, diff) in delta_values {
         if diff == 0 {
             continue;
         }
-        apply_weight_delta(&mut output, encoded, diff);
-    }
-    output
-}
-
-fn apply_weight_delta(output: &mut HashMap<Vec<u8>, i64>, encoded: Vec<u8>, diff: i64) {
-    use std::collections::hash_map::Entry;
-
-    match output.entry(encoded) {
-        Entry::Occupied(mut entry) => {
-            let next = *entry.get() + diff;
-            if next == 0 {
-                entry.remove();
-            } else {
-                *entry.get_mut() = next;
-            }
+        let dict_index = builder
+            .append(encoded.as_slice())
+            .context("append encoded row into Arrow batch dictionary")?;
+        let dict_index =
+            usize::try_from(dict_index).context("Arrow dictionary index must be non-negative")?;
+        if dict_index >= deltas_by_dictionary_index.len() {
+            deltas_by_dictionary_index.resize(dict_index + 1, 0);
         }
-        Entry::Vacant(entry) => {
-            if diff != 0 {
-                entry.insert(diff);
-            }
-        }
+        deltas_by_dictionary_index[dict_index] += diff;
     }
+
+    if deltas_by_dictionary_index.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let dictionary = builder.finish();
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| anyhow!("vectorized dictionary values were not binary"))?;
+
+    let mut output = Vec::with_capacity(deltas_by_dictionary_index.len());
+    for (idx, diff) in deltas_by_dictionary_index.into_iter().enumerate() {
+        if diff == 0 {
+            continue;
+        }
+        output.push((values.value(idx).to_vec(), diff));
+    }
+    Ok(output)
 }
 
 fn vectorized_filter_map_enabled() -> bool {

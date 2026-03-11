@@ -316,6 +316,18 @@ where
         self.intern_many_encoded_unique(encoded_keys).await
     }
 
+    /// Intern a batch of owned keys that are already unique within the batch.
+    ///
+    /// This avoids cloning key payloads while staging batch inserts.
+    pub async fn intern_many_values_unique_owned(&self, keys: Vec<K>) -> Result<Vec<u64>> {
+        let mut encoded_keys = Vec::with_capacity(keys.len());
+        for key in keys {
+            encoded_keys
+                .push(encoding::encode(&key).context("unable to encode dictionary key in batch")?);
+        }
+        self.intern_many_encoded_unique(encoded_keys).await
+    }
+
     async fn intern_many_encoded(&self, encoded_keys: Vec<Vec<u8>>) -> Result<Vec<u64>> {
         if encoded_keys.is_empty() {
             return Ok(Vec::new());
@@ -380,6 +392,13 @@ where
     }
 
     async fn intern_many_encoded_unique(&self, encoded_keys: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+        self.intern_many_encoded_unique_owned(encoded_keys).await
+    }
+
+    async fn intern_many_encoded_unique_owned(
+        &self,
+        encoded_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<u64>> {
         if encoded_keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -388,28 +407,28 @@ where
         let mut next_slot_by_hash = AHashMap::<u64, u16>::new();
         let mut output = Vec::with_capacity(encoded_keys.len());
 
-        for encoded in encoded_keys.iter() {
-            let id = if let Some(existing) = self.lookup_existing_in_cache(encoded) {
+        for encoded in encoded_keys {
+            let id = if let Some(existing) = self.lookup_existing_in_cache(encoded.as_slice()) {
                 existing
             } else {
-                let hash = self.hash(encoded);
+                let hash = self.hash(encoded.as_slice());
                 let should_allocate = {
                     let mut cache = self.cache.lock().unwrap();
-                    cache.is_negative(encoded)
+                    cache.is_negative(encoded.as_slice())
                 };
                 if should_allocate || self.fast_path_fresh {
-                    self.reserve_in_batch(hash, encoded, &mut pending, &mut next_slot_by_hash)
+                    self.reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
-                } else if let Some(existing) = self.lookup_existing_id(encoded).await? {
+                } else if let Some(existing) = self.lookup_existing_id(encoded.as_slice()).await? {
                     let mut cache = self.cache.lock().unwrap();
-                    cache.remember(encoded.clone(), existing);
+                    cache.remember(encoded, existing);
                     existing
                 } else {
                     {
                         let mut cache = self.cache.lock().unwrap();
-                        cache.remember_negative(encoded);
+                        cache.remember_negative(encoded.as_slice());
                     }
-                    self.reserve_in_batch(hash, encoded, &mut pending, &mut next_slot_by_hash)
+                    self.reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
                         .await?
                 }
             };
@@ -478,6 +497,44 @@ where
         *next_slot = Self::next_probe_slot(slot)
             .ok_or_else(|| anyhow!("dictionary full: all probe slots occupied for hash"))?;
         pending.push((encoded_key.to_vec(), id, hash, slot));
+        Ok(id)
+    }
+
+    async fn reserve_in_batch_owned(
+        &self,
+        hash: u64,
+        encoded_key: Vec<u8>,
+        pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
+        next_slot_by_hash: &mut AHashMap<u64, u16>,
+    ) -> Result<u64> {
+        if self.fast_path_fresh
+            && let std::collections::hash_map::Entry::Vacant(entry) = next_slot_by_hash.entry(hash)
+        {
+            let can_use_slot_zero = {
+                let mut seen = self.seen_hashes.lock().unwrap();
+                seen.insert(hash)
+            };
+            if can_use_slot_zero {
+                let id = self.reserve_id();
+                entry.insert(1);
+                pending.push((encoded_key, id, hash, 0));
+                return Ok(id);
+            }
+        }
+
+        let next_slot = match next_slot_by_hash.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let loaded = self.first_free_slot(hash).await?;
+                entry.insert(loaded)
+            }
+        };
+
+        let slot = *next_slot;
+        let id = self.reserve_id();
+        *next_slot = Self::next_probe_slot(slot)
+            .ok_or_else(|| anyhow!("dictionary full: all probe slots occupied for hash"))?;
+        pending.push((encoded_key, id, hash, slot));
         Ok(id)
     }
 

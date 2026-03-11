@@ -173,7 +173,7 @@ impl DbspFilterMap {
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        F: Fn(Vec<(K, i64)>) -> anyhow::Result<HashMap<R, i64>> + Send + Sync + Clone + 'static,
+        F: Fn(Vec<(K, i64)>) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync + Clone + 'static,
     {
         let table = input.table();
         let op_id = NEXT_FILTER_MAP_ID.fetch_add(1, Ordering::Relaxed);
@@ -361,7 +361,8 @@ where
         }
 
         let output_apply_start = Instant::now();
-        let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
+        let projected = projected.into_iter().collect::<Vec<_>>();
+        let output_handle = apply_deltas_to_versioned(&mut self.output, projected)
             .await
             .context("persist filter_map delta output")?;
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
@@ -404,7 +405,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    transform: Arc<dyn Fn(Vec<(K, i64)>) -> anyhow::Result<HashMap<R, i64>> + Send + Sync>,
+    transform: Arc<dyn Fn(Vec<(K, i64)>) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>,
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
@@ -466,7 +467,7 @@ where
         }
 
         let output_apply_start = Instant::now();
-        let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
+        let output_handle = apply_deltas_to_versioned(&mut self.output, projected)
             .await
             .context("persist filter_map batch delta output")?;
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
@@ -490,7 +491,7 @@ where
 
 async fn apply_deltas_to_versioned<R>(
     versioned: &mut VersionedZSet<R>,
-    deltas: &HashMap<R, i64>,
+    deltas: Vec<(R, i64)>,
 ) -> anyhow::Result<ZSetHandle>
 where
     R: Archive
@@ -503,9 +504,9 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let staged: Vec<(&R, i64)> = deltas
-        .iter()
-        .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
+    let staged: Vec<(R, i64)> = deltas
+        .into_iter()
+        .filter(|(_, delta)| *delta != 0)
         .collect();
     if staged.is_empty() {
         return Ok(versioned
@@ -513,17 +514,21 @@ where
             .unwrap_or_else(|| versioned.handle_for_version(0)));
     }
 
+    let mut keys = Vec::with_capacity(staged.len());
+    let mut weights = Vec::with_capacity(staged.len());
+    for (key, delta) in staged {
+        keys.push(key);
+        weights.push(delta);
+    }
+
     let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
     let dict = versioned.dictionary();
     let ids = dict
-        .intern_many_values_unique(staged.iter().map(|(key, _)| *key))
+        .intern_many_values_unique_owned(keys)
         .await
         .context("intern keys while staging filter_map delta")?;
-    for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {
-        buckets
-            .entry(bucket_for(id))
-            .or_default()
-            .push((id, *delta));
+    for (delta, id) in weights.into_iter().zip(ids.into_iter()) {
+        buckets.entry(bucket_for(id)).or_default().push((id, delta));
     }
 
     let mut segments = Vec::new();
