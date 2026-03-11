@@ -27,6 +27,7 @@ const DEFAULT_SAMPLE_ROW_COUNT: usize = 20;
 const CHECKSUM_MOD: i128 = 2_305_843_009_213_693_951;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
 const DAY_UTC: &str = "2023-11-14";
+const DEFAULT_NO_SINK_END_COUNT_SETTLE_MS: u64 = 13_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FieldKind {
@@ -143,9 +144,10 @@ enum TailVerifyMode {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum NoSinkVerifyMode {
+pub(crate) enum NoSinkVerifyMode {
     Full,
     CountOnly,
+    CountAtEndOnly,
 }
 
 impl NoSinkVerifyMode {
@@ -156,6 +158,8 @@ impl NoSinkVerifyMode {
             .as_str()
         {
             "count_only" | "count-only" | "count" => Self::CountOnly,
+            "count_end_only" | "count-end-only" | "count_end" | "count-end" | "end_count"
+            | "end-count" => Self::CountAtEndOnly,
             _ => Self::Full,
         }
     }
@@ -223,16 +227,24 @@ impl BidInput {
 }
 
 pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> Result<()> {
-    run_redpanda_kafka_million_test_impl(spec, SinkMode::WithKafkaSink).await
+    run_redpanda_kafka_million_test_impl(spec, SinkMode::WithKafkaSink, None).await
 }
 
 pub(crate) async fn run_redpanda_kafka_million_no_sink_test(spec: MillionQuerySpec) -> Result<()> {
-    run_redpanda_kafka_million_test_impl(spec, SinkMode::NoSink).await
+    run_redpanda_kafka_million_test_impl(spec, SinkMode::NoSink, None).await
+}
+
+pub(crate) async fn run_redpanda_kafka_million_no_sink_test_with_verify_mode(
+    spec: MillionQuerySpec,
+    verify_mode: NoSinkVerifyMode,
+) -> Result<()> {
+    run_redpanda_kafka_million_test_impl(spec, SinkMode::NoSink, Some(verify_mode)).await
 }
 
 async fn run_redpanda_kafka_million_test_impl(
     spec: MillionQuerySpec,
     sink_mode: SinkMode,
+    no_sink_verify_mode_override: Option<NoSinkVerifyMode>,
 ) -> Result<()> {
     let brokers =
         std::env::var("FLOE_REDPANDA_BROKERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
@@ -290,10 +302,19 @@ async fn run_redpanda_kafka_million_test_impl(
     let slatedb_flush_interval_ms = std::env::var("FLOE_E2E_SLATEDB_FLUSH_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
-    let no_sink_verify_mode = NoSinkVerifyMode::from_env();
+    let no_sink_verify_mode =
+        no_sink_verify_mode_override.unwrap_or_else(NoSinkVerifyMode::from_env);
+    let no_sink_end_count_settle_ms = std::env::var("FLOE_E2E_NO_SINK_END_COUNT_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NO_SINK_END_COUNT_SETTLE_MS);
     let build_samples = !matches!(
         (sink_mode, no_sink_verify_mode),
-        (SinkMode::NoSink, NoSinkVerifyMode::CountOnly)
+        (
+            SinkMode::NoSink,
+            NoSinkVerifyMode::CountOnly | NoSinkVerifyMode::CountAtEndOnly
+        )
     );
 
     eprintln!("artifacts_dir={}", artifacts_dir.display());
@@ -304,6 +325,9 @@ async fn run_redpanda_kafka_million_test_impl(
 
     if matches!(sink_mode, SinkMode::NoSink) {
         eprintln!("verify.no_sink_mode={no_sink_verify_mode:?}");
+        if matches!(no_sink_verify_mode, NoSinkVerifyMode::CountAtEndOnly) {
+            eprintln!("verify.no_sink_end_count_settle_ms={no_sink_end_count_settle_ms}");
+        }
     }
 
     let expected = {
@@ -494,6 +518,7 @@ async fn run_redpanda_kafka_million_test_impl(
                     expected.clone(),
                     Duration::from_secs(1800),
                     no_sink_verify_mode,
+                    Duration::from_millis(no_sink_end_count_settle_ms),
                 )
                 .await?;
 
@@ -893,6 +918,7 @@ async fn verify_mv_snapshot_count_and_samples(
     expected: ExpectedDataset,
     timeout: Duration,
     verify_mode: NoSinkVerifyMode,
+    end_count_settle: Duration,
 ) -> Result<NoSinkVerificationTiming> {
     let verify_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
@@ -908,28 +934,41 @@ async fn verify_mv_snapshot_count_and_samples(
     let expected_rows = usize::try_from(expected.metrics.row_count)
         .context("expected row count must be non-negative and fit usize")?;
     let count_wait_started = Instant::now();
-    loop {
+    let wait_for_count = if matches!(verify_mode, NoSinkVerifyMode::CountAtEndOnly) {
+        sleep(end_count_settle).await;
         let observed_rows = query_mv_count(&client, mv_name).await?;
-        if observed_rows == expected_rows {
-            break;
-        }
-        if observed_rows > expected_rows {
+        if observed_rows != expected_rows {
             bail!(
-                "mv row count exceeded expected: observed={}, expected={}",
+                "mv row count mismatch in end-only verification: observed={}, expected={}",
                 observed_rows,
                 expected_rows
             );
         }
-        if count_wait_started.elapsed() >= timeout {
-            bail!(
-                "mv row count did not reach expected within timeout: observed={}, expected={}",
-                observed_rows,
-                expected_rows
-            );
+        count_wait_started.elapsed()
+    } else {
+        loop {
+            let observed_rows = query_mv_count(&client, mv_name).await?;
+            if observed_rows == expected_rows {
+                break;
+            }
+            if observed_rows > expected_rows {
+                bail!(
+                    "mv row count exceeded expected: observed={}, expected={}",
+                    observed_rows,
+                    expected_rows
+                );
+            }
+            if count_wait_started.elapsed() >= timeout {
+                bail!(
+                    "mv row count did not reach expected within timeout: observed={}, expected={}",
+                    observed_rows,
+                    expected_rows
+                );
+            }
+            sleep(Duration::from_millis(250)).await;
         }
-        sleep(Duration::from_millis(250)).await;
-    }
-    let wait_for_count = count_wait_started.elapsed();
+        count_wait_started.elapsed()
+    };
 
     let sample_query_started = Instant::now();
     if matches!(verify_mode, NoSinkVerifyMode::Full) {
