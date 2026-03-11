@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = ["allocator-mimalloc"]
+default = []
 allocator-mimalloc = ["dep:mimalloc"]
 allocator-jemalloc = ["dep:tikv-jemallocator"]
 
