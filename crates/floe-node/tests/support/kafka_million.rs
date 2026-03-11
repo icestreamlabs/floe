@@ -27,7 +27,8 @@ const DEFAULT_SAMPLE_ROW_COUNT: usize = 20;
 const CHECKSUM_MOD: i128 = 2_305_843_009_213_693_951;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
 const DAY_UTC: &str = "2023-11-14";
-const DEFAULT_NO_SINK_END_COUNT_SETTLE_MS: u64 = 13_000;
+const DEFAULT_NO_SINK_END_COUNT_SETTLE_MS: u64 = 0;
+const DEFAULT_NO_SINK_END_COUNT_POLL_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FieldKind {
@@ -106,6 +107,7 @@ struct ExpectedDataset {
 #[derive(Debug, Clone, Copy)]
 struct NoSinkVerificationTiming {
     wait_for_count: Duration,
+    wait_for_count_for_throughput: Duration,
     sample_query: Duration,
     total: Duration,
 }
@@ -307,8 +309,12 @@ async fn run_redpanda_kafka_million_test_impl(
     let no_sink_end_count_settle_ms = std::env::var("FLOE_E2E_NO_SINK_END_COUNT_SETTLE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_NO_SINK_END_COUNT_SETTLE_MS);
+    let no_sink_end_count_poll_ms = std::env::var("FLOE_E2E_NO_SINK_END_COUNT_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NO_SINK_END_COUNT_POLL_MS);
     let build_samples = !matches!(
         (sink_mode, no_sink_verify_mode),
         (
@@ -327,6 +333,7 @@ async fn run_redpanda_kafka_million_test_impl(
         eprintln!("verify.no_sink_mode={no_sink_verify_mode:?}");
         if matches!(no_sink_verify_mode, NoSinkVerifyMode::CountAtEndOnly) {
             eprintln!("verify.no_sink_end_count_settle_ms={no_sink_end_count_settle_ms}");
+            eprintln!("verify.no_sink_end_count_poll_ms={no_sink_end_count_poll_ms}");
         }
     }
 
@@ -519,10 +526,12 @@ async fn run_redpanda_kafka_million_test_impl(
                     Duration::from_secs(1800),
                     no_sink_verify_mode,
                     Duration::from_millis(no_sink_end_count_settle_ms),
+                    Duration::from_millis(no_sink_end_count_poll_ms),
                 )
                 .await?;
 
-                let ingest_completion = produce_elapsed + verify_timing.wait_for_count;
+                let ingest_completion =
+                    produce_elapsed + verify_timing.wait_for_count_for_throughput;
                 let input_rows_per_sec =
                     safe_rows_per_sec(TOTAL_ROWS as f64, ingest_completion.as_secs_f64());
                 let output_rows_per_sec = safe_rows_per_sec(
@@ -530,10 +539,11 @@ async fn run_redpanda_kafka_million_test_impl(
                     ingest_completion.as_secs_f64(),
                 );
                 eprintln!(
-                    "timing.no_sink.ingest_complete_s={:.3} (produce_s={:.3}, post_produce_wait_s={:.3})",
+                    "timing.no_sink.ingest_complete_s={:.3} (produce_s={:.3}, post_produce_wait_s={:.3}, post_produce_wait_for_throughput_s={:.3})",
                     ingest_completion.as_secs_f64(),
                     produce_elapsed.as_secs_f64(),
-                    verify_timing.wait_for_count.as_secs_f64()
+                    verify_timing.wait_for_count.as_secs_f64(),
+                    verify_timing.wait_for_count_for_throughput.as_secs_f64()
                 );
                 eprintln!(
                     "timing.no_sink.verification_s={:.3} (sample_query_s={:.3})",
@@ -919,6 +929,7 @@ async fn verify_mv_snapshot_count_and_samples(
     timeout: Duration,
     verify_mode: NoSinkVerifyMode,
     end_count_settle: Duration,
+    end_count_poll: Duration,
 ) -> Result<NoSinkVerificationTiming> {
     let verify_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
@@ -934,41 +945,38 @@ async fn verify_mv_snapshot_count_and_samples(
     let expected_rows = usize::try_from(expected.metrics.row_count)
         .context("expected row count must be non-negative and fit usize")?;
     let count_wait_started = Instant::now();
-    let wait_for_count = if matches!(verify_mode, NoSinkVerifyMode::CountAtEndOnly) {
-        sleep(end_count_settle).await;
+    let (settle_before_poll, poll_interval) =
+        if matches!(verify_mode, NoSinkVerifyMode::CountAtEndOnly) {
+            (end_count_settle, end_count_poll)
+        } else {
+            (Duration::ZERO, Duration::from_millis(250))
+        };
+    if !settle_before_poll.is_zero() {
+        sleep(settle_before_poll).await;
+    }
+    loop {
         let observed_rows = query_mv_count(&client, mv_name).await?;
-        if observed_rows != expected_rows {
+        if observed_rows == expected_rows {
+            break;
+        }
+        if observed_rows > expected_rows {
             bail!(
-                "mv row count mismatch in end-only verification: observed={}, expected={}",
+                "mv row count exceeded expected: observed={}, expected={}",
                 observed_rows,
                 expected_rows
             );
         }
-        count_wait_started.elapsed()
-    } else {
-        loop {
-            let observed_rows = query_mv_count(&client, mv_name).await?;
-            if observed_rows == expected_rows {
-                break;
-            }
-            if observed_rows > expected_rows {
-                bail!(
-                    "mv row count exceeded expected: observed={}, expected={}",
-                    observed_rows,
-                    expected_rows
-                );
-            }
-            if count_wait_started.elapsed() >= timeout {
-                bail!(
-                    "mv row count did not reach expected within timeout: observed={}, expected={}",
-                    observed_rows,
-                    expected_rows
-                );
-            }
-            sleep(Duration::from_millis(250)).await;
+        if count_wait_started.elapsed() >= timeout {
+            bail!(
+                "mv row count did not reach expected within timeout: observed={}, expected={}",
+                observed_rows,
+                expected_rows
+            );
         }
-        count_wait_started.elapsed()
-    };
+        sleep(poll_interval).await;
+    }
+    let wait_for_count = count_wait_started.elapsed();
+    let wait_for_count_for_throughput = wait_for_count.saturating_sub(settle_before_poll);
 
     let sample_query_started = Instant::now();
     if matches!(verify_mode, NoSinkVerifyMode::Full) {
@@ -1043,6 +1051,7 @@ async fn verify_mv_snapshot_count_and_samples(
     let _ = connection_handle.await;
     Ok(NoSinkVerificationTiming {
         wait_for_count,
+        wait_for_count_for_throughput,
         sample_query,
         total: verify_started.elapsed(),
     })
