@@ -28,6 +28,9 @@ use super::builder::{DbspGraphBuilder, MvFlushCoalescingConfig};
 static MV_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_UPDATE_LOG_SAMPLE_EVERY: u64 = 128;
 
+pub(super) type DeltaTransformFn =
+    dyn Fn(Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
+
 #[derive(Debug, Clone, Copy)]
 enum FlushTrigger {
     MaxPendingDeltas,
@@ -58,6 +61,7 @@ struct DeltaApplyStats {
     delta_rows: usize,
     delta_bytes: usize,
     load_ms: u64,
+    transform_ms: u64,
     merge_ms: u64,
 }
 
@@ -68,6 +72,7 @@ struct PendingMvFlush {
     pending_rows: usize,
     pending_bytes: usize,
     total_load_ms: u64,
+    total_transform_ms: u64,
     total_merge_ms: u64,
     first_ts: Option<i64>,
     last_ts: Option<i64>,
@@ -81,6 +86,7 @@ impl PendingMvFlush {
         self.pending_rows = self.pending_rows.saturating_add(apply.delta_rows);
         self.pending_bytes = self.pending_bytes.saturating_add(apply.delta_bytes);
         self.total_load_ms = self.total_load_ms.saturating_add(apply.load_ms);
+        self.total_transform_ms = self.total_transform_ms.saturating_add(apply.transform_ms);
         self.total_merge_ms = self.total_merge_ms.saturating_add(apply.merge_ms);
         if self.first_ts.is_none() {
             self.first_ts = Some(ts);
@@ -155,6 +161,7 @@ impl DbspGraphBuilder {
         view_name: &str,
         schema: Arc<RowSchema>,
         upstream: DeltaHandleStream,
+        delta_transform: Option<Arc<DeltaTransformFn>>,
         cancel: &CancellationToken,
         task_events: &GraphTaskSender,
         mv_registry: &Arc<MaterializedViewRegistry>,
@@ -237,6 +244,7 @@ impl DbspGraphBuilder {
                     &mut dict_cache,
                     Arc::clone(&arrow_schema),
                     consolidation_mode,
+                    delta_transform.as_ref(),
                     &delta_handle,
                 )
                 .await
@@ -289,6 +297,7 @@ impl DbspGraphBuilder {
         let task_label = format!("materialize-view:{view_label}");
         let task_events = task_events.clone();
         let cancel = cancel.clone();
+        let delta_transform = delta_transform.clone();
         tokio::spawn(async move {
             let mut cursor = cursor;
             let mut view = view;
@@ -347,6 +356,7 @@ impl DbspGraphBuilder {
                                 &mut dict_cache,
                                 Arc::clone(&arrow_schema),
                                 consolidation_mode,
+                                delta_transform.as_ref(),
                                 flush_cfg,
                                 &bridge_clone,
                                 &registry_clone,
@@ -396,6 +406,7 @@ impl DbspGraphBuilder {
                                 &mut dict_cache,
                                 Arc::clone(&arrow_schema),
                                 consolidation_mode,
+                                delta_transform.as_ref(),
                                 flush_cfg,
                                 &bridge_clone,
                                 &registry_clone,
@@ -425,6 +436,7 @@ impl DbspGraphBuilder {
         dict_cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
         row_schema: SchemaRef,
         consolidation_mode: ConsolidationMode,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
         flush_cfg: MvFlushCoalescingConfig,
         bridge: &Arc<Mutex<DbspBridge>>,
         registry: &Arc<MaterializedViewHandle>,
@@ -450,6 +462,7 @@ impl DbspGraphBuilder {
             dict_cache,
             row_schema,
             consolidation_mode,
+            delta_transform,
             &delta_handle,
         )
         .await
@@ -515,18 +528,28 @@ impl DbspGraphBuilder {
         dict_cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
         _row_schema: SchemaRef,
         _consolidation_mode: ConsolidationMode,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
         delta_handle: &ZSetHandle,
     ) -> Result<DeltaApplyStats> {
         let load_start = Instant::now();
-        let deltas = delta_zset_handle::<Vec<u8>>(table, dict_cache, delta_handle)
+        let mut deltas = delta_zset_handle::<Vec<u8>>(table, dict_cache, delta_handle)
             .await
             .context("materialize delta handle for materialized view")?;
+        let load_ms = load_start.elapsed().as_millis() as u64;
+
+        let raw_delta_rows = deltas.len();
+        let transform_start = Instant::now();
+        if let Some(transform) = delta_transform {
+            deltas =
+                transform(deltas).context("apply transient transform before materialized view")?;
+        }
+        let transform_ms = transform_start.elapsed().as_millis() as u64;
+
         let delta_rows = deltas.len();
         let delta_bytes = deltas
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let load_ms = load_start.elapsed().as_millis() as u64;
         let merge_start = Instant::now();
         if !deltas.is_empty() {
             let mut merged = HashMap::with_capacity(deltas.len());
@@ -553,9 +576,11 @@ impl DbspGraphBuilder {
         let merge_ms = merge_start.elapsed().as_millis() as u64;
         tracing::debug!(
             delta_handle_version = delta_handle.version,
+            raw_delta_rows,
             delta_rows,
             delta_bytes,
             load_ms,
+            transform_ms,
             merge_ms,
             "materialized view delta queued"
         );
@@ -563,6 +588,7 @@ impl DbspGraphBuilder {
             delta_rows,
             delta_bytes,
             load_ms,
+            transform_ms,
             merge_ms,
         })
     }
@@ -583,7 +609,8 @@ impl DbspGraphBuilder {
             .await
             .context("flush materialized view updates")?;
         let flush_ms = flush_start.elapsed().as_millis() as u64;
-        let total_ms = pending.total_load_ms + pending.total_merge_ms + flush_ms;
+        let total_ms =
+            pending.total_load_ms + pending.total_transform_ms + pending.total_merge_ms + flush_ms;
         let first_ts = pending.first_ts.unwrap_or(-1);
         let last_ts = pending.last_ts.unwrap_or(-1);
         let latency_ms = pending
@@ -602,6 +629,7 @@ impl DbspGraphBuilder {
                 pending_rows = pending.pending_rows,
                 pending_bytes = pending.pending_bytes,
                 load_ms = pending.total_load_ms,
+                transform_ms = pending.total_transform_ms,
                 merge_ms = pending.total_merge_ms,
                 flush_ms,
                 total_ms,
@@ -620,6 +648,7 @@ impl DbspGraphBuilder {
                 pending_rows = pending.pending_rows,
                 pending_bytes = pending.pending_bytes,
                 load_ms = pending.total_load_ms,
+                transform_ms = pending.total_transform_ms,
                 merge_ms = pending.total_merge_ms,
                 flush_ms,
                 total_ms,

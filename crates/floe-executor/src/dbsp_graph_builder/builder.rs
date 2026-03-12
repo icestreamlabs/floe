@@ -4,19 +4,27 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
+use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
-use dbsp::{CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, StreamRetention};
+use dbsp::{
+    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, DbspPredicate, RowSchema,
+    StreamRetention,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::delta_consolidation::ConsolidationMode;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::task_events::GraphTaskSender;
+
+use super::eval::{eval_predicate, eval_projection};
+use super::materialize::DeltaTransformFn;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -137,8 +145,74 @@ impl DbspGraphBuilder {
             .context("validating query plan before DBSP graph build")?;
         let mut built = HashMap::new();
         let mut mv_latest = HashMap::new();
-        let root_stream = self
-            .compile_node(
+        let root_node = inputs
+            .plan
+            .node(inputs.plan.root)
+            .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
+
+        let mut root_materialized = false;
+        let root_stream = if !matches!(root_node.kind, DbspNodeKind::Sink(_)) {
+            if let Some(transient_opt) = try_build_sink_transient_unary_optimization(
+                inputs.plan,
+                inputs.plan.root,
+                &built,
+                self.graph_id(),
+                true,
+            )? {
+                let upstream = self
+                    .compile_node(
+                        inputs.plan,
+                        transient_opt.durable_input_idx,
+                        inputs.outer_handle_streams,
+                        &inputs.cancel,
+                        &inputs.task_events,
+                        &mut built,
+                        &inputs.mv_registry,
+                        &mut mv_latest,
+                        inputs.mv_retention,
+                    )
+                    .await?;
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    root = inputs.plan.root,
+                    durable_input_idx = transient_opt.durable_input_idx,
+                    optimized_nodes = ?transient_opt.optimized_nodes,
+                    "using transient unary chain for root materialization"
+                );
+                let stream = self
+                    .materialize_view(
+                        inputs.view_name,
+                        Arc::clone(&root_node.output_schema),
+                        upstream,
+                        Some(transient_opt.transform),
+                        &inputs.cancel,
+                        &inputs.task_events,
+                        &inputs.mv_registry,
+                        &mut mv_latest,
+                        inputs.mv_retention,
+                        self.output_consolidation_mode,
+                    )
+                    .await?;
+                built.insert(inputs.plan.root, stream.clone());
+                root_materialized = true;
+                stream
+            } else {
+                self.compile_node(
+                    inputs.plan,
+                    inputs.plan.root,
+                    inputs.outer_handle_streams,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &mut built,
+                    &inputs.mv_registry,
+                    &mut mv_latest,
+                    inputs.mv_retention,
+                )
+                .await?
+            }
+        } else {
+            self.compile_node(
                 inputs.plan,
                 inputs.plan.root,
                 inputs.outer_handle_streams,
@@ -149,17 +223,15 @@ impl DbspGraphBuilder {
                 &mut mv_latest,
                 inputs.mv_retention,
             )
-            .await?;
+            .await?
+        };
 
-        if !mv_latest.contains_key(inputs.view_name) {
-            let root_node = inputs.plan.node(inputs.plan.root).with_context(|| {
-                anyhow!("root node {} missing from circuit plan", inputs.plan.root)
-            })?;
-            let root_schema = Arc::clone(&root_node.output_schema);
+        if !root_materialized && !mv_latest.contains_key(inputs.view_name) {
             self.materialize_view(
                 inputs.view_name,
-                root_schema,
+                Arc::clone(&root_node.output_schema),
                 root_stream,
+                None,
                 &inputs.cancel,
                 &inputs.task_events,
                 &inputs.mv_registry,
@@ -408,31 +480,74 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
-                let upstream = self
-                    .compile_node(
-                        plan,
-                        input_idx,
-                        outer_streams,
+                if let Some(transient_opt) = try_build_sink_transient_unary_optimization(
+                    plan,
+                    input_idx,
+                    built,
+                    self.graph_id(),
+                    false,
+                )? {
+                    let upstream = self
+                        .compile_node(
+                            plan,
+                            transient_opt.durable_input_idx,
+                            outer_streams,
+                            cancel,
+                            task_events,
+                            built,
+                            mv_registry,
+                            mv_latest,
+                            mv_retention,
+                        )
+                        .await?;
+                    tracing::info!(
+                        graph_id = %self.graph_id(),
+                        sink = %sink.name,
+                        durable_input_idx = transient_opt.durable_input_idx,
+                        optimized_nodes = ?transient_opt.optimized_nodes,
+                        "using transient unary chain for sink materialization"
+                    );
+                    self.materialize_view(
+                        &sink.name,
+                        Arc::clone(sink.input_schema()),
+                        upstream,
+                        Some(transient_opt.transform),
                         cancel,
                         task_events,
-                        built,
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        self.output_consolidation_mode,
                     )
-                    .await?;
-                self.materialize_view(
-                    &sink.name,
-                    Arc::clone(sink.input_schema()),
-                    upstream,
-                    cancel,
-                    task_events,
-                    mv_registry,
-                    mv_latest,
-                    mv_retention,
-                    self.output_consolidation_mode,
-                )
-                .await?
+                    .await?
+                } else {
+                    let upstream = self
+                        .compile_node(
+                            plan,
+                            input_idx,
+                            outer_streams,
+                            cancel,
+                            task_events,
+                            built,
+                            mv_registry,
+                            mv_latest,
+                            mv_retention,
+                        )
+                        .await?;
+                    self.materialize_view(
+                        &sink.name,
+                        Arc::clone(sink.input_schema()),
+                        upstream,
+                        None,
+                        cancel,
+                        task_events,
+                        mv_registry,
+                        mv_latest,
+                        mv_retention,
+                        self.output_consolidation_mode,
+                    )
+                    .await?
+                }
             }
         };
 
@@ -515,4 +630,205 @@ fn has_single_consumer(plan: &CircuitPlan, node_idx: usize) -> bool {
         .filter(|&&input| input == node_idx)
         .count()
         == 1
+}
+
+struct SinkTransientUnaryOptimization {
+    durable_input_idx: usize,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone)]
+enum TransientUnaryStep {
+    Select {
+        predicate: DbspPredicate,
+        schema: Arc<RowSchema>,
+    },
+    Project {
+        expressions: Arc<Vec<DbspProjectExpr>>,
+        schema: Arc<RowSchema>,
+    },
+}
+
+fn try_build_sink_transient_unary_optimization(
+    plan: &CircuitPlan,
+    sink_input_idx: usize,
+    built: &HashMap<usize, DeltaHandleStream>,
+    graph_id: &str,
+    allow_terminal_without_consumer: bool,
+) -> Result<Option<SinkTransientUnaryOptimization>> {
+    let mut current_idx = sink_input_idx;
+    let mut steps_rev = Vec::new();
+    let mut optimized_nodes = Vec::new();
+
+    loop {
+        let Some(node) = plan.node(current_idx) else {
+            return Ok(None);
+        };
+
+        match &node.kind {
+            DbspNodeKind::Passthrough => {
+                let single_consumer = has_single_consumer(plan, current_idx);
+                if built.contains_key(&current_idx)
+                    || (!single_consumer
+                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
+                {
+                    return Ok(None);
+                }
+                optimized_nodes.push(current_idx);
+                current_idx = first_input(node, "passthrough")?;
+            }
+            DbspNodeKind::Select(select) => {
+                let single_consumer = has_single_consumer(plan, current_idx);
+                if built.contains_key(&current_idx)
+                    || (!single_consumer
+                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
+                {
+                    return Ok(None);
+                }
+                optimized_nodes.push(current_idx);
+                steps_rev.push(TransientUnaryStep::Select {
+                    predicate: select.predicate().clone(),
+                    schema: Arc::clone(select.output_schema()),
+                });
+                current_idx = first_input(node, "select")?;
+            }
+            DbspNodeKind::Project(project) => {
+                let single_consumer = has_single_consumer(plan, current_idx);
+                if built.contains_key(&current_idx)
+                    || (!single_consumer
+                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
+                {
+                    return Ok(None);
+                }
+                optimized_nodes.push(current_idx);
+                steps_rev.push(TransientUnaryStep::Project {
+                    expressions: Arc::new(project.expressions().to_vec()),
+                    schema: Arc::clone(project.input_schema()),
+                });
+                current_idx = first_input(node, "project")?;
+            }
+            _ => break,
+        }
+    }
+
+    if steps_rev.is_empty() {
+        return Ok(None);
+    }
+
+    steps_rev.reverse();
+    let steps = Arc::new(steps_rev);
+    let graph_id = graph_id.to_string();
+    let transform: Arc<DeltaTransformFn> =
+        Arc::new(move |deltas| apply_transient_unary_steps(&graph_id, steps.as_ref(), deltas));
+
+    Ok(Some(SinkTransientUnaryOptimization {
+        durable_input_idx: current_idx,
+        optimized_nodes,
+        transform,
+    }))
+}
+
+fn apply_transient_unary_steps(
+    graph_id: &str,
+    steps: &[TransientUnaryStep],
+    deltas: Vec<(Vec<u8>, i64)>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    if deltas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut merged: HashMap<Vec<u8>, i64> = HashMap::with_capacity(deltas.len());
+    for (encoded, diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+
+        let mut row = match decode_projected_row_key(&encoded) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode transient unary row"
+                );
+                continue;
+            }
+        };
+
+        let mut keep = true;
+        for step in steps {
+            match step {
+                TransientUnaryStep::Select { predicate, schema } => {
+                    match eval_predicate(predicate, &row, schema.as_ref()) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            keep = false;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %graph_id,
+                                error = %err,
+                                "failed to evaluate transient unary predicate"
+                            );
+                            keep = false;
+                            break;
+                        }
+                    }
+                }
+                TransientUnaryStep::Project {
+                    expressions,
+                    schema,
+                } => match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
+                    Ok(projected) => row = projected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate transient unary projection"
+                        );
+                        keep = false;
+                        break;
+                    }
+                },
+            }
+        }
+
+        if !keep {
+            continue;
+        }
+
+        let encoded = match encode_projected_row_key(&row) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to encode transient unary row"
+                );
+                continue;
+            }
+        };
+
+        match merged.entry(encoded) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() += diff;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(diff);
+            }
+        }
+    }
+
+    let mut output = Vec::with_capacity(merged.len());
+    for (row, diff) in merged {
+        if diff != 0 {
+            output.push((row, diff));
+        }
+    }
+    Ok(output)
 }
