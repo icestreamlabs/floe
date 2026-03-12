@@ -1,8 +1,6 @@
 use super::*;
 
-use crate::dbsp_graph_builder::vectorized_filter_project::{
-    VectorizedFilterProjectEvaluator, vectorized_filter_map_enabled,
-};
+use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_source(
@@ -27,12 +25,6 @@ impl DbspGraphBuilder {
         upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
-        if !vectorized_filter_map_enabled() {
-            return Err(anyhow!(
-                "vectorized filter execution is required; FLOE_VECTORIZED_FILTER_MAP cannot be disabled"
-            ));
-        }
-
         let predicate = node.predicate().clone();
         let schema = Arc::clone(node.output_schema());
         let graph_id = self.graph_id().to_string();
@@ -72,12 +64,6 @@ impl DbspGraphBuilder {
         upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
-        if !vectorized_filter_map_enabled() {
-            return Err(anyhow!(
-                "vectorized map execution is required; FLOE_VECTORIZED_FILTER_MAP cannot be disabled"
-            ));
-        }
-
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
         let schema = Arc::clone(node.input_schema());
         let graph_id = self.graph_id().to_string();
@@ -118,12 +104,6 @@ impl DbspGraphBuilder {
         upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
-        if !vectorized_filter_map_enabled() {
-            return Err(anyhow!(
-                "vectorized filter_map execution is required; FLOE_VECTORIZED_FILTER_MAP cannot be disabled"
-            ));
-        }
-
         let predicate = select.predicate().clone();
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
         let project_schema = Arc::clone(project.input_schema());

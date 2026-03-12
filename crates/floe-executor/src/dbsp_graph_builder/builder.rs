@@ -23,9 +23,7 @@ use crate::materialized_view::MaterializedViewRegistry;
 use crate::task_events::GraphTaskSender;
 
 use super::materialize::DeltaTransformFn;
-use super::vectorized_filter_project::{
-    VectorizedFilterProjectEvaluator, vectorized_filter_map_enabled,
-};
+use super::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -658,11 +656,6 @@ fn try_build_sink_transient_unary_optimization(
     graph_id: &str,
     allow_terminal_without_consumer: bool,
 ) -> Result<Option<SinkTransientUnaryOptimization>> {
-    if !vectorized_filter_map_enabled() {
-        return Err(anyhow!(
-            "vectorized transient unary execution is required; FLOE_VECTORIZED_FILTER_MAP cannot be disabled"
-        ));
-    }
     let mut current_idx = sink_input_idx;
     let mut steps_rev = Vec::new();
     let mut optimized_nodes = Vec::new();

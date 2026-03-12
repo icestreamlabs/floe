@@ -396,9 +396,3 @@ fn consolidate_encoded_delta_batch(
     }
     Ok(output)
 }
-
-pub(crate) fn vectorized_filter_map_enabled() -> bool {
-    std::env::var("FLOE_VECTORIZED_FILTER_MAP")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "False"))
-        .unwrap_or(true)
-}
