@@ -11,10 +11,9 @@ use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::{
     DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspDistinct, DbspDistinctNode,
-    DbspFilter, DbspFilterMap, DbspJoin, DbspJoinNode, DbspJoinType, DbspMap, DbspProjectNode,
-    DbspScalarType, DbspSelectNode, DbspSemiJoin, DbspSourceNode, DbspTopN, DbspTopNNode,
-    DbspUnion, DbspUnionNode, DbspWindowAggregate, DbspWindowAggregateNode, DbspWindowPolicy,
-    RowSchema, WindowKey,
+    DbspFilterMap, DbspJoin, DbspJoinNode, DbspJoinType, DbspMap, DbspProjectNode, DbspScalarType,
+    DbspSelectNode, DbspSemiJoin, DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode,
+    DbspWindowAggregate, DbspWindowAggregateNode, DbspWindowPolicy, RowSchema, WindowKey,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +23,7 @@ use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
-use super::eval::{eval_expression, eval_predicate, eval_projection, eval_scalar_expression};
+use super::eval::{eval_expression, eval_scalar_expression};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TopNSortSpec {

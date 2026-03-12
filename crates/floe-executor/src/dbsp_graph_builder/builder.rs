@@ -19,12 +19,13 @@ use tokio_util::sync::CancellationToken;
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
 use crate::delta_consolidation::ConsolidationMode;
-use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::task_events::GraphTaskSender;
 
-use super::eval::{eval_predicate, eval_projection};
 use super::materialize::DeltaTransformFn;
+use super::vectorized_filter_project::{
+    VectorizedFilterProjectEvaluator, vectorized_filter_map_enabled,
+};
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -639,7 +640,7 @@ struct SinkTransientUnaryOptimization {
 }
 
 #[derive(Clone)]
-enum TransientUnaryStep {
+enum PlannedTransientUnaryStep {
     Select {
         predicate: DbspPredicate,
         schema: Arc<RowSchema>,
@@ -657,6 +658,11 @@ fn try_build_sink_transient_unary_optimization(
     graph_id: &str,
     allow_terminal_without_consumer: bool,
 ) -> Result<Option<SinkTransientUnaryOptimization>> {
+    if !vectorized_filter_map_enabled() {
+        return Err(anyhow!(
+            "vectorized transient unary execution is required; FLOE_VECTORIZED_FILTER_MAP cannot be disabled"
+        ));
+    }
     let mut current_idx = sink_input_idx;
     let mut steps_rev = Vec::new();
     let mut optimized_nodes = Vec::new();
@@ -687,7 +693,7 @@ fn try_build_sink_transient_unary_optimization(
                     return Ok(None);
                 }
                 optimized_nodes.push(current_idx);
-                steps_rev.push(TransientUnaryStep::Select {
+                steps_rev.push(PlannedTransientUnaryStep::Select {
                     predicate: select.predicate().clone(),
                     schema: Arc::clone(select.output_schema()),
                 });
@@ -702,7 +708,7 @@ fn try_build_sink_transient_unary_optimization(
                     return Ok(None);
                 }
                 optimized_nodes.push(current_idx);
-                steps_rev.push(TransientUnaryStep::Project {
+                steps_rev.push(PlannedTransientUnaryStep::Project {
                     expressions: Arc::new(project.expressions().to_vec()),
                     schema: Arc::clone(project.input_schema()),
                 });
@@ -717,10 +723,23 @@ fn try_build_sink_transient_unary_optimization(
     }
 
     steps_rev.reverse();
-    let steps = Arc::new(steps_rev);
+    let evaluators = steps_rev
+        .into_iter()
+        .map(|step| match step {
+            PlannedTransientUnaryStep::Select { predicate, schema } => {
+                VectorizedFilterProjectEvaluator::for_filter(&predicate, schema)
+            }
+            PlannedTransientUnaryStep::Project {
+                expressions,
+                schema,
+            } => VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), schema),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let evaluators = Arc::new(evaluators);
     let graph_id = graph_id.to_string();
-    let transform: Arc<DeltaTransformFn> =
-        Arc::new(move |deltas| apply_transient_unary_steps(&graph_id, steps.as_ref(), deltas));
+    let transform: Arc<DeltaTransformFn> = Arc::new(move |deltas| {
+        apply_transient_unary_steps_vectorized(&graph_id, evaluators.as_ref(), deltas)
+    });
 
     Ok(Some(SinkTransientUnaryOptimization {
         durable_input_idx: current_idx,
@@ -729,106 +748,16 @@ fn try_build_sink_transient_unary_optimization(
     }))
 }
 
-fn apply_transient_unary_steps(
+fn apply_transient_unary_steps_vectorized(
     graph_id: &str,
-    steps: &[TransientUnaryStep],
-    deltas: Vec<(Vec<u8>, i64)>,
+    evaluators: &[VectorizedFilterProjectEvaluator],
+    mut deltas: Vec<(Vec<u8>, i64)>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
-    if deltas.is_empty() {
-        return Ok(Vec::new());
+    for evaluator in evaluators {
+        if deltas.is_empty() {
+            break;
+        }
+        deltas = evaluator.transform_delta(graph_id, deltas)?;
     }
-
-    let mut merged: HashMap<Vec<u8>, i64> = HashMap::with_capacity(deltas.len());
-    for (encoded, diff) in deltas {
-        if diff == 0 {
-            continue;
-        }
-
-        let mut row = match decode_projected_row_key(&encoded) {
-            Ok(row) => row,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode transient unary row"
-                );
-                continue;
-            }
-        };
-
-        let mut keep = true;
-        for step in steps {
-            match step {
-                TransientUnaryStep::Select { predicate, schema } => {
-                    match eval_predicate(predicate, &row, schema.as_ref()) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            keep = false;
-                            break;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %graph_id,
-                                error = %err,
-                                "failed to evaluate transient unary predicate"
-                            );
-                            keep = false;
-                            break;
-                        }
-                    }
-                }
-                TransientUnaryStep::Project {
-                    expressions,
-                    schema,
-                } => match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
-                    Ok(projected) => row = projected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %graph_id,
-                            error = %err,
-                            "failed to evaluate transient unary projection"
-                        );
-                        keep = false;
-                        break;
-                    }
-                },
-            }
-        }
-
-        if !keep {
-            continue;
-        }
-
-        let encoded = match encode_projected_row_key(&row) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to encode transient unary row"
-                );
-                continue;
-            }
-        };
-
-        match merged.entry(encoded) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                *entry.get_mut() += diff;
-                if *entry.get() == 0 {
-                    entry.remove();
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(diff);
-            }
-        }
-    }
-
-    let mut output = Vec::with_capacity(merged.len());
-    for (row, diff) in merged {
-        if diff != 0 {
-            output.push((row, diff));
-        }
-    }
-    Ok(output)
+    Ok(deltas)
 }

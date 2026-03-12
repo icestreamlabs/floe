@@ -1,29 +1,8 @@
 use anyhow::Result;
 use datafusion::scalar::ScalarValue;
-use dbsp::circuit::plan::DbspProjectExpr;
-use dbsp::{DbspExpression, DbspPredicate, RowSchema};
+use dbsp::{DbspExpression, RowSchema};
 
 use crate::expression_eval::{eval_df_expr, scalar_to_bool};
-
-pub(super) fn eval_predicate(
-    predicate: &DbspPredicate,
-    row: &[ScalarValue],
-    schema: &RowSchema,
-) -> Result<bool> {
-    let value = eval_df_expr(predicate.expression().expr(), row, schema)?;
-    scalar_to_bool(&value)
-}
-
-pub(super) fn eval_projection(
-    expressions: &[DbspProjectExpr],
-    row: &[ScalarValue],
-    schema: &RowSchema,
-) -> Result<Vec<ScalarValue>> {
-    expressions
-        .iter()
-        .map(|expr| eval_df_expr(expr.expression().expr(), row, schema))
-        .collect()
-}
 
 pub(super) fn eval_scalar_expression(
     expr: &DbspExpression,
@@ -283,10 +262,6 @@ mod tests {
                 Ok(analyzed) => analyzed,
                 Err(_) => return Ok(()),
             };
-            let predicate = match DbspPredicate::try_new(expr, Arc::clone(&schema)) {
-                Ok(predicate) => predicate,
-                Err(_) => return Ok(()),
-            };
             let evaluator = crate::expression::ExpressionEvaluator::new(
                 Arc::clone(&schema),
                 &analyzed,
@@ -294,14 +269,11 @@ mod tests {
 
             let eval_bool = evaluator.eval_bool(&row);
             let eval_expr = eval_expression(&analyzed, &row, schema.as_ref());
-            let eval_pred = eval_predicate(&predicate, &row, schema.as_ref());
 
             prop_assert_eq!(eval_bool.is_ok(), eval_expr.is_ok());
-            prop_assert_eq!(eval_bool.is_ok(), eval_pred.is_ok());
 
             if let Ok(value) = eval_bool {
                 prop_assert_eq!(value, eval_expr.unwrap());
-                prop_assert_eq!(value, eval_pred.unwrap());
             }
         }
     }
