@@ -17,6 +17,7 @@ rkyv = { workspace = true }
 slatedb = { workspace = true }
 snap = "1.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 object_store = { workspace = true }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow};
@@ -333,10 +334,19 @@ where
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
         let mut resolved = AHashMap::<u64, Vec<(usize, u64)>>::with_capacity(encoded_keys.len());
         let mut pending = Vec::<(Vec<u8>, u64, u64, u16)>::with_capacity(encoded_keys.len());
         let mut next_slot_by_hash = AHashMap::<u64, u16>::new();
         let mut output = Vec::with_capacity(encoded_keys.len());
+        let mut duplicate_reuse_hits = 0usize;
+        let mut cache_hits = 0usize;
+        let mut negative_cache_hits = 0usize;
+        let mut lookup_existing_calls = 0usize;
+        let mut lookup_existing_hits = 0usize;
+        let mut lookup_existing_ms = 0u64;
+        let mut reserve_calls = 0usize;
+        let mut reserve_ms = 0u64;
 
         for (index, encoded) in encoded_keys.iter().enumerate() {
             let resolved_hash = self.hash(encoded);
@@ -345,11 +355,13 @@ where
                     .iter()
                     .find(|(resolved_index, _)| encoded_keys[*resolved_index].as_slice() == encoded)
             {
+                duplicate_reuse_hits += 1;
                 output.push(*id);
                 continue;
             }
 
             let id = if let Some(existing) = self.lookup_existing_in_cache(encoded) {
+                cache_hits += 1;
                 existing
             } else {
                 let should_allocate = {
@@ -357,29 +369,49 @@ where
                     cache.is_negative(encoded)
                 };
                 if should_allocate || self.fast_path_fresh {
-                    self.reserve_in_batch(
-                        resolved_hash,
-                        encoded,
-                        &mut pending,
-                        &mut next_slot_by_hash,
-                    )
-                    .await?
-                } else if let Some(existing) = self.lookup_existing_id(encoded).await? {
-                    let mut cache = self.cache.lock().unwrap();
-                    cache.remember(encoded.clone(), existing);
-                    existing
-                } else {
-                    {
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.remember_negative(encoded);
+                    if should_allocate {
+                        negative_cache_hits += 1;
                     }
-                    self.reserve_in_batch(
-                        resolved_hash,
-                        encoded,
-                        &mut pending,
-                        &mut next_slot_by_hash,
-                    )
-                    .await?
+                    reserve_calls += 1;
+                    let reserve_start = Instant::now();
+                    let id = self
+                        .reserve_in_batch(
+                            resolved_hash,
+                            encoded,
+                            &mut pending,
+                            &mut next_slot_by_hash,
+                        )
+                        .await?;
+                    reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                    id
+                } else {
+                    lookup_existing_calls += 1;
+                    let lookup_start = Instant::now();
+                    let existing = self.lookup_existing_id(encoded).await?;
+                    lookup_existing_ms += lookup_start.elapsed().as_millis() as u64;
+                    if let Some(existing) = existing {
+                        lookup_existing_hits += 1;
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.remember(encoded.clone(), existing);
+                        existing
+                    } else {
+                        {
+                            let mut cache = self.cache.lock().unwrap();
+                            cache.remember_negative(encoded);
+                        }
+                        reserve_calls += 1;
+                        let reserve_start = Instant::now();
+                        let id = self
+                            .reserve_in_batch(
+                                resolved_hash,
+                                encoded,
+                                &mut pending,
+                                &mut next_slot_by_hash,
+                            )
+                            .await?;
+                        reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                        id
+                    }
                 }
             };
 
@@ -387,7 +419,28 @@ where
             output.push(id);
         }
 
+        let pending_writes = pending.len();
+        let flush_start = Instant::now();
         self.flush_pending_batch(pending).await?;
+        let flush_ms = flush_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            batch_keys = encoded_keys.len(),
+            output_ids = output.len(),
+            pending_writes,
+            duplicate_reuse_hits,
+            cache_hits,
+            negative_cache_hits,
+            lookup_existing_calls,
+            lookup_existing_hits,
+            lookup_existing_ms,
+            reserve_calls,
+            reserve_ms,
+            flush_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "dictionary intern_many breakdown"
+        );
+
         Ok(output)
     }
 
@@ -403,12 +456,21 @@ where
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
         let mut pending = Vec::<(Vec<u8>, u64, u64, u16)>::with_capacity(encoded_keys.len());
         let mut next_slot_by_hash = AHashMap::<u64, u16>::new();
         let mut output = Vec::with_capacity(encoded_keys.len());
+        let mut cache_hits = 0usize;
+        let mut negative_cache_hits = 0usize;
+        let mut lookup_existing_calls = 0usize;
+        let mut lookup_existing_hits = 0usize;
+        let mut lookup_existing_ms = 0u64;
+        let mut reserve_calls = 0usize;
+        let mut reserve_ms = 0u64;
 
         for encoded in encoded_keys {
             let id = if let Some(existing) = self.lookup_existing_in_cache(encoded.as_slice()) {
+                cache_hits += 1;
                 existing
             } else {
                 let hash = self.hash(encoded.as_slice());
@@ -417,25 +479,69 @@ where
                     cache.is_negative(encoded.as_slice())
                 };
                 if should_allocate || self.fast_path_fresh {
-                    self.reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
-                        .await?
-                } else if let Some(existing) = self.lookup_existing_id(encoded.as_slice()).await? {
-                    let mut cache = self.cache.lock().unwrap();
-                    cache.remember(encoded, existing);
-                    existing
-                } else {
-                    {
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.remember_negative(encoded.as_slice());
+                    if should_allocate {
+                        negative_cache_hits += 1;
                     }
-                    self.reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
-                        .await?
+                    reserve_calls += 1;
+                    let reserve_start = Instant::now();
+                    let id = self
+                        .reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
+                        .await?;
+                    reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                    id
+                } else {
+                    lookup_existing_calls += 1;
+                    let lookup_start = Instant::now();
+                    let existing = self.lookup_existing_id(encoded.as_slice()).await?;
+                    lookup_existing_ms += lookup_start.elapsed().as_millis() as u64;
+                    if let Some(existing) = existing {
+                        lookup_existing_hits += 1;
+                        let mut cache = self.cache.lock().unwrap();
+                        cache.remember(encoded, existing);
+                        existing
+                    } else {
+                        {
+                            let mut cache = self.cache.lock().unwrap();
+                            cache.remember_negative(encoded.as_slice());
+                        }
+                        reserve_calls += 1;
+                        let reserve_start = Instant::now();
+                        let id = self
+                            .reserve_in_batch_owned(
+                                hash,
+                                encoded,
+                                &mut pending,
+                                &mut next_slot_by_hash,
+                            )
+                            .await?;
+                        reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                        id
+                    }
                 }
             };
             output.push(id);
         }
 
+        let pending_writes = pending.len();
+        let flush_start = Instant::now();
         self.flush_pending_batch(pending).await?;
+        let flush_ms = flush_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            batch_keys = output.len(),
+            pending_writes,
+            cache_hits,
+            negative_cache_hits,
+            lookup_existing_calls,
+            lookup_existing_hits,
+            lookup_existing_ms,
+            reserve_calls,
+            reserve_ms,
+            flush_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "dictionary intern_many_unique breakdown"
+        );
+
         Ok(output)
     }
 
@@ -543,9 +649,12 @@ where
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
+        let cache_scan_start = Instant::now();
         let mut encoded_by_id: AHashMap<u64, SharedKey> = AHashMap::with_capacity(ids.len());
         let mut missing_ids = Vec::new();
         let mut seen_missing = AHashSet::with_capacity(ids.len());
+        let mut cache_hit_refs = 0usize;
 
         {
             let mut cache = self.cache.lock().unwrap();
@@ -554,15 +663,20 @@ where
                     return Err(anyhow!("id 0 is not valid"));
                 }
                 if let Some(key) = cache.lookup_key(id) {
+                    cache_hit_refs += 1;
                     encoded_by_id.entry(*id).or_insert(key);
                 } else if seen_missing.insert(*id) {
                     missing_ids.push(*id);
                 }
             }
         }
+        let cache_scan_ms = cache_scan_start.elapsed().as_millis() as u64;
 
+        let fetch_start = Instant::now();
+        let mut fetch_chunks = 0usize;
         if !missing_ids.is_empty() {
             for chunk in missing_ids.chunks(RESOLVE_MANY_FETCH_CHUNK) {
+                fetch_chunks += 1;
                 let mut id2k_keys = Vec::with_capacity(chunk.len());
                 for &id in chunk {
                     let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
@@ -586,7 +700,9 @@ where
                 }
             }
         }
+        let fetch_ms = fetch_start.elapsed().as_millis() as u64;
 
+        let decode_start = Instant::now();
         let mut decoded_by_id = AHashMap::with_capacity(encoded_by_id.len());
         for id in ids {
             if decoded_by_id.contains_key(id) {
@@ -599,7 +715,9 @@ where
                 .context("unable to decode dictionary value in batch")?;
             decoded_by_id.insert(*id, decoded);
         }
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
 
+        let output_start = Instant::now();
         let mut resolved = Vec::with_capacity(ids.len());
         for id in ids {
             let value = decoded_by_id
@@ -608,6 +726,22 @@ where
                 .ok_or_else(|| anyhow!("no key found for id {id}"))?;
             resolved.push(value);
         }
+        let output_ms = output_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            ids = ids.len(),
+            unique_ids = decoded_by_id.len(),
+            cache_hit_refs,
+            cache_miss_unique = missing_ids.len(),
+            cache_scan_ms,
+            fetch_chunks,
+            fetch_ms,
+            decode_ms,
+            output_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "dictionary resolve_many breakdown"
+        );
+
         Ok(resolved)
     }
 

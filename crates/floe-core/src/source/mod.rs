@@ -189,6 +189,8 @@ pub struct SourceEvent {
     resume_token: Option<SourceResumeToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_time_ms: Option<u64>,
+    #[serde(skip)]
+    preencoded_row_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +225,7 @@ impl SourceEvent {
             payload,
             resume_token: None,
             event_time_ms: None,
+            preencoded_row_key: None,
         }
     }
 
@@ -249,6 +252,15 @@ impl SourceEvent {
 
     pub fn with_event_time_ms(mut self, event_time_ms: u64) -> Self {
         self.event_time_ms = Some(event_time_ms);
+        self
+    }
+
+    pub fn preencoded_row_key(&self) -> Option<&[u8]> {
+        self.preencoded_row_key.as_deref()
+    }
+
+    pub fn with_preencoded_row_key(mut self, preencoded_row_key: Vec<u8>) -> Self {
+        self.preencoded_row_key = Some(preencoded_row_key);
         self
     }
 

@@ -319,14 +319,18 @@ where
     }
 
     async fn flush_without_version_update(&mut self) -> Result<(ZSetHandle, ZSetHandle)> {
+        let flush_start = std::time::Instant::now();
         self.compaction_scheduler.on_tick();
         self.poll_background_compaction().await?;
+
         let mut write_metrics = FlushWriteMetrics::default();
         let handle = self
             .versioned
             .current_handle()
             .unwrap_or_else(|| self.current_handle.clone());
         let delta_handle = self.delta_versioned.handle_for_version(0);
+
+        let stream_enqueue_start = std::time::Instant::now();
         self.stream
             .send(handle.clone())
             .await
@@ -341,21 +345,31 @@ where
             flush_stream_into_batch(&mut self.stream, &mut batch)?;
         let (delta_dirty, delta_committed_ts, delta_stream_keys) =
             flush_stream_into_batch(&mut self.delta_stream, &mut batch)?;
+        let stream_enqueue_ms = stream_enqueue_start.elapsed().as_millis() as u64;
+
         let dirty = dirty || delta_dirty;
+        let mut write_batch_ms = 0u64;
+        let mut commit_frontier_ms = 0u64;
         if dirty {
             let committed_ts = committed_ts
                 .or(delta_committed_ts)
                 .ok_or_else(|| anyhow!("stream flush missing committed timestamp"))?;
             write_metrics.record_write_batch(stream_keys + delta_stream_keys);
+            let write_batch_start = std::time::Instant::now();
             self.versioned
                 .table()
                 .write_batch(batch)
                 .await
                 .context("persist stream state")?;
+            write_batch_ms = write_batch_start.elapsed().as_millis() as u64;
+
+            let commit_start = std::time::Instant::now();
             self.stream.commit_frontier(committed_ts);
             self.delta_stream.commit_frontier(committed_ts);
+            commit_frontier_ms = commit_start.elapsed().as_millis() as u64;
         }
 
+        let retention_start = std::time::Instant::now();
         let releases = record_handle(
             &mut self.retention_window,
             &mut self.retention_counts,
@@ -373,8 +387,22 @@ where
         self.current_handle = handle.clone();
         self.delta_current_handle = delta_handle.clone();
         self.schedule_background_compaction().await?;
+        let retention_ms = retention_start.elapsed().as_millis() as u64;
+
         assert_flush_write_batch_bound(self.namespace(), false, write_metrics);
         metrics::observe_flush_write_metrics(write_metrics);
+        tracing::debug!(
+            namespace = %self.namespace(),
+            dirty,
+            stream_enqueue_ms,
+            write_batch_ms,
+            commit_frontier_ms,
+            retention_ms,
+            write_batch_calls = write_metrics.write_batch_calls,
+            keys_written = write_metrics.keys_written,
+            total_flush_ms = flush_start.elapsed().as_millis() as u64,
+            "zset flush no-version breakdown"
+        );
         Ok((handle, delta_handle))
     }
 
@@ -407,24 +435,36 @@ where
         }
         let intern_main_ms = intern_main_start.elapsed().as_millis() as u64;
 
+        let segment_build_start = std::time::Instant::now();
         let mut segments = Vec::new();
+        let mut segment_rows = 0usize;
         for (bucket, deltas) in buckets {
+            segment_rows += deltas.len();
             segments.push(SegmentRecord {
                 id: 0,
                 bucket,
                 deltas,
             });
         }
+        let segment_build_ms = segment_build_start.elapsed().as_millis() as u64;
 
         if segments.is_empty() {
+            tracing::debug!(
+                namespace = %self.namespace(),
+                overlay_rows = overlay.len(),
+                intern_main_ms,
+                segment_build_ms,
+                total_flush_ms = flush_start.elapsed().as_millis() as u64,
+                "zset flush breakdown (empty segments)"
+            );
             return self.flush_without_version_update().await;
         }
 
         let delta_segments = segments.clone();
-
         let base = self.versioned.current_handle().map(|handle| handle.version);
 
         let mut batch = WriteBatch::new();
+        let enqueue_start = std::time::Instant::now();
         let plan = self
             .versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -440,6 +480,7 @@ where
                     .context("schedule delta version update")?,
             )
         };
+        let enqueue_ms = enqueue_start.elapsed().as_millis() as u64;
         let staged_version_keys = version_write_key_count(&plan)
             + delta_plan
                 .as_ref()
@@ -453,6 +494,7 @@ where
         };
         let new_handle = self.versioned.handle_for_version(plan.version);
 
+        let stream_enqueue_start = std::time::Instant::now();
         self.stream
             .send(new_handle.clone())
             .await
@@ -469,33 +511,39 @@ where
             flush_stream_into_batch(&mut self.stream, &mut batch)?;
         let (delta_dirty, delta_committed_ts, delta_stream_keys) =
             flush_stream_into_batch(&mut self.delta_stream, &mut batch)?;
+        let stream_enqueue_ms = stream_enqueue_start.elapsed().as_millis() as u64;
         let stream_batch_keys = stream_keys + delta_stream_keys;
 
         write_metrics.record_write_batch(staged_version_keys + stream_batch_keys);
+        let write_batch_start = std::time::Instant::now();
         self.versioned
             .table()
             .write_batch(batch)
             .await
             .context("write coalesced flush updates")?;
-        let persist_versions_ms = flush_start.elapsed().as_millis() as u64;
-        let persist_streams_ms = flush_start.elapsed().as_millis() as u64;
+        let write_batch_ms = write_batch_start.elapsed().as_millis() as u64;
 
+        let apply_plan_start = std::time::Instant::now();
         self.versioned.apply_version_plan(&plan);
         if let Some(delta_plan) = &delta_plan {
             self.delta_versioned.apply_version_plan(delta_plan);
         }
-
         self.current_handle = new_handle.clone();
         self.delta_current_handle = delta_handle.clone();
+        let apply_plan_ms = apply_plan_start.elapsed().as_millis() as u64;
 
+        let mut commit_frontier_ms = 0u64;
         if stream_dirty || delta_dirty {
             let committed_ts = committed_ts
                 .or(delta_committed_ts)
                 .ok_or_else(|| anyhow!("stream flush missing committed timestamp"))?;
+            let commit_start = std::time::Instant::now();
             self.stream.commit_frontier(committed_ts);
             self.delta_stream.commit_frontier(committed_ts);
+            commit_frontier_ms = commit_start.elapsed().as_millis() as u64;
         }
 
+        let retention_start = std::time::Instant::now();
         let releases = record_handle(
             &mut self.retention_window,
             &mut self.retention_counts,
@@ -511,17 +559,25 @@ where
         );
         self.apply_delta_retention(delta_releases).await?;
         self.schedule_background_compaction().await?;
+        let retention_ms = retention_start.elapsed().as_millis() as u64;
 
         assert_flush_write_batch_bound(self.namespace(), true, write_metrics);
         metrics::observe_flush_write_metrics(write_metrics);
         tracing::debug!(
             namespace = %self.namespace(),
             overlay_rows = overlay.len(),
+            segment_rows,
+            segment_count = plan.manifest.buckets.len(),
             intern_main_ms,
+            segment_build_ms,
+            enqueue_ms,
+            stream_enqueue_ms,
+            write_batch_ms,
+            apply_plan_ms,
+            commit_frontier_ms,
+            retention_ms,
             write_batch_calls = write_metrics.write_batch_calls,
             keys_written = write_metrics.keys_written,
-            persist_versions_ms,
-            persist_streams_ms,
             total_flush_ms = flush_start.elapsed().as_millis() as u64,
             "zset flush breakdown"
         );

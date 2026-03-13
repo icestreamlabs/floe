@@ -1868,6 +1868,7 @@ dependencies = [
  "slatedb",
  "snap",
  "tokio",
+ "tracing",
  "xxhash-rust",
 ]
 

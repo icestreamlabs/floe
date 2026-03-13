@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
@@ -82,6 +83,7 @@ impl MaterializedViewTableProvider {
         &self,
         as_of_version: Option<u64>,
     ) -> DFResult<(HashMap<Vec<u8>, i64>, u64)> {
+        let total_start = Instant::now();
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "materialized view '{}' is not registered",
@@ -104,6 +106,7 @@ impl MaterializedViewTableProvider {
             view = %self.view_name,
             version = target_version,
             rows = snapshot.len(),
+            total_ms = total_start.elapsed().as_millis() as u64,
             "materialized view loaded rows"
         );
         Ok((snapshot, target_version))
@@ -114,6 +117,7 @@ impl MaterializedViewTableProvider {
         state: DbspPersistedState,
         as_of_version: Option<u64>,
     ) -> DFResult<HashMap<Vec<u8>, i64>> {
+        let total_start = Instant::now();
         let target_version = as_of_version.unwrap_or(state.version());
         let handle_view = ZSetHandleView::new(
             state.dictionary(),
@@ -125,11 +129,11 @@ impl MaterializedViewTableProvider {
             .materialize()
             .await
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        #[cfg(test)]
         tracing::debug!(
             view = %self.view_name,
             version = target_version,
             snapshot_len = snapshot.len(),
+            total_ms = total_start.elapsed().as_millis() as u64,
             "materialize dbsp rows"
         );
         Ok(snapshot)

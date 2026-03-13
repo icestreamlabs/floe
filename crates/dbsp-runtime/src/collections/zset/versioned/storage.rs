@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
@@ -178,18 +179,32 @@ where
             version = self.current_version
         );
         let _enter = span.enter();
+
+        let total_start = Instant::now();
+        let base_load_start = Instant::now();
         let mut aggregate = if let Some(base_version) = self.manifest.as_ref().and_then(|m| m.base)
         {
             self.load_version_chain(base_version).await?
         } else {
             HashMap::new()
         };
+        let base_load_ms = base_load_start.elapsed().as_millis() as u64;
 
+        let mut current_segment_count = 0usize;
+        let mut current_segment_load_ms = 0u64;
+        let mut current_delta_rows = 0usize;
+        let mut current_resolve_calls = 0usize;
+        let current_resolve_start = Instant::now();
         if let Some(current) = &self.manifest {
             for (bucket, segments) in &current.buckets {
                 for segment_id in segments {
+                    current_segment_count += 1;
+                    let segment_start = Instant::now();
                     let record = self.load_segment(*bucket, *segment_id).await?;
+                    current_segment_load_ms += segment_start.elapsed().as_millis() as u64;
+                    current_delta_rows += record.deltas.len();
                     for (key_id, delta) in record.deltas {
+                        current_resolve_calls += 1;
                         let key = self
                             .dict
                             .resolve(key_id)
@@ -200,8 +215,24 @@ where
                 }
             }
         }
+        let current_resolve_ms = current_resolve_start.elapsed().as_millis() as u64;
 
+        let rows_before_retain = aggregate.len();
         aggregate.retain(|_, weight| *weight != 0);
+        tracing::debug!(
+            namespace = %self.namespace,
+            version = self.current_version,
+            base_load_ms,
+            current_segment_count,
+            current_segment_load_ms,
+            current_delta_rows,
+            current_resolve_calls,
+            current_resolve_ms,
+            rows_before_retain,
+            rows_after_retain = aggregate.len(),
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "versioned zset materialize breakdown"
+        );
         Ok(aggregate)
     }
 
@@ -228,18 +259,38 @@ where
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
+        let manifest_start = Instant::now();
         let manifest = self.load_manifest_record(version).await?;
+        let manifest_load_ms = manifest_start.elapsed().as_millis() as u64;
+        let bucket_count = manifest.buckets.len();
+
         let mut entries = Vec::new();
         let mut resolved_by_id: HashMap<u64, K> = HashMap::new();
+        let mut segment_count = 0usize;
+        let mut segment_load_ms = 0u64;
 
         for (bucket, segments) in manifest.buckets {
             for segment_id in segments {
+                segment_count += 1;
+                let segment_start = Instant::now();
                 let record = self.load_segment(bucket, segment_id).await?;
+                segment_load_ms += segment_start.elapsed().as_millis() as u64;
                 entries.extend(record.deltas);
             }
         }
 
         if entries.is_empty() {
+            tracing::debug!(
+                namespace = %self.namespace,
+                version,
+                bucket_count,
+                segment_count,
+                manifest_load_ms,
+                segment_load_ms,
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "versioned zset delta_iter_with_dict breakdown"
+            );
             return Ok(Vec::new());
         }
 
@@ -254,17 +305,20 @@ where
             }
         }
 
+        let resolve_many_start = Instant::now();
         if !missing_ids.is_empty() {
             let resolved = self
                 .dict
                 .resolve_many(&missing_ids)
                 .await
                 .context("resolve keys while iterating delta layer")?;
-            for (key_id, key) in missing_ids.into_iter().zip(resolved) {
+            for (key_id, key) in missing_ids.iter().copied().zip(resolved) {
                 resolved_by_id.insert(key_id, key);
             }
         }
+        let resolve_many_ms = resolve_many_start.elapsed().as_millis() as u64;
 
+        let remap_start = Instant::now();
         let mut deltas = Vec::with_capacity(entries.len());
         for (key_id, delta) in entries {
             let key = resolved_by_id
@@ -273,6 +327,22 @@ where
                 .ok_or_else(|| anyhow!("resolved key {key_id} missing from local cache"))?;
             deltas.push((key, delta));
         }
+        let remap_ms = remap_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            namespace = %self.namespace,
+            version,
+            bucket_count,
+            segment_count,
+            manifest_load_ms,
+            segment_load_ms,
+            delta_rows = deltas.len(),
+            unique_key_ids = resolved_by_id.len(),
+            resolve_many_ms,
+            remap_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "versioned zset delta_iter_with_dict breakdown"
+        );
 
         Ok(deltas)
     }
@@ -394,6 +464,8 @@ where
     }
 
     async fn load_version_chain(&self, version: u64) -> Result<HashMap<K, i64>> {
+        let total_start = Instant::now();
+        let manifest_load_start = Instant::now();
         let mut chain = Vec::new();
         let mut manifests = Vec::new();
         let mut current = Some(version);
@@ -410,13 +482,24 @@ where
             manifests.push(manifest.clone());
             current = manifest.base;
         }
+        let manifest_load_ms = manifest_load_start.elapsed().as_millis() as u64;
 
         let mut aggregate = HashMap::new();
+        let mut segment_count = 0usize;
+        let mut segment_load_ms = 0u64;
+        let mut delta_rows = 0usize;
+        let mut resolve_calls = 0usize;
+        let resolve_start = Instant::now();
         for manifest in manifests.into_iter().rev() {
             for (bucket, segments) in manifest.buckets {
                 for segment_id in segments {
+                    segment_count += 1;
+                    let segment_start = Instant::now();
                     let record = self.load_segment(bucket, segment_id).await?;
+                    segment_load_ms += segment_start.elapsed().as_millis() as u64;
+                    delta_rows += record.deltas.len();
                     for (key_id, delta) in record.deltas {
+                        resolve_calls += 1;
                         let key = self
                             .dict
                             .resolve(key_id)
@@ -427,6 +510,22 @@ where
                 }
             }
         }
+        let resolve_ms = resolve_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(
+            namespace = %self.namespace,
+            chain_head = version,
+            chain_versions = chain.len(),
+            manifest_load_ms,
+            segment_count,
+            segment_load_ms,
+            delta_rows,
+            resolve_calls,
+            resolve_ms,
+            rows = aggregate.len(),
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "versioned zset load_version_chain breakdown"
+        );
 
         Ok(aggregate)
     }

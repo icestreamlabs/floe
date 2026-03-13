@@ -504,59 +504,107 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    let total_start = Instant::now();
+    let input_rows = deltas.len();
+    let stage_start = Instant::now();
     let staged: Vec<(R, i64)> = deltas
         .into_iter()
         .filter(|(_, delta)| *delta != 0)
         .collect();
+    let stage_ms = stage_start.elapsed().as_millis() as u64;
     if staged.is_empty() {
+        tracing::debug!(
+            namespace = %versioned.namespace(),
+            input_rows,
+            staged_rows = 0,
+            stage_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "filter_map apply_deltas_to_versioned breakdown (empty staged)"
+        );
         return Ok(versioned
             .current_handle()
             .unwrap_or_else(|| versioned.handle_for_version(0)));
     }
 
+    let split_start = Instant::now();
     let mut keys = Vec::with_capacity(staged.len());
     let mut weights = Vec::with_capacity(staged.len());
     for (key, delta) in staged {
         keys.push(key);
         weights.push(delta);
     }
+    let split_ms = split_start.elapsed().as_millis() as u64;
 
     let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
     let dict = versioned.dictionary();
+    let intern_start = Instant::now();
     let ids = dict
         .intern_many_values_unique_owned(keys)
         .await
         .context("intern keys while staging filter_map delta")?;
+    let intern_ms = intern_start.elapsed().as_millis() as u64;
+
+    let bucketize_start = Instant::now();
     for (delta, id) in weights.into_iter().zip(ids.into_iter()) {
         buckets.entry(bucket_for(id)).or_default().push((id, delta));
     }
+    let bucketize_ms = bucketize_start.elapsed().as_millis() as u64;
 
+    let segment_build_start = Instant::now();
     let mut segments = Vec::new();
+    let mut segment_rows = 0usize;
     for (bucket, mut bucket_deltas) in buckets {
         bucket_deltas.retain(|(_, delta)| *delta != 0);
         if bucket_deltas.is_empty() {
             continue;
         }
         bucket_deltas.sort_by_key(|(id, _)| *id);
+        segment_rows += bucket_deltas.len();
         segments.push(SegmentRecord {
             id: 0,
             bucket,
             deltas: bucket_deltas,
         });
     }
+    let segment_build_ms = segment_build_start.elapsed().as_millis() as u64;
 
     let mut batch = WriteBatch::new();
+    let enqueue_start = Instant::now();
     let plan = versioned
         .enqueue_version_with_base(segments, None, 0, &mut batch)
         .await
         .context("schedule filter_map version update")?;
+    let enqueue_ms = enqueue_start.elapsed().as_millis() as u64;
+
+    let write_start = Instant::now();
     versioned
         .table()
         .write_batch(batch)
         .await
         .context("write filter_map version update")?;
+    let write_ms = write_start.elapsed().as_millis() as u64;
 
+    let apply_plan_start = Instant::now();
     versioned.apply_version_plan(&plan);
+    let apply_plan_ms = apply_plan_start.elapsed().as_millis() as u64;
+
+    tracing::debug!(
+        namespace = %versioned.namespace(),
+        input_rows,
+        staged_rows = segment_rows,
+        segment_count = plan.manifest.buckets.len(),
+        stage_ms,
+        split_ms,
+        intern_ms,
+        bucketize_ms,
+        segment_build_ms,
+        enqueue_ms,
+        write_ms,
+        apply_plan_ms,
+        total_ms = total_start.elapsed().as_millis() as u64,
+        "filter_map apply_deltas_to_versioned breakdown"
+    );
+
     Ok(versioned.handle_for_version(plan.version))
 }
 

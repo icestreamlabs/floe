@@ -74,6 +74,14 @@ impl OuterStreamWriter {
         Ok(())
     }
 
+    pub fn append_encoded(&mut self, key: Vec<u8>, diff: Diff) -> Result<()> {
+        if diff == 0 {
+            return Ok(());
+        }
+        self.stream.add_delta(key, diff);
+        Ok(())
+    }
+
     /// Advance the stream frontier even when no rows were appended.
     pub async fn tick(&mut self) -> Result<OuterStreamHandle> {
         let span = tracing::debug_span!(

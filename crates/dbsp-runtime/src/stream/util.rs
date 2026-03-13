@@ -3,6 +3,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rkyv::Archive;
@@ -198,9 +199,11 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    let total_start = Instant::now();
     let dict_ns = dictionary_namespace_for_handle(&handle.ns);
-    let dict = if let Some(existing) = cache.get(dict_ns) {
-        existing.clone()
+    let dict_open_start = Instant::now();
+    let (dict, dict_cache_hit) = if let Some(existing) = cache.get(dict_ns) {
+        (existing.clone(), true)
     } else {
         let dictionary = Arc::new(
             Dictionary::with_table(table.clone(), dict_ns.to_string(), None)
@@ -208,15 +211,31 @@ where
                 .context("open dictionary for ZSet handle")?,
         );
         cache.insert(dict_ns.to_string(), dictionary.clone());
-        dictionary
+        (dictionary, false)
     };
+    let dict_open_ms = dict_open_start.elapsed().as_millis() as u64;
 
     let view = ZSetHandleView::new(dict, table, handle.ns.clone(), handle.version);
+    let materialize_start = Instant::now();
     let mut map = view
         .materialize()
         .await
         .context("materialize ZSet handle")?;
+    let materialize_ms = materialize_start.elapsed().as_millis() as u64;
+    let rows_before_retain = map.len();
     map.retain(|_, weight| *weight != 0);
+    tracing::debug!(
+        namespace = %handle.ns,
+        version = handle.version,
+        dict_ns,
+        dict_cache_hit,
+        dict_open_ms,
+        rows_before_retain,
+        rows_after_retain = map.len(),
+        materialize_ms,
+        total_ms = total_start.elapsed().as_millis() as u64,
+        "zset handle materialize breakdown"
+    );
     Ok(map)
 }
 
@@ -237,9 +256,11 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    let total_start = Instant::now();
     let dict_ns = dictionary_namespace_for_handle(&handle.ns);
-    let dict = if let Some(existing) = cache.get(dict_ns) {
-        existing.clone()
+    let dict_open_start = Instant::now();
+    let (dict, dict_cache_hit) = if let Some(existing) = cache.get(dict_ns) {
+        (existing.clone(), true)
     } else {
         let dictionary = Arc::new(
             Dictionary::with_table(table.clone(), dict_ns.to_string(), None)
@@ -247,15 +268,31 @@ where
                 .context("open dictionary for ZSet handle")?,
         );
         cache.insert(dict_ns.to_string(), dictionary.clone());
-        dictionary
+        (dictionary, false)
     };
+    let dict_open_ms = dict_open_start.elapsed().as_millis() as u64;
 
     let view = ZSetHandleView::new(dict, table, handle.ns.clone(), handle.version);
+    let delta_iter_start = Instant::now();
     let mut deltas = view
         .delta_iter()
         .await
         .context("delta iterate ZSet handle")?;
+    let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
+    let rows_before_retain = deltas.len();
     deltas.retain(|(_, delta)| *delta != 0);
+    tracing::debug!(
+        namespace = %handle.ns,
+        version = handle.version,
+        dict_ns,
+        dict_cache_hit,
+        dict_open_ms,
+        rows_before_retain,
+        rows_after_retain = deltas.len(),
+        delta_iter_ms,
+        total_ms = total_start.elapsed().as_millis() as u64,
+        "zset handle delta_iter breakdown"
+    );
     Ok(deltas)
 }
 

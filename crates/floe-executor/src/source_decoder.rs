@@ -52,6 +52,36 @@ impl SourceRowDecoder {
         }
         Ok((row, event_ts))
     }
+
+    pub fn encode_row_key(&self, event: &SourceEvent) -> Result<(Vec<u8>, Option<Timestamp>)> {
+        if event.source() != self.definition.name() {
+            bail!(
+                "event source {} does not match definition {}",
+                event.source(),
+                self.definition.name()
+            );
+        }
+        let payload = event.payload();
+        let object = payload
+            .as_object()
+            .context("source payload must be a JSON object")?;
+        let mut buf = Vec::with_capacity(64);
+        let count = u32::try_from(self.definition.columns().len())
+            .context("too many source columns to encode")?;
+        buf.extend_from_slice(&count.to_le_bytes());
+        let mut event_ts = None;
+        for column in self.definition.columns() {
+            let value = object.get(column.name());
+            encode_value_direct(
+                &mut buf,
+                column.data_type(),
+                value,
+                column.nullable(),
+                &mut event_ts,
+            )?;
+        }
+        Ok((buf, event_ts))
+    }
 }
 
 fn convert_value(data_type: &SourceDataType, value: &Value, nullable: bool) -> Result<ScalarValue> {
@@ -98,12 +128,86 @@ fn null_scalar(data_type: &SourceDataType) -> ScalarValue {
     }
 }
 
+fn encode_value_direct(
+    buf: &mut Vec<u8>,
+    data_type: &SourceDataType,
+    value: Option<&Value>,
+    nullable: bool,
+    event_ts: &mut Option<Timestamp>,
+) -> Result<()> {
+    match value {
+        None if nullable => {
+            encode_typed_null(buf, data_type);
+            Ok(())
+        }
+        None => bail!("missing field in source payload"),
+        Some(value) if value.is_null() => {
+            if nullable {
+                encode_typed_null(buf, data_type);
+                Ok(())
+            } else {
+                bail!("null value violates non-nullable column");
+            }
+        }
+        Some(value) => match data_type {
+            SourceDataType::Int64 => {
+                let number = value
+                    .as_i64()
+                    .with_context(|| format!("expected integer value, found {value}"))?;
+                buf.push(0x01);
+                buf.extend_from_slice(&number.to_le_bytes());
+                Ok(())
+            }
+            SourceDataType::Utf8 => {
+                let string = value
+                    .as_str()
+                    .with_context(|| format!("expected string value, found {value}"))?;
+                buf.push(0x02);
+                let bytes = string.as_bytes();
+                let len = u32::try_from(bytes.len()).context("utf8 value too large for MV key")?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+                Ok(())
+            }
+            SourceDataType::TimestampMillis => {
+                let number = value
+                    .as_i64()
+                    .with_context(|| format!("expected integer timestamp, found {value}"))?;
+                buf.push(0x03);
+                buf.extend_from_slice(&number.to_le_bytes());
+                if event_ts.is_none() && number >= 0 {
+                    *event_ts = Some(number as u64);
+                }
+                Ok(())
+            }
+            SourceDataType::Bool => {
+                let flag = value
+                    .as_bool()
+                    .with_context(|| format!("expected boolean value, found {value}"))?;
+                buf.push(0x04);
+                buf.push(if flag { 1 } else { 0 });
+                Ok(())
+            }
+        },
+    }
+}
+
+fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
+    match data_type {
+        SourceDataType::Int64 => buf.push(0x05),
+        SourceDataType::Utf8 => buf.push(0x06),
+        SourceDataType::TimestampMillis => buf.push(0x07),
+        SourceDataType::Bool => buf.push(0x08),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use floe_core::source::{SourceColumn, SourceDataType};
     use serde_json::json;
 
     use super::*;
+    use crate::encoding::encode_projected_row_key;
 
     #[test]
     fn decodes_nexmark_bid_event() {
@@ -231,5 +335,35 @@ mod tests {
             err.to_string()
                 .contains("null value violates non-nullable column")
         );
+    }
+
+    #[test]
+    fn direct_encoding_matches_row_encoding() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note", SourceDataType::Utf8, true),
+                SourceColumn::new_nullable("created_at", SourceDataType::TimestampMillis, false),
+                SourceColumn::new_nullable("enabled", SourceDataType::Bool, false),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new(
+            "orders",
+            json!({
+                "id": 42,
+                "note": "hello",
+                "created_at": 1_700_000_000_i64,
+                "enabled": true
+            }),
+        );
+
+        let (row, decoded_ts) = decoder.decode(&event).expect("decode");
+        let expected = encode_projected_row_key(&row).expect("encode row");
+        let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
+        assert_eq!(encoded, expected);
+        assert_eq!(direct_ts, decoded_ts);
     }
 }

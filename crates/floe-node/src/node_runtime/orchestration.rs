@@ -853,7 +853,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let pending_epoch = epoch.saturating_add(1);
             let batch_len = batch.len();
             let decode_start = Instant::now();
-            let mut decoded_rows = Vec::with_capacity(batch_len);
+            let mut decoded_rows = Vec::new();
+            let mut encoded_rows = Vec::with_capacity(batch_len);
             let mut decoded_counts: HashMap<String, usize> = HashMap::new();
             let mut tick_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
             let mut tick_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
@@ -896,15 +897,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         break 'executor;
                     }
                 };
-                let (row, event_ts) = match decoder.decode(&event) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::warn!(
-                            source = %source_name,
-                            error = %err,
-                            "failed to decode source event"
-                        );
-                        continue;
+                let event_ts = if let Some(preencoded_row_key) = event.preencoded_row_key() {
+                    encoded_rows.push((source_name.clone(), preencoded_row_key.to_vec()));
+                    None
+                } else {
+                    match decoder.encode_row_key(&event) {
+                        Ok((encoded, event_ts)) => {
+                            encoded_rows.push((source_name.clone(), encoded));
+                            event_ts
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                source = %source_name,
+                                error = %err,
+                                "direct source encoding fell back to row decode"
+                            );
+                            let (row, event_ts) = match decoder.decode(&event) {
+                                Ok(result) => result,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        source = %source_name,
+                                        error = %err,
+                                        "failed to decode source event"
+                                    );
+                                    continue;
+                                }
+                            };
+                            decoded_rows.push((source_name.clone(), row));
+                            event_ts
+                        }
                     }
                 };
                 let event_ts = event.event_time_ms().or(event_ts);
@@ -916,22 +937,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     *entry = (*entry).max(ts_i64);
                 }
                 *decoded_counts.entry(source_name.clone()).or_insert(0) += 1;
-                decoded_rows.push((source_name, row));
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
             metrics::observe_decode_latency_ms(decode_latency_ms);
             metrics::observe_tick_phase_latency_ms("decode", decode_latency_ms);
             tracing::debug!(
-                decoded_rows = decoded_rows.len(),
+                decoded_rows = decoded_rows.len().saturating_add(encoded_rows.len()),
                 latency_ms = decode_latency_ms,
                 "decoded ingest batch"
             );
 
-            if decoded_rows.is_empty() {
+            if decoded_rows.is_empty() && encoded_rows.is_empty() {
                 continue;
             }
 
-            let decoded_rows_len = decoded_rows.len();
+            let decoded_rows_len = decoded_rows.len().saturating_add(encoded_rows.len());
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
             for (source_name, row) in decoded_rows {
@@ -958,6 +978,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         tracing::debug!(row = ?row, "ingested auction row");
                     }
                 }
+            }
+            for (source_name, encoded) in encoded_rows {
+                let Some(writer) = registry.writer_mut(&source_name) else {
+                    tracing::warn!(
+                        source = %source_name,
+                        "no writer for source, skipping encoded row"
+                    );
+                    continue;
+                };
+                if let Err(err) = writer.append_encoded(encoded, 1) {
+                    tracing::error!(
+                        source = %source_name,
+                        error = %err,
+                        "failed to append encoded row"
+                    );
+                    continue;
+                }
+                changed = true;
             }
 
             if !changed {
