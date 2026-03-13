@@ -54,13 +54,13 @@ Both passed.
   - `reports/SPRINT_0016_PHASE23_PERSISTENCE_POLICY_SEGMENTS_COUNTONLY_RELEASE_run2_2026-03-12.log`
 - run3: `75062` rows/s
   - `reports/SPRINT_0016_PHASE23_PERSISTENCE_POLICY_SEGMENTS_COUNTONLY_RELEASE_run3_2026-03-12.log`
-- run4: `74740` rows/s
-  - `reports/SPRINT_0016_PHASE23_PERSISTENCE_POLICY_SEGMENTS_COUNTONLY_RELEASE_run4_2026-03-12.log`
+- run5: `76404` rows/s
+  - `reports/SPRINT_0016_PHASE23_PERSISTENCE_POLICY_SEGMENTS_COUNTONLY_RELEASE_run5_2026-03-12.log`
 
-Aggregate (run1-4):
+Aggregate (run1,2,3,5):
 
-- mean: `73321` rows/s
-- median: `74534` rows/s
+- mean: `73737` rows/s
+- median: `74695` rows/s
 
 Recent pre-change reference:
 
