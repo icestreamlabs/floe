@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{col, table_scan};
@@ -16,7 +16,7 @@ use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, ValidatedPlan, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
-use floe_executor::encoding::decode_projected_row_key;
+use floe_executor::encoding::{decode_projected_row_key, encode_projected_row_key};
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
@@ -54,6 +54,53 @@ async fn load_or_register_mv_makes_view_queryable() {
     )
     .await
     .expect("load mv");
+
+    let df = session
+        .sql("SELECT auction, bidder, price FROM mv_q1 ORDER BY auction")
+        .await
+        .expect("plan SQL");
+    let batches = df.collect().await.expect("collect");
+    assert_eq!(int_rows(&batches), vec![vec![1, 2, 100]]);
+}
+
+#[tokio::test]
+async fn load_or_register_mv_registers_overlay_only_view() {
+    let db = test_db("mv-loader-overlay-only").await;
+    let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let session = query.session();
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    registry.set_schema(
+        VIEW_NAME,
+        Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+        ])),
+    );
+    let handle = registry.register(VIEW_NAME.to_string());
+    handle.append_encoded_overlay_batch(
+        1,
+        vec![(
+            encode_projected_row_key(&[
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(100)),
+            ])
+            .expect("encode overlay row"),
+            1,
+        )],
+    );
+
+    let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+    load_or_register_mv(&session, Arc::clone(&registry), &mut bridge, VIEW_NAME)
+        .await
+        .expect("load overlay-only mv");
+
+    assert!(
+        handle.dbsp_state().is_none(),
+        "overlay-only MV should not force SlateDB state hydration"
+    );
 
     let df = session
         .sql("SELECT auction, bidder, price FROM mv_q1 ORDER BY auction")
@@ -191,6 +238,7 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
         .expect("graph builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&outer, &source_refs);
+    let transient_streams = gather_transient_streams(&outer, &source_refs);
     let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     builder
         .build(BuildInputs {
@@ -201,6 +249,8 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -261,6 +311,19 @@ fn gather_handle_streams(
     let mut map = HashMap::new();
     for source in sources {
         if let Some(stream) = registry.delta_handle_stream(source) {
+            map.insert((*source).to_string(), stream);
+        }
+    }
+    map
+}
+
+fn gather_transient_streams(
+    registry: &OuterStreamRegistry,
+    sources: &[&str],
+) -> HashMap<String, floe_executor::outer_stream::TransientSourceHandleStream> {
+    let mut map = HashMap::new();
+    for source in sources {
+        if let Some(stream) = registry.transient_stream(source) {
             map.insert((*source).to_string(), stream);
         }
     }

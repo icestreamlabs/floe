@@ -21,12 +21,15 @@ use crate::materialized_view::{
     DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
 };
 use crate::metrics;
+use crate::outer_stream::{TransientSourceBatch, TransientSourceHandleStream};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::{DbspGraphBuilder, MvFlushCoalescingConfig};
 
 static MV_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_UPDATE_LOG_SAMPLE_EVERY: u64 = 128;
+static MV_OVERLAY_APPLY_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MV_OVERLAY_APPLY_LOG_SAMPLE_EVERY: u64 = 16;
 
 pub(super) type DeltaTransformFn =
     dyn Fn(Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
@@ -429,6 +432,90 @@ impl DbspGraphBuilder {
         Ok(handle_stream)
     }
 
+    pub(super) async fn materialize_view_from_transient_source_overlay(
+        &mut self,
+        view_name: &str,
+        schema: Arc<RowSchema>,
+        upstream: TransientSourceHandleStream,
+        delta_transform: Arc<DeltaTransformFn>,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
+        mv_registry: &Arc<MaterializedViewRegistry>,
+    ) -> Result<()> {
+        let registry_handle = mv_registry.register(view_name.to_string());
+        let arrow_schema = schema.to_arrow_schema();
+        mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
+        {
+            let bridge = self.bridge.lock().await;
+            bridge
+                .save_mv_schema(view_name, Arc::clone(&arrow_schema))
+                .await
+                .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
+        }
+
+        let existing_handle = {
+            let mut bridge = self.bridge.lock().await;
+            let view = bridge
+                .new_view(view_name, StreamRetention::KeepLast { keep_last: 1 })
+                .await
+                .with_context(|| format!("open materialized view '{view_name}' for recovery"))?;
+            let mut view_handle_stream = view.handle_stream();
+            let view_frontier = view_handle_stream.committed_frontier();
+            if view_frontier >= 0 {
+                Some((view_frontier, view_handle_stream.get(view_frontier).await?))
+            } else {
+                None
+            }
+        };
+        let mut existing_frontier = None;
+        if let Some((view_frontier, handle)) = existing_handle {
+            let state = self.state_from_handle(&handle).await?;
+            registry_handle.set_dbsp_state(state);
+            registry_handle.publish_version(view_frontier, handle);
+            existing_frontier = Some(view_frontier);
+        }
+
+        let graph_id = self.graph_id().to_string();
+        let view_label = view_name.to_string();
+        let task_label = format!("materialize-view:{view_label}");
+        let task_events = task_events.clone();
+        let cancel = cancel.clone();
+        let mut rx = upstream.subscribe();
+        tokio::spawn(async move {
+            if let Some(frontier) = existing_frontier {
+                tracing::info!(
+                    graph_id = %graph_id,
+                    view = %view_label,
+                    version = frontier,
+                    "seeded source-journal materialized view overlay from persisted base"
+                );
+            }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    maybe_batch = rx.recv() => {
+                        let Some(batch) = maybe_batch else {
+                            break;
+                        };
+                        if let Err(err) = Self::process_transient_materialize_batch_overlay(
+                            batch,
+                            Arc::clone(&delta_transform),
+                            &registry_handle,
+                            &graph_id,
+                            &view_label,
+                        )
+                        .await
+                        {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn process_materialize_delta(
         result: Result<(i64, ZSetHandle)>,
         view: &mut DbspView,
@@ -480,6 +567,60 @@ impl DbspGraphBuilder {
                 trigger,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn process_transient_materialize_batch_overlay(
+        batch: TransientSourceBatch,
+        delta_transform: Arc<DeltaTransformFn>,
+        registry: &Arc<MaterializedViewHandle>,
+        graph_id: &str,
+        view_label: &str,
+    ) -> Result<()> {
+        let ts = batch.version;
+        let update_span = tracing::info_span!(
+            "dbsp_write",
+            graph_id = %graph_id,
+            view = %view_label,
+            namespace = "overlay",
+            version = ts,
+        );
+        let _enter = update_span.enter();
+        let apply_start = Instant::now();
+        let (apply, merged) = Self::transform_transient_batch(delta_transform, batch)
+            .await
+            .with_context(|| {
+                format!("apply transient source batch for materialized view '{view_label}' at {ts}")
+            })?;
+        if merged.is_empty() {
+            registry.publish_logical_version(ts);
+            return Ok(());
+        }
+        let apply_stats = registry
+            .append_encoded_overlay_batch(u64::try_from(ts.max(0)).unwrap_or(u64::MAX), merged);
+        let latency_ms = apply_start.elapsed().as_millis() as u64;
+        metrics::observe_mv_update_latency_ms(latency_ms);
+        metrics::inc_mv_updates();
+        if MV_OVERLAY_APPLY_LOG_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(MV_OVERLAY_APPLY_LOG_SAMPLE_EVERY)
+        {
+            tracing::info!(
+                view = %view_label,
+                namespace = "overlay",
+                version = ts,
+                delta_rows = apply.delta_rows,
+                delta_bytes = apply.delta_bytes,
+                transform_ms = apply.transform_ms,
+                merge_ms = apply.merge_ms,
+                overlay_rows = apply_stats.overlay_rows,
+                overlay_bytes = apply_stats.overlay_bytes,
+                state_apply_ms = apply_stats.apply_ms,
+                overlay_batches = apply_stats.overlay_batches,
+                latency_ms,
+                "materialized view overlay apply breakdown"
+            );
         }
         Ok(())
     }
@@ -574,6 +715,32 @@ impl DbspGraphBuilder {
             transform_ms,
             merge_ms,
         })
+    }
+
+    async fn transform_transient_batch(
+        delta_transform: Arc<DeltaTransformFn>,
+        batch: TransientSourceBatch,
+    ) -> Result<(DeltaApplyStats, Vec<(Vec<u8>, i64)>)> {
+        let transform_start = Instant::now();
+        let input_rows = batch.deltas.len();
+        let input_bytes = batch
+            .deltas
+            .iter()
+            .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
+            .sum();
+        let merged = delta_transform(batch.deltas)
+            .context("apply transient transform before materialized view")?;
+        let transform_ms = transform_start.elapsed().as_millis() as u64;
+        Ok((
+            DeltaApplyStats {
+                delta_rows: input_rows,
+                delta_bytes: input_bytes,
+                load_ms: 0,
+                transform_ms,
+                merge_ms: 0,
+            },
+            merged,
+        ))
     }
 
     async fn flush_pending_view(

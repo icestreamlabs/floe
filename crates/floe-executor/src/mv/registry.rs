@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::stream_types::{Diff, Row, Timestamp};
@@ -93,6 +94,8 @@ pub struct MaterializedViewHandle {
     state: RwLock<HashMap<Row, Diff>>,
     watermark: RwLock<Option<Timestamp>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
+    encoded_overlay_state: RwLock<Option<EncodedOverlayState>>,
+    published_versions: RwLock<BTreeSet<i64>>,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
     version_times: RwLock<HashMap<i64, i64>>,
     latest_version: RwLock<Option<i64>>,
@@ -108,6 +111,8 @@ impl MaterializedViewHandle {
             state: RwLock::new(HashMap::new()),
             watermark: RwLock::new(None),
             dbsp_state: RwLock::new(None),
+            encoded_overlay_state: RwLock::new(None),
+            published_versions: RwLock::new(BTreeSet::new()),
             versions: RwLock::new(HashMap::new()),
             version_times: RwLock::new(HashMap::new()),
             latest_version: RwLock::new(None),
@@ -162,12 +167,75 @@ impl MaterializedViewHandle {
         self.dbsp_state.read().expect("mutex poisoned").clone()
     }
 
+    pub fn has_encoded_overlay(&self) -> bool {
+        self.encoded_overlay_state
+            .read()
+            .expect("mutex poisoned")
+            .is_some()
+    }
+
+    pub fn append_encoded_overlay_batch<I>(
+        &self,
+        version: u64,
+        deltas: I,
+    ) -> EncodedOverlayApplyStats
+    where
+        I: IntoIterator<Item = (Vec<u8>, i64)>,
+    {
+        let apply_start = Instant::now();
+        let mut batches = Vec::new();
+        let mut overlay_rows = 0usize;
+        let mut overlay_bytes = 0usize;
+        for (key, diff) in deltas {
+            if diff == 0 {
+                continue;
+            }
+            overlay_rows = overlay_rows.saturating_add(1);
+            overlay_bytes = overlay_bytes.saturating_add(key.len() + std::mem::size_of::<i64>());
+            batches.push((key, diff));
+        }
+        let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
+        let state = guard.get_or_insert_with(|| EncodedOverlayState {
+            base_version: self.dbsp_state().map(|state| state.version()).unwrap_or(0),
+            ..Default::default()
+        });
+        if !batches.is_empty() {
+            state.batches.insert(version, batches);
+        }
+        state.latest_version = state.latest_version.max(version);
+        let stats = EncodedOverlayApplyStats {
+            overlay_rows,
+            overlay_bytes,
+            overlay_batches: state.batches.len(),
+            apply_ms: apply_start.elapsed().as_millis() as u64,
+        };
+        drop(guard);
+        self.publish_logical_version(version as i64);
+        stats
+    }
+
+    pub fn encoded_overlay_batches(
+        &self,
+        as_of_version: Option<u64>,
+    ) -> Option<(u64, u64, Vec<(Vec<u8>, i64)>)> {
+        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+        let state = guard.as_ref()?;
+        let target_version = as_of_version.unwrap_or(state.latest_version);
+        if target_version < state.base_version {
+            return None;
+        }
+        let mut overlay = Vec::new();
+        for (version, deltas) in &state.batches {
+            if *version > target_version {
+                break;
+            }
+            overlay.extend(deltas.iter().cloned());
+        }
+        Some((state.base_version, target_version, overlay))
+    }
+
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
         let namespace = handle.ns.clone();
-        let version_time = self
-            .watermark()
-            .map(watermark_to_micros)
-            .unwrap_or_else(current_time_micros);
         {
             let mut guard = self
                 .versions
@@ -175,20 +243,7 @@ impl MaterializedViewHandle {
                 .expect("materialized view versions lock poisoned");
             guard.insert(version, handle);
         }
-        {
-            let mut guard = self
-                .version_times
-                .write()
-                .expect("materialized view versions lock poisoned");
-            guard.insert(version, version_time);
-        }
-        {
-            let mut guard = self
-                .latest_version
-                .write()
-                .expect("materialized view version lock poisoned");
-            *guard = Some(version);
-        }
+        self.record_latest_version(version);
         self.prune_versions();
         tracing::debug!(
             view = %self.name,
@@ -196,7 +251,15 @@ impl MaterializedViewHandle {
             namespace = %namespace,
             "materialized view version recorded"
         );
-        let _ = self.version_watch.send_replace(Some(version));
+    }
+
+    pub fn publish_logical_version(&self, version: i64) {
+        self.record_latest_version(version);
+        tracing::debug!(
+            view = %self.name,
+            version,
+            "materialized view logical version recorded"
+        );
     }
 
     pub fn latest_version(&self) -> Option<i64> {
@@ -207,10 +270,10 @@ impl MaterializedViewHandle {
     }
 
     pub fn next_version_after(&self, version: i64) -> Option<i64> {
-        self.versions
+        self.published_versions
             .read()
             .expect("materialized view versions lock poisoned")
-            .keys()
+            .iter()
             .copied()
             .filter(|candidate| *candidate > version)
             .min()
@@ -265,6 +328,50 @@ impl MaterializedViewHandle {
             times.remove(&version);
         }
     }
+
+    fn record_latest_version(&self, version: i64) {
+        let version_time = self
+            .watermark()
+            .map(watermark_to_micros)
+            .unwrap_or_else(current_time_micros);
+        {
+            let mut guard = self
+                .published_versions
+                .write()
+                .expect("materialized view versions lock poisoned");
+            guard.insert(version);
+        }
+        {
+            let mut guard = self
+                .version_times
+                .write()
+                .expect("materialized view versions lock poisoned");
+            guard.insert(version, version_time);
+        }
+        {
+            let mut guard = self
+                .latest_version
+                .write()
+                .expect("materialized view version lock poisoned");
+            *guard = Some(version);
+        }
+        let _ = self.version_watch.send_replace(Some(version));
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EncodedOverlayApplyStats {
+    pub overlay_rows: usize,
+    pub overlay_bytes: usize,
+    pub overlay_batches: usize,
+    pub apply_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EncodedOverlayState {
+    base_version: u64,
+    latest_version: u64,
+    batches: BTreeMap<u64, Vec<(Vec<u8>, i64)>>,
 }
 
 fn current_time_micros() -> i64 {

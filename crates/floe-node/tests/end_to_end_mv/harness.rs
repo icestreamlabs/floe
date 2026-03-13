@@ -70,6 +70,7 @@ impl MvTestHarness {
                 .await?;
         let source_refs: Vec<&str> = required_sources.iter().map(String::as_str).collect();
         let handle_streams = gather_handle_streams(&outer, &source_refs);
+        let transient_streams = gather_transient_streams(&outer, &source_refs);
         let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
         graph_builder
             .build(BuildInputs {
@@ -80,6 +81,8 @@ impl MvTestHarness {
                 task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
+                outer_transient_streams: &transient_streams,
+                enable_source_batch_journal: false,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
                 watermark: Arc::new(AtomicI64::new(-1)),
             })
@@ -119,6 +122,19 @@ fn gather_handle_streams(
     let mut map = HashMap::new();
     for source in sources {
         if let Some(stream) = outer.delta_handle_stream(source) {
+            map.insert((*source).to_string(), stream);
+        }
+    }
+    map
+}
+
+fn gather_transient_streams(
+    outer: &OuterStreamRegistry,
+    sources: &[&str],
+) -> HashMap<String, floe_executor::outer_stream::TransientSourceHandleStream> {
+    let mut map = HashMap::new();
+    for source in sources {
+        if let Some(stream) = outer.transient_stream(source) {
             map.insert((*source).to_string(), stream);
         }
     }

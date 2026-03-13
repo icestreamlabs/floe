@@ -9,6 +9,7 @@ use datafusion::logical_expr::{Expr, JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use dbsp::handles::{ZSetHandle, ZSetHandleView};
+use dbsp::storage::SlateTable;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
@@ -19,6 +20,7 @@ use floe_executor::dbsp_plan::{
 use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
+use floe_executor::source_journal::SourceBatchJournal;
 use object_store::memory::InMemory;
 use slatedb::Db;
 use tokio::sync::mpsc;
@@ -81,6 +83,7 @@ async fn filter_and_projection_materializes_mv() {
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     let outputs = builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -90,6 +93,8 @@ async fn filter_and_projection_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -100,6 +105,140 @@ async fn filter_and_projection_materializes_mv() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
+}
+
+#[tokio::test]
+async fn source_batch_journal_replay_recovers_overlay_view() {
+    let db = test_db("source-batch-journal-replay").await;
+    let view_name = "mv_source_batch_journal";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .project(vec![col("price")])
+            .expect("project")
+            .filter(col("bidder").eq(lit(42i64)))
+            .expect("filter")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
+    mv_registry.set_schema(view_name, arrow_schema.clone());
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let journal = SourceBatchJournal::new(Arc::new(SlateTable::new(Arc::clone(&db))));
+    {
+        let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        writer
+            .append(&bid_row(1, 42, 99), 1)
+            .expect("append bidder 42");
+        writer
+            .append(&bid_row(2, 7, 50), 1)
+            .expect("append bidder 7");
+        let batch = writer
+            .pending_transient_batch(1)
+            .expect("pending transient batch");
+        journal
+            .append("nexmark_bid", 1, None, &batch.deltas)
+            .await
+            .expect("append source journal");
+    }
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick transient source root");
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+
+    let rows = overlay_rows(&mv_registry, view_name);
+    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
+
+    let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
+        .await
+        .expect("restarted bridge");
+    let mut restarted_registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut restarted_bridge)
+            .await
+            .expect("restarted outer streams");
+    restarted_registry.set_durable_enabled("nexmark_bid", false);
+
+    let restarted_mv_registry = Arc::new(MaterializedViewRegistry::new());
+    restarted_mv_registry.register(view_name);
+    restarted_mv_registry.set_schema(view_name, arrow_schema);
+
+    let restarted_handle_streams = gather_handle_streams(&restarted_registry, &source_refs);
+    let restarted_transient_streams = gather_transient_streams(&restarted_registry, &source_refs);
+    let mut restarted_builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("restarted builder");
+    restarted_builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&restarted_mv_registry),
+            outer_handle_streams: &restarted_handle_streams,
+            outer_transient_streams: &restarted_transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("rebuild graph");
+
+    journal
+        .replay_committed_entries_up_to(&mut restarted_registry, 1, &required_sources)
+        .await
+        .expect("replay source journal");
+    wait_for_logical_version(&restarted_mv_registry, view_name, 1).await;
+
+    let restarted_rows = overlay_rows(&restarted_mv_registry, view_name);
+    assert_eq!(restarted_rows, rows);
 }
 
 #[tokio::test]
@@ -178,6 +317,7 @@ async fn inner_join_materializes_mv() {
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     let outputs = builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -187,6 +327,8 @@ async fn inner_join_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -284,6 +426,7 @@ async fn left_outer_join_materializes_null_extended_rows() {
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -293,6 +436,8 @@ async fn left_outer_join_materializes_null_extended_rows() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -371,6 +516,7 @@ async fn aggregate_materializes_mv() {
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -380,6 +526,8 @@ async fn aggregate_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -516,6 +664,7 @@ async fn topn_materializes_mv() {
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -525,6 +674,8 @@ async fn topn_materializes_mv() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -588,6 +739,7 @@ async fn distinct_materializes_unique_rows() {
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -597,6 +749,8 @@ async fn distinct_materializes_unique_rows() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -685,6 +839,7 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -694,6 +849,8 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -766,6 +923,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
 
     let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     {
@@ -781,6 +939,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
                 task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
+                outer_transient_streams: &transient_streams,
+                enable_source_batch_journal: false,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
                 watermark: Arc::new(AtomicI64::new(-1)),
             })
@@ -801,6 +961,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -851,6 +1013,7 @@ async fn cancel_stops_materialized_view_updates() {
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -860,6 +1023,8 @@ async fn cancel_stops_materialized_view_updates() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -933,6 +1098,7 @@ async fn graph_task_error_is_reported() {
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
         .build(BuildInputs {
             graph_id: view_name,
@@ -942,6 +1108,8 @@ async fn graph_task_error_is_reported() {
             task_events: task_tx.clone(),
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -985,6 +1153,59 @@ fn gather_handle_streams(
         }
     }
     map
+}
+
+fn gather_transient_streams(
+    registry: &OuterStreamRegistry,
+    sources: &[&str],
+) -> HashMap<String, floe_executor::outer_stream::TransientSourceHandleStream> {
+    let mut map = HashMap::new();
+    for source in sources {
+        if let Some(stream) = registry.transient_stream(source) {
+            map.insert((*source).to_string(), stream);
+        }
+    }
+    map
+}
+
+fn overlay_rows(registry: &MaterializedViewRegistry, view_name: &str) -> Vec<Vec<ScalarValue>> {
+    let handle = registry.get(view_name).expect("view registered");
+    let (_, _, overlay) = handle
+        .encoded_overlay_batches(None)
+        .expect("overlay batches available");
+    let mut rows = Vec::new();
+    for (key, diff) in overlay {
+        if diff <= 0 {
+            continue;
+        }
+        let decoded = decode_projected_row_key(&key).expect("decode overlay row");
+        for _ in 0..diff {
+            rows.push(decoded.clone());
+        }
+    }
+    rows
+}
+
+async fn wait_for_logical_version(
+    registry: &MaterializedViewRegistry,
+    view_name: &str,
+    target_version: i64,
+) {
+    let handle = registry.get(view_name).expect("view registered");
+    if handle.latest_version().unwrap_or(-1) >= target_version {
+        return;
+    }
+    let mut rx = handle.version_watch();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if rx.borrow().unwrap_or(-1) >= target_version {
+                break;
+            }
+            rx.changed().await.expect("version watch update");
+        }
+    })
+    .await
+    .expect("wait for logical version");
 }
 
 fn sort_rows_by_first_column(rows: &mut [Vec<ScalarValue>]) {

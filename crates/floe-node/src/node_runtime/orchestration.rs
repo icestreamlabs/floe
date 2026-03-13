@@ -182,6 +182,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
     let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
     let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());
+    let mut transient_eligible_sources: BTreeSet<String> = BTreeSet::new();
+    let mut durable_required_sources: BTreeSet<String> = BTreeSet::new();
     for (mv_idx, plan) in circuit_plans.iter().enumerate() {
         let view_name = planned_materialized_views[mv_idx]
             .definition()
@@ -191,8 +193,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             required_sources, ..
         } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
         all_required_sources.extend(required_sources.iter().cloned());
+        if let Some(source_name) = source_batch_journal_root_source_name(plan)
+            && required_sources.len() == 1
+            && required_sources.contains(&source_name)
+        {
+            transient_eligible_sources.insert(source_name);
+        } else {
+            durable_required_sources.extend(required_sources.iter().cloned());
+        }
         plan_required_sources.push(required_sources);
     }
+    let transient_only_sources: BTreeSet<String> = transient_eligible_sources
+        .difference(&durable_required_sources)
+        .cloned()
+        .collect();
     all_required_sources.extend(
         source_registry
             .definitions()
@@ -217,14 +231,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .await
         .context("initialize tick checkpoint manager")?;
     let initial_sink_cursors = checkpoint_manager.snapshot_sink_cursors();
+    let recovered_tick_commit = checkpoint_manager.latest_tick_commit().cloned();
     if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
         metrics::record_last_committed_tick(tick_commit.tick_id);
     }
+    let source_batch_journal = SourceBatchJournal::new(checkpoint_manager.store().table());
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
-            .await
-            .context("initialize outer DBSP streams for sources")?
+        let mut registry =
+            OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
+                .await
+                .context("initialize outer DBSP streams for sources")?;
+        for source in &transient_only_sources {
+            registry.set_durable_enabled(source, false);
+        }
+        registry
     };
     let outer_registry = Arc::new(Mutex::new(outer_registry));
     if circuit_plans.is_empty() {
@@ -378,15 +399,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         let namespace = floe_executor::namespaces::materialized_view(view_name)
             .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
         let required_sources = &plan_required_sources[idx];
-        let handle_streams = {
+        let (handle_streams, transient_streams) = {
             let registry_guard = outer_registry.lock().await;
-            gather_handle_streams(&registry_guard, required_sources)
+            (
+                gather_handle_streams(&registry_guard, required_sources),
+                gather_transient_streams(&registry_guard, required_sources),
+            )
         };
         tracing::info!(
             view = %view_name,
             namespace = %namespace,
             required_sources = ?required_sources,
             handle_streams = ?handle_streams.keys(),
+            transient_streams = ?transient_streams.keys(),
             "building DBSP graph"
         );
 
@@ -399,11 +424,61 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 task_events: task_event_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
+                outer_transient_streams: &transient_streams,
+                enable_source_batch_journal: true,
                 mv_retention,
                 watermark: Arc::clone(&event_watermark),
             })
             .await
             .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
+    }
+    if let Some(tick_commit) = recovered_tick_commit.as_ref()
+        && !transient_only_sources.is_empty()
+    {
+        let replayed = {
+            let mut registry_guard = outer_registry.lock().await;
+            source_batch_journal
+                .replay_committed_entries_up_to(
+                    &mut registry_guard,
+                    tick_commit.tick_id,
+                    &transient_only_sources,
+                )
+                .await
+                .context("replay committed source batch journal entries")?
+        };
+        tracing::info!(
+            replayed_entries = replayed,
+            committed_tick = tick_commit.tick_id,
+            transient_only_sources = ?transient_only_sources,
+            "replayed committed source batch journal entries"
+        );
+        for mv_version in &tick_commit.mv_versions {
+            let Some(handle) = mv_registry.get(&mv_version.view) else {
+                continue;
+            };
+            if handle.latest_version().unwrap_or(-1) >= mv_version.version as i64 {
+                continue;
+            }
+            let mut rx = handle.version_watch();
+            let target_version = mv_version.version as i64;
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    if rx.borrow().unwrap_or(-1) >= target_version {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "wait for replayed materialized view '{}' to reach version {}",
+                    mv_version.view, mv_version.version
+                )
+            })?;
+        }
     }
     let decoder_registry: HashMap<String, SourceRowDecoder> = source_registry
         .definitions()
@@ -733,6 +808,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
+    let source_batch_journal_for_task = source_batch_journal.clone();
+    let transient_only_sources_for_task = transient_only_sources.clone();
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -998,6 +1075,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 changed = true;
             }
 
+            let mut source_journal_batches = Vec::new();
+            for source_name in &transient_only_sources_for_task {
+                let Some(writer) = registry.writer_mut(source_name) else {
+                    continue;
+                };
+                let Some(batch) = writer
+                    .pending_transient_batch(i64::try_from(pending_epoch).unwrap_or(i64::MAX))
+                else {
+                    continue;
+                };
+                source_journal_batches.push((
+                    source_name.clone(),
+                    tick_source_max_event_ts.get(source_name).copied(),
+                    batch.deltas,
+                ));
+            }
+            drop(registry);
+
             if !changed {
                 continue;
             }
@@ -1067,9 +1162,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if pre_tick_commit_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
+            for (source_name, max_event_time_ms, deltas) in &source_journal_batches {
+                if let Err(err) = source_batch_journal_for_task
+                    .append(source_name, epoch, *max_event_time_ms, deltas)
+                    .await
+                {
+                    tracing::error!(
+                        epoch,
+                        source = %source_name,
+                        error = %err,
+                        "failed to append source batch journal"
+                    );
+                    record_runtime_failure(
+                        &failure_for_executor,
+                        format!(
+                            "failed to append source batch journal for source '{}' at tick {}: {}",
+                            source_name, epoch, err
+                        ),
+                    );
+                    executor_cancel.cancel();
+                    break 'executor;
+                }
+            }
             // Advance frontier for all sources this epoch, even if they had no rows.
+            let mut registry = outer_for_task.lock().await;
             let tick_all_start = Instant::now();
-            if let Err(err) = registry.tick_all().await {
+            if let Err(err) = registry
+                .tick_all_with_version(i64::try_from(epoch).unwrap_or(i64::MAX))
+                .await
+            {
                 metrics::observe_tick_phase_latency_ms(
                     "state_write",
                     tick_all_start.elapsed().as_millis() as u64,

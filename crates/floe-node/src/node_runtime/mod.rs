@@ -18,10 +18,12 @@ use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, MaterializedViewTickVersion, SinkCursor, TickCommit,
 };
+use floe_executor::source_journal::SourceBatchJournal;
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
-    OuterStreamRegistry, SourceRowDecoder, SourceTableProvider, ValidatedPlan, validate_dbsp_plan,
+    OuterStreamRegistry, SourceRowDecoder, SourceTableProvider, ValidatedPlan,
+    source_batch_journal_root_source_name, validate_dbsp_plan,
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};

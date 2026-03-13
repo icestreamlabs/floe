@@ -91,6 +91,43 @@ impl MaterializedViewTableProvider {
             ))
         })?;
 
+        if let Some((base_version, target_version, overlay)) =
+            view.encoded_overlay_batches(as_of_version)
+        {
+            let mut snapshot = if let Some(state) = view.dbsp_state() {
+                if target_version <= state.version() {
+                    self.materialize_dbsp_rows(state, Some(target_version))
+                        .await?
+                } else {
+                    self.materialize_dbsp_rows(state, Some(base_version))
+                        .await?
+                }
+            } else {
+                HashMap::new()
+            };
+            for (key, diff) in overlay {
+                if diff == 0 {
+                    continue;
+                }
+                let previous = snapshot.get(&key).copied().unwrap_or(0);
+                let next = previous.saturating_add(diff);
+                if next <= 0 {
+                    snapshot.remove(&key);
+                } else {
+                    snapshot.insert(key, next);
+                }
+            }
+            tracing::info!(
+                view = %self.view_name,
+                version = target_version,
+                rows = snapshot.len(),
+                storage = "overlay",
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "materialized view loaded rows"
+            );
+            return Ok((snapshot, target_version));
+        }
+
         let Some(state) = view.dbsp_state() else {
             tracing::warn!(
                 view = %self.view_name,
@@ -106,6 +143,7 @@ impl MaterializedViewTableProvider {
             view = %self.view_name,
             version = target_version,
             rows = snapshot.len(),
+            storage = "slatedb",
             total_ms = total_start.elapsed().as_millis() as u64,
             "materialized view loaded rows"
         );

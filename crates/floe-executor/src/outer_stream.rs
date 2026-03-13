@@ -1,9 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
 use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
 use dbsp::{StreamRetention, ZSetStream};
+use tokio::sync::mpsc;
 use tracing::field;
 
 use crate::codec::ensure_outer_stream_codec;
@@ -29,12 +33,44 @@ pub struct OuterStreamCheckpoint {
     pub frontier: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TransientSourceBatch {
+    pub source: String,
+    pub version: i64,
+    pub deltas: Vec<(Vec<u8>, i64)>,
+}
+
+#[derive(Clone)]
+pub struct TransientSourceHandleStream {
+    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
+}
+
+impl TransientSourceHandleStream {
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<TransientSourceBatch> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .expect("transient source subscribers lock poisoned")
+            .push(tx);
+        rx
+    }
+}
+
 /// Batches decoded source rows into a DBSP `ZSetStream`.
 pub struct OuterStreamWriter {
     source: String,
     namespace: String,
     stream: ZSetStream<Vec<u8>>,
+    durable_enabled: bool,
+    transient_version: i64,
+    pending_transient_deltas: Vec<(Vec<u8>, i64)>,
+    pending_transient_bytes: usize,
+    pending_encode_us: u64,
+    transient_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
 }
+
+static TRANSIENT_SOURCE_BATCH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TRANSIENT_SOURCE_BATCH_LOG_SAMPLE_EVERY: u64 = 16;
 
 impl OuterStreamWriter {
     pub fn new(
@@ -46,6 +82,12 @@ impl OuterStreamWriter {
             source: source.into(),
             namespace: namespace.into(),
             stream,
+            durable_enabled: true,
+            transient_version: 0,
+            pending_transient_deltas: Vec::new(),
+            pending_transient_bytes: 0,
+            pending_encode_us: 0,
+            transient_subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -65,12 +107,36 @@ impl OuterStreamWriter {
         self.stream.delta_handle_stream()
     }
 
+    pub fn transient_stream(&self) -> TransientSourceHandleStream {
+        TransientSourceHandleStream {
+            subscribers: Arc::clone(&self.transient_subscribers),
+        }
+    }
+
+    pub fn set_durable_enabled(&mut self, enabled: bool) {
+        self.durable_enabled = enabled;
+    }
+
+    pub fn durable_enabled(&self) -> bool {
+        self.durable_enabled
+    }
+
     pub fn append(&mut self, row: &[ScalarValue], diff: Diff) -> Result<()> {
         if diff == 0 {
             return Ok(());
         }
+        let encode_start = Instant::now();
         let key = encode_projected_row_key(row)?;
-        self.stream.add_delta(key, diff);
+        self.pending_encode_us = self
+            .pending_encode_us
+            .saturating_add(encode_start.elapsed().as_micros() as u64);
+        self.pending_transient_bytes = self
+            .pending_transient_bytes
+            .saturating_add(key.len() + std::mem::size_of::<i64>());
+        self.pending_transient_deltas.push((key.clone(), diff));
+        if self.durable_enabled {
+            self.stream.add_delta(key, diff);
+        }
         Ok(())
     }
 
@@ -78,8 +144,25 @@ impl OuterStreamWriter {
         if diff == 0 {
             return Ok(());
         }
-        self.stream.add_delta(key, diff);
+        self.pending_transient_bytes = self
+            .pending_transient_bytes
+            .saturating_add(key.len() + std::mem::size_of::<i64>());
+        self.pending_transient_deltas.push((key.clone(), diff));
+        if self.durable_enabled {
+            self.stream.add_delta(key, diff);
+        }
         Ok(())
+    }
+
+    pub fn pending_transient_batch(&self, version: i64) -> Option<TransientSourceBatch> {
+        if self.pending_transient_deltas.is_empty() {
+            return None;
+        }
+        Some(TransientSourceBatch {
+            source: self.source.clone(),
+            version,
+            deltas: self.pending_transient_deltas.clone(),
+        })
     }
 
     /// Advance the stream frontier even when no rows were appended.
@@ -91,13 +174,13 @@ impl OuterStreamWriter {
             version = field::Empty
         );
         let _enter = span.enter();
-        let handle = self.stream.flush().await?;
-        span.record("version", handle.version);
+        let handle_version = self.publish_pending_batch(None).await?;
+        span.record("version", handle_version);
         tracing::debug!("outer stream ticked");
         Ok(OuterStreamHandle {
             source: self.source.clone(),
             namespace: self.namespace.clone(),
-            version: handle.version,
+            version: handle_version,
         })
     }
 
@@ -109,14 +192,98 @@ impl OuterStreamWriter {
             version = field::Empty
         );
         let _enter = span.enter();
-        let handle = self.stream.flush().await?;
-        span.record("version", handle.version);
+        let handle_version = self.publish_pending_batch(None).await?;
+        span.record("version", handle_version);
         tracing::debug!("outer stream flushed");
         Ok(OuterStreamHandle {
             source: self.source.clone(),
             namespace: self.namespace.clone(),
-            version: handle.version,
+            version: handle_version,
         })
+    }
+
+    pub async fn tick_with_version(&mut self, version: i64) -> Result<OuterStreamHandle> {
+        let span = tracing::debug_span!(
+            "tick",
+            source = %self.source,
+            namespace = %self.namespace,
+            version = field::Empty
+        );
+        let _enter = span.enter();
+        let handle_version = self.publish_pending_batch(Some(version)).await?;
+        span.record("version", handle_version);
+        tracing::debug!("outer stream ticked with logical version");
+        Ok(OuterStreamHandle {
+            source: self.source.clone(),
+            namespace: self.namespace.clone(),
+            version: handle_version,
+        })
+    }
+
+    pub fn replay_transient_batch(
+        &mut self,
+        version: i64,
+        deltas: Vec<(Vec<u8>, i64)>,
+    ) -> Result<()> {
+        self.transient_version = self.transient_version.max(version);
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        self.publish_batch(TransientSourceBatch {
+            source: self.source.clone(),
+            version,
+            deltas,
+        });
+        Ok(())
+    }
+
+    async fn publish_pending_batch(&mut self, version: Option<i64>) -> Result<u64> {
+        let publish_version = match version {
+            Some(version) => version,
+            None if self.pending_transient_deltas.is_empty() => self.transient_version,
+            None => self.transient_version.saturating_add(1),
+        };
+        if !self.pending_transient_deltas.is_empty() {
+            self.transient_version = publish_version;
+            let batch = TransientSourceBatch {
+                source: self.source.clone(),
+                version: publish_version,
+                deltas: std::mem::take(&mut self.pending_transient_deltas),
+            };
+            let delta_rows = batch.deltas.len();
+            let delta_bytes = self.pending_transient_bytes;
+            let encode_us = self.pending_encode_us;
+            self.pending_transient_bytes = 0;
+            self.pending_encode_us = 0;
+            self.publish_batch(batch);
+            if TRANSIENT_SOURCE_BATCH_LOG_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(TRANSIENT_SOURCE_BATCH_LOG_SAMPLE_EVERY)
+            {
+                tracing::info!(
+                    source = %self.source,
+                    version = publish_version,
+                    delta_rows,
+                    delta_bytes,
+                    encode_us,
+                    durable_enabled = self.durable_enabled,
+                    "outer stream transient batch published"
+                );
+            }
+        }
+        if self.durable_enabled {
+            Ok(self.stream.flush().await?.version)
+        } else {
+            Ok(u64::try_from(publish_version.max(0)).unwrap_or(u64::MAX))
+        }
+    }
+
+    fn publish_batch(&mut self, batch: TransientSourceBatch) {
+        let mut subscribers = self
+            .transient_subscribers
+            .lock()
+            .expect("transient source subscribers lock poisoned");
+        subscribers.retain(|sender| sender.send(batch.clone()).is_ok());
     }
 }
 
@@ -164,6 +331,12 @@ impl OuterStreamRegistry {
         self.writers.get_mut(source)
     }
 
+    pub fn set_durable_enabled(&mut self, source: &str, enabled: bool) {
+        if let Some(writer) = self.writers.get_mut(source) {
+            writer.set_durable_enabled(enabled);
+        }
+    }
+
     pub fn handle_stream(&self, source: &str) -> Option<SnapshotHandleStream> {
         self.writers
             .get(source)
@@ -174,6 +347,12 @@ impl OuterStreamRegistry {
         self.writers
             .get(source)
             .map(|writer| writer.delta_handle_stream())
+    }
+
+    pub fn transient_stream(&self, source: &str) -> Option<TransientSourceHandleStream> {
+        self.writers
+            .get(source)
+            .map(|writer| writer.transient_stream())
     }
 
     pub async fn flush_all(&mut self) -> Result<Vec<OuterStreamHandle>> {
@@ -190,6 +369,26 @@ impl OuterStreamRegistry {
             handles.push(writer.tick().await?);
         }
         Ok(handles)
+    }
+
+    pub async fn tick_all_with_version(&mut self, version: i64) -> Result<Vec<OuterStreamHandle>> {
+        let mut handles = Vec::with_capacity(self.writers.len());
+        for writer in self.writers.values_mut() {
+            handles.push(writer.tick_with_version(version).await?);
+        }
+        Ok(handles)
+    }
+
+    pub fn replay_transient_batch(
+        &mut self,
+        source: &str,
+        version: i64,
+        deltas: Vec<(Vec<u8>, i64)>,
+    ) -> Result<()> {
+        if let Some(writer) = self.writers.get_mut(source) {
+            writer.replay_transient_batch(version, deltas)?;
+        }
+        Ok(())
     }
 
     pub fn checkpoint_state(&self) -> Vec<OuterStreamCheckpoint> {
@@ -259,33 +458,14 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("outer-registry", store).await.expect("db"));
         let mut bridge = DbspBridge::new(db).await.expect("bridge");
-        let registry = OuterStreamRegistry::from_sources(
-            vec!["bid".to_string(), "bid".to_string(), "auction".to_string()],
-            &mut bridge,
-        )
-        .await
-        .expect("registry");
-        assert_eq!(registry.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn registry_builds_from_validated_sources() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(
-            Db::open("outer-registry-validated", store)
-                .await
-                .expect("db"),
-        );
-        let mut bridge = DbspBridge::new(db).await.expect("bridge");
-        let mut validated = BTreeSet::new();
-        validated.insert("bid".to_string());
-        validated.insert("bid".to_string());
-        validated.insert("auction".to_string());
-        let mut registry = OuterStreamRegistry::from_validated_sources(&validated, &mut bridge)
+        let validated =
+            BTreeSet::from(["bid".to_string(), "auction".to_string(), "bid".to_string()]);
+        let registry = OuterStreamRegistry::from_validated_sources(&validated, &mut bridge)
             .await
             .expect("registry");
-        assert_eq!(registry.len(), validated.len());
-        assert!(registry.writer_mut("bid").is_some());
-        assert!(registry.writer_mut("auction").is_some());
+        assert_eq!(registry.len(), 2);
+        assert!(registry.handle_stream("bid").is_some());
+        assert!(registry.handle_stream("auction").is_some());
+        assert!(registry.handle_stream("person").is_none());
     }
 }

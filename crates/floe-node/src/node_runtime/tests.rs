@@ -181,6 +181,29 @@ fn runtime_failure_records_first_error_only() {
 }
 
 #[test]
+fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let handle = registry.register("mv_overlay".to_string());
+    handle.publish_logical_version(7);
+
+    let mut last_versions = HashMap::new();
+    let committed = collect_mv_versions_for_commit(&registry, &mut last_versions);
+    assert_eq!(
+        committed,
+        vec![MaterializedViewTickVersion {
+            view: "mv_overlay".to_string(),
+            version: 7,
+        }]
+    );
+
+    let committed_again = collect_mv_versions_for_commit(&registry, &mut last_versions);
+    assert!(
+        committed_again.is_empty(),
+        "logical version should only commit once"
+    );
+}
+
+#[test]
 fn cli_connector_creation_flags_collects_explicit_connector_inputs() {
     let mut args = default_run_args();
     args.config = Some("node.toml".to_string());

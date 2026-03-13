@@ -39,7 +39,7 @@ pub async fn load_or_register_mv(
     };
 
     let handle = registry.register(view_name.to_string());
-    if handle.dbsp_state().is_none() {
+    if handle.dbsp_state().is_none() && !handle.has_encoded_overlay() {
         tracing::info!(
             view = %view_name,
             "materialized view missing DBSP state, loading from SlateDB"

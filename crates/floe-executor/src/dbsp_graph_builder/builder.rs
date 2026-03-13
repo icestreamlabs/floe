@@ -4,18 +4,26 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
+use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
-use dbsp::{CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, StreamRetention};
+use dbsp::{
+    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, RowSchema, StreamRetention,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
-use crate::dbsp_plan::{ValidatedPlan, validate_dbsp_plan};
+use crate::dbsp_graph_builder::eval::{eval_expression, eval_scalar_expression};
+use crate::dbsp_plan::{
+    DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
+};
 use crate::delta_consolidation::ConsolidationMode;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::materialized_view::MaterializedViewRegistry;
+use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::GraphTaskSender;
 
 use super::materialize::DeltaTransformFn;
@@ -152,6 +160,41 @@ impl DbspGraphBuilder {
             .plan
             .node(inputs.plan.root)
             .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
+
+        if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
+            if let Some(transient_root) =
+                try_build_transient_source_root_materialization(inputs.plan, inputs.plan.root)?
+            {
+                if let Some(upstream) = inputs
+                    .outer_transient_streams
+                    .get(&transient_root.source_name)
+                    .cloned()
+                {
+                    tracing::info!(
+                        graph_id = %self.graph_id(),
+                        view = %inputs.view_name,
+                        source = %transient_root.source_name,
+                        optimized_nodes = ?transient_root.optimized_nodes,
+                        "using transient source root materialization with source batch journal"
+                    );
+                    self.materialize_view_from_transient_source_overlay(
+                        inputs.view_name,
+                        Arc::clone(&root_node.output_schema),
+                        upstream,
+                        transient_root.transform,
+                        &inputs.cancel,
+                        &inputs.task_events,
+                        &inputs.mv_registry,
+                    )
+                    .await?;
+                    return Ok(BuildOutputs {
+                        node_streams: built,
+                        mv_latest,
+                        required_sources,
+                    });
+                }
+            }
+        }
 
         let mut root_materialized = false;
         let root_stream = if !matches!(root_node.kind, DbspNodeKind::Sink(_)) {
@@ -599,6 +642,8 @@ pub struct BuildInputs<'a> {
     pub task_events: GraphTaskSender,
     pub mv_registry: Arc<MaterializedViewRegistry>,
     pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
+    pub outer_transient_streams: &'a HashMap<String, TransientSourceHandleStream>,
+    pub enable_source_batch_journal: bool,
     pub mv_retention: StreamRetention,
     pub watermark: Arc<AtomicI64>,
 }
@@ -734,4 +779,284 @@ fn apply_transient_segment_vectorized(
         deltas = evaluator.transform_delta(graph_id, deltas)?;
     }
     Ok(deltas)
+}
+
+struct TransientSourceRootMaterialization {
+    source_name: String,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+enum TransientSourceRootShape {
+    Source {
+        source: DbspSourceNode,
+        optimized_nodes: Vec<usize>,
+    },
+    Select {
+        source: DbspSourceNode,
+        select: DbspSelectNode,
+        optimized_nodes: Vec<usize>,
+    },
+    Project {
+        source: DbspSourceNode,
+        project: DbspProjectNode,
+        optimized_nodes: Vec<usize>,
+    },
+    FilterMap {
+        source: DbspSourceNode,
+        select: DbspSelectNode,
+        project: DbspProjectNode,
+        optimized_nodes: Vec<usize>,
+    },
+}
+
+impl TransientSourceRootShape {
+    fn source_name(&self) -> &str {
+        match self {
+            Self::Source { source, .. }
+            | Self::Select { source, .. }
+            | Self::Project { source, .. }
+            | Self::FilterMap { source, .. } => &source.table.name,
+        }
+    }
+}
+
+pub fn source_batch_journal_root_source_name(plan: &CircuitPlan) -> Option<String> {
+    find_transient_source_root_shape(plan, plan.root)
+        .ok()
+        .flatten()
+        .map(|shape| shape.source_name().to_string())
+}
+
+fn try_build_transient_source_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceRootMaterialization>> {
+    let Some(shape) = find_transient_source_root_shape(plan, root_idx)? else {
+        return Ok(None);
+    };
+    let source_name = shape.source_name().to_string();
+    let optimized_nodes = match &shape {
+        TransientSourceRootShape::Source {
+            optimized_nodes, ..
+        }
+        | TransientSourceRootShape::Select {
+            optimized_nodes, ..
+        }
+        | TransientSourceRootShape::Project {
+            optimized_nodes, ..
+        }
+        | TransientSourceRootShape::FilterMap {
+            optimized_nodes, ..
+        } => optimized_nodes.clone(),
+    };
+    let transform = match shape {
+        TransientSourceRootShape::Source { .. } => {
+            Ok(Arc::new(|deltas| Ok(deltas)) as Arc<DeltaTransformFn>)
+        }
+        TransientSourceRootShape::Select { select, .. } => build_filter_transform(&select),
+        TransientSourceRootShape::Project { project, .. } => build_map_transform(&project),
+        TransientSourceRootShape::FilterMap {
+            select, project, ..
+        } => build_filter_map_transform(&select, &project),
+    }?;
+    Ok(Some(TransientSourceRootMaterialization {
+        source_name,
+        optimized_nodes,
+        transform,
+    }))
+}
+
+fn find_transient_source_root_shape(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceRootShape>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::Source(source) => Ok(Some(TransientSourceRootShape::Source {
+            source: source.clone(),
+            optimized_nodes: vec![root_idx],
+        })),
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(input) = plan.node(input_idx) else {
+                return Ok(None);
+            };
+            let DbspNodeKind::Source(source) = &input.kind else {
+                return Ok(None);
+            };
+            Ok(Some(TransientSourceRootShape::Select {
+                source: source.clone(),
+                select: select.clone(),
+                optimized_nodes: vec![root_idx],
+            }))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let Some(source_node) = plan.node(select_input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Source(source) = &source_node.kind else {
+                    return Ok(None);
+                };
+                return Ok(Some(TransientSourceRootShape::FilterMap {
+                    source: source.clone(),
+                    select: select.clone(),
+                    project: project.clone(),
+                    optimized_nodes: vec![root_idx, input_idx],
+                }));
+            }
+            let Some(input) = plan.node(input_idx) else {
+                return Ok(None);
+            };
+            let DbspNodeKind::Source(source) = &input.kind else {
+                return Ok(None);
+            };
+            Ok(Some(TransientSourceRootShape::Project {
+                source: source.clone(),
+                project: project.clone(),
+                optimized_nodes: vec![root_idx],
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>> {
+    let predicate = node.predicate().clone();
+    let schema = Arc::clone(node.output_schema());
+    if let Ok(evaluator) =
+        VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema))
+    {
+        let evaluator = Arc::new(evaluator);
+        return Ok(Arc::new(move |delta_values| {
+            evaluator.transform_delta("source_batch_journal", delta_values)
+        }));
+    }
+    Ok(Arc::new(move |delta_values| {
+        let mut staged = Vec::with_capacity(delta_values.len());
+        for (encoded, diff) in delta_values {
+            if diff == 0 {
+                continue;
+            }
+            let row = match decode_projected_row_key(&encoded) {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            if matches!(eval_predicate(&predicate, &row, schema.as_ref()), Ok(true)) {
+                staged.push((encoded, diff));
+            }
+        }
+        Ok(staged)
+    }))
+}
+
+fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> {
+    let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
+    let schema = Arc::clone(node.input_schema());
+    if let Ok(evaluator) =
+        VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
+    {
+        let evaluator = Arc::new(evaluator);
+        return Ok(Arc::new(move |delta_values| {
+            evaluator.transform_delta("source_batch_journal", delta_values)
+        }));
+    }
+    Ok(Arc::new(move |delta_values| {
+        let mut staged = Vec::with_capacity(delta_values.len());
+        for (encoded, diff) in delta_values {
+            if diff == 0 {
+                continue;
+            }
+            let row = match decode_projected_row_key(&encoded) {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
+                Ok(projected) => projected,
+                Err(_) => continue,
+            };
+            let encoded = match encode_projected_row_key(&projected) {
+                Ok(encoded) => encoded,
+                Err(_) => continue,
+            };
+            staged.push((encoded, diff));
+        }
+        Ok(staged)
+    }))
+}
+
+fn build_filter_map_transform(
+    select: &DbspSelectNode,
+    project: &DbspProjectNode,
+) -> Result<Arc<DeltaTransformFn>> {
+    let predicate = select.predicate().clone();
+    let filter_schema = Arc::clone(select.output_schema());
+    let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
+    let project_schema = Arc::clone(project.input_schema());
+    if let Ok(evaluator) = VectorizedFilterProjectEvaluator::for_filter_map(
+        &predicate,
+        expressions.as_ref(),
+        Arc::clone(&project_schema),
+    ) {
+        let evaluator = Arc::new(evaluator);
+        return Ok(Arc::new(move |delta_values| {
+            evaluator.transform_delta("source_batch_journal", delta_values)
+        }));
+    }
+    Ok(Arc::new(move |delta_values| {
+        let mut staged = Vec::with_capacity(delta_values.len());
+        for (encoded, diff) in delta_values {
+            if diff == 0 {
+                continue;
+            }
+            let row = match decode_projected_row_key(&encoded) {
+                Ok(row) => row,
+                Err(_) => continue,
+            };
+            match eval_predicate(&predicate, &row, filter_schema.as_ref()) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => continue,
+            }
+            let projected =
+                match eval_projection(expressions.as_ref(), &row, project_schema.as_ref()) {
+                    Ok(projected) => projected,
+                    Err(_) => continue,
+                };
+            let encoded = match encode_projected_row_key(&projected) {
+                Ok(encoded) => encoded,
+                Err(_) => continue,
+            };
+            staged.push((encoded, diff));
+        }
+        Ok(staged)
+    }))
+}
+
+fn eval_predicate(
+    predicate: &dbsp::DbspPredicate,
+    row: &[datafusion::scalar::ScalarValue],
+    schema: &RowSchema,
+) -> Result<bool> {
+    eval_expression(predicate.expression(), row, schema)
+}
+
+fn eval_projection(
+    expressions: &[DbspProjectExpr],
+    row: &[datafusion::scalar::ScalarValue],
+    schema: &RowSchema,
+) -> Result<Vec<datafusion::scalar::ScalarValue>> {
+    expressions
+        .iter()
+        .map(|expr| eval_scalar_expression(expr.expression(), row, schema))
+        .collect()
 }

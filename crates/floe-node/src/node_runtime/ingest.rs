@@ -38,11 +38,8 @@ pub(super) fn collect_mv_versions_for_commit(
         if frontier < 0 {
             continue;
         }
-        let Some(zset_handle) = handle.handle_for_version(frontier) else {
-            continue;
-        };
         let view = handle.name().to_string();
-        let version = zset_handle.version;
+        let version = u64::try_from(frontier).unwrap_or(u64::MAX);
         let entry = last_versions.entry(view.clone()).or_insert(0);
         if version > *entry {
             committed.push(MaterializedViewTickVersion { view, version });

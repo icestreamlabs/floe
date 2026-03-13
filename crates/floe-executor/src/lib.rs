@@ -24,6 +24,7 @@ pub mod operators;
 pub mod outer_stream;
 pub mod projection;
 pub mod source_decoder;
+pub mod source_journal;
 pub mod stream_types;
 pub mod table_provider;
 pub mod tail;
@@ -36,6 +37,7 @@ pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{
     BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig,
+    source_batch_journal_root_source_name,
 };
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use dbsp_table_environment::DbspTableEnvironment;
