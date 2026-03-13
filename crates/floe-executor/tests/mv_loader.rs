@@ -111,6 +111,62 @@ async fn load_or_register_mv_registers_overlay_only_view() {
 }
 
 #[tokio::test]
+async fn mv_loader_reads_persisted_base_plus_overlay() {
+    let fixture = build_q1_fixture("mv-loader-hybrid-overlay", vec![bid_row(1, 2, 50)]).await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    registry.set_schema(VIEW_NAME, Arc::clone(&fixture.schema));
+    let source_handle = fixture.registry.get(VIEW_NAME).expect("source handle");
+    let version = source_handle
+        .dbsp_state()
+        .expect("persisted state")
+        .version();
+    let logical_base_version = version + 100;
+    let state = source_handle
+        .dbsp_state()
+        .expect("persisted state")
+        .with_logical_version(logical_base_version);
+    let handle = registry.register(VIEW_NAME.to_string());
+    handle.set_dbsp_state(state.clone());
+    handle.publish_version(
+        logical_base_version as i64,
+        dbsp::handles::ZSetHandle {
+            ns: state.namespace().to_string(),
+            version,
+        },
+    );
+    handle.append_encoded_overlay_batch(
+        logical_base_version + 1,
+        vec![(
+            encode_projected_row_key(&[
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(140)),
+            ])
+            .expect("encode row"),
+            1,
+        )],
+    );
+
+    let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
+    let query = FloeQueryContext::new(Arc::clone(&catalog));
+    let session = query.session();
+    let mut bridge = DbspBridge::new(Arc::clone(&fixture.db))
+        .await
+        .expect("bridge");
+
+    load_or_register_mv(&session, Arc::clone(&registry), &mut bridge, VIEW_NAME)
+        .await
+        .expect("load hybrid overlay");
+
+    let df = session
+        .sql("SELECT auction, bidder, price FROM mv_q1 ORDER BY auction")
+        .await
+        .expect("plan SQL");
+    let batches = df.collect().await.expect("collect");
+    assert_eq!(int_rows(&batches), vec![vec![1, 2, 100], vec![2, 3, 140]]);
+}
+
+#[tokio::test]
 async fn mv_loader_supports_as_of_filter() {
     let fixture = build_q1_fixture(
         "mv-loader-as-of",

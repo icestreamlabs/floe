@@ -281,6 +281,7 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             kafka_max_messages: Some(1024),
             watermark_idle_source_ms: Some(45_000),
             mv_flush: config::MvFlushConfig::default(),
+            mv_snapshot: config::MvSnapshotConfig::default(),
         },
         storage: config::StorageConfig {
             await_durable: Some(true),
@@ -410,6 +411,28 @@ fn mv_flush_coalescing_defaults_to_disabled() {
     assert_eq!(mapped.max_pending_rows, None);
     assert_eq!(mapped.max_pending_bytes, None);
     assert_eq!(mapped.max_delay_ms, None);
+}
+
+#[test]
+fn mv_snapshot_config_maps_optional_fields() {
+    let config = config::MvSnapshotConfig {
+        max_pending_batches: Some(2_048),
+        max_pending_rows: Some(500_000),
+        max_delay_ms: Some(2_000),
+    };
+
+    let mapped = mv_snapshot_config(&config);
+    assert_eq!(mapped.max_pending_batches, 2_048);
+    assert_eq!(mapped.max_pending_rows, 500_000);
+    assert_eq!(mapped.max_delay_ms, 2_000);
+}
+
+#[test]
+fn mv_snapshot_config_defaults_to_overlay_snapshot_defaults() {
+    let mapped = mv_snapshot_config(&config::MvSnapshotConfig::default());
+    assert_eq!(mapped.max_pending_batches, 16_384);
+    assert_eq!(mapped.max_pending_rows, 1_000_000);
+    assert_eq!(mapped.max_delay_ms, 10_000);
 }
 
 #[test]

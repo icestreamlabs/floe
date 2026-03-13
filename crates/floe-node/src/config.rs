@@ -79,6 +79,8 @@ pub struct RuntimeConfig {
     pub watermark_idle_source_ms: Option<u64>,
     #[serde(default)]
     pub mv_flush: MvFlushConfig,
+    #[serde(default)]
+    pub mv_snapshot: MvSnapshotConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -100,6 +102,17 @@ pub struct MvFlushConfig {
     pub flush_on_catchup_boundary: Option<bool>,
     #[serde(default)]
     pub flush_on_shutdown: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MvSnapshotConfig {
+    #[serde(default)]
+    pub max_pending_batches: Option<usize>,
+    #[serde(default)]
+    pub max_pending_rows: Option<usize>,
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -559,6 +572,11 @@ mod tests {
             ingest_batch_size = 128
             mv_retain_last = 5
 
+            [runtime.mv_snapshot]
+            max_pending_batches = 2048
+            max_pending_rows = 500000
+            max_delay_ms = 2000
+
             [storage]
             await_durable = true
             zset_compaction_max_chain_len = 64
@@ -570,6 +588,9 @@ mod tests {
         let config: NodeConfig = toml::from_str(input).expect("parse toml");
         assert_eq!(config.materialized_views.len(), 1);
         assert_eq!(config.runtime.ingest_batch_size, Some(128));
+        assert_eq!(config.runtime.mv_snapshot.max_pending_batches, Some(2048));
+        assert_eq!(config.runtime.mv_snapshot.max_pending_rows, Some(500000));
+        assert_eq!(config.runtime.mv_snapshot.max_delay_ms, Some(2000));
         assert_eq!(config.storage.await_durable, Some(true));
         assert_eq!(config.maintenance.paused, Some(true));
     }
@@ -600,6 +621,25 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("duplicate materialized view name 'mv_dup'")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_non_positive_mv_snapshot_max_pending_batches() {
+        let config = NodeConfig {
+            runtime: RuntimeConfig {
+                mv_snapshot: MvSnapshotConfig {
+                    max_pending_batches: Some(0),
+                    ..MvSnapshotConfig::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("runtime.mv_snapshot.max_pending_batches must be greater than 0")
         );
     }
 

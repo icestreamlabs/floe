@@ -61,8 +61,14 @@ pub async fn load_or_register_mv(
                 )
             })?;
         let (dict, table, ns, version) = handle_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
+        let logical_version = bridge
+            .load_mv_logical_version(view_name)
+            .await?
+            .unwrap_or(version);
+        let state =
+            DbspPersistedState::new(dict, table, ns, version).with_logical_version(logical_version);
         handle.set_dbsp_state(state);
+        handle.mark_state_non_authoritative();
     }
 
     let provider = MaterializedViewTableProvider::new(

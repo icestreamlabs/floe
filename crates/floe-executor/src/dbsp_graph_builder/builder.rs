@@ -37,6 +37,7 @@ pub struct DbspGraphBuilder {
     pub(super) watermark: Arc<AtomicI64>,
     output_consolidation_mode: ConsolidationMode,
     pub(super) mv_flush_coalescing: MvFlushCoalescingConfig,
+    pub(super) mv_overlay_snapshot: OverlaySnapshotConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +50,23 @@ pub struct MvFlushCoalescingConfig {
     pub max_delay_ms: Option<u64>,
     pub flush_on_catchup_boundary: bool,
     pub flush_on_shutdown: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OverlaySnapshotConfig {
+    pub max_pending_batches: usize,
+    pub max_pending_rows: usize,
+    pub max_delay_ms: u64,
+}
+
+impl Default for OverlaySnapshotConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_batches: 16_384,
+            max_pending_rows: 1_000_000,
+            max_delay_ms: 10_000,
+        }
+    }
 }
 
 impl Default for MvFlushCoalescingConfig {
@@ -76,6 +94,7 @@ impl DbspGraphBuilder {
             watermark: Arc::new(AtomicI64::new(-1)),
             output_consolidation_mode: ConsolidationMode::ByAllColumns,
             mv_flush_coalescing: MvFlushCoalescingConfig::default(),
+            mv_overlay_snapshot: OverlaySnapshotConfig::default(),
         })
     }
 
@@ -89,6 +108,20 @@ impl DbspGraphBuilder {
             sanitized.max_pending_deltas = 1;
         }
         self.mv_flush_coalescing = sanitized;
+    }
+
+    pub fn set_mv_overlay_snapshot(&mut self, config: OverlaySnapshotConfig) {
+        let mut sanitized = config;
+        if sanitized.max_pending_batches == 0 {
+            sanitized.max_pending_batches = 1;
+        }
+        if sanitized.max_pending_rows == 0 {
+            sanitized.max_pending_rows = 1;
+        }
+        if sanitized.max_delay_ms == 0 {
+            sanitized.max_delay_ms = 1;
+        }
+        self.mv_overlay_snapshot = sanitized;
     }
 
     pub async fn set_stream_compaction(

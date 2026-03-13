@@ -5,12 +5,15 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::stream_types::{Diff, Row, Timestamp};
+use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
 use tracing::field;
+
+use crate::encoding::decode_projected_row_key;
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -92,6 +95,8 @@ impl MaterializedViewRegistry {
 pub struct MaterializedViewHandle {
     name: String,
     state: RwLock<HashMap<Row, Diff>>,
+    state_row_count: RwLock<i64>,
+    state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
     encoded_overlay_state: RwLock<Option<EncodedOverlayState>>,
@@ -109,6 +114,8 @@ impl MaterializedViewHandle {
         Self {
             name,
             state: RwLock::new(HashMap::new()),
+            state_row_count: RwLock::new(0),
+            state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
             dbsp_state: RwLock::new(None),
             encoded_overlay_state: RwLock::new(None),
@@ -131,11 +138,20 @@ impl MaterializedViewHandle {
         }
 
         let mut guard = self.state.write().expect("mutex poisoned");
-        let entry = guard.entry(row.clone()).or_insert(0);
-        *entry += diff;
-        if *entry == 0 {
+        let previous = guard.get(&row).copied().unwrap_or(0);
+        let next = previous.saturating_add(diff);
+        if next == 0 {
             guard.remove(&row);
+        } else {
+            guard.insert(row, next);
         }
+        let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+        let previous_rows = previous.max(0);
+        let next_rows = next.max(0);
+        *row_count = row_count
+            .saturating_add(next_rows)
+            .saturating_sub(previous_rows)
+            .max(0);
     }
 
     pub fn update_watermark(&self, watermark: Timestamp) {
@@ -148,6 +164,36 @@ impl MaterializedViewHandle {
 
     pub fn snapshot(&self) -> HashMap<Row, Diff> {
         self.state.read().expect("mutex poisoned").clone()
+    }
+
+    pub fn mark_state_authoritative(&self) {
+        *self.state_authoritative.write().expect("mutex poisoned") = true;
+    }
+
+    pub fn mark_state_non_authoritative(&self) {
+        *self.state_authoritative.write().expect("mutex poisoned") = false;
+    }
+
+    pub fn authoritative_row_count(&self) -> Option<usize> {
+        if !*self.state_authoritative.read().expect("mutex poisoned") {
+            return None;
+        }
+        Some(usize::try_from(*self.state_row_count.read().expect("mutex poisoned")).unwrap_or(0))
+    }
+
+    pub fn apply_encoded_state_batch(&self, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
+        if !*self.state_authoritative.read().expect("mutex poisoned") {
+            return Ok(());
+        }
+        for (key, diff) in deltas {
+            if *diff == 0 {
+                continue;
+            }
+            let row = decode_projected_row_key(key)
+                .with_context(|| "decode encoded overlay row for state cache")?;
+            self.apply(row, *diff);
+        }
+        Ok(())
     }
 
     pub fn set_dbsp_state(&self, state: DbspPersistedState) {
@@ -196,7 +242,10 @@ impl MaterializedViewHandle {
         }
         let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
         let state = guard.get_or_insert_with(|| EncodedOverlayState {
-            base_version: self.dbsp_state().map(|state| state.version()).unwrap_or(0),
+            base_version: self
+                .dbsp_state()
+                .map(|state| state.logical_version())
+                .unwrap_or(0),
             ..Default::default()
         });
         if !batches.is_empty() {
@@ -232,6 +281,37 @@ impl MaterializedViewHandle {
             overlay.extend(deltas.iter().cloned());
         }
         Some((state.base_version, target_version, overlay))
+    }
+
+    pub fn compact_encoded_overlay_up_to(
+        &self,
+        base_version: u64,
+    ) -> EncodedOverlayCompactionStats {
+        let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
+        let Some(state) = guard.as_mut() else {
+            return EncodedOverlayCompactionStats::default();
+        };
+        let removed_batches = state
+            .batches
+            .keys()
+            .take_while(|version| **version <= base_version)
+            .count();
+        let removed_versions: Vec<u64> = state
+            .batches
+            .keys()
+            .copied()
+            .take_while(|version| *version <= base_version)
+            .collect();
+        for version in removed_versions {
+            state.batches.remove(&version);
+        }
+        state.base_version = state.base_version.max(base_version);
+        let remaining_rows = state.batches.values().map(|deltas| deltas.len()).sum();
+        EncodedOverlayCompactionStats {
+            removed_batches,
+            remaining_batches: state.batches.len(),
+            remaining_rows,
+        }
     }
 
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
@@ -367,6 +447,13 @@ pub struct EncodedOverlayApplyStats {
     pub apply_ms: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EncodedOverlayCompactionStats {
+    pub removed_batches: usize,
+    pub remaining_batches: usize,
+    pub remaining_rows: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 struct EncodedOverlayState {
     base_version: u64,
@@ -407,6 +494,7 @@ pub struct DbspPersistedState {
     table: Arc<dyn KeyValueTable>,
     namespace: String,
     version: u64,
+    logical_version: u64,
 }
 
 impl std::fmt::Debug for DbspPersistedState {
@@ -414,6 +502,7 @@ impl std::fmt::Debug for DbspPersistedState {
         f.debug_struct("DbspPersistedState")
             .field("namespace", &self.namespace)
             .field("version", &self.version)
+            .field("logical_version", &self.logical_version)
             .finish()
     }
 }
@@ -430,6 +519,7 @@ impl DbspPersistedState {
             table,
             namespace,
             version,
+            logical_version: version,
         }
     }
 
@@ -448,6 +538,15 @@ impl DbspPersistedState {
     pub fn version(&self) -> u64 {
         self.version
     }
+
+    pub fn with_logical_version(mut self, logical_version: u64) -> Self {
+        self.logical_version = logical_version;
+        self
+    }
+
+    pub fn logical_version(&self) -> u64 {
+        self.logical_version
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +555,7 @@ mod tests {
     use dbsp::handles::ZSetHandle;
 
     use super::*;
+    use crate::encoding::encode_projected_row_key;
 
     #[test]
     fn registers_and_updates_view_state() {
@@ -508,5 +608,44 @@ mod tests {
         assert!(view.handle_for_version(1).is_none());
         assert!(view.handle_for_version(2).is_some());
         assert!(view.handle_for_version(3).is_some());
+    }
+
+    #[test]
+    fn compact_overlay_batches_advances_base_version() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_overlay");
+
+        view.append_encoded_overlay_batch(1, vec![(b"k1".to_vec(), 1)]);
+        view.append_encoded_overlay_batch(2, vec![(b"k2".to_vec(), 1)]);
+        view.append_encoded_overlay_batch(3, vec![(b"k3".to_vec(), 1)]);
+
+        let stats = view.compact_encoded_overlay_up_to(2);
+        assert_eq!(stats.removed_batches, 2);
+        assert_eq!(stats.remaining_batches, 1);
+        assert_eq!(stats.remaining_rows, 1);
+
+        let (base_version, target_version, overlay) = view
+            .encoded_overlay_batches(None)
+            .expect("remaining overlay");
+        assert_eq!(base_version, 2);
+        assert_eq!(target_version, 3);
+        assert_eq!(overlay, vec![(b"k3".to_vec(), 1)]);
+    }
+
+    #[test]
+    fn authoritative_row_count_tracks_encoded_state_batches() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_count");
+        view.mark_state_authoritative();
+
+        let row = vec![ScalarValue::Int64(Some(1))];
+        let key = encode_projected_row_key(&row).expect("encode row");
+        view.apply_encoded_state_batch(&[(key.clone(), 1)])
+            .expect("apply first delta");
+        assert_eq!(view.authoritative_row_count(), Some(1));
+
+        view.apply_encoded_state_batch(&[(key, -1)])
+            .expect("apply delete delta");
+        assert_eq!(view.authoritative_row_count(), Some(0));
     }
 }

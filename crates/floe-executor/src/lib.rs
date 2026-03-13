@@ -36,7 +36,7 @@ pub use barrier_clock::{BarrierClock, StepId};
 pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{
-    BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig,
+    BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig,
     source_batch_journal_root_source_name,
 };
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};

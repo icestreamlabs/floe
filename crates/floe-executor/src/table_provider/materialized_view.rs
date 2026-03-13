@@ -56,6 +56,23 @@ impl MaterializedViewTableProvider {
         datafusion::arrow::datatypes::SchemaRef,
         Vec<datafusion::arrow::record_batch::RecordBatch>,
     )> {
+        let (projected_schema, projected_indices) =
+            super::helpers::project_schema(&self.schema, projection)?;
+        if projected_indices.is_empty() {
+            if let Some((row_count, _version)) =
+                self.fast_count_batches(as_of_version, limit).await?
+            {
+                let options = datafusion::arrow::record_batch::RecordBatchOptions::new()
+                    .with_row_count(Some(row_count));
+                let batch = datafusion::arrow::record_batch::RecordBatch::try_new_with_options(
+                    Arc::clone(&projected_schema),
+                    vec![],
+                    &options,
+                )
+                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+                return Ok((projected_schema, vec![batch]));
+            }
+        }
         let (snapshot, version) = self.load_snapshot(as_of_version).await?;
         build_batches_from_encoded_snapshot(
             snapshot,
@@ -95,11 +112,11 @@ impl MaterializedViewTableProvider {
             view.encoded_overlay_batches(as_of_version)
         {
             let mut snapshot = if let Some(state) = view.dbsp_state() {
-                if target_version <= state.version() {
-                    self.materialize_dbsp_rows(state, Some(target_version))
-                        .await?
+                if target_version < state.logical_version() || base_version > target_version {
+                    HashMap::new()
                 } else {
-                    self.materialize_dbsp_rows(state, Some(base_version))
+                    let persisted_version = state.version();
+                    self.materialize_dbsp_rows(state, Some(persisted_version))
                         .await?
                 }
             } else {
@@ -121,7 +138,7 @@ impl MaterializedViewTableProvider {
                 view = %self.view_name,
                 version = target_version,
                 rows = snapshot.len(),
-                storage = "overlay",
+                storage = "hybrid_overlay",
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "materialized view loaded rows"
             );
@@ -135,9 +152,10 @@ impl MaterializedViewTableProvider {
             );
             return Ok((HashMap::new(), 0));
         };
-        let target_version = as_of_version.unwrap_or(state.version());
+        let target_version = as_of_version.unwrap_or(state.logical_version());
+        let persisted_version = state.version();
         let snapshot = self
-            .materialize_dbsp_rows(state, Some(target_version))
+            .materialize_dbsp_rows(state, Some(persisted_version))
             .await?;
         tracing::info!(
             view = %self.view_name,
@@ -148,6 +166,38 @@ impl MaterializedViewTableProvider {
             "materialized view loaded rows"
         );
         Ok((snapshot, target_version))
+    }
+
+    async fn fast_count_batches(
+        &self,
+        as_of_version: Option<u64>,
+        limit: Option<usize>,
+    ) -> DFResult<Option<(usize, u64)>> {
+        let view = self.registry.get(&self.view_name).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "materialized view '{}' is not registered",
+                self.view_name
+            ))
+        })?;
+        let latest_version = view
+            .latest_version()
+            .and_then(|version| u64::try_from(version).ok());
+        let target_version = as_of_version.or(latest_version).unwrap_or(0);
+        if as_of_version.is_some() && latest_version != Some(target_version) {
+            return Ok(None);
+        }
+        let Some(row_count) = view.authoritative_row_count() else {
+            return Ok(None);
+        };
+        let row_count = limit.map(|limit| row_count.min(limit)).unwrap_or(row_count);
+        tracing::info!(
+            view = %self.view_name,
+            version = target_version,
+            rows = row_count,
+            storage = "hybrid_overlay_cached_count",
+            "materialized view loaded rows"
+        );
+        Ok(Some((row_count, target_version)))
     }
 
     async fn materialize_dbsp_rows(

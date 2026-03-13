@@ -76,6 +76,18 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         runtime.mv_flush.max_delay_ms,
         "runtime.mv_flush.max_delay_ms",
     )?;
+    ensure_optional_positive_usize(
+        runtime.mv_snapshot.max_pending_batches,
+        "runtime.mv_snapshot.max_pending_batches",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.mv_snapshot.max_pending_rows,
+        "runtime.mv_snapshot.max_pending_rows",
+    )?;
+    ensure_optional_positive_u64(
+        runtime.mv_snapshot.max_delay_ms,
+        "runtime.mv_snapshot.max_delay_ms",
+    )?;
     Ok(())
 }
 

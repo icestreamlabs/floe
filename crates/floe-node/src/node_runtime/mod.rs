@@ -22,8 +22,8 @@ use floe_executor::source_journal::SourceBatchJournal;
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
-    OuterStreamRegistry, SourceRowDecoder, SourceTableProvider, ValidatedPlan,
-    source_batch_journal_root_source_name, validate_dbsp_plan,
+    OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
+    ValidatedPlan, source_batch_journal_root_source_name, validate_dbsp_plan,
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
@@ -55,9 +55,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    ConnectorConfig, MvFlushConfig, NodeConfig, OutputConsolidationModeConfig, SinkConfig,
-    SinkSpec, apply_connector_properties, load_config, materialized_view_definitions_from_config,
-    normalize_connectors, normalize_sinks, sink_spec_from_sql,
+    ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
+    SinkConfig, SinkSpec, apply_connector_properties, load_config,
+    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
+    sink_spec_from_sql,
 };
 use crate::{cli, config, http_ingest, metrics, sinks};
 

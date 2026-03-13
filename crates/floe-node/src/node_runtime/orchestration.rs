@@ -280,6 +280,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .context("initialize DBSP graph builder")?;
     if let Some(config) = config.as_ref() {
         graph_builder.set_mv_flush_coalescing(mv_flush_coalescing_config(&config.runtime.mv_flush));
+        graph_builder.set_mv_overlay_snapshot(mv_snapshot_config(&config.runtime.mv_snapshot));
     }
     let output_mode =
         resolve_output_consolidation_mode(run_args.output_consolidation_mode, &source_registry);

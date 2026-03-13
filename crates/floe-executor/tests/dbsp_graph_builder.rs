@@ -192,8 +192,9 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
         .await
         .expect("tick transient source root");
     wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_dbsp_state(&mv_registry, view_name).await;
 
-    let rows = overlay_rows(&mv_registry, view_name);
+    let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
 
     let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
@@ -236,8 +237,9 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
         .await
         .expect("replay source journal");
     wait_for_logical_version(&restarted_mv_registry, view_name, 1).await;
+    wait_for_dbsp_state(&restarted_mv_registry, view_name).await;
 
-    let restarted_rows = overlay_rows(&restarted_mv_registry, view_name);
+    let restarted_rows = materialized_rows(&restarted_mv_registry, view_name).await;
     assert_eq!(restarted_rows, rows);
 }
 
@@ -1168,24 +1170,6 @@ fn gather_transient_streams(
     map
 }
 
-fn overlay_rows(registry: &MaterializedViewRegistry, view_name: &str) -> Vec<Vec<ScalarValue>> {
-    let handle = registry.get(view_name).expect("view registered");
-    let (_, _, overlay) = handle
-        .encoded_overlay_batches(None)
-        .expect("overlay batches available");
-    let mut rows = Vec::new();
-    for (key, diff) in overlay {
-        if diff <= 0 {
-            continue;
-        }
-        let decoded = decode_projected_row_key(&key).expect("decode overlay row");
-        for _ in 0..diff {
-            rows.push(decoded.clone());
-        }
-    }
-    rows
-}
-
 async fn wait_for_logical_version(
     registry: &MaterializedViewRegistry,
     view_name: &str,
@@ -1206,6 +1190,20 @@ async fn wait_for_logical_version(
     })
     .await
     .expect("wait for logical version");
+}
+
+async fn wait_for_dbsp_state(registry: &MaterializedViewRegistry, view_name: &str) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let handle = registry.get(view_name).expect("view registered");
+            if handle.dbsp_state().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("wait for dbsp state");
 }
 
 fn sort_rows_by_first_column(rows: &mut [Vec<ScalarValue>]) {

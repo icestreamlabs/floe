@@ -20,6 +20,7 @@ use slatedb::Db;
 use crate::namespaces;
 
 const MV_SCHEMA_SUFFIX: &str = "/meta/schema.json";
+const MV_LOGICAL_VERSION_SUFFIX: &str = "/meta/logical_version.bin";
 const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
 
 fn dictionary_namespace(namespace: &str) -> &str {
@@ -207,9 +208,48 @@ impl DbspBridge {
         Ok(Some(reader.schema()))
     }
 
+    pub async fn save_mv_logical_version(
+        &self,
+        view_name: &str,
+        logical_version: u64,
+    ) -> Result<()> {
+        let key = Self::mv_logical_version_key(view_name)?;
+        self.table
+            .put(&key, &logical_version.to_le_bytes())
+            .await
+            .with_context(|| format!("persist logical version for materialized view '{view_name}'"))
+    }
+
+    pub async fn load_mv_logical_version(&self, view_name: &str) -> Result<Option<u64>> {
+        let key = Self::mv_logical_version_key(view_name)?;
+        let bytes = match self.table.get(&key).await.with_context(|| {
+            format!("load logical version metadata for materialized view '{view_name}'")
+        })? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        if bytes.len() != std::mem::size_of::<u64>() {
+            anyhow::bail!(
+                "persisted logical version metadata for materialized view '{}' had invalid length {}",
+                view_name,
+                bytes.len()
+            );
+        }
+        Ok(Some(u64::from_le_bytes(
+            bytes[..std::mem::size_of::<u64>()]
+                .try_into()
+                .expect("slice width already checked"),
+        )))
+    }
+
     fn mv_schema_key(view_name: &str) -> Result<Vec<u8>> {
         let namespace = namespaces::materialized_view(view_name)?;
         Ok(format!("{namespace}{MV_SCHEMA_SUFFIX}").into_bytes())
+    }
+
+    fn mv_logical_version_key(view_name: &str) -> Result<Vec<u8>> {
+        let namespace = namespaces::materialized_view(view_name)?;
+        Ok(format!("{namespace}{MV_LOGICAL_VERSION_SUFFIX}").into_bytes())
     }
 
     pub async fn handle_view_for(
@@ -278,6 +318,10 @@ impl DbspView {
 
     pub async fn flush(&mut self) -> Result<ZSetHandle> {
         self.zset.flush().await
+    }
+
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) {
+        self.zset.set_compaction_policy(policy);
     }
 
     pub fn latest_handle_view(&self) -> ZSetHandleView<Vec<u8>> {
@@ -365,5 +409,20 @@ mod tests {
             .await
             .expect("run one-shot gc while paused");
         assert_eq!(stats.recovered_intents, 0);
+    }
+
+    #[tokio::test]
+    async fn persists_materialized_view_logical_version_metadata() {
+        let bridge = build_bridge("bridge-mv-logical-version").await;
+        bridge
+            .save_mv_logical_version("mv_logical", 42)
+            .await
+            .expect("persist logical version");
+
+        let loaded = bridge
+            .load_mv_logical_version("mv_logical")
+            .await
+            .expect("load logical version");
+        assert_eq!(loaded, Some(42));
     }
 }
