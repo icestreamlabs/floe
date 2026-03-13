@@ -552,26 +552,9 @@ impl DbspGraphBuilder {
             .sum();
         let merge_start = Instant::now();
         if !deltas.is_empty() {
-            let mut merged = HashMap::with_capacity(deltas.len());
-            for (key, diff) in deltas {
-                if diff == 0 {
-                    continue;
-                }
-                match merged.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        *entry.get_mut() += diff;
-                        if *entry.get() == 0 {
-                            entry.remove();
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(diff);
-                    }
-                }
-            }
-            if !merged.is_empty() {
-                view.add_deltas(merged);
-            }
+            // Transient segment outputs are already batch-transformed; feed rows straight
+            // into MV overlay and let ZSetStream overlay consolidation handle duplicates.
+            view.add_deltas(deltas);
         }
         let merge_ms = merge_start.elapsed().as_millis() as u64;
         tracing::debug!(

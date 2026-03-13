@@ -4,15 +4,11 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
-use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
-use dbsp::{
-    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, DbspPredicate, RowSchema,
-    StreamRetention,
-};
+use dbsp::{CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, StreamRetention};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +19,7 @@ use crate::materialized_view::MaterializedViewRegistry;
 use crate::task_events::GraphTaskSender;
 
 use super::materialize::DeltaTransformFn;
+use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
 use super::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
@@ -144,6 +141,13 @@ impl DbspGraphBuilder {
             .context("validating query plan before DBSP graph build")?;
         let mut built = HashMap::new();
         let mut mv_latest = HashMap::new();
+        let persistence_policy = PersistencePolicy::for_plan(inputs.plan);
+        tracing::info!(
+            graph_id = %self.graph_id(),
+            transient_max_segment_nodes = persistence_policy.max_transient_segment_nodes(),
+            transient_min_segment_score = persistence_policy.min_transient_segment_score(),
+            "persistence policy configured"
+        );
         let root_node = inputs
             .plan
             .node(inputs.plan.root)
@@ -151,12 +155,13 @@ impl DbspGraphBuilder {
 
         let mut root_materialized = false;
         let root_stream = if !matches!(root_node.kind, DbspNodeKind::Sink(_)) {
-            if let Some(transient_opt) = try_build_sink_transient_unary_optimization(
+            if let Some(transient_opt) = try_build_transient_segment_optimization(
                 inputs.plan,
                 inputs.plan.root,
                 &built,
                 self.graph_id(),
                 true,
+                &persistence_policy,
             )? {
                 let upstream = self
                     .compile_node(
@@ -169,6 +174,7 @@ impl DbspGraphBuilder {
                         &inputs.mv_registry,
                         &mut mv_latest,
                         inputs.mv_retention,
+                        &persistence_policy,
                     )
                     .await?;
                 tracing::info!(
@@ -177,7 +183,8 @@ impl DbspGraphBuilder {
                     root = inputs.plan.root,
                     durable_input_idx = transient_opt.durable_input_idx,
                     optimized_nodes = ?transient_opt.optimized_nodes,
-                    "using transient unary chain for root materialization"
+                    segment_score = transient_opt.score,
+                    "using transient segment for root materialization"
                 );
                 let stream = self
                     .materialize_view(
@@ -207,6 +214,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                     &mut mv_latest,
                     inputs.mv_retention,
+                    &persistence_policy,
                 )
                 .await?
             }
@@ -221,6 +229,7 @@ impl DbspGraphBuilder {
                 &inputs.mv_registry,
                 &mut mv_latest,
                 inputs.mv_retention,
+                &persistence_policy,
             )
             .await?
         };
@@ -265,6 +274,7 @@ impl DbspGraphBuilder {
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
         mv_retention: StreamRetention,
+        persistence_policy: &PersistencePolicy,
     ) -> Result<DeltaHandleStream> {
         if let Some(stream) = built.get(&node_idx) {
             return Ok(stream.clone());
@@ -291,6 +301,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_filter(select, upstream, task_events).await?
@@ -319,6 +330,7 @@ impl DbspGraphBuilder {
                             mv_registry,
                             mv_latest,
                             mv_retention,
+                            persistence_policy,
                         )
                         .await?;
                     self.compile_filter_map(&select, project, upstream, task_events)
@@ -335,6 +347,7 @@ impl DbspGraphBuilder {
                             mv_registry,
                             mv_latest,
                             mv_retention,
+                            persistence_policy,
                         )
                         .await?;
                     self.compile_map(project, upstream, task_events).await?
@@ -353,6 +366,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 let right = self
@@ -366,6 +380,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_join(join, left, right, cancel, task_events)
@@ -384,6 +399,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_aggregate(aggregate, upstream, task_events)
@@ -402,6 +418,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_topn(topn, upstream, task_events).await?
@@ -419,6 +436,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_distinct(distinct, upstream, task_events)
@@ -437,6 +455,7 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
+                        persistence_policy,
                     )
                     .await?;
                 self.compile_window_aggregate(window, upstream, task_events)
@@ -456,6 +475,7 @@ impl DbspGraphBuilder {
                             mv_registry,
                             mv_latest,
                             mv_retention,
+                            persistence_policy,
                         )
                         .await?;
                     inputs.push(upstream);
@@ -474,17 +494,19 @@ impl DbspGraphBuilder {
                     mv_registry,
                     mv_latest,
                     mv_retention,
+                    persistence_policy,
                 )
                 .await?
             }
             DbspNodeKind::Sink(sink) => {
                 let input_idx = first_input(node, "sink")?;
-                if let Some(transient_opt) = try_build_sink_transient_unary_optimization(
+                if let Some(transient_opt) = try_build_transient_segment_optimization(
                     plan,
                     input_idx,
                     built,
                     self.graph_id(),
                     false,
+                    persistence_policy,
                 )? {
                     let upstream = self
                         .compile_node(
@@ -497,6 +519,7 @@ impl DbspGraphBuilder {
                             mv_registry,
                             mv_latest,
                             mv_retention,
+                            persistence_policy,
                         )
                         .await?;
                     tracing::info!(
@@ -504,7 +527,8 @@ impl DbspGraphBuilder {
                         sink = %sink.name,
                         durable_input_idx = transient_opt.durable_input_idx,
                         optimized_nodes = ?transient_opt.optimized_nodes,
-                        "using transient unary chain for sink materialization"
+                        segment_score = transient_opt.score,
+                        "using transient segment for sink materialization"
                     );
                     self.materialize_view(
                         &sink.name,
@@ -531,6 +555,7 @@ impl DbspGraphBuilder {
                             mv_registry,
                             mv_latest,
                             mv_retention,
+                            persistence_policy,
                         )
                         .await?;
                     self.materialize_view(
@@ -631,117 +656,73 @@ fn has_single_consumer(plan: &CircuitPlan, node_idx: usize) -> bool {
         == 1
 }
 
-struct SinkTransientUnaryOptimization {
+struct TransientSegmentOptimization {
     durable_input_idx: usize,
     optimized_nodes: Vec<usize>,
+    score: i32,
     transform: Arc<DeltaTransformFn>,
 }
 
-#[derive(Clone)]
-enum PlannedTransientUnaryStep {
-    Select {
-        predicate: DbspPredicate,
-        schema: Arc<RowSchema>,
-    },
-    Project {
-        expressions: Arc<Vec<DbspProjectExpr>>,
-        schema: Arc<RowSchema>,
-    },
-}
-
-fn try_build_sink_transient_unary_optimization(
+fn try_build_transient_segment_optimization(
     plan: &CircuitPlan,
-    sink_input_idx: usize,
+    terminal_input_idx: usize,
     built: &HashMap<usize, DeltaHandleStream>,
     graph_id: &str,
     allow_terminal_without_consumer: bool,
-) -> Result<Option<SinkTransientUnaryOptimization>> {
-    let mut current_idx = sink_input_idx;
-    let mut steps_rev = Vec::new();
-    let mut optimized_nodes = Vec::new();
+    persistence_policy: &PersistencePolicy,
+) -> Result<Option<TransientSegmentOptimization>> {
+    let Some(segment) = persistence_policy.build_transient_segment(
+        plan,
+        terminal_input_idx,
+        built,
+        allow_terminal_without_consumer,
+    )?
+    else {
+        return Ok(None);
+    };
+    build_transient_segment_optimization_from_spec(graph_id, segment).map(Some)
+}
 
-    loop {
-        let Some(node) = plan.node(current_idx) else {
-            return Ok(None);
-        };
-
-        match &node.kind {
-            DbspNodeKind::Passthrough => {
-                let single_consumer = has_single_consumer(plan, current_idx);
-                if built.contains_key(&current_idx)
-                    || (!single_consumer
-                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
-                {
-                    return Ok(None);
-                }
-                optimized_nodes.push(current_idx);
-                current_idx = first_input(node, "passthrough")?;
+fn build_transient_segment_optimization_from_spec(
+    graph_id: &str,
+    segment: TransientSegmentSpec,
+) -> Result<TransientSegmentOptimization> {
+    let mut evaluators = Vec::new();
+    for step in segment.steps {
+        match step {
+            TransientSegmentStep::Passthrough => {}
+            TransientSegmentStep::Select { predicate, schema } => {
+                evaluators.push(VectorizedFilterProjectEvaluator::for_filter(
+                    &predicate, schema,
+                )?);
             }
-            DbspNodeKind::Select(select) => {
-                let single_consumer = has_single_consumer(plan, current_idx);
-                if built.contains_key(&current_idx)
-                    || (!single_consumer
-                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
-                {
-                    return Ok(None);
-                }
-                optimized_nodes.push(current_idx);
-                steps_rev.push(PlannedTransientUnaryStep::Select {
-                    predicate: select.predicate().clone(),
-                    schema: Arc::clone(select.output_schema()),
-                });
-                current_idx = first_input(node, "select")?;
+            TransientSegmentStep::Project {
+                expressions,
+                schema,
+            } => {
+                evaluators.push(VectorizedFilterProjectEvaluator::for_map(
+                    expressions.as_ref(),
+                    schema,
+                )?);
             }
-            DbspNodeKind::Project(project) => {
-                let single_consumer = has_single_consumer(plan, current_idx);
-                if built.contains_key(&current_idx)
-                    || (!single_consumer
-                        && !(allow_terminal_without_consumer && optimized_nodes.is_empty()))
-                {
-                    return Ok(None);
-                }
-                optimized_nodes.push(current_idx);
-                steps_rev.push(PlannedTransientUnaryStep::Project {
-                    expressions: Arc::new(project.expressions().to_vec()),
-                    schema: Arc::clone(project.input_schema()),
-                });
-                current_idx = first_input(node, "project")?;
-            }
-            _ => break,
         }
     }
 
-    if steps_rev.is_empty() {
-        return Ok(None);
-    }
-
-    steps_rev.reverse();
-    let evaluators = steps_rev
-        .into_iter()
-        .map(|step| match step {
-            PlannedTransientUnaryStep::Select { predicate, schema } => {
-                VectorizedFilterProjectEvaluator::for_filter(&predicate, schema)
-            }
-            PlannedTransientUnaryStep::Project {
-                expressions,
-                schema,
-            } => VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), schema),
-        })
-        .collect::<Result<Vec<_>>>()?;
     let evaluators = Arc::new(evaluators);
     let graph_id = graph_id.to_string();
     let transform: Arc<DeltaTransformFn> = Arc::new(move |deltas| {
-        apply_transient_unary_steps_vectorized(&graph_id, evaluators.as_ref(), deltas)
+        apply_transient_segment_vectorized(&graph_id, evaluators.as_ref(), deltas)
     });
 
-    Ok(Some(SinkTransientUnaryOptimization {
-        durable_input_idx: current_idx,
-        optimized_nodes,
+    Ok(TransientSegmentOptimization {
+        durable_input_idx: segment.durable_input_idx,
+        optimized_nodes: segment.segment_nodes,
+        score: segment.score,
         transform,
-    }))
+    })
 }
 
-fn apply_transient_unary_steps_vectorized(
+fn apply_transient_segment_vectorized(
     graph_id: &str,
     evaluators: &[VectorizedFilterProjectEvaluator],
     mut deltas: Vec<(Vec<u8>, i64)>,

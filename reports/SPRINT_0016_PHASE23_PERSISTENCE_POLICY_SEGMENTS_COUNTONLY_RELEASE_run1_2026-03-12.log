@@ -1,0 +1,119 @@
+   Compiling floe-executor v0.1.0 (/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-executor)
+warning: function `observe_delta_consolidation` is never used
+   --> crates/floe-executor/src/metrics.rs:116:15
+    |
+116 | pub(crate) fn observe_delta_consolidation(stats: ConsolidationStats, latency_ms: u64) {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling floe-node-core v0.1.0 (/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-node-core)
+   Compiling floe-server v0.1.0 (/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-server)
+warning: `floe-executor` (lib) generated 1 warning
+   Compiling floe-node v0.1.0 (/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-node)
+    Finished `release` profile [optimized] target(s) in 54.34s
+     Running unittests src/lib.rs (target/release/deps/floe_node-cd00cad56c876901)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/floe_node-e408f412663e8865)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.00s
+
+     Running unittests src/bin/floe-tail.rs (target/release/deps/floe_tail-57981c249dfc0388)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/config_first_dry_run.rs (target/release/deps/config_first_dry_run-3507eb3e2966150c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/end_to_end_mv.rs (target/release/deps/end_to_end_mv-c134eeb98abea25f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/ga_acceptance.rs (target/release/deps/ga_acceptance-ff08721ce1450da1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/http_healthz.rs (target/release/deps/http_healthz-d1b05d5bd93ab930)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/http_ingest_tail_end_to_end.rs (target/release/deps/http_ingest_tail_end_to_end-6cea8c92fac80a6a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/production_smoke.rs (target/release/deps/production_smoke-ed89650a49cf696a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/redpanda_kafka_million_e2e.rs (target/release/deps/redpanda_kafka_million_e2e-f133200c68af5c66)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/redpanda_kafka_million_filter_projection_e2e.rs (target/release/deps/redpanda_kafka_million_filter_projection_e2e-6f376ccec4d6a0ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/redpanda_kafka_million_filter_projection_nosink_e2e.rs (target/release/deps/redpanda_kafka_million_filter_projection_nosink_e2e-bfb6bb0e478fc81d)
+
+running 1 test
+artifacts_dir=/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-node/../../target/e2e_artifacts/mv_kafka_redpanda_million_filter_projection_nosink_1773366148566
+dataset_path=/home/jlerche/programming_projects/github.com/icestreamlabs/floe/crates/floe-node/../../target/e2e_artifacts/mv_kafka_redpanda_million_filter_projection_nosink_1773366148566/dataset_1m.jsonl
+brokers=127.0.0.1:9092 input_topic=floe_redpanda_in_1773366148566 output_topic=floe_redpanda_out_1773366148566 sink_mode=NoSink
+verify.no_sink_mode=CountOnly
+runtime.mv_flush.enabled=false
+connector.max_messages_per_tick=16384
+run.ingest_batch_size=16384
+run.ingest_batch_per_source=16384
+run.ingest_batch_per_connector=16384
+waiting for pgwire at 127.0.0.1:41709: Connection refused (os error 111)
+produced 100000 rows to topic=floe_redpanda_in_1773366148566
+produced 200000 rows to topic=floe_redpanda_in_1773366148566
+produced 300000 rows to topic=floe_redpanda_in_1773366148566
+produced 400000 rows to topic=floe_redpanda_in_1773366148566
+produced 500000 rows to topic=floe_redpanda_in_1773366148566
+produced 600000 rows to topic=floe_redpanda_in_1773366148566
+produced 700000 rows to topic=floe_redpanda_in_1773366148566
+produced 800000 rows to topic=floe_redpanda_in_1773366148566
+produced 900000 rows to topic=floe_redpanda_in_1773366148566
+produced 1000000 rows to topic=floe_redpanda_in_1773366148566
+kafka production completed in 1.512152122s
+timing.no_sink.ingest_complete_s=13.454 (produce_s=1.512, post_produce_wait_s=11.942, post_produce_wait_for_throughput_s=11.942)
+timing.no_sink.verification_s=11.942 (sample_query_s=0.000)
+throughput.no_sink.input_rows_per_sec=74328 output_rows_per_sec=37164
+timing.execution.total_s=13.454
+verified rows=500000 checksum=2120482723518105267
+test redpanda_kafka_million_filter_projection_nosink_row_e2e ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 15.66s
+
+     Running tests/streaming_mv_end_to_end.rs (target/release/deps/streaming_mv_end_to_end-073f0f9d5d5d4320)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
