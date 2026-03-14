@@ -14,7 +14,7 @@ use crate::codec::ensure_outer_stream_codec;
 use crate::dbsp_bridge::DbspBridge;
 use crate::encoding::encode_projected_row_key;
 use crate::namespaces;
-use crate::stream_types::Diff;
+use crate::stream_types::{Diff, EncodedDelta, EncodedDeltaBatch};
 
 /// Handle describing the sealed outer stream state for a single source.
 #[derive(Debug, Clone)]
@@ -37,7 +37,7 @@ pub struct OuterStreamCheckpoint {
 pub struct TransientSourceBatch {
     pub source: String,
     pub version: i64,
-    pub deltas: Vec<(Vec<u8>, i64)>,
+    pub deltas: EncodedDeltaBatch,
 }
 
 #[derive(Clone)]
@@ -63,7 +63,7 @@ pub struct OuterStreamWriter {
     stream: ZSetStream<Vec<u8>>,
     durable_enabled: bool,
     transient_version: i64,
-    pending_transient_deltas: Vec<(Vec<u8>, i64)>,
+    pending_transient_deltas: EncodedDeltaBatch,
     pending_transient_bytes: usize,
     pending_encode_us: u64,
     transient_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
@@ -84,7 +84,7 @@ impl OuterStreamWriter {
             stream,
             durable_enabled: true,
             transient_version: 0,
-            pending_transient_deltas: Vec::new(),
+            pending_transient_deltas: Arc::new(Vec::new()),
             pending_transient_bytes: 0,
             pending_encode_us: 0,
             transient_subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -133,9 +133,11 @@ impl OuterStreamWriter {
         self.pending_transient_bytes = self
             .pending_transient_bytes
             .saturating_add(key.len() + std::mem::size_of::<i64>());
-        self.pending_transient_deltas.push((key.clone(), diff));
         if self.durable_enabled {
+            Arc::make_mut(&mut self.pending_transient_deltas).push((key.clone(), diff));
             self.stream.add_delta(key, diff);
+        } else {
+            Arc::make_mut(&mut self.pending_transient_deltas).push((key, diff));
         }
         Ok(())
     }
@@ -147,9 +149,11 @@ impl OuterStreamWriter {
         self.pending_transient_bytes = self
             .pending_transient_bytes
             .saturating_add(key.len() + std::mem::size_of::<i64>());
-        self.pending_transient_deltas.push((key.clone(), diff));
         if self.durable_enabled {
+            Arc::make_mut(&mut self.pending_transient_deltas).push((key.clone(), diff));
             self.stream.add_delta(key, diff);
+        } else {
+            Arc::make_mut(&mut self.pending_transient_deltas).push((key, diff));
         }
         Ok(())
     }
@@ -161,7 +165,7 @@ impl OuterStreamWriter {
         Some(TransientSourceBatch {
             source: self.source.clone(),
             version,
-            deltas: self.pending_transient_deltas.clone(),
+            deltas: Arc::clone(&self.pending_transient_deltas),
         })
     }
 
@@ -223,7 +227,7 @@ impl OuterStreamWriter {
     pub fn replay_transient_batch(
         &mut self,
         version: i64,
-        deltas: Vec<(Vec<u8>, i64)>,
+        deltas: Vec<EncodedDelta>,
     ) -> Result<()> {
         self.transient_version = self.transient_version.max(version);
         if deltas.is_empty() {
@@ -232,7 +236,7 @@ impl OuterStreamWriter {
         self.publish_batch(TransientSourceBatch {
             source: self.source.clone(),
             version,
-            deltas,
+            deltas: Arc::new(deltas),
         });
         Ok(())
     }
@@ -248,7 +252,7 @@ impl OuterStreamWriter {
             let batch = TransientSourceBatch {
                 source: self.source.clone(),
                 version: publish_version,
-                deltas: std::mem::take(&mut self.pending_transient_deltas),
+                deltas: std::mem::replace(&mut self.pending_transient_deltas, Arc::new(Vec::new())),
             };
             let delta_rows = batch.deltas.len();
             let delta_bytes = self.pending_transient_bytes;
@@ -383,7 +387,7 @@ impl OuterStreamRegistry {
         &mut self,
         source: &str,
         version: i64,
-        deltas: Vec<(Vec<u8>, i64)>,
+        deltas: Vec<EncodedDelta>,
     ) -> Result<()> {
         if let Some(writer) = self.writers.get_mut(source) {
             writer.replay_transient_batch(version, deltas)?;
