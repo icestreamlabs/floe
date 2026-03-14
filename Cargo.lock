@@ -2053,6 +2053,7 @@ dependencies = [
  "mimalloc",
  "object_store",
  "parking_lot",
+ "rdkafka",
  "rkyv 0.8.12",
  "slatedb",
  "tikv-jemallocator",

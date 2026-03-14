@@ -14,6 +14,7 @@ floe-executor = { path = "../floe-executor" }
 floe-node-core = { path = "../floe-node-core" }
 floe-sql-parser = { path = "../floe-sql-parser" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rdkafka = { workspace = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
 tikv-jemallocator = { version = "0.6", optional = true }
 
