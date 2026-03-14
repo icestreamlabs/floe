@@ -207,12 +207,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .difference(&durable_required_sources)
         .cloned()
         .collect();
-    all_required_sources.extend(
-        source_registry
-            .definitions()
-            .iter()
-            .map(|definition| definition.name().to_string()),
-    );
     if run_args.dry_run {
         tracing::info!(
             connector_count = connector_specs.len(),
@@ -800,6 +794,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
     let outer_for_task = Arc::clone(&outer_registry);
     let decoder_for_task = Arc::clone(&decoder_registry);
+    let materialized_sources_for_task = all_required_sources.clone();
     let watermark_for_task = Arc::clone(&event_watermark);
     let mv_for_task = Arc::clone(&mv_registry);
     let kafka_commit_senders_for_task = kafka_commit_senders;
@@ -964,6 +959,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     if lsn_value > entry.0 {
                         *entry = (lsn_value, lsn_text);
                     }
+                }
+                if !materialized_sources_for_task.contains(&source_name) {
+                    tracing::debug!(
+                        source = %source_name,
+                        "dropping event for source outside active materialization set"
+                    );
+                    continue;
                 }
                 let decoder = match lookup_decoder_for_source(&decoder_for_task, &source_name) {
                     Ok(decoder) => decoder,
