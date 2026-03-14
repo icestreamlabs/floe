@@ -21,8 +21,8 @@ async fn nexmark_connector_emits_events() {
     drop(ctx);
 
     let mut events = Vec::new();
-    while let Some(event) = rx.recv().await {
-        events.push(event);
+    while let Some(batch) = rx.recv().await {
+        events.extend(batch);
     }
 
     assert_eq!(events.len(), 3);

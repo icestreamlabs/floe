@@ -73,11 +73,12 @@ async fn kafka_connector_ingests_messages() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let batch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("receive event")
         .expect("missing event");
-    assert_eq!(event.source(), "nexmark_bid");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].source(), "nexmark_bid");
 
     connector.shutdown().await.expect("connector shutdown");
 }

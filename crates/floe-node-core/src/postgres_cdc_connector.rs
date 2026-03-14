@@ -127,6 +127,7 @@ impl Connector for PostgresCdcConnector {
             .context("peek logical slot changes")?;
 
         let mut emitted = 0usize;
+        let mut staged = Vec::new();
         for row in rows {
             let lsn: String = row.try_get(0).context("read logical slot lsn")?;
             let txid: Option<i64> = row.try_get(1).context("read logical slot txid")?;
@@ -149,12 +150,15 @@ impl Connector for PostgresCdcConnector {
                     lsn: lsn.clone(),
                     txid,
                 });
-                ctx.sender()
-                    .send(event)
-                    .await
-                    .context("failed to enqueue postgres cdc event")?;
+                staged.push(event);
                 emitted = emitted.saturating_add(1);
             }
+        }
+
+        if !staged.is_empty() {
+            ctx.send_batch(staged)
+                .await
+                .context("failed to enqueue postgres cdc batch")?;
         }
 
         if emitted > 0 {

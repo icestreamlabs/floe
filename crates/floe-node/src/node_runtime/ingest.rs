@@ -196,8 +196,8 @@ pub(super) async fn recv_from_any(queues: &mut Vec<ConnectorQueue>) -> bool {
         (event, index)
     };
     match event {
-        Some(event) => {
-            queues[index].pending.push_back(event);
+        Some(events) => {
+            queues[index].pending.extend(events);
         }
         None => {
             queues[index].closed = true;
@@ -211,7 +211,7 @@ pub(super) fn drain_connectors(queues: &mut [ConnectorQueue], capacity: usize) {
     for queue in queues.iter_mut() {
         while queue.pending.len() < capacity {
             match queue.receiver.try_recv() {
-                Ok(event) => queue.pending.push_back(event),
+                Ok(events) => queue.pending.extend(events),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     queue.closed = true;

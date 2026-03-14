@@ -4,8 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::source::SourceEventSender;
-use floe_core::source::SourceDefinition;
+use crate::source::{SourceEventBatch, SourceEventSender, send_batch, send_event};
+use floe_core::source::{SourceDefinition, SourceEvent};
 
 /// Context shared with connector implementations for event emission.
 #[derive(Clone)]
@@ -20,6 +20,20 @@ impl ConnectorContext {
 
     pub fn sender(&self) -> &SourceEventSender {
         &self.sender
+    }
+
+    pub async fn send_event(
+        &self,
+        event: SourceEvent,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<SourceEventBatch>> {
+        send_event(&self.sender, event).await
+    }
+
+    pub async fn send_batch(
+        &self,
+        events: SourceEventBatch,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<SourceEventBatch>> {
+        send_batch(&self.sender, events).await
     }
 }
 
@@ -55,6 +69,7 @@ pub async fn run_connector<C: Connector>(
     connector.init(ctx).await?;
     let interval = connector.tick_interval();
     let mut error: Option<anyhow::Error> = None;
+    let mut consecutive_emitted_ticks = 0usize;
 
     if interval.is_zero() {
         loop {
@@ -63,7 +78,15 @@ pub async fn run_connector<C: Connector>(
                 result = connector.tick(ctx) => {
                     match result {
                         Ok(ConnectorTick::Finished) => break,
-                        Ok(_) => {
+                        Ok(ConnectorTick::Emitted(_)) => {
+                            consecutive_emitted_ticks = consecutive_emitted_ticks.saturating_add(1);
+                            if consecutive_emitted_ticks >= 64 {
+                                consecutive_emitted_ticks = 0;
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        Ok(ConnectorTick::Idle) => {
+                            consecutive_emitted_ticks = 0;
                             tokio::task::yield_now().await;
                         }
                         Err(err) => {
