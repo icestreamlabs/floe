@@ -56,22 +56,16 @@ fn event(source: &str, id: i64) -> core_source::SourceEvent {
 
 #[test]
 fn build_batch_limits_per_connector() {
-    let (_tx_a, rx_a) = core_source::channel(8);
-    let (_tx_b, rx_b) = core_source::channel(8);
     let mut queues = vec![
         ConnectorQueue {
             id: 0,
             name: "a".to_string(),
-            receiver: rx_a,
             pending: VecDeque::from([event("s1", 1), event("s1", 2)]),
-            closed: false,
         },
         ConnectorQueue {
             id: 1,
             name: "b".to_string(),
-            receiver: rx_b,
             pending: VecDeque::from([event("s2", 3), event("s2", 4)]),
-            closed: false,
         },
     ];
 
@@ -85,13 +79,10 @@ fn build_batch_limits_per_connector() {
 
 #[test]
 fn build_batch_limits_per_source() {
-    let (_tx, rx) = core_source::channel(8);
     let mut queues = vec![ConnectorQueue {
         id: 0,
         name: "a".to_string(),
-        receiver: rx,
         pending: VecDeque::from([event("s1", 1), event("s1", 2), event("s1", 3)]),
-        closed: false,
     }];
 
     let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
