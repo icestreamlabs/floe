@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -7,9 +8,9 @@ use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray};
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::DFSchema;
+use datafusion::common::{Column, DFSchema};
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
@@ -20,10 +21,17 @@ use crate::encoding::encode_projected_row_key;
 #[derive(Clone)]
 pub(crate) struct VectorizedFilterProjectEvaluator {
     input_schema: datafusion::arrow::datatypes::SchemaRef,
-    predicate: Option<Arc<dyn PhysicalExpr>>,
+    predicate: Option<PredicatePlan>,
     projection_plan: ProjectionPlan,
     decoded_input_slots: Arc<Vec<Option<usize>>>,
+    decoded_input_value_types: Arc<Vec<CompiledValueType>>,
     decoded_input_count: usize,
+}
+
+#[derive(Clone)]
+enum PredicatePlan {
+    Compiled(Arc<CompiledExpr>),
+    Physical(Arc<dyn PhysicalExpr>),
 }
 
 impl VectorizedFilterProjectEvaluator {
@@ -44,15 +52,40 @@ impl VectorizedFilterProjectEvaluator {
             input_schema.len(),
             &decoded_input_columns,
         ));
+        let decoded_input_value_types = Arc::new(build_decoded_input_value_types(
+            input_schema.as_ref(),
+            &decoded_input_columns,
+        )?);
         let input_schema = input_schema.to_arrow_schema();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized filter_map")?;
         let ctx = SessionContext::new();
-        let predicate = ctx
-            .create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-            .context("compile vectorized predicate expression")?;
+        let predicate = if let Some(compiled) = CompiledExpr::try_compile(
+            predicate.expression().expr(),
+            &df_schema,
+            input_schema.as_ref(),
+        )? {
+            PredicatePlan::Compiled(Arc::new(compiled))
+        } else {
+            PredicatePlan::Physical(
+                ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
+                    .context("compile vectorized predicate expression")?,
+            )
+        };
         let projection_plan = if let Some(indices) = column_projection {
             ProjectionPlan::column_indices(indices, input_schema.fields().len())
+        } else if let Some(compiled) = projections
+            .iter()
+            .map(|expr| {
+                CompiledExpr::try_compile(
+                    expr.expression().expr(),
+                    &df_schema,
+                    input_schema.as_ref(),
+                )
+            })
+            .collect::<Result<Option<Vec<_>>>>()?
+        {
+            ProjectionPlan::Compiled(Arc::new(compiled))
         } else {
             let projections = projections
                 .iter()
@@ -68,6 +101,7 @@ impl VectorizedFilterProjectEvaluator {
             predicate: Some(predicate),
             projection_plan,
             decoded_input_slots,
+            decoded_input_value_types,
             decoded_input_count,
         })
     }
@@ -84,19 +118,33 @@ impl VectorizedFilterProjectEvaluator {
             input_schema.len(),
             &decoded_input_columns,
         ));
+        let decoded_input_value_types = Arc::new(build_decoded_input_value_types(
+            input_schema.as_ref(),
+            &decoded_input_columns,
+        )?);
         let input_schema = input_schema.to_arrow_schema();
         let input_width = input_schema.fields().len();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized filter")?;
         let ctx = SessionContext::new();
-        let predicate = ctx
-            .create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-            .context("compile vectorized filter predicate expression")?;
+        let predicate = if let Some(compiled) = CompiledExpr::try_compile(
+            predicate.expression().expr(),
+            &df_schema,
+            input_schema.as_ref(),
+        )? {
+            PredicatePlan::Compiled(Arc::new(compiled))
+        } else {
+            PredicatePlan::Physical(
+                ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
+                    .context("compile vectorized filter predicate expression")?,
+            )
+        };
         Ok(Self {
             input_schema,
             predicate: Some(predicate),
             projection_plan: ProjectionPlan::column_indices(projections, input_width),
             decoded_input_slots,
+            decoded_input_value_types,
             decoded_input_count,
         })
     }
@@ -117,12 +165,28 @@ impl VectorizedFilterProjectEvaluator {
             input_schema.len(),
             &decoded_input_columns,
         ));
+        let decoded_input_value_types = Arc::new(build_decoded_input_value_types(
+            input_schema.as_ref(),
+            &decoded_input_columns,
+        )?);
         let input_schema = input_schema.to_arrow_schema();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized map")?;
         let ctx = SessionContext::new();
         let projection_plan = if let Some(indices) = column_projection {
             ProjectionPlan::column_indices(indices, input_schema.fields().len())
+        } else if let Some(compiled) = projections
+            .iter()
+            .map(|expr| {
+                CompiledExpr::try_compile(
+                    expr.expression().expr(),
+                    &df_schema,
+                    input_schema.as_ref(),
+                )
+            })
+            .collect::<Result<Option<Vec<_>>>>()?
+        {
+            ProjectionPlan::Compiled(Arc::new(compiled))
         } else {
             let projections = projections
                 .iter()
@@ -138,6 +202,7 @@ impl VectorizedFilterProjectEvaluator {
             predicate: None,
             projection_plan,
             decoded_input_slots,
+            decoded_input_value_types,
             decoded_input_count,
         })
     }
@@ -161,11 +226,7 @@ impl VectorizedFilterProjectEvaluator {
         if prepared.encoded_rows.is_empty() {
             return Ok(Vec::new());
         }
-        let selected = if let Some(batch) = prepared.batch.as_ref() {
-            self.selected_indices(batch)?
-        } else {
-            (0..prepared.encoded_rows.len()).collect()
-        };
+        let selected = self.selected_indices(&prepared)?;
 
         match &self.projection_plan {
             ProjectionPlan::ColumnIndices { indices, .. } => {
@@ -198,6 +259,40 @@ impl VectorizedFilterProjectEvaluator {
                         continue;
                     };
                     let encoded = project_encoded_row(encoded, ranges, indices.len())?;
+                    staged.push((encoded, diff));
+                }
+                consolidate_encoded_delta_batch(staged)
+            }
+            ProjectionPlan::Compiled(projections) => {
+                let batch = prepared
+                    .compiled_batch
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("compiled projection batch was unexpectedly missing"))?;
+                let projection_columns = projections
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| {
+                        expr.evaluate(batch)
+                            .with_context(|| format!("evaluate compiled projection column {idx}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut staged = Vec::with_capacity(selected.len());
+                for idx in selected {
+                    let diff = prepared.weights.get(idx).copied().unwrap_or(0);
+                    if diff == 0 {
+                        continue;
+                    }
+                    let projected_row = projection_columns
+                        .iter()
+                        .map(|column| {
+                            column
+                                .get(idx)
+                                .cloned()
+                                .ok_or_else(|| anyhow!("compiled projection row {idx} was missing"))
+                                .map(|value| value.to_scalar_value())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let encoded = encode_projected_row_key(&projected_row)?;
                     staged.push((encoded, diff));
                 }
                 consolidate_encoded_delta_batch(staged)
@@ -243,12 +338,17 @@ impl VectorizedFilterProjectEvaluator {
         graph_id: &str,
         delta_values: Vec<(Vec<u8>, i64)>,
     ) -> Result<PreparedEncodedInput> {
-        let needs_batch = self.predicate.is_some() || self.projection_plan.requires_batch();
+        let needs_physical_batch = self.predicate_requires_physical_batch()
+            || self.projection_plan.requires_physical_batch();
+        let needs_compiled_batch = self.predicate_requires_compiled_batch()
+            || self.projection_plan.requires_compiled_batch();
         let capture_projection_ranges = self
             .projection_plan
             .needs_projection_ranges(self.input_schema.fields().len());
-        let mut decoded_columns =
-            vec![Vec::with_capacity(delta_values.len()); self.decoded_input_count];
+        let mut decoded_columns = needs_physical_batch
+            .then(|| vec![Vec::with_capacity(delta_values.len()); self.decoded_input_count]);
+        let mut compiled_columns = needs_compiled_batch
+            .then(|| vec![Vec::with_capacity(delta_values.len()); self.decoded_input_count]);
         let mut encoded_rows = Vec::with_capacity(delta_values.len());
         let mut weights = Vec::with_capacity(delta_values.len());
         let mut projected_ranges =
@@ -257,10 +357,26 @@ impl VectorizedFilterProjectEvaluator {
             if weight == 0 {
                 continue;
             }
-            match self.decode_row(&encoded, capture_projection_ranges) {
+            match self.decode_row(
+                &encoded,
+                capture_projection_ranges,
+                needs_physical_batch,
+                needs_compiled_batch,
+            ) {
                 Ok(decoded) => {
-                    for (slot, value) in decoded.decoded_values.into_iter().enumerate() {
-                        decoded_columns[slot].push(value);
+                    if let (Some(all_columns), Some(row_values)) =
+                        (decoded_columns.as_mut(), decoded.decoded_values)
+                    {
+                        for (slot, value) in row_values.into_iter().enumerate() {
+                            all_columns[slot].push(value);
+                        }
+                    }
+                    if let (Some(all_columns), Some(row_values)) =
+                        (compiled_columns.as_mut(), decoded.compiled_values)
+                    {
+                        for (slot, value) in row_values.into_iter().enumerate() {
+                            all_columns[slot].push(value);
+                        }
                     }
                     if let Some(all_ranges) = projected_ranges.as_mut()
                         && let Some(ranges) = decoded.projected_ranges
@@ -279,18 +395,29 @@ impl VectorizedFilterProjectEvaluator {
                 }
             }
         }
-        let batch = if needs_batch && !encoded_rows.is_empty() {
+        let batch = if needs_physical_batch && !encoded_rows.is_empty() {
             Some(build_sparse_input_batch(
                 &self.input_schema,
                 self.decoded_input_slots.as_ref(),
-                decoded_columns,
+                decoded_columns.unwrap_or_default(),
                 encoded_rows.len(),
             )?)
         } else {
             None
         };
+        let compiled_batch = if needs_compiled_batch && !encoded_rows.is_empty() {
+            Some(build_compiled_input_batch(
+                self.input_schema.fields().len(),
+                self.decoded_input_slots.as_ref(),
+                compiled_columns.unwrap_or_default(),
+                encoded_rows.len(),
+            ))
+        } else {
+            None
+        };
         Ok(PreparedEncodedInput {
             batch,
+            compiled_batch,
             encoded_rows,
             weights,
             projected_ranges,
@@ -301,6 +428,8 @@ impl VectorizedFilterProjectEvaluator {
         &self,
         encoded: &[u8],
         capture_projection_ranges: bool,
+        decode_scalar_values: bool,
+        decode_compiled_values: bool,
     ) -> Result<DecodedEncodedRow> {
         if encoded.len() < 4 {
             return Err(anyhow!("encoded key too short"));
@@ -313,7 +442,15 @@ impl VectorizedFilterProjectEvaluator {
             ));
         }
         let mut cursor = 4usize;
-        let mut decoded_values = vec![ScalarValue::Null; self.decoded_input_count];
+        let mut decoded_values =
+            decode_scalar_values.then(|| vec![ScalarValue::Null; self.decoded_input_count]);
+        let mut compiled_values = decode_compiled_values.then(|| {
+            self.decoded_input_value_types
+                .iter()
+                .copied()
+                .map(CompiledValue::null)
+                .collect::<Vec<_>>()
+        });
         let mut projected_ranges = if capture_projection_ranges {
             Some(vec![0..0; self.projection_plan.output_width()])
         } else {
@@ -324,7 +461,15 @@ impl VectorizedFilterProjectEvaluator {
             let start = cursor;
             let end = encoded_field_end(encoded, start)?;
             if let Some(slot) = self.decoded_input_slots[input_idx] {
-                decoded_values[slot] = decode_encoded_field(&encoded[start..end])?;
+                if let Some(values) = decoded_values.as_mut() {
+                    values[slot] = decode_encoded_field(&encoded[start..end])?;
+                }
+                if let Some(values) = compiled_values.as_mut() {
+                    values[slot] = decode_encoded_field_as_compiled_value(
+                        &encoded[start..end],
+                        self.decoded_input_value_types[slot],
+                    )?;
+                }
             }
             if let (Some(ranges), Some(positions)) =
                 (projected_ranges.as_mut(), projection_positions)
@@ -347,33 +492,65 @@ impl VectorizedFilterProjectEvaluator {
         }
         Ok(DecodedEncodedRow {
             decoded_values,
+            compiled_values,
             projected_ranges,
         })
     }
 
-    fn selected_indices(&self, batch: &RecordBatch) -> Result<Vec<usize>> {
-        let mut selected = Vec::with_capacity(batch.num_rows());
-        if let Some(predicate) = &self.predicate {
-            let predicate = predicate
-                .evaluate(batch)
-                .context("evaluate vectorized filter_map predicate")?
-                .into_array(batch.num_rows())
-                .context("materialize vectorized predicate result")?;
-            let bool_array = predicate
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| anyhow!("vectorized predicate did not evaluate to boolean"))?;
-            for idx in 0..bool_array.len() {
-                if bool_array.is_valid(idx) && bool_array.value(idx) {
+    fn selected_indices(&self, prepared: &PreparedEncodedInput) -> Result<Vec<usize>> {
+        let mut selected = Vec::with_capacity(prepared.encoded_rows.len());
+        match (
+            &self.predicate,
+            prepared.compiled_batch.as_ref(),
+            prepared.batch.as_ref(),
+        ) {
+            (Some(PredicatePlan::Compiled(predicate)), Some(batch), _) => {
+                let predicate = predicate
+                    .evaluate(batch)
+                    .context("evaluate compiled filter_map predicate")?;
+                for (idx, value) in predicate.iter().enumerate() {
+                    if value.predicate_truth()? {
+                        selected.push(idx);
+                    }
+                }
+            }
+            (Some(PredicatePlan::Physical(predicate)), _, Some(batch)) => {
+                let predicate = predicate
+                    .evaluate(batch)
+                    .context("evaluate vectorized filter_map predicate")?
+                    .into_array(batch.num_rows())
+                    .context("materialize vectorized predicate result")?;
+                let bool_array = predicate
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| anyhow!("vectorized predicate did not evaluate to boolean"))?;
+                for idx in 0..bool_array.len() {
+                    if bool_array.is_valid(idx) && bool_array.value(idx) {
+                        selected.push(idx);
+                    }
+                }
+            }
+            (None, _, _) => {
+                for idx in 0..prepared.encoded_rows.len() {
                     selected.push(idx);
                 }
             }
-        } else {
-            for idx in 0..batch.num_rows() {
-                selected.push(idx);
+            (Some(PredicatePlan::Compiled(_)), None, _) => {
+                return Err(anyhow!("compiled predicate batch was unexpectedly missing"));
+            }
+            (Some(PredicatePlan::Physical(_)), _, None) => {
+                return Err(anyhow!("physical predicate batch was unexpectedly missing"));
             }
         }
         Ok(selected)
+    }
+
+    fn predicate_requires_physical_batch(&self) -> bool {
+        matches!(self.predicate, Some(PredicatePlan::Physical(_)))
+    }
+
+    fn predicate_requires_compiled_batch(&self) -> bool {
+        matches!(self.predicate, Some(PredicatePlan::Compiled(_)))
     }
 }
 
@@ -383,6 +560,7 @@ enum ProjectionPlan {
         indices: Arc<Vec<usize>>,
         output_positions_by_input: Arc<Vec<Vec<usize>>>,
     },
+    Compiled(Arc<Vec<CompiledExpr>>),
     Physical(Arc<Vec<Arc<dyn PhysicalExpr>>>),
 }
 
@@ -404,6 +582,7 @@ impl ProjectionPlan {
                 indices.len() == input_width
                     && indices.iter().enumerate().all(|(idx, col)| idx == *col)
             }
+            Self::Compiled(_) => false,
             Self::Physical(_) => false,
         }
     }
@@ -411,6 +590,7 @@ impl ProjectionPlan {
     fn output_width(&self) -> usize {
         match self {
             Self::ColumnIndices { indices, .. } => indices.len(),
+            Self::Compiled(projections) => projections.len(),
             Self::Physical(projections) => projections.len(),
         }
     }
@@ -421,7 +601,7 @@ impl ProjectionPlan {
                 output_positions_by_input,
                 ..
             } => Some(output_positions_by_input.as_ref()),
-            Self::Physical(_) => None,
+            Self::Compiled(_) | Self::Physical(_) => None,
         }
     }
 
@@ -429,9 +609,623 @@ impl ProjectionPlan {
         matches!(self, Self::ColumnIndices { .. }) && !self.is_identity(input_width)
     }
 
-    fn requires_batch(&self) -> bool {
+    fn requires_physical_batch(&self) -> bool {
         matches!(self, Self::Physical(_))
     }
+
+    fn requires_compiled_batch(&self) -> bool {
+        matches!(self, Self::Compiled(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompiledValueType {
+    Int64,
+    Utf8,
+    TimestampMillis,
+    Bool,
+}
+
+impl CompiledValueType {
+    fn try_from_arrow(data_type: &DataType) -> Option<Self> {
+        match data_type {
+            DataType::Int64 => Some(Self::Int64),
+            DataType::Utf8 => Some(Self::Utf8),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => Some(Self::TimestampMillis),
+            DataType::Boolean => Some(Self::Bool),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CompiledValue {
+    Int64(Option<i64>),
+    Utf8(Option<String>),
+    TimestampMillis(Option<i64>),
+    Bool(Option<bool>),
+}
+
+impl CompiledValue {
+    fn null(data_type: CompiledValueType) -> Self {
+        match data_type {
+            CompiledValueType::Int64 => Self::Int64(None),
+            CompiledValueType::Utf8 => Self::Utf8(None),
+            CompiledValueType::TimestampMillis => Self::TimestampMillis(None),
+            CompiledValueType::Bool => Self::Bool(None),
+        }
+    }
+
+    fn from_scalar(value: &ScalarValue, data_type: CompiledValueType) -> Result<Self> {
+        match (data_type, value) {
+            (CompiledValueType::Int64, ScalarValue::Int64(value)) => Ok(Self::Int64(*value)),
+            (CompiledValueType::Utf8, ScalarValue::Utf8(value)) => Ok(Self::Utf8(value.clone())),
+            (CompiledValueType::TimestampMillis, ScalarValue::TimestampMillisecond(value, _)) => {
+                Ok(Self::TimestampMillis(*value))
+            }
+            (CompiledValueType::Bool, ScalarValue::Boolean(value)) => Ok(Self::Bool(*value)),
+            (data_type, ScalarValue::Null) => Ok(Self::null(data_type)),
+            _ => Err(anyhow!(
+                "unsupported literal {:?} for compiled type {:?}",
+                value,
+                data_type
+            )),
+        }
+    }
+
+    fn to_scalar_value(&self) -> ScalarValue {
+        match self {
+            Self::Int64(value) => ScalarValue::Int64(*value),
+            Self::Utf8(value) => ScalarValue::Utf8(value.clone()),
+            Self::TimestampMillis(value) => ScalarValue::TimestampMillisecond(*value, None),
+            Self::Bool(value) => ScalarValue::Boolean(*value),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(
+            self,
+            Self::Int64(None) | Self::Utf8(None) | Self::TimestampMillis(None) | Self::Bool(None)
+        )
+    }
+
+    fn predicate_truth(&self) -> Result<bool> {
+        match self {
+            Self::Bool(Some(value)) => Ok(*value),
+            Self::Bool(None) => Ok(false),
+            other => Err(anyhow!(
+                "compiled predicate did not evaluate to boolean: {other:?}"
+            )),
+        }
+    }
+
+    fn as_bool_opt(&self) -> Result<Option<bool>> {
+        match self {
+            Self::Bool(value) => Ok(*value),
+            other => Err(anyhow!("expected boolean value, found {other:?}")),
+        }
+    }
+
+    fn as_i64_opt(&self, context: &str) -> Result<Option<i64>> {
+        match self {
+            Self::Int64(value) => Ok(*value),
+            other => Err(anyhow!("{context} expects Int64, found {other:?}")),
+        }
+    }
+
+    fn equals(&self, other: &Self) -> Result<Option<bool>> {
+        if self.is_null() || other.is_null() {
+            return Ok(None);
+        }
+        let equal = match (self, other) {
+            (Self::Int64(Some(left)), Self::Int64(Some(right))) => left == right,
+            (Self::Utf8(Some(left)), Self::Utf8(Some(right))) => left == right,
+            (Self::TimestampMillis(Some(left)), Self::TimestampMillis(Some(right))) => {
+                left == right
+            }
+            (Self::Bool(Some(left)), Self::Bool(Some(right))) => left == right,
+            _ => {
+                return Err(anyhow!(
+                    "mismatched compiled comparison operands: {self:?} vs {other:?}"
+                ));
+            }
+        };
+        Ok(Some(equal))
+    }
+
+    fn compare(&self, other: &Self) -> Result<Option<Ordering>> {
+        if self.is_null() || other.is_null() {
+            return Ok(None);
+        }
+        let ordering = match (self, other) {
+            (Self::Int64(Some(left)), Self::Int64(Some(right))) => left.cmp(right),
+            (Self::Utf8(Some(left)), Self::Utf8(Some(right))) => left.cmp(right),
+            (Self::TimestampMillis(Some(left)), Self::TimestampMillis(Some(right))) => {
+                left.cmp(right)
+            }
+            (Self::Bool(Some(left)), Self::Bool(Some(right))) => left.cmp(right),
+            _ => {
+                return Err(anyhow!(
+                    "mismatched compiled comparison operands: {self:?} vs {other:?}"
+                ));
+            }
+        };
+        Ok(Some(ordering))
+    }
+}
+
+type CompiledColumn = Arc<Vec<CompiledValue>>;
+
+struct CompiledInputBatch {
+    columns: Vec<Option<CompiledColumn>>,
+    row_count: usize,
+}
+
+impl CompiledInputBatch {
+    fn column(&self, index: usize) -> Result<CompiledColumn> {
+        self.columns
+            .get(index)
+            .and_then(|column| column.as_ref())
+            .cloned()
+            .ok_or_else(|| anyhow!("compiled input column {index} was unexpectedly missing"))
+    }
+}
+
+#[derive(Clone)]
+enum CompiledExpr {
+    Column {
+        index: usize,
+    },
+    Literal {
+        value: CompiledValue,
+    },
+    Binary {
+        op: Operator,
+        left: Arc<CompiledExpr>,
+        right: Arc<CompiledExpr>,
+    },
+    Not(Arc<CompiledExpr>),
+    Negative(Arc<CompiledExpr>),
+    IsNull(Arc<CompiledExpr>),
+    IsNotNull(Arc<CompiledExpr>),
+    IsTrue(Arc<CompiledExpr>),
+    IsNotTrue(Arc<CompiledExpr>),
+    IsFalse(Arc<CompiledExpr>),
+    IsNotFalse(Arc<CompiledExpr>),
+    IsUnknown(Arc<CompiledExpr>),
+    IsNotUnknown(Arc<CompiledExpr>),
+    Between {
+        expr: Arc<CompiledExpr>,
+        low: Arc<CompiledExpr>,
+        high: Arc<CompiledExpr>,
+        negated: bool,
+    },
+    InList {
+        expr: Arc<CompiledExpr>,
+        list: Arc<Vec<CompiledExpr>>,
+        negated: bool,
+    },
+}
+
+impl CompiledExpr {
+    fn try_compile(
+        expr: &Expr,
+        df_schema: &DFSchema,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Result<Option<Self>> {
+        match expr {
+            Expr::Alias(alias) => Self::try_compile(alias.expr.as_ref(), df_schema, input_schema),
+            Expr::Column(column) => Ok(Some(Self::Column {
+                index: resolve_compiled_column_index(input_schema, column)?,
+            })),
+            Expr::Literal(value, _) => {
+                let Some(data_type) = CompiledValueType::try_from_arrow(&expr.get_type(df_schema)?)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::Literal {
+                    value: CompiledValue::from_scalar(value, data_type)?,
+                }))
+            }
+            Expr::BinaryExpr(binary) => {
+                let supported = matches!(
+                    binary.op,
+                    Operator::Eq
+                        | Operator::NotEq
+                        | Operator::Lt
+                        | Operator::LtEq
+                        | Operator::Gt
+                        | Operator::GtEq
+                        | Operator::And
+                        | Operator::Or
+                        | Operator::Plus
+                        | Operator::Minus
+                        | Operator::Multiply
+                        | Operator::Divide
+                        | Operator::Modulo
+                        | Operator::StringConcat
+                );
+                if !supported {
+                    return Ok(None);
+                }
+                let Some(left) = Self::try_compile(binary.left.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                let Some(right) =
+                    Self::try_compile(binary.right.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::Binary {
+                    op: binary.op,
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                }))
+            }
+            Expr::Not(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::Not(Arc::new(expr)))),
+            Expr::Negative(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::Negative(Arc::new(expr)))),
+            Expr::IsNull(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsNull(Arc::new(expr)))),
+            Expr::IsNotNull(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsNotNull(Arc::new(expr)))),
+            Expr::IsTrue(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsTrue(Arc::new(expr)))),
+            Expr::IsNotTrue(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsNotTrue(Arc::new(expr)))),
+            Expr::IsFalse(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsFalse(Arc::new(expr)))),
+            Expr::IsNotFalse(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsNotFalse(Arc::new(expr)))),
+            Expr::IsUnknown(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsUnknown(Arc::new(expr)))),
+            Expr::IsNotUnknown(inner) => Self::try_compile(inner.as_ref(), df_schema, input_schema)
+                .map(|expr| expr.map(|expr| Self::IsNotUnknown(Arc::new(expr)))),
+            Expr::Between(between) => {
+                let Some(expr) = Self::try_compile(between.expr.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                let Some(low) = Self::try_compile(between.low.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                let Some(high) = Self::try_compile(between.high.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::Between {
+                    expr: Arc::new(expr),
+                    low: Arc::new(low),
+                    high: Arc::new(high),
+                    negated: between.negated,
+                }))
+            }
+            Expr::InList(in_list) => {
+                let Some(expr) = Self::try_compile(in_list.expr.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                let Some(list) = in_list
+                    .list
+                    .iter()
+                    .map(|item| Self::try_compile(item, df_schema, input_schema))
+                    .collect::<Result<Option<Vec<_>>>>()?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::InList {
+                    expr: Arc::new(expr),
+                    list: Arc::new(list),
+                    negated: in_list.negated,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate(&self, batch: &CompiledInputBatch) -> Result<CompiledColumn> {
+        match self {
+            Self::Column { index } => batch.column(*index),
+            Self::Literal { value } => Ok(Arc::new(vec![value.clone(); batch.row_count])),
+            Self::Binary { op, left, right } => {
+                let left = left.evaluate(batch)?;
+                let right = right.evaluate(batch)?;
+                eval_compiled_binary(*op, left.as_ref(), right.as_ref())
+            }
+            Self::Not(inner) => {
+                let values = inner.evaluate(batch)?;
+                Ok(Arc::new(
+                    values
+                        .iter()
+                        .map(|value| {
+                            Ok(CompiledValue::Bool(value.as_bool_opt()?.map(|flag| !flag)))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
+            Self::Negative(inner) => {
+                let values = inner.evaluate(batch)?;
+                Ok(Arc::new(
+                    values
+                        .iter()
+                        .map(|value| {
+                            Ok(CompiledValue::Int64(
+                                value.as_i64_opt("compiled negation")?.map(|number| -number),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
+            Self::IsNull(inner) | Self::IsUnknown(inner) => {
+                let values = inner.evaluate(batch)?;
+                Ok(Arc::new(
+                    values
+                        .iter()
+                        .map(|value| CompiledValue::Bool(Some(value.is_null())))
+                        .collect(),
+                ))
+            }
+            Self::IsNotNull(inner) | Self::IsNotUnknown(inner) => {
+                let values = inner.evaluate(batch)?;
+                Ok(Arc::new(
+                    values
+                        .iter()
+                        .map(|value| CompiledValue::Bool(Some(!value.is_null())))
+                        .collect(),
+                ))
+            }
+            Self::IsTrue(inner) => evaluate_truthy(inner, batch, Some(true)),
+            Self::IsNotTrue(inner) => evaluate_not_truthy(inner, batch, Some(true)),
+            Self::IsFalse(inner) => evaluate_truthy(inner, batch, Some(false)),
+            Self::IsNotFalse(inner) => evaluate_not_truthy(inner, batch, Some(false)),
+            Self::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let expr = expr.evaluate(batch)?;
+                let low = low.evaluate(batch)?;
+                let high = high.evaluate(batch)?;
+                let mut output = Vec::with_capacity(batch.row_count);
+                for ((value, low), high) in expr.iter().zip(low.iter()).zip(high.iter()) {
+                    let lower = compare_compiled_values(value, low, Operator::GtEq)?;
+                    let upper = compare_compiled_values(value, high, Operator::LtEq)?;
+                    let value =
+                        and_bool_opt(lower, upper).map(|flag| if *negated { !flag } else { flag });
+                    output.push(CompiledValue::Bool(value));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let expr = expr.evaluate(batch)?;
+                let list = list
+                    .iter()
+                    .map(|item| item.evaluate(batch))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut output = Vec::with_capacity(batch.row_count);
+                for row_idx in 0..batch.row_count {
+                    let value = expr
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled in-list row {row_idx} was missing"))?;
+                    if value.is_null() {
+                        output.push(CompiledValue::Bool(None));
+                        continue;
+                    }
+                    let mut saw_null = false;
+                    let mut matched = false;
+                    for item in &list {
+                        let item = item.get(row_idx).ok_or_else(|| {
+                            anyhow!("compiled in-list row {row_idx} was missing from list item")
+                        })?;
+                        match value.equals(item)? {
+                            Some(true) => {
+                                matched = true;
+                                break;
+                            }
+                            Some(false) => {}
+                            None => saw_null = true,
+                        }
+                    }
+                    let result = if matched {
+                        Some(!negated)
+                    } else if saw_null {
+                        None
+                    } else {
+                        Some(*negated)
+                    };
+                    output.push(CompiledValue::Bool(result));
+                }
+                Ok(Arc::new(output))
+            }
+        }
+    }
+}
+
+fn evaluate_truthy(
+    expr: &CompiledExpr,
+    batch: &CompiledInputBatch,
+    expected: Option<bool>,
+) -> Result<CompiledColumn> {
+    let values = expr.evaluate(batch)?;
+    Ok(Arc::new(
+        values
+            .iter()
+            .map(|value| Ok(CompiledValue::Bool(Some(value.as_bool_opt()? == expected))))
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn evaluate_not_truthy(
+    expr: &CompiledExpr,
+    batch: &CompiledInputBatch,
+    expected: Option<bool>,
+) -> Result<CompiledColumn> {
+    let values = expr.evaluate(batch)?;
+    Ok(Arc::new(
+        values
+            .iter()
+            .map(|value| {
+                let result = match value.as_bool_opt()? {
+                    value if value == expected => false,
+                    _ => true,
+                };
+                Ok(CompiledValue::Bool(Some(result)))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn eval_compiled_binary(
+    op: Operator,
+    left: &[CompiledValue],
+    right: &[CompiledValue],
+) -> Result<CompiledColumn> {
+    if left.len() != right.len() {
+        return Err(anyhow!(
+            "compiled binary expression length mismatch: {} vs {}",
+            left.len(),
+            right.len()
+        ));
+    }
+    Ok(Arc::new(
+        left.iter()
+            .zip(right.iter())
+            .map(|(left, right)| eval_compiled_binary_value(op, left, right))
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn eval_compiled_binary_value(
+    op: Operator,
+    left: &CompiledValue,
+    right: &CompiledValue,
+) -> Result<CompiledValue> {
+    match op {
+        Operator::Eq => Ok(CompiledValue::Bool(left.equals(right)?)),
+        Operator::NotEq => Ok(CompiledValue::Bool(left.equals(right)?.map(|value| !value))),
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => Ok(CompiledValue::Bool(
+            compare_compiled_values(left, right, op)?,
+        )),
+        Operator::And => {
+            let lhs = left.as_bool_opt()?;
+            let rhs = right.as_bool_opt()?;
+            Ok(CompiledValue::Bool(and_bool_opt(lhs, rhs)))
+        }
+        Operator::Or => {
+            let lhs = left.as_bool_opt()?;
+            let rhs = right.as_bool_opt()?;
+            Ok(CompiledValue::Bool(or_bool_opt(lhs, rhs)))
+        }
+        Operator::Plus
+        | Operator::Minus
+        | Operator::Multiply
+        | Operator::Divide
+        | Operator::Modulo => {
+            let Some(lhs) = left.as_i64_opt("compiled arithmetic")? else {
+                return Ok(CompiledValue::Int64(None));
+            };
+            let Some(rhs) = right.as_i64_opt("compiled arithmetic")? else {
+                return Ok(CompiledValue::Int64(None));
+            };
+            let value = match op {
+                Operator::Plus => lhs + rhs,
+                Operator::Minus => lhs - rhs,
+                Operator::Multiply => lhs * rhs,
+                Operator::Divide => {
+                    if rhs == 0 {
+                        return Err(anyhow!("division by zero in compiled expression"));
+                    }
+                    lhs / rhs
+                }
+                Operator::Modulo => {
+                    if rhs == 0 {
+                        return Err(anyhow!("modulo by zero in compiled expression"));
+                    }
+                    lhs % rhs
+                }
+                _ => unreachable!(),
+            };
+            Ok(CompiledValue::Int64(Some(value)))
+        }
+        Operator::StringConcat => match (left, right) {
+            (CompiledValue::Utf8(Some(left)), CompiledValue::Utf8(Some(right))) => {
+                Ok(CompiledValue::Utf8(Some(format!("{left}{right}"))))
+            }
+            (CompiledValue::Utf8(None), _) | (_, CompiledValue::Utf8(None)) => {
+                Ok(CompiledValue::Utf8(None))
+            }
+            _ => Err(anyhow!(
+                "compiled string concat expects Utf8 operands: {left:?} vs {right:?}"
+            )),
+        },
+        _ => Err(anyhow!("unsupported compiled binary operator {op:?}")),
+    }
+}
+
+fn compare_compiled_values(
+    left: &CompiledValue,
+    right: &CompiledValue,
+    op: Operator,
+) -> Result<Option<bool>> {
+    let Some(ordering) = left.compare(right)? else {
+        return Ok(None);
+    };
+    let result = match op {
+        Operator::Lt => ordering.is_lt(),
+        Operator::LtEq => ordering.is_le(),
+        Operator::Gt => ordering.is_gt(),
+        Operator::GtEq => ordering.is_ge(),
+        _ => return Err(anyhow!("unsupported compiled comparison operator {op:?}")),
+    };
+    Ok(Some(result))
+}
+
+fn and_bool_opt(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(false), _) => Some(false),
+        (Some(true), other) => other,
+        (None, Some(false)) => Some(false),
+        (None, Some(true)) => None,
+        (None, None) => None,
+    }
+}
+
+fn or_bool_opt(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(true), _) => Some(true),
+        (Some(false), other) => other,
+        (None, Some(true)) => Some(true),
+        (None, Some(false)) => None,
+        (None, None) => None,
+    }
+}
+
+fn resolve_compiled_column_index(
+    input_schema: &datafusion::arrow::datatypes::Schema,
+    column: &Column,
+) -> Result<usize> {
+    let qualified = column.flat_name();
+    input_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, field)| {
+            (field.name() == &qualified || field.name() == &column.name).then_some(idx)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "column {} not found in vectorized input schema",
+                column.name
+            )
+        })
 }
 
 fn column_projection_indices(
@@ -499,6 +1293,28 @@ fn build_decoded_input_slots(input_width: usize, required_columns: &[usize]) -> 
     slots
 }
 
+fn build_decoded_input_value_types(
+    input_schema: &RowSchema,
+    required_columns: &[usize],
+) -> Result<Vec<CompiledValueType>> {
+    required_columns
+        .iter()
+        .map(|column_idx| {
+            let field = input_schema
+                .field(*column_idx)
+                .ok_or_else(|| anyhow!("vectorized input column {column_idx} was out of bounds"))?;
+            Ok(match field.data_type {
+                dbsp::circuit::types::DbspScalarType::Int64 => CompiledValueType::Int64,
+                dbsp::circuit::types::DbspScalarType::Utf8 => CompiledValueType::Utf8,
+                dbsp::circuit::types::DbspScalarType::TimestampMillis => {
+                    CompiledValueType::TimestampMillis
+                }
+                dbsp::circuit::types::DbspScalarType::Bool => CompiledValueType::Bool,
+            })
+        })
+        .collect()
+}
+
 fn build_sparse_input_batch(
     schema: &datafusion::arrow::datatypes::SchemaRef,
     decoded_input_slots: &[Option<usize>],
@@ -521,6 +1337,21 @@ fn build_sparse_input_batch(
         })
         .collect::<Result<_>>()?;
     RecordBatch::try_new(Arc::clone(schema), arrays).context("build vectorized input batch")
+}
+
+fn build_compiled_input_batch(
+    input_width: usize,
+    decoded_input_slots: &[Option<usize>],
+    mut decoded_columns: Vec<Vec<CompiledValue>>,
+    row_count: usize,
+) -> CompiledInputBatch {
+    let mut columns = vec![None; input_width];
+    for (input_idx, slot) in decoded_input_slots.iter().copied().enumerate() {
+        if let Some(slot) = slot {
+            columns[input_idx] = Some(Arc::new(std::mem::take(&mut decoded_columns[slot])));
+        }
+    }
+    CompiledInputBatch { columns, row_count }
 }
 
 fn placeholder_scalar(data_type: &DataType) -> Result<ScalarValue> {
@@ -621,6 +1452,57 @@ fn decode_encoded_field(field: &[u8]) -> Result<ScalarValue> {
     }
 }
 
+fn decode_encoded_field_as_compiled_value(
+    field: &[u8],
+    data_type: CompiledValueType,
+) -> Result<CompiledValue> {
+    let tag = *field
+        .first()
+        .ok_or_else(|| anyhow!("encoded field must contain a tag"))?;
+    match (data_type, tag) {
+        (_, 0x00) => Ok(CompiledValue::null(data_type)),
+        (CompiledValueType::Int64, 0x01) => {
+            let chunk = field.get(1..9).ok_or_else(|| anyhow!("truncated int64"))?;
+            Ok(CompiledValue::Int64(Some(i64::from_le_bytes(
+                chunk.try_into().unwrap(),
+            ))))
+        }
+        (CompiledValueType::Utf8, 0x02) => {
+            let len_bytes = field
+                .get(1..5)
+                .ok_or_else(|| anyhow!("truncated string length"))?;
+            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            let chunk = field
+                .get(5..5 + len)
+                .ok_or_else(|| anyhow!("truncated string payload"))?;
+            let text =
+                std::str::from_utf8(chunk).map_err(|err| anyhow!("utf8 decode error: {err}"))?;
+            Ok(CompiledValue::Utf8(Some(text.to_string())))
+        }
+        (CompiledValueType::TimestampMillis, 0x03) => {
+            let chunk = field
+                .get(1..9)
+                .ok_or_else(|| anyhow!("truncated timestamp"))?;
+            Ok(CompiledValue::TimestampMillis(Some(i64::from_le_bytes(
+                chunk.try_into().unwrap(),
+            ))))
+        }
+        (CompiledValueType::Bool, 0x04) => {
+            let flag = *field
+                .get(1)
+                .ok_or_else(|| anyhow!("missing boolean payload"))?;
+            Ok(CompiledValue::Bool(Some(flag != 0)))
+        }
+        (CompiledValueType::Int64, 0x05) => Ok(CompiledValue::Int64(None)),
+        (CompiledValueType::Utf8, 0x06) => Ok(CompiledValue::Utf8(None)),
+        (CompiledValueType::TimestampMillis, 0x07) => Ok(CompiledValue::TimestampMillis(None)),
+        (CompiledValueType::Bool, 0x08) => Ok(CompiledValue::Bool(None)),
+        _ => Err(anyhow!(
+            "encoded field tag {tag:#x} did not match compiled type {data_type:?}"
+        )),
+    }
+}
+
 fn project_encoded_row(encoded: &[u8], ranges: &[Range<usize>], width: usize) -> Result<Vec<u8>> {
     let count = u32::try_from(width).context("too many columns in projected encoded row")?;
     let payload_len = ranges.iter().map(|range| range.len()).sum::<usize>();
@@ -638,13 +1520,15 @@ fn project_encoded_row(encoded: &[u8], ranges: &[Range<usize>], width: usize) ->
 
 struct PreparedEncodedInput {
     batch: Option<RecordBatch>,
+    compiled_batch: Option<CompiledInputBatch>,
     encoded_rows: Vec<Vec<u8>>,
     weights: Vec<i64>,
     projected_ranges: Option<Vec<Vec<Range<usize>>>>,
 }
 
 struct DecodedEncodedRow {
-    decoded_values: Vec<ScalarValue>,
+    decoded_values: Option<Vec<ScalarValue>>,
+    compiled_values: Option<Vec<CompiledValue>>,
     projected_ranges: Option<Vec<Range<usize>>>,
 }
 
