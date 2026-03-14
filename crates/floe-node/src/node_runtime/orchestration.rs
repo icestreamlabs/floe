@@ -556,6 +556,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
+    let source_id_by_name: HashMap<String, usize> = definitions
+        .iter()
+        .enumerate()
+        .map(|(idx, definition)| (definition.name().to_string(), idx))
+        .collect();
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
@@ -563,9 +568,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .map(|cursor| (cursor.sink.clone(), cursor))
         .collect();
 
-    for connector in connector_specs {
+    for (connector_id, connector) in connector_specs.into_iter().enumerate() {
         let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
-        connector_queues.push(ConnectorQueue::new(connector.name.clone(), receiver));
+        connector_queues.push(ConnectorQueue::new(
+            connector_id,
+            connector.name.clone(),
+            receiver,
+        ));
         let cancel = ingest_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
         let failure_state = Arc::clone(&runtime_failure);
@@ -806,6 +815,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_batch_journal_for_task = source_batch_journal.clone();
     let transient_only_sources_for_task = transient_only_sources.clone();
+    let source_id_by_name_for_task = source_id_by_name;
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -907,6 +917,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 per_connector_counts,
             } = build_batch(
                 &mut connector_queues,
+                &source_id_by_name_for_task,
+                source_id_by_name_for_task.len(),
                 next_connector,
                 max_batch,
                 max_batch_per_source,
@@ -939,7 +951,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 raw_batch_size = batch_len
             );
             let _decode_guard = decode_span.enter();
-            for event in batch {
+            for mut event in batch {
                 let source_name = event.source().to_string();
                 if let Some((partition, offset)) = event_resume_offset(event.resume_token()) {
                     let entry = tick_source_offsets
@@ -977,8 +989,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         break 'executor;
                     }
                 };
-                let event_ts = if let Some(preencoded_row_key) = event.preencoded_row_key() {
-                    encoded_rows.push((source_name.clone(), preencoded_row_key.to_vec()));
+                let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
+                    encoded_rows.push((source_name.clone(), preencoded_row_key));
                     None
                 } else {
                     match decoder.encode_row_key(&event) {
@@ -1324,6 +1336,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .sum();
             metrics::record_ingest_queue_depth(queue_depth);
             if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
+                let per_connector: Vec<_> = connector_queues
+                    .iter()
+                    .map(|queue| (queue.name.as_str(), per_connector_counts[queue.id]))
+                    .filter(|(_, count)| *count > 0)
+                    .collect();
                 tracing::info!(
                     epoch,
                     queue_depth,
@@ -1338,7 +1355,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     checkpoint_write_latency_ms,
                     tick_latency_ms,
                     per_source = ?decoded_counts,
-                    per_connector = ?per_connector_counts,
+                    per_connector = ?per_connector,
                     "ingest batch metrics"
                 );
             }

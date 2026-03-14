@@ -224,27 +224,39 @@ pub(super) fn drain_connectors(queues: &mut [ConnectorQueue], capacity: usize) {
 
 pub(super) fn build_batch(
     queues: &mut [ConnectorQueue],
+    source_id_by_name: &HashMap<String, usize>,
+    source_count: usize,
     start_index: usize,
     max_batch: usize,
     max_per_source: usize,
     max_per_connector: usize,
 ) -> BatchSelection {
     let mut batch = Vec::with_capacity(max_batch);
-    let mut per_source_counts: HashMap<String, usize> = HashMap::new();
-    let mut per_connector_counts: HashMap<String, usize> = HashMap::new();
+    let mut per_source_counts = vec![0usize; source_count];
+    let mut unknown_source_counts: HashMap<String, usize> = HashMap::new();
+    let per_connector_count_len = queues
+        .iter()
+        .map(|queue| queue.id)
+        .max()
+        .map_or(0, |id| id + 1);
+    let mut per_connector_counts = vec![0usize; per_connector_count_len];
     let mut deferred: Vec<VecDeque<core_source::SourceEvent>> = vec![VecDeque::new(); queues.len()];
     let connector_count = queues.len();
     for step in 0..connector_count {
         let idx = (start_index + step) % connector_count;
         let queue = &mut queues[idx];
         let deferred_queue = &mut deferred[idx];
-        let per_connector = per_connector_counts.entry(queue.name.clone()).or_insert(0);
+        let per_connector = &mut per_connector_counts[queue.id];
         while *per_connector < max_per_connector && batch.len() < max_batch {
             let Some(event) = queue.pending.pop_front() else {
                 break;
             };
             let source = event.source();
-            let count = per_source_counts.entry(source.to_string()).or_insert(0);
+            let count = if let Some(source_id) = source_id_by_name.get(source) {
+                &mut per_source_counts[*source_id]
+            } else {
+                unknown_source_counts.entry(source.to_string()).or_insert(0)
+            };
             if *count >= max_per_source {
                 deferred_queue.push_back(event);
                 continue;
