@@ -60,12 +60,14 @@ fn build_batch_limits_per_connector() {
     let (_tx_b, rx_b) = core_source::channel(8);
     let mut queues = vec![
         ConnectorQueue {
+            id: 0,
             name: "a".to_string(),
             receiver: rx_a,
             pending: VecDeque::from([event("s1", 1), event("s1", 2)]),
             closed: false,
         },
         ConnectorQueue {
+            id: 1,
             name: "b".to_string(),
             receiver: rx_b,
             pending: VecDeque::from([event("s2", 3), event("s2", 4)]),
@@ -73,10 +75,10 @@ fn build_batch_limits_per_connector() {
         },
     ];
 
-    let selection = build_batch(&mut queues, 0, 10, 10, 1);
+    let source_id_by_name = HashMap::from([("s1".to_string(), 0usize), ("s2".to_string(), 1usize)]);
+    let selection = build_batch(&mut queues, &source_id_by_name, 2, 0, 10, 10, 1);
     assert_eq!(selection.batch.len(), 2);
-    assert_eq!(selection.per_connector_counts.get("a"), Some(&1));
-    assert_eq!(selection.per_connector_counts.get("b"), Some(&1));
+    assert_eq!(selection.per_connector_counts, vec![1, 1]);
     assert_eq!(queues[0].pending.len(), 1);
     assert_eq!(queues[1].pending.len(), 1);
 }
@@ -85,13 +87,15 @@ fn build_batch_limits_per_connector() {
 fn build_batch_limits_per_source() {
     let (_tx, rx) = core_source::channel(8);
     let mut queues = vec![ConnectorQueue {
+        id: 0,
         name: "a".to_string(),
         receiver: rx,
         pending: VecDeque::from([event("s1", 1), event("s1", 2), event("s1", 3)]),
         closed: false,
     }];
 
-    let selection = build_batch(&mut queues, 0, 10, 1, 10);
+    let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
+    let selection = build_batch(&mut queues, &source_id_by_name, 1, 0, 10, 1, 10);
     assert_eq!(selection.batch.len(), 1);
     assert_eq!(queues[0].pending.len(), 2);
 }

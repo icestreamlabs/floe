@@ -453,8 +453,7 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
         else {
             return Ok(None);
         };
-        let mut event =
-            SourceEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row);
+        let mut event = SourceEvent::preencoded(source_name, encoded_row);
         if let Some(event_time_ms) = event_ts {
             event = event.with_event_time_ms(event_time_ms);
         }
@@ -798,11 +797,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source(), "public.users");
         assert_eq!(
-            events[0].payload().get("__floe_op").and_then(Value::as_str),
+            events[0]
+                .payload()
+                .and_then(|payload| payload.get("__floe_op"))
+                .and_then(Value::as_str),
             Some("upsert")
         );
         assert_eq!(
-            events[0].payload().get("name").and_then(Value::as_str),
+            events[0]
+                .payload()
+                .and_then(|payload| payload.get("name"))
+                .and_then(Value::as_str),
             Some("new")
         );
     }
@@ -820,11 +825,17 @@ mod tests {
             .expect("parse debezium");
         assert_eq!(events.len(), 1);
         assert_eq!(
-            events[0].payload().get("__floe_op").and_then(Value::as_str),
+            events[0]
+                .payload()
+                .and_then(|payload| payload.get("__floe_op"))
+                .and_then(Value::as_str),
             Some("delete")
         );
         assert_eq!(
-            events[0].payload().get("id").and_then(Value::as_i64),
+            events[0]
+                .payload()
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_i64),
             Some(7)
         );
     }
@@ -836,7 +847,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source(), "nexmark_bid");
         assert_eq!(
-            events[0].payload().get("auction").and_then(Value::as_i64),
+            events[0]
+                .payload()
+                .and_then(|payload| payload.get("auction"))
+                .and_then(Value::as_i64),
             Some(1)
         );
     }

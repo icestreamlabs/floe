@@ -184,7 +184,8 @@ impl SourceRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceEvent {
     source: String,
-    payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_token: Option<SourceResumeToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,10 +223,20 @@ impl SourceEvent {
     pub fn new(source: impl Into<String>, payload: Value) -> Self {
         Self {
             source: source.into(),
-            payload,
+            payload: Some(payload),
             resume_token: None,
             event_time_ms: None,
             preencoded_row_key: None,
+        }
+    }
+
+    pub fn preencoded(source: impl Into<String>, preencoded_row_key: Vec<u8>) -> Self {
+        Self {
+            source: source.into(),
+            payload: None,
+            resume_token: None,
+            event_time_ms: None,
+            preencoded_row_key: Some(preencoded_row_key),
         }
     }
 
@@ -233,8 +244,8 @@ impl SourceEvent {
         &self.source
     }
 
-    pub fn payload(&self) -> &Value {
-        &self.payload
+    pub fn payload(&self) -> Option<&Value> {
+        self.payload.as_ref()
     }
 
     pub fn resume_token(&self) -> Option<&SourceResumeToken> {
@@ -260,18 +271,23 @@ impl SourceEvent {
     }
 
     pub fn with_preencoded_row_key(mut self, preencoded_row_key: Vec<u8>) -> Self {
+        self.payload = None;
         self.preencoded_row_key = Some(preencoded_row_key);
         self
     }
 
-    pub fn into_payload(self) -> Value {
+    pub fn take_preencoded_row_key(&mut self) -> Option<Vec<u8>> {
+        self.preencoded_row_key.take()
+    }
+
+    pub fn into_payload(self) -> Option<Value> {
         self.payload
     }
 
     pub fn to_json_value(&self) -> Value {
         json!({
             "source": self.source,
-            "data": self.payload,
+            "data": self.payload.clone().unwrap_or(Value::Null),
         })
     }
 

@@ -93,6 +93,7 @@ const ADMIN_PORT_ENV: &str = "FLOE_ADMIN_PORT";
 const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
 
 struct ConnectorQueue {
+    id: usize,
     name: String,
     receiver: core_source::SourceEventReceiver,
     pending: VecDeque<core_source::SourceEvent>,
@@ -101,12 +102,13 @@ struct ConnectorQueue {
 
 struct BatchSelection {
     batch: Vec<core_source::SourceEvent>,
-    per_connector_counts: HashMap<String, usize>,
+    per_connector_counts: Vec<usize>,
 }
 
 impl ConnectorQueue {
-    fn new(name: impl Into<String>, receiver: core_source::SourceEventReceiver) -> Self {
+    fn new(id: usize, name: impl Into<String>, receiver: core_source::SourceEventReceiver) -> Self {
         Self {
+            id,
             name: name.into(),
             receiver,
             pending: VecDeque::new(),
