@@ -61,15 +61,17 @@ async fn file_connector_ingests_and_queries() -> Result<()> {
         })
         .collect();
 
-    while let Some(event) = rx.recv().await {
-        let Some(decoder) = decoders.get(event.source()) else {
-            continue;
-        };
-        let (row, _ts) = decoder.decode(&event)?;
-        let Some(writer) = harness.outer.writer_mut(event.source()) else {
-            continue;
-        };
-        writer.append(&row, 1)?;
+    while let Some(batch) = rx.recv().await {
+        for event in batch {
+            let Some(decoder) = decoders.get(event.source()) else {
+                continue;
+            };
+            let (row, _ts) = decoder.decode(&event)?;
+            let Some(writer) = harness.outer.writer_mut(event.source()) else {
+                continue;
+            };
+            writer.append(&row, 1)?;
+        }
     }
     harness.outer.tick_all().await?;
 

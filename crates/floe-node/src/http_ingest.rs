@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use floe_node_core::source::{SourceEvent, SourceEventSender};
+use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch};
 
 #[derive(Debug, Clone)]
 pub struct HttpIngestConfig {
@@ -144,14 +144,12 @@ async fn ingest(
         )
     })?;
 
-    for event in events {
-        state.sender.send(event).await.map_err(|err| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("ingest channel closed: {err}"),
-            )
-        })?;
-    }
+    send_batch(&state.sender, events).await.map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("ingest channel closed: {err}"),
+        )
+    })?;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -366,8 +364,9 @@ mod tests {
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-        let event = rx.recv().await.expect("event");
-        assert_eq!(event.source(), "nexmark_bid");
+        let batch = rx.recv().await.expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].source(), "nexmark_bid");
     }
 
     #[tokio::test]
