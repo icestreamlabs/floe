@@ -540,11 +540,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     });
     let connector_count = connector_specs.len();
-    let per_connector_queue_capacity = (queue_capacity / connector_count).max(1);
     tracing::info!(
         connector_count,
         queue_capacity,
-        per_connector_queue_capacity,
         max_batch,
         max_batch_per_source,
         max_batch_per_connector,
@@ -561,6 +559,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .enumerate()
         .map(|(idx, definition)| (definition.name().to_string(), idx))
         .collect();
+    let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
@@ -569,12 +568,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .collect();
 
     for (connector_id, connector) in connector_specs.into_iter().enumerate() {
-        let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
-        connector_queues.push(ConnectorQueue::new(
-            connector_id,
-            connector.name.clone(),
-            receiver,
-        ));
+        let sender = core_source::routed_sender(connector_id, connector_sender.clone());
+        connector_queues.push(ConnectorQueue::new(connector_id, connector.name.clone()));
         let cancel = ingest_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
         let failure_state = Arc::clone(&runtime_failure);
@@ -801,6 +796,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
         }
     }
+    drop(connector_sender);
     let outer_for_task = Arc::clone(&outer_registry);
     let decoder_for_task = Arc::clone(&decoder_registry);
     let materialized_sources_for_task = all_required_sources.clone();
@@ -816,6 +812,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let source_batch_journal_for_task = source_batch_journal.clone();
     let transient_only_sources_for_task = transient_only_sources.clone();
     let source_id_by_name_for_task = source_id_by_name;
+    let mut connector_receiver_for_task = connector_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -903,14 +900,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             {
                 let has_events = tokio::select! {
                     _ = executor_cancel.cancelled() => false,
-                    has_events = recv_from_any(&mut connector_queues) => has_events,
+                    has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
                 };
                 if !has_events {
                     break;
                 }
             }
-            drain_connectors(&mut connector_queues, per_connector_queue_capacity);
-            connector_queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
+            drain_ready(&mut connector_receiver_for_task, &mut connector_queues);
 
             let BatchSelection {
                 batch,
@@ -1332,9 +1328,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
             let queue_depth: usize = connector_queues
                 .iter()
-                .map(|queue| queue.pending.len() + queue.receiver.len())
+                .map(|queue| queue.pending.len())
                 .sum();
-            metrics::record_ingest_queue_depth(queue_depth);
+            let total_queue_depth = queue_depth.saturating_add(connector_receiver_for_task.len());
+            metrics::record_ingest_queue_depth(total_queue_depth);
             if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
                 let per_connector: Vec<_> = connector_queues
                     .iter()
@@ -1343,9 +1340,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     .collect();
                 tracing::info!(
                     epoch,
-                    queue_depth,
+                    queue_depth = total_queue_depth,
                     batch_size = batch_len,
-                    pending = queue_depth,
+                    pending = total_queue_depth,
                     decoded_rows = decoded_rows_len,
                     max_batch,
                     max_batch_per_source,

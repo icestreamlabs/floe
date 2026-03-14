@@ -183,41 +183,31 @@ pub(super) fn current_unix_time_ms() -> u64 {
     }
 }
 
-pub(super) async fn recv_from_any(queues: &mut Vec<ConnectorQueue>) -> bool {
-    if queues.is_empty() {
+pub(super) async fn recv_from_ready(
+    receiver: &mut core_source::RoutedSourceEventReceiver,
+    queues: &mut [ConnectorQueue],
+) -> bool {
+    let Some(batch) = receiver.recv().await else {
         return false;
-    }
-    let (event, index) = {
-        let futures: Vec<_> = queues
-            .iter_mut()
-            .map(|queue| Box::pin(queue.receiver.recv()))
-            .collect();
-        let (event, index, _remaining) = select_all(futures).await;
-        (event, index)
     };
-    match event {
-        Some(events) => {
-            queues[index].pending.extend(events);
-        }
-        None => {
-            queues[index].closed = true;
-        }
+    if let Some(queue) = queues.get_mut(batch.connector_id) {
+        queue.pending.extend(batch.events);
     }
-    queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
-    !queues.is_empty()
+    true
 }
 
-pub(super) fn drain_connectors(queues: &mut [ConnectorQueue], capacity: usize) {
-    for queue in queues.iter_mut() {
-        while queue.pending.len() < capacity {
-            match queue.receiver.try_recv() {
-                Ok(events) => queue.pending.extend(events),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    queue.closed = true;
-                    break;
+pub(super) fn drain_ready(
+    receiver: &mut core_source::RoutedSourceEventReceiver,
+    queues: &mut [ConnectorQueue],
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(batch) => {
+                if let Some(queue) = queues.get_mut(batch.connector_id) {
+                    queue.pending.extend(batch.events);
                 }
             }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
 }
