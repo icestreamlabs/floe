@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::stream_types::{Diff, Row, Timestamp};
+use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Row, Timestamp};
 use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::handles::ZSetHandle;
@@ -13,7 +13,7 @@ use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
 use tracing::field;
 
-use crate::encoding::decode_projected_row_key;
+use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -94,7 +94,7 @@ impl MaterializedViewRegistry {
 
 pub struct MaterializedViewHandle {
     name: String,
-    state: RwLock<HashMap<Row, Diff>>,
+    state: RwLock<HashMap<EncodedRow, Diff>>,
     state_row_count: RwLock<i64>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
@@ -132,18 +132,31 @@ impl MaterializedViewHandle {
         &self.name
     }
 
-    pub fn apply(&self, row: Row, diff: Diff) {
+    pub fn apply(&self, row: Row, diff: Diff) -> Result<()> {
+        if diff == 0 {
+            return Ok(());
+        }
+        let key = encode_projected_row_key(&row).context("encode materialized view state row")?;
+        self.apply_encoded(&key, diff);
+        Ok(())
+    }
+
+    fn apply_encoded(&self, key: &[u8], diff: Diff) {
         if diff == 0 {
             return;
         }
 
         let mut guard = self.state.write().expect("mutex poisoned");
-        let previous = guard.get(&row).copied().unwrap_or(0);
+        let previous = guard.get(key).copied().unwrap_or(0);
         let next = previous.saturating_add(diff);
         if next == 0 {
-            guard.remove(&row);
+            guard.remove(key);
         } else {
-            guard.insert(row, next);
+            if let Some(current) = guard.get_mut(key) {
+                *current = next;
+            } else {
+                guard.insert(key.to_vec(), next);
+            }
         }
         let mut row_count = self.state_row_count.write().expect("mutex poisoned");
         let previous_rows = previous.max(0);
@@ -163,7 +176,18 @@ impl MaterializedViewHandle {
     }
 
     pub fn snapshot(&self) -> HashMap<Row, Diff> {
-        self.state.read().expect("mutex poisoned").clone()
+        self.state
+            .read()
+            .expect("mutex poisoned")
+            .iter()
+            .map(|(key, diff)| {
+                (
+                    decode_projected_row_key(key)
+                        .expect("materialized view authoritative state should contain valid rows"),
+                    *diff,
+                )
+            })
+            .collect()
     }
 
     pub fn mark_state_authoritative(&self) {
@@ -186,12 +210,7 @@ impl MaterializedViewHandle {
             return Ok(());
         }
         for (key, diff) in deltas {
-            if *diff == 0 {
-                continue;
-            }
-            let row = decode_projected_row_key(key)
-                .with_context(|| "decode encoded overlay row for state cache")?;
-            self.apply(row, *diff);
+            self.apply_encoded(key, *diff);
         }
         Ok(())
     }
@@ -220,26 +239,18 @@ impl MaterializedViewHandle {
             .is_some()
     }
 
-    pub fn append_encoded_overlay_batch<I>(
+    pub fn append_shared_encoded_overlay_batch(
         &self,
         version: u64,
-        deltas: I,
-    ) -> EncodedOverlayApplyStats
-    where
-        I: IntoIterator<Item = (Vec<u8>, i64)>,
-    {
+        deltas: EncodedDeltaBatch,
+    ) -> EncodedOverlayApplyStats {
         let apply_start = Instant::now();
-        let mut batches = Vec::new();
-        let mut overlay_rows = 0usize;
-        let mut overlay_bytes = 0usize;
-        for (key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            overlay_rows = overlay_rows.saturating_add(1);
-            overlay_bytes = overlay_bytes.saturating_add(key.len() + std::mem::size_of::<i64>());
-            batches.push((key, diff));
-        }
+        let overlay_rows = deltas.iter().filter(|(_, diff)| *diff != 0).count();
+        let overlay_bytes = deltas
+            .iter()
+            .filter(|(_, diff)| *diff != 0)
+            .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
+            .sum();
         let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
         let state = guard.get_or_insert_with(|| EncodedOverlayState {
             base_version: self
@@ -248,8 +259,8 @@ impl MaterializedViewHandle {
                 .unwrap_or(0),
             ..Default::default()
         });
-        if !batches.is_empty() {
-            state.batches.insert(version, batches);
+        if overlay_rows > 0 {
+            state.batches.insert(version, deltas);
         }
         state.latest_version = state.latest_version.max(version);
         let stats = EncodedOverlayApplyStats {
@@ -261,6 +272,17 @@ impl MaterializedViewHandle {
         drop(guard);
         self.publish_logical_version(version as i64);
         stats
+    }
+
+    pub fn append_encoded_overlay_batch<I>(
+        &self,
+        version: u64,
+        deltas: I,
+    ) -> EncodedOverlayApplyStats
+    where
+        I: IntoIterator<Item = (Vec<u8>, i64)>,
+    {
+        self.append_shared_encoded_overlay_batch(version, Arc::new(deltas.into_iter().collect()))
     }
 
     pub fn encoded_overlay_batches(
@@ -458,7 +480,7 @@ pub struct EncodedOverlayCompactionStats {
 struct EncodedOverlayState {
     base_version: u64,
     latest_version: u64,
-    batches: BTreeMap<u64, Vec<(Vec<u8>, i64)>>,
+    batches: BTreeMap<u64, EncodedDeltaBatch>,
 }
 
 fn current_time_micros() -> i64 {
@@ -562,9 +584,9 @@ mod tests {
         let registry = MaterializedViewRegistry::new();
         let view = registry.register("mv_test");
         let row = vec![ScalarValue::Int64(Some(1))];
-        view.apply(row.clone(), 1);
+        view.apply(row.clone(), 1).expect("apply insert");
         assert_eq!(view.snapshot().get(&row), Some(&1));
-        view.apply(row.clone(), -1);
+        view.apply(row.clone(), -1).expect("apply delete");
         assert!(view.snapshot().is_empty());
         view.update_watermark(42);
         assert_eq!(view.watermark(), Some(42));

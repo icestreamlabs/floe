@@ -286,7 +286,7 @@ mod tests {
             .expect("replay timeout")
             .expect("transient batch");
         assert_eq!(batch.version, 1);
-        assert_eq!(batch.deltas, vec![(b"a".to_vec(), 1)]);
+        assert_eq!(batch.deltas.as_slice(), &[(b"a".to_vec(), 1)]);
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "replay should stop at the committed tick boundary"
