@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
+use crate::source::send_event;
 
 const CONNECTOR_NAME: &str = "nexmark";
 const CONNECTOR_PROPERTY: &str = "connector";
@@ -151,8 +152,7 @@ where
         .with_context(|| format!("failed to serialize {entity} event"))?;
     let event =
         SourceEvent::new(source, json).with_resume_token(SourceResumeToken::Generator { position });
-    sender
-        .send(event)
+    send_event(sender, event)
         .await
         .map_err(|err| anyhow!("failed to enqueue event for source {source}: {err}"))?;
     Ok(())
@@ -233,8 +233,8 @@ mod tests {
         run(config, tx).await.expect("generator run");
 
         let mut collected = Vec::new();
-        while let Some(event) = rx.recv().await {
-            collected.push(event.source().to_owned());
+        while let Some(batch) = rx.recv().await {
+            collected.extend(batch.into_iter().map(|event| event.source().to_owned()));
         }
 
         assert_eq!(collected.len(), 5);

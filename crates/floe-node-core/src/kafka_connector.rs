@@ -107,11 +107,7 @@ impl KafkaConnector {
             .set("enable.auto.offset.store", "false");
     }
 
-    async fn handle_message(
-        &self,
-        ctx: &ConnectorContext,
-        message: &BorrowedMessage<'_>,
-    ) -> Result<usize> {
+    async fn handle_message(&self, message: &BorrowedMessage<'_>) -> Result<Vec<SourceEvent>> {
         let payload = match message.payload() {
             Some(payload) => payload,
             None => {
@@ -121,7 +117,7 @@ impl KafkaConnector {
                     offset = message.offset(),
                     "kafka message missing payload"
                 );
-                return Ok(0);
+                return Ok(Vec::new());
             }
         };
         let events = match self.message_format {
@@ -163,7 +159,7 @@ impl KafkaConnector {
                             error = %err,
                             "failed to decode kafka message json"
                         );
-                        return Ok(0);
+                        return Ok(Vec::new());
                     }
                 };
                 parse_debezium_events(
@@ -185,12 +181,13 @@ impl KafkaConnector {
                     error = %err,
                     "failed to parse kafka message payload"
                 );
-                return Ok(0);
+                return Ok(Vec::new());
             }
         };
 
-        for event in &events {
-            let mut event = event.clone().with_resume_token(SourceResumeToken::Kafka {
+        let mut staged = Vec::with_capacity(events.len());
+        for event in events {
+            let mut event = event.with_resume_token(SourceResumeToken::Kafka {
                 topic: message.topic().to_string(),
                 partition: message.partition(),
                 offset: message.offset(),
@@ -198,12 +195,9 @@ impl KafkaConnector {
             if let Some(event_time_ms) = kafka_message_timestamp_ms(message) {
                 event = event.with_event_time_ms(event_time_ms);
             }
-            let source_name = event.source().to_string();
-            ctx.sender().send(event).await.with_context(|| {
-                format!("failed to enqueue kafka event for source {}", source_name)
-            })?;
+            staged.push(event);
         }
-        Ok(events.len())
+        Ok(staged)
     }
 }
 
@@ -245,6 +239,7 @@ impl Connector for KafkaConnector {
             .as_ref()
             .context("kafka connector is not initialized")?;
         let mut emitted = 0usize;
+        let mut staged = Vec::new();
 
         let first_timeout = if self.config.poll_timeout.is_zero() {
             Duration::from_millis(0)
@@ -253,7 +248,9 @@ impl Connector for KafkaConnector {
         };
         match tokio::time::timeout(first_timeout, consumer.recv()).await {
             Ok(Ok(message)) => {
-                emitted = emitted.saturating_add(self.handle_message(ctx, &message).await?);
+                let mut events = self.handle_message(&message).await?;
+                emitted = emitted.saturating_add(events.len());
+                staged.append(&mut events);
             }
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "failed to receive kafka message");
@@ -264,13 +261,21 @@ impl Connector for KafkaConnector {
         while emitted < self.config.max_messages_per_tick {
             match tokio::time::timeout(Duration::from_millis(0), consumer.recv()).await {
                 Ok(Ok(message)) => {
-                    emitted = emitted.saturating_add(self.handle_message(ctx, &message).await?);
+                    let mut events = self.handle_message(&message).await?;
+                    emitted = emitted.saturating_add(events.len());
+                    staged.append(&mut events);
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(error = %err, "failed to receive kafka message");
                 }
                 Err(_) => break,
             }
+        }
+
+        if !staged.is_empty() {
+            ctx.send_batch(staged)
+                .await
+                .context("failed to enqueue kafka event batch")?;
         }
 
         self.commit_offsets_if_requested().await?;

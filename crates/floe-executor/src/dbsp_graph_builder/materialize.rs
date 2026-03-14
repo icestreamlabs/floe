@@ -23,6 +23,7 @@ use crate::materialized_view::{
 };
 use crate::metrics;
 use crate::outer_stream::{TransientSourceBatch, TransientSourceHandleStream};
+use crate::stream_types::EncodedDeltaBatch;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::{DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig};
@@ -168,11 +169,11 @@ struct PendingOverlaySnapshot {
     first_version: Option<i64>,
     last_version: Option<i64>,
     first_enqueue_at: Option<Instant>,
-    deltas: Vec<(Vec<u8>, i64)>,
+    delta_batches: Vec<EncodedDeltaBatch>,
 }
 
 impl PendingOverlaySnapshot {
-    fn record(&mut self, version: i64, deltas: &[(Vec<u8>, i64)]) {
+    fn record(&mut self, version: i64, deltas: EncodedDeltaBatch) {
         if deltas.is_empty() {
             return;
         }
@@ -191,11 +192,11 @@ impl PendingOverlaySnapshot {
         if self.first_enqueue_at.is_none() {
             self.first_enqueue_at = Some(Instant::now());
         }
-        self.deltas.extend(deltas.iter().cloned());
+        self.delta_batches.push(deltas);
     }
 
     fn has_pending(&self) -> bool {
-        !self.deltas.is_empty()
+        !self.delta_batches.is_empty()
     }
 
     fn should_flush(&self, config: OverlaySnapshotConfig, now: Instant) -> bool {
@@ -235,7 +236,7 @@ impl PendingOverlaySnapshot {
             bytes: self.bytes,
             first_version: self.first_version.unwrap_or(-1),
             last_version: self.last_version.unwrap_or(-1),
-            deltas: std::mem::take(&mut self.deltas),
+            delta_batches: std::mem::take(&mut self.delta_batches),
         };
         self.clear();
         Some(request)
@@ -249,7 +250,14 @@ struct OverlaySnapshotFlushRequest {
     bytes: usize,
     first_version: i64,
     last_version: i64,
-    deltas: Vec<(Vec<u8>, i64)>,
+    delta_batches: Vec<EncodedDeltaBatch>,
+}
+
+fn into_owned_deltas(deltas: EncodedDeltaBatch) -> Vec<(Vec<u8>, i64)> {
+    match Arc::try_unwrap(deltas) {
+        Ok(deltas) => deltas,
+        Err(deltas) => deltas.as_ref().clone(),
+    }
 }
 
 impl DbspGraphBuilder {
@@ -832,13 +840,13 @@ impl DbspGraphBuilder {
             registry.publish_logical_version(ts);
             return Ok(());
         }
-        let apply_stats = registry.append_encoded_overlay_batch(ts_u64, merged.clone());
+        let apply_stats = registry.append_shared_encoded_overlay_batch(ts_u64, Arc::clone(&merged));
         registry
-            .apply_encoded_state_batch(&merged)
+            .apply_encoded_state_batch(merged.as_slice())
             .with_context(|| {
                 format!("update overlay state cache for materialized view '{view_label}' at {ts}")
             })?;
-        pending_snapshot.record(ts, &merged);
+        pending_snapshot.record(ts, merged);
         let latency_ms = apply_start.elapsed().as_millis() as u64;
         metrics::observe_mv_update_latency_ms(latency_ms);
         metrics::inc_mv_updates();
@@ -875,7 +883,11 @@ impl DbspGraphBuilder {
         request: OverlaySnapshotFlushRequest,
     ) -> Result<()> {
         let flush_start = Instant::now();
-        view.add_deltas(request.deltas);
+        let mut deltas = Vec::with_capacity(request.rows);
+        for batch in request.delta_batches {
+            deltas.extend(into_owned_deltas(batch));
+        }
+        view.add_deltas(deltas);
         let handle = view
             .flush()
             .await
@@ -1020,7 +1032,7 @@ impl DbspGraphBuilder {
     async fn transform_transient_batch(
         delta_transform: Arc<DeltaTransformFn>,
         batch: TransientSourceBatch,
-    ) -> Result<(DeltaApplyStats, Vec<(Vec<u8>, i64)>)> {
+    ) -> Result<(DeltaApplyStats, EncodedDeltaBatch)> {
         let transform_start = Instant::now();
         let input_rows = batch.deltas.len();
         let input_bytes = batch
@@ -1028,7 +1040,7 @@ impl DbspGraphBuilder {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let merged = delta_transform(batch.deltas)
+        let merged = delta_transform(into_owned_deltas(batch.deltas))
             .context("apply transient transform before materialized view")?;
         let transform_ms = transform_start.elapsed().as_millis() as u64;
         Ok((
@@ -1039,7 +1051,7 @@ impl DbspGraphBuilder {
                 transform_ms,
                 merge_ms: 0,
             },
-            merged,
+            Arc::new(merged),
         ))
     }
 

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::event_parser::parse_event_line;
 use crate::source::SourceEventSender;
+use crate::source::send_event;
 use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 
 #[derive(Debug, Clone)]
@@ -71,8 +72,7 @@ impl Connector for FileConnector {
         let cursor = u64::try_from(self.cursor).unwrap_or(u64::MAX);
         self.cursor = self.cursor.saturating_add(1);
         let event = event.with_resume_token(SourceResumeToken::File { cursor });
-        ctx.sender()
-            .send(event)
+        send_event(ctx.sender(), event)
             .await
             .context("failed to send file connector event")?;
         Ok(ConnectorTick::Emitted(1))
