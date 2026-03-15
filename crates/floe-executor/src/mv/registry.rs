@@ -305,6 +305,15 @@ impl MaterializedViewHandle {
         Some((state.base_version, target_version, overlay))
     }
 
+    pub fn encoded_overlay_batch(&self, version: u64) -> Option<Vec<(Vec<u8>, i64)>> {
+        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+        let state = guard.as_ref()?;
+        state
+            .batches
+            .get(&version)
+            .map(|deltas| deltas.iter().cloned().collect())
+    }
+
     pub fn compact_encoded_overlay_up_to(
         &self,
         base_version: u64,

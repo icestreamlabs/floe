@@ -3,7 +3,9 @@ use anyhow::Result;
 use floe_node::generator::BID_SOURCE_NAME;
 
 use crate::harness::MvTestHarness;
-use crate::helpers::{append_auction, append_bid, append_row, wait_for_version};
+use crate::helpers::{
+    append_auction, append_bid, append_row, wait_for_materialized_row_count, wait_for_version,
+};
 use crate::rows::{bid_row_nullable, int_rows, int_rows2};
 
 #[tokio::test]
@@ -22,7 +24,7 @@ async fn sql_filter_excludes_nulls() -> Result<()> {
         bid_row_nullable(Some(1), None, 10),
     )
     .await?;
-    append_row(
+    let handle = append_row(
         &mut harness.outer,
         &mut harness.ingestion_bridge,
         BID_SOURCE_NAME,
@@ -30,7 +32,12 @@ async fn sql_filter_excludes_nulls() -> Result<()> {
     )
     .await?;
 
-    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+    wait_for_version(
+        &harness.mv_registry,
+        &harness.view_name,
+        handle.version as i64,
+    )
+    .await?;
 
     let (session, _) = harness.session_with_view().await?;
     let df = session
@@ -71,8 +78,7 @@ async fn sql_join_skips_null_keys() -> Result<()> {
     )
     .await?;
     append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 8, 60).await?;
-
-    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+    wait_for_materialized_row_count(&harness.mv_registry, &harness.view_name, 1).await?;
 
     let (session, _) = harness.session_with_view().await?;
     let df = session

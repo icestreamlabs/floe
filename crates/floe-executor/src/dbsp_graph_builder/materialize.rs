@@ -367,7 +367,12 @@ impl DbspGraphBuilder {
                     .await
                     .context("flush pending materialized view updates (catchup)")?
                     {
-                        let state = self.state_from_handle(&flush.handle).await?;
+                        let logical_version =
+                            u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
+                        let state = self
+                            .state_from_handle(&flush.handle)
+                            .await?
+                            .with_logical_version(logical_version);
                         registry_handle.set_dbsp_state(state);
                         registry_handle.publish_version(flush.published_ts, flush.handle.clone());
                         mv_latest.insert(view_name.to_string(), (flush.published_ts, flush.handle));
@@ -387,7 +392,12 @@ impl DbspGraphBuilder {
                 .await
                 .context("flush pending materialized view updates at catchup boundary")?
                 {
-                    let state = self.state_from_handle(&flush.handle).await?;
+                    let logical_version =
+                        u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
+                    let state = self
+                        .state_from_handle(&flush.handle)
+                        .await?
+                        .with_logical_version(logical_version);
                     registry_handle.set_dbsp_state(state);
                     registry_handle.publish_version(flush.published_ts, flush.handle.clone());
                     mv_latest.insert(view_name.to_string(), (flush.published_ts, flush.handle));
@@ -952,9 +962,11 @@ impl DbspGraphBuilder {
                 .await
                 .context("flush pending materialized view updates")?
         {
+            let logical_version = u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
             let state = Self::state_from_handle_with_bridge(bridge, &flush.handle)
                 .await
-                .with_context(|| format!("update materialized view '{view_label}' state"))?;
+                .with_context(|| format!("update materialized view '{view_label}' state"))?
+                .with_logical_version(logical_version);
             registry.set_dbsp_state(state);
             registry.publish_version(flush.published_ts, flush.handle);
             metrics::observe_mv_update_latency_ms(flush.latency_ms);

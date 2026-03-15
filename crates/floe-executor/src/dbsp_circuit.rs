@@ -136,8 +136,11 @@ impl DbspCircuitInstance {
                 Ok(snapshot_handle) => {
                     let latest = view.latest_handle_view();
                     let (dict, table, namespace, version) = latest.into_parts();
-                    view_handle
-                        .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+                    let logical_version = u64::try_from(ts.max(0)).unwrap_or(u64::MAX);
+                    view_handle.set_dbsp_state(
+                        DbspPersistedState::new(dict, table, namespace, version)
+                            .with_logical_version(logical_version),
+                    );
                     view_handle.publish_version(ts, snapshot_handle);
                 }
                 Err(err) => {
@@ -179,9 +182,12 @@ impl DbspCircuitInstance {
                                 Ok(snapshot_handle) => {
                                     let latest = view.latest_handle_view();
                                     let (dict, table, namespace, version) = latest.into_parts();
-                                    view_handle.set_dbsp_state(DbspPersistedState::new(
-                                        dict, table, namespace, version,
-                                    ));
+                                    let logical_version =
+                                        u64::try_from(ts.max(0)).unwrap_or(u64::MAX);
+                                    view_handle.set_dbsp_state(
+                                        DbspPersistedState::new(dict, table, namespace, version)
+                                            .with_logical_version(logical_version),
+                                    );
                                     view_handle.publish_version(ts, snapshot_handle);
                                 }
                                 Err(err) => {

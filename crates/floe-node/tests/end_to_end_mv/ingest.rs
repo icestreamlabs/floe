@@ -35,7 +35,8 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
         )
         .await?;
     }
-    wait_for_version(&harness.mv_registry, &harness.view_name, 2).await?;
+    let target_version = handles.last().expect("latest handle").version as i64;
+    wait_for_version(&harness.mv_registry, &harness.view_name, target_version).await?;
 
     let (session, _bridge) = harness.session_with_view().await?;
 

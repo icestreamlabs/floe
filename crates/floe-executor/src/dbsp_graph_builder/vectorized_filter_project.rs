@@ -120,11 +120,8 @@ impl VectorizedFilterProjectEvaluator {
                 .collect::<Result<Vec<_>>>()?;
             ProjectionPlan::Physical(Arc::new(projections))
         };
-        let encoded_fast_path = build_encoded_fast_path(
-            Some(&predicate),
-            &projection_plan,
-            input_schema.as_ref(),
-        );
+        let encoded_fast_path =
+            build_encoded_fast_path(Some(&predicate), &projection_plan, input_schema.as_ref());
         Ok(Self {
             input_schema,
             predicate: Some(predicate),
@@ -166,7 +163,7 @@ impl VectorizedFilterProjectEvaluator {
         } else {
             PredicatePlan::Physical(
                 ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-                .context("compile vectorized filter predicate expression")?,
+                    .context("compile vectorized filter predicate expression")?,
             )
         };
         let projection_plan = ProjectionPlan::column_indices(projections, input_width);

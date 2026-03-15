@@ -267,7 +267,8 @@ impl CheckpointStore {
     }
 
     pub async fn persist_tick_commit(&self, commit: &TickCommit) -> Result<()> {
-        self.persist_tick_commit_with_source_batches(commit, &[]).await
+        self.persist_tick_commit_with_source_batches(commit, &[])
+            .await
     }
 
     pub async fn persist_tick_commit_with_source_batches(
@@ -277,7 +278,13 @@ impl CheckpointStore {
     ) -> Result<()> {
         let mut batch = WriteBatch::new();
         for (source, max_event_time_ms, deltas) in source_batches {
-            append_entry_to_batch(&mut batch, source, commit.tick_id, *max_event_time_ms, deltas)?;
+            append_entry_to_batch(
+                &mut batch,
+                source,
+                commit.tick_id,
+                *max_event_time_ms,
+                deltas,
+            )?;
         }
         let commit_key = self.tick_commit_key(commit.tick_id);
         let serialized = serde_json::to_vec(commit).context("serialize tick commit to JSON")?;
@@ -534,7 +541,8 @@ impl CheckpointManager {
     }
 
     pub async fn persist_tick_commit(&mut self, commit: TickCommit) -> Result<()> {
-        self.persist_tick_commit_with_source_batches(commit, &[]).await
+        self.persist_tick_commit_with_source_batches(commit, &[])
+            .await
     }
 
     pub async fn persist_tick_commit_with_source_batches(
@@ -674,13 +682,15 @@ pub async fn recover_materialized_views(
                 )
             })?;
         let (dict, table, namespace, version) = handle_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, namespace, version);
-        view_handle.set_dbsp_state(state);
         let frontier = if entry.frontier == 0 {
             i64::try_from(entry.version).unwrap_or(i64::MAX)
         } else {
             entry.frontier
         };
+        let logical_version = u64::try_from(frontier.max(0)).unwrap_or(u64::MAX);
+        let state = DbspPersistedState::new(dict, table, namespace, version)
+            .with_logical_version(logical_version);
+        view_handle.set_dbsp_state(state);
         view_handle.publish_version(frontier, handle);
     }
     if manifest.watermark > 0 {

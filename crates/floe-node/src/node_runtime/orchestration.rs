@@ -1392,10 +1392,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     .iter()
                     .enumerate()
                     .filter_map(|(source_id, count)| {
-                        (*count > 0).then_some((
-                            source_names_by_id_for_task[source_id].as_str(),
-                            *count,
-                        ))
+                        (*count > 0)
+                            .then_some((source_names_by_id_for_task[source_id].as_str(), *count))
                     })
                     .collect();
                 let per_connector: Vec<_> = connector_queues

@@ -77,6 +77,54 @@ async fn materialized_view_provider_emits_rows() {
 }
 
 #[tokio::test]
+async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_logical_version_test");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv-provider-logical-version", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let mut dbsp_view = bridge
+        .new_view(
+            "mv_logical_version_test",
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("dbsp view");
+    let row = vec![
+        ScalarValue::Int64(Some(7)),
+        ScalarValue::Utf8(Some("seven".into())),
+    ];
+    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    let handle = dbsp_view.flush().await.expect("flush logical version test");
+    let logical_version = 42_i64;
+    view.publish_version(logical_version, handle.clone());
+    let latest_view = dbsp_view.latest_handle_view();
+    let (dict, table, namespace, version) = latest_view.into_parts();
+    view.set_dbsp_state(
+        DbspPersistedState::new(dict, table, namespace, version)
+            .with_logical_version(logical_version as u64),
+    );
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_logical_version_test", schema);
+
+    let as_of = provider
+        .build_batches_at_version(logical_version as u64)
+        .await
+        .expect("build logical as of version");
+    assert_eq!(as_of.len(), 1);
+    assert_eq!(as_of[0].num_rows(), 1);
+}
+
+#[tokio::test]
 async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_projection_limit");

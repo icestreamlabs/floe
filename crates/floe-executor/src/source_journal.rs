@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use dbsp::storage::KeyValueTable;
-use slatedb::config::ScanOptions;
 use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 
 use crate::outer_stream::OuterStreamRegistry;
 
@@ -41,12 +41,9 @@ impl SourceBatchJournal {
         if encoded_len == 0 {
             return Ok(0);
         }
-        self.table
-            .write_batch(batch)
-            .await
-            .with_context(|| {
-                format!("persist source batch journal entry for '{source}' at tick {tick_id}")
-            })?;
+        self.table.write_batch(batch).await.with_context(|| {
+            format!("persist source batch journal entry for '{source}' at tick {tick_id}")
+        })?;
         Ok(encoded_len)
     }
 
