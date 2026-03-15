@@ -108,7 +108,7 @@ where
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
         let ids = dict
-            .intern_many_values(staged.iter().map(|(key, _)| *key))
+            .intern_many_values_unique(staged.iter().map(|(key, _)| *key))
             .await
             .context("intern keys while staging filter delta")?;
         for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {

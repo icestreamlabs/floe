@@ -580,6 +580,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     );
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
+    let pending_event_counter = core_source::PendingEventCounter::default();
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
@@ -588,7 +589,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .collect();
 
     for (connector_id, connector) in connector_specs.into_iter().enumerate() {
-        let sender = core_source::routed_sender(connector_id, connector_sender.clone());
+        let sender = core_source::routed_sender(
+            connector_id,
+            connector_sender.clone(),
+            pending_event_counter.clone(),
+        );
         connector_queues.push(ConnectorQueue::new(connector_id, connector.name.clone()));
         let cancel = ingest_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
@@ -939,6 +944,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 max_batch,
                 max_batch_per_source,
                 max_batch_per_connector,
+                &pending_event_counter,
             );
 
             if batch.is_empty() {
