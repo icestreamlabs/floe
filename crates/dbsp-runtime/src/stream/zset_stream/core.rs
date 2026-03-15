@@ -419,7 +419,7 @@ where
 
         let intern_main_start = std::time::Instant::now();
         let ids = dict
-            .intern_many_values(
+            .intern_many_values_unique(
                 overlay
                     .iter()
                     .filter_map(|(key, delta)| (*delta != 0).then_some(key)),
