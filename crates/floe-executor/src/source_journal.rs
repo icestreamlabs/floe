@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use dbsp::storage::KeyValueTable;
 use slatedb::config::ScanOptions;
+use slatedb::WriteBatch;
 
 use crate::outer_stream::OuterStreamRegistry;
 
@@ -34,17 +35,19 @@ impl SourceBatchJournal {
         max_event_time_ms: Option<i64>,
         deltas: &[(Vec<u8>, i64)],
     ) -> Result<usize> {
-        if deltas.is_empty() {
+        let mut batch = WriteBatch::new();
+        let encoded_len =
+            append_entry_to_batch(&mut batch, source, tick_id, max_event_time_ms, deltas)?;
+        if encoded_len == 0 {
             return Ok(0);
         }
-        let encoded = encode_entry(max_event_time_ms, deltas)?;
         self.table
-            .put(&entry_key(source, tick_id)?, &encoded)
+            .write_batch(batch)
             .await
             .with_context(|| {
                 format!("persist source batch journal entry for '{source}' at tick {tick_id}")
             })?;
-        Ok(encoded.len())
+        Ok(encoded_len)
     }
 
     pub async fn load_committed_entries_up_to(
@@ -106,6 +109,22 @@ impl SourceBatchJournal {
         }
         Ok(replayed)
     }
+}
+
+pub(crate) fn append_entry_to_batch(
+    batch: &mut WriteBatch,
+    source: &str,
+    tick_id: u64,
+    max_event_time_ms: Option<i64>,
+    deltas: &[(Vec<u8>, i64)],
+) -> Result<usize> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+    let encoded = encode_entry(max_event_time_ms, deltas)?;
+    let encoded_len = encoded.len();
+    batch.put(entry_key(source, tick_id)?, encoded);
+    Ok(encoded_len)
 }
 
 fn entry_prefix() -> Vec<u8> {

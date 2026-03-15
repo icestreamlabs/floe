@@ -830,7 +830,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
-    let source_batch_journal_for_task = source_batch_journal.clone();
     let transient_only_source_ids_for_task = Arc::clone(&transient_only_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
     let mut connector_receiver_for_task = connector_receiver;
@@ -1217,29 +1216,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if pre_tick_commit_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
-            for (source_id, max_event_time_ms, deltas) in &source_journal_batches {
-                let source_name = source_names_by_id_for_task[*source_id].as_str();
-                if let Err(err) = source_batch_journal_for_task
-                    .append(source_name, epoch, *max_event_time_ms, deltas)
-                    .await
-                {
-                    tracing::error!(
-                        epoch,
-                        source = %source_name,
-                        error = %err,
-                        "failed to append source batch journal"
-                    );
-                    record_runtime_failure(
-                        &failure_for_executor,
-                        format!(
-                            "failed to append source batch journal for source '{}' at tick {}: {}",
-                            source_name, epoch, err
-                        ),
-                    );
-                    executor_cancel.cancel();
-                    break 'executor;
-                }
-            }
             // Advance frontier for all sources this epoch, even if they had no rows.
             let mut registry = outer_for_task.lock().await;
             let tick_all_start = Instant::now();
@@ -1313,8 +1289,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 checkpoint_manager.snapshot_sink_cursors(),
             );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
+            let source_journal_commit_batches: Vec<_> = source_journal_batches
+                .iter()
+                .map(|(source_id, max_event_time_ms, deltas)| {
+                    (
+                        source_names_by_id_for_task[*source_id].clone(),
+                        *max_event_time_ms,
+                        deltas.clone(),
+                    )
+                })
+                .collect();
             let checkpoint_write_start = Instant::now();
-            if let Err(err) = checkpoint_manager.persist_tick_commit(tick_commit).await {
+            if let Err(err) = checkpoint_manager
+                .persist_tick_commit_with_source_batches(
+                    tick_commit,
+                    &source_journal_commit_batches,
+                )
+                .await
+            {
                 metrics::observe_tick_phase_latency_ms(
                     "checkpoint_write",
                     checkpoint_write_start.elapsed().as_millis() as u64,
