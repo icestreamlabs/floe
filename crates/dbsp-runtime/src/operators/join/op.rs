@@ -233,7 +233,7 @@ where
             keyed_deltas.push((key, *delta));
         }
         let ids = dict
-            .intern_many_values(keyed_deltas.iter().map(|(key, _)| *key))
+            .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))
             .await
             .context("batch intern keys while staging join delta")?;
         for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
