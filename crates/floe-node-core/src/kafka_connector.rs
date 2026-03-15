@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -68,8 +69,15 @@ pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
+    direct_decode_lookup: DirectDecodeLookup,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DirectDecodeLookup {
+    definition_index_by_name: HashMap<String, usize>,
+    column_indexes_by_definition: Vec<HashMap<String, usize>>,
 }
 
 impl KafkaConnector {
@@ -84,10 +92,12 @@ impl KafkaConnector {
             "kafka max messages per tick must be positive"
         );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
+        let direct_decode_lookup = build_direct_decode_lookup(&definitions);
         Ok(Self {
             config,
             message_format,
             definitions,
+            direct_decode_lookup,
             consumer: None,
             last_committed_tick_id: 0,
         })
@@ -126,6 +136,7 @@ impl KafkaConnector {
                 self.config.default_source.as_deref(),
                 message.topic(),
                 &self.definitions,
+                &self.direct_decode_lookup,
             ) {
                 Ok(Some(event)) => Ok(vec![event]),
                 Ok(None) => parse_floe_json_events(
@@ -360,12 +371,14 @@ fn parse_direct_floe_json_event(
     default_source: Option<&str>,
     topic: &str,
     definitions: &[SourceDefinition],
+    lookup: &DirectDecodeLookup,
 ) -> Result<Option<SourceEvent>> {
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     DirectFloeJsonEventSeed {
         default_source,
         topic,
         definitions,
+        lookup,
     }
     .deserialize(&mut deserializer)
     .map_err(|err| anyhow::anyhow!("direct floe_json decode failed: {err}"))
@@ -375,6 +388,7 @@ struct DirectFloeJsonEventSeed<'a> {
     default_source: Option<&'a str>,
     topic: &'a str,
     definitions: &'a [SourceDefinition],
+    lookup: &'a DirectDecodeLookup,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectFloeJsonEventSeed<'_> {
@@ -421,15 +435,20 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
                         skip_remaining_map(&mut map)?;
                         return Ok(None);
                     };
-                    let Some(definition) =
-                        lookup_source_definition(self.seed.definitions, source_name)
-                    else {
+                    let Some((definition_idx, definition)) = lookup_source_definition(
+                        self.seed.definitions,
+                        &self.seed.lookup.definition_index_by_name,
+                        source_name,
+                    ) else {
                         let _: IgnoredAny = map.next_value()?;
                         skip_remaining_map(&mut map)?;
                         return Ok(None);
                     };
-                    let (encoded, parsed_event_ts) =
-                        map.next_value_seed(DirectSourceDataSeed { definition })?;
+                    let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceDataSeed {
+                        definition,
+                        column_indexes: &self.seed.lookup.column_indexes_by_definition
+                            [definition_idx],
+                    })?;
                     encoded_row = Some(encoded);
                     if event_ts.is_none() {
                         event_ts = parsed_event_ts;
@@ -467,6 +486,7 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
 
 struct DirectSourceDataSeed<'a> {
     definition: &'a SourceDefinition,
+    column_indexes: &'a HashMap<String, usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
@@ -478,12 +498,14 @@ impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
     {
         deserializer.deserialize_map(DirectSourceDataVisitor {
             definition: self.definition,
+            column_indexes: self.column_indexes,
         })
     }
 }
 
 struct DirectSourceDataVisitor<'a> {
     definition: &'a SourceDefinition,
+    column_indexes: &'a HashMap<String, usize>,
 }
 
 impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
@@ -500,7 +522,9 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
         let mut encoded_columns = vec![None; self.definition.columns().len()];
         let mut event_ts = None;
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-            if let Some((idx, column)) = lookup_source_column(self.definition, key.as_ref()) {
+            if let Some((idx, column)) =
+                lookup_source_column(self.definition, self.column_indexes, key.as_ref())
+            {
                 let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceColumnSeed {
                     data_type: column.data_type(),
                     nullable: column.nullable(),
@@ -630,22 +654,37 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
 
 fn lookup_source_definition<'a>(
     definitions: &'a [SourceDefinition],
+    definition_index_by_name: &HashMap<String, usize>,
     source: &str,
-) -> Option<&'a SourceDefinition> {
-    definitions
-        .iter()
-        .find(|definition| definition.name() == source)
+) -> Option<(usize, &'a SourceDefinition)> {
+    let idx = definition_index_by_name.get(source).copied()?;
+    Some((idx, definitions.get(idx)?))
 }
 
 fn lookup_source_column<'a>(
     definition: &'a SourceDefinition,
+    column_indexes: &HashMap<String, usize>,
     field_name: &str,
 ) -> Option<(usize, &'a floe_core::source::SourceColumn)> {
-    definition
-        .columns()
-        .iter()
-        .enumerate()
-        .find(|(_, column)| column.name() == field_name)
+    let idx = column_indexes.get(field_name).copied()?;
+    Some((idx, definition.columns().get(idx)?))
+}
+
+fn build_direct_decode_lookup(definitions: &[SourceDefinition]) -> DirectDecodeLookup {
+    let mut definition_index_by_name = HashMap::with_capacity(definitions.len());
+    let mut column_indexes_by_definition = Vec::with_capacity(definitions.len());
+    for (definition_idx, definition) in definitions.iter().enumerate() {
+        definition_index_by_name.insert(definition.name().to_string(), definition_idx);
+        let mut column_indexes = HashMap::with_capacity(definition.columns().len());
+        for (column_idx, column) in definition.columns().iter().enumerate() {
+            column_indexes.insert(column.name().to_string(), column_idx);
+        }
+        column_indexes_by_definition.push(column_indexes);
+    }
+    DirectDecodeLookup {
+        definition_index_by_name,
+        column_indexes_by_definition,
+    }
 }
 
 fn skip_remaining_map<'de, A>(map: &mut A) -> std::result::Result<(), A::Error>
@@ -867,10 +906,12 @@ mod tests {
         )
         .expect("definition");
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
+        let lookup = build_direct_decode_lookup(&[definition.clone()]);
 
-        let direct = parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()])
-            .expect("direct parse")
-            .expect("direct event");
+        let direct =
+            parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()], &lookup)
+                .expect("direct parse")
+                .expect("direct event");
         let expected_event = SourceEvent::new(
             "nexmark_bid",
             json!({
