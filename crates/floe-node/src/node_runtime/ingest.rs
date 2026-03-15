@@ -183,68 +183,70 @@ pub(super) fn current_unix_time_ms() -> u64 {
     }
 }
 
-pub(super) async fn recv_from_any(queues: &mut Vec<ConnectorQueue>) -> bool {
-    if queues.is_empty() {
+pub(super) async fn recv_from_ready(
+    receiver: &mut core_source::RoutedSourceEventReceiver,
+    queues: &mut [ConnectorQueue],
+) -> bool {
+    let Some(batch) = receiver.recv().await else {
         return false;
-    }
-    let (event, index) = {
-        let futures: Vec<_> = queues
-            .iter_mut()
-            .map(|queue| Box::pin(queue.receiver.recv()))
-            .collect();
-        let (event, index, _remaining) = select_all(futures).await;
-        (event, index)
     };
-    match event {
-        Some(events) => {
-            queues[index].pending.extend(events);
-        }
-        None => {
-            queues[index].closed = true;
-        }
+    if let Some(queue) = queues.get_mut(batch.connector_id) {
+        queue.pending.extend(batch.events);
     }
-    queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
-    !queues.is_empty()
+    true
 }
 
-pub(super) fn drain_connectors(queues: &mut [ConnectorQueue], capacity: usize) {
-    for queue in queues.iter_mut() {
-        while queue.pending.len() < capacity {
-            match queue.receiver.try_recv() {
-                Ok(events) => queue.pending.extend(events),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    queue.closed = true;
-                    break;
+pub(super) fn drain_ready(
+    receiver: &mut core_source::RoutedSourceEventReceiver,
+    queues: &mut [ConnectorQueue],
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(batch) => {
+                if let Some(queue) = queues.get_mut(batch.connector_id) {
+                    queue.pending.extend(batch.events);
                 }
             }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
 }
 
 pub(super) fn build_batch(
     queues: &mut [ConnectorQueue],
+    source_id_by_name: &HashMap<String, usize>,
+    source_count: usize,
     start_index: usize,
     max_batch: usize,
     max_per_source: usize,
     max_per_connector: usize,
 ) -> BatchSelection {
     let mut batch = Vec::with_capacity(max_batch);
-    let mut per_source_counts: HashMap<String, usize> = HashMap::new();
-    let mut per_connector_counts: HashMap<String, usize> = HashMap::new();
+    let mut per_source_counts = vec![0usize; source_count];
+    let mut unknown_source_counts: HashMap<String, usize> = HashMap::new();
+    let per_connector_count_len = queues
+        .iter()
+        .map(|queue| queue.id)
+        .max()
+        .map_or(0, |id| id + 1);
+    let mut per_connector_counts = vec![0usize; per_connector_count_len];
     let mut deferred: Vec<VecDeque<core_source::SourceEvent>> = vec![VecDeque::new(); queues.len()];
     let connector_count = queues.len();
     for step in 0..connector_count {
         let idx = (start_index + step) % connector_count;
         let queue = &mut queues[idx];
         let deferred_queue = &mut deferred[idx];
-        let per_connector = per_connector_counts.entry(queue.name.clone()).or_insert(0);
+        let per_connector = &mut per_connector_counts[queue.id];
         while *per_connector < max_per_connector && batch.len() < max_batch {
             let Some(event) = queue.pending.pop_front() else {
                 break;
             };
             let source = event.source();
-            let count = per_source_counts.entry(source.to_string()).or_insert(0);
+            let count = if let Some(source_id) = source_id_by_name.get(source) {
+                &mut per_source_counts[*source_id]
+            } else {
+                unknown_source_counts.entry(source.to_string()).or_insert(0)
+            };
             if *count >= max_per_source {
                 deferred_queue.push_back(event);
                 continue;

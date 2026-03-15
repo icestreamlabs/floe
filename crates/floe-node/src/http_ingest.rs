@@ -343,9 +343,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_ingest_accepts_events() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel::<Vec<SourceEvent>>(4);
         let state = HttpIngestState {
-            sender: tx,
+            sender: SourceEventSender::Direct(tx),
             default_source: Some("nexmark_bid".to_string()),
             cancel: CancellationToken::new(),
             health: None,
@@ -373,7 +373,7 @@ mod tests {
     async fn healthz_reports_unavailable_when_executor_stops() {
         let (tx, _rx) = mpsc::channel(1);
         let state = HttpIngestState {
-            sender: tx,
+            sender: SourceEventSender::Direct(tx),
             default_source: Some("nexmark_bid".to_string()),
             cancel: CancellationToken::new(),
             health: Some(HttpIngestHealth {
@@ -417,7 +417,7 @@ mod tests {
             }],
         }));
         let state = HttpIngestState {
-            sender: tx,
+            sender: SourceEventSender::Direct(tx),
             default_source: Some("nexmark_bid".to_string()),
             cancel: CancellationToken::new(),
             health: Some(HttpIngestHealth {

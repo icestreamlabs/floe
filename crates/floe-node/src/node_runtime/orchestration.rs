@@ -540,11 +540,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     });
     let connector_count = connector_specs.len();
-    let per_connector_queue_capacity = (queue_capacity / connector_count).max(1);
     tracing::info!(
         connector_count,
         queue_capacity,
-        per_connector_queue_capacity,
         max_batch,
         max_batch_per_source,
         max_batch_per_connector,
@@ -556,6 +554,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
+    let source_id_by_name: HashMap<String, usize> = definitions
+        .iter()
+        .enumerate()
+        .map(|(idx, definition)| (definition.name().to_string(), idx))
+        .collect();
+    let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
@@ -563,9 +567,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .map(|cursor| (cursor.sink.clone(), cursor))
         .collect();
 
-    for connector in connector_specs {
-        let (sender, receiver) = core_source::channel(per_connector_queue_capacity);
-        connector_queues.push(ConnectorQueue::new(connector.name.clone(), receiver));
+    for (connector_id, connector) in connector_specs.into_iter().enumerate() {
+        let sender = core_source::routed_sender(connector_id, connector_sender.clone());
+        connector_queues.push(ConnectorQueue::new(connector_id, connector.name.clone()));
         let cancel = ingest_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
         let failure_state = Arc::clone(&runtime_failure);
@@ -792,6 +796,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
         }
     }
+    drop(connector_sender);
     let outer_for_task = Arc::clone(&outer_registry);
     let decoder_for_task = Arc::clone(&decoder_registry);
     let materialized_sources_for_task = all_required_sources.clone();
@@ -806,6 +811,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_batch_journal_for_task = source_batch_journal.clone();
     let transient_only_sources_for_task = transient_only_sources.clone();
+    let source_id_by_name_for_task = source_id_by_name;
+    let mut connector_receiver_for_task = connector_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -893,20 +900,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             {
                 let has_events = tokio::select! {
                     _ = executor_cancel.cancelled() => false,
-                    has_events = recv_from_any(&mut connector_queues) => has_events,
+                    has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
                 };
                 if !has_events {
                     break;
                 }
             }
-            drain_connectors(&mut connector_queues, per_connector_queue_capacity);
-            connector_queues.retain(|queue| !(queue.closed && queue.pending.is_empty()));
+            drain_ready(&mut connector_receiver_for_task, &mut connector_queues);
 
             let BatchSelection {
                 batch,
                 per_connector_counts,
             } = build_batch(
                 &mut connector_queues,
+                &source_id_by_name_for_task,
+                source_id_by_name_for_task.len(),
                 next_connector,
                 max_batch,
                 max_batch_per_source,
@@ -939,7 +947,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 raw_batch_size = batch_len
             );
             let _decode_guard = decode_span.enter();
-            for event in batch {
+            for mut event in batch {
                 let source_name = event.source().to_string();
                 if let Some((partition, offset)) = event_resume_offset(event.resume_token()) {
                     let entry = tick_source_offsets
@@ -977,8 +985,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         break 'executor;
                     }
                 };
-                let event_ts = if let Some(preencoded_row_key) = event.preencoded_row_key() {
-                    encoded_rows.push((source_name.clone(), preencoded_row_key.to_vec()));
+                let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
+                    encoded_rows.push((source_name.clone(), preencoded_row_key));
                     None
                 } else {
                     match decoder.encode_row_key(&event) {
@@ -1320,15 +1328,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
             let queue_depth: usize = connector_queues
                 .iter()
-                .map(|queue| queue.pending.len() + queue.receiver.len())
+                .map(|queue| queue.pending.len())
                 .sum();
-            metrics::record_ingest_queue_depth(queue_depth);
+            let total_queue_depth = queue_depth.saturating_add(connector_receiver_for_task.len());
+            metrics::record_ingest_queue_depth(total_queue_depth);
             if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
+                let per_connector: Vec<_> = connector_queues
+                    .iter()
+                    .map(|queue| (queue.name.as_str(), per_connector_counts[queue.id]))
+                    .filter(|(_, count)| *count > 0)
+                    .collect();
                 tracing::info!(
                     epoch,
-                    queue_depth,
+                    queue_depth = total_queue_depth,
                     batch_size = batch_len,
-                    pending = queue_depth,
+                    pending = total_queue_depth,
                     decoded_rows = decoded_rows_len,
                     max_batch,
                     max_batch_per_source,
@@ -1338,7 +1352,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     checkpoint_write_latency_ms,
                     tick_latency_ms,
                     per_source = ?decoded_counts,
-                    per_connector = ?per_connector_counts,
+                    per_connector = ?per_connector,
                     "ingest batch metrics"
                 );
             }

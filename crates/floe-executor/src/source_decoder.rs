@@ -27,7 +27,9 @@ impl SourceRowDecoder {
                 self.definition.name()
             );
         }
-        let payload = event.payload();
+        let payload = event
+            .payload()
+            .context("source payload must be present for decoded events")?;
         let object = payload
             .as_object()
             .context("source payload must be a JSON object")?;
@@ -61,7 +63,9 @@ impl SourceRowDecoder {
                 self.definition.name()
             );
         }
-        let payload = event.payload();
+        let payload = event
+            .payload()
+            .context("source payload must be present for encoded events")?;
         let object = payload
             .as_object()
             .context("source payload must be a JSON object")?;
