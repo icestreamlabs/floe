@@ -97,8 +97,13 @@ struct ConnectorQueue {
     pending: VecDeque<core_source::SourceEvent>,
 }
 
+struct SelectedSourceEvent {
+    source_id: Option<usize>,
+    event: core_source::SourceEvent,
+}
+
 struct BatchSelection {
-    batch: Vec<core_source::SourceEvent>,
+    batch: Vec<SelectedSourceEvent>,
     per_connector_counts: Vec<usize>,
 }
 
