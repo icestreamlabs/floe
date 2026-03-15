@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -68,6 +69,7 @@ pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
+    direct_source_plans: HashMap<String, DirectSourcePlan>,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
 }
@@ -84,10 +86,12 @@ impl KafkaConnector {
             "kafka max messages per tick must be positive"
         );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
+        let direct_source_plans = build_direct_source_plans(&definitions)?;
         Ok(Self {
             config,
             message_format,
             definitions,
+            direct_source_plans,
             consumer: None,
             last_committed_tick_id: 0,
         })
@@ -125,7 +129,7 @@ impl KafkaConnector {
                 payload,
                 self.config.default_source.as_deref(),
                 message.topic(),
-                &self.definitions,
+                &self.direct_source_plans,
             ) {
                 Ok(Some(event)) => Ok(vec![event]),
                 Ok(None) => parse_floe_json_events(
@@ -359,22 +363,80 @@ fn parse_direct_floe_json_event(
     payload: &[u8],
     default_source: Option<&str>,
     topic: &str,
-    definitions: &[SourceDefinition],
+    direct_source_plans: &HashMap<String, DirectSourcePlan>,
 ) -> Result<Option<SourceEvent>> {
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     DirectFloeJsonEventSeed {
         default_source,
         topic,
-        definitions,
+        direct_source_plans,
     }
     .deserialize(&mut deserializer)
     .map_err(|err| anyhow::anyhow!("direct floe_json decode failed: {err}"))
 }
 
+#[derive(Debug, Clone)]
+struct DirectSourcePlan {
+    column_count: u32,
+    encoded_capacity: usize,
+    columns: Vec<DirectSourceColumnPlan>,
+    column_index_by_name: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectSourceColumnPlan {
+    name: String,
+    data_type: SourceDataType,
+    nullable: bool,
+}
+
+#[derive(Debug, Clone)]
+enum DirectColumnValue<'de> {
+    Int64(i64),
+    Utf8(Cow<'de, str>),
+    Bool(bool),
+    Null,
+}
+
+fn build_direct_source_plans(
+    definitions: &[SourceDefinition],
+) -> Result<HashMap<String, DirectSourcePlan>> {
+    let mut plans = HashMap::with_capacity(definitions.len());
+    for definition in definitions {
+        let mut column_index_by_name = HashMap::with_capacity(definition.columns().len());
+        let mut columns = Vec::with_capacity(definition.columns().len());
+        let mut encoded_capacity = 4usize;
+        for (idx, column) in definition.columns().iter().enumerate() {
+            column_index_by_name.insert(column.name().to_string(), idx);
+            columns.push(DirectSourceColumnPlan {
+                name: column.name().to_string(),
+                data_type: column.data_type().clone(),
+                nullable: column.nullable(),
+            });
+            encoded_capacity += match column.data_type() {
+                SourceDataType::Int64 | SourceDataType::TimestampMillis => 9,
+                SourceDataType::Bool => 2,
+                SourceDataType::Utf8 => 5,
+            };
+        }
+        plans.insert(
+            definition.name().to_string(),
+            DirectSourcePlan {
+                column_count: u32::try_from(definition.columns().len())
+                    .context("too many source columns to encode")?,
+                encoded_capacity,
+                columns,
+                column_index_by_name,
+            },
+        );
+    }
+    Ok(plans)
+}
+
 struct DirectFloeJsonEventSeed<'a> {
     default_source: Option<&'a str>,
     topic: &'a str,
-    definitions: &'a [SourceDefinition],
+    direct_source_plans: &'a HashMap<String, DirectSourcePlan>,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectFloeJsonEventSeed<'_> {
@@ -421,15 +483,15 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
                         skip_remaining_map(&mut map)?;
                         return Ok(None);
                     };
-                    let Some(definition) =
-                        lookup_source_definition(self.seed.definitions, source_name)
+                    let Some(plan) =
+                        self.seed.direct_source_plans.get(source_name)
                     else {
                         let _: IgnoredAny = map.next_value()?;
                         skip_remaining_map(&mut map)?;
                         return Ok(None);
                     };
                     let (encoded, parsed_event_ts) =
-                        map.next_value_seed(DirectSourceDataSeed { definition })?;
+                        map.next_value_seed(DirectSourceDataSeed { plan })?;
                     encoded_row = Some(encoded);
                     if event_ts.is_none() {
                         event_ts = parsed_event_ts;
@@ -466,7 +528,7 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
 }
 
 struct DirectSourceDataSeed<'a> {
-    definition: &'a SourceDefinition,
+    plan: &'a DirectSourcePlan,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
@@ -476,14 +538,12 @@ impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(DirectSourceDataVisitor {
-            definition: self.definition,
-        })
+        deserializer.deserialize_map(DirectSourceDataVisitor { plan: self.plan })
     }
 }
 
 struct DirectSourceDataVisitor<'a> {
-    definition: &'a SourceDefinition,
+    plan: &'a DirectSourcePlan,
 }
 
 impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
@@ -497,16 +557,15 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let mut encoded_columns = vec![None; self.definition.columns().len()];
+        let mut column_values = vec![None; self.plan.columns.len()];
         let mut event_ts = None;
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-            if let Some((idx, column)) = lookup_source_column(self.definition, key.as_ref()) {
-                let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceColumnSeed {
-                    data_type: column.data_type(),
-                    nullable: column.nullable(),
-                    field_name: column.name(),
+            if let Some(&idx) = self.plan.column_index_by_name.get(key.as_ref()) {
+                let column = &self.plan.columns[idx];
+                let (value, parsed_event_ts) = map.next_value_seed(DirectSourceColumnSeed {
+                    column,
                 })?;
-                encoded_columns[idx] = Some(encoded);
+                column_values[idx] = Some(value);
                 if event_ts.is_none() {
                     event_ts = parsed_event_ts;
                 }
@@ -515,19 +574,17 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
             }
         }
 
-        let mut row = Vec::with_capacity(64);
-        let count = u32::try_from(self.definition.columns().len())
-            .map_err(|_| de::Error::custom("too many source columns to encode"))?;
-        row.extend_from_slice(&count.to_le_bytes());
-        for (idx, column) in self.definition.columns().iter().enumerate() {
-            if let Some(encoded) = encoded_columns[idx].take() {
-                row.extend_from_slice(&encoded);
-            } else if column.nullable() {
-                encode_typed_null(&mut row, column.data_type());
+        let mut row = Vec::with_capacity(self.plan.encoded_capacity);
+        row.extend_from_slice(&self.plan.column_count.to_le_bytes());
+        for (idx, column) in self.plan.columns.iter().enumerate() {
+            if let Some(value) = column_values[idx].take() {
+                encode_direct_column_value(&mut row, column, value);
+            } else if column.nullable {
+                encode_typed_null(&mut row, &column.data_type);
             } else {
                 return Err(de::Error::custom(format!(
                     "missing field '{}' in source payload",
-                    column.name()
+                    column.name
                 )));
             }
         }
@@ -536,86 +593,69 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
 }
 
 struct DirectSourceColumnSeed<'a> {
-    data_type: &'a SourceDataType,
-    nullable: bool,
-    field_name: &'a str,
+    column: &'a DirectSourceColumnPlan,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
-    type Value = (Vec<u8>, Option<u64>);
+    type Value = (DirectColumnValue<'de>, Option<u64>);
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        match self.data_type {
+        match self.column.data_type {
             SourceDataType::Int64 => {
                 let value = Option::<i64>::deserialize(deserializer)?;
-                encode_i64_column(value, self.nullable, self.field_name, false)
-                    .map(|encoded| (encoded, None))
+                match value {
+                    Some(value) => Ok((DirectColumnValue::Int64(value), None)),
+                    None if self.column.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.column.name
+                    ))),
+                }
             }
             SourceDataType::TimestampMillis => {
                 let value = Option::<i64>::deserialize(deserializer)?;
-                let encoded = encode_i64_column(value, self.nullable, self.field_name, true)?;
-                let event_ts = value.filter(|value| *value >= 0).map(|value| value as u64);
-                Ok((encoded, event_ts))
+                match value {
+                    Some(value) => Ok((
+                        DirectColumnValue::Int64(value),
+                        (value >= 0).then_some(value as u64),
+                    )),
+                    None if self.column.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.column.name
+                    ))),
+                }
             }
             SourceDataType::Utf8 => {
                 let value = Option::<Cow<'de, str>>::deserialize(deserializer)?;
                 match value {
                     Some(value) => {
-                        let bytes = value.as_bytes();
-                        let len = u32::try_from(bytes.len())
+                        let _ = u32::try_from(value.len())
                             .map_err(|_| de::Error::custom("utf8 value too large for MV key"))?;
-                        let mut encoded = Vec::with_capacity(1 + 4 + bytes.len());
-                        encoded.push(0x02);
-                        encoded.extend_from_slice(&len.to_le_bytes());
-                        encoded.extend_from_slice(bytes);
-                        Ok((encoded, None))
+                        Ok((DirectColumnValue::Utf8(value), None))
                     }
-                    None if self.nullable => Ok((vec![0x06], None)),
+                    None if self.column.nullable => Ok((DirectColumnValue::Null, None)),
                     None => Err(de::Error::custom(format!(
                         "null value violates non-nullable column '{}'",
-                        self.field_name
+                        self.column.name
                     ))),
                 }
             }
             SourceDataType::Bool => {
                 let value = Option::<bool>::deserialize(deserializer)?;
                 match value {
-                    Some(value) => Ok((vec![0x04, if value { 1 } else { 0 }], None)),
-                    None if self.nullable => Ok((vec![0x08], None)),
+                    Some(value) => Ok((DirectColumnValue::Bool(value), None)),
+                    None if self.column.nullable => Ok((DirectColumnValue::Null, None)),
                     None => Err(de::Error::custom(format!(
                         "null value violates non-nullable column '{}'",
-                        self.field_name
+                        self.column.name
                     ))),
                 }
             }
         }
-    }
-}
-
-fn encode_i64_column<E>(
-    value: Option<i64>,
-    nullable: bool,
-    field_name: &str,
-    timestamp: bool,
-) -> std::result::Result<Vec<u8>, E>
-where
-    E: de::Error,
-{
-    match value {
-        Some(value) => {
-            let mut encoded = Vec::with_capacity(9);
-            encoded.push(if timestamp { 0x03 } else { 0x01 });
-            encoded.extend_from_slice(&value.to_le_bytes());
-            Ok(encoded)
-        }
-        None if nullable => Ok(vec![if timestamp { 0x07 } else { 0x05 }]),
-        None => Err(E::custom(format!(
-            "null value violates non-nullable column '{}'",
-            field_name
-        ))),
     }
 }
 
@@ -628,24 +668,36 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
     }
 }
 
-fn lookup_source_definition<'a>(
-    definitions: &'a [SourceDefinition],
-    source: &str,
-) -> Option<&'a SourceDefinition> {
-    definitions
-        .iter()
-        .find(|definition| definition.name() == source)
-}
-
-fn lookup_source_column<'a>(
-    definition: &'a SourceDefinition,
-    field_name: &str,
-) -> Option<(usize, &'a floe_core::source::SourceColumn)> {
-    definition
-        .columns()
-        .iter()
-        .enumerate()
-        .find(|(_, column)| column.name() == field_name)
+fn encode_direct_column_value(
+    buf: &mut Vec<u8>,
+    column: &DirectSourceColumnPlan,
+    value: DirectColumnValue<'_>,
+) {
+    match (&column.data_type, value) {
+        (SourceDataType::Int64, DirectColumnValue::Int64(value)) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        (SourceDataType::TimestampMillis, DirectColumnValue::Int64(value)) => {
+            buf.push(0x03);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        (SourceDataType::Utf8, DirectColumnValue::Utf8(value)) => {
+            let bytes = value.as_bytes();
+            let len = u32::try_from(bytes.len()).expect("utf8 length validated during decode");
+            buf.push(0x02);
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        (SourceDataType::Bool, DirectColumnValue::Bool(value)) => {
+            buf.push(0x04);
+            buf.push(if value { 1 } else { 0 });
+        }
+        (_, DirectColumnValue::Null) => encode_typed_null(buf, &column.data_type),
+        _ => {
+            unreachable!("direct source column value type should match the source plan");
+        }
+    }
 }
 
 fn skip_remaining_map<'de, A>(map: &mut A) -> std::result::Result<(), A::Error>
@@ -868,7 +920,8 @@ mod tests {
         .expect("definition");
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
 
-        let direct = parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()])
+        let plans = build_direct_source_plans(&[definition.clone()]).expect("direct source plans");
+        let direct = parse_direct_floe_json_event(payload, None, "topic", &plans)
             .expect("direct parse")
             .expect("direct event");
         let expected_event = SourceEvent::new(
