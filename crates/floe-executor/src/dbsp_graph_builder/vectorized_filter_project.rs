@@ -23,6 +23,7 @@ pub(crate) struct VectorizedFilterProjectEvaluator {
     input_schema: datafusion::arrow::datatypes::SchemaRef,
     predicate: Option<PredicatePlan>,
     projection_plan: ProjectionPlan,
+    encoded_fast_path: Option<EncodedFilterProjectFastPath>,
     decoded_input_slots: Arc<Vec<Option<usize>>>,
     decoded_input_value_types: Arc<Vec<CompiledValueType>>,
     decoded_input_count: usize,
@@ -32,6 +33,29 @@ pub(crate) struct VectorizedFilterProjectEvaluator {
 enum PredicatePlan {
     Compiled(Arc<CompiledExpr>),
     Physical(Arc<dyn PhysicalExpr>),
+}
+
+#[derive(Clone)]
+struct EncodedFilterProjectFastPath {
+    predicate: SimpleEncodedPredicate,
+    projection_width: usize,
+    output_positions_by_input: Arc<Vec<Vec<usize>>>,
+    max_required_input_index: usize,
+    input_width: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SimpleEncodedPredicate {
+    column_index: usize,
+    op: Operator,
+    literal: i64,
+    field_type: EncodedFieldType,
+}
+
+#[derive(Clone, Copy)]
+enum EncodedFieldType {
+    Int64,
+    TimestampMillis,
 }
 
 impl VectorizedFilterProjectEvaluator {
@@ -96,10 +120,16 @@ impl VectorizedFilterProjectEvaluator {
                 .collect::<Result<Vec<_>>>()?;
             ProjectionPlan::Physical(Arc::new(projections))
         };
+        let encoded_fast_path = build_encoded_fast_path(
+            Some(&predicate),
+            &projection_plan,
+            input_schema.as_ref(),
+        );
         Ok(Self {
             input_schema,
             predicate: Some(predicate),
             projection_plan,
+            encoded_fast_path,
             decoded_input_slots,
             decoded_input_value_types,
             decoded_input_count,
@@ -136,13 +166,17 @@ impl VectorizedFilterProjectEvaluator {
         } else {
             PredicatePlan::Physical(
                 ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-                    .context("compile vectorized filter predicate expression")?,
+                .context("compile vectorized filter predicate expression")?,
             )
         };
+        let projection_plan = ProjectionPlan::column_indices(projections, input_width);
+        let encoded_fast_path =
+            build_encoded_fast_path(Some(&predicate), &projection_plan, input_schema.as_ref());
         Ok(Self {
             input_schema,
             predicate: Some(predicate),
-            projection_plan: ProjectionPlan::column_indices(projections, input_width),
+            projection_plan,
+            encoded_fast_path,
             decoded_input_slots,
             decoded_input_value_types,
             decoded_input_count,
@@ -201,6 +235,7 @@ impl VectorizedFilterProjectEvaluator {
             input_schema,
             predicate: None,
             projection_plan,
+            encoded_fast_path: None,
             decoded_input_slots,
             decoded_input_value_types,
             decoded_input_count,
@@ -220,6 +255,9 @@ impl VectorizedFilterProjectEvaluator {
             .is_identity(self.input_schema.fields().len());
         if self.predicate.is_none() && identity_projection {
             return consolidate_encoded_delta_batch(delta_values);
+        }
+        if let Some(fast_path) = self.encoded_fast_path.as_ref() {
+            return fast_path.transform_delta(delta_values);
         }
 
         let mut prepared = self.prepare_input(graph_id, delta_values)?;
@@ -615,6 +653,209 @@ impl ProjectionPlan {
 
     fn requires_compiled_batch(&self) -> bool {
         matches!(self, Self::Compiled(_))
+    }
+}
+
+fn build_encoded_fast_path(
+    predicate: Option<&PredicatePlan>,
+    projection_plan: &ProjectionPlan,
+    input_schema: &datafusion::arrow::datatypes::Schema,
+) -> Option<EncodedFilterProjectFastPath> {
+    let PredicatePlan::Compiled(predicate) = predicate? else {
+        return None;
+    };
+    let ProjectionPlan::ColumnIndices {
+        indices,
+        output_positions_by_input,
+    } = projection_plan
+    else {
+        return None;
+    };
+    let predicate = SimpleEncodedPredicate::try_from_compiled(predicate.as_ref(), input_schema)?;
+    let max_projection_index = indices.iter().copied().max().unwrap_or(0);
+    Some(EncodedFilterProjectFastPath {
+        predicate,
+        projection_width: indices.len(),
+        output_positions_by_input: Arc::clone(output_positions_by_input),
+        max_required_input_index: max_projection_index.max(predicate.column_index),
+        input_width: input_schema.fields().len(),
+    })
+}
+
+impl EncodedFilterProjectFastPath {
+    fn transform_delta(&self, delta_values: Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> {
+        if delta_values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut staged = Vec::with_capacity(delta_values.len());
+        for (encoded, diff) in delta_values {
+            if diff == 0 {
+                continue;
+            }
+            if let Some(projected) = self.transform_row(&encoded)? {
+                staged.push((projected, diff));
+            }
+        }
+        consolidate_encoded_delta_batch(staged)
+    }
+
+    fn transform_row(&self, encoded: &[u8]) -> Result<Option<Vec<u8>>> {
+        if encoded.len() < 4 {
+            return Err(anyhow!("encoded key too short"));
+        }
+        let count = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        if count != self.input_width {
+            return Err(anyhow!(
+                "encoded row has {count} columns but schema has {}",
+                self.input_width
+            ));
+        }
+
+        let mut cursor = 4usize;
+        let mut predicate_range = None;
+        let mut projection_ranges = vec![0..0; self.projection_width];
+        for input_idx in 0..count {
+            let start = cursor;
+            let end = encoded_field_end(encoded, start)?;
+            if input_idx == self.predicate.column_index {
+                predicate_range = Some(start..end);
+            }
+            for output_idx in &self.output_positions_by_input[input_idx] {
+                projection_ranges[*output_idx] = start..end;
+            }
+            cursor = end;
+            if input_idx >= self.max_required_input_index
+                && predicate_range.is_some()
+                && projection_ranges.iter().all(|range| !range.is_empty())
+            {
+                break;
+            }
+        }
+
+        let predicate_range =
+            predicate_range.ok_or_else(|| anyhow!("encoded predicate column was missing"))?;
+        if !self.predicate.matches(
+            encoded
+                .get(predicate_range)
+                .ok_or_else(|| anyhow!("encoded predicate slice was out of bounds"))?,
+        )? {
+            return Ok(None);
+        }
+        if projection_ranges.iter().any(Range::is_empty) {
+            return Err(anyhow!(
+                "encoded projection row was missing one or more columns"
+            ));
+        }
+        Ok(Some(project_encoded_row(
+            encoded,
+            &projection_ranges,
+            self.projection_width,
+        )?))
+    }
+}
+
+impl SimpleEncodedPredicate {
+    fn try_from_compiled(
+        expr: &CompiledExpr,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Option<Self> {
+        let CompiledExpr::Binary { op, left, right } = expr else {
+            return None;
+        };
+        if !matches!(
+            op,
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            return None;
+        }
+        if let Some(predicate) =
+            Self::column_literal(left.as_ref(), right.as_ref(), *op, input_schema)
+        {
+            return Some(predicate);
+        }
+        Self::column_literal(
+            right.as_ref(),
+            left.as_ref(),
+            invert_comparison_operator(*op)?,
+            input_schema,
+        )
+    }
+
+    fn column_literal(
+        column_expr: &CompiledExpr,
+        literal_expr: &CompiledExpr,
+        op: Operator,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Option<Self> {
+        let CompiledExpr::Column { index } = column_expr else {
+            return None;
+        };
+        let CompiledExpr::Literal { value } = literal_expr else {
+            return None;
+        };
+        let field_type = match input_schema.field(*index).data_type() {
+            DataType::Int64 => EncodedFieldType::Int64,
+            DataType::Timestamp(TimeUnit::Millisecond, _) => EncodedFieldType::TimestampMillis,
+            _ => return None,
+        };
+        let literal = match value {
+            CompiledValue::Int64(Some(value)) => *value,
+            CompiledValue::TimestampMillis(Some(value)) => *value,
+            _ => return None,
+        };
+        Some(Self {
+            column_index: *index,
+            op,
+            literal,
+            field_type,
+        })
+    }
+
+    fn matches(&self, field: &[u8]) -> Result<bool> {
+        let value = match (self.field_type, field.first().copied()) {
+            (EncodedFieldType::Int64, Some(0x01))
+            | (EncodedFieldType::TimestampMillis, Some(0x03)) => {
+                let chunk = field
+                    .get(1..9)
+                    .ok_or_else(|| anyhow!("truncated encoded predicate field"))?;
+                Some(i64::from_le_bytes(chunk.try_into().unwrap()))
+            }
+            (EncodedFieldType::Int64, Some(0x05))
+            | (EncodedFieldType::TimestampMillis, Some(0x07)) => None,
+            _ => {
+                return Err(anyhow!(
+                    "encoded predicate field did not match the expected scalar type"
+                ));
+            }
+        };
+        let Some(value) = value else {
+            return Ok(false);
+        };
+        Ok(match self.op {
+            Operator::Eq => value == self.literal,
+            Operator::NotEq => value != self.literal,
+            Operator::Lt => value < self.literal,
+            Operator::LtEq => value <= self.literal,
+            Operator::Gt => value > self.literal,
+            Operator::GtEq => value >= self.literal,
+            _ => unreachable!("validated encoded predicate operator"),
+        })
+    }
+}
+
+fn invert_comparison_operator(op: Operator) -> Option<Operator> {
+    match op {
+        Operator::Eq | Operator::NotEq => Some(op),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        _ => None,
     }
 }
 
