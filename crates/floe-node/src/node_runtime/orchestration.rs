@@ -475,19 +475,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             })?;
         }
     }
-    let decoder_registry: HashMap<String, SourceRowDecoder> = source_registry
-        .definitions()
-        .iter()
-        .filter(|definition| all_required_sources.contains(definition.name()))
-        .map(|definition| {
-            (
-                definition.name().to_string(),
-                SourceRowDecoder::new(definition.clone()),
-            )
-        })
-        .collect();
-    let decoder_registry = Arc::new(decoder_registry);
-
     let queue_capacity = run_args.ingest_queue_capacity;
     let max_batch = run_args.ingest_batch_size;
     let max_batch_per_source = run_args.ingest_batch_per_source;
@@ -559,6 +546,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .enumerate()
         .map(|(idx, definition)| (definition.name().to_string(), idx))
         .collect();
+    let source_names_by_id = Arc::new(
+        definitions
+            .iter()
+            .map(|definition| definition.name().to_string())
+            .collect::<Vec<_>>(),
+    );
+    let decoders_by_source_id = Arc::new(
+        definitions
+            .iter()
+            .map(|definition| {
+                all_required_sources
+                    .contains(definition.name())
+                    .then(|| SourceRowDecoder::new(definition.clone()))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let materialized_source_ids = Arc::new(
+        definitions
+            .iter()
+            .map(|definition| all_required_sources.contains(definition.name()))
+            .collect::<Vec<_>>(),
+    );
+    let transient_only_source_ids = Arc::new(
+        definitions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, definition)| {
+                transient_only_sources
+                    .contains(definition.name())
+                    .then_some(idx)
+            })
+            .collect::<Vec<_>>(),
+    );
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
@@ -798,8 +818,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
     drop(connector_sender);
     let outer_for_task = Arc::clone(&outer_registry);
-    let decoder_for_task = Arc::clone(&decoder_registry);
-    let materialized_sources_for_task = all_required_sources.clone();
+    let decoders_by_source_id_for_task = Arc::clone(&decoders_by_source_id);
+    let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
+    let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
     let watermark_for_task = Arc::clone(&event_watermark);
     let mv_for_task = Arc::clone(&mv_registry);
     let kafka_commit_senders_for_task = kafka_commit_senders;
@@ -810,7 +831,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_batch_journal_for_task = source_batch_journal.clone();
-    let transient_only_sources_for_task = transient_only_sources.clone();
+    let transient_only_source_ids_for_task = Arc::clone(&transient_only_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
     let mut connector_receiver_for_task = connector_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -933,25 +954,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
             let pending_epoch = epoch.saturating_add(1);
             let batch_len = batch.len();
+            let source_count = source_names_by_id_for_task.len();
             let decode_start = Instant::now();
             let mut decoded_rows = Vec::new();
             let mut encoded_rows = Vec::with_capacity(batch_len);
-            let mut decoded_counts: HashMap<String, usize> = HashMap::new();
-            let mut tick_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
+            let mut decoded_counts = vec![0usize; source_count];
+            let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
             let mut tick_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
             let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
-            let mut tick_source_max_event_ts: HashMap<String, i64> = HashMap::new();
+            let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
             let decode_span = tracing::debug_span!(
                 "ingest_decode",
                 epoch = pending_epoch,
                 raw_batch_size = batch_len
             );
             let _decode_guard = decode_span.enter();
-            for mut event in batch {
-                let source_name = event.source().to_string();
+            for SelectedSourceEvent {
+                source_id,
+                mut event,
+            } in batch
+            {
+                let Some(source_id) = source_id else {
+                    let source_name = event.source().to_string();
+                    tracing::debug!(
+                        source = %source_name,
+                        "dropping event for unknown source"
+                    );
+                    continue;
+                };
+                let source_name = source_names_by_id_for_task[source_id].as_str();
                 if let Some((partition, offset)) = event_resume_offset(event.resume_token()) {
-                    let entry = tick_source_offsets
-                        .entry((source_name.clone(), partition))
+                    let entry = tick_source_offsets[source_id]
+                        .get_or_insert_with(HashMap::new)
+                        .entry(partition)
                         .or_insert(0);
                     *entry = (*entry).max(offset);
                 }
@@ -968,30 +1003,34 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         *entry = (lsn_value, lsn_text);
                     }
                 }
-                if !materialized_sources_for_task.contains(&source_name) {
+                if !materialized_source_ids_for_task
+                    .get(source_id)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     tracing::debug!(
                         source = %source_name,
                         "dropping event for source outside active materialization set"
                     );
                     continue;
                 }
-                let decoder = match lookup_decoder_for_source(&decoder_for_task, &source_name) {
-                    Ok(decoder) => decoder,
-                    Err(err) => {
-                        let message = err.to_string();
-                        tracing::error!(source = %source_name, "{message}");
-                        record_runtime_failure(&failure_for_executor, message);
-                        executor_cancel.cancel();
-                        break 'executor;
-                    }
+                let Some(decoder) = decoders_by_source_id_for_task
+                    .get(source_id)
+                    .and_then(|decoder| decoder.as_ref())
+                else {
+                    let message = format!("received event for unknown source '{source_name}'");
+                    tracing::error!(source = %source_name, "{message}");
+                    record_runtime_failure(&failure_for_executor, message);
+                    executor_cancel.cancel();
+                    break 'executor;
                 };
                 let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
-                    encoded_rows.push((source_name.clone(), preencoded_row_key));
+                    encoded_rows.push((source_id, preencoded_row_key));
                     None
                 } else {
                     match decoder.encode_row_key(&event) {
                         Ok((encoded, event_ts)) => {
-                            encoded_rows.push((source_name.clone(), encoded));
+                            encoded_rows.push((source_id, encoded));
                             event_ts
                         }
                         Err(err) => {
@@ -1011,7 +1050,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                     continue;
                                 }
                             };
-                            decoded_rows.push((source_name.clone(), row));
+                            decoded_rows.push((source_id, row));
                             event_ts
                         }
                     }
@@ -1019,12 +1058,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let event_ts = event.event_time_ms().or(event_ts);
                 if let Some(ts) = event_ts {
                     let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
-                    let entry = tick_source_max_event_ts
-                        .entry(source_name.clone())
-                        .or_insert(i64::MIN);
+                    let entry = tick_source_max_event_ts[source_id].get_or_insert(i64::MIN);
                     *entry = (*entry).max(ts_i64);
                 }
-                *decoded_counts.entry(source_name.clone()).or_insert(0) += 1;
+                decoded_counts[source_id] = decoded_counts[source_id].saturating_add(1);
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
             metrics::observe_decode_latency_ms(decode_latency_ms);
@@ -1042,7 +1079,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let decoded_rows_len = decoded_rows.len().saturating_add(encoded_rows.len());
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
-            for (source_name, row) in decoded_rows {
+            for (source_id, row) in decoded_rows {
+                let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(&source_name) else {
                     tracing::warn!(
                         source = %source_name,
@@ -1067,7 +1105,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            for (source_name, encoded) in encoded_rows {
+            for (source_id, encoded) in encoded_rows {
+                let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(&source_name) else {
                     tracing::warn!(
                         source = %source_name,
@@ -1087,7 +1126,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
 
             let mut source_journal_batches = Vec::new();
-            for source_name in &transient_only_sources_for_task {
+            for &source_id in transient_only_source_ids_for_task.iter() {
+                let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(source_name) else {
                     continue;
                 };
@@ -1097,8 +1137,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     continue;
                 };
                 source_journal_batches.push((
-                    source_name.clone(),
-                    tick_source_max_event_ts.get(source_name).copied(),
+                    source_id,
+                    tick_source_max_event_ts[source_id],
                     batch.deltas,
                 ));
             }
@@ -1110,7 +1150,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
             epoch = pending_epoch;
             let now_instant = Instant::now();
-            for (source, max_event_ts) in tick_source_max_event_ts {
+            for (source_id, max_event_ts) in tick_source_max_event_ts.iter().enumerate() {
+                let Some(max_event_ts) = *max_event_ts else {
+                    continue;
+                };
+                let source = source_names_by_id_for_task[source_id].clone();
                 let watermark_entry = source_watermarks.entry(source.clone()).or_insert(i64::MIN);
                 *watermark_entry = (*watermark_entry).max(max_event_ts);
                 metrics::record_source_watermark_ms(&source, *watermark_entry);
@@ -1173,7 +1217,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if pre_tick_commit_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
-            for (source_name, max_event_time_ms, deltas) in &source_journal_batches {
+            for (source_id, max_event_time_ms, deltas) in &source_journal_batches {
+                let source_name = source_names_by_id_for_task[*source_id].as_str();
                 if let Err(err) = source_batch_journal_for_task
                     .append(source_name, epoch, *max_event_time_ms, deltas)
                     .await
@@ -1228,19 +1273,31 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
             drop(registry);
-            for ((source, partition), offset) in &tick_source_offsets {
-                let key = (source.clone(), *partition);
-                let latest_entry = latest_source_offsets.entry(key.clone()).or_insert(0);
-                *latest_entry = (*latest_entry).max(*offset);
-                let committed_offset = committed_source_offsets.get(&key).copied().unwrap_or(0);
-                metrics::record_source_offset_lag(
-                    source.as_str(),
-                    *partition,
-                    latest_entry.saturating_sub(committed_offset),
-                );
+            for (source_id, offsets) in tick_source_offsets.iter().enumerate() {
+                let Some(offsets) = offsets.as_ref() else {
+                    continue;
+                };
+                let source = source_names_by_id_for_task[source_id].as_str();
+                for (&partition, &offset) in offsets {
+                    let key = (source.to_string(), partition);
+                    let latest_entry = latest_source_offsets.entry(key.clone()).or_insert(0);
+                    *latest_entry = (*latest_entry).max(offset);
+                    let committed_offset = committed_source_offsets.get(&key).copied().unwrap_or(0);
+                    metrics::record_source_offset_lag(
+                        source,
+                        partition,
+                        latest_entry.saturating_sub(committed_offset),
+                    );
+                }
             }
-            for ((source, partition), offset) in &tick_source_offsets {
-                checkpoint_manager.update_partition_offset(source.as_str(), *partition, *offset);
+            for (source_id, offsets) in tick_source_offsets.iter().enumerate() {
+                let Some(offsets) = offsets.as_ref() else {
+                    continue;
+                };
+                let source = source_names_by_id_for_task[source_id].as_str();
+                for (&partition, &offset) in offsets {
+                    checkpoint_manager.update_partition_offset(source, partition, offset);
+                }
             }
             let frontier = watermark_for_task
                 .load(Ordering::Relaxed)
@@ -1282,16 +1339,22 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     "tick checkpoint_write completed"
                 );
             }
-            for ((source, partition), offset) in &tick_source_offsets {
-                let key = (source.clone(), *partition);
-                let committed_entry = committed_source_offsets.entry(key.clone()).or_insert(0);
-                *committed_entry = (*committed_entry).max(*offset);
-                let latest_offset = latest_source_offsets.get(&key).copied().unwrap_or(*offset);
-                metrics::record_source_offset_lag(
-                    source.as_str(),
-                    *partition,
-                    latest_offset.saturating_sub(*committed_entry),
-                );
+            for (source_id, offsets) in tick_source_offsets.iter().enumerate() {
+                let Some(offsets) = offsets.as_ref() else {
+                    continue;
+                };
+                let source = source_names_by_id_for_task[source_id].as_str();
+                for (&partition, &offset) in offsets {
+                    let key = (source.to_string(), partition);
+                    let committed_entry = committed_source_offsets.entry(key.clone()).or_insert(0);
+                    *committed_entry = (*committed_entry).max(offset);
+                    let latest_offset = latest_source_offsets.get(&key).copied().unwrap_or(offset);
+                    metrics::record_source_offset_lag(
+                        source,
+                        partition,
+                        latest_offset.saturating_sub(*committed_entry),
+                    );
+                }
             }
             for mv_version in &mv_versions {
                 mv_last_update_at_ms.insert(mv_version.view.clone(), committed_at_ms);
@@ -1333,6 +1396,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let total_queue_depth = queue_depth.saturating_add(connector_receiver_for_task.len());
             metrics::record_ingest_queue_depth(total_queue_depth);
             if should_sample(&INGEST_METRICS_COUNTER, INGEST_METRICS_SAMPLE_EVERY) {
+                let per_source: Vec<_> = decoded_counts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(source_id, count)| {
+                        (*count > 0).then_some((
+                            source_names_by_id_for_task[source_id].as_str(),
+                            *count,
+                        ))
+                    })
+                    .collect();
                 let per_connector: Vec<_> = connector_queues
                     .iter()
                     .map(|queue| (queue.name.as_str(), per_connector_counts[queue.id]))
@@ -1351,7 +1424,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     state_write_latency_ms,
                     checkpoint_write_latency_ms,
                     tick_latency_ms,
-                    per_source = ?decoded_counts,
+                    per_source = ?per_source,
                     per_connector = ?per_connector,
                     "ingest batch metrics"
                 );
