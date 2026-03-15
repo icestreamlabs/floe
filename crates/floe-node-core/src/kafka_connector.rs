@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::message::{BorrowedMessage, Timestamp};
 use rdkafka::{Offset, TopicPartitionList};
 use serde::Deserialize;
@@ -68,7 +68,7 @@ pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
-    consumer: Option<StreamConsumer>,
+    consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
 }
 
@@ -107,7 +107,7 @@ impl KafkaConnector {
             .set("enable.auto.offset.store", "false");
     }
 
-    async fn handle_message(&self, message: &BorrowedMessage<'_>) -> Result<Vec<SourceEvent>> {
+    fn handle_message(&self, message: &BorrowedMessage<'_>) -> Result<Vec<SourceEvent>> {
         let payload = match message.payload() {
             Some(payload) => payload,
             None => {
@@ -224,7 +224,7 @@ impl Connector for KafkaConnector {
             .set("auto.offset.reset", "earliest");
         Self::apply_latency_fetch_config(&mut client_config);
         tracing::info!("kafka latency fetch config enabled by default");
-        let consumer: StreamConsumer = client_config.create().context("create kafka consumer")?;
+        let consumer: BaseConsumer = client_config.create().context("create kafka consumer")?;
         let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
         consumer
             .subscribe(&topics)
@@ -241,34 +241,30 @@ impl Connector for KafkaConnector {
         let mut emitted = 0usize;
         let mut staged = Vec::new();
 
-        let first_timeout = if self.config.poll_timeout.is_zero() {
-            Duration::from_millis(0)
-        } else {
-            self.config.poll_timeout
-        };
-        match tokio::time::timeout(first_timeout, consumer.recv()).await {
-            Ok(Ok(message)) => {
-                let mut events = self.handle_message(&message).await?;
-                emitted = emitted.saturating_add(events.len());
-                staged.append(&mut events);
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "failed to receive kafka message");
-            }
-            Err(_) => {}
-        }
-
-        while emitted < self.config.max_messages_per_tick {
-            match tokio::time::timeout(Duration::from_millis(0), consumer.recv()).await {
-                Ok(Ok(message)) => {
-                    let mut events = self.handle_message(&message).await?;
+        if let Some(message) = consumer.poll(self.config.poll_timeout) {
+            match message {
+                Ok(message) => {
+                    let mut events = self.handle_message(&message)?;
                     emitted = emitted.saturating_add(events.len());
                     staged.append(&mut events);
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     tracing::warn!(error = %err, "failed to receive kafka message");
                 }
-                Err(_) => break,
+            }
+        }
+
+        while emitted < self.config.max_messages_per_tick {
+            match consumer.poll(Duration::ZERO) {
+                Some(Ok(message)) => {
+                    let mut events = self.handle_message(&message)?;
+                    emitted = emitted.saturating_add(events.len());
+                    staged.append(&mut events);
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "failed to receive kafka message");
+                }
+                None => break,
             }
         }
 

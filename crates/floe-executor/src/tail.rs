@@ -219,10 +219,12 @@ async fn run_tail_task<M: MaterializedView + 'static>(
         }
         last_emitted = as_of_version;
     } else if with_snapshot {
-        let version =
-            latest.ok_or_else(|| anyhow!("materialized view '{}' has no versions yet", mv_name))?;
-        emit_version(mv.as_ref(), &schema, &mv_name, version, tx).await?;
-        last_emitted = version;
+        if let Some(version) = latest {
+            emit_version(mv.as_ref(), &schema, &mv_name, version, tx).await?;
+            last_emitted = version;
+        } else {
+            last_emitted = -1;
+        }
     } else {
         last_emitted = latest.unwrap_or(-1);
     }
@@ -360,8 +362,7 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     version: i64,
     version_time: Option<i64>,
 ) -> PgResult<Vec<TailBatch>> {
-    let handle = mv.handle_for(version)?;
-    let snapshot = handle.materialize().await?;
+    let snapshot = mv.snapshot_for(version).await?;
     let rows = rows_from_snapshot(snapshot)?;
     build_tail_batches(rows, schema, version_time)
 }
@@ -373,11 +374,8 @@ async fn materialize_delta_batches<M: MaterializedView>(
     version_time: Option<i64>,
 ) -> PgResult<Vec<TailBatch>> {
     let total_start = Instant::now();
-    let handle_start = Instant::now();
-    let handle = mv.handle_for(version)?;
-    let handle_ms = handle_start.elapsed().as_millis() as u64;
     let delta_iter_start = Instant::now();
-    let deltas = handle.delta_iter().await?;
+    let deltas = mv.delta_for(version).await?;
     let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
     let rows_decode_start = Instant::now();
     let rows = rows_from_delta(deltas)?;
@@ -391,7 +389,6 @@ async fn materialize_delta_batches<M: MaterializedView>(
         tracing::info!(
             version,
             rows = rows_len,
-            handle_ms,
             delta_iter_ms,
             rows_decode_ms,
             batch_build_ms,
@@ -879,6 +876,54 @@ mod tests {
 
         let batch = stream.next().await.expect("post-asof batch")?;
         assert_eq!(batch.version, handle3_version);
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_snapshot_waits_for_first_version_when_view_starts_empty() -> PgResult<()> {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_empty_start", build_schema());
+        let handle = registry.register("mv_tail_empty_start");
+
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("tail-empty-start", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_empty_start",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_empty_start".to_string(),
+            with_snapshot: true,
+            as_of: None,
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        assert!(
+            timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err()
+        );
+
+        let handle1 = append_version(&mut dbsp_view, &[11]).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state =
+            DbspPersistedState::new(dict, table, ns, version).with_logical_version(handle1.version);
+        handle.set_dbsp_state(state);
+        handle.publish_version(handle1.version as i64, handle1);
+
+        let batch = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for first version")
+            .expect("expected first tail batch")?;
+        assert_eq!(batch.version, 1);
         cancel.cancel();
         Ok(())
     }

@@ -142,12 +142,8 @@ async fn materialized_view_joins_auctions() -> Result<()> {
             item_name: "sofa".to_string(),
         },
     ];
-    wait_for_version(
-        &harness.mv_registry,
-        &harness.view_name,
-        expected_rows.len() as i64,
-    )
-    .await?;
+    let target_version = handles.last().expect("latest handle").version as i64;
+    wait_for_version(&harness.mv_registry, &harness.view_name, target_version).await?;
 
     let (session, _bridge) = harness.session_with_view().await?;
     let df = session

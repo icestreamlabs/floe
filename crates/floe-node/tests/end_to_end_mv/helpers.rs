@@ -127,6 +127,47 @@ pub(crate) async fn wait_for_version(
     Ok(())
 }
 
+pub(crate) async fn wait_for_materialized_row_count(
+    registry: &MaterializedViewRegistry,
+    view: &str,
+    expected_rows: usize,
+) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let handle = registry
+                .get(view)
+                .with_context(|| format!("materialized view handle for '{view}'"))?;
+            let Some(state) = handle.dbsp_state() else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            let handle_view = ZSetHandleView::new(
+                state.dictionary(),
+                state.table(),
+                state.namespace().to_string(),
+                state.version(),
+            );
+            let snapshot = handle_view
+                .materialize()
+                .await
+                .with_context(|| format!("materialize view '{view}'"))?;
+            let row_count: usize = snapshot
+                .values()
+                .filter(|diff| **diff > 0)
+                .map(|diff| usize::try_from(*diff).unwrap_or(0))
+                .sum();
+            if row_count >= expected_rows {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timeout waiting for materialized rows")??;
+    Ok(())
+}
+
 pub(crate) async fn rows_at_version(
     registry: &MaterializedViewRegistry,
     view: &str,

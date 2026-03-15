@@ -12,7 +12,8 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operator_state::OperatorStateHandle;
 use crate::outer_stream::{OuterStreamCheckpoint, OuterStreamRegistry};
-use crate::stream_types::Timestamp;
+use crate::source_journal::append_entry_to_batch;
+use crate::stream_types::{EncodedDeltaBatch, Timestamp};
 
 const CHECKPOINT_PREFIX: &str = "checkpoint";
 
@@ -266,7 +267,25 @@ impl CheckpointStore {
     }
 
     pub async fn persist_tick_commit(&self, commit: &TickCommit) -> Result<()> {
+        self.persist_tick_commit_with_source_batches(commit, &[])
+            .await
+    }
+
+    pub async fn persist_tick_commit_with_source_batches(
+        &self,
+        commit: &TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+    ) -> Result<()> {
         let mut batch = WriteBatch::new();
+        for (source, max_event_time_ms, deltas) in source_batches {
+            append_entry_to_batch(
+                &mut batch,
+                source,
+                commit.tick_id,
+                *max_event_time_ms,
+                deltas,
+            )?;
+        }
         let commit_key = self.tick_commit_key(commit.tick_id);
         let serialized = serde_json::to_vec(commit).context("serialize tick commit to JSON")?;
         batch.put(commit_key, serialized);
@@ -522,7 +541,18 @@ impl CheckpointManager {
     }
 
     pub async fn persist_tick_commit(&mut self, commit: TickCommit) -> Result<()> {
-        self.store.persist_tick_commit(&commit).await?;
+        self.persist_tick_commit_with_source_batches(commit, &[])
+            .await
+    }
+
+    pub async fn persist_tick_commit_with_source_batches(
+        &mut self,
+        commit: TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+    ) -> Result<()> {
+        self.store
+            .persist_tick_commit_with_source_batches(&commit, source_batches)
+            .await?;
         for cursor in &commit.sink_cursors {
             self.sink_cursors
                 .insert(cursor.sink.clone(), cursor.clone());
@@ -652,13 +682,15 @@ pub async fn recover_materialized_views(
                 )
             })?;
         let (dict, table, namespace, version) = handle_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, namespace, version);
-        view_handle.set_dbsp_state(state);
         let frontier = if entry.frontier == 0 {
             i64::try_from(entry.version).unwrap_or(i64::MAX)
         } else {
             entry.frontier
         };
+        let logical_version = u64::try_from(frontier.max(0)).unwrap_or(u64::MAX);
+        let state = DbspPersistedState::new(dict, table, namespace, version)
+            .with_logical_version(logical_version);
+        view_handle.set_dbsp_state(state);
         view_handle.publish_version(frontier, handle);
     }
     if manifest.watermark > 0 {
@@ -673,6 +705,9 @@ mod tests {
     use dbsp::storage::SlateTable;
     use object_store::memory::InMemory;
     use slatedb::Db;
+    use std::collections::BTreeSet;
+
+    use crate::source_journal::SourceBatchJournal;
 
     async fn checkpoint_manager(graph_id: &str) -> CheckpointManager {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -766,5 +801,38 @@ mod tests {
                 && cursor.last_emitted_mv_version == 8
                 && cursor.row_index.is_none()
         }));
+    }
+
+    #[tokio::test]
+    async fn tick_commit_batches_source_journal_entries_atomically() {
+        let mut manager = checkpoint_manager("tick-journal-batch").await;
+        manager.update_partition_offset("nexmark_bid", 0, 42);
+        let commit = TickCommit::new(3, 123, manager.snapshot_offsets(), Vec::new(), Vec::new());
+        let source_batches = vec![(
+            "nexmark_bid".to_string(),
+            Some(456),
+            Arc::new(vec![(b"encoded".to_vec(), 1)]),
+        )];
+
+        manager
+            .persist_tick_commit_with_source_batches(commit.clone(), &source_batches)
+            .await
+            .expect("persist combined tick batch");
+
+        let reloaded = CheckpointManager::new("tick-journal-batch", manager.store().table())
+            .await
+            .expect("reload checkpoint manager");
+        assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
+
+        let journal = SourceBatchJournal::new(manager.store().table());
+        let entries = journal
+            .load_committed_entries_up_to(commit.tick_id, &BTreeSet::new())
+            .await
+            .expect("load journal entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "nexmark_bid");
+        assert_eq!(entries[0].tick_id, commit.tick_id);
+        assert_eq!(entries[0].max_event_time_ms, Some(456));
+        assert_eq!(entries[0].deltas, vec![(b"encoded".to_vec(), 1)]);
     }
 }

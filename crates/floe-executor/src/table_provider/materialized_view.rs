@@ -12,7 +12,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use dbsp::handles::ZSetHandleView;
 
-use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::materialized_view::{
+    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
+};
 use crate::table_provider::SnapshotScanExec;
 
 use super::MV_VERSION_COLUMN;
@@ -112,12 +114,12 @@ impl MaterializedViewTableProvider {
             view.encoded_overlay_batches(as_of_version)
         {
             let mut snapshot = if let Some(state) = view.dbsp_state() {
-                if target_version < state.logical_version() || base_version > target_version {
-                    HashMap::new()
-                } else {
-                    let persisted_version = state.version();
-                    self.materialize_dbsp_rows(state, Some(persisted_version))
-                        .await?
+                match Self::resolve_dbsp_version(view.as_ref(), &state, base_version) {
+                    Some(base_dbsp_version) => {
+                        self.materialize_dbsp_rows(state, Some(base_dbsp_version))
+                            .await?
+                    }
+                    None => HashMap::new(),
                 }
             } else {
                 HashMap::new()
@@ -153,10 +155,14 @@ impl MaterializedViewTableProvider {
             return Ok((HashMap::new(), 0));
         };
         let target_version = as_of_version.unwrap_or(state.logical_version());
-        let persisted_version = state.version();
-        let snapshot = self
-            .materialize_dbsp_rows(state, Some(persisted_version))
-            .await?;
+        let snapshot = if let Some(dbsp_version) =
+            Self::resolve_dbsp_version(view.as_ref(), &state, target_version)
+        {
+            self.materialize_dbsp_rows(state, Some(dbsp_version))
+                .await?
+        } else {
+            HashMap::new()
+        };
         tracing::info!(
             view = %self.view_name,
             version = target_version,
@@ -166,6 +172,26 @@ impl MaterializedViewTableProvider {
             "materialized view loaded rows"
         );
         Ok((snapshot, target_version))
+    }
+
+    fn resolve_dbsp_version(
+        view: &MaterializedViewHandle,
+        state: &DbspPersistedState,
+        target_version: u64,
+    ) -> Option<u64> {
+        i64::try_from(target_version)
+            .ok()
+            .and_then(|version| view.handle_for_version(version))
+            .map(|handle| handle.version)
+            .or_else(|| {
+                if target_version <= state.version() {
+                    Some(target_version)
+                } else if target_version == state.logical_version() {
+                    Some(state.version())
+                } else {
+                    None
+                }
+            })
     }
 
     async fn fast_count_batches(

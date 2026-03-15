@@ -1,17 +1,23 @@
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use dbsp::handles::ZSetHandleView;
+use std::collections::HashMap;
 use tokio::sync::watch;
 
 use super::registry::MaterializedViewHandle;
 
+#[async_trait]
 pub trait MaterializedView: Send + Sync {
     fn latest_version(&self) -> Option<i64>;
     fn next_version_after(&self, version: i64) -> Option<i64>;
     fn subscribe_versions(&self) -> watch::Receiver<Option<i64>>;
     fn handle_for(&self, version: i64) -> Result<ZSetHandleView<Vec<u8>>>;
     fn version_time(&self, version: i64) -> Option<i64>;
+    async fn snapshot_for(&self, version: i64) -> Result<HashMap<Vec<u8>, i64>>;
+    async fn delta_for(&self, version: i64) -> Result<Vec<(Vec<u8>, i64)>>;
 }
 
+#[async_trait]
 impl MaterializedView for MaterializedViewHandle {
     fn latest_version(&self) -> Option<i64> {
         MaterializedViewHandle::latest_version(self)
@@ -49,6 +55,105 @@ impl MaterializedView for MaterializedViewHandle {
     fn version_time(&self, version: i64) -> Option<i64> {
         MaterializedViewHandle::version_time(self, version)
     }
+
+    async fn snapshot_for(&self, version: i64) -> Result<HashMap<Vec<u8>, i64>> {
+        if let Ok(handle) = self.handle_for(version) {
+            return handle.materialize().await;
+        }
+
+        let version_u64 = u64::try_from(version).map_err(|_| {
+            anyhow!(
+                "version {version} is out of range for materialized view '{}'.",
+                self.name()
+            )
+        })?;
+        if let Some((base_version, _target_version, overlay)) =
+            self.encoded_overlay_batches(Some(version_u64))
+        {
+            let mut snapshot = if let Some(state) = self.dbsp_state() {
+                if let Some(base_dbsp_version) = resolve_dbsp_version(self, &state, base_version) {
+                    materialize_dbsp_version(&state, base_dbsp_version).await?
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            };
+            for (key, diff) in overlay {
+                if diff == 0 {
+                    continue;
+                }
+                let previous = snapshot.get(&key).copied().unwrap_or(0);
+                let next = previous.saturating_add(diff);
+                if next <= 0 {
+                    snapshot.remove(&key);
+                } else {
+                    snapshot.insert(key, next);
+                }
+            }
+            return Ok(snapshot);
+        }
+
+        Err(anyhow!(
+            "version {version} not found for materialized view '{}'.",
+            self.name()
+        ))
+    }
+
+    async fn delta_for(&self, version: i64) -> Result<Vec<(Vec<u8>, i64)>> {
+        if let Ok(handle) = self.handle_for(version) {
+            return handle.delta_iter().await;
+        }
+
+        let version_u64 = u64::try_from(version).map_err(|_| {
+            anyhow!(
+                "version {version} is out of range for materialized view '{}'.",
+                self.name()
+            )
+        })?;
+        if let Some(delta) = self.encoded_overlay_batch(version_u64) {
+            return Ok(delta);
+        }
+
+        Err(anyhow!(
+            "version {version} not found for materialized view '{}'.",
+            self.name()
+        ))
+    }
+}
+
+fn resolve_dbsp_version(
+    view: &MaterializedViewHandle,
+    state: &crate::materialized_view::DbspPersistedState,
+    target_version: u64,
+) -> Option<u64> {
+    i64::try_from(target_version)
+        .ok()
+        .and_then(|version| view.handle_for_version(version))
+        .map(|handle| handle.version)
+        .or_else(|| {
+            if target_version <= state.version() {
+                Some(target_version)
+            } else if target_version == state.logical_version() {
+                Some(state.version())
+            } else {
+                None
+            }
+        })
+}
+
+async fn materialize_dbsp_version(
+    state: &crate::materialized_view::DbspPersistedState,
+    version: u64,
+) -> Result<HashMap<Vec<u8>, i64>> {
+    ZSetHandleView::new(
+        state.dictionary(),
+        state.table(),
+        state.namespace().to_string(),
+        version,
+    )
+    .materialize()
+    .await
 }
 
 #[cfg(test)]

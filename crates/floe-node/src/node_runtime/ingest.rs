@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn lookup_decoder_for_source<'a>(
     decoders: &'a HashMap<String, SourceRowDecoder>,
     source_name: &str,
@@ -242,8 +243,9 @@ pub(super) fn build_batch(
                 break;
             };
             let source = event.source();
-            let count = if let Some(source_id) = source_id_by_name.get(source) {
-                &mut per_source_counts[*source_id]
+            let source_id = source_id_by_name.get(source).copied();
+            let count = if let Some(source_id) = source_id {
+                &mut per_source_counts[source_id]
             } else {
                 unknown_source_counts.entry(source.to_string()).or_insert(0)
             };
@@ -253,7 +255,7 @@ pub(super) fn build_batch(
             }
             *count += 1;
             *per_connector += 1;
-            batch.push(event);
+            batch.push(SelectedSourceEvent { source_id, event });
         }
     }
     for (queue, mut deferred_queue) in queues.iter_mut().zip(deferred) {

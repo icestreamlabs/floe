@@ -15,9 +15,14 @@ async fn sql_projection_applies_expressions() -> Result<()> {
     .await?;
 
     append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 1, 7, 40).await?;
-    append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 8, 70).await?;
+    let handle = append_bid(&mut harness.outer, &mut harness.ingestion_bridge, 2, 8, 70).await?;
 
-    wait_for_version(&harness.mv_registry, &harness.view_name, 1).await?;
+    wait_for_version(
+        &harness.mv_registry,
+        &harness.view_name,
+        handle.version as i64,
+    )
+    .await?;
 
     let (session, _) = harness.session_with_view().await?;
     let df = session
