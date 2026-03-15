@@ -221,6 +221,7 @@ pub(super) fn build_batch(
     max_batch: usize,
     max_per_source: usize,
     max_per_connector: usize,
+    pending_events: &core_source::PendingEventCounter,
 ) -> BatchSelection {
     let mut batch = Vec::with_capacity(max_batch);
     let mut per_source_counts = vec![0usize; source_count];
@@ -264,6 +265,8 @@ pub(super) fn build_batch(
             queue.pending = deferred_queue;
         }
     }
+
+    pending_events.record_dequeue(batch.len());
 
     BatchSelection {
         batch,

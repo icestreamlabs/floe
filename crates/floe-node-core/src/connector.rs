@@ -7,6 +7,9 @@ use tokio_util::sync::CancellationToken;
 use crate::source::{SourceEventBatch, SourceEventSender, send_batch, send_event};
 use floe_core::source::{SourceDefinition, SourceEvent};
 
+const MAX_PENDING_EVENTS_BEFORE_YIELD: usize = 65_536;
+const MAX_CONSECUTIVE_EMITTED_TICKS_BEFORE_YIELD: usize = 8;
+
 /// Context shared with connector implementations for event emission.
 #[derive(Clone)]
 pub struct ConnectorContext {
@@ -20,6 +23,10 @@ impl ConnectorContext {
 
     pub fn sender(&self) -> &SourceEventSender {
         &self.sender
+    }
+
+    pub fn pending_events(&self) -> usize {
+        self.sender.pending_events()
     }
 
     pub async fn send_event(
@@ -80,7 +87,9 @@ pub async fn run_connector<C: Connector>(
                         Ok(ConnectorTick::Finished) => break,
                         Ok(ConnectorTick::Emitted(_)) => {
                             consecutive_emitted_ticks = consecutive_emitted_ticks.saturating_add(1);
-                            if consecutive_emitted_ticks >= 64 {
+                            if consecutive_emitted_ticks >= MAX_CONSECUTIVE_EMITTED_TICKS_BEFORE_YIELD
+                                || ctx.pending_events() >= MAX_PENDING_EVENTS_BEFORE_YIELD
+                            {
                                 consecutive_emitted_ticks = 0;
                                 tokio::task::yield_now().await;
                             }
