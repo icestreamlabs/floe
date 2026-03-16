@@ -110,19 +110,22 @@ impl DbspJoin {
             format!("join_right_index_{join_id}"),
         );
 
-        let join_op = Arc::new(AsyncMutex::new(JoinOp::new(
-            left_state,
-            right_state,
-            left_index,
-            right_index,
-            Arc::new(left_key),
-            Arc::new(right_key),
-            Arc::new(predicate),
-            Arc::new(projector),
-            table.clone(),
-            output,
-            None,
-        )));
+        let join_op = Arc::new(AsyncMutex::new(
+            JoinOp::new(
+                left_state,
+                right_state,
+                left_index,
+                right_index,
+                Arc::new(left_key),
+                Arc::new(right_key),
+                Arc::new(predicate),
+                Arc::new(projector),
+                table.clone(),
+                output,
+                None,
+            )
+            .with_persist_indexes(false),
+        ));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
             default: ZSetHandle {

@@ -85,6 +85,13 @@ fn project_sum(l: &i64, r: &i64) -> i64 {
     l + r
 }
 
+fn empty_handle(namespace: &str) -> ZSetHandle {
+    ZSetHandle {
+        ns: namespace.to_string(),
+        version: 0,
+    }
+}
+
 fn apply_deltas(state: &mut HashMap<i64, i64>, deltas: &[(i64, i64)]) {
     for (key, delta) in deltas {
         let entry = state.entry(*key).or_insert(0);
@@ -819,4 +826,98 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
         .await
         .expect("materialize join delta");
     assert_eq!(materialized.get(&14), Some(&1));
+}
+
+#[tokio::test]
+async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_inmemory_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_inmemory_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_inmemory_output", None)
+            .await
+            .expect("out dict"),
+    );
+    let left_state = RelationState::empty(table.clone(), "join_inmemory_left_state".to_string())
+        .await
+        .expect("left state");
+    let right_state = RelationState::empty(table.clone(), "join_inmemory_right_state".to_string())
+        .await
+        .expect("right state");
+    let output = VersionedZSet::new(
+        out_dict.clone(),
+        table.clone(),
+        "join_inmemory_output".to_string(),
+    )
+    .await
+    .expect("output zset");
+
+    let mut op = JoinOp::new(
+        left_state,
+        right_state,
+        IndexedBatchZSet::new(table.clone(), "join_inmemory_left_index"),
+        IndexedBatchZSet::new(table.clone(), "join_inmemory_right_index"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        output,
+        None,
+    )
+    .with_persist_indexes(false);
+
+    let empty_left = empty_handle("join_inmemory_left_stream");
+    let right_delta = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "join_inmemory_right_stream",
+        &[(7, 1)],
+    )
+    .await;
+    assert!(
+        op.on_step(1, &[empty_left, right_delta])
+            .await
+            .expect("seed right inmemory index")
+            .is_none()
+    );
+
+    let left_delta = stage_version(
+        left_dict,
+        table.clone(),
+        "join_inmemory_left_stream",
+        &[(7, 1)],
+    )
+    .await;
+    let empty_right = empty_handle("join_inmemory_right_stream");
+    let out = op
+        .on_step(2, &[left_delta, empty_right])
+        .await
+        .expect("join step")
+        .expect("join output");
+
+    let mut cache = HashMap::new();
+    cache.insert("join_inmemory_output".to_string(), out_dict);
+    let materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
+        .await
+        .expect("materialize inmemory join delta");
+    assert_eq!(materialized.get(&14), Some(&1));
+
+    assert!(
+        op.right_index
+            .values_for_key(&7)
+            .await
+            .expect("lookup persisted right index")
+            .is_empty(),
+        "in-memory join indexes should not persist arranged state on the hot path"
+    );
 }

@@ -77,6 +77,9 @@ where
     output: VersionedZSet<O>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
+    left_memory_index: HashMap<K, HashMap<L, i64>>,
+    right_memory_index: HashMap<K, HashMap<R, i64>>,
+    persist_indexes: bool,
 }
 
 impl<L, R, O, K> JoinOp<L, R, O, K>
@@ -148,7 +151,15 @@ where
             output,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
+            left_memory_index: HashMap::new(),
+            right_memory_index: HashMap::new(),
+            persist_indexes: true,
         }
+    }
+
+    pub fn with_persist_indexes(mut self, persist_indexes: bool) -> Self {
+        self.persist_indexes = persist_indexes;
+        self
     }
 
     fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut HashMap<O, i64>) {
@@ -287,6 +298,48 @@ where
         );
         Ok(versioned.handle_for_version(plan.version))
     }
+
+    fn values_for_key_from_memory<T>(index: &HashMap<K, HashMap<T, i64>>, key: &K) -> Vec<(T, i64)>
+    where
+        T: Clone + Eq + Hash,
+    {
+        index
+            .get(key)
+            .map(|rows| {
+                rows.iter()
+                    .map(|(row, weight)| (row.clone(), *weight))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn apply_keyed_updates_to_memory_index<T>(
+        index: &mut HashMap<K, HashMap<T, i64>>,
+        keyed: &HashMap<K, Vec<(T, i64)>>,
+    ) where
+        T: Clone + Eq + Hash,
+    {
+        for (key, entries) in keyed {
+            let should_remove_key = {
+                let rows = index.entry(key.clone()).or_default();
+                for (row, weight) in entries {
+                    if *weight == 0 {
+                        continue;
+                    }
+                    let next = rows.get(row).copied().unwrap_or(0).saturating_add(*weight);
+                    if next == 0 {
+                        rows.remove(row);
+                    } else {
+                        rows.insert(row.clone(), next);
+                    }
+                }
+                rows.is_empty()
+            };
+            if should_remove_key {
+                index.remove(key);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -372,11 +425,14 @@ where
         // ΔA ⋈ B
         if has_left {
             for (key, left_entries) in &left_keyed {
-                let right_entries = self
-                    .right_index
-                    .values_for_key(key)
-                    .await
-                    .context("load right join index")?;
+                let right_entries = if self.persist_indexes {
+                    self.right_index
+                        .values_for_key(key)
+                        .await
+                        .context("load right join index")?
+                } else {
+                    Self::values_for_key_from_memory(&self.right_memory_index, key)
+                };
                 self.join_entries(left_entries, &right_entries, &mut delta_join);
             }
         }
@@ -384,11 +440,14 @@ where
         // A ⋈ ΔB
         if has_right {
             for (key, right_entries) in &right_keyed {
-                let left_entries = self
-                    .left_index
-                    .values_for_key(key)
-                    .await
-                    .context("load left join index")?;
+                let left_entries = if self.persist_indexes {
+                    self.left_index
+                        .values_for_key(key)
+                        .await
+                        .context("load left join index")?
+                } else {
+                    Self::values_for_key_from_memory(&self.left_memory_index, key)
+                };
                 self.join_entries(&left_entries, right_entries, &mut delta_join);
             }
         }
@@ -403,22 +462,29 @@ where
         }
         delta_join.retain(|_, w| *w != 0);
 
+        if !self.persist_indexes {
+            Self::apply_keyed_updates_to_memory_index(&mut self.left_memory_index, &left_keyed);
+            Self::apply_keyed_updates_to_memory_index(&mut self.right_memory_index, &right_keyed);
+        }
+
         let mut left_updates = Vec::new();
         for (key, entries) in &left_keyed {
             for (row, weight) in entries {
                 left_updates.push((key.clone(), row.clone(), *weight));
             }
         }
-        let left_index_persist_start = std::time::Instant::now();
-        self.left_index
-            .apply_deltas(left_updates)
-            .await
-            .context("update left join index")?;
-        metrics::observe_operator_persistence_latency_ms(
-            "join",
-            "left_index",
-            left_index_persist_start.elapsed().as_millis() as u64,
-        );
+        if self.persist_indexes {
+            let left_index_persist_start = std::time::Instant::now();
+            self.left_index
+                .apply_deltas(left_updates)
+                .await
+                .context("update left join index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "join",
+                "left_index",
+                left_index_persist_start.elapsed().as_millis() as u64,
+            );
+        }
 
         let mut right_updates = Vec::new();
         for (key, entries) in &right_keyed {
@@ -426,16 +492,18 @@ where
                 right_updates.push((key.clone(), row.clone(), *weight));
             }
         }
-        let right_index_persist_start = std::time::Instant::now();
-        self.right_index
-            .apply_deltas(right_updates)
-            .await
-            .context("update right join index")?;
-        metrics::observe_operator_persistence_latency_ms(
-            "join",
-            "right_index",
-            right_index_persist_start.elapsed().as_millis() as u64,
-        );
+        if self.persist_indexes {
+            let right_index_persist_start = std::time::Instant::now();
+            self.right_index
+                .apply_deltas(right_updates)
+                .await
+                .context("update right join index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "join",
+                "right_index",
+                right_index_persist_start.elapsed().as_millis() as u64,
+            );
+        }
 
         if delta_join.is_empty() {
             return Ok(None);
