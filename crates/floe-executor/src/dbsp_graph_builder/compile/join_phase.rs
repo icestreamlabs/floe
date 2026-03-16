@@ -1,4 +1,7 @@
 use super::*;
+use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
+use datafusion::common::Column;
+use datafusion::logical_expr::Expr;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_join(
@@ -157,12 +160,29 @@ impl DbspGraphBuilder {
         let right_key_exprs = Arc::clone(&join_keys);
         let left_key_schema = Arc::clone(&left_schema);
         let right_key_schema = Arc::clone(&right_schema);
+        let left_key_columns =
+            direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
+        let right_key_columns =
+            direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = left_key_columns.as_ref() {
+                return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %left_graph_id,
+                            error = %err,
+                            "failed to extract join left key columns"
+                        );
+                        None
+                    }
+                };
+            }
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -210,6 +230,19 @@ impl DbspGraphBuilder {
         };
 
         let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = right_key_columns.as_ref() {
+                return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %right_graph_id,
+                            error = %err,
+                            "failed to extract join right key columns"
+                        );
+                        None
+                    }
+                };
+            }
             let right_row = match decode_projected_row_key(right_bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -299,36 +332,13 @@ impl DbspGraphBuilder {
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            let mut combined = match decode_projected_row_key(left_bytes) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %projector_graph_id,
-                        error = %err,
-                        "failed to decode join projection left row"
-                    );
-                    return Vec::new();
-                }
-            };
-            let right_row = match decode_projected_row_key(right_bytes) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %projector_graph_id,
-                        error = %err,
-                        "failed to decode join projection right row"
-                    );
-                    return Vec::new();
-                }
-            };
-            combined.extend(right_row);
-            match encode_projected_row_key(&combined) {
+            match concat_encoded_rows(left_bytes, right_bytes) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %projector_graph_id,
                         error = %err,
-                        "failed to encode join projection row"
+                        "failed to concatenate join projection rows"
                     );
                     Vec::new()
                 }
@@ -704,4 +714,49 @@ impl DbspGraphBuilder {
             .context("initialize OUTER join union")?;
         Ok(union.stream())
     }
+}
+
+#[derive(Clone, Copy)]
+enum JoinKeySide {
+    Left,
+    Right,
+}
+
+fn direct_join_key_columns(
+    node: &DbspJoinNode,
+    schema: &RowSchema,
+    side: JoinKeySide,
+) -> Option<Vec<usize>> {
+    node.keys
+        .iter()
+        .map(|key| match side {
+            JoinKeySide::Left => direct_column_index(key.left_expression(), schema),
+            JoinKeySide::Right => direct_column_index(key.right_expression(), schema),
+        })
+        .collect()
+}
+
+fn direct_column_index(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr.expr() {
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        other => direct_column_index_expression(other, schema),
+    }
+}
+
+fn direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => resolve_direct_column(schema, column),
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    schema
+        .field_index(&qualified)
+        .or_else(|| schema.field_index(&column.name))
 }

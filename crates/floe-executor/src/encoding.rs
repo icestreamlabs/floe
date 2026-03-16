@@ -125,6 +125,126 @@ pub fn decode_projected_row_key(bytes: &[u8]) -> Result<Vec<ScalarValue>> {
     Ok(columns)
 }
 
+pub fn extract_encoded_row_columns(
+    bytes: &[u8],
+    indices: &[usize],
+    require_non_null: bool,
+) -> Result<Option<Vec<u8>>> {
+    let count = encoded_row_column_count(bytes)?;
+    if indices.iter().any(|index| *index >= count) {
+        return Err(anyhow!(
+            "encoded row has {count} columns but a requested index was out of bounds"
+        ));
+    }
+
+    let mut requested = indices
+        .iter()
+        .enumerate()
+        .map(|(slot, index)| (*index, slot))
+        .collect::<Vec<_>>();
+    requested.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut spans = vec![(0usize, 0usize); indices.len()];
+    let mut request_idx = 0usize;
+    let mut cursor = 4usize;
+
+    for column_idx in 0..count {
+        let start = cursor;
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        cursor = encoded_field_end(bytes, cursor, tag)?;
+        let end = cursor;
+
+        while request_idx < requested.len() && requested[request_idx].0 == column_idx {
+            if require_non_null && is_null_field_tag(tag) {
+                return Ok(None);
+            }
+            let slot = requested[request_idx].1;
+            spans[slot] = (start, end);
+            request_idx += 1;
+        }
+    }
+
+    let total_payload_len = spans.iter().map(|(start, end)| end - start).sum::<usize>();
+    let selected_count =
+        u32::try_from(indices.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut out = Vec::with_capacity(4 + total_payload_len);
+    out.extend_from_slice(&selected_count.to_le_bytes());
+    for (start, end) in spans {
+        out.extend_from_slice(&bytes[start..end]);
+    }
+    Ok(Some(out))
+}
+
+pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
+    let left_count = encoded_row_column_count(left)?;
+    let right_count = encoded_row_column_count(right)?;
+    let total_count = left_count
+        .checked_add(right_count)
+        .ok_or_else(|| anyhow!("combined row has too many columns"))?;
+    let total_count =
+        u32::try_from(total_count).map_err(|_| anyhow!("too many columns in MV key"))?;
+
+    let mut out = Vec::with_capacity(left.len() + right.len() - 4);
+    out.extend_from_slice(&total_count.to_le_bytes());
+    out.extend_from_slice(&left[4..]);
+    out.extend_from_slice(&right[4..]);
+    Ok(out)
+}
+
+fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
+    if bytes.len() < 4 {
+        return Err(anyhow!("encoded key too short"));
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4usize;
+    for _ in 0..count {
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        cursor = encoded_field_end(bytes, cursor, tag)?;
+    }
+    Ok(count)
+}
+
+fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
+    match tag {
+        0x00 | 0x05 | 0x06 | 0x07 | 0x08 => Ok(cursor),
+        0x01 | 0x03 => {
+            let end = cursor + 8;
+            bytes
+                .get(cursor..end)
+                .ok_or_else(|| anyhow!("truncated fixed-width value"))?;
+            Ok(end)
+        }
+        0x02 => {
+            let len_bytes = bytes
+                .get(cursor..cursor + 4)
+                .ok_or_else(|| anyhow!("truncated string length"))?;
+            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            let end = cursor + 4 + len;
+            bytes
+                .get(cursor + 4..end)
+                .ok_or_else(|| anyhow!("truncated string payload"))?;
+            Ok(end)
+        }
+        0x04 => {
+            bytes
+                .get(cursor)
+                .ok_or_else(|| anyhow!("missing boolean payload"))?;
+            Ok(cursor + 1)
+        }
+        _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
+    }
+}
+
+fn is_null_field_tag(tag: u8) -> bool {
+    matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +279,65 @@ mod tests {
         let encoded = encode_projected_row_key(&row).expect("encode");
         let decoded = decode_projected_row_key(&encoded).expect("decode");
         assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn extracts_selected_columns_without_full_decode() {
+        let row = vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Utf8(Some("abc".into())),
+            ScalarValue::TimestampMillisecond(Some(1234), None),
+            ScalarValue::Boolean(Some(false)),
+        ];
+        let encoded = encode_projected_row_key(&row).expect("encode");
+        let selected = extract_encoded_row_columns(&encoded, &[3, 0], true)
+            .expect("extract")
+            .expect("non-null key");
+        let decoded = decode_projected_row_key(&selected).expect("decode");
+        assert_eq!(
+            decoded,
+            vec![
+                ScalarValue::Boolean(Some(false)),
+                ScalarValue::Int64(Some(10))
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_null_key_column_returns_none_when_non_null_required() {
+        let row = vec![
+            ScalarValue::Int64(None),
+            ScalarValue::Utf8(Some("abc".into())),
+        ];
+        let encoded = encode_projected_row_key(&row).expect("encode");
+        let selected =
+            extract_encoded_row_columns(&encoded, &[0], true).expect("extract nullable key");
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn concatenates_encoded_rows_without_decode_reencode() {
+        let left = encode_projected_row_key(&[
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Utf8(Some("left".into())),
+        ])
+        .expect("encode left");
+        let right = encode_projected_row_key(&[
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::TimestampMillisecond(Some(55), None),
+        ])
+        .expect("encode right");
+
+        let combined = concat_encoded_rows(&left, &right).expect("concat");
+        let decoded = decode_projected_row_key(&combined).expect("decode combined");
+        assert_eq!(
+            decoded,
+            vec![
+                ScalarValue::Int64(Some(10)),
+                ScalarValue::Utf8(Some("left".into())),
+                ScalarValue::Boolean(Some(true)),
+                ScalarValue::TimestampMillisecond(Some(55), None),
+            ]
+        );
     }
 }
