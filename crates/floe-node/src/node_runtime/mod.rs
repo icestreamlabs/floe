@@ -23,7 +23,7 @@ use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
     OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
-    ValidatedPlan, source_batch_journal_root_source_name, transient_source_root_requirements,
+    ValidatedPlan, plan_source_requirements, source_batch_journal_root_source_name,
     validate_dbsp_plan,
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};

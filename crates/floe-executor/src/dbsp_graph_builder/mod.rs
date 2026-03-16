@@ -7,5 +7,6 @@ mod vectorized_filter_project;
 
 pub use builder::{
     BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig,
-    source_batch_journal_root_source_name, transient_source_root_requirements,
+    plan_source_requirements, source_batch_journal_root_source_name,
+    transient_source_root_requirements,
 };

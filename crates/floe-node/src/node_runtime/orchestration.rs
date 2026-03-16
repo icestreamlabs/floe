@@ -207,29 +207,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .difference(&durable_required_sources)
         .cloned()
         .collect();
-    let transient_required_columns_by_source = if transient_only_sources.is_empty() {
-        HashMap::new()
-    } else {
+    let transient_required_columns_by_source = {
         let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
             .definitions()
             .iter()
             .map(|definition| (definition.name(), definition))
             .collect();
         let mut required_columns_by_source: HashMap<String, BTreeSet<usize>> = HashMap::new();
-        for plan in &circuit_plans {
-            let Some(requirements) = transient_source_root_requirements(plan)? else {
+        let mut pruning_blocked_sources = BTreeSet::new();
+        for (plan, required_sources) in circuit_plans.iter().zip(plan_required_sources.iter()) {
+            let Some(requirements) = plan_source_requirements(plan)? else {
+                pruning_blocked_sources.extend(required_sources.iter().cloned());
                 continue;
             };
-            if !transient_only_sources.contains(&requirements.source_name) {
+            let covered_sources: BTreeSet<_> = requirements
+                .iter()
+                .map(|requirement| requirement.source_name.clone())
+                .collect();
+            if covered_sources != *required_sources {
+                pruning_blocked_sources.extend(required_sources.iter().cloned());
                 continue;
             }
-            required_columns_by_source
-                .entry(requirements.source_name)
-                .or_default()
-                .extend(requirements.required_columns);
+            for requirement in requirements {
+                required_columns_by_source
+                    .entry(requirement.source_name)
+                    .or_default()
+                    .extend(requirement.required_columns);
+            }
         }
         let mut masks = HashMap::new();
         for (source_name, required_columns) in required_columns_by_source {
+            if pruning_blocked_sources.contains(&source_name) {
+                continue;
+            }
             let definition = definition_by_name
                 .get(source_name.as_str())
                 .copied()
@@ -263,7 +273,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .collect::<Vec<_>>();
         tracing::info!(
             pruned_sources = ?pruned_sources,
-            "resolved transient source column pruning"
+            "resolved source column pruning"
         );
     }
     if run_args.dry_run {

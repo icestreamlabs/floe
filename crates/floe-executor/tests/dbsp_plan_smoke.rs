@@ -7,6 +7,7 @@ use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, TableDescriptor,
     nexmark_auction_table, nexmark_bid_table, nexmark_config, nexmark_person_table,
 };
+use floe_executor::plan_source_requirements;
 
 #[test]
 fn plans_scan_then_project() -> Result<()> {
@@ -91,6 +92,70 @@ fn plans_join_with_single_key() -> Result<()> {
         }
         other => panic!("expected join root, found {other:?}"),
     }
+
+    Ok(())
+}
+
+#[test]
+fn source_requirement_analysis_tracks_filter_projection_inputs() -> Result<()> {
+    let logical_plan = table_scan(
+        Some(nexmark_bid_table().name),
+        &schema_for(nexmark_bid_table()),
+        None,
+    )?
+    .filter(col("auction").lt_eq(lit(5000i64)))?
+    .project(vec![col("auction"), col("bidder"), col("price")])?
+    .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("filter/projection plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].source_name, "nexmark_bid");
+    assert_eq!(requirements[0].required_columns, vec![0, 1, 2]);
+
+    Ok(())
+}
+
+#[test]
+fn source_requirement_analysis_tracks_join_inputs() -> Result<()> {
+    let auction_scan = table_scan(
+        Some(nexmark_auction_table().name),
+        &schema_for(nexmark_auction_table()),
+        None,
+    )?
+    .filter(col("category").eq(lit(10i64)))?
+    .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_bid_table().name),
+        &schema_for(nexmark_bid_table()),
+        None,
+    )?
+    .join(
+        auction_scan,
+        JoinType::Inner,
+        (
+            vec![Column::from_name("auction")],
+            vec![Column::from_name("id")],
+        ),
+        None,
+    )?
+    .project(vec![
+        col("auction"),
+        col("bidder"),
+        col("price"),
+        col("seller"),
+    ])?
+    .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("join plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].source_name, "nexmark_auction");
+    assert_eq!(requirements[0].required_columns, vec![0, 5, 6]);
+    assert_eq!(requirements[1].source_name, "nexmark_bid");
+    assert_eq!(requirements[1].required_columns, vec![0, 1, 2]);
 
     Ok(())
 }

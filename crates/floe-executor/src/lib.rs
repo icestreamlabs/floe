@@ -37,7 +37,8 @@ pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{
     BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig,
-    source_batch_journal_root_source_name, transient_source_root_requirements,
+    plan_source_requirements, source_batch_journal_root_source_name,
+    transient_source_root_requirements,
 };
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use dbsp_table_environment::DbspTableEnvironment;
