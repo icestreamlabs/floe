@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rkyv::Archive;
@@ -24,6 +25,7 @@ use crate::stream::util::delta_zset_handle;
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type FastHashMap<K, V> = AHashMap<K, V>;
 
 pub struct JoinOp<L, R, O, K>
 where
@@ -77,8 +79,8 @@ where
     output: VersionedZSet<O>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
-    left_memory_index: HashMap<K, HashMap<L, i64>>,
-    right_memory_index: HashMap<K, HashMap<R, i64>>,
+    left_memory_index: FastHashMap<K, FastHashMap<L, i64>>,
+    right_memory_index: FastHashMap<K, FastHashMap<R, i64>>,
     persist_indexes: bool,
 }
 
@@ -151,8 +153,8 @@ where
             output,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
-            left_memory_index: HashMap::new(),
-            right_memory_index: HashMap::new(),
+            left_memory_index: FastHashMap::new(),
+            right_memory_index: FastHashMap::new(),
             persist_indexes: true,
         }
     }
@@ -162,7 +164,7 @@ where
         self
     }
 
-    fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut HashMap<O, i64>) {
+    fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut FastHashMap<O, i64>) {
         for (lk, lw) in left {
             if *lw == 0 {
                 continue;
@@ -181,13 +183,13 @@ where
 
     fn keyed_deltas<T>(
         &self,
-        deltas: &HashMap<T, i64>,
+        deltas: &FastHashMap<T, i64>,
         extractor: &JoinKeyExtractor<T, K>,
-    ) -> HashMap<K, Vec<(T, i64)>>
+    ) -> FastHashMap<K, Vec<(T, i64)>>
     where
         T: Clone,
     {
-        let mut keyed = HashMap::new();
+        let mut keyed = FastHashMap::new();
         for (row, weight) in deltas {
             if *weight == 0 {
                 continue;
@@ -202,11 +204,11 @@ where
         keyed
     }
 
-    fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> HashMap<T, i64>
+    fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> FastHashMap<T, i64>
     where
         T: Clone + Eq + Hash,
     {
-        let mut merged = HashMap::new();
+        let mut merged = FastHashMap::new();
         for (row, weight) in deltas {
             let entry = merged.entry(row.clone()).or_insert(0);
             *entry += weight;
@@ -219,7 +221,7 @@ where
 
     async fn apply_deltas_to_versioned<T>(
         versioned: &mut VersionedZSet<T>,
-        deltas: &HashMap<T, i64>,
+        deltas: &FastHashMap<T, i64>,
         base: Option<u64>,
         state_label: &'static str,
     ) -> Result<ZSetHandle>
@@ -299,7 +301,10 @@ where
         Ok(versioned.handle_for_version(plan.version))
     }
 
-    fn values_for_key_from_memory<T>(index: &HashMap<K, HashMap<T, i64>>, key: &K) -> Vec<(T, i64)>
+    fn values_for_key_from_memory<T>(
+        index: &FastHashMap<K, FastHashMap<T, i64>>,
+        key: &K,
+    ) -> Vec<(T, i64)>
     where
         T: Clone + Eq + Hash,
     {
@@ -314,8 +319,8 @@ where
     }
 
     fn apply_keyed_updates_to_memory_index<T>(
-        index: &mut HashMap<K, HashMap<T, i64>>,
-        keyed: &HashMap<K, Vec<(T, i64)>>,
+        index: &mut FastHashMap<K, FastHashMap<T, i64>>,
+        keyed: &FastHashMap<K, Vec<(T, i64)>>,
     ) where
         T: Clone + Eq + Hash,
     {
@@ -418,7 +423,7 @@ where
         // Build output delta from pre-update state (A, B) and current deltas
         // (ΔA, ΔB). State/index updates happen after this block to keep
         // each tick atomic.
-        let mut delta_join: HashMap<O, i64> = HashMap::new();
+        let mut delta_join: FastHashMap<O, i64> = FastHashMap::new();
         let has_left = !left_keyed.is_empty();
         let has_right = !right_keyed.is_empty();
 
