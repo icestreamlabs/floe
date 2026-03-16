@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use futures::TryStreamExt;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
@@ -28,7 +30,7 @@ const CHECKSUM_MOD: i128 = 2_305_843_009_213_693_951;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
 const DAY_UTC: &str = "2023-11-14";
 const DEFAULT_NO_SINK_END_COUNT_SETTLE_MS: u64 = 0;
-const DEFAULT_NO_SINK_END_COUNT_POLL_MS: u64 = 1_000;
+const DEFAULT_NO_SINK_END_COUNT_POLL_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FieldKind {
@@ -421,6 +423,11 @@ async fn run_redpanda_kafka_million_test_impl(
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write node config")?;
 
+    ensure_topic_exists(&brokers, &input_topic).await?;
+    if matches!(sink_mode, SinkMode::WithKafkaSink) {
+        ensure_topic_exists(&brokers, &output_topic).await?;
+    }
+
     let node_spawn_started = Instant::now();
     let mut child = spawn_node(
         &config_path,
@@ -594,6 +601,34 @@ async fn run_redpanda_kafka_million_test_impl(
 
     stop_child(&mut child, "INT").await;
     test_result
+}
+
+async fn ensure_topic_exists(brokers: &str, topic: &str) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .context("create kafka admin client")?;
+    let results = admin
+        .create_topics(
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(5))),
+        )
+        .await
+        .with_context(|| format!("create topic {topic}"))?;
+    for result in results {
+        match result {
+            Ok(created_topic) if created_topic == topic => {}
+            Ok(created_topic) => {
+                bail!("unexpected topic creation result for '{created_topic}', expected '{topic}'")
+            }
+            Err((existing_topic, RDKafkaErrorCode::TopicAlreadyExists))
+                if existing_topic == topic => {}
+            Err((failed_topic, code)) => {
+                bail!("failed to create topic '{failed_topic}': {code}")
+            }
+        }
+    }
+    Ok(())
 }
 
 fn generate_dataset_file(
