@@ -8,6 +8,7 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 const DEFAULT_ROWS: usize = 1_000_000;
 const DEFAULT_PROGRESS_EVERY: usize = 100_000;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
+const AUCTION_CARDINALITY: i64 = 10_000;
 
 #[derive(Debug)]
 struct Config {
@@ -15,6 +16,13 @@ struct Config {
     topic: String,
     rows: usize,
     progress_every: usize,
+    dataset: DatasetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatasetKind {
+    Bid,
+    Auction,
 }
 
 #[derive(Debug)]
@@ -73,17 +81,95 @@ impl BidInput {
     }
 }
 
+#[derive(Debug)]
+struct AuctionInput {
+    id: i64,
+    item_name: String,
+    description: String,
+    initial_bid: i64,
+    reserve: i64,
+    seller: i64,
+    category: i64,
+    expires_ms: i64,
+    date_time_ms: i64,
+}
+
+impl AuctionInput {
+    fn from_auction_idx(auction_idx: usize) -> Self {
+        let auction_idx_i64 = i64::try_from(auction_idx).unwrap_or_default();
+        let id = auction_idx_i64;
+        let category = ((auction_idx_i64 - 1).rem_euclid(10)) + 1;
+        let seller = 50_000_i64 + auction_idx_i64;
+        let initial_bid = 5_000_i64 + (auction_idx_i64 % 25_000);
+        let reserve = initial_bid + 500;
+        let date_time_ms = BASE_TS_MS + auction_idx_i64;
+        let expires_ms = date_time_ms + 86_400_000;
+        Self {
+            id,
+            item_name: format!("item_{auction_idx}"),
+            description: format!("auction_description_{auction_idx}"),
+            initial_bid,
+            reserve,
+            seller,
+            category,
+            expires_ms,
+            date_time_ms,
+        }
+    }
+
+    fn to_json(&self, auction_idx: usize) -> String {
+        format!(
+            "{{\"id\":{},\"item_name\":\"{}\",\"description\":\"{}\",\"initial_bid\":{},\"reserve\":{},\"seller\":{},\"category\":{},\"expires\":{},\"date_time\":{},\"extra\":\"auction_extra_{}\"}}",
+            self.id,
+            self.item_name,
+            self.description,
+            self.initial_bid,
+            self.reserve,
+            self.seller,
+            self.category,
+            self.expires_ms,
+            self.date_time_ms,
+            auction_idx,
+        )
+    }
+}
+
+impl DatasetKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "bid" | "bids" => Ok(Self::Bid),
+            "auction" | "auctions" => Ok(Self::Auction),
+            other => bail!("unsupported --dataset value '{other}' (expected bid|auction)"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bid => "bid",
+            Self::Auction => "auction",
+        }
+    }
+}
+
 fn parse_args() -> Result<Config> {
     let mut brokers = None;
     let mut topic = None;
     let mut rows = DEFAULT_ROWS;
     let mut progress_every = DEFAULT_PROGRESS_EVERY;
+    let mut dataset = DatasetKind::Bid;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--brokers" => brokers = args.next(),
             "--topic" => topic = args.next(),
+            "--dataset" => {
+                dataset = DatasetKind::parse(
+                    args.next()
+                        .context("missing value for --dataset")?
+                        .as_str(),
+                )?;
+            }
             "--rows" => {
                 rows = args
                     .next()
@@ -114,12 +200,13 @@ fn parse_args() -> Result<Config> {
         topic,
         rows,
         progress_every,
+        dataset,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: kafka_million_bid_producer --brokers HOST:PORT --topic TOPIC [--rows N] [--progress-every N]"
+        "Usage: kafka_million_bid_producer --brokers HOST:PORT --topic TOPIC [--dataset bid|auction] [--rows N] [--progress-every N]"
     );
 }
 
@@ -132,8 +219,14 @@ async fn main() -> Result<()> {
         .create()
         .context("create kafka producer")?;
 
-    for bid_idx in 1..=config.rows {
-        let payload = BidInput::from_bid_idx(bid_idx).to_json(bid_idx);
+    for row_idx in 1..=config.rows {
+        let payload = match config.dataset {
+            DatasetKind::Bid => BidInput::from_bid_idx(row_idx).to_json(row_idx),
+            DatasetKind::Auction => {
+                let auction_idx = row_idx.min(usize::try_from(AUCTION_CARDINALITY).unwrap_or(row_idx));
+                AuctionInput::from_auction_idx(auction_idx).to_json(auction_idx)
+            }
+        };
 
         loop {
             let record: BaseRecord<'_, (), _> = BaseRecord::to(&config.topic).payload(&payload);
@@ -151,8 +244,12 @@ async fn main() -> Result<()> {
 
         producer.poll(Duration::ZERO);
 
-        if config.progress_every > 0 && bid_idx % config.progress_every == 0 {
-            println!("produced {bid_idx} rows to topic={}", config.topic);
+        if config.progress_every > 0 && row_idx % config.progress_every == 0 {
+            println!(
+                "produced {row_idx} {} rows to topic={}",
+                config.dataset.label(),
+                config.topic
+            );
         }
     }
 
@@ -161,8 +258,11 @@ async fn main() -> Result<()> {
         .context("flush kafka producer")?;
 
     println!(
-        "finished producing rows={} topic={} brokers={}",
-        config.rows, config.topic, config.brokers
+        "finished producing dataset={} rows={} topic={} brokers={}",
+        config.dataset.label(),
+        config.rows,
+        config.topic,
+        config.brokers
     );
 
     Ok(())
