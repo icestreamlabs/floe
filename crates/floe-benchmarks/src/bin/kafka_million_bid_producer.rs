@@ -165,9 +165,7 @@ fn parse_args() -> Result<Config> {
             "--topic" => topic = args.next(),
             "--dataset" => {
                 dataset = DatasetKind::parse(
-                    args.next()
-                        .context("missing value for --dataset")?
-                        .as_str(),
+                    args.next().context("missing value for --dataset")?.as_str(),
                 )?;
             }
             "--rows" => {
@@ -223,7 +221,8 @@ async fn main() -> Result<()> {
         let payload = match config.dataset {
             DatasetKind::Bid => BidInput::from_bid_idx(row_idx).to_json(row_idx),
             DatasetKind::Auction => {
-                let auction_idx = row_idx.min(usize::try_from(AUCTION_CARDINALITY).unwrap_or(row_idx));
+                let auction_idx =
+                    row_idx.min(usize::try_from(AUCTION_CARDINALITY).unwrap_or(row_idx));
                 AuctionInput::from_auction_idx(auction_idx).to_json(auction_idx)
             }
         };
