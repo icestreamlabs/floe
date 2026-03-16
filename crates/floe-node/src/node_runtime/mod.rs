@@ -23,7 +23,8 @@ use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
     OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
-    ValidatedPlan, source_batch_journal_root_source_name, validate_dbsp_plan,
+    ValidatedPlan, source_batch_journal_root_source_name, transient_source_root_requirements,
+    validate_dbsp_plan,
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};

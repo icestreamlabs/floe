@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -80,10 +81,15 @@ pub struct KafkaConnector {
 struct DirectDecodeLookup {
     definition_index_by_name: HashMap<String, usize>,
     column_indexes_by_definition: Vec<HashMap<String, usize>>,
+    required_columns_by_definition: Vec<Option<Arc<[bool]>>>,
 }
 
 impl KafkaConnector {
-    pub fn new(config: KafkaConnectorConfig, definitions: Vec<SourceDefinition>) -> Result<Self> {
+    pub fn new(
+        config: KafkaConnectorConfig,
+        definitions: Vec<SourceDefinition>,
+        required_columns_by_source: HashMap<String, Arc<[bool]>>,
+    ) -> Result<Self> {
         ensure!(
             !config.brokers.trim().is_empty(),
             "kafka brokers must not be empty"
@@ -94,7 +100,8 @@ impl KafkaConnector {
             "kafka max messages per tick must be positive"
         );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
-        let direct_decode_lookup = build_direct_decode_lookup(&definitions);
+        let direct_decode_lookup =
+            build_direct_decode_lookup(&definitions, &required_columns_by_source);
         Ok(Self {
             config,
             message_format,
@@ -108,7 +115,7 @@ impl KafkaConnector {
     }
 
     pub async fn run(config: KafkaConnectorConfig, sender: SourceEventSender) -> Result<()> {
-        let mut connector = KafkaConnector::new(config, Vec::new())?;
+        let mut connector = KafkaConnector::new(config, Vec::new(), HashMap::new())?;
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
     }
@@ -465,6 +472,9 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
                         definition,
                         column_indexes: &self.seed.lookup.column_indexes_by_definition
                             [definition_idx],
+                        required_columns: self.seed.lookup.required_columns_by_definition
+                            [definition_idx]
+                            .as_deref(),
                     })?;
                     encoded_row = Some(encoded);
                     if event_ts.is_none() {
@@ -504,6 +514,7 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
 struct DirectSourceDataSeed<'a> {
     definition: &'a SourceDefinition,
     column_indexes: &'a HashMap<String, usize>,
+    required_columns: Option<&'a [bool]>,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
@@ -516,6 +527,7 @@ impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
         deserializer.deserialize_map(DirectSourceDataVisitor {
             definition: self.definition,
             column_indexes: self.column_indexes,
+            required_columns: self.required_columns,
         })
     }
 }
@@ -523,6 +535,7 @@ impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
 struct DirectSourceDataVisitor<'a> {
     definition: &'a SourceDefinition,
     column_indexes: &'a HashMap<String, usize>,
+    required_columns: Option<&'a [bool]>,
 }
 
 impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
@@ -542,6 +555,10 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
             if let Some((idx, column)) =
                 lookup_source_column(self.definition, self.column_indexes, key.as_ref())
             {
+                if !column_required(self.required_columns, idx) {
+                    let _: IgnoredAny = map.next_value()?;
+                    continue;
+                }
                 let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceColumnSeed {
                     data_type: column.data_type(),
                     nullable: column.nullable(),
@@ -561,6 +578,10 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
             .map_err(|_| de::Error::custom("too many source columns to encode"))?;
         row.extend_from_slice(&count.to_le_bytes());
         for (idx, column) in self.definition.columns().iter().enumerate() {
+            if !column_required(self.required_columns, idx) {
+                encode_typed_null(&mut row, column.data_type());
+                continue;
+            }
             if let Some(encoded) = encoded_columns[idx].take() {
                 row.extend_from_slice(&encoded);
             } else if column.nullable() {
@@ -669,6 +690,13 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
     }
 }
 
+fn column_required(required_columns: Option<&[bool]>, idx: usize) -> bool {
+    required_columns
+        .and_then(|columns| columns.get(idx))
+        .copied()
+        .unwrap_or(true)
+}
+
 fn lookup_source_definition<'a>(
     definitions: &'a [SourceDefinition],
     definition_index_by_name: &HashMap<String, usize>,
@@ -687,9 +715,13 @@ fn lookup_source_column<'a>(
     Some((idx, definition.columns().get(idx)?))
 }
 
-fn build_direct_decode_lookup(definitions: &[SourceDefinition]) -> DirectDecodeLookup {
+fn build_direct_decode_lookup(
+    definitions: &[SourceDefinition],
+    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
+) -> DirectDecodeLookup {
     let mut definition_index_by_name = HashMap::with_capacity(definitions.len());
     let mut column_indexes_by_definition = Vec::with_capacity(definitions.len());
+    let mut required_columns_by_definition = Vec::with_capacity(definitions.len());
     for (definition_idx, definition) in definitions.iter().enumerate() {
         definition_index_by_name.insert(definition.name().to_string(), definition_idx);
         let mut column_indexes = HashMap::with_capacity(definition.columns().len());
@@ -697,10 +729,16 @@ fn build_direct_decode_lookup(definitions: &[SourceDefinition]) -> DirectDecodeL
             column_indexes.insert(column.name().to_string(), column_idx);
         }
         column_indexes_by_definition.push(column_indexes);
+        required_columns_by_definition.push(
+            required_columns_by_source
+                .get(definition.name())
+                .map(Arc::clone),
+        );
     }
     DirectDecodeLookup {
         definition_index_by_name,
         column_indexes_by_definition,
+        required_columns_by_definition,
     }
 }
 
@@ -923,7 +961,7 @@ mod tests {
         )
         .expect("definition");
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
-        let lookup = build_direct_decode_lookup(&[definition.clone()]);
+        let lookup = build_direct_decode_lookup(&[definition.clone()], &HashMap::new());
 
         let direct =
             parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()], &lookup)
@@ -952,5 +990,52 @@ mod tests {
         );
         assert_eq!(direct.event_time_ms(), expected_ts);
         assert_eq!(direct.source(), "nexmark_bid");
+    }
+
+    #[test]
+    fn direct_floe_json_parse_skips_unneeded_columns() {
+        let definition = SourceDefinition::new(
+            "nexmark_bid",
+            vec![
+                SourceColumn::new("auction", SourceDataType::Int64),
+                SourceColumn::new("bidder", SourceDataType::Int64),
+                SourceColumn::new("price", SourceDataType::Int64),
+                SourceColumn::new_nullable("channel", SourceDataType::Utf8, false),
+            ],
+        )
+        .expect("definition");
+        let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99}}"#;
+        let lookup = build_direct_decode_lookup(
+            &[definition.clone()],
+            &HashMap::from([(
+                "nexmark_bid".to_string(),
+                Arc::from([true, true, true, false]),
+            )]),
+        );
+
+        let direct =
+            parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()], &lookup)
+                .expect("direct parse")
+                .expect("direct event");
+        let decoder = SourceRowDecoder::new_with_encoded_required_columns(
+            definition,
+            Some(Arc::from([true, true, true, false])),
+        );
+        let expected_event = SourceEvent::new(
+            "nexmark_bid",
+            json!({
+                "auction": 100,
+                "bidder": 42,
+                "price": 99
+            }),
+        );
+        let (expected_encoded, _) = decoder
+            .encode_row_key(&expected_event)
+            .expect("expected encoding");
+
+        assert_eq!(
+            direct.preencoded_row_key(),
+            Some(expected_encoded.as_slice())
+        );
     }
 }

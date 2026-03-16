@@ -28,7 +28,9 @@ use crate::task_events::GraphTaskSender;
 
 use super::materialize::DeltaTransformFn;
 use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
-use super::vectorized_filter_project::VectorizedFilterProjectEvaluator;
+use super::vectorized_filter_project::{
+    VectorizedFilterProjectEvaluator, required_encoded_input_columns,
+};
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -854,11 +856,48 @@ impl TransientSourceRootShape {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransientSourceRootRequirements {
+    pub source_name: String,
+    pub required_columns: Vec<usize>,
+}
+
 pub fn source_batch_journal_root_source_name(plan: &CircuitPlan) -> Option<String> {
     find_transient_source_root_shape(plan, plan.root)
         .ok()
         .flatten()
         .map(|shape| shape.source_name().to_string())
+}
+
+pub fn transient_source_root_requirements(
+    plan: &CircuitPlan,
+) -> Result<Option<TransientSourceRootRequirements>> {
+    let Some(shape) = find_transient_source_root_shape(plan, plan.root)? else {
+        return Ok(None);
+    };
+    let source_name = shape.source_name().to_string();
+    let required_columns = match &shape {
+        TransientSourceRootShape::Source { source, .. }
+        | TransientSourceRootShape::Select { source, .. } => {
+            (0..source.output_schema().len()).collect()
+        }
+        TransientSourceRootShape::Project { project, .. } => required_encoded_input_columns(
+            None,
+            Some(project.expressions()),
+            project.input_schema(),
+        )?,
+        TransientSourceRootShape::FilterMap {
+            select, project, ..
+        } => required_encoded_input_columns(
+            Some(select.predicate()),
+            Some(project.expressions()),
+            project.input_schema(),
+        )?,
+    };
+    Ok(Some(TransientSourceRootRequirements {
+        source_name,
+        required_columns,
+    }))
 }
 
 fn try_build_transient_source_root_materialization(

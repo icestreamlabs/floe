@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use datafusion::scalar::ScalarValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
@@ -8,11 +10,25 @@ use crate::stream_types::{Row, Timestamp};
 #[derive(Debug, Clone)]
 pub struct SourceRowDecoder {
     definition: SourceDefinition,
+    encoded_required_columns: Option<Arc<[bool]>>,
 }
 
 impl SourceRowDecoder {
     pub fn new(definition: SourceDefinition) -> Self {
-        Self { definition }
+        Self {
+            definition,
+            encoded_required_columns: None,
+        }
+    }
+
+    pub fn new_with_encoded_required_columns(
+        definition: SourceDefinition,
+        encoded_required_columns: Option<Arc<[bool]>>,
+    ) -> Self {
+        Self {
+            definition,
+            encoded_required_columns,
+        }
     }
 
     pub fn definition(&self) -> &SourceDefinition {
@@ -74,7 +90,11 @@ impl SourceRowDecoder {
             .context("too many source columns to encode")?;
         buf.extend_from_slice(&count.to_le_bytes());
         let mut event_ts = None;
-        for column in self.definition.columns() {
+        for (idx, column) in self.definition.columns().iter().enumerate() {
+            if !self.column_required(idx) {
+                encode_typed_null(&mut buf, column.data_type());
+                continue;
+            }
             let value = object.get(column.name());
             encode_value_direct(
                 &mut buf,
@@ -85,6 +105,14 @@ impl SourceRowDecoder {
             )?;
         }
         Ok((buf, event_ts))
+    }
+
+    fn column_required(&self, idx: usize) -> bool {
+        self.encoded_required_columns
+            .as_ref()
+            .and_then(|columns| columns.get(idx))
+            .copied()
+            .unwrap_or(true)
     }
 }
 
@@ -211,7 +239,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::encoding::encode_projected_row_key;
+    use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 
     #[test]
     fn decodes_nexmark_bid_event() {
@@ -369,5 +397,39 @@ mod tests {
         let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
         assert_eq!(encoded, expected);
         assert_eq!(direct_ts, decoded_ts);
+    }
+
+    #[test]
+    fn direct_encoding_can_omit_unneeded_columns() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note", SourceDataType::Utf8, false),
+                SourceColumn::new_nullable("created_at", SourceDataType::TimestampMillis, false),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new_with_encoded_required_columns(
+            definition,
+            Some(Arc::from([true, false, true])),
+        );
+        let event = SourceEvent::new(
+            "orders",
+            json!({
+                "id": 42,
+                "created_at": 1_700_000_000_i64
+            }),
+        );
+
+        let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
+        let decoded = decode_projected_row_key(&encoded).expect("decode encoded row");
+        assert_eq!(decoded[0], ScalarValue::Int64(Some(42)));
+        assert_eq!(decoded[1], ScalarValue::Utf8(None));
+        assert_eq!(
+            decoded[2],
+            ScalarValue::TimestampMillisecond(Some(1_700_000_000), None)
+        );
+        assert_eq!(direct_ts, Some(1_700_000_000_u64));
     }
 }

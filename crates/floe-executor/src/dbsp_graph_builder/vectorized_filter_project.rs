@@ -1486,6 +1486,27 @@ fn column_projection_indices(
         .collect::<Option<Vec<_>>>()
 }
 
+pub(crate) fn required_encoded_input_columns(
+    predicate: Option<&DbspPredicate>,
+    projections: Option<&[DbspProjectExpr]>,
+    input_schema: &RowSchema,
+) -> Result<Vec<usize>> {
+    let mut columns = BTreeSet::new();
+    if let Some(predicate) = predicate {
+        add_expr_input_columns(predicate.expression().expr(), input_schema, &mut columns)?;
+    }
+    if let Some(projections) = projections {
+        if let Some(indices) = column_projection_indices(projections, input_schema) {
+            columns.extend(indices);
+        } else {
+            for projection in projections {
+                add_expr_input_columns(projection.expression().expr(), input_schema, &mut columns)?;
+            }
+        }
+    }
+    Ok(columns.into_iter().collect())
+}
+
 fn required_input_columns(
     predicate: Option<&DbspPredicate>,
     projections: Option<&[DbspProjectExpr]>,

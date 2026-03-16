@@ -207,6 +207,65 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .difference(&durable_required_sources)
         .cloned()
         .collect();
+    let transient_required_columns_by_source = if transient_only_sources.is_empty() {
+        HashMap::new()
+    } else {
+        let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
+            .definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect();
+        let mut required_columns_by_source: HashMap<String, BTreeSet<usize>> = HashMap::new();
+        for plan in &circuit_plans {
+            let Some(requirements) = transient_source_root_requirements(plan)? else {
+                continue;
+            };
+            if !transient_only_sources.contains(&requirements.source_name) {
+                continue;
+            }
+            required_columns_by_source
+                .entry(requirements.source_name)
+                .or_default()
+                .extend(requirements.required_columns);
+        }
+        let mut masks = HashMap::new();
+        for (source_name, required_columns) in required_columns_by_source {
+            let definition = definition_by_name
+                .get(source_name.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("missing source definition for '{source_name}'"))?;
+            if required_columns.len() >= definition.columns().len() {
+                continue;
+            }
+            let mut mask = vec![false; definition.columns().len()];
+            for column_idx in required_columns {
+                let Some(required) = mask.get_mut(column_idx) else {
+                    return Err(anyhow!(
+                        "required column index {column_idx} out of bounds for source '{source_name}'"
+                    ));
+                };
+                *required = true;
+            }
+            if mask.iter().all(|required| *required) {
+                continue;
+            }
+            masks.insert(source_name, Arc::<[bool]>::from(mask));
+        }
+        masks
+    };
+    if !transient_required_columns_by_source.is_empty() {
+        let pruned_sources = transient_required_columns_by_source
+            .iter()
+            .map(|(source, columns)| {
+                let required = columns.iter().filter(|required| **required).count();
+                format!("{source}:{required}/{}", columns.len())
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            pruned_sources = ?pruned_sources,
+            "resolved transient source column pruning"
+        );
+    }
     if run_args.dry_run {
         tracing::info!(
             connector_count = connector_specs.len(),
@@ -541,6 +600,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
+    let transient_required_columns_by_source = Arc::new(transient_required_columns_by_source);
     let source_id_by_name: HashMap<String, usize> = definitions
         .iter()
         .enumerate()
@@ -556,9 +616,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         definitions
             .iter()
             .map(|definition| {
-                all_required_sources
-                    .contains(definition.name())
-                    .then(|| SourceRowDecoder::new(definition.clone()))
+                all_required_sources.contains(definition.name()).then(|| {
+                    SourceRowDecoder::new_with_encoded_required_columns(
+                        definition.clone(),
+                        transient_required_columns_by_source
+                            .get(definition.name())
+                            .map(Arc::clone),
+                    )
+                })
             })
             .collect::<Vec<_>>(),
     );
@@ -647,6 +712,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
+                let transient_required_columns_by_source =
+                    Arc::clone(&transient_required_columns_by_source);
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {
                     let config = KafkaConnectorConfig {
@@ -659,7 +726,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         message_format: format,
                         commit_offsets_rx: Some(commit_rx),
                     };
-                    let mut connector = match KafkaConnector::new(config, definitions) {
+                    let mut connector = match KafkaConnector::new(
+                        config,
+                        definitions,
+                        transient_required_columns_by_source
+                            .iter()
+                            .map(|(source, columns)| (source.clone(), Arc::clone(columns)))
+                            .collect(),
+                    ) {
                         Ok(connector) => connector,
                         Err(err) => {
                             tracing::error!(error = %err, "Kafka connector config invalid");
