@@ -24,7 +24,8 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-const TOTAL_ROWS: usize = 1_000_000;
+pub(crate) const BID_ROW_COUNT: usize = 1_000_000;
+pub(crate) const JOIN_AUCTION_ROW_COUNT: usize = 10_000;
 const DEFAULT_SAMPLE_ROW_COUNT: usize = 20;
 const CHECKSUM_MOD: i128 = 2_305_843_009_213_693_951;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
@@ -132,9 +133,21 @@ pub(crate) struct MillionQuerySpec {
     pub(crate) mv_name: &'static str,
     pub(crate) mv_sql: &'static str,
     pub(crate) output_fields: &'static [FieldSpec],
-    pub(crate) project: fn(&BidInput) -> Option<ExpectedRow>,
+    pub(crate) input_row_count: usize,
+    pub(crate) dataset: MillionDatasetKind,
     pub(crate) sample_selection: SampleSelection,
     pub(crate) sample_match_field: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MillionDatasetKind {
+    BidOnly {
+        project: fn(&BidInput) -> Option<ExpectedRow>,
+    },
+    BidAuctionJoin {
+        auction_rows: usize,
+        project: fn(&BidInput, &AuctionInput) -> Option<ExpectedRow>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,7 +197,7 @@ pub(crate) struct BidInput {
 impl BidInput {
     fn from_bid_idx(bid_idx: usize) -> Self {
         let bid_idx_i64 = i64::try_from(bid_idx).unwrap_or_default();
-        let auction = i64::try_from((bid_idx - 1) % 10_000 + 1).unwrap_or_default();
+        let auction = i64::try_from((bid_idx - 1) % JOIN_AUCTION_ROW_COUNT + 1).unwrap_or_default();
         let bidder = 10_000_i64 + bid_idx_i64;
         let price = 1_000_i64 + (bid_idx_i64 % 50_000);
         let channel = match bid_idx % 5 {
@@ -231,6 +244,58 @@ impl BidInput {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuctionInput {
+    pub(crate) id: i64,
+    pub(crate) seller: i64,
+    pub(crate) category: i64,
+    pub(crate) initial_bid: i64,
+    pub(crate) reserve: i64,
+    pub(crate) item_name: String,
+    pub(crate) description: String,
+    pub(crate) expires_ms: i64,
+    pub(crate) date_time_ms: i64,
+}
+
+impl AuctionInput {
+    fn from_auction_idx(auction_idx: usize) -> Self {
+        let auction_idx_i64 = i64::try_from(auction_idx).unwrap_or_default();
+        let category = 10 + i64::try_from((auction_idx - 1) % 10).unwrap_or_default();
+        let initial_bid = 500 + (auction_idx_i64 % 1_000);
+        let reserve = initial_bid + 100;
+        Self {
+            id: auction_idx_i64,
+            seller: 20_000 + auction_idx_i64,
+            category,
+            initial_bid,
+            reserve,
+            item_name: format!("item_{auction_idx}"),
+            description: format!("auction_desc_{auction_idx}"),
+            expires_ms: BASE_TS_MS + 3_600_000 + auction_idx_i64,
+            date_time_ms: BASE_TS_MS - 60_000 + auction_idx_i64,
+        }
+    }
+
+    fn write_json_line(&self, writer: &mut BufWriter<File>, auction_idx: usize) -> Result<()> {
+        writeln!(
+            writer,
+            "{{\"source\":\"nexmark_auction\",\"data\":{{\"id\":{},\"item_name\":\"{}\",\"description\":\"{}\",\"initial_bid\":{},\"reserve\":{},\"seller\":{},\"category\":{},\"expires\":{},\"date_time\":{},\"extra\":\"auction_extra_{}\"}}}}",
+            self.id,
+            self.item_name,
+            self.description,
+            self.initial_bid,
+            self.reserve,
+            self.seller,
+            self.category,
+            self.expires_ms,
+            self.date_time_ms,
+            auction_idx,
+        )
+        .context("write auction row")?;
+        Ok(())
+    }
+}
+
 pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> Result<()> {
     run_redpanda_kafka_million_test_impl(spec, SinkMode::WithKafkaSink, None).await
 }
@@ -262,7 +327,7 @@ async fn run_redpanda_kafka_million_test_impl(
         .join(format!("{}_{}", spec.mv_name, run_id));
     std::fs::create_dir_all(&artifacts_dir).context("create artifact dir")?;
 
-    let dataset_path = artifacts_dir.join("dataset_1m.jsonl");
+    let dataset_path = artifacts_dir.join("dataset.jsonl");
     let config_path = artifacts_dir.join("node_config.json");
     let stdout_log_path = artifacts_dir.join("floe-node.stdout.log");
     let stderr_log_path = artifacts_dir.join("floe-node.stderr.log");
@@ -354,11 +419,11 @@ async fn run_redpanda_kafka_million_test_impl(
         );
         expected
     };
-    if expected.generated_rows != TOTAL_ROWS {
+    if expected.generated_rows != spec.input_row_count {
         bail!(
             "dataset generator wrote {} rows, expected {}",
             expected.generated_rows,
-            TOTAL_ROWS
+            spec.input_row_count
         );
     }
 
@@ -483,7 +548,12 @@ async fn run_redpanda_kafka_million_test_impl(
                     let brokers = brokers.clone();
                     let input_topic = input_topic.clone();
                     tokio::task::spawn_blocking(move || {
-                        produce_dataset_file(&dataset_path, &brokers, &input_topic)
+                        produce_dataset_file(
+                            &dataset_path,
+                            &brokers,
+                            &input_topic,
+                            spec.input_row_count,
+                        )
                     })
                     .await
                     .context("join kafka producer task")??;
@@ -531,7 +601,12 @@ async fn run_redpanda_kafka_million_test_impl(
                     let brokers = brokers.clone();
                     let input_topic = input_topic.clone();
                     tokio::task::spawn_blocking(move || {
-                        produce_dataset_file(&dataset_path, &brokers, &input_topic)
+                        produce_dataset_file(
+                            &dataset_path,
+                            &brokers,
+                            &input_topic,
+                            spec.input_row_count,
+                        )
                     })
                     .await
                     .context("join kafka producer task")??;
@@ -558,7 +633,7 @@ async fn run_redpanda_kafka_million_test_impl(
                 let ingest_completion =
                     produce_elapsed + verify_timing.wait_for_count_for_throughput;
                 let input_rows_per_sec =
-                    safe_rows_per_sec(TOTAL_ROWS as f64, ingest_completion.as_secs_f64());
+                    safe_rows_per_sec(spec.input_row_count as f64, ingest_completion.as_secs_f64());
                 let output_rows_per_sec = safe_rows_per_sec(
                     expected.metrics.row_count.max(0) as f64,
                     ingest_completion.as_secs_f64(),
@@ -640,17 +715,57 @@ fn generate_dataset_file(
         File::create(path).with_context(|| format!("create dataset file {}", path.display()))?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
     let mut expected = ExpectedDataset::default();
-    let mut output_rows = 0usize;
-
-    for bid_idx in 1..=TOTAL_ROWS {
-        let input = BidInput::from_bid_idx(bid_idx);
-        input.write_json_line(&mut writer, bid_idx)?;
-        expected.generated_rows += 1;
-        if let Some(row) = (spec.project)(&input) {
-            expected.metrics.apply(&row, 1);
-            output_rows += 1;
+    let output_rows = match spec.dataset {
+        MillionDatasetKind::BidOnly { project } => {
+            let mut output_rows = 0usize;
+            for bid_idx in 1..=BID_ROW_COUNT {
+                let input = BidInput::from_bid_idx(bid_idx);
+                input.write_json_line(&mut writer, bid_idx)?;
+                expected.generated_rows += 1;
+                if let Some(row) = project(&input) {
+                    expected.metrics.apply(&row, 1);
+                    output_rows += 1;
+                }
+            }
+            output_rows
         }
-    }
+        MillionDatasetKind::BidAuctionJoin {
+            auction_rows,
+            project,
+        } => {
+            if auction_rows < JOIN_AUCTION_ROW_COUNT {
+                bail!(
+                    "join dataset requires at least {} auction rows, got {}",
+                    JOIN_AUCTION_ROW_COUNT,
+                    auction_rows
+                );
+            }
+            let mut auctions = Vec::with_capacity(auction_rows);
+            for auction_idx in 1..=auction_rows {
+                let auction = AuctionInput::from_auction_idx(auction_idx);
+                auction.write_json_line(&mut writer, auction_idx)?;
+                expected.generated_rows += 1;
+                auctions.push(auction);
+            }
+
+            let mut output_rows = 0usize;
+            for bid_idx in 1..=BID_ROW_COUNT {
+                let input = BidInput::from_bid_idx(bid_idx);
+                input.write_json_line(&mut writer, bid_idx)?;
+                expected.generated_rows += 1;
+                let auction = auctions
+                    .get((input.auction - 1).max(0) as usize)
+                    .with_context(|| {
+                        format!("missing auction row for join key {}", input.auction)
+                    })?;
+                if let Some(row) = project(&input, auction) {
+                    expected.metrics.apply(&row, 1);
+                    output_rows += 1;
+                }
+            }
+            output_rows
+        }
+    };
 
     writer.flush().context("flush dataset writer")?;
 
@@ -664,32 +779,58 @@ fn generate_dataset_file(
     }
     let sample_field_idx = sample_field_index(spec.output_fields, spec.sample_match_field)?;
 
-    let mut output_ordinal = 0usize;
-    for bid_idx in 1..=TOTAL_ROWS {
-        let input = BidInput::from_bid_idx(bid_idx);
-        let Some(row) = (spec.project)(&input) else {
-            continue;
-        };
-        output_ordinal += 1;
-        if sample_ordinals.contains(&output_ordinal) {
-            let key = expected_value_key(row.values.get(sample_field_idx).with_context(|| {
-                format!(
-                    "sample field index {} out of bounds for field '{}'",
-                    sample_field_idx, spec.sample_match_field
-                )
-            })?);
-            if expected
-                .sample_rows_by_key
-                .insert(key.clone(), row)
-                .is_some()
-            {
-                bail!(
-                    "duplicate sample key '{key}' for field '{}'; choose a unique sample_match_field",
-                    spec.sample_match_field
-                );
+    match spec.dataset {
+        MillionDatasetKind::BidOnly { project } => {
+            let mut output_ordinal = 0usize;
+            for bid_idx in 1..=BID_ROW_COUNT {
+                let input = BidInput::from_bid_idx(bid_idx);
+                let Some(row) = project(&input) else {
+                    continue;
+                };
+                output_ordinal += 1;
+                maybe_record_sample_row(
+                    &mut expected,
+                    &sample_ordinals,
+                    &mut output_ordinal,
+                    sample_field_idx,
+                    spec.sample_match_field,
+                    row,
+                )?;
+                if expected.sample_rows_by_key.len() == sample_ordinals.len() {
+                    break;
+                }
             }
-            if expected.sample_rows_by_key.len() == sample_ordinals.len() {
-                break;
+        }
+        MillionDatasetKind::BidAuctionJoin {
+            auction_rows,
+            project,
+        } => {
+            let auctions: Vec<_> = (1..=auction_rows)
+                .map(AuctionInput::from_auction_idx)
+                .collect();
+            let mut output_ordinal = 0usize;
+            for bid_idx in 1..=BID_ROW_COUNT {
+                let input = BidInput::from_bid_idx(bid_idx);
+                let auction = auctions
+                    .get((input.auction - 1).max(0) as usize)
+                    .with_context(|| {
+                        format!("missing auction row for join key {}", input.auction)
+                    })?;
+                let Some(row) = project(&input, auction) else {
+                    continue;
+                };
+                output_ordinal += 1;
+                maybe_record_sample_row(
+                    &mut expected,
+                    &sample_ordinals,
+                    &mut output_ordinal,
+                    sample_field_idx,
+                    spec.sample_match_field,
+                    row,
+                )?;
+                if expected.sample_rows_by_key.len() == sample_ordinals.len() {
+                    break;
+                }
             }
         }
     }
@@ -737,7 +878,43 @@ fn compute_sample_ordinals(total_rows: usize, selection: SampleSelection) -> BTr
     out
 }
 
-fn produce_dataset_file(dataset_path: &Path, brokers: &str, topic: &str) -> Result<()> {
+fn maybe_record_sample_row(
+    expected: &mut ExpectedDataset,
+    sample_ordinals: &BTreeSet<usize>,
+    output_ordinal: &mut usize,
+    sample_field_idx: usize,
+    sample_match_field: &str,
+    row: ExpectedRow,
+) -> Result<()> {
+    if !sample_ordinals.contains(output_ordinal) {
+        return Ok(());
+    }
+
+    let key = expected_value_key(row.values.get(sample_field_idx).with_context(|| {
+        format!(
+            "sample field index {} out of bounds for field '{}'",
+            sample_field_idx, sample_match_field
+        )
+    })?);
+    if expected
+        .sample_rows_by_key
+        .insert(key.clone(), row)
+        .is_some()
+    {
+        bail!(
+            "duplicate sample key '{key}' for field '{}'; choose a unique sample_match_field",
+            sample_match_field
+        );
+    }
+    Ok(())
+}
+
+fn produce_dataset_file(
+    dataset_path: &Path,
+    brokers: &str,
+    topic: &str,
+    expected_rows: usize,
+) -> Result<()> {
     let producer: BaseProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("queue.buffering.max.messages", "200000")
@@ -777,8 +954,8 @@ fn produce_dataset_file(dataset_path: &Path, brokers: &str, topic: &str) -> Resu
         .flush(Duration::from_secs(120))
         .context("flush kafka producer")?;
 
-    if produced != TOTAL_ROWS {
-        bail!("produced {produced} rows, expected {TOTAL_ROWS}");
+    if produced != expected_rows {
+        bail!("produced {produced} rows, expected {expected_rows}");
     }
 
     Ok(())

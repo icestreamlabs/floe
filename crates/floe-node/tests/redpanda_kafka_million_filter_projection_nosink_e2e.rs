@@ -3,8 +3,8 @@ mod kafka_million;
 
 use anyhow::Result;
 use kafka_million::{
-    BidInput, ExpectedRow, FieldSpec, MillionQuerySpec, NoSinkVerifyMode, SampleSelection, int64,
-    run_redpanda_kafka_million_no_sink_test,
+    BID_ROW_COUNT, BidInput, ExpectedRow, FieldSpec, MillionDatasetKind, MillionQuerySpec,
+    NoSinkVerifyMode, SampleSelection, int64, run_redpanda_kafka_million_no_sink_test,
     run_redpanda_kafka_million_no_sink_test_with_verify_mode,
 };
 
@@ -28,7 +28,10 @@ const SPEC: MillionQuerySpec = MillionQuerySpec {
     mv_name: "mv_kafka_redpanda_million_filter_projection_nosink",
     mv_sql: MV_SQL,
     output_fields: OUTPUT_FIELDS,
-    project: project_row,
+    input_row_count: BID_ROW_COUNT,
+    dataset: MillionDatasetKind::BidOnly {
+        project: project_row,
+    },
     sample_selection: SampleSelection::FirstN(20),
     sample_match_field: "bidder",
 };

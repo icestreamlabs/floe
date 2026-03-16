@@ -3,8 +3,8 @@ mod kafka_million;
 
 use anyhow::Result;
 use kafka_million::{
-    BidInput, ExpectedRow, FieldSpec, MillionQuerySpec, SampleSelection, day_string, int64,
-    run_redpanda_kafka_million_test, string,
+    BID_ROW_COUNT, BidInput, ExpectedRow, FieldSpec, MillionDatasetKind, MillionQuerySpec,
+    SampleSelection, day_string, int64, run_redpanda_kafka_million_test, string,
 };
 
 const MV_SQL: &str = r#"
@@ -39,7 +39,10 @@ const SPEC: MillionQuerySpec = MillionQuerySpec {
     mv_name: "mv_kafka_redpanda_million",
     mv_sql: MV_SQL,
     output_fields: OUTPUT_FIELDS,
-    project: project_row,
+    input_row_count: BID_ROW_COUNT,
+    dataset: MillionDatasetKind::BidOnly {
+        project: project_row,
+    },
     sample_selection: SampleSelection::EvenlySpaced(20),
     sample_match_field: "bidder",
 };
