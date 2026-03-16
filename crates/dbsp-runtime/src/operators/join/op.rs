@@ -467,13 +467,13 @@ where
             Self::apply_keyed_updates_to_memory_index(&mut self.right_memory_index, &right_keyed);
         }
 
-        let mut left_updates = Vec::new();
-        for (key, entries) in &left_keyed {
-            for (row, weight) in entries {
-                left_updates.push((key.clone(), row.clone(), *weight));
-            }
-        }
         if self.persist_indexes {
+            let mut left_updates = Vec::new();
+            for (key, entries) in &left_keyed {
+                for (row, weight) in entries {
+                    left_updates.push((key.clone(), row.clone(), *weight));
+                }
+            }
             let left_index_persist_start = std::time::Instant::now();
             self.left_index
                 .apply_deltas(left_updates)
@@ -486,13 +486,13 @@ where
             );
         }
 
-        let mut right_updates = Vec::new();
-        for (key, entries) in &right_keyed {
-            for (row, weight) in entries {
-                right_updates.push((key.clone(), row.clone(), *weight));
-            }
-        }
         if self.persist_indexes {
+            let mut right_updates = Vec::new();
+            for (key, entries) in &right_keyed {
+                for (row, weight) in entries {
+                    right_updates.push((key.clone(), row.clone(), *weight));
+                }
+            }
             let right_index_persist_start = std::time::Instant::now();
             self.right_index
                 .apply_deltas(right_updates)
