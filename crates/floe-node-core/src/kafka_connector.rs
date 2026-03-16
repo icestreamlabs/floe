@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use rdkafka::ClientConfig;
@@ -72,6 +72,8 @@ pub struct KafkaConnector {
     direct_decode_lookup: DirectDecodeLookup,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
+    started_at: Option<Instant>,
+    first_batch_logged: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +102,8 @@ impl KafkaConnector {
             direct_decode_lookup,
             consumer: None,
             last_committed_tick_id: 0,
+            started_at: None,
+            first_batch_logged: false,
         })
     }
 
@@ -241,6 +245,8 @@ impl Connector for KafkaConnector {
             .subscribe(&topics)
             .context("subscribe to kafka topics")?;
         self.consumer = Some(consumer);
+        self.started_at = Some(Instant::now());
+        self.first_batch_logged = false;
         Ok(())
     }
 
@@ -283,6 +289,17 @@ impl Connector for KafkaConnector {
             ctx.send_batch(staged)
                 .await
                 .context("failed to enqueue kafka event batch")?;
+            if !self.first_batch_logged {
+                self.first_batch_logged = true;
+                tracing::info!(
+                    emitted,
+                    time_to_first_batch_ms = self
+                        .started_at
+                        .map(|started| started.elapsed().as_millis() as u64)
+                        .unwrap_or_default(),
+                    "kafka connector emitted first batch"
+                );
+            }
         }
 
         self.commit_offsets_if_requested().await?;

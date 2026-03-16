@@ -869,6 +869,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 configured_watermark_idle_source_ms.unwrap_or(DEFAULT_WATERMARK_IDLE_SOURCE_MS),
             );
         let watermark_idle_timeout = Duration::from_millis(watermark_idle_source_ms);
+        let executor_loop_started = Instant::now();
+        let mut first_nonempty_decode_logged = false;
+        let mut first_tick_commit_logged = false;
         if let Some(existing_commit) = checkpoint_manager.latest_tick_commit() {
             metrics::record_last_committed_tick(existing_commit.tick_id);
             epoch = existing_commit.tick_id;
@@ -1071,6 +1074,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
             metrics::observe_decode_latency_ms(decode_latency_ms);
             metrics::observe_tick_phase_latency_ms("decode", decode_latency_ms);
+            if !first_nonempty_decode_logged {
+                first_nonempty_decode_logged = true;
+                tracing::info!(
+                    epoch = pending_epoch,
+                    batch_size = batch_len,
+                    decoded_rows = decoded_rows.len().saturating_add(encoded_rows.len()),
+                    decode_latency_ms,
+                    time_to_first_nonempty_decode_ms =
+                        executor_loop_started.elapsed().as_millis() as u64,
+                    "executor decoded first non-empty ingest batch"
+                );
+            }
             tracing::debug!(
                 decoded_rows = decoded_rows.len().saturating_add(encoded_rows.len()),
                 latency_ms = decode_latency_ms,
@@ -1335,6 +1350,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     epoch,
                     checkpoint_write_latency_ms,
                     "tick checkpoint_write completed"
+                );
+            }
+            if !first_tick_commit_logged {
+                first_tick_commit_logged = true;
+                tracing::info!(
+                    epoch,
+                    batch_size = batch_len,
+                    decoded_rows = decoded_rows_len,
+                    state_write_latency_ms,
+                    checkpoint_write_latency_ms,
+                    time_to_first_tick_commit_ms =
+                        executor_loop_started.elapsed().as_millis() as u64,
+                    "executor committed first tick"
                 );
             }
             for (source_id, offsets) in tick_source_offsets.iter().enumerate() {

@@ -106,6 +106,7 @@ struct ExpectedDataset {
 
 #[derive(Debug, Clone, Copy)]
 struct NoSinkVerificationTiming {
+    pgwire_connect: Duration,
     wait_for_count: Duration,
     wait_for_count_for_throughput: Duration,
     sample_query: Duration,
@@ -338,12 +339,18 @@ async fn run_redpanda_kafka_million_test_impl(
     }
 
     let expected = {
+        let dataset_generation_started = Instant::now();
         let dataset_path = dataset_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let expected = tokio::task::spawn_blocking(move || {
             generate_dataset_file(&dataset_path, spec, build_samples)
         })
         .await
-        .context("join dataset generation task")??
+        .context("join dataset generation task")??;
+        eprintln!(
+            "timing.dataset_generation_s={:.3}",
+            dataset_generation_started.elapsed().as_secs_f64()
+        );
+        expected
     };
     if expected.generated_rows != TOTAL_ROWS {
         bail!(
@@ -414,6 +421,7 @@ async fn run_redpanda_kafka_million_test_impl(
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write node config")?;
 
+    let node_spawn_started = Instant::now();
     let mut child = spawn_node(
         &config_path,
         pg_port,
@@ -426,9 +434,19 @@ async fn run_redpanda_kafka_million_test_impl(
         slatedb_flush_interval_ms,
     )
     .await?;
+    eprintln!(
+        "timing.node.spawn_s={:.3}",
+        node_spawn_started.elapsed().as_secs_f64()
+    );
 
     let test_result = async {
+        let pgwire_ready_started = Instant::now();
         wait_for_pgwire(pg_port, &mut child, &stderr_log_path).await?;
+        eprintln!(
+            "timing.node.pgwire_ready_s={:.3} (post_spawn_wait_s={:.3})",
+            node_spawn_started.elapsed().as_secs_f64(),
+            pgwire_ready_started.elapsed().as_secs_f64()
+        );
         let execution_started = Instant::now();
 
         match sink_mode {
@@ -544,6 +562,10 @@ async fn run_redpanda_kafka_million_test_impl(
                     produce_elapsed.as_secs_f64(),
                     verify_timing.wait_for_count.as_secs_f64(),
                     verify_timing.wait_for_count_for_throughput.as_secs_f64()
+                );
+                eprintln!(
+                    "timing.no_sink.pgwire_connect_s={:.3}",
+                    verify_timing.pgwire_connect.as_secs_f64()
                 );
                 eprintln!(
                     "timing.no_sink.verification_s={:.3} (sample_query_s={:.3})",
@@ -932,12 +954,14 @@ async fn verify_mv_snapshot_count_and_samples(
     end_count_poll: Duration,
 ) -> Result<NoSinkVerificationTiming> {
     let verify_started = Instant::now();
+    let pgwire_connect_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={pg_port} user=postgres"),
         NoTls,
     )
     .await
     .context("connect to pgwire for no-sink verification")?;
+    let pgwire_connect = pgwire_connect_started.elapsed();
     let connection_handle = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -954,8 +978,24 @@ async fn verify_mv_snapshot_count_and_samples(
     if !settle_before_poll.is_zero() {
         sleep(settle_before_poll).await;
     }
+    let progress_targets = count_progress_targets(expected_rows);
+    let mut first_nonzero_logged = false;
+    let mut next_progress_idx = 0usize;
+    let mut last_progress_rows = 0usize;
+    let mut last_observed_rows = 0usize;
+    let mut last_observed_elapsed = Duration::ZERO;
     loop {
         let observed_rows = query_mv_count(&client, mv_name).await?;
+        log_count_progress(
+            observed_rows,
+            &count_wait_started,
+            &mut first_nonzero_logged,
+            &progress_targets,
+            &mut next_progress_idx,
+            &mut last_progress_rows,
+            &mut last_observed_rows,
+            &mut last_observed_elapsed,
+        );
         if observed_rows == expected_rows {
             break;
         }
@@ -1050,11 +1090,64 @@ async fn verify_mv_snapshot_count_and_samples(
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(NoSinkVerificationTiming {
+        pgwire_connect,
         wait_for_count,
         wait_for_count_for_throughput,
         sample_query,
         total: verify_started.elapsed(),
     })
+}
+
+fn count_progress_targets(expected_rows: usize) -> [(&'static str, usize); 6] {
+    [
+        ("10pct", expected_rows / 10),
+        ("25pct", expected_rows / 4),
+        ("50pct", expected_rows / 2),
+        ("75pct", expected_rows.saturating_mul(3) / 4),
+        ("90pct", expected_rows.saturating_mul(9) / 10),
+        ("100pct", expected_rows),
+    ]
+}
+
+fn log_count_progress(
+    observed_rows: usize,
+    count_wait_started: &Instant,
+    first_nonzero_logged: &mut bool,
+    progress_targets: &[(&'static str, usize)],
+    next_progress_idx: &mut usize,
+    last_progress_rows: &mut usize,
+    last_observed_rows: &mut usize,
+    last_observed_elapsed: &mut Duration,
+) {
+    let elapsed = count_wait_started.elapsed();
+    let poll_rows = observed_rows.saturating_sub(*last_observed_rows);
+    let poll_elapsed = elapsed.saturating_sub(*last_observed_elapsed);
+    let poll_rows_per_sec = safe_rows_per_sec(poll_rows as f64, poll_elapsed.as_secs_f64());
+    if !*first_nonzero_logged && observed_rows > 0 {
+        *first_nonzero_logged = true;
+        eprintln!(
+            "timing.no_sink.count_progress.first_nonzero_s={:.3} rows={observed_rows}",
+            elapsed.as_secs_f64()
+        );
+    }
+    while let Some((label, target_rows)) = progress_targets.get(*next_progress_idx) {
+        if observed_rows < *target_rows {
+            break;
+        }
+        let interval_rows = target_rows.saturating_sub(*last_progress_rows);
+        eprintln!(
+            "timing.no_sink.count_progress.{label}_s={:.3} observed_rows={} interval_rows={} poll_rows_per_sec={:.0} cumulative_rows_per_sec={:.0}",
+            elapsed.as_secs_f64(),
+            observed_rows,
+            interval_rows,
+            poll_rows_per_sec,
+            safe_rows_per_sec(*target_rows as f64, elapsed.as_secs_f64())
+        );
+        *last_progress_rows = *target_rows;
+        *next_progress_idx += 1;
+    }
+    *last_observed_rows = observed_rows;
+    *last_observed_elapsed = elapsed;
 }
 
 async fn query_mv_count(client: &tokio_postgres::Client, mv_name: &str) -> Result<usize> {
