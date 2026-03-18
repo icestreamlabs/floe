@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -181,24 +181,74 @@ where
         }
     }
 
+    fn join_entries_with_right_map(
+        &self,
+        left: &[(L, i64)],
+        right: Option<&FastHashMap<R, i64>>,
+        acc: &mut FastHashMap<O, i64>,
+    ) {
+        let Some(right) = right else {
+            return;
+        };
+        for (lk, lw) in left {
+            if *lw == 0 {
+                continue;
+            }
+            for (rk, rw) in right {
+                if *rw == 0 {
+                    continue;
+                }
+                if (self.predicate)(lk, rk) {
+                    let out = (self.projector)(lk, rk);
+                    *acc.entry(out).or_insert(0) += lw * rw;
+                }
+            }
+        }
+    }
+
+    fn join_entries_with_left_map(
+        &self,
+        left: Option<&FastHashMap<L, i64>>,
+        right: &[(R, i64)],
+        acc: &mut FastHashMap<O, i64>,
+    ) {
+        let Some(left) = left else {
+            return;
+        };
+        for (lk, lw) in left {
+            if *lw == 0 {
+                continue;
+            }
+            for (rk, rw) in right {
+                if *rw == 0 {
+                    continue;
+                }
+                if (self.predicate)(lk, rk) {
+                    let out = (self.projector)(lk, rk);
+                    *acc.entry(out).or_insert(0) += lw * rw;
+                }
+            }
+        }
+    }
+
     fn keyed_deltas<T>(
         &self,
-        deltas: &FastHashMap<T, i64>,
+        deltas: FastHashMap<T, i64>,
         extractor: &JoinKeyExtractor<T, K>,
     ) -> FastHashMap<K, Vec<(T, i64)>>
     where
-        T: Clone,
+        T: Eq + Hash,
     {
         let mut keyed = FastHashMap::new();
         for (row, weight) in deltas {
-            if *weight == 0 {
+            if weight == 0 {
                 continue;
             }
-            if let Some(key) = extractor(row) {
+            if let Some(key) = extractor(&row) {
                 keyed
                     .entry(key)
                     .or_insert_with(Vec::new)
-                    .push((row.clone(), *weight));
+                    .push((row, weight));
             }
         }
         keyed
@@ -206,14 +256,25 @@ where
 
     fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> FastHashMap<T, i64>
     where
-        T: Clone + Eq + Hash,
+        T: Eq + Hash,
     {
-        let mut merged = FastHashMap::new();
+        let mut merged: FastHashMap<T, i64> = FastHashMap::new();
         for (row, weight) in deltas {
-            let entry = merged.entry(row.clone()).or_insert(0);
-            *entry += weight;
-            if *entry == 0 {
-                merged.remove(&row);
+            if weight == 0 {
+                continue;
+            }
+            match merged.entry(row) {
+                Entry::Occupied(mut entry) => {
+                    let next = entry.get().saturating_add(weight);
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(weight);
+                }
             }
         }
         merged
@@ -299,23 +360,6 @@ where
             persist_start.elapsed().as_millis() as u64,
         );
         Ok(versioned.handle_for_version(plan.version))
-    }
-
-    fn values_for_key_from_memory<T>(
-        index: &FastHashMap<K, FastHashMap<T, i64>>,
-        key: &K,
-    ) -> Vec<(T, i64)>
-    where
-        T: Clone + Eq + Hash,
-    {
-        index
-            .get(key)
-            .map(|rows| {
-                rows.iter()
-                    .map(|(row, weight)| (row.clone(), *weight))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn apply_keyed_updates_to_memory_index<T>(
@@ -417,8 +461,8 @@ where
         .context("load right delta for join")?;
         let left_delta = self.coalesce_deltas(left_delta_values);
         let right_delta = self.coalesce_deltas(right_delta_values);
-        let left_keyed = self.keyed_deltas(&left_delta, &self.left_key);
-        let right_keyed = self.keyed_deltas(&right_delta, &self.right_key);
+        let left_keyed = self.keyed_deltas(left_delta, &self.left_key);
+        let right_keyed = self.keyed_deltas(right_delta, &self.right_key);
 
         // Build output delta from pre-update state (A, B) and current deltas
         // (ΔA, ΔB). State/index updates happen after this block to keep
@@ -430,30 +474,40 @@ where
         // ΔA ⋈ B
         if has_left {
             for (key, left_entries) in &left_keyed {
-                let right_entries = if self.persist_indexes {
-                    self.right_index
+                if self.persist_indexes {
+                    let right_entries = self
+                        .right_index
                         .values_for_key(key)
                         .await
-                        .context("load right join index")?
+                        .context("load right join index")?;
+                    self.join_entries(left_entries, &right_entries, &mut delta_join);
                 } else {
-                    Self::values_for_key_from_memory(&self.right_memory_index, key)
-                };
-                self.join_entries(left_entries, &right_entries, &mut delta_join);
+                    self.join_entries_with_right_map(
+                        left_entries,
+                        self.right_memory_index.get(key),
+                        &mut delta_join,
+                    );
+                }
             }
         }
 
         // A ⋈ ΔB
         if has_right {
             for (key, right_entries) in &right_keyed {
-                let left_entries = if self.persist_indexes {
-                    self.left_index
+                if self.persist_indexes {
+                    let left_entries = self
+                        .left_index
                         .values_for_key(key)
                         .await
-                        .context("load left join index")?
+                        .context("load left join index")?;
+                    self.join_entries(&left_entries, right_entries, &mut delta_join);
                 } else {
-                    Self::values_for_key_from_memory(&self.left_memory_index, key)
-                };
-                self.join_entries(&left_entries, right_entries, &mut delta_join);
+                    self.join_entries_with_left_map(
+                        self.left_memory_index.get(key),
+                        right_entries,
+                        &mut delta_join,
+                    );
+                }
             }
         }
 
