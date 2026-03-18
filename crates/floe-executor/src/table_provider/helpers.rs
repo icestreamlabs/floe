@@ -170,6 +170,56 @@ where
     Ok((projected_schema, batches))
 }
 
+pub(super) fn build_constant_projection_batches(
+    schema: SchemaRef,
+    value: ScalarValue,
+    row_count: usize,
+) -> DFResult<Vec<RecordBatch>> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), vec![], &options)
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        return Ok(vec![batch]);
+    }
+
+    if row_count == 0 {
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|_| {
+                value
+                    .clone()
+                    .to_array_of_size(0)
+                    .map_err(|err| DataFusionError::Execution(err.to_string()))
+            })
+            .collect::<DFResult<_>>()?;
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        return Ok(vec![batch]);
+    }
+
+    let mut batches = Vec::new();
+    let mut remaining = row_count;
+    while remaining > 0 {
+        let batch_rows = remaining.min(SCAN_BATCH_ROW_LIMIT);
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|_| {
+                value
+                    .clone()
+                    .to_array_of_size(batch_rows)
+                    .map_err(|err| DataFusionError::Execution(err.to_string()))
+            })
+            .collect::<DFResult<_>>()?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        batches.push(batch);
+        remaining -= batch_rows;
+    }
+    Ok(batches)
+}
+
 fn flush_columns_to_batch(
     columns: &mut [Vec<ScalarValue>],
     schema: SchemaRef,
