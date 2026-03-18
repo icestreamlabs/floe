@@ -848,11 +848,12 @@ impl DbspGraphBuilder {
             })?;
         if merged.is_empty() {
             registry.publish_logical_version(ts);
+            registry.advance_authoritative_row_count_version(ts_u64);
             return Ok(());
         }
         let apply_stats = registry.append_shared_encoded_overlay_batch(ts_u64, Arc::clone(&merged));
         registry
-            .apply_encoded_state_batch(merged.as_slice())
+            .apply_encoded_state_batch(ts_u64, merged.as_slice())
             .with_context(|| {
                 format!("update overlay state cache for materialized view '{view_label}' at {ts}")
             })?;

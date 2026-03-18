@@ -166,6 +166,9 @@ async fn log_handle_rows(
     handle: &ZSetHandle,
     bridge: &Arc<Mutex<DbspBridge>>,
 ) -> Result<()> {
+    if !tracing::event_enabled!(tracing::Level::DEBUG) {
+        return Ok(());
+    }
     let mut guard = bridge.lock().await;
     let handle_view = guard
         .handle_view_for(&handle.ns, handle.version)

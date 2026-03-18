@@ -96,6 +96,7 @@ pub struct MaterializedViewHandle {
     name: String,
     state: RwLock<HashMap<EncodedRow, Diff>>,
     state_row_count: RwLock<i64>,
+    state_row_count_version: RwLock<Option<i64>>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
@@ -115,6 +116,7 @@ impl MaterializedViewHandle {
             name,
             state: RwLock::new(HashMap::new()),
             state_row_count: RwLock::new(0),
+            state_row_count_version: RwLock::new(None),
             state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
             dbsp_state: RwLock::new(None),
@@ -196,6 +198,27 @@ impl MaterializedViewHandle {
 
     pub fn mark_state_non_authoritative(&self) {
         *self.state_authoritative.write().expect("mutex poisoned") = false;
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = None;
+    }
+
+    pub fn seed_authoritative_row_count_if_latest(&self, version: u64, row_count: usize) -> bool {
+        let Ok(version) = i64::try_from(version) else {
+            return false;
+        };
+        if self.latest_version() != Some(version) {
+            return false;
+        }
+        *self.state_row_count.write().expect("mutex poisoned") =
+            i64::try_from(row_count).unwrap_or(i64::MAX);
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = Some(version);
+        *self.state_authoritative.write().expect("mutex poisoned") = true;
+        true
     }
 
     pub fn authoritative_row_count(&self) -> Option<usize> {
@@ -205,13 +228,49 @@ impl MaterializedViewHandle {
         Some(usize::try_from(*self.state_row_count.read().expect("mutex poisoned")).unwrap_or(0))
     }
 
-    pub fn apply_encoded_state_batch(&self, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
+    pub fn authoritative_row_count_for(&self, version: u64) -> Option<usize> {
+        let Ok(version) = i64::try_from(version) else {
+            return None;
+        };
+        if self
+            .state_row_count_version
+            .read()
+            .expect("mutex poisoned")
+            .as_ref()
+            != Some(&version)
+        {
+            return None;
+        }
+        self.authoritative_row_count()
+    }
+
+    pub fn advance_authoritative_row_count_version(&self, version: u64) {
+        if !*self.state_authoritative.read().expect("mutex poisoned") {
+            return;
+        }
+        let Ok(version) = i64::try_from(version) else {
+            return;
+        };
+        if self.latest_version() != Some(version) {
+            return;
+        }
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = Some(version);
+    }
+
+    pub fn apply_encoded_state_batch(&self, version: u64, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
         if !*self.state_authoritative.read().expect("mutex poisoned") {
             return Ok(());
         }
         for (key, diff) in deltas {
             self.apply_encoded(key, *diff);
         }
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = i64::try_from(version).ok();
         Ok(())
     }
 
@@ -668,15 +727,48 @@ mod tests {
         let registry = MaterializedViewRegistry::new();
         let view = registry.register("mv_count");
         view.mark_state_authoritative();
+        view.publish_logical_version(1);
 
         let row = vec![ScalarValue::Int64(Some(1))];
         let key = encode_projected_row_key(&row).expect("encode row");
-        view.apply_encoded_state_batch(&[(key.clone(), 1)])
+        view.apply_encoded_state_batch(1, &[(key.clone(), 1)])
             .expect("apply first delta");
         assert_eq!(view.authoritative_row_count(), Some(1));
+        assert_eq!(view.authoritative_row_count_for(1), Some(1));
 
-        view.apply_encoded_state_batch(&[(key, -1)])
+        view.apply_encoded_state_batch(2, &[(key, -1)])
             .expect("apply delete delta");
         assert_eq!(view.authoritative_row_count(), Some(0));
+        assert_eq!(view.authoritative_row_count_for(1), None);
+        assert_eq!(view.authoritative_row_count_for(2), Some(0));
+    }
+
+    #[test]
+    fn seeds_authoritative_row_count_only_for_latest_version() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_seed_count");
+        view.publish_logical_version(7);
+
+        assert!(view.seed_authoritative_row_count_if_latest(7, 3));
+        assert_eq!(view.authoritative_row_count(), Some(3));
+        assert_eq!(view.authoritative_row_count_for(7), Some(3));
+
+        view.mark_state_non_authoritative();
+        assert!(!view.seed_authoritative_row_count_if_latest(6, 2));
+        assert_eq!(view.authoritative_row_count(), None);
+    }
+
+    #[test]
+    fn authoritative_row_count_advances_for_empty_versions() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_advance_count");
+        view.publish_logical_version(4);
+        assert!(view.seed_authoritative_row_count_if_latest(4, 2));
+
+        view.publish_logical_version(5);
+        view.advance_authoritative_row_count_version(5);
+
+        assert_eq!(view.authoritative_row_count_for(4), None);
+        assert_eq!(view.authoritative_row_count_for(5), Some(2));
     }
 }

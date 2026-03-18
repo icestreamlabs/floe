@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
@@ -225,6 +225,276 @@ async fn materialized_view_provider_empty_then_populated() {
         .expect("build populated batches");
     assert_eq!(populated.len(), 1);
     assert_eq!(populated[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_recovers_authoritative_row_count_from_latest_snapshot() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_count_recovery");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv-provider-count-recovery", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let mut dbsp_view = bridge
+        .new_view(
+            "mv_count_recovery",
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("dbsp view");
+    for id in [1_i64, 2_i64, 3_i64] {
+        dbsp_view.add_delta(
+            encode_projected_row_key(&vec![ScalarValue::Int64(Some(id))]).expect("encode row"),
+            1,
+        );
+    }
+    dbsp_view.flush().await.expect("flush count recovery");
+    let handle_view = dbsp_view.latest_handle_view();
+    let (dict, table, namespace, handle_version) = handle_view.into_parts();
+    view.set_dbsp_state(DbspPersistedState::new(
+        dict,
+        table,
+        namespace,
+        handle_version,
+    ));
+    view.publish_logical_version(i64::try_from(handle_version).expect("logical version"));
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider =
+        MaterializedViewTableProvider::new(Arc::clone(&registry), "mv_count_recovery", schema);
+
+    assert_eq!(view.authoritative_row_count(), None);
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build recovered snapshot");
+    assert_eq!(batches[0].num_rows(), 3);
+    assert_eq!(view.authoritative_row_count(), Some(3));
+}
+
+#[tokio::test]
+async fn materialized_view_provider_recovers_authoritative_row_count_from_overlay_snapshot() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_overlay_count_recovery");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv-provider-overlay-count-recovery", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let mut dbsp_view = bridge
+        .new_view(
+            "mv_overlay_count_recovery",
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("dbsp view");
+    for id in [1_i64, 2_i64] {
+        dbsp_view.add_delta(
+            encode_projected_row_key(&vec![ScalarValue::Int64(Some(id))]).expect("encode row"),
+            1,
+        );
+    }
+    dbsp_view.flush().await.expect("flush overlay base");
+    let handle_view = dbsp_view.latest_handle_view();
+    let (dict, table, namespace, handle_version) = handle_view.into_parts();
+    view.set_dbsp_state(DbspPersistedState::new(
+        dict,
+        table,
+        namespace,
+        handle_version,
+    ));
+    view.publish_logical_version(i64::try_from(handle_version).expect("logical version"));
+    view.append_encoded_overlay_batch(
+        handle_version.saturating_add(1),
+        vec![(
+            encode_projected_row_key(&vec![ScalarValue::Int64(Some(3))]).expect("encode row"),
+            1,
+        )],
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider = MaterializedViewTableProvider::new(
+        Arc::clone(&registry),
+        "mv_overlay_count_recovery",
+        schema,
+    );
+
+    assert_eq!(view.authoritative_row_count(), None);
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build recovered overlay snapshot");
+    assert_eq!(batches[0].num_rows(), 3);
+    assert_eq!(view.authoritative_row_count(), Some(3));
+}
+
+#[tokio::test]
+async fn materialized_view_provider_invalidates_stale_authoritative_count_after_version_advance() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_stale_count_recovery");
+    view.publish_logical_version(0);
+    assert!(view.seed_authoritative_row_count_if_latest(0, 0));
+    view.append_encoded_overlay_batch(
+        1,
+        vec![(
+            encode_projected_row_key(&vec![ScalarValue::Int64(Some(9))]).expect("encode row"),
+            1,
+        )],
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider = MaterializedViewTableProvider::new(
+        Arc::clone(&registry),
+        "mv_stale_count_recovery",
+        schema,
+    );
+
+    assert_eq!(view.authoritative_row_count_for(0), Some(0));
+    assert_eq!(view.authoritative_row_count_for(1), None);
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build stale-count recovery snapshot");
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(view.authoritative_row_count_for(1), Some(1));
+}
+
+#[tokio::test]
+async fn materialized_view_provider_builds_mv_version_only_batches_from_authoritative_state() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_version_only");
+    view.mark_state_authoritative();
+    view.publish_logical_version(7);
+    for id in [1_i64, 2_i64, 3_i64] {
+        let row = vec![ScalarValue::Int64(Some(id))];
+        view.apply_encoded_state_batch(
+            7,
+            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
+        )
+        .expect("apply authoritative row");
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_version_only", schema);
+    let session = SessionContext::new();
+    let state = session.state();
+    let projection = vec![1usize];
+    let plan = provider
+        .scan(&state, Some(&projection), &[], None)
+        .await
+        .expect("scan mv version");
+    let batches = collect(plan, session.state().task_ctx())
+        .await
+        .expect("collect mv version batches");
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        3
+    );
+    let version_values: Vec<u64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("mv version array")
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(version_values, vec![7, 7, 7]);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_answers_count_star_from_authoritative_state() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_count_fast");
+    view.mark_state_authoritative();
+    view.publish_logical_version(11);
+    for id in [1_i64, 2_i64, 3_i64] {
+        let row = vec![ScalarValue::Int64(Some(id))];
+        view.apply_encoded_state_batch(
+            11,
+            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
+        )
+        .expect("apply authoritative row");
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast", schema);
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "mv_count_fast",
+        Arc::new(provider) as Arc<dyn TableProvider>,
+    )
+    .expect("register mv provider");
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_fast")
+        .await
+        .expect("build count query")
+        .collect()
+        .await
+        .expect("collect count query");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count, 3);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_answers_count_star_from_authoritative_non_null_state() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_count_fast_non_null");
+    view.mark_state_authoritative();
+    view.publish_logical_version(11);
+    for id in [1_i64, 2_i64, 3_i64] {
+        let row = vec![ScalarValue::Int64(Some(id))];
+        view.apply_encoded_state_batch(
+            11,
+            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
+        )
+        .expect("apply authoritative row");
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast_non_null", schema);
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "mv_count_fast_non_null",
+        Arc::new(provider) as Arc<dyn TableProvider>,
+    )
+    .expect("register mv provider");
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_fast_non_null")
+        .await
+        .expect("build count query")
+        .collect()
+        .await
+        .expect("collect count query");
+    assert_eq!(batches.len(), 1);
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count, 3);
 }
 
 #[tokio::test]
