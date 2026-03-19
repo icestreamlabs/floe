@@ -101,11 +101,9 @@ impl DbspFilterMap {
                 let mut guard = state.lock().await;
                 guard.on_step(ts as i64, &handle).await?
             };
-            if let Some(out_handle) = out_handle {
-                let mut writer_guard = writer.lock().await;
-                push_value_in_place(&mut writer_guard, out_handle);
-                writer_guard.flush().await?;
-            }
+            let mut writer_guard = writer.lock().await;
+            push_value_in_place(&mut writer_guard, out_handle);
+            writer_guard.flush().await?;
         }
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
@@ -120,11 +118,10 @@ impl DbspFilterMap {
                     ));
                 }
                 let mut state_guard = state.lock().await;
-                if let Some(out_handle) = state_guard.on_step(ts, &handles_vec[0]).await? {
-                    let mut writer_guard = writer.lock().await;
-                    push_value_in_place(&mut writer_guard, out_handle);
-                    writer_guard.flush().await?;
-                }
+                let out_handle = state_guard.on_step(ts, &handles_vec[0]).await?;
+                let mut writer_guard = writer.lock().await;
+                push_value_in_place(&mut writer_guard, out_handle);
+                writer_guard.flush().await?;
                 Ok(())
             })
         });
@@ -219,11 +216,9 @@ impl DbspFilterMap {
                 let mut guard = state.lock().await;
                 guard.on_step(ts as i64, &handle).await?
             };
-            if let Some(out_handle) = out_handle {
-                let mut writer_guard = writer.lock().await;
-                push_value_in_place(&mut writer_guard, out_handle);
-                writer_guard.flush().await?;
-            }
+            let mut writer_guard = writer.lock().await;
+            push_value_in_place(&mut writer_guard, out_handle);
+            writer_guard.flush().await?;
         }
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
@@ -238,11 +233,10 @@ impl DbspFilterMap {
                     ));
                 }
                 let mut state_guard = state.lock().await;
-                if let Some(out_handle) = state_guard.on_step(ts, &handles_vec[0]).await? {
-                    let mut writer_guard = writer.lock().await;
-                    push_value_in_place(&mut writer_guard, out_handle);
-                    writer_guard.flush().await?;
-                }
+                let out_handle = state_guard.on_step(ts, &handles_vec[0]).await?;
+                let mut writer_guard = writer.lock().await;
+                push_value_in_place(&mut writer_guard, out_handle);
+                writer_guard.flush().await?;
                 Ok(())
             })
         });
@@ -316,11 +310,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    async fn on_step(
-        &mut self,
-        ts: i64,
-        input_handle: &ZSetHandle,
-    ) -> anyhow::Result<Option<ZSetHandle>> {
+    async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
         let delta_values =
@@ -357,7 +347,7 @@ where
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "filter_map operator timing (no output)"
             );
-            return Ok(None);
+            return Ok(self.output.handle_for_version(0));
         }
 
         let output_apply_start = Instant::now();
@@ -380,7 +370,7 @@ where
             total_ms = total_start.elapsed().as_millis() as u64,
             "filter_map operator timing"
         );
-        Ok(Some(output_handle))
+        Ok(output_handle)
     }
 }
 
@@ -432,11 +422,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    async fn on_step(
-        &mut self,
-        ts: i64,
-        input_handle: &ZSetHandle,
-    ) -> anyhow::Result<Option<ZSetHandle>> {
+    async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
         let delta_values =
@@ -463,7 +449,7 @@ where
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "filter_map_batch operator timing (no output)"
             );
-            return Ok(None);
+            return Ok(self.output.handle_for_version(0));
         }
 
         let output_apply_start = Instant::now();
@@ -485,7 +471,7 @@ where
             total_ms = total_start.elapsed().as_millis() as u64,
             "filter_map_batch operator timing"
         );
-        Ok(Some(output_handle))
+        Ok(output_handle)
     }
 }
 

@@ -206,7 +206,7 @@ where
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "filter operator timing (no output)"
             );
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let base_version = self

@@ -1,5 +1,6 @@
 mod delay;
 mod delta_join;
+mod filter_map;
 mod h;
 mod join;
 mod nested_select;
