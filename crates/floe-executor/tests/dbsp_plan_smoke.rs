@@ -4,8 +4,9 @@ use datafusion::common::Column;
 use datafusion::logical_expr::{JoinType, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
-    CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, TableDescriptor,
-    nexmark_auction_table, nexmark_bid_table, nexmark_config, nexmark_person_table,
+    CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, RowSchema,
+    TableDescriptor, nexmark_auction_table, nexmark_bid_table, nexmark_config,
+    nexmark_person_table,
 };
 use floe_executor::plan_source_requirements;
 
@@ -161,6 +162,165 @@ fn source_requirement_analysis_tracks_join_inputs() -> Result<()> {
 }
 
 #[test]
+fn join_filter_pushdown_prunes_join_inputs() -> Result<()> {
+    let auction_scan = table_scan(
+        Some(nexmark_auction_table().name),
+        &schema_for(nexmark_auction_table()),
+        None,
+    )?
+    .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_bid_table().name),
+        &schema_for(nexmark_bid_table()),
+        None,
+    )?
+    .join(
+        auction_scan,
+        JoinType::Inner,
+        (
+            vec![Column::from_name("auction")],
+            vec![Column::from_name("id")],
+        ),
+        None,
+    )?
+    .filter(col("category").eq(lit(10i64)))?
+    .project(vec![
+        col("auction"),
+        col("bidder"),
+        col("price"),
+        col("seller"),
+    ])?
+    .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let root = root_node(&plan);
+    let join = match &input_node(&plan, root, 0).kind {
+        DbspNodeKind::Join(join) => join,
+        other => panic!("expected join below projection root, found {other:?}"),
+    };
+    assert_eq!(
+        field_names(join.left_schema.as_ref()),
+        vec!["auction", "bidder", "price"]
+    );
+    assert_eq!(
+        field_names(join.right_schema.as_ref()),
+        vec!["id", "seller"]
+    );
+
+    let left = plan
+        .node(input_node(&plan, root, 0).inputs[0])
+        .expect("left join input");
+    match &left.kind {
+        DbspNodeKind::Project(project) => {
+            assert_eq!(
+                field_names(project.output_schema().as_ref()),
+                vec!["auction", "bidder", "price"]
+            );
+        }
+        other => panic!("expected left join input project, found {other:?}"),
+    }
+
+    let right = plan
+        .node(input_node(&plan, root, 0).inputs[1])
+        .expect("right join input");
+    let right_select = match &input_node(&plan, right, 0).kind {
+        DbspNodeKind::Select(_) => input_node(&plan, right, 0),
+        other => {
+            panic!("expected pushed right-side filter below final projection, found {other:?}")
+        }
+    };
+    match &right.kind {
+        DbspNodeKind::Project(project) => {
+            assert_eq!(
+                field_names(project.output_schema().as_ref()),
+                vec!["id", "seller"]
+            );
+        }
+        other => panic!("expected projected right join input, found {other:?}"),
+    };
+    match &right_select.kind {
+        DbspNodeKind::Select(_) => {
+            let pushed_filter_input = input_node(&plan, right_select, 0);
+            match &pushed_filter_input.kind {
+                DbspNodeKind::Source(_) => {}
+                other => {
+                    panic!("expected pushed filter to read directly from source, found {other:?}")
+                }
+            }
+        }
+        other => panic!("expected select for pushed right filter, found {other:?}"),
+    }
+
+    let requirements = plan_source_requirements(&plan)?
+        .expect("optimized join plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].source_name, "nexmark_auction");
+    assert_eq!(requirements[0].required_columns, vec![0, 5, 6]);
+    assert_eq!(requirements[1].source_name, "nexmark_bid");
+    assert_eq!(requirements[1].required_columns, vec![0, 1, 2]);
+
+    Ok(())
+}
+
+#[test]
+fn mixed_join_filter_stays_above_join() -> Result<()> {
+    let auction_scan = table_scan(
+        Some(nexmark_auction_table().name),
+        &schema_for(nexmark_auction_table()),
+        None,
+    )?
+    .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_bid_table().name),
+        &schema_for(nexmark_bid_table()),
+        None,
+    )?
+    .join(
+        auction_scan,
+        JoinType::Inner,
+        (
+            vec![Column::from_name("auction")],
+            vec![Column::from_name("id")],
+        ),
+        None,
+    )?
+    .filter(col("price").gt(col("reserve")))?
+    .project(vec![col("auction"), col("price"), col("reserve")])?
+    .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let root = root_node(&plan);
+    let select = input_node(&plan, root, 0);
+    let join = match &input_node(&plan, select, 0).kind {
+        DbspNodeKind::Join(join) => join,
+        other => panic!("expected join below remaining select, found {other:?}"),
+    };
+    assert_eq!(
+        field_names(join.left_schema.as_ref()),
+        vec!["auction", "price"]
+    );
+    assert_eq!(
+        field_names(join.right_schema.as_ref()),
+        vec!["id", "reserve"]
+    );
+
+    match &select.kind {
+        DbspNodeKind::Select(_) => {}
+        other => panic!("expected mixed predicate to remain above join, found {other:?}"),
+    }
+
+    let requirements = plan_source_requirements(&plan)?
+        .expect("mixed join filter plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].source_name, "nexmark_auction");
+    assert_eq!(requirements[0].required_columns, vec![0, 4]);
+    assert_eq!(requirements[1].source_name, "nexmark_bid");
+    assert_eq!(requirements[1].required_columns, vec![0, 2]);
+
+    Ok(())
+}
+
+#[test]
 fn missing_table_raises_planner_error() {
     let schema = schema_for(nexmark_person_table());
     let logical_plan = table_scan(Some("unregistered_table"), &schema, None)
@@ -187,4 +347,17 @@ fn schema_for(table: &'static TableDescriptor) -> SchemaRef {
 
 fn root_node(plan: &CircuitPlan) -> &CircuitNode {
     plan.node(plan.root).expect("plan root node")
+}
+
+fn input_node<'a>(plan: &'a CircuitPlan, node: &'a CircuitNode, index: usize) -> &'a CircuitNode {
+    let input_id = *node.inputs.get(index).expect("input index");
+    plan.node(input_id).expect("input node")
+}
+
+fn field_names(schema: &RowSchema) -> Vec<&str> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect()
 }

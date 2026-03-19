@@ -350,6 +350,174 @@ async fn inner_join_materializes_mv() {
 }
 
 #[tokio::test]
+async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
+    let db = test_db("join-filter-pushdown-static-build").await;
+    let view_name = "mv_join_filter_pushdown";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let bid_schema = nexmark_bid_schema();
+        let auction_schema = nexmark_auction_schema();
+        let logical = table_scan(Some("nexmark_bid"), &bid_schema, None)
+            .expect("bid scan")
+            .join(
+                table_scan(Some("nexmark_auction"), &auction_schema, None)
+                    .expect("auction scan")
+                    .build()
+                    .expect("auction plan"),
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("auction")],
+                    vec![Column::from_name("id")],
+                ),
+                None,
+            )
+            .expect("join")
+            .filter(col("category").eq(lit(10i64)))
+            .expect("filter")
+            .project(vec![
+                col("auction"),
+                col("bidder"),
+                col("price").alias("projected_price"),
+                col("seller"),
+            ])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("projected_price", DataType::Int64, true),
+            Field::new("seller", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append(&auction_row_with_category(1, 100, 10), 1)
+        .expect("append matching auction");
+    auction_writer
+        .append(&auction_row_with_category(2, 200, 5), 1)
+        .expect("append filtered auction");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick auction setup");
+
+    {
+        let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        bid_writer
+            .append(&bid_row(1, 42, 10), 1)
+            .expect("append first matching bid");
+        bid_writer
+            .append(&bid_row(2, 7, 20), 1)
+            .expect("append filtered bid");
+        bid_writer
+            .append(&bid_row(1, 8, 30), 1)
+            .expect("append second matching bid");
+    }
+    registry
+        .tick_all_with_version(2)
+        .await
+        .expect("tick first bid batch");
+
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    {
+        let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        bid_writer
+            .append(&bid_row(1, 9, 40), 1)
+            .expect("append later matching bid");
+        bid_writer
+            .append(&bid_row(2, 10, 50), 1)
+            .expect("append later filtered bid");
+    }
+    registry
+        .tick_all_with_version(3)
+        .await
+        .expect("tick second bid batch");
+
+    wait_for_visible_row_count(&mv_registry, view_name, 3).await;
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    rows.sort_by_key(|row| match row.get(1) {
+        Some(ScalarValue::Int64(Some(value))) => *value,
+        _ => 0,
+    });
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(8)),
+                ScalarValue::Int64(Some(30)),
+                ScalarValue::Int64(Some(100)),
+            ],
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(9)),
+                ScalarValue::Int64(Some(40)),
+                ScalarValue::Int64(Some(100)),
+            ],
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(42)),
+                ScalarValue::Int64(Some(10)),
+                ScalarValue::Int64(Some(100)),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn left_outer_join_materializes_null_extended_rows() {
     let db = test_db("left-outer-join").await;
     let view_name = "mv_left_join";
@@ -1249,6 +1417,10 @@ fn person_row(id: i64, name: &str) -> Vec<ScalarValue> {
 }
 
 fn auction_row(id: i64, seller: i64) -> Vec<ScalarValue> {
+    auction_row_with_category(id, seller, 5)
+}
+
+fn auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec<ScalarValue> {
     vec![
         ScalarValue::Int64(Some(id)),
         ScalarValue::Utf8(Some("item".to_string())),
@@ -1256,7 +1428,7 @@ fn auction_row(id: i64, seller: i64) -> Vec<ScalarValue> {
         ScalarValue::Int64(Some(10)),
         ScalarValue::Int64(Some(20)),
         ScalarValue::Int64(Some(seller)),
-        ScalarValue::Int64(Some(5)),
+        ScalarValue::Int64(Some(category)),
         ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
         ScalarValue::TimestampMillisecond(Some(1_700_000_100_000), None),
         ScalarValue::Utf8(Some("extra".to_string())),

@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, WindowFunctionDefinition};
 use datafusion::scalar::ScalarValue;
-use datafusion_common::Column;
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{Column, DataFusionError};
 
 use dbsp_circuit::circuit::plan::{
     DbspAggregateNode, DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode,
@@ -36,7 +38,7 @@ impl CircuitPlanner {
         let planned = ctx.plan_node(plan)?;
         Ok(CircuitPlan {
             root: planned.id,
-            nodes: ctx.into_nodes(),
+            nodes: ctx.into_reachable_nodes(planned.id)?,
         })
     }
 }
@@ -46,6 +48,7 @@ struct PlannerContext<'cfg> {
     nodes: Vec<CircuitNode>,
 }
 
+#[derive(Clone)]
 struct PlannedNode {
     id: usize,
     schema: Arc<RowSchema>,
@@ -61,8 +64,26 @@ impl<'cfg> PlannerContext<'cfg> {
         }
     }
 
-    fn into_nodes(self) -> Vec<CircuitNode> {
-        self.nodes
+    fn into_reachable_nodes(self, root: usize) -> Result<Vec<CircuitNode>, PlannerError> {
+        let mut reachable = BTreeSet::new();
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if !reachable.insert(node_id) {
+                continue;
+            }
+            let node = self.node_by_id(node_id).ok_or_else(|| {
+                PlannerError::UnsupportedPlan(format!(
+                    "planned node {node_id} was not found during reachability pruning",
+                ))
+            })?;
+            stack.extend(node.inputs.iter().copied());
+        }
+
+        Ok(self
+            .nodes
+            .into_iter()
+            .filter(|node| reachable.contains(&node.id))
+            .collect())
     }
 
     fn node_by_id(&self, id: usize) -> Option<&CircuitNode> {
@@ -163,6 +184,14 @@ impl<'cfg> PlannerContext<'cfg> {
                 }
 
                 let input = self.plan_node(&filter.input)?;
+                let normalized_predicate = normalize_expr(filter.predicate.clone())?;
+                if let Some(optimized) = self.optimize_join_subtree(
+                    input.clone(),
+                    Some(normalized_predicate.clone()),
+                    None,
+                )? {
+                    return Ok(optimized);
+                }
                 let mut predicate_schema = input.schema.clone();
                 if matches!(filter.input.as_ref(), LogicalPlan::Projection(_))
                     && let Some(node) = self.node_by_id(input.id)
@@ -170,10 +199,7 @@ impl<'cfg> PlannerContext<'cfg> {
                 {
                     predicate_schema = Arc::clone(project.input_schema());
                 }
-                let select = DbspSelectNode::try_new(
-                    predicate_schema,
-                    normalize_expr(filter.predicate.clone())?,
-                )?;
+                let select = DbspSelectNode::try_new(predicate_schema, normalized_predicate)?;
                 let id = self.add_node(
                     vec![input.id],
                     DbspNodeKind::Select(select),
@@ -240,6 +266,11 @@ impl<'cfg> PlannerContext<'cfg> {
         input: PlannedNode,
         projection: &datafusion::logical_expr::logical_plan::Projection,
     ) -> Result<PlannedNode, PlannerError> {
+        if let Some(optimized) =
+            self.optimize_join_subtree(input.clone(), None, Some(&projection.expr))?
+        {
+            return Ok(optimized);
+        }
         self.build_projection_items(input, &projection.expr)
     }
 
@@ -269,6 +300,236 @@ impl<'cfg> PlannerContext<'cfg> {
             id,
             schema: output_schema,
         })
+    }
+
+    fn optimize_join_subtree(
+        &mut self,
+        input: PlannedNode,
+        top_filter: Option<Expr>,
+        projection_exprs: Option<&[Expr]>,
+    ) -> Result<Option<PlannedNode>, PlannerError> {
+        let Some(input_node) = self.node_by_id(input.id).cloned() else {
+            return Ok(None);
+        };
+
+        let (join_input_id, current_top_filter) = match &input_node.kind {
+            DbspNodeKind::Join(_) => (input.id, top_filter),
+            DbspNodeKind::Select(select) => {
+                let Some(join_input_id) = input_node.inputs.first().copied() else {
+                    return Ok(None);
+                };
+                (
+                    join_input_id,
+                    combine_optional_filters(
+                        top_filter,
+                        Some(select.predicate().expression().expr().clone()),
+                    ),
+                )
+            }
+            _ => return Ok(None),
+        };
+
+        let Some(join_node) = self.node_by_id(join_input_id).cloned() else {
+            return Ok(None);
+        };
+        let DbspNodeKind::Join(join) = &join_node.kind else {
+            return Ok(None);
+        };
+        if !matches!(join.join_type, DbspJoinType::Inner) || join_node.inputs.len() != 2 {
+            return Ok(None);
+        }
+
+        let required_output_columns = if let Some(expressions) = projection_exprs {
+            required_columns_for_expressions(expressions, input.schema.as_ref())?
+        } else {
+            (0..input.schema.len()).collect::<BTreeSet<_>>()
+        };
+        let SplitJoinFilter {
+            left_pushdown,
+            right_pushdown,
+            remaining,
+            required_columns,
+        } = split_join_filter(
+            current_top_filter.as_ref(),
+            join.output_schema.as_ref(),
+            join.left_schema.len(),
+            join,
+        )?;
+
+        let mut left_required = BTreeSet::new();
+        let mut right_required = BTreeSet::new();
+        split_join_required_columns(
+            &required_output_columns,
+            join.left_schema.len(),
+            &mut left_required,
+            &mut right_required,
+        )?;
+        split_join_required_columns(
+            &required_columns,
+            join.left_schema.len(),
+            &mut left_required,
+            &mut right_required,
+        )?;
+        for key in &join.keys {
+            add_required_expression_columns(
+                key.left_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                key.right_expression().expr(),
+                join.right_schema.as_ref(),
+                &mut right_required,
+            )?;
+        }
+        if let Some(residual) = &join.residual {
+            let mut residual_columns = BTreeSet::new();
+            add_required_expression_columns(
+                residual.expr(),
+                join.output_schema.as_ref(),
+                &mut residual_columns,
+            )?;
+            split_join_required_columns(
+                &residual_columns,
+                join.left_schema.len(),
+                &mut left_required,
+                &mut right_required,
+            )?;
+        }
+
+        let left_full = (0..join.left_schema.len()).collect::<BTreeSet<_>>();
+        let right_full = (0..join.right_schema.len()).collect::<BTreeSet<_>>();
+        let changed = left_pushdown.is_some()
+            || right_pushdown.is_some()
+            || remaining != current_top_filter
+            || left_required != left_full
+            || right_required != right_full;
+        if !changed {
+            return Ok(None);
+        }
+
+        let left_input = PlannedNode {
+            id: join_node.inputs[0],
+            schema: Arc::clone(&join.left_schema),
+        };
+        let right_input = PlannedNode {
+            id: join_node.inputs[1],
+            schema: Arc::clone(&join.right_schema),
+        };
+
+        let left = self.build_required_projection(
+            left_input,
+            Arc::clone(&join.left_schema),
+            &left_required,
+        )?;
+        let right = self.build_required_projection(
+            right_input,
+            Arc::clone(&join.right_schema),
+            &right_required,
+        )?;
+        let left = self.build_optional_select(left, left_pushdown)?;
+        let right = self.build_optional_select(right, right_pushdown)?;
+
+        let key_pairs = join
+            .keys
+            .iter()
+            .map(|key| {
+                (
+                    key.left_expression().expr().clone(),
+                    key.right_expression().expr().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rebuilt_join = DbspJoinNode::try_new(
+            DbspJoinType::Inner,
+            left.schema.clone(),
+            right.schema.clone(),
+            key_pairs,
+            join.residual
+                .as_ref()
+                .map(|residual| residual.expr().clone()),
+        )?;
+        let rebuilt_join_schema = rebuilt_join.output_schema.clone();
+        let rebuilt_join_id = self.add_node(
+            vec![left.id, right.id],
+            DbspNodeKind::Join(rebuilt_join),
+            rebuilt_join_schema.clone(),
+        );
+        let mut current = PlannedNode {
+            id: rebuilt_join_id,
+            schema: rebuilt_join_schema,
+        };
+        if let Some(remaining) = remaining {
+            current = self.build_select(current, remaining)?;
+        }
+        if let Some(expressions) = projection_exprs {
+            return self.build_projection_items(current, expressions).map(Some);
+        }
+        Ok(Some(current))
+    }
+
+    fn build_required_projection(
+        &mut self,
+        input: PlannedNode,
+        input_schema: Arc<RowSchema>,
+        required_columns: &BTreeSet<usize>,
+    ) -> Result<PlannedNode, PlannerError> {
+        if required_columns.len() == input_schema.len() {
+            return Ok(input);
+        }
+        let items = required_columns
+            .iter()
+            .map(|column_idx| {
+                let field = input_schema.field(*column_idx).ok_or_else(|| {
+                    PlannerError::UnsupportedPlan(format!(
+                        "required projection column {column_idx} out of bounds",
+                    ))
+                })?;
+                Ok(ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, PlannerError>>()?;
+        let project = DbspProjectNode::try_new(input_schema, items)?;
+        let output_schema = project.output_schema().clone();
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::Project(project),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
+    }
+
+    fn build_select(
+        &mut self,
+        input: PlannedNode,
+        predicate: Expr,
+    ) -> Result<PlannedNode, PlannerError> {
+        let select = DbspSelectNode::try_new(input.schema.clone(), predicate)?;
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::Select(select),
+            input.schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: input.schema,
+        })
+    }
+
+    fn build_optional_select(
+        &mut self,
+        input: PlannedNode,
+        predicate: Option<Expr>,
+    ) -> Result<PlannedNode, PlannerError> {
+        match predicate {
+            Some(predicate) => self.build_select(input, predicate),
+            None => Ok(input),
+        }
     }
 
     fn plan_row_number_filter(
@@ -813,6 +1074,203 @@ impl<'cfg> PlannerContext<'cfg> {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Default)]
+struct SplitJoinFilter {
+    left_pushdown: Option<Expr>,
+    right_pushdown: Option<Expr>,
+    remaining: Option<Expr>,
+    required_columns: BTreeSet<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum JoinInputSide {
+    Left,
+    Right,
+}
+
+fn combine_optional_filters(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> {
+    let mut filters = Vec::new();
+    if let Some(left) = left {
+        filters.push(left);
+    }
+    if let Some(right) = right {
+        filters.push(right);
+    }
+    combine_filters(filters)
+}
+
+fn required_columns_for_expressions(
+    expressions: &[Expr],
+    input_schema: &RowSchema,
+) -> Result<BTreeSet<usize>, PlannerError> {
+    let mut columns = BTreeSet::new();
+    for expr in expressions {
+        let (expression, _) = extract_alias(expr.clone())?;
+        add_required_expression_columns(&expression, input_schema, &mut columns)?;
+    }
+    Ok(columns)
+}
+
+fn split_join_filter(
+    predicate: Option<&Expr>,
+    output_schema: &RowSchema,
+    left_width: usize,
+    join: &DbspJoinNode,
+) -> Result<SplitJoinFilter, PlannerError> {
+    let Some(predicate) = predicate else {
+        return Ok(SplitJoinFilter::default());
+    };
+    let normalized = normalize_expr(predicate.clone())?;
+    let conjuncts = split_conjuncts(&normalized);
+    let mut left_pushdown = Vec::new();
+    let mut right_pushdown = Vec::new();
+    let mut remaining = Vec::new();
+    let mut required_columns = BTreeSet::new();
+
+    for conjunct in conjuncts {
+        let columns = expression_output_columns(&conjunct, output_schema)?;
+        required_columns.extend(columns.iter().copied());
+        let references_left = columns.iter().any(|column_idx| *column_idx < left_width);
+        let references_right = columns.iter().any(|column_idx| *column_idx >= left_width);
+        match (references_left, references_right) {
+            (true, false) => left_pushdown.push(rewrite_join_output_expr_for_side(
+                conjunct,
+                join,
+                JoinInputSide::Left,
+            )?),
+            (false, true) => right_pushdown.push(rewrite_join_output_expr_for_side(
+                conjunct,
+                join,
+                JoinInputSide::Right,
+            )?),
+            _ => remaining.push(conjunct),
+        }
+    }
+
+    Ok(SplitJoinFilter {
+        left_pushdown: combine_filters(left_pushdown),
+        right_pushdown: combine_filters(right_pushdown),
+        remaining: combine_filters(remaining),
+        required_columns,
+    })
+}
+
+fn split_conjuncts(predicate: &Expr) -> Vec<Expr> {
+    match predicate {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            let mut conjuncts = split_conjuncts(binary.left.as_ref());
+            conjuncts.extend(split_conjuncts(binary.right.as_ref()));
+            conjuncts
+        }
+        _ => vec![predicate.clone()],
+    }
+}
+
+fn expression_output_columns(
+    expression: &Expr,
+    output_schema: &RowSchema,
+) -> Result<BTreeSet<usize>, PlannerError> {
+    let mut columns = BTreeSet::new();
+    add_required_expression_columns(expression, output_schema, &mut columns)?;
+    Ok(columns)
+}
+
+fn rewrite_join_output_expr_for_side(
+    expression: Expr,
+    join: &DbspJoinNode,
+    side: JoinInputSide,
+) -> Result<Expr, PlannerError> {
+    expression
+        .transform_up(|expr| match expr {
+            Expr::Column(column) => {
+                let output_idx = join
+                    .output_schema
+                    .field_index(column.name.as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "column '{}' not found in join output schema",
+                            column.name
+                        ))
+                    })?;
+                let rewritten = match side {
+                    JoinInputSide::Left if output_idx < join.left_schema.len() => {
+                        let field = join.left_schema.field(output_idx).ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "left join output column index {output_idx} out of bounds",
+                            ))
+                        })?;
+                        Expr::Column(Column::new_unqualified(field.name.clone()))
+                    }
+                    JoinInputSide::Right if output_idx >= join.left_schema.len() => {
+                        let right_idx = output_idx - join.left_schema.len();
+                        let field = join.right_schema.field(right_idx).ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "right join output column index {right_idx} out of bounds",
+                            ))
+                        })?;
+                        Expr::Column(Column::new_unqualified(field.name.clone()))
+                    }
+                    JoinInputSide::Left => {
+                        return Err(DataFusionError::Plan(format!(
+                            "attempted to rewrite right-side join column '{}' onto left input",
+                            column.name
+                        )));
+                    }
+                    JoinInputSide::Right => {
+                        return Err(DataFusionError::Plan(format!(
+                            "attempted to rewrite left-side join column '{}' onto right input",
+                            column.name
+                        )));
+                    }
+                };
+                Ok(Transformed::yes(rewritten))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .map(|result| result.data)
+        .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+fn add_required_expression_columns(
+    expression: &Expr,
+    input_schema: &RowSchema,
+    columns: &mut BTreeSet<usize>,
+) -> Result<(), PlannerError> {
+    for column in expression.column_refs() {
+        let column_idx = input_schema
+            .field_index(column.name.as_str())
+            .ok_or_else(|| {
+                PlannerError::AnalysisError(anyhow::anyhow!(
+                    "column '{}' not found in input schema",
+                    column.name
+                ))
+            })?;
+        columns.insert(column_idx);
+    }
+    Ok(())
+}
+
+fn split_join_required_columns(
+    columns: &BTreeSet<usize>,
+    left_width: usize,
+    left_columns: &mut BTreeSet<usize>,
+    right_columns: &mut BTreeSet<usize>,
+) -> Result<(), PlannerError> {
+    for column_idx in columns {
+        if *column_idx < left_width {
+            left_columns.insert(*column_idx);
+        } else {
+            let right_idx = column_idx.checked_sub(left_width).ok_or_else(|| {
+                PlannerError::AnalysisError(anyhow::anyhow!(
+                    "join column index underflow for {column_idx}",
+                ))
+            })?;
+            right_columns.insert(right_idx);
+        }
+    }
+    Ok(())
 }
 
 fn extract_row_number_limit(predicate: &Expr) -> Result<Option<(String, usize)>, PlannerError> {
