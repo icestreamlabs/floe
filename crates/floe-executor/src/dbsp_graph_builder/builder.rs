@@ -1390,3 +1390,87 @@ fn eval_projection(
         .map(|expr| eval_scalar_expression(expr.expression(), row, schema))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use datafusion::common::Column;
+    use datafusion::logical_expr::{JoinType, col, lit, table_scan};
+
+    use crate::dbsp_plan::{
+        DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
+    };
+
+    #[test]
+    fn benchmark_join_shape_still_matches_transient_join_root() {
+        let bid = nexmark_bid_table();
+        let auction = nexmark_auction_table();
+        let bid_schema = bid.schema().to_arrow_schema();
+        let auction_schema = auction.schema().to_arrow_schema();
+        let logical = table_scan(Some("nexmark_bid"), &bid_schema, None)
+            .expect("bid scan")
+            .join(
+                table_scan(Some("nexmark_auction"), &auction_schema, None)
+                    .expect("auction scan")
+                    .build()
+                    .expect("auction logical"),
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("auction")],
+                    vec![Column::from_name("id")],
+                ),
+                None,
+            )
+            .expect("join")
+            .filter(col("category").eq(lit(10i64)))
+            .expect("filter")
+            .project(vec![
+                col("auction"),
+                col("bidder"),
+                col("price").alias("projected_price"),
+                col("seller"),
+            ])
+            .expect("project")
+            .build()
+            .expect("logical plan");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        let persistence_policy = PersistencePolicy::for_plan(&plan);
+        let transient_opt = try_build_transient_segment_optimization(
+            &plan,
+            plan.root,
+            &HashMap::new(),
+            "benchmark_result",
+            true,
+            &persistence_policy,
+        )
+        .expect("transient optimization result");
+
+        assert!(
+            transient_opt.is_some(),
+            "expected transient optimization for benchmark query plan: {plan:#?}"
+        );
+        let transient_opt = transient_opt.expect("transient opt");
+        let join_node = plan
+            .node(transient_opt.durable_input_idx)
+            .expect("durable input node");
+        assert!(
+            matches!(join_node.kind, DbspNodeKind::Join(_)),
+            "expected durable input to be a join node: {plan:#?}"
+        );
+        let (left_idx, right_idx) = join_inputs(join_node).expect("join inputs");
+        assert!(
+            try_build_transient_source_root_materialization(&plan, left_idx)
+                .expect("left transient input shape")
+                .is_some(),
+            "expected left benchmark join input to be transient-eligible: {plan:#?}"
+        );
+        assert!(
+            try_build_transient_source_root_materialization(&plan, right_idx)
+                .expect("right transient input shape")
+                .is_some(),
+            "expected right benchmark join input to be transient-eligible: {plan:#?}"
+        );
+    }
+}

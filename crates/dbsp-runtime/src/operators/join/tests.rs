@@ -9,7 +9,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::Db;
 
-use super::JoinOp;
+use super::{JoinOp, JoinTransientInputs};
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
@@ -1027,7 +1027,7 @@ async fn join_operator_transient_batches_match_persisted_output() {
     );
     assert!(
         transient
-            .on_step_transient(1, &[empty_left, right_seed])
+            .on_step_transient_with_inputs(1, &[empty_left, right_seed], None)
             .await
             .expect("seed transient join")
             .is_none()
@@ -1047,7 +1047,7 @@ async fn join_operator_transient_batches_match_persisted_output() {
         .expect("persisted t2")
         .expect("persisted t2 output");
     let transient_t2 = transient
-        .on_step_transient(2, &[left_match, empty_right])
+        .on_step_transient_with_inputs(2, &[left_match, empty_right], None)
         .await
         .expect("transient t2")
         .expect("transient t2 output");
@@ -1074,7 +1074,7 @@ async fn join_operator_transient_batches_match_persisted_output() {
         .expect("persisted t3")
         .expect("persisted t3 output");
     let transient_t3 = transient
-        .on_step_transient(3, &[empty_left, right_retract])
+        .on_step_transient_with_inputs(3, &[empty_left, right_retract], None)
         .await
         .expect("transient t3")
         .expect("transient t3 output");
@@ -1083,4 +1083,147 @@ async fn join_operator_transient_batches_match_persisted_output() {
         .await
         .expect("materialize persisted t3");
     assert_eq!(persisted_t3_rows, batch_to_map(&transient_t3));
+}
+
+#[tokio::test]
+async fn join_operator_preloaded_transient_inputs_match_handle_path() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_preloaded_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_preloaded_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+
+    let mut handle_path = JoinOp::new_without_output(
+        RelationState::empty(
+            table.clone(),
+            "join_preloaded_left_state_handle".to_string(),
+        )
+        .await
+        .expect("handle left state"),
+        RelationState::empty(
+            table.clone(),
+            "join_preloaded_right_state_handle".to_string(),
+        )
+        .await
+        .expect("handle right state"),
+        IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_handle"),
+        IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_handle"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        None,
+    )
+    .with_persist_indexes(false);
+
+    let mut preloaded_path = JoinOp::new_without_output(
+        RelationState::empty(
+            table.clone(),
+            "join_preloaded_left_state_transient".to_string(),
+        )
+        .await
+        .expect("transient left state"),
+        RelationState::empty(
+            table.clone(),
+            "join_preloaded_right_state_transient".to_string(),
+        )
+        .await
+        .expect("transient right state"),
+        IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_transient"),
+        IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_transient"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        None,
+    )
+    .with_persist_indexes(false);
+
+    let empty_left = empty_handle("join_preloaded_left_stream");
+    let empty_right = empty_handle("join_preloaded_right_stream");
+
+    let right_seed = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "join_preloaded_right_stream",
+        &[(7, 1)],
+    )
+    .await;
+    assert!(
+        handle_path
+            .on_step_transient_with_inputs(1, &[empty_left.clone(), right_seed], None)
+            .await
+            .expect("seed handle path")
+            .is_none()
+    );
+    assert!(
+        preloaded_path
+            .on_step_transient_with_inputs(
+                1,
+                &[empty_left.clone(), empty_right.clone()],
+                Some(JoinTransientInputs {
+                    left: None,
+                    right: Some(Arc::new(vec![(7, 1)])),
+                }),
+            )
+            .await
+            .expect("seed preloaded path")
+            .is_none()
+    );
+
+    let left_match = stage_version(
+        left_dict.clone(),
+        table.clone(),
+        "join_preloaded_left_stream",
+        &[(7, 2)],
+    )
+    .await;
+    let handle_t2 = handle_path
+        .on_step_transient_with_inputs(2, &[left_match, empty_right.clone()], None)
+        .await
+        .expect("handle t2")
+        .expect("handle t2 output");
+    let preloaded_t2 = preloaded_path
+        .on_step_transient_with_inputs(
+            2,
+            &[empty_left.clone(), empty_right.clone()],
+            Some(JoinTransientInputs {
+                left: Some(Arc::new(vec![(7, 2)])),
+                right: None,
+            }),
+        )
+        .await
+        .expect("preloaded t2")
+        .expect("preloaded t2 output");
+    assert_eq!(batch_to_map(&handle_t2), batch_to_map(&preloaded_t2));
+
+    let right_retract =
+        stage_version(right_dict, table, "join_preloaded_right_stream", &[(7, -1)]).await;
+    let handle_t3 = handle_path
+        .on_step_transient_with_inputs(3, &[empty_left.clone(), right_retract], None)
+        .await
+        .expect("handle t3")
+        .expect("handle t3 output");
+    let preloaded_t3 = preloaded_path
+        .on_step_transient_with_inputs(
+            3,
+            &[empty_left, empty_right],
+            Some(JoinTransientInputs {
+                left: None,
+                right: Some(Arc::new(vec![(7, -1)])),
+            }),
+        )
+        .await
+        .expect("preloaded t3")
+        .expect("preloaded t3 output");
+    assert_eq!(batch_to_map(&handle_t3), batch_to_map(&preloaded_t3));
 }

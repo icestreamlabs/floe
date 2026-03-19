@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -8,11 +9,12 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::operators::join::JoinOp;
+use crate::operators::join::{JoinOp, JoinTransientInputs};
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -26,6 +28,82 @@ use crate::stream::{DeltaHandleStream, Stream};
 
 static JOIN_STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const JOIN_STEP_LOG_SAMPLE_EVERY: u64 = 256;
+
+#[derive(Clone)]
+pub struct TransientJoinInputBatch<T> {
+    pub ts: i64,
+    pub deltas: Arc<Vec<(T, i64)>>,
+}
+
+struct JoinTransientInputBuffer<T> {
+    receiver: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<T>>>,
+    pending: BTreeMap<i64, Arc<Vec<(T, i64)>>>,
+    replay_cutoff_ts: i64,
+}
+
+impl<T> JoinTransientInputBuffer<T> {
+    fn new(
+        receiver: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<T>>>,
+        replay_cutoff_ts: i64,
+    ) -> Self {
+        Self {
+            receiver,
+            pending: BTreeMap::new(),
+            replay_cutoff_ts,
+        }
+    }
+
+    fn take_for_ts(&mut self, ts: i64) -> Option<Arc<Vec<(T, i64)>>> {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return None;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(batch) => {
+                    if batch.ts <= self.replay_cutoff_ts || batch.ts < ts {
+                        continue;
+                    }
+                    self.pending.insert(batch.ts, batch.deltas);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.receiver = None;
+                    break;
+                }
+            }
+        }
+        self.replay_cutoff_ts = self.replay_cutoff_ts.max(ts);
+        let future = self.pending.split_off(&ts.saturating_add(1));
+        let current = self.pending.remove(&ts);
+        self.pending = future;
+        current
+    }
+}
+
+struct JoinTransientInputState<L, R> {
+    left: JoinTransientInputBuffer<L>,
+    right: JoinTransientInputBuffer<R>,
+}
+
+impl<L, R> JoinTransientInputState<L, R> {
+    fn new(
+        left: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>>,
+        right: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
+        replay_cutoff_ts: i64,
+    ) -> Self {
+        Self {
+            left: JoinTransientInputBuffer::new(left, replay_cutoff_ts),
+            right: JoinTransientInputBuffer::new(right, replay_cutoff_ts),
+        }
+    }
+
+    fn take_for_ts(&mut self, ts: i64) -> JoinTransientInputs<L, R> {
+        JoinTransientInputs {
+            left: self.left.take_for_ts(ts),
+            right: self.right.take_for_ts(ts),
+        }
+    }
+}
 
 /// Join wrapper that drives the JoinOp operator over handle streams without requiring aligned timestamps.
 pub struct DbspJoin {
@@ -253,6 +331,76 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
+        Self::spawn_transient_with_inputs(
+            left,
+            right,
+            None,
+            None,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            observer,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_transient_with_inputs<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>>,
+        right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
+        left_key: KL,
+        right_key: KR,
+        predicate: P,
+        projector: F,
+        observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<()>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        O: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
+        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
+        P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+        F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
+    {
         let table = left.table();
         let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -293,6 +441,11 @@ impl DbspJoin {
         let left_default = left.default_value();
         let right_default = right.default_value();
         let replay_len = left_history.len().max(right_history.len());
+        let replay_cutoff_ts = left.current_time().max(right.current_time()).max(
+            i64::try_from(replay_len)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(1),
+        );
         for ts in 0..replay_len {
             let handles = vec![
                 left_history
@@ -304,17 +457,32 @@ impl DbspJoin {
                     .cloned()
                     .unwrap_or_else(|| right_default.clone()),
             ];
-            drive_join_transient(&join_op, &observer, &output_version, ts as i64, handles).await?;
+            drive_join_transient(
+                &join_op,
+                &observer,
+                &output_version,
+                None,
+                ts as i64,
+                handles,
+            )
+            .await?;
         }
 
+        let transient_inputs = Arc::new(AsyncMutex::new(JoinTransientInputState::new(
+            left_transient,
+            right_transient,
+            replay_cutoff_ts,
+        )));
         let op = Arc::clone(&join_op);
         let observer_clone = Arc::clone(&observer);
         let version_clone = Arc::clone(&output_version);
+        let transient_inputs_clone = Arc::clone(&transient_inputs);
         let mut runtime =
             HandleOperatorRuntime::new(vec![left.stream(), right.stream()], move |ts, handles| {
                 let op = Arc::clone(&op);
                 let observer = Arc::clone(&observer_clone);
                 let output_version = Arc::clone(&version_clone);
+                let transient_inputs = Arc::clone(&transient_inputs_clone);
                 let handles = handles.to_vec();
                 Box::pin(async move {
                     if handles.len() != 2 {
@@ -323,7 +491,15 @@ impl DbspJoin {
                             handles.len()
                         ));
                     }
-                    drive_join_transient(&op, &observer, &output_version, ts, handles).await
+                    drive_join_transient(
+                        &op,
+                        &observer,
+                        &output_version,
+                        Some(&transient_inputs),
+                        ts,
+                        handles,
+                    )
+                    .await
                 })
             });
 
@@ -425,6 +601,7 @@ async fn drive_join_transient<L, R, O, K>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
     observer: &Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
     output_version: &Arc<AtomicU64>,
+    transient_inputs: Option<&Arc<AsyncMutex<JoinTransientInputState<L, R>>>>,
     ts: i64,
     handles: Vec<ZSetHandle>,
 ) -> Result<()>
@@ -483,8 +660,17 @@ where
         span.record("right_ns", right.ns.as_str());
         span.record("right_version", right.version);
     }
+    let transient_inputs = if let Some(state) = transient_inputs {
+        let mut state_guard = state.lock().await;
+        Some(state_guard.take_for_ts(ts))
+    } else {
+        None
+    };
     let mut op_guard = op.lock().await;
-    if let Some(batch) = op_guard.on_step_transient(ts, &handles).await? {
+    if let Some(batch) = op_guard
+        .on_step_transient_with_inputs(ts, &handles, transient_inputs)
+        .await?
+    {
         let version = output_version
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);

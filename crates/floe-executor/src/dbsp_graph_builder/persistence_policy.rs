@@ -35,7 +35,7 @@ pub(crate) struct TransientSegmentSpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistencePolicy {
-    classes: Vec<PersistenceClass>,
+    classes: HashMap<usize, PersistenceClass>,
     max_transient_segment_nodes: usize,
     min_transient_segment_score: i32,
 }
@@ -45,8 +45,8 @@ impl PersistencePolicy {
         let classes = plan
             .nodes()
             .iter()
-            .map(|node| classify_node(&node.kind))
-            .collect::<Vec<_>>();
+            .map(|node| (node.id, classify_node(&node.kind)))
+            .collect::<HashMap<_, _>>();
         let max_transient_segment_nodes = std::env::var("FLOE_TRANSIENT_SEGMENT_MAX_NODES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -73,7 +73,7 @@ impl PersistencePolicy {
 
     pub(crate) fn class_for_node(&self, node_idx: usize) -> PersistenceClass {
         self.classes
-            .get(node_idx)
+            .get(&node_idx)
             .copied()
             .unwrap_or(PersistenceClass::Durable)
     }

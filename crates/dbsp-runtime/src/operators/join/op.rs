@@ -26,10 +26,16 @@ type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
+type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
 
 pub(crate) struct JoinStepResult<O> {
     pub(crate) delta_batch: Arc<Vec<(O, i64)>>,
     pub(crate) persisted_handle: Option<ZSetHandle>,
+}
+
+pub struct JoinTransientInputs<L, R> {
+    pub(crate) left: Option<Arc<Vec<(L, i64)>>>,
+    pub(crate) right: Option<Arc<Vec<(R, i64)>>>,
 }
 
 pub struct JoinOp<L, R, O, K>
@@ -204,7 +210,15 @@ where
         self
     }
 
-    fn join_entries(&self, left: &[(L, i64)], right: &[(R, i64)], acc: &mut FastHashMap<O, i64>) {
+    fn join_entries_with_right_map(
+        &self,
+        left: &[(L, i64)],
+        right: Option<&FastHashMap<R, i64>>,
+        acc: &mut FastHashMap<O, i64>,
+    ) {
+        let Some(right) = right else {
+            return;
+        };
         for (lk, lw) in left {
             if *lw == 0 {
                 continue;
@@ -221,13 +235,13 @@ where
         }
     }
 
-    fn join_entries_with_right_map(
+    fn join_entries_with_maps(
         &self,
-        left: &[(L, i64)],
+        left: Option<&FastHashMap<L, i64>>,
         right: Option<&FastHashMap<R, i64>>,
         acc: &mut FastHashMap<O, i64>,
     ) {
-        let Some(right) = right else {
+        let (Some(left), Some(right)) = (left, right) else {
             return;
         };
         for (lk, lw) in left {
@@ -271,53 +285,55 @@ where
         }
     }
 
-    fn keyed_deltas<T>(
+    fn stage_keyed_deltas<T>(
         &self,
-        deltas: FastHashMap<T, i64>,
+        deltas: &[(T, i64)],
         extractor: &JoinKeyExtractor<T, K>,
-    ) -> FastHashMap<K, Vec<(T, i64)>>
+    ) -> KeyedRowDeltas<K, T>
     where
-        T: Eq + Hash,
+        T: Clone + Eq + Hash,
     {
-        let mut keyed = FastHashMap::new();
+        let mut keyed: KeyedRowDeltas<K, T> = FastHashMap::new();
         for (row, weight) in deltas {
-            if weight == 0 {
+            if *weight == 0 {
                 continue;
             }
-            if let Some(key) = extractor(&row) {
-                keyed
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push((row, weight));
+            if let Some(key) = extractor(row) {
+                let rows = keyed.entry(key).or_default();
+                match rows.entry(row.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        let next = entry.get().saturating_add(*weight);
+                        if next == 0 {
+                            entry.remove();
+                        } else {
+                            *entry.get_mut() = next;
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(*weight);
+                    }
+                }
             }
         }
+        keyed.retain(|_, rows| !rows.is_empty());
         keyed
     }
 
-    fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> FastHashMap<T, i64>
+    fn flatten_keyed_updates<T>(keyed: &KeyedRowDeltas<K, T>) -> Vec<(K, T, i64)>
     where
-        T: Eq + Hash,
+        T: Clone,
     {
-        let mut merged: FastHashMap<T, i64> = FastHashMap::new();
-        for (row, weight) in deltas {
-            if weight == 0 {
-                continue;
-            }
-            match merged.entry(row) {
-                Entry::Occupied(mut entry) => {
-                    let next = entry.get().saturating_add(weight);
-                    if next == 0 {
-                        entry.remove();
-                    } else {
-                        *entry.get_mut() = next;
-                    }
+        let estimated = keyed.values().map(|rows| rows.len()).sum();
+        let mut updates = Vec::with_capacity(estimated);
+        for (key, rows) in keyed {
+            for (row, weight) in rows {
+                if *weight == 0 {
+                    continue;
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(weight);
-                }
+                updates.push((key.clone(), row.clone(), *weight));
             }
         }
-        merged
+        updates
     }
 
     async fn apply_deltas_to_versioned<T>(
@@ -404,7 +420,7 @@ where
 
     fn apply_keyed_updates_to_memory_index<T>(
         index: &mut FastHashMap<K, FastHashMap<T, i64>>,
-        keyed: &FastHashMap<K, Vec<(T, i64)>>,
+        keyed: &KeyedRowDeltas<K, T>,
     ) where
         T: Clone + Eq + Hash,
     {
@@ -434,6 +450,7 @@ where
         &mut self,
         _ts: i64,
         inputs: &[ZSetHandle],
+        transient_inputs: Option<JoinTransientInputs<L, R>>,
         persist_output: bool,
     ) -> anyhow::Result<Option<JoinStepResult<O>>> {
         let left_delta_handle = inputs
@@ -445,24 +462,40 @@ where
             .cloned()
             .context("join operator requires right delta handle")?;
 
-        let left_delta_values = delta_zset_handle::<L>(
-            self.table.clone(),
-            &mut self.dict_cache_left,
-            &left_delta_handle,
-        )
-        .await
-        .context("load left delta for join")?;
-        let right_delta_values = delta_zset_handle::<R>(
-            self.table.clone(),
-            &mut self.dict_cache_right,
-            &right_delta_handle,
-        )
-        .await
-        .context("load right delta for join")?;
-        let left_delta = self.coalesce_deltas(left_delta_values);
-        let right_delta = self.coalesce_deltas(right_delta_values);
-        let left_keyed = self.keyed_deltas(left_delta, &self.left_key);
-        let right_keyed = self.keyed_deltas(right_delta, &self.right_key);
+        let left_loaded;
+        let left_delta_values: &[(L, i64)] = if let Some(batch) = transient_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.left.as_ref())
+        {
+            batch.as_ref()
+        } else {
+            left_loaded = delta_zset_handle::<L>(
+                self.table.clone(),
+                &mut self.dict_cache_left,
+                &left_delta_handle,
+            )
+            .await
+            .context("load left delta for join")?;
+            left_loaded.as_slice()
+        };
+        let right_loaded;
+        let right_delta_values: &[(R, i64)] = if let Some(batch) = transient_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.right.as_ref())
+        {
+            batch.as_ref()
+        } else {
+            right_loaded = delta_zset_handle::<R>(
+                self.table.clone(),
+                &mut self.dict_cache_right,
+                &right_delta_handle,
+            )
+            .await
+            .context("load right delta for join")?;
+            right_loaded.as_slice()
+        };
+        let left_keyed = self.stage_keyed_deltas(left_delta_values, &self.left_key);
+        let right_keyed = self.stage_keyed_deltas(right_delta_values, &self.right_key);
 
         // Build output delta from pre-update state (A, B) and current deltas
         // (ΔA, ΔB). State/index updates happen after this block to keep
@@ -480,10 +513,14 @@ where
                         .values_for_key(key)
                         .await
                         .context("load right join index")?;
-                    self.join_entries(left_entries, &right_entries, &mut delta_join);
+                    self.join_entries_with_left_map(
+                        Some(left_entries),
+                        &right_entries,
+                        &mut delta_join,
+                    );
                 } else {
-                    self.join_entries_with_right_map(
-                        left_entries,
+                    self.join_entries_with_maps(
+                        Some(left_entries),
                         self.right_memory_index.get(key),
                         &mut delta_join,
                     );
@@ -500,11 +537,15 @@ where
                         .values_for_key(key)
                         .await
                         .context("load left join index")?;
-                    self.join_entries(&left_entries, right_entries, &mut delta_join);
+                    self.join_entries_with_right_map(
+                        &left_entries,
+                        Some(right_entries),
+                        &mut delta_join,
+                    );
                 } else {
-                    self.join_entries_with_left_map(
+                    self.join_entries_with_maps(
                         self.left_memory_index.get(key),
-                        right_entries,
+                        Some(right_entries),
                         &mut delta_join,
                     );
                 }
@@ -515,7 +556,11 @@ where
         if has_left && has_right {
             for (key, left_entries) in &left_keyed {
                 if let Some(right_entries) = right_keyed.get(key) {
-                    self.join_entries(left_entries, right_entries, &mut delta_join);
+                    self.join_entries_with_maps(
+                        Some(left_entries),
+                        Some(right_entries),
+                        &mut delta_join,
+                    );
                 }
             }
         }
@@ -527,12 +572,7 @@ where
         }
 
         if self.persist_indexes {
-            let mut left_updates = Vec::new();
-            for (key, entries) in &left_keyed {
-                for (row, weight) in entries {
-                    left_updates.push((key.clone(), row.clone(), *weight));
-                }
-            }
+            let left_updates = Self::flatten_keyed_updates(&left_keyed);
             let left_index_persist_start = std::time::Instant::now();
             self.left_index
                 .apply_deltas(left_updates)
@@ -546,12 +586,7 @@ where
         }
 
         if self.persist_indexes {
-            let mut right_updates = Vec::new();
-            for (key, entries) in &right_keyed {
-                for (row, weight) in entries {
-                    right_updates.push((key.clone(), row.clone(), *weight));
-                }
-            }
+            let right_updates = Self::flatten_keyed_updates(&right_keyed);
             let right_index_persist_start = std::time::Instant::now();
             self.right_index
                 .apply_deltas(right_updates)
@@ -611,13 +646,14 @@ where
         }))
     }
 
-    pub(crate) async fn on_step_transient(
+    pub(crate) async fn on_step_transient_with_inputs(
         &mut self,
         ts: i64,
         inputs: &[ZSetHandle],
+        transient_inputs: Option<JoinTransientInputs<L, R>>,
     ) -> anyhow::Result<Option<Arc<Vec<(O, i64)>>>> {
         Ok(self
-            .step_internal(ts, inputs, false)
+            .step_internal(ts, inputs, transient_inputs, false)
             .await?
             .map(|result| result.delta_batch))
     }
@@ -669,7 +705,7 @@ where
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
         Ok(self
-            .step_internal(ts, inputs, true)
+            .step_internal(ts, inputs, None, true)
             .await?
             .and_then(|result| result.persisted_handle))
     }
