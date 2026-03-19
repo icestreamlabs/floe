@@ -721,6 +721,12 @@ impl DbspGraphBuilder {
         node: &DbspJoinNode,
         left: DeltaHandleStream,
         right: DeltaHandleStream,
+        left_transient: Option<
+            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        >,
+        right_transient: Option<
+            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        >,
         output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
         task_events: &GraphTaskSender,
     ) -> Result<()> {
@@ -942,9 +948,11 @@ impl DbspGraphBuilder {
             let _ = output_tx.send(TransientMaterializeBatch { version, deltas });
         });
 
-        DbspJoin::spawn_transient::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+        DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
             &left,
             &right,
+            left_transient,
+            right_transient,
             left_key,
             right_key,
             predicate,
