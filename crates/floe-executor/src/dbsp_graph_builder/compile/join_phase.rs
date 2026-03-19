@@ -1,4 +1,5 @@
 use super::*;
+use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
@@ -713,6 +714,248 @@ impl DbspGraphBuilder {
             .await
             .context("initialize OUTER join union")?;
         Ok(union.stream())
+    }
+
+    pub(crate) async fn compile_transient_join_root_materialization(
+        &mut self,
+        node: &DbspJoinNode,
+        left: DeltaHandleStream,
+        right: DeltaHandleStream,
+        output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
+        task_events: &GraphTaskSender,
+    ) -> Result<()> {
+        let left_schema = Arc::clone(&node.left_schema);
+        let right_schema = Arc::clone(&node.right_schema);
+        let join_type = node.join_type.clone();
+        let residual = node.residual.clone();
+        let output_schema = Arc::clone(&node.output_schema);
+        if !matches!(join_type, DbspJoinType::Inner) {
+            return Err(anyhow!(
+                "transient join-to-mv fast path currently only supports INNER joins"
+            ));
+        }
+        if residual.is_some() && !matches!(join_type, DbspJoinType::Inner) {
+            return Err(anyhow!(
+                "OUTER joins currently require pure equi-join predicates"
+            ));
+        }
+
+        let graph_id = self.graph_id().to_string();
+        let join_events = task_events.clone();
+        let join_graph_id = graph_id.clone();
+        let join_label = format!("join:{graph_id}");
+        let join_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&join_events, &join_graph_id, join_label.clone(), err);
+        });
+
+        let join_keys = Arc::new(node.keys.clone());
+        let left_key_exprs = Arc::clone(&join_keys);
+        let right_key_exprs = Arc::clone(&join_keys);
+        let left_key_schema = Arc::clone(&left_schema);
+        let right_key_schema = Arc::clone(&right_schema);
+        let left_key_columns =
+            direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
+        let right_key_columns =
+            direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let left_graph_id = graph_id.clone();
+        let right_graph_id = graph_id.clone();
+        let predicate_graph_id = graph_id.clone();
+        let projector_graph_id = graph_id.clone();
+
+        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = left_key_columns.as_ref() {
+                return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %left_graph_id,
+                            error = %err,
+                            "failed to extract join left key columns"
+                        );
+                        None
+                    }
+                };
+            }
+            let left_row = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %left_graph_id,
+                        error = %err,
+                        "failed to decode join left key"
+                    );
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(left_key_exprs.len());
+            for key in left_key_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.left_expression(),
+                    &left_row,
+                    left_key_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %left_graph_id,
+                            error = %err,
+                            "failed to evaluate join left key expression"
+                        );
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            match encode_projected_row_key(&key_columns) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %left_graph_id,
+                        error = %err,
+                        "failed to encode join left key"
+                    );
+                    None
+                }
+            }
+        };
+
+        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = right_key_columns.as_ref() {
+                return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %right_graph_id,
+                            error = %err,
+                            "failed to extract join right key columns"
+                        );
+                        None
+                    }
+                };
+            }
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %right_graph_id,
+                        error = %err,
+                        "failed to decode join right key"
+                    );
+                    return None;
+                }
+            };
+            let mut key_columns = Vec::with_capacity(right_key_exprs.len());
+            for key in right_key_exprs.iter() {
+                let value = match eval_scalar_expression(
+                    key.right_expression(),
+                    &right_row,
+                    right_key_schema.as_ref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %right_graph_id,
+                            error = %err,
+                            "failed to evaluate join right key expression"
+                        );
+                        return None;
+                    }
+                };
+                if value.is_null() {
+                    return None;
+                }
+                key_columns.push(value);
+            }
+            match encode_projected_row_key(&key_columns) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %right_graph_id,
+                        error = %err,
+                        "failed to encode join right key"
+                    );
+                    None
+                }
+            }
+        };
+
+        let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
+            let Some(expr) = residual.as_ref() else {
+                return true;
+            };
+            let left_row = match decode_projected_row_key(left_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to decode join left row"
+                    );
+                    return false;
+                }
+            };
+            let right_row = match decode_projected_row_key(right_bytes) {
+                Ok(row) => row,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to decode join right row"
+                    );
+                    return false;
+                }
+            };
+            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+            combined.extend(left_row.into_iter());
+            combined.extend(right_row.into_iter());
+            match eval_expression(expr, &combined, output_schema.as_ref()) {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %predicate_graph_id,
+                        error = %err,
+                        "failed to evaluate join residual"
+                    );
+                    false
+                }
+            }
+        };
+
+        let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+            match concat_encoded_rows(left_bytes, right_bytes) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %projector_graph_id,
+                        error = %err,
+                        "failed to concatenate join projection rows"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
+            let _ = output_tx.send(TransientMaterializeBatch { version, deltas });
+        });
+
+        DbspJoin::spawn_transient::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+            &left,
+            &right,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            observer,
+            Some(join_error_handler),
+        )
+        .await
+        .context("initialize transient DBSP join")?;
+
+        Ok(())
     }
 }
 

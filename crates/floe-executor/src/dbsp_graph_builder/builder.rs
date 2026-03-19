@@ -26,7 +26,7 @@ use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::GraphTaskSender;
 
-use super::materialize::DeltaTransformFn;
+use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
 use super::vectorized_filter_project::{
     VectorizedFilterProjectEvaluator, required_encoded_input_columns,
@@ -241,6 +241,76 @@ impl DbspGraphBuilder {
                 true,
                 &persistence_policy,
             )? {
+                if inputs.enable_source_batch_journal
+                    && let Some(join_node) = inputs.plan.node(transient_opt.durable_input_idx)
+                    && let DbspNodeKind::Join(join) = &join_node.kind
+                    && matches!(join.join_type, dbsp::DbspJoinType::Inner)
+                    && has_single_consumer(inputs.plan, transient_opt.durable_input_idx)
+                {
+                    let (left_idx, right_idx) = join_inputs(join_node)?;
+                    let left = self
+                        .compile_node(
+                            inputs.plan,
+                            left_idx,
+                            inputs.outer_handle_streams,
+                            &inputs.cancel,
+                            &inputs.task_events,
+                            &mut built,
+                            &inputs.mv_registry,
+                            &mut mv_latest,
+                            inputs.mv_retention,
+                            &persistence_policy,
+                        )
+                        .await?;
+                    let right = self
+                        .compile_node(
+                            inputs.plan,
+                            right_idx,
+                            inputs.outer_handle_streams,
+                            &inputs.cancel,
+                            &inputs.task_events,
+                            &mut built,
+                            &inputs.mv_registry,
+                            &mut mv_latest,
+                            inputs.mv_retention,
+                            &persistence_policy,
+                        )
+                        .await?;
+                    let (tx, rx) =
+                        tokio::sync::mpsc::unbounded_channel::<TransientMaterializeBatch>();
+                    tracing::info!(
+                        graph_id = %self.graph_id(),
+                        view = %inputs.view_name,
+                        root = inputs.plan.root,
+                        durable_input_idx = transient_opt.durable_input_idx,
+                        optimized_nodes = ?transient_opt.optimized_nodes,
+                        segment_score = transient_opt.score,
+                        "using transient join-to-mv root materialization"
+                    );
+                    self.materialize_view_from_transient_overlay_receiver(
+                        inputs.view_name,
+                        Arc::clone(&root_node.output_schema),
+                        rx,
+                        Arc::clone(&transient_opt.transform),
+                        &inputs.cancel,
+                        &inputs.task_events,
+                        &inputs.mv_registry,
+                    )
+                    .await?;
+                    self.compile_transient_join_root_materialization(
+                        join,
+                        left,
+                        right,
+                        tx,
+                        &inputs.task_events,
+                    )
+                    .await?;
+                    return Ok(BuildOutputs {
+                        node_streams: built,
+                        mv_latest,
+                        required_sources,
+                    });
+                }
                 let upstream = self
                     .compile_node(
                         inputs.plan,

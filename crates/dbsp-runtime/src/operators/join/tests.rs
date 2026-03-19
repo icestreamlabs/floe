@@ -115,6 +115,19 @@ fn recompute_join(left: &HashMap<i64, i64>, right: &HashMap<i64, i64>) -> HashMa
     out
 }
 
+fn batch_to_map(batch: &Arc<Vec<(i64, i64)>>) -> HashMap<i64, i64> {
+    let mut out = HashMap::new();
+    for (key, weight) in batch.iter() {
+        let next = out.get(key).copied().unwrap_or(0) + *weight;
+        if next == 0 {
+            out.remove(key);
+        } else {
+            out.insert(*key, next);
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn join_operator_matches_batch_join_over_time() {
     let db = build_db().await;
@@ -920,4 +933,154 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
             .is_empty(),
         "in-memory join indexes should not persist arranged state on the hot path"
     );
+}
+
+#[tokio::test]
+async fn join_operator_transient_batches_match_persisted_output() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_transient_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_transient_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_transient_output", None)
+            .await
+            .expect("out dict"),
+    );
+
+    let mut persisted = JoinOp::new(
+        RelationState::empty(
+            table.clone(),
+            "join_transient_left_state_persisted".to_string(),
+        )
+        .await
+        .expect("persisted left state"),
+        RelationState::empty(
+            table.clone(),
+            "join_transient_right_state_persisted".to_string(),
+        )
+        .await
+        .expect("persisted right state"),
+        IndexedBatchZSet::new(table.clone(), "join_transient_left_index_persisted"),
+        IndexedBatchZSet::new(table.clone(), "join_transient_right_index_persisted"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        VersionedZSet::new(
+            out_dict.clone(),
+            table.clone(),
+            "join_transient_output".to_string(),
+        )
+        .await
+        .expect("persisted output"),
+        None,
+    )
+    .with_persist_indexes(false);
+
+    let mut transient = JoinOp::new_without_output(
+        RelationState::empty(
+            table.clone(),
+            "join_transient_left_state_transient".to_string(),
+        )
+        .await
+        .expect("transient left state"),
+        RelationState::empty(
+            table.clone(),
+            "join_transient_right_state_transient".to_string(),
+        )
+        .await
+        .expect("transient right state"),
+        IndexedBatchZSet::new(table.clone(), "join_transient_left_index_transient"),
+        IndexedBatchZSet::new(table.clone(), "join_transient_right_index_transient"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        None,
+    )
+    .with_persist_indexes(false);
+
+    let right_seed = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "join_transient_right_stream",
+        &[(7, 1)],
+    )
+    .await;
+    let empty_left = empty_handle("join_transient_left_stream");
+    assert!(
+        persisted
+            .on_step(1, &[empty_left.clone(), right_seed.clone()])
+            .await
+            .expect("seed persisted join")
+            .is_none()
+    );
+    assert!(
+        transient
+            .on_step_transient(1, &[empty_left, right_seed])
+            .await
+            .expect("seed transient join")
+            .is_none()
+    );
+
+    let left_match = stage_version(
+        left_dict.clone(),
+        table.clone(),
+        "join_transient_left_stream",
+        &[(7, 2)],
+    )
+    .await;
+    let empty_right = empty_handle("join_transient_right_stream");
+    let persisted_t2 = persisted
+        .on_step(2, &[left_match.clone(), empty_right.clone()])
+        .await
+        .expect("persisted t2")
+        .expect("persisted t2 output");
+    let transient_t2 = transient
+        .on_step_transient(2, &[left_match, empty_right])
+        .await
+        .expect("transient t2")
+        .expect("transient t2 output");
+
+    let mut cache = HashMap::new();
+    cache.insert("join_transient_output".to_string(), out_dict.clone());
+    let persisted_t2_rows =
+        materialize_zset_handle::<i64>(table.clone(), &mut cache, &persisted_t2)
+            .await
+            .expect("materialize persisted t2");
+    assert_eq!(persisted_t2_rows, batch_to_map(&transient_t2));
+
+    let right_retract = stage_version(
+        right_dict,
+        table.clone(),
+        "join_transient_right_stream",
+        &[(7, -1)],
+    )
+    .await;
+    let empty_left = empty_handle("join_transient_left_stream");
+    let persisted_t3 = persisted
+        .on_step(3, &[empty_left.clone(), right_retract.clone()])
+        .await
+        .expect("persisted t3")
+        .expect("persisted t3 output");
+    let transient_t3 = transient
+        .on_step_transient(3, &[empty_left, right_retract])
+        .await
+        .expect("transient t3")
+        .expect("transient t3 output");
+
+    let persisted_t3_rows = materialize_zset_handle::<i64>(table, &mut cache, &persisted_t3)
+        .await
+        .expect("materialize persisted t3");
+    assert_eq!(persisted_t3_rows, batch_to_map(&transient_t3));
 }

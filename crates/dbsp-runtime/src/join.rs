@@ -201,6 +201,145 @@ impl DbspJoin {
         })
     }
 
+    pub async fn spawn_transient<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        left_key: KL,
+        right_key: KR,
+        predicate: P,
+        projector: F,
+        observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<()>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        O: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
+        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
+        P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+        F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
+    {
+        let table = left.table();
+        let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
+
+        let left_state =
+            RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
+        let right_state =
+            RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
+        let left_index = crate::collections::IndexedBatchZSet::new(
+            table.clone(),
+            format!("join_left_index_{join_id}"),
+        );
+        let right_index = crate::collections::IndexedBatchZSet::new(
+            table.clone(),
+            format!("join_right_index_{join_id}"),
+        );
+
+        let join_op = Arc::new(AsyncMutex::new(
+            JoinOp::new_without_output(
+                left_state,
+                right_state,
+                left_index,
+                right_index,
+                Arc::new(left_key),
+                Arc::new(right_key),
+                Arc::new(predicate),
+                Arc::new(projector),
+                table.clone(),
+                None,
+            )
+            .with_persist_indexes(false),
+        ));
+
+        let output_version = Arc::new(AtomicU64::new(0));
+
+        // Rehydrate join state from any existing input handles before going live.
+        let left_history = collect_values(left, left.current_time()).await?;
+        let right_history = collect_values(right, right.current_time()).await?;
+        let left_default = left.default_value();
+        let right_default = right.default_value();
+        let replay_len = left_history.len().max(right_history.len());
+        for ts in 0..replay_len {
+            let handles = vec![
+                left_history
+                    .get(ts)
+                    .cloned()
+                    .unwrap_or_else(|| left_default.clone()),
+                right_history
+                    .get(ts)
+                    .cloned()
+                    .unwrap_or_else(|| right_default.clone()),
+            ];
+            drive_join_transient(&join_op, &observer, &output_version, ts as i64, handles).await?;
+        }
+
+        let op = Arc::clone(&join_op);
+        let observer_clone = Arc::clone(&observer);
+        let version_clone = Arc::clone(&output_version);
+        let mut runtime =
+            HandleOperatorRuntime::new(vec![left.stream(), right.stream()], move |ts, handles| {
+                let op = Arc::clone(&op);
+                let observer = Arc::clone(&observer_clone);
+                let output_version = Arc::clone(&version_clone);
+                let handles = handles.to_vec();
+                Box::pin(async move {
+                    if handles.len() != 2 {
+                        return Err(anyhow::anyhow!(
+                            "join runtime expected 2 handles, got {}",
+                            handles.len()
+                        ));
+                    }
+                    drive_join_transient(&op, &observer, &output_version, ts, handles).await
+                })
+            });
+
+        let error_handler = error_handler.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = runtime.step().await {
+                    report_runtime_error(&error_handler, "join", err);
+                    break;
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
     }
@@ -278,6 +417,78 @@ where
         let mut writer_guard = writer.lock().await;
         push_value_in_place(&mut writer_guard, out);
         writer_guard.flush().await?;
+    }
+    Ok(())
+}
+
+async fn drive_join_transient<L, R, O, K>(
+    op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
+    observer: &Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+    output_version: &Arc<AtomicU64>,
+    ts: i64,
+    handles: Vec<ZSetHandle>,
+) -> Result<()>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let span = tracing::trace_span!(
+        "join_step_transient",
+        ts,
+        left_ns = tracing::field::Empty,
+        left_version = tracing::field::Empty,
+        right_ns = tracing::field::Empty,
+        right_version = tracing::field::Empty
+    );
+    let _enter = span.enter();
+    if let Some(left) = handles.first() {
+        span.record("left_ns", left.ns.as_str());
+        span.record("left_version", left.version);
+    }
+    if let Some(right) = handles.get(1) {
+        span.record("right_ns", right.ns.as_str());
+        span.record("right_version", right.version);
+    }
+    let mut op_guard = op.lock().await;
+    if let Some(batch) = op_guard.on_step_transient(ts, &handles).await? {
+        let version = output_version
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        observer(i64::try_from(version).unwrap_or(i64::MAX), batch);
     }
     Ok(())
 }

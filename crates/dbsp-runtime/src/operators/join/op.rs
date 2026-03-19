@@ -27,6 +27,11 @@ type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
 
+pub(crate) struct JoinStepResult<O> {
+    pub(crate) delta_batch: Arc<Vec<(O, i64)>>,
+    pub(crate) persisted_handle: Option<ZSetHandle>,
+}
+
 pub struct JoinOp<L, R, O, K>
 where
     L: Archive
@@ -76,7 +81,7 @@ where
     pub projector: JoinProjector<L, R, O>,
     pub table: Arc<dyn KeyValueTable>,
     pub integrated: Option<RelationState<O>>,
-    output: VersionedZSet<O>,
+    output: Option<VersionedZSet<O>>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
     left_memory_index: FastHashMap<K, FastHashMap<L, i64>>,
@@ -150,7 +155,42 @@ where
             projector,
             table,
             integrated,
-            output,
+            output: Some(output),
+            dict_cache_left: HashMap::new(),
+            dict_cache_right: HashMap::new(),
+            left_memory_index: FastHashMap::new(),
+            right_memory_index: FastHashMap::new(),
+            persist_indexes: true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_without_output(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_key: JoinKeyExtractor<L, K>,
+        right_key: JoinKeyExtractor<R, K>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        integrated: Option<RelationState<O>>,
+    ) -> Self {
+        debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
+        debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
+        Self {
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            table,
+            integrated,
+            output: None,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
             left_memory_index: FastHashMap::new(),
@@ -389,53 +429,13 @@ where
             }
         }
     }
-}
 
-#[async_trait]
-impl<L, R, O, K> DeltaOperator for JoinOp<L, R, O, K>
-where
-    L: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    R: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    O: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    K: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    async fn on_step(
+    async fn step_internal(
         &mut self,
         _ts: i64,
         inputs: &[ZSetHandle],
-    ) -> anyhow::Result<Option<ZSetHandle>> {
+        persist_output: bool,
+    ) -> anyhow::Result<Option<JoinStepResult<O>>> {
         let left_delta_handle = inputs
             .first()
             .cloned()
@@ -584,11 +584,94 @@ where
             integrated.update_handle(new_integrated_handle);
         }
 
-        let delta_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &delta_join, None, "output")
-                .await
-                .context("persist join delta output")?;
-        Ok(Some(delta_handle))
+        let delta_batch = Arc::new(
+            delta_join
+                .iter()
+                .map(|(row, weight)| (row.clone(), *weight))
+                .collect(),
+        );
+
+        let persisted_handle = if persist_output {
+            let output = self
+                .output
+                .as_mut()
+                .context("join output persistence requested without configured output zset")?;
+            Some(
+                Self::apply_deltas_to_versioned(output, &delta_join, None, "output")
+                    .await
+                    .context("persist join delta output")?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(JoinStepResult {
+            delta_batch,
+            persisted_handle,
+        }))
+    }
+
+    pub(crate) async fn on_step_transient(
+        &mut self,
+        ts: i64,
+        inputs: &[ZSetHandle],
+    ) -> anyhow::Result<Option<Arc<Vec<(O, i64)>>>> {
+        Ok(self
+            .step_internal(ts, inputs, false)
+            .await?
+            .map(|result| result.delta_batch))
+    }
+}
+
+#[async_trait]
+impl<L, R, O, K> DeltaOperator for JoinOp<L, R, O, K>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn on_step(
+        &mut self,
+        ts: i64,
+        inputs: &[ZSetHandle],
+    ) -> anyhow::Result<Option<ZSetHandle>> {
+        Ok(self
+            .step_internal(ts, inputs, true)
+            .await?
+            .and_then(|result| result.persisted_handle))
     }
 }
 
