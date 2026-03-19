@@ -1,6 +1,9 @@
 use super::*;
 use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
-use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
+use crate::encoding::{
+    EncodedRowProjectionColumn, concat_encoded_rows, extract_encoded_row_columns,
+    project_joined_encoded_rows,
+};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
@@ -727,6 +730,7 @@ impl DbspGraphBuilder {
         right_transient: Option<
             tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
         >,
+        output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
         output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
         task_events: &GraphTaskSender,
     ) -> Result<()> {
@@ -931,6 +935,20 @@ impl DbspGraphBuilder {
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+            if let Some(columns) = output_projection.as_ref() {
+                return match project_joined_encoded_rows(left_bytes, right_bytes, columns.as_ref())
+                {
+                    Ok(encoded) => encoded,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project join output columns directly"
+                        );
+                        Vec::new()
+                    }
+                };
+            }
             match concat_encoded_rows(left_bytes, right_bytes) {
                 Ok(encoded) => encoded,
                 Err(err) => {

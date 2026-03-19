@@ -1,6 +1,18 @@
 use anyhow::{Result, anyhow};
 use datafusion::scalar::ScalarValue;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EncodedRowProjectionSource {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EncodedRowProjectionColumn {
+    pub source: EncodedRowProjectionSource,
+    pub index: usize,
+}
+
 /// Encode a projected row into deterministic bytes for DBSP keys.
 pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
@@ -194,6 +206,45 @@ pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub(crate) fn project_joined_encoded_rows(
+    left: &[u8],
+    right: &[u8],
+    columns: &[EncodedRowProjectionColumn],
+) -> Result<Vec<u8>> {
+    let mut left_requests = Vec::new();
+    let mut right_requests = Vec::new();
+    for (output_idx, column) in columns.iter().enumerate() {
+        match column.source {
+            EncodedRowProjectionSource::Left => left_requests.push((column.index, output_idx)),
+            EncodedRowProjectionSource::Right => right_requests.push((column.index, output_idx)),
+        }
+    }
+
+    let mut spans_by_output = vec![(0usize, 0usize); columns.len()];
+    let mut total_payload_len = 0usize;
+    for (output_idx, start, end) in collect_encoded_field_spans(left, &left_requests)? {
+        spans_by_output[output_idx] = (start, end);
+        total_payload_len += end - start;
+    }
+    for (output_idx, start, end) in collect_encoded_field_spans(right, &right_requests)? {
+        spans_by_output[output_idx] = (start, end);
+        total_payload_len += end - start;
+    }
+
+    let projected_count =
+        u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut out = Vec::with_capacity(4 + total_payload_len);
+    out.extend_from_slice(&projected_count.to_le_bytes());
+    for (output_idx, (start, end)) in spans_by_output.into_iter().enumerate() {
+        let source_bytes = match columns[output_idx].source {
+            EncodedRowProjectionSource::Left => left,
+            EncodedRowProjectionSource::Right => right,
+        };
+        out.extend_from_slice(&source_bytes[start..end]);
+    }
+    Ok(out)
+}
+
 fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < 4 {
         return Err(anyhow!("encoded key too short"));
@@ -243,6 +294,42 @@ fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
 
 fn is_null_field_tag(tag: u8) -> bool {
     matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08)
+}
+
+fn collect_encoded_field_spans(
+    bytes: &[u8],
+    requests: &[(usize, usize)],
+) -> Result<Vec<(usize, usize, usize)>> {
+    let count = encoded_row_column_count(bytes)?;
+    if requests.iter().any(|(index, _)| *index >= count) {
+        return Err(anyhow!(
+            "encoded row has {count} columns but a requested index was out of bounds"
+        ));
+    }
+
+    let mut requested = requests.to_vec();
+    requested.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut spans = Vec::with_capacity(requested.len());
+    let mut request_idx = 0usize;
+    let mut cursor = 4usize;
+
+    for column_idx in 0..count {
+        let start = cursor;
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        cursor = encoded_field_end(bytes, cursor, tag)?;
+        let end = cursor;
+
+        while request_idx < requested.len() && requested[request_idx].0 == column_idx {
+            spans.push((requested[request_idx].1, start, end));
+            request_idx += 1;
+        }
+    }
+
+    Ok(spans)
 }
 
 #[cfg(test)]
@@ -337,6 +424,56 @@ mod tests {
                 ScalarValue::Utf8(Some("left".into())),
                 ScalarValue::Boolean(Some(true)),
                 ScalarValue::TimestampMillisecond(Some(55), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn projects_joined_rows_without_full_decode() {
+        let left = encode_projected_row_key(&[
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Utf8(Some("left".into())),
+            ScalarValue::Boolean(Some(true)),
+        ])
+        .expect("encode left");
+        let right = encode_projected_row_key(&[
+            ScalarValue::TimestampMillisecond(Some(55), None),
+            ScalarValue::Int64(Some(99)),
+        ])
+        .expect("encode right");
+
+        let projected = project_joined_encoded_rows(
+            &left,
+            &right,
+            &[
+                EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Right,
+                    index: 1,
+                },
+                EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Left,
+                    index: 0,
+                },
+                EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Right,
+                    index: 0,
+                },
+                EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Left,
+                    index: 2,
+                },
+            ],
+        )
+        .expect("project");
+        let decoded = decode_projected_row_key(&projected).expect("decode projected");
+
+        assert_eq!(
+            decoded,
+            vec![
+                ScalarValue::Int64(Some(99)),
+                ScalarValue::Int64(Some(10)),
+                ScalarValue::TimestampMillisecond(Some(55), None),
+                ScalarValue::Boolean(Some(true)),
             ]
         );
     }

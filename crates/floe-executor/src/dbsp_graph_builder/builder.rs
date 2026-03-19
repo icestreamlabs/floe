@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
+use datafusion::common::Column;
+use datafusion::logical_expr::Expr;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
@@ -21,7 +23,10 @@ use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };
 use crate::delta_consolidation::ConsolidationMode;
-use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+use crate::encoding::{
+    EncodedRowProjectionColumn, EncodedRowProjectionSource, decode_projected_row_key,
+    encode_projected_row_key,
+};
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::GraphTaskSender;
@@ -302,6 +307,14 @@ impl DbspGraphBuilder {
                     let right_transient_nodes = right_transient_input
                         .as_ref()
                         .map(|input| input.optimized_nodes.clone());
+                    let output_projection =
+                        try_build_direct_join_output_projection(join, &transient_opt.steps);
+                    let direct_output_projection = output_projection.is_some();
+                    let delta_transform: Arc<DeltaTransformFn> = if direct_output_projection {
+                        Arc::new(|deltas| Ok(deltas))
+                    } else {
+                        Arc::clone(&transient_opt.transform)
+                    };
                     let (tx, rx) =
                         tokio::sync::mpsc::unbounded_channel::<TransientMaterializeBatch>();
                     tracing::info!(
@@ -315,13 +328,14 @@ impl DbspGraphBuilder {
                         left_transient_nodes = ?left_transient_nodes,
                         right_transient_source = ?right_transient_source,
                         right_transient_nodes = ?right_transient_nodes,
+                        direct_output_projection,
                         "using transient join-to-mv root materialization"
                     );
                     self.materialize_view_from_transient_overlay_receiver(
                         inputs.view_name,
                         Arc::clone(&root_node.output_schema),
                         rx,
-                        Arc::clone(&transient_opt.transform),
+                        delta_transform,
                         &inputs.cancel,
                         &inputs.task_events,
                         &inputs.mv_registry,
@@ -333,6 +347,7 @@ impl DbspGraphBuilder {
                         right,
                         left_transient_input.map(|input| input.receiver),
                         right_transient_input.map(|input| input.receiver),
+                        output_projection,
                         tx,
                         &inputs.task_events,
                     )
@@ -842,6 +857,7 @@ struct TransientSegmentOptimization {
     durable_input_idx: usize,
     optimized_nodes: Vec<usize>,
     score: i32,
+    steps: Vec<TransientSegmentStep>,
     transform: Arc<DeltaTransformFn>,
 }
 
@@ -869,13 +885,15 @@ fn build_transient_segment_optimization_from_spec(
     graph_id: &str,
     segment: TransientSegmentSpec,
 ) -> Result<TransientSegmentOptimization> {
+    let steps = segment.steps.clone();
     let mut evaluators = Vec::new();
-    for step in segment.steps {
+    for step in &steps {
         match step {
             TransientSegmentStep::Passthrough => {}
             TransientSegmentStep::Select { predicate, schema } => {
                 evaluators.push(VectorizedFilterProjectEvaluator::for_filter(
-                    &predicate, schema,
+                    predicate,
+                    Arc::clone(schema),
                 )?);
             }
             TransientSegmentStep::Project {
@@ -884,7 +902,7 @@ fn build_transient_segment_optimization_from_spec(
             } => {
                 evaluators.push(VectorizedFilterProjectEvaluator::for_map(
                     expressions.as_ref(),
-                    schema,
+                    Arc::clone(schema),
                 )?);
             }
         }
@@ -900,6 +918,7 @@ fn build_transient_segment_optimization_from_spec(
         durable_input_idx: segment.durable_input_idx,
         optimized_nodes: segment.segment_nodes,
         score: segment.score,
+        steps,
         transform,
     })
 }
@@ -1194,6 +1213,72 @@ fn split_join_required_columns(
         right_columns.insert(right_idx);
     }
     Ok(())
+}
+
+fn try_build_direct_join_output_projection(
+    join: &dbsp::DbspJoinNode,
+    steps: &[TransientSegmentStep],
+) -> Option<Arc<Vec<EncodedRowProjectionColumn>>> {
+    let mut project_expressions: Option<Arc<Vec<DbspProjectExpr>>> = None;
+    for step in steps {
+        match step {
+            TransientSegmentStep::Passthrough => {}
+            TransientSegmentStep::Select { .. } => return None,
+            TransientSegmentStep::Project { expressions, .. } => {
+                if project_expressions.is_some() {
+                    return None;
+                }
+                project_expressions = Some(Arc::clone(expressions));
+            }
+        }
+    }
+
+    let expressions = project_expressions?;
+    let left_width = join.left_schema.len();
+    let columns = expressions
+        .iter()
+        .map(|expr| {
+            let column_idx = projection_direct_column_index(expr, join.output_schema.as_ref())?;
+            if column_idx < left_width {
+                Some(EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Left,
+                    index: column_idx,
+                })
+            } else {
+                Some(EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Right,
+                    index: column_idx - left_width,
+                })
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Arc::new(columns))
+}
+
+fn projection_direct_column_index(expr: &DbspProjectExpr, schema: &RowSchema) -> Option<usize> {
+    match expr.expression().expr() {
+        Expr::Alias(alias) => {
+            projection_direct_column_index_expression(alias.expr.as_ref(), schema)
+        }
+        other => projection_direct_column_index_expression(other, schema),
+    }
+}
+
+fn projection_direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => projection_resolve_direct_column(schema, column),
+        Expr::Alias(alias) => {
+            projection_direct_column_index_expression(alias.expr.as_ref(), schema)
+        }
+        _ => None,
+    }
+}
+
+fn projection_resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    schema
+        .field_index(&qualified)
+        .or_else(|| schema.field_index(&column.name))
 }
 
 fn try_build_transient_join_input_optimization(
@@ -1573,6 +1658,10 @@ mod tests {
             matches!(join_node.kind, DbspNodeKind::Join(_)),
             "expected durable input to be a join node: {plan:#?}"
         );
+        let join = match &join_node.kind {
+            DbspNodeKind::Join(join) => join,
+            other => panic!("expected join node, got {other:?}"),
+        };
         let (left_idx, right_idx) = join_inputs(join_node).expect("join inputs");
         assert!(
             try_build_transient_source_root_materialization(&plan, left_idx)
@@ -1585,6 +1674,10 @@ mod tests {
                 .expect("right transient input shape")
                 .is_some(),
             "expected right benchmark join input to be transient-eligible: {plan:#?}"
+        );
+        assert!(
+            try_build_direct_join_output_projection(join, &transient_opt.steps).is_some(),
+            "expected benchmark join root to expose a direct output projection: {plan:#?}"
         );
     }
 
