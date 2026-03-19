@@ -350,6 +350,114 @@ async fn inner_join_materializes_mv() {
 }
 
 #[tokio::test]
+async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
+    let db = test_db("inner-join-transient-root").await;
+    let view_name = "mv_join_transient_root";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let person_schema = nexmark_person_schema();
+        let auction_schema = nexmark_auction_schema();
+        let right = table_scan(Some("nexmark_person"), &person_schema, None)
+            .expect("person scan")
+            .project(vec![col("id").alias("person_id"), col("name")])
+            .expect("person project")
+            .build()
+            .expect("person plan");
+        let logical = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .join(
+                right,
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("seller")],
+                    vec![Column::from_name("person_id")],
+                ),
+                None,
+            )
+            .expect("join")
+            .project(vec![col("id"), col("name")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_person", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let person_writer = registry
+        .writer_mut("nexmark_person")
+        .expect("person writer");
+    person_writer
+        .append(&person_row(100, "alice"), 1)
+        .expect("append alice");
+    person_writer.flush().await.expect("flush person");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append(&auction_row(10, 100), 1)
+        .expect("append auction");
+    auction_writer.flush().await.expect("flush auction");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    let outputs = builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient join graph");
+
+    assert_eq!(outputs.required_sources, required_sources);
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Utf8(Some("alice".to_string())),
+        ]]
+    );
+}
+
+#[tokio::test]
 async fn left_outer_join_materializes_null_extended_rows() {
     let db = test_db("left-outer-join").await;
     let view_name = "mv_left_join";
