@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -89,20 +89,53 @@ impl SourceBatchJournal {
             .load_committed_entries_up_to(max_tick_id, allowed_sources)
             .await?;
         let mut replayed = 0usize;
-        for entry in entries {
-            registry
-                .replay_transient_batch(
-                    &entry.source,
-                    i64::try_from(entry.tick_id).unwrap_or(i64::MAX),
-                    entry.deltas,
-                )
-                .with_context(|| {
-                    format!(
-                        "replay source batch journal entry for '{}' at tick {}",
-                        entry.source, entry.tick_id
+        if allowed_sources.is_empty() {
+            for entry in entries {
+                registry
+                    .replay_transient_batch(
+                        &entry.source,
+                        i64::try_from(entry.tick_id).unwrap_or(i64::MAX),
+                        entry.deltas,
                     )
-                })?;
-            replayed = replayed.saturating_add(1);
+                    .with_context(|| {
+                        format!(
+                            "replay source batch journal entry for '{}' at tick {}",
+                            entry.source, entry.tick_id
+                        )
+                    })?;
+                replayed = replayed.saturating_add(1);
+            }
+            return Ok(replayed);
+        }
+
+        let mut entry_by_tick_and_source = BTreeMap::new();
+        for entry in entries {
+            entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
+        }
+
+        for tick_id in 1..=max_tick_id {
+            for source in allowed_sources {
+                let (replay_source, deltas) =
+                    match entry_by_tick_and_source.remove(&(tick_id, source.clone())) {
+                        Some(entry) => {
+                            replayed = replayed.saturating_add(1);
+                            (entry.source, entry.deltas)
+                        }
+                        None => (source.clone(), Vec::new()),
+                    };
+                registry
+                    .replay_transient_batch(
+                        &replay_source,
+                        i64::try_from(tick_id).unwrap_or(i64::MAX),
+                        deltas,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "replay source batch journal entry for '{}' at tick {}",
+                            replay_source, tick_id
+                        )
+                    })?;
+            }
         }
         Ok(replayed)
     }
@@ -307,5 +340,70 @@ mod tests {
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "replay should stop at the committed tick boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn source_batch_journal_replay_synthesizes_empty_batches_for_missing_ticks() {
+        let db = test_db("source-batch-journal-empty-replay").await;
+        let journal = SourceBatchJournal::new(Arc::new(SlateTable::new(Arc::clone(&db))));
+        journal
+            .append("nexmark_bid", 1, None, &[(b"a".to_vec(), 1)])
+            .await
+            .expect("append bid entry");
+        journal
+            .append("nexmark_auction", 2, None, &[(b"z".to_vec(), 1)])
+            .await
+            .expect("append auction entry");
+
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let mut registry = OuterStreamRegistry::from_sources(
+            vec!["nexmark_bid".to_string(), "nexmark_auction".to_string()],
+            &mut bridge,
+        )
+        .await
+        .expect("outer streams");
+        let mut bid_rx = registry
+            .transient_stream("nexmark_bid")
+            .expect("bid transient stream")
+            .subscribe();
+        let mut auction_rx = registry
+            .transient_stream("nexmark_auction")
+            .expect("auction transient stream")
+            .subscribe();
+
+        let allowed = BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()]);
+        let replayed = journal
+            .replay_committed_entries_up_to(&mut registry, 2, &allowed)
+            .await
+            .expect("replay");
+        assert_eq!(replayed, 2);
+
+        let bid_tick_1 = timeout(Duration::from_secs(1), bid_rx.recv())
+            .await
+            .expect("bid tick 1 timeout")
+            .expect("bid tick 1 batch");
+        assert_eq!(bid_tick_1.version, 1);
+        assert_eq!(bid_tick_1.deltas.as_slice(), &[(b"a".to_vec(), 1)]);
+
+        let bid_tick_2 = timeout(Duration::from_secs(1), bid_rx.recv())
+            .await
+            .expect("bid tick 2 timeout")
+            .expect("bid tick 2 batch");
+        assert_eq!(bid_tick_2.version, 2);
+        assert!(bid_tick_2.deltas.is_empty());
+
+        let auction_tick_1 = timeout(Duration::from_secs(1), auction_rx.recv())
+            .await
+            .expect("auction tick 1 timeout")
+            .expect("auction tick 1 batch");
+        assert_eq!(auction_tick_1.version, 1);
+        assert!(auction_tick_1.deltas.is_empty());
+
+        let auction_tick_2 = timeout(Duration::from_secs(1), auction_rx.recv())
+            .await
+            .expect("auction tick 2 timeout")
+            .expect("auction tick 2 batch");
+        assert_eq!(auction_tick_2.version, 2);
+        assert_eq!(auction_tick_2.deltas.as_slice(), &[(b"z".to_vec(), 1)]);
     }
 }

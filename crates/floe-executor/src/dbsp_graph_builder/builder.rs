@@ -995,11 +995,58 @@ pub struct PlanSourceRequirements {
     pub required_columns: Vec<usize>,
 }
 
+pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = find_transient_source_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_name().to_string()])));
+    }
+
+    let persistence_policy = PersistencePolicy::for_plan(plan);
+    let Some(transient_opt) = try_build_transient_segment_optimization(
+        plan,
+        plan.root,
+        &HashMap::new(),
+        "source_batch_journal",
+        true,
+        &persistence_policy,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(join_node) = plan.node(transient_opt.durable_input_idx) else {
+        return Ok(None);
+    };
+    let DbspNodeKind::Join(join) = &join_node.kind else {
+        return Ok(None);
+    };
+    if !matches!(join.join_type, dbsp::DbspJoinType::Inner)
+        || !has_single_consumer(plan, transient_opt.durable_input_idx)
+    {
+        return Ok(None);
+    }
+    let (left_idx, right_idx) = join_inputs(join_node)?;
+    let Some(left_root) = try_build_transient_source_root_materialization(plan, left_idx)? else {
+        return Ok(None);
+    };
+    let Some(right_root) = try_build_transient_source_root_materialization(plan, right_idx)? else {
+        return Ok(None);
+    };
+    Ok(Some(BTreeSet::from([
+        left_root.source_name,
+        right_root.source_name,
+    ])))
+}
+
 pub fn source_batch_journal_root_source_name(plan: &CircuitPlan) -> Option<String> {
-    find_transient_source_root_shape(plan, plan.root)
+    source_batch_journal_root_sources(plan)
         .ok()
         .flatten()
-        .map(|shape| shape.source_name().to_string())
+        .and_then(|sources| {
+            if sources.len() == 1 {
+                sources.into_iter().next()
+            } else {
+                None
+            }
+        })
 }
 
 pub fn transient_source_root_requirements(
@@ -1649,6 +1696,13 @@ mod tests {
         assert!(
             transient_opt.is_some(),
             "expected transient optimization for benchmark query plan: {plan:#?}"
+        );
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
         let transient_opt = transient_opt.expect("transient opt");
         let join_node = plan

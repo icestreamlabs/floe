@@ -495,7 +495,8 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
         else {
             return Ok(None);
         };
-        let mut event = SourceEvent::preencoded(source_name, encoded_row);
+        let mut event =
+            SourceEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row);
         if let Some(event_time_ms) = event_ts {
             event = event.with_event_time_ms(event_time_ms);
         }

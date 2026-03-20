@@ -193,11 +193,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             required_sources, ..
         } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
         all_required_sources.extend(required_sources.iter().cloned());
-        if let Some(source_name) = source_batch_journal_root_source_name(plan)
-            && required_sources.len() == 1
-            && required_sources.contains(&source_name)
+        if let Some(source_names) = source_batch_journal_root_sources(plan)?
+            && !source_names.is_empty()
+            && source_names == required_sources
         {
-            transient_eligible_sources.insert(source_name);
+            transient_eligible_sources.extend(source_names);
         } else {
             durable_required_sources.extend(required_sources.iter().cloned());
         }
@@ -1061,11 +1061,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 raw_batch_size = batch_len
             );
             let _decode_guard = decode_span.enter();
-            for SelectedSourceEvent {
-                source_id,
-                mut event,
-            } in batch
-            {
+            for SelectedSourceEvent { source_id, event } in batch {
                 let Some(source_id) = source_id else {
                     let source_name = event.source().to_string();
                     tracing::debug!(
@@ -1116,7 +1112,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     executor_cancel.cancel();
                     break 'executor;
                 };
-                let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
+                let event_ts = if let Some(preencoded_row_key) =
+                    event.preencoded_row_key().map(|key| key.to_vec())
+                {
                     encoded_rows.push((source_id, preencoded_row_key));
                     None
                 } else {

@@ -53,18 +53,36 @@ impl<T> JoinTransientInputBuffer<T> {
         }
     }
 
+    fn push_batch(&mut self, batch: TransientJoinInputBatch<T>) {
+        if batch.ts <= self.replay_cutoff_ts {
+            return;
+        }
+        self.pending.insert(batch.ts, batch.deltas);
+    }
+
+    fn take_pending_for_ts(&mut self, ts: i64) -> Option<Arc<Vec<(T, i64)>>> {
+        while self
+            .pending
+            .first_key_value()
+            .is_some_and(|(pending_ts, _)| *pending_ts < ts)
+        {
+            self.pending.pop_first();
+        }
+        let current = self.pending.remove(&ts);
+        if current.is_some() {
+            self.replay_cutoff_ts = self.replay_cutoff_ts.max(ts);
+        }
+        current
+    }
+
     fn take_for_ts(&mut self, ts: i64) -> Option<Arc<Vec<(T, i64)>>> {
-        let Some(receiver) = self.receiver.as_mut() else {
-            return None;
-        };
         loop {
-            match receiver.try_recv() {
-                Ok(batch) => {
-                    if batch.ts <= self.replay_cutoff_ts || batch.ts < ts {
-                        continue;
-                    }
-                    self.pending.insert(batch.ts, batch.deltas);
-                }
+            let recv_result = match self.receiver.as_mut() {
+                Some(receiver) => receiver.try_recv(),
+                None => return self.take_pending_for_ts(ts),
+            };
+            match recv_result {
+                Ok(batch) => self.push_batch(batch),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.receiver = None;
@@ -72,11 +90,43 @@ impl<T> JoinTransientInputBuffer<T> {
                 }
             }
         }
-        self.replay_cutoff_ts = self.replay_cutoff_ts.max(ts);
-        let future = self.pending.split_off(&ts.saturating_add(1));
-        let current = self.pending.remove(&ts);
-        self.pending = future;
-        current
+        self.take_pending_for_ts(ts)
+    }
+
+    async fn recv_next_available_ts(&mut self) -> Option<i64> {
+        loop {
+            if let Some((ts, _)) = self.pending.first_key_value() {
+                return Some(*ts);
+            }
+            let Some(receiver) = self.receiver.as_mut() else {
+                return None;
+            };
+            match receiver.recv().await {
+                Some(batch) => self.push_batch(batch),
+                None => {
+                    self.receiver = None;
+                    return None;
+                }
+            }
+        }
+    }
+
+    async fn recv_for_ts(&mut self, ts: i64) -> Option<Arc<Vec<(T, i64)>>> {
+        loop {
+            if let Some(batch) = self.take_pending_for_ts(ts) {
+                return Some(batch);
+            }
+            let Some(receiver) = self.receiver.as_mut() else {
+                return None;
+            };
+            match receiver.recv().await {
+                Some(batch) => self.push_batch(batch),
+                None => {
+                    self.receiver = None;
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -468,6 +518,37 @@ impl DbspJoin {
             .await?;
         }
 
+        let use_source_driven_runtime = left_transient.is_some() && right_transient.is_some();
+        if use_source_driven_runtime {
+            let op = Arc::clone(&join_op);
+            let observer_clone = Arc::clone(&observer);
+            let version_clone = Arc::clone(&output_version);
+            let error_handler = error_handler.clone();
+            let left_default_handle = left_default.clone();
+            let right_default_handle = right_default.clone();
+            let left_transient =
+                left_transient.expect("source-driven join requires left transient input");
+            let right_transient =
+                right_transient.expect("source-driven join requires right transient input");
+            tokio::spawn(async move {
+                if let Err(err) = run_source_driven_join_transient(
+                    op,
+                    observer_clone,
+                    version_clone,
+                    left_default_handle,
+                    right_default_handle,
+                    left_transient,
+                    right_transient,
+                    replay_cutoff_ts,
+                )
+                .await
+                {
+                    report_runtime_error(&error_handler, "join", err);
+                }
+            });
+            return Ok(());
+        }
+
         let transient_inputs = Arc::new(AsyncMutex::new(JoinTransientInputState::new(
             left_transient,
             right_transient,
@@ -491,11 +572,15 @@ impl DbspJoin {
                             handles.len()
                         ));
                     }
+                    let transient_inputs = {
+                        let mut state_guard = transient_inputs.lock().await;
+                        Some(state_guard.take_for_ts(ts))
+                    };
                     drive_join_transient(
                         &op,
                         &observer,
                         &output_version,
-                        Some(&transient_inputs),
+                        transient_inputs,
                         ts,
                         handles,
                     )
@@ -601,7 +686,7 @@ async fn drive_join_transient<L, R, O, K>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
     observer: &Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
     output_version: &Arc<AtomicU64>,
-    transient_inputs: Option<&Arc<AsyncMutex<JoinTransientInputState<L, R>>>>,
+    transient_inputs: Option<JoinTransientInputs<L, R>>,
     ts: i64,
     handles: Vec<ZSetHandle>,
 ) -> Result<()>
@@ -660,12 +745,6 @@ where
         span.record("right_ns", right.ns.as_str());
         span.record("right_version", right.version);
     }
-    let transient_inputs = if let Some(state) = transient_inputs {
-        let mut state_guard = state.lock().await;
-        Some(state_guard.take_for_ts(ts))
-    } else {
-        None
-    };
     let mut op_guard = op.lock().await;
     if let Some(batch) = op_guard
         .on_step_transient_with_inputs(ts, &handles, transient_inputs)
@@ -675,6 +754,90 @@ where
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         observer(i64::try_from(version).unwrap_or(i64::MAX), batch);
+    }
+    Ok(())
+}
+
+async fn run_source_driven_join_transient<L, R, O, K>(
+    op: Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
+    observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+    output_version: Arc<AtomicU64>,
+    left_default: ZSetHandle,
+    right_default: ZSetHandle,
+    left_transient: mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>,
+    right_transient: mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>,
+    replay_cutoff_ts: i64,
+) -> Result<()>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let mut transient_inputs = JoinTransientInputState::new(
+        Some(left_transient),
+        Some(right_transient),
+        replay_cutoff_ts,
+    );
+    let Some(mut next_ts) = transient_inputs.left.recv_next_available_ts().await else {
+        return Ok(());
+    };
+    let Some(right_start_ts) = transient_inputs.right.recv_next_available_ts().await else {
+        return Ok(());
+    };
+    next_ts = next_ts.max(right_start_ts);
+    loop {
+        let Some(left_batch) = transient_inputs.left.recv_for_ts(next_ts).await else {
+            break;
+        };
+        let Some(right_batch) = transient_inputs.right.recv_for_ts(next_ts).await else {
+            break;
+        };
+        drive_join_transient(
+            &op,
+            &observer,
+            &output_version,
+            Some(JoinTransientInputs {
+                left: Some(left_batch),
+                right: Some(right_batch),
+            }),
+            next_ts,
+            vec![left_default.clone(), right_default.clone()],
+        )
+        .await?;
+        next_ts = next_ts.saturating_add(1);
     }
     Ok(())
 }

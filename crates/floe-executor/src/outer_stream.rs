@@ -159,7 +159,7 @@ impl OuterStreamWriter {
     }
 
     pub fn pending_transient_batch(&self, version: i64) -> Option<TransientSourceBatch> {
-        if self.pending_transient_deltas.is_empty() {
+        if self.pending_transient_deltas.is_empty() && !self.has_transient_subscribers() {
             return None;
         }
         Some(TransientSourceBatch {
@@ -230,9 +230,6 @@ impl OuterStreamWriter {
         deltas: Vec<EncodedDelta>,
     ) -> Result<()> {
         self.transient_version = self.transient_version.max(version);
-        if deltas.is_empty() {
-            return Ok(());
-        }
         self.publish_batch(TransientSourceBatch {
             source: self.source.clone(),
             version,
@@ -242,6 +239,9 @@ impl OuterStreamWriter {
     }
 
     async fn publish_pending_batch(&mut self, version: Option<i64>) -> Result<u64> {
+        let publish_empty_transient = version.is_some()
+            && self.pending_transient_deltas.is_empty()
+            && self.has_transient_subscribers();
         let publish_version = match version {
             Some(version) => version,
             None if self.pending_transient_deltas.is_empty() => self.transient_version,
@@ -274,12 +274,27 @@ impl OuterStreamWriter {
                     "outer stream transient batch published"
                 );
             }
+        } else if publish_empty_transient {
+            self.transient_version = publish_version;
+            self.publish_batch(TransientSourceBatch {
+                source: self.source.clone(),
+                version: publish_version,
+                deltas: Arc::new(Vec::new()),
+            });
         }
         if self.durable_enabled {
             Ok(self.stream.flush().await?.version)
         } else {
             Ok(u64::try_from(publish_version.max(0)).unwrap_or(u64::MAX))
         }
+    }
+
+    fn has_transient_subscribers(&self) -> bool {
+        !self
+            .transient_subscribers
+            .lock()
+            .expect("transient source subscribers lock poisoned")
+            .is_empty()
     }
 
     fn publish_batch(&mut self, batch: TransientSourceBatch) {
@@ -455,6 +470,35 @@ mod tests {
         assert_eq!(handle.namespace, namespace);
         assert_eq!(handle.source, "bid");
         assert_eq!(handle.version, 1);
+    }
+
+    #[tokio::test]
+    async fn versioned_tick_publishes_empty_transient_batch_to_subscribers() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("outer-empty-transient", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let namespace = namespaces::source("bid").expect("namespace");
+        let stream = bridge
+            .new_stream(
+                namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("stream");
+        let mut writer = OuterStreamWriter::new("bid", namespace, stream);
+        let mut rx = writer.transient_stream().subscribe();
+
+        writer
+            .tick_with_version(7)
+            .await
+            .expect("tick with version");
+
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("receive timeout")
+            .expect("transient batch");
+        assert_eq!(batch.version, 7);
+        assert!(batch.deltas.is_empty());
     }
 
     #[tokio::test]

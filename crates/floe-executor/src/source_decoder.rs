@@ -1,11 +1,27 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use datafusion::scalar::ScalarValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 use serde_json::Value;
 
 use crate::stream_types::{Row, Timestamp};
+
+trait PayloadRefExt<'a> {
+    fn require_payload(self, message: &'static str) -> Result<&'a Value>;
+}
+
+impl<'a> PayloadRefExt<'a> for &'a Value {
+    fn require_payload(self, _message: &'static str) -> Result<&'a Value> {
+        Ok(self)
+    }
+}
+
+impl<'a> PayloadRefExt<'a> for Option<&'a Value> {
+    fn require_payload(self, message: &'static str) -> Result<&'a Value> {
+        self.ok_or_else(|| anyhow!(message))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SourceRowDecoder {
@@ -43,9 +59,8 @@ impl SourceRowDecoder {
                 self.definition.name()
             );
         }
-        let payload = event
-            .payload()
-            .context("source payload must be present for decoded events")?;
+        let payload = SourceEvent::payload(event)
+            .require_payload("source payload must be present for decoded events")?;
         let object = payload
             .as_object()
             .context("source payload must be a JSON object")?;
@@ -79,9 +94,8 @@ impl SourceRowDecoder {
                 self.definition.name()
             );
         }
-        let payload = event
-            .payload()
-            .context("source payload must be present for encoded events")?;
+        let payload = SourceEvent::payload(event)
+            .require_payload("source payload must be present for encoded events")?;
         let object = payload
             .as_object()
             .context("source payload must be a JSON object")?;
