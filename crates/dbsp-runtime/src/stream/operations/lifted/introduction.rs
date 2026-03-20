@@ -11,9 +11,7 @@ use crate::handles::StreamHandle;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
-use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
-};
+use crate::stream::util::{build_exact_stream_from_values, collect_values};
 
 use super::super::basic::stream_introduction;
 
@@ -28,7 +26,9 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(stream, stream.current_time()).await?;
+    let frontier = stream.current_time();
+    let horizon = stream.semantic_horizon();
+    let values = collect_values(stream, horizon).await?;
     let group = stream.group();
     let table = stream.table();
 
@@ -40,31 +40,21 @@ where
         outputs.push(introduced.handle());
     }
 
-    let default_handle = if let Some(first) = outputs.first() {
-        first.clone()
-    } else {
-        let identity = group.identity().await;
-        let mut identity_stream =
-            stream_introduction(table.clone(), group.clone(), identity).await?;
-        identity_stream.flush().await?;
-        identity_stream.handle()
-    };
+    let mut default_stream =
+        stream_introduction(table.clone(), group.clone(), stream.default_value()).await?;
+    default_stream.flush().await?;
+    let default_handle = default_stream.handle();
 
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result = build_derived_stream(table, handle_group, "stream_lift_intro/").await?;
-
-    if outputs.is_empty() {
-        set_default_in_place(&mut result, default_handle);
-    } else {
-        set_default_in_place(&mut result, outputs[0].clone());
-        for handle in outputs.iter().skip(1) {
-            push_value_in_place(&mut result, handle.clone());
-        }
-        if let Some(last) = outputs.last() {
-            set_default_in_place(&mut result, last.clone());
-        }
-    }
-
-    Ok(result)
+    build_exact_stream_from_values(
+        table,
+        handle_group,
+        "stream_lift_intro/",
+        frontier,
+        horizon,
+        &outputs,
+        default_handle,
+    )
+    .await
 }

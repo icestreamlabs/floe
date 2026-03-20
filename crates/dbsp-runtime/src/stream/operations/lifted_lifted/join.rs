@@ -13,8 +13,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    LIFTED_JOIN_STREAM_PREFIX, build_derived_stream, collect_values, push_value_in_place,
-    set_default_in_place,
+    LIFTED_JOIN_STREAM_PREFIX, build_exact_stream_from_values, collect_values,
 };
 
 use super::super::zset::lifted_join_zset_stream;
@@ -56,29 +55,30 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
     F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
 {
-    let left_handles = collect_values(left, left.current_time()).await?;
-    let right_handles = collect_values(right, right.current_time()).await?;
-    let total = left_handles.len().min(right_handles.len());
-    let mut output_handles = Vec::with_capacity(total);
+    let frontier = left.current_time().max(right.current_time());
+    let horizon = left.semantic_horizon().max(right.semantic_horizon());
+    let left_handles = collect_values(left, horizon).await?;
+    let right_handles = collect_values(right, horizon).await?;
+    let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
 
-    for t in 0..total {
+    for t in 0..=horizon {
         let left_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
             Arc::new(HandleGroup::new(ZSetHandle {
-                ns: left_handles[t].ns.clone(),
+                ns: left_handles[t as usize].ns.clone(),
                 version: 0,
             }));
         let right_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
             Arc::new(HandleGroup::new(ZSetHandle {
-                ns: right_handles[t].ns.clone(),
+                ns: right_handles[t as usize].ns.clone(),
                 version: 0,
             }));
 
         let left_stream = left
-            .resolve_handle(&left_handles[t], left_inner_group.clone())
+            .resolve_handle(&left_handles[t as usize], left_inner_group.clone())
             .await
             .context("resolve left stream for lifted-lifted join")?;
         let right_stream = right
-            .resolve_handle(&right_handles[t], right_inner_group.clone())
+            .resolve_handle(&right_handles[t as usize], right_inner_group.clone())
             .await
             .context("resolve right stream for lifted-lifted join")?;
 
@@ -96,19 +96,61 @@ where
     if output_handles.is_empty() {
         return Err(anyhow!("lifted_lifted_join_zset_stream produced no output"));
     }
-    let default_handle = output_handles[0].clone();
+    let left_default_handle = left.default_value();
+    let right_default_handle = right.default_value();
+    let default_handle = if let Some(existing) = left_handles
+        .iter()
+        .zip(right_handles.iter())
+        .zip(output_handles.iter())
+        .find_map(|((left_handle, right_handle), derived)| {
+            if *left_handle == left_default_handle && *right_handle == right_default_handle {
+                Some(derived.clone())
+            } else {
+                None
+            }
+        }) {
+        existing
+    } else {
+        let left_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: left_default_handle.ns.clone(),
+                version: 0,
+            }));
+        let right_inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: right_default_handle.ns.clone(),
+                version: 0,
+            }));
+        let left_stream = left
+            .resolve_handle(&left_default_handle, left_inner_group.clone())
+            .await
+            .context("resolve default left stream for lifted-lifted join")?;
+        let right_stream = right
+            .resolve_handle(&right_default_handle, right_inner_group.clone())
+            .await
+            .context("resolve default right stream for lifted-lifted join")?;
+        let mut result_stream = lifted_join_zset_stream::<L, R, O, _, _>(
+            &left_stream,
+            &right_stream,
+            predicate.clone(),
+            projector.clone(),
+        )
+        .await?;
+        result_stream.flush().await?;
+        result_stream.handle()
+    };
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(left.table(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
-
-    set_default_in_place(&mut result_stream, default_handle.clone());
-    for handle in output_handles.iter().skip(1) {
-        push_value_in_place(&mut result_stream, handle.clone());
-    }
-    if let Some(latest) = output_handles.last() {
-        set_default_in_place(&mut result_stream, latest.clone());
-    }
+    let mut result_stream = build_exact_stream_from_values(
+        left.table(),
+        handle_group,
+        LIFTED_JOIN_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)

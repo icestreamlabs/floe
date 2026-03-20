@@ -117,7 +117,7 @@ async fn delta_lifted_delta_lifted_join_produces_handles() {
 }
 
 #[tokio::test]
-async fn delta_lifted_delta_lifted_join_aligns_to_shortest_stream() {
+async fn delta_lifted_delta_lifted_join_preserves_ticks_when_one_side_stops() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
 
@@ -198,19 +198,48 @@ async fn delta_lifted_delta_lifted_join_aligns_to_shortest_stream() {
         .await
         .expect("flush aligned delta lifted join output");
 
-    assert_eq!(
-        result.current_time(),
-        outer_right.current_time(),
-        "aggregator should stop at shortest timeline"
-    );
+    assert_eq!(result.current_time(), outer_left.current_time());
 
     let handles = collect_values(&result, result.current_time())
         .await
         .expect("collect aligned result handles");
     assert_eq!(
         handles.len(),
-        usize::try_from(outer_right.current_time().saturating_add(1))
+        usize::try_from(outer_left.current_time().saturating_add(1))
             .expect("convert timestamp to length"),
-        "expected handles only up to shortest stream frontier"
+        "expected handles for each logical tick through the longer stream frontier"
+    );
+
+    let nested_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(ZSetHandle {
+        ns: handles[0].ns.clone(),
+        version: 0,
+    }));
+    let mut first_stream = result
+        .resolve_handle(&handles[0], nested_group.clone())
+        .await
+        .expect("resolve first aligned stream");
+    let first_handle = first_stream
+        .latest()
+        .await
+        .expect("load first aligned handle");
+    let mut second_stream = result
+        .resolve_handle(&handles[1], nested_group)
+        .await
+        .expect("resolve second aligned stream");
+    let second_handle = second_stream
+        .latest()
+        .await
+        .expect("load second aligned handle");
+
+    let mut cache = HashMap::new();
+    let first = materialize_zset_handle::<(i32, i32)>(table.clone(), &mut cache, &first_handle)
+        .await
+        .expect("materialize first aligned handle");
+    let second = materialize_zset_handle::<(i32, i32)>(table.clone(), &mut cache, &second_handle)
+        .await
+        .expect("materialize second aligned handle");
+    assert_eq!(
+        first, second,
+        "extra tick should preserve the previous state"
     );
 }

@@ -13,8 +13,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    LIFTED_PROJECT_STREAM_PREFIX, build_derived_stream, collect_values, push_value_in_place,
-    set_default_in_place,
+    LIFTED_PROJECT_STREAM_PREFIX, build_exact_stream_from_values, collect_values,
 };
 
 use super::super::zset::lifted_project_zset_stream;
@@ -44,7 +43,9 @@ where
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&K) -> R + Send + Sync + Clone + 'static,
 {
-    let handles = collect_values(input, input.current_time()).await?;
+    let frontier = input.current_time();
+    let horizon = input.semantic_horizon();
+    let handles = collect_values(input, horizon).await?;
     let mut output_handles = Vec::with_capacity(handles.len());
 
     for handle in &handles {
@@ -68,19 +69,46 @@ where
             "lifted_lifted_project_zset_stream produced no output"
         ));
     }
-    let default_handle = output_handles[0].clone();
+    let input_default_handle = input.default_value();
+    let default_handle = if let Some(existing) =
+        handles
+            .iter()
+            .zip(output_handles.iter())
+            .find_map(|(handle, derived)| {
+                if *handle == input_default_handle {
+                    Some(derived.clone())
+                } else {
+                    None
+                }
+            }) {
+        existing
+    } else {
+        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+            Arc::new(HandleGroup::new(ZSetHandle {
+                ns: input_default_handle.ns.clone(),
+                version: 0,
+            }));
+        let inner_stream = input
+            .resolve_handle(&input_default_handle, inner_group.clone())
+            .await
+            .context("resolve default inner stream for lifted-lifted project")?;
+        let mut result_stream =
+            lifted_project_zset_stream::<K, R, _>(&inner_stream, projector.clone()).await?;
+        result_stream.flush().await?;
+        result_stream.handle()
+    };
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(input.table(), handle_group, LIFTED_PROJECT_STREAM_PREFIX).await?;
-
-    set_default_in_place(&mut result_stream, default_handle.clone());
-    for handle in output_handles.iter().skip(1) {
-        push_value_in_place(&mut result_stream, handle.clone());
-    }
-    if let Some(latest) = output_handles.last() {
-        set_default_in_place(&mut result_stream, latest.clone());
-    }
+    let mut result_stream = build_exact_stream_from_values(
+        input.table(),
+        handle_group,
+        LIFTED_PROJECT_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)

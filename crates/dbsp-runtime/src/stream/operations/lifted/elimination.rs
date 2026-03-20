@@ -10,9 +10,7 @@ use crate::algebra::AbelianGroup;
 use crate::handles::StreamHandle;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
-use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
-};
+use crate::stream::util::{build_exact_stream_from_values, collect_values};
 
 pub async fn lifted_stream_elimination<T>(
     stream: &Stream<StreamHandle>,
@@ -28,7 +26,9 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let handles = collect_values(stream, stream.current_time()).await?;
+    let frontier = stream.current_time();
+    let horizon = stream.semantic_horizon();
+    let handles = collect_values(stream, horizon).await?;
     let mut outputs = Vec::with_capacity(handles.len());
     for handle in &handles {
         let inner = stream
@@ -43,26 +43,24 @@ where
         outputs.push(latest);
     }
 
-    let default_value = if let Some(first) = outputs.first() {
-        first.clone()
-    } else {
-        inner_group.identity().await
-    };
+    let default_inner = stream
+        .resolve_handle(&stream.default_value(), inner_group.clone())
+        .await
+        .context("resolve default handle for lifted stream elimination")?;
+    let mut default_resolved = default_inner;
+    let default_value = default_resolved
+        .latest()
+        .await
+        .context("load latest default handle for lifted stream elimination")?;
 
-    let mut result =
-        build_derived_stream(stream.table(), inner_group.clone(), "stream_lift_elim/").await?;
-
-    if outputs.is_empty() {
-        set_default_in_place(&mut result, default_value);
-    } else {
-        set_default_in_place(&mut result, outputs[0].clone());
-        for value in outputs.iter().skip(1) {
-            push_value_in_place(&mut result, value.clone());
-        }
-        if let Some(last) = outputs.last() {
-            set_default_in_place(&mut result, last.clone());
-        }
-    }
-
-    Ok(result)
+    build_exact_stream_from_values(
+        stream.table(),
+        inner_group,
+        "stream_lift_elim/",
+        frontier,
+        horizon,
+        &outputs,
+        default_value,
+    )
+    .await
 }

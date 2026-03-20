@@ -65,4 +65,13 @@ async fn lifted_delay_operates_on_stream_handles() {
         .expect("resolve second delayed stream");
     assert_eq!(resolved_second.get(1).await.expect("second t1"), 0);
     assert_eq!(resolved_second.get(2).await.expect("second t2"), 5);
+
+    let tail_handle = delayed.get(3).await.expect("read delayed tail handle");
+    let mut resolved_tail = delayed
+        .resolve_handle(&tail_handle, group.clone())
+        .await
+        .expect("resolve delayed tail stream");
+    assert_eq!(resolved_tail.get(0).await.expect("tail t0"), 0);
+    assert_eq!(resolved_tail.get(1).await.expect("tail t1"), 0);
+    assert_eq!(resolved_tail.get(2).await.expect("tail t2"), 1);
 }

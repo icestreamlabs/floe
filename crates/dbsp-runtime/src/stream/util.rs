@@ -169,12 +169,14 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     Fut: Future<Output = Result<Stream<T>>>,
 {
-    let handles = collect_values(input, input.current_time()).await?;
+    let frontier = input.current_time();
+    let horizon = input.semantic_horizon();
+    let handles = collect_values(input, horizon).await?;
     let mut derived_handles = Vec::with_capacity(handles.len());
 
-    for handle in handles {
+    for handle in &handles {
         let inner = input
-            .resolve_handle(&handle, inner_group.clone())
+            .resolve_handle(handle, inner_group.clone())
             .await
             .context("resolve handle for lifted operator")?;
         let mut derived = op(inner).await?;
@@ -182,25 +184,39 @@ where
         derived_handles.push(derived.handle());
     }
 
-    let default_handle = derived_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| input.default_value());
+    let input_default_handle = input.default_value();
+    let default_handle = if let Some(existing) = handles
+        .iter()
+        .zip(derived_handles.iter())
+        .find_map(|(handle, derived)| {
+            if *handle == input_default_handle {
+                Some(derived.clone())
+            } else {
+                None
+            }
+        }) {
+        existing
+    } else {
+        let default_inner = input
+            .resolve_handle(&input_default_handle, inner_group)
+            .await
+            .context("resolve default handle for lifted operator")?;
+        let mut default_derived = op(default_inner).await?;
+        default_derived.flush().await?;
+        default_derived.handle()
+    };
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result = build_derived_stream(input.table(), handle_group, namespace_prefix).await?;
-
-    if derived_handles.is_empty() {
-        set_default_in_place(&mut result, default_handle);
-    } else {
-        set_default_in_place(&mut result, derived_handles[0].clone());
-        for handle in derived_handles.iter().skip(1) {
-            push_value_in_place(&mut result, handle.clone());
-        }
-        if let Some(last) = derived_handles.last() {
-            set_default_in_place(&mut result, last.clone());
-        }
-    }
+    let mut result = build_exact_stream_from_values(
+        input.table(),
+        handle_group,
+        namespace_prefix,
+        frontier,
+        horizon,
+        &derived_handles,
+        default_handle,
+    )
+    .await?;
 
     result.flush().await?;
     Ok(result)
