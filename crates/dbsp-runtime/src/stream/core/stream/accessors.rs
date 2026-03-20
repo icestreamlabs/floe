@@ -41,6 +41,12 @@ where
         self.read_state().logical_timestamp
     }
 
+    /// Conservative upper bound on the last timestamp downstream operators must
+    /// inspect before the stream settles to its eventual tail.
+    pub fn semantic_horizon(&self) -> i64 {
+        self.read_state().max_known_timestamp
+    }
+
     /// Last committed frontier persisted to storage.
     pub fn committed_frontier(&self) -> i64 {
         *self.frontier_rx.borrow()

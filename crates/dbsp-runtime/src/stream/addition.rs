@@ -1,7 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
 use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
@@ -13,7 +11,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::core::stream::Stream;
-use super::util::{collect_values, push_value_in_place, set_default_in_place};
+use super::util::{build_derived_stream, build_exact_stream_from_values, collect_values};
 
 pub struct StreamAddition<T>
 where
@@ -29,7 +27,6 @@ where
     group: Arc<dyn AbelianGroup<T>>,
     table: Arc<dyn KeyValueTable>,
     namespace_prefix: String,
-    counter: AtomicU64,
 }
 
 impl<T> StreamAddition<T>
@@ -52,22 +49,11 @@ where
             group,
             table,
             namespace_prefix: namespace_prefix.into(),
-            counter: AtomicU64::new(0),
         }
     }
 
     pub fn from_stream(stream: &Stream<T>) -> Self {
         Self::new(stream.group(), stream.table(), "stream_add/")
-    }
-
-    fn next_namespace(&self) -> String {
-        let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}{}", self.namespace_prefix, id)
-    }
-
-    async fn build_stream(&self) -> Result<Stream<T>> {
-        let namespace = self.next_namespace();
-        Stream::with_table(self.table.clone(), namespace, self.group.clone()).await
     }
 }
 
@@ -84,60 +70,70 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     async fn add(&self, a: &Stream<T>, b: &Stream<T>) -> Stream<T> {
-        let max_ts = a.current_time().max(b.current_time());
-        let values_a = collect_values(a, max_ts)
+        let frontier = a.current_time().max(b.current_time());
+        let horizon = a.semantic_horizon().max(b.semantic_horizon());
+        let values_a = collect_values(a, horizon)
             .await
             .expect("collect stream values for left operand");
-        let values_b = collect_values(b, max_ts)
+        let values_b = collect_values(b, horizon)
             .await
             .expect("collect stream values for right operand");
 
-        let mut result = self
-            .build_stream()
-            .await
-            .expect("failed to construct stream for addition");
-        if !values_a.is_empty() && !values_b.is_empty() {
-            let default_value = self.group.add(&values_a[0], &values_b[0]).await;
-            set_default_in_place(&mut result, default_value.clone());
-
-            for t in 1..=max_ts {
-                let sum = self
-                    .group
+        let mut sums = Vec::with_capacity((horizon + 1) as usize);
+        for t in 0..=horizon {
+            sums.push(
+                self.group
                     .add(&values_a[t as usize], &values_b[t as usize])
-                    .await;
-                push_value_in_place(&mut result, sum);
-            }
+                    .await,
+            );
         }
+        let tail_default = self.group.add(&a.default_value(), &b.default_value()).await;
 
-        result
+        build_exact_stream_from_values(
+            self.table.clone(),
+            self.group.clone(),
+            &self.namespace_prefix,
+            frontier,
+            horizon,
+            &sums,
+            tail_default,
+        )
+        .await
+        .expect("failed to construct stream for addition")
     }
 
     async fn neg(&self, a: &Stream<T>) -> Stream<T> {
-        let max_ts = a.current_time();
-        let values = collect_values(a, max_ts)
+        let frontier = a.current_time();
+        let horizon = a.semantic_horizon();
+        let values = collect_values(a, horizon)
             .await
             .expect("collect stream values for negation");
-        let mut result = self
-            .build_stream()
-            .await
-            .expect("failed to construct stream for negation");
-
-        if let Some(first) = values.first() {
-            let default_value = self.group.neg(first).await;
-            set_default_in_place(&mut result, default_value.clone());
-
-            for t in 1..=max_ts {
-                let value = self.group.neg(&values[t as usize]).await;
-                push_value_in_place(&mut result, value);
-            }
+        let mut negated = Vec::with_capacity((horizon + 1) as usize);
+        for t in 0..=horizon {
+            negated.push(self.group.neg(&values[t as usize]).await);
         }
+        let tail_default = self.group.neg(&a.default_value()).await;
 
-        result
+        build_exact_stream_from_values(
+            self.table.clone(),
+            self.group.clone(),
+            &self.namespace_prefix,
+            frontier,
+            horizon,
+            &negated,
+            tail_default,
+        )
+        .await
+        .expect("failed to construct stream for negation")
     }
 
     async fn identity(&self) -> Stream<T> {
-        self.build_stream()
-            .await
-            .expect("failed to construct stream for identity")
+        build_derived_stream(
+            self.table.clone(),
+            self.group.clone(),
+            &self.namespace_prefix,
+        )
+        .await
+        .expect("failed to construct stream for identity")
     }
 }

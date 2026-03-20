@@ -9,9 +9,7 @@ use rkyv::bytecheck::CheckBytes;
 use crate::algebra::AbelianGroup;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::Stream;
-use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
-};
+use crate::stream::util::{build_exact_stream_from_values, collect_values};
 
 use super::time::{delay, integrate};
 use crate::stream::addition::StreamAddition;
@@ -40,24 +38,25 @@ where
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&I) -> O + Send + Sync,
 {
-    let values = collect_values(input, input.current_time()).await?;
-    let mut result =
-        build_derived_stream(input.table(), output_group.clone(), "stream_lift1/").await?;
-
-    if let Some(first) = values.first() {
-        let mut last = function(first);
-        set_default_in_place(&mut result, last.clone());
-
-        for t in 1..=input.current_time() {
-            let value = function(&values[t as usize]);
-            last = value.clone();
-            push_value_in_place(&mut result, value);
-        }
-
-        set_default_in_place(&mut result, last);
+    let frontier = input.current_time();
+    let horizon = input.semantic_horizon();
+    let values = collect_values(input, horizon).await?;
+    let mut mapped = Vec::with_capacity((horizon + 1) as usize);
+    for value in &values {
+        mapped.push(function(value));
     }
+    let tail_default = function(&input.default_value());
 
-    Ok(result)
+    build_exact_stream_from_values(
+        input.table(),
+        output_group,
+        "stream_lift1/",
+        frontier,
+        horizon,
+        &mapped,
+        tail_default,
+    )
+    .await
 }
 
 pub async fn lift2<L, R, O, F>(
@@ -94,25 +93,28 @@ where
     F: Fn(&L, &R) -> O + Send + Sync,
 {
     let frontier = left.current_time().max(right.current_time());
-    let left_values = collect_values(left, frontier).await?;
-    let right_values = collect_values(right, frontier).await?;
-    let mut result =
-        build_derived_stream(left.table(), output_group.clone(), "stream_lift2/").await?;
-
-    if let Some((first_left, first_right)) = left_values.first().zip(right_values.first()) {
-        let mut last = function(first_left, first_right);
-        set_default_in_place(&mut result, last.clone());
-
-        for t in 1..=frontier {
-            let value = function(&left_values[t as usize], &right_values[t as usize]);
-            last = value.clone();
-            push_value_in_place(&mut result, value);
-        }
-
-        set_default_in_place(&mut result, last);
+    let horizon = left.semantic_horizon().max(right.semantic_horizon());
+    let left_values = collect_values(left, horizon).await?;
+    let right_values = collect_values(right, horizon).await?;
+    let mut combined = Vec::with_capacity((horizon + 1) as usize);
+    for t in 0..=horizon {
+        combined.push(function(
+            &left_values[t as usize],
+            &right_values[t as usize],
+        ));
     }
+    let tail_default = function(&left.default_value(), &right.default_value());
 
-    Ok(result)
+    build_exact_stream_from_values(
+        left.table(),
+        output_group,
+        "stream_lift2/",
+        frontier,
+        horizon,
+        &combined,
+        tail_default,
+    )
+    .await
 }
 
 pub async fn incrementalize2<T, R, O, F>(

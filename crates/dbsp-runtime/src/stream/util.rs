@@ -71,12 +71,14 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let mut clone = stream.clone();
-    if up_to > clone.current_time() {
-        clone.get(up_to).await?;
-    } else {
-        clone.get(clone.current_time()).await?;
+    if up_to < 0 {
+        return Ok(Vec::new());
     }
-    clone.to_vec().await
+    let mut values = Vec::with_capacity((up_to + 1) as usize);
+    for t in 0..=up_to {
+        values.push(clone.get(t).await?);
+    }
+    Ok(values)
 }
 
 pub(crate) fn next_derived_namespace(prefix: &str) -> String {
@@ -106,6 +108,48 @@ where
 {
     let namespace = next_derived_namespace(prefix);
     Stream::with_table(table, namespace, group).await
+}
+
+pub(crate) async fn build_exact_stream_from_values<T>(
+    table: Arc<dyn KeyValueTable>,
+    group: Arc<dyn AbelianGroup<T>>,
+    prefix: &str,
+    frontier: i64,
+    horizon: i64,
+    values: &[T],
+    tail_default: T,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let mut result = build_derived_stream(table, group, prefix).await?;
+
+    if let Some(first) = values.first() {
+        set_default_in_place(&mut result, first.clone());
+
+        for t in 1..=frontier {
+            push_value_in_place(&mut result, values[t as usize].clone());
+        }
+
+        if first != &tail_default {
+            set_default_at_in_place(&result, frontier + 1, tail_default.clone());
+        }
+
+        if horizon > frontier {
+            for t in (frontier + 1)..=horizon {
+                set_value_at_in_place(&result, t, values[t as usize].clone());
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 pub(crate) async fn apply_on_resolved_handles<T, Fut>(
@@ -333,6 +377,20 @@ where
     stream.set_default_in_place(value);
 }
 
+pub(crate) fn set_default_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    stream.set_default_at_in_place(timestamp, value);
+}
+
 pub(crate) fn push_value_in_place<T>(stream: &mut Stream<T>, value: T)
 where
     T: Archive
@@ -345,4 +403,18 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     stream.push_value_in_place(value);
+}
+
+pub(crate) fn set_value_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    stream.set_value_at_in_place(timestamp, value);
 }

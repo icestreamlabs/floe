@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::algebra::AbelianGroup;
 use crate::stream::core::stream::Stream;
 use crate::stream::tests::common::{IntegerGroup, build_db};
+use crate::stream::util::{set_default_at_in_place, set_default_in_place};
 use slatedb::WriteBatch;
 
 #[tokio::test]
@@ -54,14 +55,26 @@ async fn committed_frontier_advances_after_flush() {
 }
 
 #[tokio::test]
-async fn fills_with_default_when_reading_ahead() {
+async fn reading_ahead_is_non_mutating() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
     let mut stream = Stream::new(db, "ahead", group).await.unwrap();
 
     let value = stream.get(5).await.unwrap();
     assert_eq!(value, 0);
+    assert_eq!(stream.current_time(), 0);
+}
+
+#[tokio::test]
+async fn advance_to_explicitly_advances_with_defaults() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+    let mut stream = Stream::new(db, "advance_to", group).await.unwrap();
+
+    stream.advance_to(5).await.unwrap();
+
     assert_eq!(stream.current_time(), 5);
+    assert_eq!(stream.get(5).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -102,6 +115,34 @@ async fn remembers_last_default_ts() {
     assert_eq!(reopened.last_default_ts(), 1);
     assert_eq!(reopened.get(1).await.expect("get value"), 7);
     assert_eq!(reopened.get(2).await.expect("get value"), 7);
+}
+
+#[tokio::test]
+async fn set_default_preserves_later_scheduled_tail() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+    let mut stream = Stream::new(db.clone(), "scheduled_tail", group.clone())
+        .await
+        .expect("build stream");
+
+    set_default_in_place(&mut stream, 5);
+    set_default_at_in_place(&stream, 2, 0);
+    stream.advance_to(1).await.expect("advance to t1");
+
+    assert_eq!(stream.default_value(), 0);
+
+    stream.set_default(7).await.expect("set default at t1");
+    assert_eq!(stream.get(1).await.expect("get t1"), 7);
+    assert_eq!(stream.get(2).await.expect("get t2"), 0);
+    assert_eq!(stream.default_value(), 0);
+
+    stream.flush().await.expect("flush stream");
+    let mut reopened = Stream::new(db, "scheduled_tail", group)
+        .await
+        .expect("reopen stream");
+    assert_eq!(reopened.default_value(), 0);
+    assert_eq!(reopened.get(1).await.expect("reopened t1"), 7);
+    assert_eq!(reopened.get(2).await.expect("reopened t2"), 0);
 }
 
 #[tokio::test]

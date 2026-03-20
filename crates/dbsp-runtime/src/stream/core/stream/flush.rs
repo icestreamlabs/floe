@@ -98,6 +98,7 @@ where
             }
             (
                 state.logical_timestamp,
+                state.max_known_timestamp,
                 state.identity,
                 state.default.clone(),
                 state.last_default_ts,

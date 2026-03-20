@@ -117,7 +117,10 @@ mod tests {
     }
 
     async fn assert_stream_eq(left: &Stream<i64>, right: &Stream<i64>) {
-        let max_ts = left.current_time().max(right.current_time());
+        let max_ts = left
+            .semantic_horizon()
+            .max(right.semantic_horizon())
+            .saturating_add(1);
         let left_values = collect_values(left, max_ts)
             .await
             .expect("collect left stream values");

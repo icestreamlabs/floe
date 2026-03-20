@@ -24,12 +24,14 @@ where
         let next_timestamp = {
             let mut state = self.write_state();
             let next_timestamp = state.logical_timestamp + 1;
-            if element != state.default {
+            let default_at_next = state.default_at(next_timestamp);
+            if element != default_at_next {
                 state.pending_data.insert(next_timestamp, element.clone());
                 state.data_cache.insert(next_timestamp, element);
                 state.identity = false;
             }
             state.logical_timestamp = next_timestamp;
+            state.max_known_timestamp = state.max_known_timestamp.max(next_timestamp);
             state.pending_state = true;
             next_timestamp
         };
@@ -39,8 +41,12 @@ where
     pub async fn set_default(&mut self, new_default: T) -> Result<()> {
         let mut state = self.write_state();
         let current_ts = state.logical_timestamp;
-        state.default = new_default.clone();
         state.pending_defaults.insert(current_ts, new_default);
+        if current_ts >= state.last_default_ts {
+            state.default = state.pending_defaults[&current_ts].clone();
+            state.last_default_ts = current_ts;
+        }
+        state.max_known_timestamp = state.max_known_timestamp.max(current_ts);
         state.pending_state = true;
         Ok(())
     }
@@ -51,28 +57,19 @@ where
         }
 
         loop {
-            let mut fetch_key: Option<Vec<u8>> = None;
-            let mut fallback_value: Option<T> = None;
-            let mut needs_advance = false;
-
-            {
+            let (fetch_key, fallback_value) = {
                 let state = self.read_state();
-                if timestamp > state.logical_timestamp {
-                    needs_advance = true;
-                } else if let Some(value) = state.pending_data.get(&timestamp) {
+                if let Some(value) = state.pending_data.get(&timestamp) {
                     return Ok(value.clone());
                 } else if let Some(value) = state.data_cache.get(&timestamp) {
                     return Ok(value.clone());
                 } else {
-                    fetch_key = Some(self.core.encode_data_key(timestamp)?);
-                    fallback_value = Some(state.default_at(timestamp));
+                    (
+                        Some(self.core.encode_data_key(timestamp)?),
+                        Some(state.default_at(timestamp)),
+                    )
                 }
-            }
-
-            if needs_advance {
-                self.advance_to(timestamp).await?;
-                continue;
-            }
+            };
 
             if let Some(key) = fetch_key {
                 if let Some(bytes) = self.core.table.get_bytes(&key).await? {
@@ -115,7 +112,10 @@ where
             if current >= timestamp {
                 break;
             }
-            let default = { self.read_state().default.clone() };
+            let default = {
+                let state = self.read_state();
+                state.default_at(current + 1)
+            };
             self.send(default).await?;
         }
         Ok(())
@@ -124,20 +124,52 @@ where
     pub(crate) fn set_default_in_place(&self, value: T) {
         let mut state = self.write_state();
         let current_ts = state.logical_timestamp;
-        state.default = value.clone();
         state.pending_defaults.insert(current_ts, value);
+        if current_ts >= state.last_default_ts {
+            state.default = state.pending_defaults[&current_ts].clone();
+            state.last_default_ts = current_ts;
+        }
+        state.max_known_timestamp = state.max_known_timestamp.max(current_ts);
         state.pending_state = true;
     }
 
     pub(crate) fn push_value_in_place(&self, value: T) {
         let mut state = self.write_state();
         let next_timestamp = state.logical_timestamp + 1;
-        if value != state.default {
+        let default_at_next = state.default_at(next_timestamp);
+        if value != default_at_next {
             state.pending_data.insert(next_timestamp, value.clone());
             state.data_cache.insert(next_timestamp, value);
             state.identity = false;
         }
         state.logical_timestamp = next_timestamp;
+        state.max_known_timestamp = state.max_known_timestamp.max(next_timestamp);
+        state.pending_state = true;
+    }
+
+    pub(crate) fn set_default_at_in_place(&self, timestamp: i64, value: T) {
+        let mut state = self.write_state();
+        state.pending_defaults.insert(timestamp, value.clone());
+        if timestamp >= state.last_default_ts {
+            state.default = value;
+            state.last_default_ts = timestamp;
+        }
+        state.max_known_timestamp = state.max_known_timestamp.max(timestamp);
+        state.pending_state = true;
+    }
+
+    pub(crate) fn set_value_at_in_place(&self, timestamp: i64, value: T) {
+        let mut state = self.write_state();
+        let default_at_timestamp = state.default_at(timestamp);
+        if value != default_at_timestamp {
+            state.pending_data.insert(timestamp, value.clone());
+            state.data_cache.insert(timestamp, value);
+            state.identity = false;
+        } else {
+            state.pending_data.remove(&timestamp);
+            state.data_cache.remove(&timestamp);
+        }
+        state.max_known_timestamp = state.max_known_timestamp.max(timestamp);
         state.pending_state = true;
     }
 }

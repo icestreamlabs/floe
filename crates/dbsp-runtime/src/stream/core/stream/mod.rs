@@ -81,6 +81,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     logical_timestamp: i64,
+    max_known_timestamp: i64,
     identity: bool,
     default: T,
     pending_data: BTreeMap<i64, T>,

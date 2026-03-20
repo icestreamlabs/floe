@@ -27,6 +27,7 @@ where
     pub(super) fn new(default: T) -> Self {
         Self {
             logical_timestamp: 0,
+            max_known_timestamp: 0,
             identity: true,
             default,
             pending_data: BTreeMap::new(),

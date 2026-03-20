@@ -73,18 +73,28 @@ where
         stream.core.clear_intent().await?;
 
         if let Some(bytes) = stream.table().get_bytes(&stream.core.state_key).await? {
-            let (timestamp, identity, default, last_default_ts) =
-                if let Ok(tuple) = encoding::decode::<(i64, bool, T, i64)>(bytes.as_ref()) {
+            let (timestamp, max_known_timestamp, identity, default, last_default_ts) =
+                if let Ok(tuple) = encoding::decode::<(i64, i64, bool, T, i64)>(bytes.as_ref()) {
                     tuple
+                } else if let Ok(tuple) = encoding::decode::<(i64, bool, T, i64)>(bytes.as_ref()) {
+                    let (timestamp, identity, default, last_default_ts) = tuple;
+                    (
+                        timestamp,
+                        timestamp.max(last_default_ts),
+                        identity,
+                        default,
+                        last_default_ts,
+                    )
                 } else {
                     let (timestamp, identity, default) =
                         encoding::decode::<(i64, bool, T)>(bytes.as_ref())
                             .context("unable to decode legacy stream state")?;
-                    (timestamp, identity, default, timestamp)
+                    (timestamp, timestamp, identity, default, timestamp)
                 };
             {
                 let mut state = stream.write_state();
                 state.logical_timestamp = timestamp;
+                state.max_known_timestamp = max_known_timestamp.max(timestamp);
                 state.identity = identity;
                 state.default = default.clone();
                 state.last_default_ts = last_default_ts;

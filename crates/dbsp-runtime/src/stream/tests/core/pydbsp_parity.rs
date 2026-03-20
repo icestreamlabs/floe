@@ -14,7 +14,7 @@ async fn assert_stream_values(stream: &Stream<i64>, expected: &[i64]) {
 }
 
 #[tokio::test]
-async fn pydbsp_sequence_updates_default_at_current_time() {
+async fn sequence_updates_default_after_explicit_advance() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
     let mut stream = Stream::new(db.clone(), "pydbsp_seq_default", group.clone())
@@ -26,11 +26,11 @@ async fn pydbsp_sequence_updates_default_at_current_time() {
 
     stream.send(5).await.expect("send t1");
     stream.send(7).await.expect("send t2");
-    stream.get(4).await.expect("advance to t4");
+    stream.advance_to(4).await.expect("advance to t4");
 
     stream.set_default(2).await.expect("set default at t4");
     assert_eq!(stream.get(4).await.expect("get t4"), 2);
-    stream.get(5).await.expect("advance to t5");
+    stream.advance_to(5).await.expect("advance to t5");
 
     assert_stream_values(&stream, &[5, 5, 7, 5, 2, 2]).await;
 
@@ -42,7 +42,7 @@ async fn pydbsp_sequence_updates_default_at_current_time() {
 }
 
 #[tokio::test]
-async fn pydbsp_sequence_get_and_default_changes_match() {
+async fn sequence_advance_and_default_changes_match() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
     let mut stream = Stream::new(db.clone(), "pydbsp_seq_get", group.clone())
@@ -50,6 +50,7 @@ async fn pydbsp_sequence_get_and_default_changes_match() {
         .expect("create stream");
 
     assert_eq!(stream.get(2).await.expect("get t2"), 0);
+    stream.advance_to(2).await.expect("advance to t2");
     stream.set_default(3).await.expect("set default at t2");
     assert_eq!(stream.get(2).await.expect("get t2"), 3);
 
@@ -59,7 +60,7 @@ async fn pydbsp_sequence_get_and_default_changes_match() {
     stream.set_default(1).await.expect("set default at t4");
     assert_eq!(stream.get(4).await.expect("get t4"), 1);
     assert_eq!(stream.get(1).await.expect("get t1"), 0);
-    stream.get(5).await.expect("advance to t5");
+    stream.advance_to(5).await.expect("advance to t5");
 
     assert_stream_values(&stream, &[0, 0, 3, 4, 1, 1]).await;
 
