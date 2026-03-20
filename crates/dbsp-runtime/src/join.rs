@@ -650,26 +650,32 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let span = tracing::trace_span!(
-        "join_step",
-        ts,
-        left_ns = tracing::field::Empty,
-        left_version = tracing::field::Empty,
-        right_ns = tracing::field::Empty,
-        right_version = tracing::field::Empty
-    );
-    let _enter = span.enter();
-    if let Some(left) = handles.first() {
-        span.record("left_ns", left.ns.as_str());
-        span.record("left_version", left.version);
+    let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
+    let span = trace_enabled.then(|| {
+        tracing::trace_span!(
+            "join_step",
+            ts,
+            left_ns = tracing::field::Empty,
+            left_version = tracing::field::Empty,
+            right_ns = tracing::field::Empty,
+            right_version = tracing::field::Empty
+        )
+    });
+    let _enter = span.as_ref().map(|span| span.enter());
+    if let Some(span) = span.as_ref() {
+        if let Some(left) = handles.first() {
+            span.record("left_ns", left.ns.as_str());
+            span.record("left_version", left.version);
+        }
+        if let Some(right) = handles.get(1) {
+            span.record("right_ns", right.ns.as_str());
+            span.record("right_version", right.version);
+        }
     }
-    if let Some(right) = handles.get(1) {
-        span.record("right_ns", right.ns.as_str());
-        span.record("right_version", right.version);
-    }
-    if JOIN_STEP_LOG_COUNTER
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(JOIN_STEP_LOG_SAMPLE_EVERY)
+    if trace_enabled
+        && JOIN_STEP_LOG_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(JOIN_STEP_LOG_SAMPLE_EVERY)
     {
         tracing::trace!("join step");
     }
@@ -728,22 +734,26 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let span = tracing::trace_span!(
-        "join_step_transient",
-        ts,
-        left_ns = tracing::field::Empty,
-        left_version = tracing::field::Empty,
-        right_ns = tracing::field::Empty,
-        right_version = tracing::field::Empty
-    );
-    let _enter = span.enter();
-    if let Some(left) = handles.first() {
-        span.record("left_ns", left.ns.as_str());
-        span.record("left_version", left.version);
-    }
-    if let Some(right) = handles.get(1) {
-        span.record("right_ns", right.ns.as_str());
-        span.record("right_version", right.version);
+    let span = tracing::enabled!(tracing::Level::TRACE).then(|| {
+        tracing::trace_span!(
+            "join_step_transient",
+            ts,
+            left_ns = tracing::field::Empty,
+            left_version = tracing::field::Empty,
+            right_ns = tracing::field::Empty,
+            right_version = tracing::field::Empty
+        )
+    });
+    let _enter = span.as_ref().map(|span| span.enter());
+    if let Some(span) = span.as_ref() {
+        if let Some(left) = handles.first() {
+            span.record("left_ns", left.ns.as_str());
+            span.record("left_version", left.version);
+        }
+        if let Some(right) = handles.get(1) {
+            span.record("right_ns", right.ns.as_str());
+            span.record("right_version", right.version);
+        }
     }
     let mut op_guard = op.lock().await;
     if let Some(batch) = op_guard
