@@ -600,7 +600,19 @@ where
         }
 
         if delta_join.is_empty() {
-            return Ok(None);
+            return if persist_output {
+                let empty_handle = self
+                    .output
+                    .as_ref()
+                    .context("join output persistence requested without configured output zset")?
+                    .handle_for_version(0);
+                Ok(Some(JoinStepResult {
+                    delta_batch: Arc::new(Vec::new()),
+                    persisted_handle: Some(empty_handle),
+                }))
+            } else {
+                Ok(None)
+            };
         }
 
         if let Some(integrated) = &mut self.integrated {
@@ -704,10 +716,13 @@ where
         ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
-        Ok(self
-            .step_internal(ts, inputs, None, true)
-            .await?
-            .and_then(|result| result.persisted_handle))
+        Ok(Some(
+            self.step_internal(ts, inputs, None, true)
+                .await?
+                .context("join persisted path should always emit a handle")?
+                .persisted_handle
+                .context("join step persisted without output handle")?,
+        ))
     }
 }
 

@@ -75,6 +75,9 @@ where
             .context("create delta handle stream")?;
         let delta_default_handle = delta_stream.default_value();
 
+        // ZSetStream retention and visible-version adoption are defined over the
+        // committed frontier. Future scheduled handle ticks belong to derived
+        // wrapper streams, not to the underlying versioned state reopened here.
         let history = collect_values(&stream, stream.current_time()).await?;
         let current_handle = history.last().cloned().unwrap_or(default_handle.clone());
         let (retention_window, retention_counts) =

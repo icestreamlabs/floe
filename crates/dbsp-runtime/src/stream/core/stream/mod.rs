@@ -30,9 +30,16 @@ mod values;
 pub type DeltaStream = Stream<ZSetHandle>;
 
 /// Logical-time stream keyed by a logical transaction index.
-/// - Time = logical transaction index.
-/// - For each relation `R`: `Stream<ZSetHandle>` represents the delta (Delta R_t) of `R` at time `t`.
-/// - `VersionedZSet<K>` is the integrated `R_t`.
+///
+/// This is an operational prefix-plus-tail abstraction:
+/// - `current_time()` is the committed logical frontier,
+/// - `semantic_horizon()` is the last timestamp with explicitly scheduled
+///   semantics,
+/// - `default_value()` describes the eventual tail after that horizon.
+///
+/// For each relation `R` in the SQL runtime:
+/// - `Stream<ZSetHandle>` represents `Delta R_t`,
+/// - `VersionedZSet<K>` represents the integrated `R_t`.
 pub struct Stream<T>
 where
     T: Archive

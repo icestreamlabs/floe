@@ -468,6 +468,7 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
         .await
         .expect("tick first bid batch");
 
+    wait_for_logical_version(&mv_registry, view_name, 2).await;
     wait_for_visible_row_count(&mv_registry, view_name, 2).await;
 
     {
@@ -484,7 +485,21 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
         .await
         .expect("tick second bid batch");
 
+    wait_for_logical_version(&mv_registry, view_name, 3).await;
     wait_for_visible_row_count(&mv_registry, view_name, 3).await;
+
+    {
+        let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+        bid_writer
+            .append(&bid_row(2, 11, 60), 1)
+            .expect("append no-op filtered bid");
+    }
+    registry
+        .tick_all_with_version(4)
+        .await
+        .expect("tick no-op bid batch");
+
+    wait_for_logical_version(&mv_registry, view_name, 4).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
@@ -1079,6 +1094,146 @@ async fn left_outer_join_materializes_null_extended_rows() {
             ],
             vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)],
         ]
+    );
+}
+
+#[tokio::test]
+async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() {
+    let db = test_db("left-outer-join-live-noop").await;
+    let view_name = "mv_left_join_live_noop";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let person_schema = nexmark_person_schema();
+        let auction_schema = nexmark_auction_schema();
+        let right = table_scan(Some("nexmark_person"), &person_schema, None)
+            .expect("person scan")
+            .project(vec![col("id").alias("person_id"), col("name")])
+            .expect("person project")
+            .build()
+            .expect("person plan");
+        let logical = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .join(
+                right,
+                JoinType::Left,
+                (
+                    vec![Column::from_name("seller")],
+                    vec![Column::from_name("person_id")],
+                ),
+                None,
+            )
+            .expect("left join")
+            .project(vec![col("id"), col("name")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_person", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build left join graph");
+
+    {
+        let auction_writer = registry
+            .writer_mut("nexmark_auction")
+            .expect("auction writer");
+        auction_writer
+            .append(&auction_row(11, 999), 1)
+            .expect("append unmatched auction");
+    }
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick unmatched auction");
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)]]
+    );
+
+    {
+        let person_writer = registry
+            .writer_mut("nexmark_person")
+            .expect("person writer");
+        person_writer
+            .append(&person_row(100, "alice"), 1)
+            .expect("append unrelated person");
+    }
+    registry
+        .tick_all_with_version(2)
+        .await
+        .expect("tick unrelated person");
+    wait_for_logical_version(&mv_registry, view_name, 2).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)]]
+    );
+
+    {
+        let person_writer = registry
+            .writer_mut("nexmark_person")
+            .expect("person writer");
+        person_writer
+            .append(&person_row(999, "bob"), 1)
+            .expect("append matching person");
+    }
+    registry
+        .tick_all_with_version(3)
+        .await
+        .expect("tick matching person");
+    wait_for_logical_version(&mv_registry, view_name, 3).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![
+            ScalarValue::Int64(Some(11)),
+            ScalarValue::Utf8(Some("bob".to_string())),
+        ]]
     );
 }
 

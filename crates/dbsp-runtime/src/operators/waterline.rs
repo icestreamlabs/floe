@@ -228,7 +228,7 @@ where
         }
 
         if updates.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         self.current = new_current;
@@ -391,16 +391,12 @@ mod tests {
                 .await
                 .expect("waterline step");
 
-            if expected_delta.is_empty() {
-                assert!(out_handle.is_none(), "expected empty output at step {step}");
-            } else {
-                let out_handle = out_handle.expect("output handle");
-                let materialized =
-                    materialize_zset_handle::<i64>(table.clone(), &mut cache_out, &out_handle)
-                        .await
-                        .expect("materialize output");
-                assert_eq!(materialized, expected_delta, "step {step}");
-            }
+            let out_handle = out_handle.expect("output handle");
+            let materialized =
+                materialize_zset_handle::<i64>(table.clone(), &mut cache_out, &out_handle)
+                    .await
+                    .expect("materialize output");
+            assert_eq!(materialized, expected_delta, "step {step}");
 
             prev_output = expected_state;
         }

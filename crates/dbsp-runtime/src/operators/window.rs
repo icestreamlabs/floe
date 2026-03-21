@@ -551,7 +551,7 @@ where
         }
 
         if aggregate_updates.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let base_version = self

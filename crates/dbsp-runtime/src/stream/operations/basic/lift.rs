@@ -150,6 +150,8 @@ where
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&T, &R) -> O + Send + Sync + Clone + 'static,
 {
+    // This follows the DBSP-style construction `D(f(I(x), z^-1 I(y)))`
+    // against the exact generic stream semantics implemented in this module.
     let integrated_left = integrate(left).await?;
     let delayed_integrated_left = delay(&integrated_left).await?;
 

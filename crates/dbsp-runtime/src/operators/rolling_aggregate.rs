@@ -292,7 +292,7 @@ where
         }
 
         if net_delta.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let mut keyed_deltas: HashMap<K, Vec<(V, i64)>> = HashMap::new();
@@ -309,7 +309,7 @@ where
         }
 
         if keyed_deltas.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let affected_keys: HashSet<K> = keyed_deltas.keys().cloned().collect();
@@ -364,7 +364,7 @@ where
         }
 
         if aggregate_updates.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let base_version = self
@@ -586,19 +586,12 @@ mod tests {
                 .await
                 .expect("rolling step");
 
-            if expected_delta.is_empty() {
-                assert!(out_handle.is_none(), "expected empty output at step {step}");
-            } else {
-                let out_handle = out_handle.expect("output handle");
-                let materialized = materialize_zset_handle::<(i64, i64)>(
-                    table.clone(),
-                    &mut cache_out,
-                    &out_handle,
-                )
-                .await
-                .expect("materialize output");
-                assert_eq!(materialized, expected_delta, "step {step}");
-            }
+            let out_handle = out_handle.expect("output handle");
+            let materialized =
+                materialize_zset_handle::<(i64, i64)>(table.clone(), &mut cache_out, &out_handle)
+                    .await
+                    .expect("materialize output");
+            assert_eq!(materialized, expected_delta, "step {step}");
 
             prev_output = aggregated;
         }

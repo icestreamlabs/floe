@@ -171,7 +171,7 @@ where
                 .context("load delta for distinct")?;
 
         if delta_values.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         self.ensure_integrated_cache()
@@ -188,7 +188,7 @@ where
         }
 
         if delta_map.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let mut h_deltas = HashMap::new();
@@ -232,7 +232,7 @@ where
         }
 
         if h_deltas.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let h_handle = Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None)

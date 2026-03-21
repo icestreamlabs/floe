@@ -897,12 +897,12 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
         &[(7, 1)],
     )
     .await;
-    assert!(
-        op.on_step(1, &[empty_left, right_delta])
-            .await
-            .expect("seed right inmemory index")
-            .is_none()
-    );
+    let out = op
+        .on_step(1, &[empty_left, right_delta])
+        .await
+        .expect("seed right inmemory index")
+        .expect("empty handle");
+    assert_eq!(out.version, 0);
 
     let left_delta = stage_version(
         left_dict,
@@ -1018,13 +1018,12 @@ async fn join_operator_transient_batches_match_persisted_output() {
     )
     .await;
     let empty_left = empty_handle("join_transient_left_stream");
-    assert!(
-        persisted
-            .on_step(1, &[empty_left.clone(), right_seed.clone()])
-            .await
-            .expect("seed persisted join")
-            .is_none()
-    );
+    let persisted_seed = persisted
+        .on_step(1, &[empty_left.clone(), right_seed.clone()])
+        .await
+        .expect("seed persisted join")
+        .expect("persisted empty handle");
+    assert_eq!(persisted_seed.version, 0);
     assert!(
         transient
             .on_step_transient_with_inputs(1, &[empty_left, right_seed], None)

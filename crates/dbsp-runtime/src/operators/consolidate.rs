@@ -138,7 +138,7 @@ where
                 .context("load delta for consolidate")?;
 
         if delta_values.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let mut consolidated = HashMap::new();
@@ -151,7 +151,7 @@ where
         }
 
         if consolidated.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let handle = Self::apply_deltas_to_versioned(&mut self.output, &consolidated)
@@ -302,7 +302,7 @@ mod tests {
                 .expect("build output dictionary"),
         );
         let output = VersionedZSet::new(
-            output_dict,
+            output_dict.clone(),
             table.clone(),
             "consolidate_empty_output".to_string(),
         )
@@ -320,7 +320,13 @@ mod tests {
         .await;
 
         let out = op.on_step(1, &[delta]).await.expect("consolidate step");
-        assert!(out.is_none());
+        let out = out.expect("empty handle");
+        let mut cache = HashMap::new();
+        cache.insert("consolidate_empty_output".to_string(), output_dict.clone());
+        let materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &out)
+            .await
+            .expect("materialize output");
+        assert!(materialized.is_empty());
     }
 
     #[tokio::test]

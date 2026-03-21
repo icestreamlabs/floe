@@ -281,12 +281,12 @@ where
                 .context("load delta for group-by")?;
 
         if delta_values.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let coalesced = self.coalesce_deltas(delta_values);
         if coalesced.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let mut updates = Vec::new();
@@ -302,7 +302,7 @@ where
         }
 
         if updates.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let index_persist_start = std::time::Instant::now();
@@ -358,7 +358,7 @@ where
         }
 
         if output_deltas.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let base_version = self

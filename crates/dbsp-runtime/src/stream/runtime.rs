@@ -13,8 +13,13 @@ use super::cursor::StreamCursor;
 pub trait DeltaOperator: Send {
     /// Called when all inputs have a delta at logical time `ts`.
     /// `inputs[i]` is Delta R_i_t.
-    /// Returns `Some(output_handle)` if this op emits Delta O_t (non-empty),
-    /// or `None` if it emits nothing.
+    ///
+    /// Operators that produce a downstream delta stream should return
+    /// `Some(handle)` for every logical tick, using the empty delta handle
+    /// (`version = 0`) when the delta at `ts` is empty.
+    ///
+    /// `None` is reserved for operators that do not emit a downstream handle at
+    /// all, such as side-effect-only indexing/sink stages.
     async fn on_step(
         &mut self,
         ts: i64,
@@ -181,7 +186,7 @@ impl Pipeline {
                     input_count,
                     ?input_versions,
                     operator_elapsed_ms,
-                    "pipeline operator step emitted no output; stopping pipeline for timestamp"
+                    "pipeline operator emitted no downstream handle; stopping pipeline for timestamp"
                 );
                 break;
             }

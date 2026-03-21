@@ -246,7 +246,7 @@ where
                 .context("load delta for topk")?;
 
         if delta_values.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         self.ensure_input_cache()
@@ -263,7 +263,7 @@ where
         }
 
         if delta_map.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         self.ensure_order_index()
@@ -353,7 +353,7 @@ where
         self.output_cache = new_output;
 
         if output_delta_vec.is_empty() {
-            return Ok(None);
+            return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let output_delta: HashMap<K, i64> = output_delta_vec.into_iter().collect();

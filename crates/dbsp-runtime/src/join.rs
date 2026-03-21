@@ -303,9 +303,6 @@ impl DbspJoin {
                 let empty_handle = empty_handle.clone();
                 let handles = handles.to_vec();
                 Box::pin(async move {
-                    // If either side did not change at this ts, synthesize an empty delta
-                    // handle in the corresponding namespace so downstream logic observes
-                    // aligned timestamps with zero deltas.
                     if handles.len() != 2 {
                         return Err(anyhow::anyhow!(
                             "join runtime expected 2 handles, got {}",
@@ -492,7 +489,9 @@ impl DbspJoin {
 
         let output_version = Arc::new(AtomicU64::new(0));
 
-        // Rehydrate join state from any existing input handles before going live.
+        // Rehydrate only through the committed frontier. Any future scheduled
+        // handles past that frontier are still replayed by the live runtime as
+        // their timestamps are committed upstream.
         let left_history = collect_values(left, left.current_time()).await?;
         let right_history = collect_values(right, right.current_time()).await?;
         let left_default = left.default_value();

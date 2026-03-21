@@ -9,6 +9,10 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::Stream;
 use crate::stream::util::{build_exact_stream_from_values, collect_values};
 
+/// Exact one-tick delay over the represented total stream.
+///
+/// The result preserves scheduled values through `semantic_horizon()` and then
+/// settles to the input stream's eventual tail.
 pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
     T: Archive
@@ -40,6 +44,10 @@ where
     .await
 }
 
+/// Exact stream differentiation through the input semantic horizon.
+///
+/// The resulting stream is eventually the group identity after the final
+/// scheduled transition.
 pub async fn differentiate<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
     T: Archive
@@ -79,6 +87,10 @@ where
     .await
 }
 
+/// Exact prefix integration for eventually-identity input streams.
+///
+/// Non-identity tails are rejected because the current `Stream<T>` model cannot
+/// encode their integrated future exactly.
 pub async fn integrate<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
     T: Archive
