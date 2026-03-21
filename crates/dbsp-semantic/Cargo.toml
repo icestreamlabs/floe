@@ -8,8 +8,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 dbsp-runtime = { path = "../dbsp-runtime" }
 rkyv = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 object_store = { workspace = true }
 slatedb = { workspace = true }
-tokio = { workspace = true }

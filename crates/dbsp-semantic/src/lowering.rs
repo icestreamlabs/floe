@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use dbsp_runtime::algebra::AbelianGroup;
 use dbsp_runtime::collections::zset::{SegmentRecord, VersionedZSet};
@@ -17,6 +17,7 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::stream::ReferenceEvaluator;
 use crate::stream::Stream;
@@ -86,14 +87,164 @@ impl AbelianGroup<ZSetHandle> for RuntimeHandleGroup {
     }
 }
 
+struct ScalarLoweringDriver<T>
+where
+    T: RuntimeValueBounds + GroupValue,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    semantic: Stream<T>,
+    evaluator: ReferenceEvaluator,
+    runtime: RuntimeStream<T>,
+    emitted_len: usize,
+}
+
+impl<T> ScalarLoweringDriver<T>
+where
+    T: RuntimeValueBounds + GroupValue,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn ensure_prefix(&mut self, observed_len: usize) -> Result<()> {
+        while self.emitted_len < observed_len {
+            let t = self.emitted_len;
+            let value = self.evaluator.at(&self.semantic, t);
+            if t == 0 {
+                self.runtime.set_default(value).await?;
+            } else {
+                self.runtime.send(value.clone()).await?;
+                self.runtime.set_default(value).await?;
+            }
+            self.runtime.flush().await?;
+            self.emitted_len += 1;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
-pub struct LoweredZSetStream<K> {
+pub struct LoweredScalarStream<T>
+where
+    T: RuntimeValueBounds + GroupValue,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    stream: RuntimeStream<T>,
+    driver: Arc<AsyncMutex<ScalarLoweringDriver<T>>>,
+}
+
+impl<T> LoweredScalarStream<T>
+where
+    T: RuntimeValueBounds + GroupValue,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub fn stream(&self) -> RuntimeStream<T> {
+        self.stream.clone()
+    }
+
+    pub fn namespace(&self) -> &str {
+        self.stream.namespace()
+    }
+
+    pub async fn ensure_prefix(&self, observed_len: usize) -> Result<()> {
+        self.driver.lock().await.ensure_prefix(observed_len).await
+    }
+
+    pub async fn collect_prefix(&self, observed_len: usize) -> Result<Vec<T>> {
+        self.ensure_prefix(observed_len).await?;
+        let mut stream = self.stream();
+        collect_runtime_scalar_prefix(&mut stream, observed_len).await
+    }
+}
+
+struct ZSetLoweringDriver<K>
+where
+    K: RuntimeKeyBounds,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    semantic: Stream<ZSet<K>>,
+    evaluator: ReferenceEvaluator,
+    dict: Arc<Dictionary<K>>,
+    snapshot_versioned: VersionedZSet<K>,
+    delta_versioned: VersionedZSet<K>,
+    snapshot_stream: RuntimeStream<ZSetHandle>,
+    delta_stream: RuntimeStream<ZSetHandle>,
+    previous_snapshot: HashMap<K, i64>,
+    emitted_len: usize,
+    delta_default: ZSetHandle,
+}
+
+impl<K> ZSetLoweringDriver<K>
+where
+    K: RuntimeKeyBounds,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn ensure_prefix(&mut self, observed_len: usize) -> Result<()> {
+        while self.emitted_len < observed_len {
+            let t = self.emitted_len;
+            let snapshot = self.evaluator.at(&self.semantic, t);
+            let current_snapshot: HashMap<K, i64> = snapshot.iter().cloned().collect();
+            let delta_entries = compute_delta(&self.previous_snapshot, &current_snapshot);
+
+            let snapshot_handle = if delta_entries.is_empty() {
+                self.snapshot_versioned
+                    .current_handle()
+                    .unwrap_or_else(|| self.snapshot_versioned.handle_for_version(0))
+            } else {
+                persist_delta_version(
+                    &self.dict,
+                    &mut self.snapshot_versioned,
+                    &delta_entries,
+                    true,
+                )
+                .await?
+            };
+
+            let delta_handle = if delta_entries.is_empty() {
+                self.delta_versioned.handle_for_version(0)
+            } else {
+                persist_delta_version(&self.dict, &mut self.delta_versioned, &delta_entries, false)
+                    .await?
+            };
+
+            if t == 0 {
+                self.snapshot_stream
+                    .set_default(snapshot_handle.clone())
+                    .await?;
+                self.delta_stream.set_default(delta_handle.clone()).await?;
+            } else {
+                self.snapshot_stream.send(snapshot_handle.clone()).await?;
+                self.snapshot_stream.set_default(snapshot_handle).await?;
+                self.delta_stream.send(delta_handle).await?;
+                self.delta_stream
+                    .set_default(self.delta_default.clone())
+                    .await?;
+            }
+
+            self.snapshot_stream.flush().await?;
+            self.delta_stream.flush().await?;
+            self.previous_snapshot = current_snapshot;
+            self.emitted_len += 1;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct LoweredZSetStream<K>
+where
+    K: RuntimeKeyBounds,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    table: Arc<dyn KeyValueTable>,
     snapshot: SnapshotHandleStream,
     delta: DeltaHandleStream,
+    driver: Arc<AsyncMutex<ZSetLoweringDriver<K>>>,
     marker: PhantomData<K>,
 }
 
-impl<K> LoweredZSetStream<K> {
+impl<K> LoweredZSetStream<K>
+where
+    K: RuntimeKeyBounds,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
     pub fn snapshot_stream(&self) -> SnapshotHandleStream {
         self.snapshot.clone()
     }
@@ -101,58 +252,63 @@ impl<K> LoweredZSetStream<K> {
     pub fn delta_stream(&self) -> DeltaHandleStream {
         self.delta.clone()
     }
+
+    pub async fn ensure_prefix(&self, observed_len: usize) -> Result<()> {
+        self.driver.lock().await.ensure_prefix(observed_len).await
+    }
+
+    pub async fn collect_snapshot_prefix(&self, observed_len: usize) -> Result<Vec<ZSet<K>>> {
+        self.ensure_prefix(observed_len).await?;
+        let mut stream = self.snapshot.stream();
+        collect_runtime_zset_prefix::<K>(self.table.clone(), &mut stream, observed_len).await
+    }
+
+    pub async fn collect_delta_prefix(&self, observed_len: usize) -> Result<Vec<ZSet<K>>> {
+        self.ensure_prefix(observed_len).await?;
+        let mut stream = self.delta.stream();
+        collect_runtime_zset_prefix::<K>(self.table.clone(), &mut stream, observed_len).await
+    }
 }
 
-pub async fn lower_scalar_prefix<T>(
+pub async fn lower_scalar<T>(
     table: Arc<dyn KeyValueTable>,
     namespace: impl Into<String>,
     input: &Stream<T>,
-    observed_len: usize,
-) -> Result<RuntimeStream<T>>
+) -> Result<LoweredScalarStream<T>>
 where
     T: RuntimeValueBounds + GroupValue,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    if observed_len == 0 {
-        return Err(anyhow!("observed_len must be positive"));
-    }
-
     let group: Arc<dyn AbelianGroup<T>> = Arc::new(RuntimeGroup::<T> {
         marker: PhantomData,
     });
-    let mut stream = RuntimeStream::with_table(table, namespace.into(), group).await?;
-    let observed = ReferenceEvaluator::observe_prefix(input, observed_len);
-    stream.set_default(observed[0].clone()).await?;
-    for value in observed.iter().skip(1) {
-        stream.send(value.clone()).await?;
-    }
-    stream
-        .set_default(observed.last().expect("observed prefix non-empty").clone())
-        .await?;
-    stream.flush().await?;
-    Ok(stream)
+    let stream = RuntimeStream::with_table(table, namespace.into(), group).await?;
+    Ok(LoweredScalarStream {
+        stream: stream.clone(),
+        driver: Arc::new(AsyncMutex::new(ScalarLoweringDriver {
+            semantic: input.clone(),
+            evaluator: ReferenceEvaluator::default(),
+            runtime: stream,
+            emitted_len: 0,
+        })),
+    })
 }
 
-pub async fn lower_zset_prefix<K>(
+pub async fn lower_zset<K>(
     table: Arc<dyn KeyValueTable>,
     namespace: impl Into<String>,
     input: &Stream<ZSet<K>>,
-    observed_len: usize,
 ) -> Result<LoweredZSetStream<K>>
 where
     K: RuntimeKeyBounds,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    if observed_len == 0 {
-        return Err(anyhow!("observed_len must be positive"));
-    }
-
     let namespace = namespace.into();
     let delta_namespace = format!("{namespace}/delta");
     let dict = Arc::new(Dictionary::<K>::with_table(table.clone(), namespace.clone(), None).await?);
-    let mut snapshot_versioned =
+    let snapshot_versioned =
         VersionedZSet::new(dict.clone(), table.clone(), namespace.clone()).await?;
-    let mut delta_versioned =
+    let delta_versioned =
         VersionedZSet::new(dict.clone(), table.clone(), delta_namespace.clone()).await?;
 
     let snapshot_default = ZSetHandle {
@@ -165,96 +321,54 @@ where
     };
 
     let snapshot_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(RuntimeHandleGroup {
-        default: snapshot_default.clone(),
+        default: snapshot_default,
     });
     let delta_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(RuntimeHandleGroup {
         default: delta_default.clone(),
     });
 
-    let mut snapshot_stream =
+    let snapshot_stream =
         RuntimeStream::with_table(table.clone(), namespace.clone(), snapshot_group).await?;
-    let mut delta_stream =
+    let delta_stream =
         RuntimeStream::with_table(table.clone(), delta_namespace.clone(), delta_group).await?;
 
-    let observed = ReferenceEvaluator::observe_prefix(input, observed_len);
-    let mut previous_snapshot: HashMap<K, i64> = HashMap::new();
-    let mut snapshot_handles = Vec::with_capacity(observed_len);
-    let mut delta_handles = Vec::with_capacity(observed_len);
-
-    for snapshot in observed {
-        let current_snapshot: HashMap<K, i64> = snapshot.iter().cloned().collect();
-        let delta_entries = compute_delta(&previous_snapshot, &current_snapshot);
-
-        let snapshot_handle = if delta_entries.is_empty() {
-            snapshot_versioned
-                .current_handle()
-                .unwrap_or_else(|| snapshot_versioned.handle_for_version(0))
-        } else {
-            persist_delta_version(&dict, &mut snapshot_versioned, &delta_entries, true).await?
-        };
-
-        let delta_handle = if delta_entries.is_empty() {
-            delta_versioned.handle_for_version(0)
-        } else {
-            persist_delta_version(&dict, &mut delta_versioned, &delta_entries, false).await?
-        };
-
-        snapshot_handles.push(snapshot_handle);
-        delta_handles.push(delta_handle);
-        previous_snapshot = current_snapshot;
-    }
-
-    snapshot_stream
-        .set_default(snapshot_handles[0].clone())
-        .await?;
-    delta_stream.set_default(delta_handles[0].clone()).await?;
-
-    for handle in snapshot_handles.iter().skip(1) {
-        snapshot_stream.send(handle.clone()).await?;
-    }
-    for handle in delta_handles.iter().skip(1) {
-        delta_stream.send(handle.clone()).await?;
-    }
-
-    snapshot_stream
-        .set_default(
-            snapshot_handles
-                .last()
-                .expect("observed prefix non-empty")
-                .clone(),
-        )
-        .await?;
-    delta_stream.set_default(delta_default).await?;
-
-    snapshot_stream.flush().await?;
-    delta_stream.flush().await?;
-
     Ok(LoweredZSetStream {
-        snapshot: SnapshotHandleStream::new(snapshot_stream),
-        delta: DeltaHandleStream::new(delta_stream),
+        table,
+        snapshot: SnapshotHandleStream::new(snapshot_stream.clone()),
+        delta: DeltaHandleStream::new(delta_stream.clone()),
+        driver: Arc::new(AsyncMutex::new(ZSetLoweringDriver {
+            semantic: input.clone(),
+            evaluator: ReferenceEvaluator::default(),
+            dict,
+            snapshot_versioned,
+            delta_versioned,
+            snapshot_stream,
+            delta_stream,
+            previous_snapshot: HashMap::new(),
+            emitted_len: 0,
+            delta_default,
+        })),
         marker: PhantomData,
     })
 }
 
-pub async fn lower_set_prefix<K>(
+pub async fn lower_set<K>(
     table: Arc<dyn KeyValueTable>,
     namespace: impl Into<String>,
     input: &Stream<Set<K>>,
-    observed_len: usize,
 ) -> Result<LoweredZSetStream<K>>
 where
     K: RuntimeKeyBounds,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let zset_stream = input.lift("lower_set_to_zset", |value| value.to_zset());
-    lower_zset_prefix(table, namespace, &zset_stream, observed_len).await
+    lower_zset(table, namespace, &zset_stream).await
 }
 
-pub async fn lower_indexed_prefix<K, V>(
+pub async fn lower_indexed<K, V>(
     table: Arc<dyn KeyValueTable>,
     namespace: impl Into<String>,
     input: &Stream<IndexedZSet<K, V>>,
-    observed_len: usize,
 ) -> Result<LoweredZSetStream<(K, V)>>
 where
     K: RuntimeKeyBounds,
@@ -266,7 +380,7 @@ where
         RkyvDeserialize<(K, V), RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let pair_stream = input.lift("lower_indexed_to_pairs", |value| value.as_pairs());
-    lower_zset_prefix(table, namespace, &pair_stream, observed_len).await
+    lower_zset(table, namespace, &pair_stream).await
 }
 
 pub async fn collect_runtime_scalar_prefix<T>(

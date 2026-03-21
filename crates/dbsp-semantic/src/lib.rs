@@ -2,41 +2,50 @@
 //!
 //! # Contract
 //!
-//! `dbsp-semantic` defines the paper-facing semantic layer for Floe.
-//! Semantic streams denote total functions from logical time `t in N` to
-//! values. The semantic API is intentionally opaque: it does not expose
-//! runtime observations such as committed frontiers, semantic horizons, or
-//! storage-backed tails.
+//! `dbsp-semantic` defines Floe's paper-facing semantic layer.
+//! Semantic streams denote total functions from logical time `t in N` to values.
+//! The public API is intentionally opaque: it does not expose runtime frontiers,
+//! semantic horizons, storage-backed tails, or any other operational state.
 //!
-//! The semantic value domain covers:
-//! - scalar group-valued streams,
-//! - finite set values,
-//! - bag/Z-set values,
-//! - indexed collections,
-//! - nested relations formed compositionally from the collection types.
+//! The claimed semantic value domains are:
+//! - scalar abelian-group values,
+//! - finite set values with extensional equality,
+//! - finite-support bag / Z-set values with normalized weight-map equality,
+//! - indexed collections with normalized `K -> ZSet<V>` equality,
+//! - nested values formed compositionally from the collection domains.
 //!
 //! The semantic circuit model supports composition, pointwise lifting,
-//! strict delay, and guarded feedback. `differentiate(x)` is defined as
-//! `x - delay(x)`. `integrate(x)` is defined through semantic feedback and is
-//! total for all `GroupValue` streams, including streams that are not
-//! eventually identity.
+//! strict delay, guarded feedback, circuit transforms `D` and `I`, and
+//! incrementalization `QΔ = D ∘ ↑Q ∘ I`.
 //!
-//! # Laws
+//! # Laws And Admissibility
 //!
-//! For values in the stated domain, the semantic layer is expected to satisfy:
-//! - extensional equality over finite observations,
+//! For values in the stated domain, the semantic layer satisfies the tested laws:
 //! - `delay(x)(0) = 0` and `delay(x)(t + 1) = x(t)`,
 //! - `differentiate(x) = x - delay(x)`,
 //! - `integrate(x) = x + delay(integrate(x))`,
-//! - circuit incrementalization `QΔ = D ∘ ↑Q ∘ I` for supported circuits.
+//! - `D(I(x)) = x`,
+//! - `I(D(x)) = x` under the documented zero-initial assumption,
+//! - `QΔ = D ∘ ↑Q ∘ I` for the covered circuit families.
+//!
+//! Recursive semantics are admitted only for guarded feedback. Every cycle in the
+//! claimed domain must pass through `delay`; unguarded feedback is rejected by the
+//! evaluator as outside the semantic domain.
+//!
+//! Window semantics are event-time snapshot semantics over integer timestamps.
+//! Windows use half-open intervals `[start, end)`. Negative timestamps are
+//! unassigned. Watermark and lateness semantics are intentionally out of scope.
 //!
 //! # Runtime Separation
 //!
 //! Lowering lives in this crate, but runtime semantics do not. Lowering targets
-//! the existing `dbsp-runtime` handle and Z-set substrate by materializing the
-//! requested observational prefix into runtime streams and versioned Z-sets.
-//! This crate does not claim that `dbsp-runtime::stream::Stream<T>` is the
-//! denotational DBSP paper object.
+//! the existing `dbsp-runtime` stream, handle, and versioned Z-set substrate by
+//! advancing committed logical-time prefixes one tick at a time.
+//! The execution claim is that those committed prefixes, plus reopened prefixes
+//! for the covered rows, match the denotational reference model.
+//! This crate still does not claim that `dbsp-runtime::stream::Stream<T>` is the
+//! denotational DBSP paper object or that provisional future defaults beyond the
+//! committed frontier are themselves the semantic infinite tail.
 //!
 //! # Non-goals
 //!
@@ -54,9 +63,8 @@ pub use circuit::{
     Circuit, add_circuit, circuit_d, circuit_i, identity, incrementalize, pointwise, strict_delay,
 };
 pub use lowering::{
-    LoweredZSetStream, RuntimeValueBounds, collect_runtime_scalar_prefix,
-    collect_runtime_zset_prefix, lower_indexed_prefix, lower_scalar_prefix, lower_set_prefix,
-    lower_zset_prefix,
+    LoweredScalarStream, LoweredZSetStream, RuntimeValueBounds, collect_runtime_scalar_prefix,
+    collect_runtime_zset_prefix, lower_indexed, lower_scalar, lower_set, lower_zset,
 };
 pub use operators::{
     aggregate_zset, arrange_by, count_by_zset, distinct_zset, filter_set, filter_zset,
