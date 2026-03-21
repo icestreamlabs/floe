@@ -20,7 +20,7 @@ use crate::stream::runtime::{
     DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
 };
 use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+    build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
 /// Filter wrapper that drives the FilterOp over handle streams.
@@ -47,8 +47,14 @@ impl DbspFilter {
         P: Fn(&K) -> bool + Send + Sync + Clone + 'static,
     {
         let table = input.table();
+        let frontier = input.current_time();
+        let horizon = input.semantic_horizon();
         let filter_id = NEXT_FILTER_ID.fetch_add(1, Ordering::Relaxed);
         let output_ns = format!("filter_output_{filter_id}");
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
 
         let state =
             RelationState::empty(table.clone(), format!("filter_state_{filter_id}")).await?;
@@ -69,42 +75,40 @@ impl DbspFilter {
         )));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
-            default: ZSetHandle {
-                ns: output_ns.clone(),
-                version: 0,
-            },
+            default: empty_handle.clone(),
         });
-        let mut stream =
-            build_derived_stream(table.clone(), handle_group, "filter_output_stream/").await?;
-        set_default_in_place(
-            &mut stream,
-            ZSetHandle {
-                ns: output_ns,
-                version: 0,
-            },
-        );
 
-        let writer = Arc::new(AsyncMutex::new(stream.clone()));
-
-        // Seed the filter output with any handles that already exist on the input stream.
-        let history = collect_values(input, input.current_time()).await?;
+        let history = collect_values(input, horizon).await?;
+        let mut output_handles = Vec::with_capacity(history.len());
         for (ts, handle) in history.into_iter().enumerate() {
             let out_handle = {
                 let mut op_guard = filter_op.lock().await;
                 op_guard
                     .on_step(ts as i64, std::slice::from_ref(&handle))
                     .await?
-            };
-            if let Some(out_handle) = out_handle {
-                let mut writer_guard = writer.lock().await;
-                push_value_in_place(&mut writer_guard, out_handle);
-                writer_guard.flush().await?;
             }
+            .unwrap_or_else(|| empty_handle.clone());
+            output_handles.push(out_handle);
         }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "filter_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
             let op = Arc::clone(&filter_op);
             let writer = Arc::clone(&writer);
+            let empty_handle = empty_handle.clone();
             let handles_vec = handles.to_vec();
             Box::pin(async move {
                 if handles_vec.len() != 1 {
@@ -113,12 +117,19 @@ impl DbspFilter {
                         handles_vec.len()
                     ));
                 }
-                let mut op_guard = op.lock().await;
-                if let Some(out_handle) = op_guard.on_step(ts, &handles_vec).await? {
+                if ts <= horizon {
                     let mut writer_guard = writer.lock().await;
-                    push_value_in_place(&mut writer_guard, out_handle);
-                    writer_guard.flush().await?;
+                    publish_scheduled_value(&mut writer_guard, ts).await?;
+                    return Ok(());
                 }
+                let mut op_guard = op.lock().await;
+                let out_handle = op_guard
+                    .on_step(ts, &handles_vec)
+                    .await?
+                    .unwrap_or_else(|| empty_handle.clone());
+                let mut writer_guard = writer.lock().await;
+                push_value_in_place(&mut writer_guard, out_handle);
+                writer_guard.flush().await?;
                 Ok(())
             })
         });
@@ -133,7 +144,6 @@ impl DbspFilter {
             }
         });
 
-        stream.flush().await?;
         Ok(Self {
             stream: DeltaHandleStream::new(stream),
         })

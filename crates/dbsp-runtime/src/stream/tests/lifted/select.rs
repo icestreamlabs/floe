@@ -10,6 +10,7 @@ use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::core::stream::Stream;
 use crate::stream::cursor::StreamCursor;
 use crate::stream::groups::HandleGroup;
+use crate::stream::operations::basic::delay;
 use crate::stream::operations::lifted_select_zset_stream;
 use crate::stream::tests::common::build_db;
 use crate::stream::util::{
@@ -187,5 +188,61 @@ async fn lifted_select_handles_compaction_noop_without_replaying_snapshot() {
         t2.get("keep"),
         Some(&1),
         "noop tick should not double-count"
+    );
+}
+
+#[tokio::test]
+async fn lifted_select_preserves_future_scheduled_handle() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "lifted_select_scheduled", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut source = ZSetStream::new(
+        dict,
+        table.clone(),
+        "lifted_select_scheduled",
+        StreamRetention::KeepLast { keep_last: 3 },
+    )
+    .await
+    .expect("create source stream");
+    source.add_delta("keep".to_string(), 1);
+    source.flush().await.expect("flush t1");
+    source.add_delta("keep".to_string(), -1);
+    source.add_delta("drop".to_string(), 1);
+    source.flush().await.expect("flush t2");
+
+    let delayed = delay(&source.handle_stream())
+        .await
+        .expect("delay handle stream");
+    let mut derived =
+        lifted_select_zset_stream::<String, _>(&delayed, |value: &String| value.starts_with('k'))
+            .await
+            .expect("build lifted select");
+    derived.flush().await.expect("flush derived stream");
+
+    let mut cache = HashMap::new();
+    let t2 = materialize_zset_handle::<String>(
+        table.clone(),
+        &mut cache,
+        &derived.get(2).await.expect("derived t2"),
+    )
+    .await
+    .expect("materialize t2");
+    let t3 = materialize_zset_handle::<String>(
+        table.clone(),
+        &mut cache,
+        &derived.get(3).await.expect("derived t3"),
+    )
+    .await
+    .expect("materialize t3");
+
+    assert_eq!(t2.get("keep"), Some(&1));
+    assert!(
+        t3.is_empty(),
+        "future scheduled handle should reflect delayed t3"
     );
 }

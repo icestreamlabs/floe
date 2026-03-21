@@ -20,8 +20,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::DeltaHandleStream;
 use crate::stream::runtime::{HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error};
 use crate::stream::util::{
-    build_derived_stream, collect_values, delta_zset_handle, push_value_in_place,
-    set_default_in_place,
+    build_exact_stream_from_values, collect_values, delta_zset_handle, publish_scheduled_value,
+    push_value_in_place,
 };
 
 /// Filter+map wrapper that evaluates a fused row transform over handle streams.
@@ -58,8 +58,14 @@ impl DbspFilterMap {
         F: Fn(&K) -> Option<R> + Send + Sync + Clone + 'static,
     {
         let table = input.table();
+        let frontier = input.current_time();
+        let horizon = input.semantic_horizon();
         let op_id = NEXT_FILTER_MAP_ID.fetch_add(1, Ordering::Relaxed);
         let output_ns = format!("filter_map_output_{op_id}");
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
 
         let output_dict = Arc::new(
             Dictionary::<R>::with_table(table.clone(), output_ns.clone(), None)
@@ -77,34 +83,31 @@ impl DbspFilterMap {
         }));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
-            default: ZSetHandle {
-                ns: output_ns.clone(),
-                version: 0,
-            },
+            default: empty_handle.clone(),
         });
-        let mut stream =
-            build_derived_stream(table.clone(), handle_group, "filter_map_output_stream/").await?;
-        set_default_in_place(
-            &mut stream,
-            ZSetHandle {
-                ns: output_ns,
-                version: 0,
-            },
-        );
-
-        let writer = Arc::new(AsyncMutex::new(stream.clone()));
-
-        // Seed downstream with any already-materialized input handles.
-        let history = collect_values(input, input.current_time()).await?;
+        let history = collect_values(input, horizon).await?;
+        let mut output_handles = Vec::with_capacity(history.len());
         for (ts, handle) in history.into_iter().enumerate() {
             let out_handle = {
                 let mut guard = state.lock().await;
                 guard.on_step(ts as i64, &handle).await?
             };
-            let mut writer_guard = writer.lock().await;
-            push_value_in_place(&mut writer_guard, out_handle);
-            writer_guard.flush().await?;
+            output_handles.push(out_handle);
         }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "filter_map_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
             let state = Arc::clone(&state);
@@ -116,6 +119,11 @@ impl DbspFilterMap {
                         "filter_map runtime expected 1 handle, got {}",
                         handles_vec.len()
                     ));
+                }
+                if ts <= horizon {
+                    let mut writer_guard = writer.lock().await;
+                    publish_scheduled_value(&mut writer_guard, ts).await?;
+                    return Ok(());
                 }
                 let mut state_guard = state.lock().await;
                 let out_handle = state_guard.on_step(ts, &handles_vec[0]).await?;
@@ -136,7 +144,6 @@ impl DbspFilterMap {
             }
         });
 
-        stream.flush().await?;
         Ok(Self {
             stream: DeltaHandleStream::new(stream),
         })
@@ -173,8 +180,14 @@ impl DbspFilterMap {
         F: Fn(Vec<(K, i64)>) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync + Clone + 'static,
     {
         let table = input.table();
+        let frontier = input.current_time();
+        let horizon = input.semantic_horizon();
         let op_id = NEXT_FILTER_MAP_ID.fetch_add(1, Ordering::Relaxed);
         let output_ns = format!("filter_map_output_{op_id}");
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
 
         let output_dict = Arc::new(
             Dictionary::<R>::with_table(table.clone(), output_ns.clone(), None)
@@ -192,34 +205,31 @@ impl DbspFilterMap {
         }));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
-            default: ZSetHandle {
-                ns: output_ns.clone(),
-                version: 0,
-            },
+            default: empty_handle.clone(),
         });
-        let mut stream =
-            build_derived_stream(table.clone(), handle_group, "filter_map_output_stream/").await?;
-        set_default_in_place(
-            &mut stream,
-            ZSetHandle {
-                ns: output_ns,
-                version: 0,
-            },
-        );
-
-        let writer = Arc::new(AsyncMutex::new(stream.clone()));
-
-        // Seed downstream with any already-materialized input handles.
-        let history = collect_values(input, input.current_time()).await?;
+        let history = collect_values(input, horizon).await?;
+        let mut output_handles = Vec::with_capacity(history.len());
         for (ts, handle) in history.into_iter().enumerate() {
             let out_handle = {
                 let mut guard = state.lock().await;
                 guard.on_step(ts as i64, &handle).await?
             };
-            let mut writer_guard = writer.lock().await;
-            push_value_in_place(&mut writer_guard, out_handle);
-            writer_guard.flush().await?;
+            output_handles.push(out_handle);
         }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "filter_map_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
             let state = Arc::clone(&state);
@@ -231,6 +241,11 @@ impl DbspFilterMap {
                         "filter_map runtime expected 1 handle, got {}",
                         handles_vec.len()
                     ));
+                }
+                if ts <= horizon {
+                    let mut writer_guard = writer.lock().await;
+                    publish_scheduled_value(&mut writer_guard, ts).await?;
+                    return Ok(());
                 }
                 let mut state_guard = state.lock().await;
                 let out_handle = state_guard.on_step(ts, &handles_vec[0]).await?;
@@ -251,7 +266,6 @@ impl DbspFilterMap {
             }
         });
 
-        stream.flush().await?;
         Ok(Self {
             stream: DeltaHandleStream::new(stream),
         })

@@ -22,7 +22,7 @@ use crate::stream::runtime::{
     DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
 };
 use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+    build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 use crate::stream::{DeltaHandleStream, Stream};
 
@@ -213,6 +213,8 @@ impl DbspJoin {
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
         let table = left.table();
+        let frontier = left.current_time().max(right.current_time());
+        let horizon = left.semantic_horizon().max(right.semantic_horizon());
         let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
 
         let left_state =
@@ -254,50 +256,51 @@ impl DbspJoin {
             )
             .with_persist_indexes(false),
         ));
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
-            default: ZSetHandle {
-                ns: output_ns.clone(),
-                version: 0,
-            },
+            default: empty_handle.clone(),
         });
-        let mut stream =
-            build_derived_stream(table.clone(), handle_group, "join_output_stream/").await?;
-        set_default_in_place(
-            &mut stream,
-            ZSetHandle {
-                ns: output_ns,
-                version: 0,
-            },
-        );
+
+        let left_history = collect_values(left, horizon).await?;
+        let right_history = collect_values(right, horizon).await?;
+        let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
+        for ts in 0..=horizon {
+            let handles = vec![
+                left_history[ts as usize].clone(),
+                right_history[ts as usize].clone(),
+            ];
+            let out_handle = {
+                let mut op_guard = join_op.lock().await;
+                op_guard.on_step(ts, &handles).await?
+            }
+            .unwrap_or_else(|| empty_handle.clone());
+            output_handles.push(out_handle);
+        }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "join_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
-
-        // Rehydrate join state from any existing input handles before going live.
-        let left_history = collect_values(left, left.current_time()).await?;
-        let right_history = collect_values(right, right.current_time()).await?;
-        let left_default = left.default_value();
-        let right_default = right.default_value();
-        let replay_len = left_history.len().max(right_history.len());
-        for ts in 0..replay_len {
-            let handles = vec![
-                left_history
-                    .get(ts)
-                    .cloned()
-                    .unwrap_or_else(|| left_default.clone()),
-                right_history
-                    .get(ts)
-                    .cloned()
-                    .unwrap_or_else(|| right_default.clone()),
-            ];
-            drive_join(&join_op, &writer, ts as i64, handles).await?;
-        }
 
         let op = Arc::clone(&join_op);
         let mut runtime =
             HandleOperatorRuntime::new(vec![left.stream(), right.stream()], move |ts, handles| {
                 let op = Arc::clone(&op);
                 let writer = Arc::clone(&writer);
+                let empty_handle = empty_handle.clone();
                 let handles = handles.to_vec();
                 Box::pin(async move {
                     // If either side did not change at this ts, synthesize an empty delta
@@ -309,7 +312,12 @@ impl DbspJoin {
                             handles.len()
                         ));
                     }
-                    drive_join(&op, &writer, ts, handles).await
+                    if ts <= horizon {
+                        let mut writer_guard = writer.lock().await;
+                        publish_scheduled_value(&mut writer_guard, ts).await?;
+                        return Ok(());
+                    }
+                    drive_join(&op, &writer, &empty_handle, ts, handles).await
                 })
             });
 
@@ -323,7 +331,6 @@ impl DbspJoin {
             }
         });
 
-        stream.flush().await?;
         Ok(Self {
             stream: DeltaHandleStream::new(stream),
         })
@@ -609,6 +616,7 @@ impl DbspJoin {
 async fn drive_join<L, R, O, K>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
     writer: &Arc<AsyncMutex<Stream<ZSetHandle>>>,
+    empty_handle: &ZSetHandle,
     ts: i64,
     handles: Vec<ZSetHandle>,
 ) -> Result<()>
@@ -680,11 +688,13 @@ where
         tracing::trace!("join step");
     }
     let mut op_guard = op.lock().await;
-    if let Some(out) = op_guard.on_step(ts, &handles).await? {
-        let mut writer_guard = writer.lock().await;
-        push_value_in_place(&mut writer_guard, out);
-        writer_guard.flush().await?;
-    }
+    let out = op_guard
+        .on_step(ts, &handles)
+        .await?
+        .unwrap_or_else(|| empty_handle.clone());
+    let mut writer_guard = writer.lock().await;
+    push_value_in_place(&mut writer_guard, out);
+    writer_guard.flush().await?;
     Ok(())
 }
 

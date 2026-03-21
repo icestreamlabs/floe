@@ -16,7 +16,8 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::Stream;
 use crate::stream::util::{
-    delta_handle_namespace, delta_zset_handle, push_value_in_place, set_default_in_place,
+    delta_handle_namespace, delta_zset_handle, publish_scheduled_value, push_value_in_place,
+    set_default_in_place,
 };
 
 pub(super) async fn publish_handle(
@@ -33,6 +34,15 @@ pub(super) async fn publish_handle(
     set_default_in_place(stream, handle.clone());
     stream.flush().await?;
     Ok(())
+}
+
+pub(super) async fn publish_scheduled_handle(
+    stream: &mut Stream<ZSetHandle>,
+    ts: i64,
+) -> Result<()> {
+    publish_scheduled_value(stream, ts)
+        .await
+        .with_context(|| format!("publish scheduled zset handle at {ts}"))
 }
 
 pub(super) async fn delta_zset_with_retry<K>(

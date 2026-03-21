@@ -152,6 +152,26 @@ where
     Ok(result)
 }
 
+pub(crate) async fn publish_scheduled_value<T>(stream: &mut Stream<T>, ts: i64) -> Result<()>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let value = stream
+        .get(ts)
+        .await
+        .with_context(|| format!("load scheduled stream value at {ts}"))?;
+    push_value_in_place(stream, value);
+    stream.flush().await?;
+    Ok(())
+}
+
 pub(crate) async fn apply_on_resolved_handles<T, Fut>(
     input: &Stream<StreamHandle>,
     inner_group: Arc<dyn AbelianGroup<T>>,

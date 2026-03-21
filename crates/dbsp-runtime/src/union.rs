@@ -20,7 +20,7 @@ use crate::stream::runtime::{
     DeltaOperator, HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error,
 };
 use crate::stream::util::{
-    build_derived_stream, collect_values, push_value_in_place, set_default_in_place,
+    build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
 /// Union wrapper that drives UnionOp over multiple handle streams.
@@ -49,6 +49,16 @@ impl DbspUnion {
         }
 
         let table = inputs[0].table();
+        let frontier = inputs
+            .iter()
+            .map(|input| input.current_time())
+            .max()
+            .unwrap_or(0);
+        let horizon = inputs
+            .iter()
+            .map(|input| input.semantic_horizon())
+            .max()
+            .unwrap_or(0);
         for input in inputs.iter().skip(1) {
             if !Arc::ptr_eq(&table, &input.table()) {
                 return Err(anyhow!("union inputs must share the same backing table"));
@@ -67,54 +77,64 @@ impl DbspUnion {
             .context("create output zset for union")?;
 
         let union_op = Arc::new(AsyncMutex::new(UnionOp::new(table.clone(), output)));
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
-            default: ZSetHandle {
-                ns: output_ns.clone(),
-                version: 0,
-            },
+            default: empty_handle.clone(),
         });
-        let mut stream =
-            build_derived_stream(table.clone(), handle_group, "union_output_stream/").await?;
-        set_default_in_place(
-            &mut stream,
-            ZSetHandle {
-                ns: output_ns,
-                version: 0,
-            },
-        );
-
-        let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut histories = Vec::with_capacity(inputs.len());
-        let mut defaults = Vec::with_capacity(inputs.len());
-        let mut max_len = 0usize;
         for input in inputs {
-            let history = collect_values(input, input.current_time()).await?;
-            max_len = max_len.max(history.len());
+            let history = collect_values(input, horizon).await?;
             histories.push(history);
-            defaults.push(input.default_value());
         }
 
-        for ts in 0..max_len {
+        let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
+        for ts in 0..=horizon {
             let mut handles = Vec::with_capacity(inputs.len());
-            for (idx, history) in histories.iter().enumerate() {
-                let handle = history
-                    .get(ts)
-                    .cloned()
-                    .unwrap_or_else(|| defaults[idx].clone());
-                handles.push(handle);
+            for history in &histories {
+                handles.push(history[ts as usize].clone());
             }
-            drive_union(&union_op, &writer, ts as i64, handles).await?;
+            let out_handle = {
+                let mut op_guard = union_op.lock().await;
+                op_guard.on_step(ts, &handles).await?
+            }
+            .unwrap_or_else(|| empty_handle.clone());
+            output_handles.push(out_handle);
         }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "union_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let streams: Vec<Stream<ZSetHandle>> = inputs.iter().map(|input| input.stream()).collect();
         let op = Arc::clone(&union_op);
         let mut runtime = HandleOperatorRuntime::new(streams, move |ts, handles| {
             let op = Arc::clone(&op);
             let writer = Arc::clone(&writer);
+            let empty_handle = empty_handle.clone();
             let handles = handles.to_vec();
-            Box::pin(async move { drive_union(&op, &writer, ts, handles).await })
+            Box::pin(async move {
+                if ts <= horizon {
+                    let mut writer_guard = writer.lock().await;
+                    publish_scheduled_value(&mut writer_guard, ts).await?;
+                    return Ok(());
+                }
+                drive_union(&op, &writer, &empty_handle, ts, handles).await
+            })
         });
 
         let error_handler = error_handler.clone();
@@ -127,7 +147,6 @@ impl DbspUnion {
             }
         });
 
-        stream.flush().await?;
         Ok(Self {
             stream: DeltaHandleStream::new(stream),
         })
@@ -141,6 +160,7 @@ impl DbspUnion {
 async fn drive_union<K>(
     op: &Arc<AsyncMutex<UnionOp<K>>>,
     writer: &Arc<AsyncMutex<Stream<ZSetHandle>>>,
+    empty_handle: &ZSetHandle,
     ts: i64,
     handles: Vec<ZSetHandle>,
 ) -> Result<()>
@@ -156,11 +176,13 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let mut op_guard = op.lock().await;
-    if let Some(out) = op_guard.on_step(ts, &handles).await? {
-        let mut writer_guard = writer.lock().await;
-        push_value_in_place(&mut writer_guard, out);
-        writer_guard.flush().await?;
-    }
+    let out = op_guard
+        .on_step(ts, &handles)
+        .await?
+        .unwrap_or_else(|| empty_handle.clone());
+    let mut writer_guard = writer.lock().await;
+    push_value_in_place(&mut writer_guard, out);
+    writer_guard.flush().await?;
     Ok(())
 }
 

@@ -17,12 +17,14 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
-    LIFTED_JOIN_STREAM_PREFIX, LIFTED_JOIN_ZSET_PREFIX, build_derived_stream, collect_values,
-    next_lifted_zset_namespace, open_delta_handle_stream,
+    LIFTED_JOIN_STREAM_PREFIX, LIFTED_JOIN_ZSET_PREFIX, build_exact_stream_from_values,
+    collect_values, next_lifted_zset_namespace, open_delta_handle_stream,
 };
 use crate::stream::{Stream, StreamRetention, ZSetStream};
 
-use super::helpers::{delta_for_snapshot_step_with_retry, publish_handle};
+use super::helpers::{
+    delta_for_snapshot_step_with_retry, publish_handle, publish_scheduled_handle,
+};
 
 pub async fn lifted_join_zset_stream<L, R, O, P, F>(
     left: &Stream<ZSetHandle>,
@@ -61,13 +63,14 @@ where
     P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
     F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
 {
-    let left_handles = collect_values(left, left.current_time()).await?;
-    let right_handles = collect_values(right, right.current_time()).await?;
+    let frontier = left.current_time().max(right.current_time());
+    let horizon = left.semantic_horizon().max(right.semantic_horizon());
+    let left_handles = collect_values(left, horizon).await?;
+    let right_handles = collect_values(right, horizon).await?;
     let left_delta_stream = open_delta_handle_stream(left).await?;
     let right_delta_stream = open_delta_handle_stream(right).await?;
-    let left_delta_handles = collect_values(&left_delta_stream, left.current_time()).await?;
-    let right_delta_handles = collect_values(&right_delta_stream, right.current_time()).await?;
-    let total = left_handles.len().min(right_handles.len());
+    let left_delta_handles = collect_values(&left_delta_stream, horizon).await?;
+    let right_delta_handles = collect_values(&right_delta_stream, horizon).await?;
     let table = left.table();
     let namespace = next_lifted_zset_namespace(LIFTED_JOIN_ZSET_PREFIX);
     let dict = Arc::new(
@@ -79,23 +82,17 @@ where
         .await
         .context("create ZSet stream for lifted join")?;
 
-    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(zset_stream.current_handle().clone()));
-    let mut result_stream =
-        build_derived_stream(table.clone(), handle_group, LIFTED_JOIN_STREAM_PREFIX).await?;
-
     let mut left_cache: HashMap<String, Arc<Dictionary<L>>> = HashMap::new();
     let mut right_cache: HashMap<String, Arc<Dictionary<R>>> = HashMap::new();
     let mut left_state: HashMap<L, i64> = HashMap::new();
     let mut right_state: HashMap<R, i64> = HashMap::new();
     let mut previous_left_handle: Option<ZSetHandle> = None;
     let mut previous_right_handle: Option<ZSetHandle> = None;
-    let mut initialized = false;
-    let mut writer = result_stream.clone();
     let predicate: Arc<P> = Arc::new(predicate);
     let projector: Arc<F> = Arc::new(projector);
+    let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
 
-    for t in 0..total {
+    for t in 0..=horizon {
         let mut join_ctx = JoinHandleContext {
             table: table.clone(),
             predicate: &predicate,
@@ -108,20 +105,52 @@ where
             previous_right_handle: &mut previous_right_handle,
             zset_stream: &mut zset_stream,
         };
-        let left_candidate = left_delta_handles.get(t);
-        let right_candidate = right_delta_handles.get(t);
+        let left_candidate = left_delta_handles.get(t as usize);
+        let right_candidate = right_delta_handles.get(t as usize);
         let output_handle = join_handle(
             &mut join_ctx,
-            &left_handles[t],
-            &right_handles[t],
+            &left_handles[t as usize],
+            &right_handles[t as usize],
             left_candidate,
             right_candidate,
         )
         .await?;
-        publish_handle(&mut writer, output_handle, &mut initialized).await?;
+        output_handles.push(output_handle);
     }
 
+    let left_default_handle = left.default_value();
+    let right_default_handle = right.default_value();
+    let default_handle = left_handles
+        .iter()
+        .zip(right_handles.iter())
+        .zip(output_handles.iter())
+        .find_map(|((left_handle, right_handle), derived)| {
+            if *left_handle == left_default_handle && *right_handle == right_default_handle {
+                Some(derived.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            output_handles
+                .last()
+                .cloned()
+                .unwrap_or_else(|| zset_stream.current_handle().clone())
+        });
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        LIFTED_JOIN_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
     result_stream.flush().await?;
+    let writer = result_stream.clone();
 
     let mut runtime =
         HandleOperatorRuntime::new(vec![left.clone(), right.clone()], |_, _| async { Ok(()) });
@@ -136,10 +165,22 @@ where
         let mut left_delta_stream = left_delta_stream;
         let mut right_delta_stream = right_delta_stream;
         let mut writer = writer;
-        let mut initialized = initialized;
+        let mut initialized = true;
+        let scheduled_horizon = horizon;
         loop {
             match runtime.next_handles().await {
                 Ok((ts, handles)) => {
+                    if ts <= scheduled_horizon {
+                        if let Err(err) = publish_scheduled_handle(&mut writer, ts).await {
+                            tracing::error!(
+                                error = %err,
+                                timestamp = ts,
+                                "failed to publish scheduled lifted join handle"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
                     if handles.len() != 2 {
                         tracing::error!(
                             handle_count = handles.len(),

@@ -15,12 +15,14 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    LIFTED_SELECT_STREAM_PREFIX, LIFTED_SELECT_ZSET_PREFIX, build_derived_stream, collect_values,
-    next_lifted_zset_namespace, open_delta_handle_stream,
+    LIFTED_SELECT_STREAM_PREFIX, LIFTED_SELECT_ZSET_PREFIX, build_exact_stream_from_values,
+    collect_values, next_lifted_zset_namespace, open_delta_handle_stream,
 };
 use crate::stream::{Stream, StreamCursor, StreamRetention, ZSetStream};
 
-use super::helpers::{delta_for_snapshot_step_with_retry, publish_handle};
+use super::helpers::{
+    delta_for_snapshot_step_with_retry, publish_handle, publish_scheduled_handle,
+};
 
 pub async fn lifted_select_zset_stream<K, P>(
     input: &Stream<ZSetHandle>,
@@ -39,6 +41,8 @@ where
     P: Fn(&K) -> bool + Send + Sync + Clone + 'static,
 {
     let table = input.table();
+    let frontier = input.current_time();
+    let horizon = input.semantic_horizon();
     let namespace = next_lifted_zset_namespace(LIFTED_SELECT_ZSET_PREFIX);
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)
@@ -49,20 +53,14 @@ where
         .await
         .context("create ZSet stream for lifted select")?;
 
-    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(zset_stream.current_handle().clone()));
-    let mut result_stream =
-        build_derived_stream(table.clone(), handle_group, LIFTED_SELECT_STREAM_PREFIX).await?;
-
     let mut dict_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
     let delta_input = open_delta_handle_stream(input).await?;
-    let mut initialized = false;
-    let mut writer = result_stream.clone();
     let predicate: Arc<P> = Arc::new(predicate);
 
-    let handles = collect_values(input, input.current_time()).await?;
-    let delta_handles = collect_values(&delta_input, input.current_time()).await?;
+    let handles = collect_values(input, horizon).await?;
+    let delta_handles = collect_values(&delta_input, horizon).await?;
     let mut previous_input_handle: Option<ZSetHandle> = None;
+    let mut output_handles = Vec::with_capacity(handles.len());
     for (index, handle) in handles.iter().enumerate() {
         let candidate_delta = delta_handles.get(index);
         let output_handle = select_handle(
@@ -75,10 +73,40 @@ where
             candidate_delta,
         )
         .await?;
-        publish_handle(&mut writer, output_handle, &mut initialized).await?;
+        output_handles.push(output_handle);
     }
 
+    let input_default_handle = input.default_value();
+    let default_handle = handles
+        .iter()
+        .zip(output_handles.iter())
+        .find_map(|(handle, derived)| {
+            if *handle == input_default_handle {
+                Some(derived.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            output_handles
+                .last()
+                .cloned()
+                .unwrap_or_else(|| zset_stream.current_handle().clone())
+        });
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut result_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        LIFTED_SELECT_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
     result_stream.flush().await?;
+    let writer = result_stream.clone();
 
     let mut cursor = StreamCursor::new(input.clone());
     tokio::spawn(async move {
@@ -86,11 +114,23 @@ where
         let mut zset_stream = zset_stream;
         let mut delta_input = delta_input;
         let mut writer = writer;
-        let mut initialized = initialized;
+        let mut initialized = true;
         let mut previous_input_handle = previous_input_handle;
+        let scheduled_horizon = horizon;
         loop {
             match cursor.next().await {
                 Ok((ts, handle)) => {
+                    if ts <= scheduled_horizon {
+                        if let Err(err) = publish_scheduled_handle(&mut writer, ts).await {
+                            tracing::error!(
+                                error = %err,
+                                timestamp = ts,
+                                "failed to publish scheduled lifted select handle"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
                     let delta_handle = match delta_input.get(ts).await {
                         Ok(handle) => Some(handle),
                         Err(err) => {

@@ -18,9 +18,9 @@ use crate::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
-    build_derived_stream, build_exact_stream_from_values, collect_values, delta_zset_handle,
-    next_lifted_zset_namespace, open_delta_handle_stream, push_value_in_place,
-    set_default_in_place,
+    build_exact_stream_from_values, collect_values, delta_handle_namespace, delta_zset_handle,
+    next_lifted_zset_namespace, open_delta_handle_stream, publish_scheduled_value,
+    push_value_in_place,
 };
 use slatedb::WriteBatch;
 
@@ -126,71 +126,98 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let table = input.table();
+    let frontier = input.current_time();
+    let horizon = input.semantic_horizon();
     let namespace = next_lifted_zset_namespace("stream_live_diff/");
     let dict = Arc::new(
         Dictionary::with_table(table.clone(), namespace.clone(), None)
             .await
             .context("build dictionary for live differentiate_zset_stream")?,
     );
-    let versioned = VersionedZSet::new(dict, table.clone(), namespace.clone())
+    let mut versioned = VersionedZSet::new(dict, table.clone(), namespace.clone())
         .await
         .context("create versioned zset for live diff")?;
     let delta_stream = open_delta_handle_stream(input).await?;
-    let state = Arc::new(Mutex::new(LiveDiffState {
-        versioned,
-        delta_stream,
-        delta_cache: HashMap::new(),
-    }));
+    let handles = collect_values(input, horizon).await?;
+    let delta_handles = collect_values(&delta_stream, horizon).await?;
+    let mut delta_cache = HashMap::new();
+    let mut previous_snapshot: Option<ZSetHandle> = None;
+    let mut output_handles = Vec::with_capacity(handles.len());
 
-    let mut guard = state.lock().await;
-    let default_handle = guard.versioned.handle_for_version(0);
-    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut out_stream =
-        build_derived_stream(table.clone(), handle_group, "stream_live_diff_handles/").await?;
-    set_default_in_place(&mut out_stream, default_handle.clone());
-
-    // Drain history up to current time to seed the live diff stream.
-    let delta_handles = collect_values(&guard.delta_stream, input.current_time()).await?;
-    for handle in delta_handles {
-        let deltas =
-            delta_zset_handle::<K>(guard.versioned.table(), &mut guard.delta_cache, &handle)
-                .await
-                .context("delta iterate input handle for live diff history")?;
+    for (index, handle) in handles.iter().enumerate() {
+        let deltas = resolve_live_diff_step_deltas::<K>(
+            table.clone(),
+            &mut delta_cache,
+            handle,
+            previous_snapshot.as_ref(),
+            delta_handles.get(index),
+        )
+        .await
+        .context("resolve snapshot deltas for live diff history")?;
+        previous_snapshot = Some(handle.clone());
         let out_handle = if deltas.is_empty() {
-            guard.versioned.handle_for_version(0)
+            versioned.handle_for_version(0)
         } else {
-            apply_delta_version(&mut guard.versioned, deltas)
+            apply_delta_version(&mut versioned, deltas)
                 .await
                 .context("persist live diff history version")?
         };
-        push_value_in_place(&mut out_stream, out_handle.clone());
+        output_handles.push(out_handle);
     }
-    if let Some(last) = out_stream.to_vec().await?.last() {
-        set_default_in_place(&mut out_stream, last.clone());
-    }
+
+    let default_handle = versioned.handle_for_version(0);
+    let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
+        Arc::new(HandleGroup::new(default_handle.clone()));
+    let mut out_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        "stream_live_diff_handles/",
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
     out_stream.flush().await?;
-    drop(guard);
+
+    let state = Arc::new(Mutex::new(LiveDiffState {
+        versioned,
+        delta_stream,
+        delta_cache,
+        previous_snapshot,
+    }));
 
     let writer = Arc::new(Mutex::new(out_stream.clone()));
     let state_clone = Arc::clone(&state);
-    let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, _| {
+    let scheduled_horizon = horizon;
+    let mut runtime = HandleOperatorRuntime::new(vec![input.clone()], move |ts, handles| {
         let state = Arc::clone(&state_clone);
         let writer = Arc::clone(&writer);
+        let snapshot_handle = handles[0].clone();
         Box::pin(async move {
+            if ts <= scheduled_horizon {
+                let mut writer_guard = writer.lock().await;
+                publish_scheduled_handle(&mut writer_guard, ts).await?;
+                return Ok(());
+            }
+
             let mut guard = state.lock().await;
+            let previous_snapshot = guard.previous_snapshot.clone();
             let delta_handle = guard
                 .delta_stream
                 .get(ts)
                 .await
                 .context("load live diff delta handle")?;
-            let deltas = delta_zset_handle::<K>(
+            let deltas = resolve_live_diff_step_deltas::<K>(
                 guard.versioned.table(),
                 &mut guard.delta_cache,
-                &delta_handle,
+                &snapshot_handle,
+                previous_snapshot.as_ref(),
+                Some(&delta_handle),
             )
             .await
             .context("delta iterate input handle for live diff")?;
+            guard.previous_snapshot = Some(snapshot_handle.clone());
             let out_handle = if deltas.is_empty() {
                 guard.versioned.handle_for_version(0)
             } else {
@@ -236,6 +263,62 @@ where
     versioned: VersionedZSet<K>,
     delta_stream: Stream<ZSetHandle>,
     delta_cache: HashMap<String, Arc<Dictionary<K>>>,
+    previous_snapshot: Option<ZSetHandle>,
+}
+
+async fn resolve_live_diff_step_deltas<K>(
+    table: Arc<dyn crate::storage::KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    snapshot_handle: &ZSetHandle,
+    previous_snapshot: Option<&ZSetHandle>,
+    candidate_delta: Option<&ZSetHandle>,
+) -> Result<Vec<(K, i64)>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    if previous_snapshot == Some(snapshot_handle) {
+        return Ok(Vec::new());
+    }
+
+    let expected_ns = delta_handle_namespace(&snapshot_handle.ns);
+    if let Some(candidate) = candidate_delta
+        && candidate.ns == expected_ns
+    {
+        return delta_zset_handle::<K>(table, cache, candidate)
+            .await
+            .context("read candidate live diff delta handle");
+    }
+
+    let fallback = ZSetHandle {
+        ns: expected_ns,
+        version: snapshot_handle.version,
+    };
+    match delta_zset_handle::<K>(table, cache, &fallback).await {
+        Ok(deltas) => Ok(deltas),
+        Err(err) if is_missing_manifest(&err) => Ok(Vec::new()),
+        Err(err) => Err(err).context("read fallback live diff delta handle"),
+    }
+}
+
+async fn publish_scheduled_handle(stream: &mut Stream<ZSetHandle>, ts: i64) -> Result<()> {
+    publish_scheduled_value(stream, ts)
+        .await
+        .with_context(|| format!("publish scheduled live diff handle at {ts}"))
+}
+
+fn is_missing_manifest(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("manifest version")
+        || message.contains("not found for namespace")
+        || message.contains("not found")
 }
 
 async fn apply_delta_version<K>(

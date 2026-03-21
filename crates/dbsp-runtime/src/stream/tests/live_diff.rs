@@ -6,6 +6,7 @@ use crate::collections::CompactionPolicy;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::cursor::StreamCursor;
+use crate::stream::operations::basic::delay;
 use crate::stream::operations::basic::differentiate_zset_stream_live;
 use crate::stream::tests::common::build_db;
 use crate::stream::util::{collect_values, materialize_zset_handle};
@@ -127,4 +128,55 @@ async fn live_differentiate_stream_emits_empty_on_compaction_noop_tick() {
 
     assert_eq!(t1, HashMap::from([(b"a".to_vec(), 1)]));
     assert!(t2.is_empty(), "noop tick must emit empty delta");
+}
+
+#[tokio::test]
+async fn live_differentiate_preserves_future_scheduled_delta() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "live_diff_scheduled_input", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut source = ZSetStream::new(
+        dict,
+        table.clone(),
+        "live_diff_scheduled_input".to_string(),
+        StreamRetention::KeepLast { keep_last: 4 },
+    )
+    .await
+    .expect("create zset stream");
+    source.add_delta(b"a".to_vec(), 1);
+    source.flush().await.expect("flush t1");
+    source.add_delta(b"b".to_vec(), 1);
+    source.flush().await.expect("flush t2");
+
+    let delayed = delay(&source.handle_stream())
+        .await
+        .expect("delay handle stream");
+    let mut derived = differentiate_zset_stream_live::<Vec<u8>>(&delayed)
+        .await
+        .expect("build live differentiate stream");
+    derived.flush().await.expect("flush derived stream");
+
+    let mut cache = HashMap::new();
+    let t3 = materialize_zset_handle::<Vec<u8>>(
+        table.clone(),
+        &mut cache,
+        &derived.get(3).await.expect("derived t3"),
+    )
+    .await
+    .expect("materialize t3");
+    let t4 = materialize_zset_handle::<Vec<u8>>(
+        table.clone(),
+        &mut cache,
+        &derived.get(4).await.expect("derived t4"),
+    )
+    .await
+    .expect("materialize t4");
+
+    assert_eq!(t3, HashMap::from([(b"b".to_vec(), 1)]));
+    assert!(t4.is_empty(), "tail delta should settle to empty");
 }
