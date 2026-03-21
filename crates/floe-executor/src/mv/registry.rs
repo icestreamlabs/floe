@@ -449,6 +449,13 @@ impl MaterializedViewHandle {
             .min()
     }
 
+    pub fn is_version_published(&self, version: i64) -> bool {
+        self.published_versions
+            .read()
+            .expect("materialized view versions lock poisoned")
+            .contains(&version)
+    }
+
     pub fn version_time(&self, version: i64) -> Option<i64> {
         self.version_times
             .read()
@@ -467,6 +474,16 @@ impl MaterializedViewHandle {
             .expect("materialized view versions lock poisoned")
             .get(&version)
             .cloned()
+    }
+
+    pub fn handle_at_or_before_version(&self, version: i64) -> Option<ZSetHandle> {
+        self.versions
+            .read()
+            .expect("materialized view versions lock poisoned")
+            .iter()
+            .filter(|(candidate, _)| **candidate <= version)
+            .max_by_key(|(candidate, _)| *candidate)
+            .map(|(_, handle)| handle.clone())
     }
 
     fn prune_versions(&self) {
@@ -698,6 +715,31 @@ mod tests {
         assert!(view.handle_for_version(1).is_none());
         assert!(view.handle_for_version(2).is_some());
         assert!(view.handle_for_version(3).is_some());
+    }
+
+    #[test]
+    fn resolves_latest_handle_at_or_before_published_version() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_version_lookup");
+
+        view.publish_version(
+            1,
+            ZSetHandle {
+                ns: "mv_version_lookup".to_string(),
+                version: 10,
+            },
+        );
+        view.publish_logical_version(2);
+        view.publish_logical_version(3);
+
+        assert!(view.is_version_published(2));
+        assert_eq!(
+            view.handle_at_or_before_version(3),
+            Some(ZSetHandle {
+                ns: "mv_version_lookup".to_string(),
+                version: 10,
+            })
+        );
     }
 
     #[test]

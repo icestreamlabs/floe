@@ -617,7 +617,15 @@ fn materialized_view_entries(
         .into_iter()
         .filter_map(|handle| {
             let frontier = handle.latest_version()?;
-            let zset_handle = handle.handle_for_version(frontier)?;
+            let zset_handle = handle
+                .handle_for_version(frontier)
+                .or_else(|| handle.handle_at_or_before_version(frontier))
+                .or_else(|| {
+                    handle.dbsp_state().map(|state| ZSetHandle {
+                        ns: state.namespace().to_string(),
+                        version: state.version(),
+                    })
+                })?;
             Some(MaterializedViewCheckpointEntry {
                 view: handle.name().to_string(),
                 namespace: zset_handle.ns,
@@ -702,6 +710,9 @@ pub async fn recover_materialized_views(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbsp_bridge::DbspBridge;
+    use crate::encoding::encode_projected_row_key;
+    use datafusion::scalar::ScalarValue;
     use dbsp::storage::SlateTable;
     use object_store::memory::InMemory;
     use slatedb::Db;
@@ -834,5 +845,103 @@ mod tests {
         assert_eq!(entries[0].tick_id, commit.tick_id);
         assert_eq!(entries[0].max_event_time_ms, Some(456));
         assert_eq!(entries[0].deltas, vec![(b"encoded".to_vec(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_manifest_keeps_materialized_view_with_noop_latest_tick() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_checkpoint_noop");
+
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("checkpoint-mv-noop", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_checkpoint_noop",
+                dbsp::StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("dbsp view");
+
+        let row = vec![ScalarValue::Int64(Some(5))];
+        dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode row"), 1);
+        let handle = dbsp_view.flush().await.expect("flush base version");
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, namespace, version) = latest_view.into_parts();
+        view.set_dbsp_state(
+            DbspPersistedState::new(dict, table, namespace.clone(), version)
+                .with_logical_version(2),
+        );
+        view.publish_version(1, handle.clone());
+        view.publish_logical_version(2);
+
+        let entries = materialized_view_entries(&registry);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].view, "mv_checkpoint_noop");
+        assert_eq!(entries[0].namespace, namespace);
+        assert_eq!(entries[0].version, handle.version);
+        assert_eq!(entries[0].frontier, 2);
+    }
+
+    #[tokio::test]
+    async fn recover_materialized_view_restores_frontier_ahead_of_handle_version() {
+        let registry = MaterializedViewRegistry::new();
+
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("checkpoint-mv-recover-noop", store)
+                .await
+                .expect("db"),
+        );
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_checkpoint_recover_noop",
+                dbsp::StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("dbsp view");
+
+        let row = vec![ScalarValue::Int64(Some(11))];
+        dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode row"), 1);
+        let handle = dbsp_view.flush().await.expect("flush base version");
+
+        let manifest = CheckpointManifest {
+            id: 1,
+            watermark: 0,
+            format: ManifestFormat::V2,
+            dbsp_handles: vec![DbspHandleRecord::materialized_view(
+                "mv_checkpoint_recover_noop",
+                handle.ns.clone(),
+                handle.version,
+            )],
+            source_offsets: Vec::new(),
+            operator_states: Vec::new(),
+            materialized_views: vec![MaterializedViewCheckpointEntry {
+                view: "mv_checkpoint_recover_noop".to_string(),
+                namespace: handle.ns.clone(),
+                version: handle.version,
+                frontier: 2,
+            }],
+            outer_streams: Vec::new(),
+            sink_cursors: Vec::new(),
+        };
+
+        recover_materialized_views(&manifest, &registry, &mut bridge)
+            .await
+            .expect("recover materialized views");
+
+        let view = registry
+            .get("mv_checkpoint_recover_noop")
+            .expect("recovered view");
+        assert_eq!(view.latest_version(), Some(2));
+        let state = view.dbsp_state().expect("recovered dbsp state");
+        assert_eq!(state.version(), handle.version);
+        assert_eq!(state.logical_version(), 2);
+        let recovered_handle = view
+            .handle_for_version(2)
+            .expect("recovered logical version handle");
+        assert_eq!(recovered_handle.version, handle.version);
+        assert_eq!(recovered_handle.ns, handle.ns);
     }
 }

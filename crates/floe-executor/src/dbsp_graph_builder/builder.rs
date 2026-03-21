@@ -2376,6 +2376,7 @@ mod tests {
             &right_stream,
             Some(left_transient_rx),
             Some(right_transient_rx),
+            false,
             left_key,
             right_key,
             predicate,
@@ -2428,11 +2429,21 @@ mod tests {
             .tick_all_with_version(1)
             .await
             .expect("tick auction batch");
+        let (ts, canonical_handle) = timeout(Duration::from_secs(1), canonical_cursor.next())
+            .await
+            .expect("wait canonical join build tick")
+            .expect("canonical join build tick");
+        assert_eq!(ts, 1);
+        let build_tick_delta = materialize_zset_handle::<Vec<u8>>(
+            Arc::clone(&table),
+            &mut HashMap::new(),
+            &canonical_handle,
+        )
+        .await
+        .expect("materialize canonical build tick");
         assert!(
-            timeout(Duration::from_millis(100), canonical_cursor.next())
-                .await
-                .is_err(),
-            "auction build tick should not emit canonical join output"
+            build_tick_delta.is_empty(),
+            "auction build tick should emit an explicit empty canonical join handle"
         );
         assert!(
             timeout(Duration::from_millis(100), observer_rx.recv())
@@ -2442,6 +2453,7 @@ mod tests {
         );
 
         let mut cache = HashMap::new();
+        let mut expected_transient_version = 1_i64;
         for tick in 0..64usize {
             let ts = i64::try_from(tick + 2).expect("tick version");
             let bid_batch = vec![
@@ -2503,15 +2515,25 @@ mod tests {
             .await
             .expect("materialize canonical join delta");
 
+            if actual.is_empty() {
+                assert!(
+                    timeout(Duration::from_millis(100), observer_rx.recv())
+                        .await
+                        .is_err(),
+                    "empty canonical join tick should not emit transient join output"
+                );
+                continue;
+            }
+
             let (version, transient_batch) = timeout(Duration::from_secs(1), observer_rx.recv())
                 .await
                 .expect("wait transient join output")
                 .expect("transient join output");
             assert_eq!(
-                version,
-                i64::try_from(tick + 1).expect("transient output version"),
+                version, expected_transient_version,
                 "unexpected transient join output version at bid tick {tick}"
             );
+            expected_transient_version = expected_transient_version.saturating_add(1);
             let expected = consolidate_encoded_deltas(transient_batch.as_ref().clone());
             assert_eq!(actual, expected, "join output mismatch at bid tick {tick}");
         }
@@ -2753,6 +2775,7 @@ mod tests {
             &right_stream,
             Some(left_transient.receiver),
             Some(right_transient.receiver),
+            true,
             left_key,
             right_key,
             predicate,
@@ -2797,11 +2820,21 @@ mod tests {
             .tick_all_with_version(1)
             .await
             .expect("tick auction batch");
+        let (ts, canonical_handle) = timeout(Duration::from_secs(1), canonical_cursor.next())
+            .await
+            .expect("wait canonical join build tick")
+            .expect("canonical join build tick");
+        assert_eq!(ts, 1);
+        let build_tick_delta = materialize_zset_handle::<Vec<u8>>(
+            Arc::clone(&table),
+            &mut HashMap::new(),
+            &canonical_handle,
+        )
+        .await
+        .expect("materialize canonical build tick");
         assert!(
-            timeout(Duration::from_millis(100), canonical_cursor.next())
-                .await
-                .is_err(),
-            "auction build tick should not emit canonical join output"
+            build_tick_delta.is_empty(),
+            "auction build tick should emit an explicit empty canonical join handle"
         );
         assert!(
             timeout(Duration::from_millis(100), observer_rx.recv())

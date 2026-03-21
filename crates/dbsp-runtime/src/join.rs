@@ -390,6 +390,7 @@ impl DbspJoin {
             right,
             None,
             None,
+            false,
             left_key,
             right_key,
             predicate,
@@ -406,6 +407,7 @@ impl DbspJoin {
         right: &DeltaHandleStream,
         left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>>,
         right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
+        prefer_source_driven_runtime: bool,
         left_key: KL,
         right_key: KR,
         predicate: P,
@@ -524,7 +526,8 @@ impl DbspJoin {
             .await?;
         }
 
-        let use_source_driven_runtime = left_transient.is_some() && right_transient.is_some();
+        let use_source_driven_runtime =
+            prefer_source_driven_runtime && left_transient.is_some() && right_transient.is_some();
         if use_source_driven_runtime {
             let op = Arc::clone(&join_op);
             let observer_clone = Arc::clone(&observer);

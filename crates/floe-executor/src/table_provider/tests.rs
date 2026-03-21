@@ -125,6 +125,62 @@ async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() 
 }
 
 #[tokio::test]
+async fn materialized_view_provider_resolves_published_empty_logical_versions() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_empty_logical_versions");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv-provider-empty-logical-version", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let mut dbsp_view = bridge
+        .new_view(
+            "mv_empty_logical_versions",
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("dbsp view");
+    let row = vec![
+        ScalarValue::Int64(Some(9)),
+        ScalarValue::Utf8(Some("nine".into())),
+    ];
+    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    let handle = dbsp_view.flush().await.expect("flush base version");
+    let latest_view = dbsp_view.latest_handle_view();
+    let (dict, table, namespace, version) = latest_view.into_parts();
+    view.set_dbsp_state(
+        DbspPersistedState::new(dict, table, namespace, version).with_logical_version(3),
+    );
+    view.publish_version(1, handle);
+    view.publish_logical_version(2);
+    view.publish_logical_version(3);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let provider =
+        MaterializedViewTableProvider::new(registry, "mv_empty_logical_versions", schema);
+
+    let as_of_two = provider
+        .build_batches_at_version(2)
+        .await
+        .expect("build logical version 2");
+    assert_eq!(as_of_two.len(), 1);
+    assert_eq!(as_of_two[0].num_rows(), 1);
+
+    let as_of_three = provider
+        .build_batches_at_version(3)
+        .await
+        .expect("build logical version 3");
+    assert_eq!(as_of_three.len(), 1);
+    assert_eq!(as_of_three[0].num_rows(), 1);
+}
+
+#[tokio::test]
 async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_projection_limit");

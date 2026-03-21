@@ -213,7 +213,10 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     let max_catchup_versions = tail_max_catchup_versions();
 
     if let Some(as_of_version) = as_of {
-        let _ = mv.handle_for(as_of_version)?;
+        ensure!(
+            mv_version_exists(mv.as_ref(), as_of_version),
+            "version {as_of_version} not found for requested materialized view"
+        );
         if with_snapshot {
             emit_version(mv.as_ref(), &schema, &mv_name, as_of_version, tx).await?;
         }
@@ -265,6 +268,11 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     }
 
     Ok(())
+}
+
+fn mv_version_exists<M: MaterializedView>(mv: &M, version: i64) -> bool {
+    mv.latest_version() == Some(version)
+        || mv.next_version_after(version.saturating_sub(1)) == Some(version)
 }
 
 fn tail_stream_channel_capacity() -> usize {
@@ -666,6 +674,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tail_emits_empty_batch_for_published_noop_version() -> PgResult<()> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("tail-empty-version", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_empty_version",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
+
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_empty_version", build_schema());
+        let handle = registry.register("mv_tail_empty_version");
+
+        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1)]).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, ns, version).with_logical_version(2);
+        handle.set_dbsp_state(state);
+        let handle1_version = handle1.version as i64;
+        handle.publish_version(handle1_version, handle1);
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_empty_version".to_string(),
+            with_snapshot: false,
+            as_of: Some(handle1_version),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        handle.publish_logical_version(2);
+
+        let batch = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for empty tail batch")
+            .expect("expected empty tail batch")?;
+        assert_eq!(batch.version, 2);
+        assert_eq!(batch.batch.num_rows(), 0);
+        assert!(batch.ops.is_empty());
+        assert!(batch.times.is_empty());
+
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tail_deltas_match_materialized_state() -> PgResult<()> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-delta-validate", store).await.expect("db"));
@@ -824,6 +880,50 @@ mod tests {
         let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
         let batch = stream.next().await.expect("snapshot batch")?;
         assert_eq!(batch.version, handle1_version);
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_of_with_snapshot_accepts_published_empty_logical_version() -> PgResult<()> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("tail-asof-empty-logical", store)
+                .await
+                .expect("db"),
+        );
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_asof_empty_logical",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
+
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_asof_empty_logical", build_schema());
+        let handle = registry.register("mv_tail_asof_empty_logical");
+
+        let handle1 = append_version(&mut dbsp_view, &[10]).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, ns, version).with_logical_version(2);
+        handle.set_dbsp_state(state);
+        handle.publish_version(handle1.version as i64, handle1);
+        handle.publish_logical_version(2);
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_asof_empty_logical".to_string(),
+            with_snapshot: true,
+            as_of: Some(2),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        let batch = stream.next().await.expect("snapshot batch")?;
+        assert_eq!(batch.version, 2);
+        assert_eq!(batch.batch.num_rows(), 1);
         cancel.cancel();
         Ok(())
     }

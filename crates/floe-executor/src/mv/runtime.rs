@@ -94,6 +94,12 @@ impl MaterializedView for MaterializedViewHandle {
             return Ok(snapshot);
         }
 
+        if let Some(state) = self.dbsp_state()
+            && let Some(dbsp_version) = resolve_dbsp_version(self, &state, version_u64)
+        {
+            return materialize_dbsp_version(&state, dbsp_version).await;
+        }
+
         Err(anyhow!(
             "version {version} not found for materialized view '{}'.",
             self.name()
@@ -115,6 +121,10 @@ impl MaterializedView for MaterializedViewHandle {
             return Ok(delta);
         }
 
+        if self.is_version_published(version) {
+            return Ok(Vec::new());
+        }
+
         Err(anyhow!(
             "version {version} not found for materialized view '{}'.",
             self.name()
@@ -127,19 +137,24 @@ fn resolve_dbsp_version(
     state: &crate::materialized_view::DbspPersistedState,
     target_version: u64,
 ) -> Option<u64> {
-    i64::try_from(target_version)
-        .ok()
-        .and_then(|version| view.handle_for_version(version))
-        .map(|handle| handle.version)
-        .or_else(|| {
-            if target_version <= state.version() {
-                Some(target_version)
-            } else if target_version == state.logical_version() {
-                Some(state.version())
-            } else {
-                None
-            }
-        })
+    let target_version_i64 = i64::try_from(target_version).ok()?;
+    if let Some(handle) = view.handle_for_version(target_version_i64) {
+        return Some(handle.version);
+    }
+    if view.is_version_published(target_version_i64) {
+        return view
+            .handle_at_or_before_version(target_version_i64)
+            .map(|handle| handle.version)
+            .or_else(|| (target_version == state.logical_version()).then_some(state.version()))
+            .or_else(|| (state.version() == 0).then_some(0));
+    }
+    if target_version <= state.version() {
+        Some(target_version)
+    } else if target_version == state.logical_version() {
+        Some(state.version())
+    } else {
+        None
+    }
 }
 
 async fn materialize_dbsp_version(

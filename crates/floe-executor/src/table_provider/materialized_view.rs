@@ -208,19 +208,24 @@ impl MaterializedViewTableProvider {
         state: &DbspPersistedState,
         target_version: u64,
     ) -> Option<u64> {
-        i64::try_from(target_version)
-            .ok()
-            .and_then(|version| view.handle_for_version(version))
-            .map(|handle| handle.version)
-            .or_else(|| {
-                if target_version <= state.version() {
-                    Some(target_version)
-                } else if target_version == state.logical_version() {
-                    Some(state.version())
-                } else {
-                    None
-                }
-            })
+        let target_version_i64 = i64::try_from(target_version).ok()?;
+        if let Some(handle) = view.handle_for_version(target_version_i64) {
+            return Some(handle.version);
+        }
+        if view.is_version_published(target_version_i64) {
+            return view
+                .handle_at_or_before_version(target_version_i64)
+                .map(|handle| handle.version)
+                .or_else(|| (target_version == state.logical_version()).then_some(state.version()))
+                .or_else(|| (state.version() == 0).then_some(0));
+        }
+        if target_version <= state.version() {
+            Some(target_version)
+        } else if target_version == state.logical_version() {
+            Some(state.version())
+        } else {
+            None
+        }
     }
 
     fn fast_count_batches(

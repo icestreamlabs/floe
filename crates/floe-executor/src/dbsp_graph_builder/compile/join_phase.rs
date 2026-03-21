@@ -971,6 +971,7 @@ impl DbspGraphBuilder {
             &right,
             left_transient,
             right_transient,
+            true,
             left_key,
             right_key,
             predicate,
