@@ -18,8 +18,9 @@ use crate::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::runtime::HandleOperatorRuntime;
 use crate::stream::util::{
-    build_derived_stream, collect_values, delta_zset_handle, next_lifted_zset_namespace,
-    open_delta_handle_stream, push_value_in_place, set_default_in_place,
+    build_derived_stream, build_exact_stream_from_values, collect_values, delta_zset_handle,
+    next_lifted_zset_namespace, open_delta_handle_stream, push_value_in_place,
+    set_default_in_place,
 };
 use slatedb::WriteBatch;
 
@@ -57,7 +58,9 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let delta_input = open_delta_handle_stream(input).await?;
-    let handles = collect_values(&delta_input, input.current_time()).await?;
+    let frontier = delta_input.current_time();
+    let horizon = delta_input.semantic_horizon();
+    let handles = collect_values(&delta_input, horizon).await?;
     let table = input.table();
     let namespace = next_lifted_zset_namespace("stream_diff_zset/");
     let dict = Arc::new(
@@ -87,26 +90,19 @@ where
         output_handles.push(next_handle.clone());
     }
 
-    let default_handle = output_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| versioned.handle_for_version(0));
+    let default_handle = versioned.handle_for_version(0);
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(table.clone(), handle_group, "stream_diff_zset_handles/").await?;
-
-    if output_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, output_handles[0].clone());
-        for handle in output_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = output_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
-    }
+    let mut result_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        "stream_diff_zset_handles/",
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)

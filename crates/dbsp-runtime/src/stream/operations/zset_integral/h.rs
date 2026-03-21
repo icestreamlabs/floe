@@ -14,9 +14,8 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    LIFTED_H_STREAM_PREFIX, LIFTED_H_ZSET_PREFIX, build_derived_stream, collect_values,
-    compute_delta, materialize_zset_handle, next_lifted_zset_namespace, push_value_in_place,
-    set_default_in_place,
+    LIFTED_H_STREAM_PREFIX, LIFTED_H_ZSET_PREFIX, build_exact_stream_from_values, collect_values,
+    compute_delta, materialize_zset_handle, next_lifted_zset_namespace,
 };
 use crate::stream::{Stream, StreamRetention, ZSetStream};
 
@@ -35,9 +34,14 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let diff_handles = collect_values(diff_stream, diff_stream.current_time()).await?;
-    let state_handles = collect_values(integrated_stream, integrated_stream.current_time()).await?;
-    let total = diff_handles.len().min(state_handles.len());
+    let frontier = diff_stream
+        .current_time()
+        .max(integrated_stream.current_time());
+    let horizon = diff_stream
+        .semantic_horizon()
+        .max(integrated_stream.semantic_horizon());
+    let diff_handles = collect_values(diff_stream, horizon).await?;
+    let state_handles = collect_values(integrated_stream, horizon).await?;
     let table = diff_stream.table();
     let namespace = next_lifted_zset_namespace(LIFTED_H_ZSET_PREFIX);
     let dict = Arc::new(
@@ -52,14 +56,18 @@ where
     let mut diff_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
     let mut state_cache: HashMap<String, Arc<Dictionary<K>>> = HashMap::new();
     let mut previous: HashMap<K, i64> = HashMap::new();
-    let mut output_handles = Vec::with_capacity(total);
+    let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
 
-    for t in 0..total {
+    for t in 0..=horizon {
         let diff_map =
-            materialize_zset_handle::<K>(table.clone(), &mut diff_cache, &diff_handles[t]).await?;
-        let state_map =
-            materialize_zset_handle::<K>(table.clone(), &mut state_cache, &state_handles[t])
+            materialize_zset_handle::<K>(table.clone(), &mut diff_cache, &diff_handles[t as usize])
                 .await?;
+        let state_map = materialize_zset_handle::<K>(
+            table.clone(),
+            &mut state_cache,
+            &state_handles[t as usize],
+        )
+        .await?;
 
         let mut distincted = HashMap::new();
         for (key, &diff_weight) in &diff_map {
@@ -85,26 +93,19 @@ where
         previous = distincted;
     }
 
-    let default_handle = output_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| zset_stream.current_handle().clone());
+    let default_handle = zset_stream.current_handle().clone();
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(table.clone(), handle_group, LIFTED_H_STREAM_PREFIX).await?;
-
-    if output_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, output_handles[0].clone());
-        for handle in output_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = output_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
-    }
+    let mut result_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        LIFTED_H_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &output_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)

@@ -4,7 +4,7 @@ use crate::algebra::AbelianGroup;
 use crate::stream::addition::StreamAddition;
 use crate::stream::core::stream::Stream;
 use crate::stream::operations::basic::{
-    delay, differentiate, incrementalize2, integrate, lift1, lift2,
+    delay, differentiate, incrementalize2, integrate, lift1, lift2, stream_elimination,
 };
 use crate::stream::tests::common::{IntegerGroup, build_db};
 
@@ -241,4 +241,45 @@ async fn derived_stream_persists_future_semantic_horizon() {
     assert_eq!(reopened.semantic_horizon(), 4);
     assert_eq!(reopened.get(4).await.expect("t4"), 15);
     assert_eq!(reopened.get(5).await.expect("t5"), 0);
+}
+
+#[tokio::test]
+async fn stream_elimination_sums_exact_eventually_identity_stream() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "stream_elimination_input", group.clone())
+        .await
+        .expect("create stream");
+    source.send(1).await.expect("send t1");
+    source.send(2).await.expect("send t2");
+
+    let delayed = delay(&source).await.expect("delay source");
+    let eliminated = stream_elimination(&delayed)
+        .await
+        .expect("eliminate delayed stream");
+    assert_eq!(eliminated, 3);
+}
+
+#[tokio::test]
+async fn stream_elimination_rejects_non_identity_tail() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "stream_elimination_non_identity_tail", group)
+        .await
+        .expect("create stream");
+    source
+        .set_default(1)
+        .await
+        .expect("set non-identity default");
+
+    let err = match stream_elimination(&source).await {
+        Ok(_) => panic!("non-identity tail should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("eventually-identity input stream"),
+        "unexpected error: {err}"
+    );
 }

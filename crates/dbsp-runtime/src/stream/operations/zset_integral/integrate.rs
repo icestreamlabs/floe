@@ -14,9 +14,9 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    ZSET_INTEGRAL_PREFIX, ZSET_INTEGRAL_STREAM_PREFIX, build_derived_stream, collect_values,
-    delta_handle_namespace, delta_zset_handle, next_lifted_zset_namespace,
-    open_delta_handle_stream, push_value_in_place, resolve_apply_handle_op, set_default_in_place,
+    ZSET_INTEGRAL_PREFIX, ZSET_INTEGRAL_STREAM_PREFIX, build_exact_stream_from_values,
+    collect_values, delta_handle_namespace, delta_zset_handle, next_lifted_zset_namespace,
+    open_delta_handle_stream, resolve_apply_handle_op,
 };
 use crate::stream::{Stream, StreamRetention, ZSetStream};
 
@@ -58,9 +58,13 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let handles = collect_values(stream, stream.current_time()).await?;
     let delta_stream = open_delta_handle_stream(stream).await?;
-    let delta_handles = collect_values(&delta_stream, stream.current_time()).await?;
+    let frontier = stream.current_time().max(delta_stream.current_time());
+    let horizon = stream
+        .semantic_horizon()
+        .max(delta_stream.semantic_horizon());
+    let handles = collect_values(stream, horizon).await?;
+    let delta_handles = collect_values(&delta_stream, horizon).await?;
     let table = stream.table();
     let namespace = next_lifted_zset_namespace(ZSET_INTEGRAL_PREFIX);
     let dict = Arc::new(
@@ -95,26 +99,19 @@ where
         result_handles.push(handle);
     }
 
-    let default_handle = result_handles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| aggregator.current_handle().clone());
+    let default_handle = aggregator.current_handle().clone();
     let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(table, handle_group, ZSET_INTEGRAL_STREAM_PREFIX).await?;
-
-    if result_handles.is_empty() {
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        set_default_in_place(&mut result_stream, result_handles[0].clone());
-        for handle in result_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = result_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
-    }
+    let mut result_stream = build_exact_stream_from_values(
+        table,
+        handle_group,
+        ZSET_INTEGRAL_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &result_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)

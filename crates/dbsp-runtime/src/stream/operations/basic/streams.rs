@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -44,9 +44,15 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let values = collect_values(stream, stream.current_time()).await?;
+    let horizon = stream.semantic_horizon();
+    let values = collect_values(stream, horizon).await?;
     let group = stream.group();
     let mut acc = group.identity().await;
+    if stream.default_value() != acc {
+        return Err(anyhow!(
+            "stream_elimination requires an eventually-identity input stream for exact semantics"
+        ));
+    }
     for value in values {
         acc = group.add(&acc, &value).await;
     }

@@ -17,8 +17,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
 use crate::stream::util::{
-    DELTA_LIFTED_JOIN_STREAM_PREFIX, ZSET_SUM_PREFIX, build_derived_stream, compute_delta,
-    materialize_zset_handle, next_lifted_zset_namespace, push_value_in_place, set_default_in_place,
+    DELTA_LIFTED_JOIN_STREAM_PREFIX, ZSET_SUM_PREFIX, build_exact_stream_from_values,
+    compute_delta, materialize_zset_handle, next_lifted_zset_namespace,
 };
 use crate::stream::zset_stream::{StreamRetention, ZSetStream};
 
@@ -113,14 +113,16 @@ where
     )
     .await?;
 
-    let mut total_ts = join1
+    let frontier = join1
         .current_time()
-        .min(join2.current_time())
-        .min(join3.current_time())
-        .min(join4.current_time());
-    if total_ts < 0 {
-        total_ts = 0;
-    }
+        .max(join2.current_time())
+        .max(join3.current_time())
+        .max(join4.current_time());
+    let horizon = join1
+        .semantic_horizon()
+        .max(join2.semantic_horizon())
+        .max(join3.semantic_horizon())
+        .max(join4.semantic_horizon());
 
     let table = left.table();
 
@@ -139,10 +141,10 @@ where
         .context("create aggregator stream for delta lifted join")?;
 
     let mut previous: HashMap<O, i64> = HashMap::new();
-    let capacity = usize::try_from(total_ts.saturating_add(1)).unwrap_or(usize::MAX);
+    let capacity = usize::try_from(horizon.saturating_add(1)).unwrap_or(usize::MAX);
     let mut aggregated_handles = Vec::with_capacity(capacity);
 
-    for t in 0..=total_ts {
+    for t in 0..=horizon {
         let mut combined: HashMap<O, i64> = HashMap::new();
 
         for (idx, component) in components.iter_mut().enumerate() {
@@ -185,40 +187,27 @@ where
         aggregated_handles.push(aggregator.stream.handle());
     }
 
-    let fallback_handle = aggregator.stream.handle();
-    let default_handle = aggregated_handles
-        .first()
-        .cloned()
-        .unwrap_or(fallback_handle);
+    let default_handle = aggregator.stream.handle();
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream =
-        build_derived_stream(table.clone(), handle_group, DELTA_LIFTED_JOIN_STREAM_PREFIX).await?;
-
-    if aggregated_handles.is_empty() {
-        tracing::debug!(
-            left_default_ns = %left_default.ns,
-            right_default_ns = %right_default.ns,
-            "delta_lifted_delta_lifted_join produced no aggregated handles"
-        );
-        set_default_in_place(&mut result_stream, default_handle);
-    } else {
-        tracing::debug!(
-            handle_count = aggregated_handles.len(),
-            latest_version = aggregated_handles
-                .last()
-                .map(|h| h.frontier)
-                .unwrap_or_default(),
-            "delta_lifted_delta_lifted_join aggregated handles"
-        );
-        set_default_in_place(&mut result_stream, aggregated_handles[0].clone());
-        for handle in aggregated_handles.iter().skip(1) {
-            push_value_in_place(&mut result_stream, handle.clone());
-        }
-        if let Some(last) = aggregated_handles.last() {
-            set_default_in_place(&mut result_stream, last.clone());
-        }
-    }
+    tracing::debug!(
+        handle_count = aggregated_handles.len(),
+        latest_version = aggregated_handles
+            .last()
+            .map(|h| h.frontier)
+            .unwrap_or_default(),
+        "delta_lifted_delta_lifted_join aggregated handles"
+    );
+    let mut result_stream = build_exact_stream_from_values(
+        table.clone(),
+        handle_group,
+        DELTA_LIFTED_JOIN_STREAM_PREFIX,
+        frontier,
+        horizon,
+        &aggregated_handles,
+        default_handle,
+    )
+    .await?;
 
     result_stream.flush().await?;
     Ok(result_stream)
