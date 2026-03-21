@@ -37,6 +37,9 @@ pub type DeltaStream = Stream<ZSetHandle>;
 ///   semantics,
 /// - `default_value()` describes the eventual tail after that horizon.
 ///
+/// This type is intentionally not the paper DBSP denotational stream object.
+/// The paper-facing semantic stream API lives in `dbsp-semantic`.
+///
 /// For each relation `R` in the SQL runtime:
 /// - `Stream<ZSetHandle>` represents `Delta R_t`,
 /// - `VersionedZSet<K>` represents the integrated `R_t`.

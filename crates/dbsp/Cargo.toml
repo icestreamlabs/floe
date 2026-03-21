@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 dbsp-circuit = { path = "../dbsp-circuit" }
 dbsp-planner = { path = "../dbsp-planner" }
+dbsp-semantic = { path = "../dbsp-semantic" }
 dbsp-runtime = { path = "../dbsp-runtime" }
 dbsp-storage = { path = "../dbsp-storage" }
 

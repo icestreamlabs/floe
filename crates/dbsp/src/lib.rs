@@ -1,3 +1,9 @@
+//! Floe DBSP facade.
+//!
+//! Paper-facing semantic streams and circuits live under [`semantic`]. The
+//! root-level runtime exports remain focused on operational execution types,
+//! handle/Z-set streams, and planner/runtime wrappers.
+
 pub mod circuit {
     pub use dbsp_circuit::circuit::*;
     pub use dbsp_planner::{CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError};
@@ -7,6 +13,10 @@ pub mod circuit {
             CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError,
         };
     }
+}
+
+pub mod semantic {
+    pub use dbsp_semantic::*;
 }
 
 pub use dbsp_runtime::{
@@ -45,13 +55,7 @@ pub use operators::window::WindowKey;
 pub use relation_state::RelationState;
 pub use semijoin::DbspSemiJoin;
 pub use stream::{
-    CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, Stream, StreamRetention,
-    ZSetStream, delay, delta_lifted_delta_lifted_join, differentiate, incrementalize2, integrate,
-    lift1, lift2, lifted_delay, lifted_differentiate, lifted_h_zset_stream, lifted_integrate,
-    lifted_join_zset_stream, lifted_lifted_h_zset_stream, lifted_lifted_join_zset_stream,
-    lifted_lifted_project_zset_stream, lifted_lifted_select_zset_stream,
-    lifted_project_zset_stream, lifted_select_zset_stream, lifted_stream_elimination,
-    lifted_stream_introduction, stream_elimination, stream_introduction,
+    CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
 pub use topk::DbspTopK;
 pub use topn::DbspTopN;

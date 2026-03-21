@@ -1798,6 +1798,7 @@ dependencies = [
  "dbsp-circuit",
  "dbsp-planner",
  "dbsp-runtime",
+ "dbsp-semantic",
  "dbsp-storage",
  "object_store",
  "rand 0.8.5",
@@ -1847,6 +1848,19 @@ dependencies = [
  "slatedb",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dbsp-semantic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dbsp-runtime",
+ "object_store",
+ "rkyv 0.8.12",
+ "slatedb",
+ "tokio",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ members = [
     "crates/floe-storage",
     "crates/floe-connector-sdk",
     "crates/dbsp",
+    "crates/dbsp-semantic",
     "crates/dbsp-runtime",
     "crates/dbsp-storage",
     "crates/dbsp-circuit",

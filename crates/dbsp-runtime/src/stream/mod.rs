@@ -1,3 +1,9 @@
+//! Operational runtime streams and execution helpers.
+//!
+//! This module is intentionally not the denotational DBSP paper model.
+//! `Stream<T>` exposes runtime-facing notions such as current time,
+//! committed frontier, semantic horizon, and default-tail behavior.
+
 mod addition;
 pub mod core;
 mod cursor;
