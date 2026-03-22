@@ -585,10 +585,7 @@ materialize_benchmark() {
   docker run -d \
     --name "${MATERIALIZE_CONTAINER}" \
     --network "${NETWORK_NAME}" \
-    -p 16874:6874 \
     -p "${MATERIALIZE_SQL_PORT}:6875" \
-    -p 16876:6876 \
-    -p 16877:6877 \
     "${MATERIALIZE_IMAGE}" >/dev/null
 
   wait_for_pg "${MATERIALIZE_SQL_PORT}" materialize materialize "Materialize"

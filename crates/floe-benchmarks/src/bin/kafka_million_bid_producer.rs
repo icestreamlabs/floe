@@ -23,6 +23,7 @@ struct Config {
 enum DatasetKind {
     Bid,
     Auction,
+    Person,
 }
 
 #[derive(Debug)]
@@ -134,12 +135,62 @@ impl AuctionInput {
     }
 }
 
+#[derive(Debug)]
+struct PersonInput {
+    id: i64,
+    name: String,
+    email_address: String,
+    credit_card: String,
+    city: String,
+    state: &'static str,
+    date_time_ms: i64,
+}
+
+impl PersonInput {
+    fn from_person_idx(person_idx: usize) -> Self {
+        let person_idx_i64 = i64::try_from(person_idx).unwrap_or_default();
+        let id = 50_000_i64 + person_idx_i64;
+        let state = match person_idx % 6 {
+            0 => "or",
+            1 => "id",
+            2 => "ca",
+            3 => "wa",
+            4 => "ny",
+            _ => "tx",
+        };
+        Self {
+            id,
+            name: format!("person_{person_idx}"),
+            email_address: format!("person_{person_idx}@example.com"),
+            credit_card: format!("0000-0000-0000-{person_idx:04}"),
+            city: format!("city_{}", person_idx % 101),
+            state,
+            date_time_ms: BASE_TS_MS + person_idx_i64,
+        }
+    }
+
+    fn to_json(&self, person_idx: usize) -> String {
+        format!(
+            "{{\"id\":{},\"name\":\"{}\",\"email_address\":\"{}\",\"credit_card\":\"{}\",\"city\":\"{}\",\"state\":\"{}\",\"date_time\":{},\"extra\":\"person_extra_{}\"}}",
+            self.id,
+            self.name,
+            self.email_address,
+            self.credit_card,
+            self.city,
+            self.state,
+            self.date_time_ms,
+            person_idx,
+        )
+    }
+}
+
 impl DatasetKind {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "bid" | "bids" => Ok(Self::Bid),
             "auction" | "auctions" => Ok(Self::Auction),
-            other => bail!("unsupported --dataset value '{other}' (expected bid|auction)"),
+            "person" | "persons" => Ok(Self::Person),
+            other => bail!("unsupported --dataset value '{other}' (expected bid|auction|person)"),
         }
     }
 
@@ -147,6 +198,7 @@ impl DatasetKind {
         match self {
             Self::Bid => "bid",
             Self::Auction => "auction",
+            Self::Person => "person",
         }
     }
 }
@@ -204,7 +256,7 @@ fn parse_args() -> Result<Config> {
 
 fn print_usage() {
     println!(
-        "Usage: kafka_million_bid_producer --brokers HOST:PORT --topic TOPIC [--dataset bid|auction] [--rows N] [--progress-every N]"
+        "Usage: kafka_million_bid_producer --brokers HOST:PORT --topic TOPIC [--dataset bid|auction|person] [--rows N] [--progress-every N]"
     );
 }
 
@@ -225,6 +277,7 @@ async fn main() -> Result<()> {
                     row_idx.min(usize::try_from(AUCTION_CARDINALITY).unwrap_or(row_idx));
                 AuctionInput::from_auction_idx(auction_idx).to_json(auction_idx)
             }
+            DatasetKind::Person => PersonInput::from_person_idx(row_idx).to_json(row_idx),
         };
 
         loop {
