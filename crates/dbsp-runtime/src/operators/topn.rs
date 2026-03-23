@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -45,8 +45,9 @@ where
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     input_cache: Option<HashMap<K, i64>>,
     output_cache: HashMap<K, i64>,
+    partition_output_cache: BTreeMap<P, HashMap<K, i64>>,
     // In-memory ordering index for top-N row semantics; rebuilt from storage on restart.
-    order_index: Option<BTreeMap<(P, O, K), i64>>,
+    order_index: Option<BTreeMap<P, BTreeMap<(O, K), i64>>>,
     row_partition_cache: HashMap<K, Option<P>>,
     row_order_cache: HashMap<K, Option<O>>,
     partition_key: PartitionKeyFn<K, P>,
@@ -86,6 +87,7 @@ where
             dict_cache: HashMap::new(),
             input_cache: None,
             output_cache: HashMap::new(),
+            partition_output_cache: BTreeMap::new(),
             order_index: None,
             row_partition_cache: HashMap::new(),
             row_order_cache: HashMap::new(),
@@ -112,25 +114,18 @@ where
         Ok(())
     }
 
-    fn compute_topn(&self, order_index: &BTreeMap<(P, O, K), i64>) -> HashMap<K, i64> {
+    fn compute_partition_topn(&self, partition_index: &BTreeMap<(O, K), i64>) -> HashMap<K, i64> {
         if self.limit == 0 {
             return HashMap::new();
         }
 
-        let mut current_partition: Option<&P> = None;
-        let mut remaining_skip = 0usize;
-        let mut remaining_take = 0usize;
+        let mut remaining_skip = self.offset;
+        let mut remaining_take = self.limit;
         let mut output = HashMap::new();
 
-        for ((partition, _order_key, row), weight) in order_index.iter() {
-            if current_partition != Some(partition) {
-                current_partition = Some(partition);
-                remaining_skip = self.offset;
-                remaining_take = self.limit;
-            }
-
+        for ((_order_key, row), weight) in partition_index.iter() {
             if remaining_take == 0 {
-                continue;
+                break;
             }
 
             let mut remaining_weight = *weight;
@@ -169,7 +164,7 @@ where
             .iter()
             .map(|(key, weight)| (key.clone(), *weight))
             .collect();
-        let mut index = BTreeMap::new();
+        let mut index: BTreeMap<P, BTreeMap<(O, K), i64>> = BTreeMap::new();
         for (key, weight) in entries {
             if weight <= 0 {
                 continue;
@@ -177,7 +172,10 @@ where
             let partition_key = self.partition_key_for(&key);
             let order_key = self.order_key_for(&key);
             if let (Some(partition_key), Some(order_key)) = (partition_key, order_key) {
-                index.insert((partition_key, order_key, key), weight);
+                index
+                    .entry(partition_key)
+                    .or_default()
+                    .insert((order_key, key), weight);
             }
         }
         self.order_index = Some(index);
@@ -360,6 +358,7 @@ where
         }
 
         let mut cache_prune = Vec::new();
+        let mut affected_partitions = BTreeSet::new();
         if let Some(mut order_index) = self.order_index.take() {
             for (key, old_weight, new_weight, partition_key, order_key) in &cache_updates {
                 let old_positive = *old_weight > 0;
@@ -383,13 +382,29 @@ where
                     continue;
                 };
 
-                let index_key = (partition_key, order_key, key.clone());
+                affected_partitions.insert(partition_key.clone());
+                let index_key = (order_key, key.clone());
                 if old_positive && new_positive {
-                    order_index.insert(index_key, *new_weight);
+                    order_index
+                        .entry(partition_key.clone())
+                        .or_default()
+                        .insert(index_key, *new_weight);
                 } else if old_positive {
-                    order_index.remove(&index_key);
+                    let mut remove_partition = false;
+                    if let Some(partition_index) = order_index.get_mut(&partition_key) {
+                        partition_index.remove(&index_key);
+                        if partition_index.is_empty() {
+                            remove_partition = true;
+                        }
+                    }
+                    if remove_partition {
+                        order_index.remove(&partition_key);
+                    }
                 } else if new_positive {
-                    order_index.insert(index_key, *new_weight);
+                    order_index
+                        .entry(partition_key.clone())
+                        .or_default()
+                        .insert(index_key, *new_weight);
                 }
 
                 if *new_weight == 0 {
@@ -407,15 +422,48 @@ where
             .order_index
             .as_ref()
             .context("topn order index missing after update")?;
-        let new_output = self.compute_topn(order_index);
-        let output_delta_vec = compute_delta(&self.output_cache, &new_output);
-        self.output_cache = new_output;
+        let mut output_delta = HashMap::new();
+        for partition_key in affected_partitions {
+            let old_partition_output = self
+                .partition_output_cache
+                .get(&partition_key)
+                .cloned()
+                .unwrap_or_default();
+            let new_partition_output = order_index
+                .get(&partition_key)
+                .map(|partition_index| self.compute_partition_topn(partition_index))
+                .unwrap_or_default();
 
-        if output_delta_vec.is_empty() {
+            for (key, delta) in compute_delta(&old_partition_output, &new_partition_output) {
+                if delta == 0 {
+                    continue;
+                }
+                let entry = output_delta.entry(key.clone()).or_insert(0);
+                *entry += delta;
+                if *entry == 0 {
+                    output_delta.remove(&key);
+                }
+            }
+
+            if new_partition_output.is_empty() {
+                self.partition_output_cache.remove(&partition_key);
+            } else {
+                self.partition_output_cache
+                    .insert(partition_key, new_partition_output);
+            }
+        }
+        for (key, delta) in &output_delta {
+            let entry = self.output_cache.entry(key.clone()).or_insert(0);
+            *entry += *delta;
+            if *entry == 0 {
+                self.output_cache.remove(key);
+            }
+        }
+
+        if output_delta.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let output_delta: HashMap<K, i64> = output_delta_vec.into_iter().collect();
         let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None)
             .await
             .context("persist topn output delta")?;
@@ -775,6 +823,89 @@ mod tests {
             .await
             .expect("materialize output");
         assert_eq!(materialized, HashMap::from([(101, 1), (201, 1)]));
+    }
+
+    #[tokio::test]
+    async fn topn_operator_updates_only_affected_partition_output() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_local_input", None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_local_output", None)
+                .await
+                .expect("output dict"),
+        );
+        let integrated_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "topn_partition_local_state", None)
+                .await
+                .expect("state dict"),
+        );
+
+        let state = RelationState {
+            integrated: VersionedZSet::new(
+                integrated_dict,
+                table.clone(),
+                "topn_partition_local_state".to_string(),
+            )
+            .await
+            .expect("integrated state"),
+            latest_handle: ZSetHandle {
+                ns: "topn_partition_local_state".to_string(),
+                version: 0,
+            },
+        };
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "topn_partition_local_output".to_string(),
+        )
+        .await
+        .expect("output");
+
+        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value / 100));
+        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value % 100));
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+
+        let initial = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "topn_partition_local_input",
+            &[(101, 1), (102, 1), (201, 1), (202, 1)],
+        )
+        .await;
+        op.on_step(1, &[initial])
+            .await
+            .expect("initial step")
+            .expect("initial output");
+
+        let update = stage_version(
+            input_dict,
+            table.clone(),
+            "topn_partition_local_input",
+            &[(100, 1)],
+        )
+        .await;
+        let out = op
+            .on_step(2, &[update])
+            .await
+            .expect("partition-local update")
+            .expect("non-empty delta");
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            "topn_partition_local_output".to_string(),
+            output_dict.clone(),
+        );
+        let materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
+            .await
+            .expect("materialize output");
+        assert_eq!(materialized, HashMap::from([(101, -1), (100, 1)]));
     }
 
     #[tokio::test]
