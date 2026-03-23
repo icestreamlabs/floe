@@ -350,6 +350,133 @@ query_sql_for_engine() {
   esac
 }
 
+query_sql_floe() {
+  case "$1" in
+    q0)
+      cat <<'SQL'
+SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra FROM nexmark_bid
+SQL
+      ;;
+    q1)
+      cat <<'SQL'
+SELECT auction, bidder, price * 89 / 100 AS converted_price, date_time AS "dateTime", extra FROM nexmark_bid
+SQL
+      ;;
+    q2)
+      cat <<'SQL'
+SELECT auction, price FROM nexmark_bid WHERE auction % 123 = 0
+SQL
+      ;;
+    q3)
+      cat <<'SQL'
+SELECT p.name, p.city, p.state, a.id FROM nexmark_auction AS a JOIN nexmark_person AS p ON a.seller = p.id WHERE a.category = 10 AND p.state IN ('or', 'id', 'ca')
+SQL
+      ;;
+    q4)
+      cat <<'SQL'
+SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category
+SQL
+      ;;
+    q5)
+      cat <<'SQL'
+SELECT auction, COUNT(*) AS num FROM nexmark_bid GROUP BY auction, HOP(date_time, 2000, 10000)
+SQL
+      ;;
+    q6)
+      cat <<'SQL'
+SELECT seller, AVG(price) AS moving_avg_price FROM (SELECT a.seller, b.price, b.date_time, ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked WHERE rownum <= 1 GROUP BY seller
+SQL
+      ;;
+    q7)
+      cat <<'SQL'
+SELECT MAX(price) AS maxprice FROM nexmark_bid GROUP BY TUMBLE(date_time, 10000)
+SQL
+      ;;
+    q8)
+      cat <<'SQL'
+SELECT id, name, COUNT(*) AS person_count FROM nexmark_person GROUP BY id, name, TUMBLE(date_time, 10000)
+SQL
+      ;;
+    q9)
+      cat <<'SQL'
+SELECT id, "itemName", description, "initialBid", reserve, "dateTime", expires, seller, category, extra, auction, bidder, price, "bidTime", "bidExtra" FROM (SELECT a.id, a.item_name AS "itemName", a.description, a.initial_bid AS "initialBid", a.reserve, a.date_time AS "dateTime", a.expires, a.seller, a.category, a.extra, b.auction, b.bidder, b.price, b.date_time AS "bidTime", b.extra AS "bidExtra", ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.date_time ASC) AS rownum FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked WHERE rownum <= 1
+SQL
+      ;;
+    q12)
+      cat <<'SQL'
+SELECT bidder, COUNT(*) AS bid_count FROM nexmark_bid GROUP BY bidder, TUMBLE(date_time, 10000)
+SQL
+      ;;
+    q13)
+      cat <<'SQL'
+SELECT b.auction, b.bidder, b.price, b.date_time AS "dateTime", a.seller AS value FROM (SELECT *, PROCTIME() AS p_time FROM nexmark_bid) b JOIN nexmark_auction AS a ON b.auction = a.id WHERE b.auction % 10000 = a.id % 10000
+SQL
+      ;;
+    q14)
+      cat <<'SQL'
+SELECT auction, bidder, price * 908 / 1000 AS price, CASE WHEN HOUR(date_time) >= 8 AND HOUR(date_time) <= 18 THEN 'dayTime' WHEN HOUR(date_time) <= 6 OR HOUR(date_time) >= 20 THEN 'nightTime' ELSE 'otherTime' END AS bid_time_type, date_time AS "dateTime", extra, COUNT_CHAR(extra, 'c') AS c_counts FROM nexmark_bid WHERE price * 908 / 1000 > 1000000 AND price * 908 / 1000 < 50000000
+SQL
+      ;;
+    q15)
+      cat <<'SQL'
+SELECT DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM nexmark_bid GROUP BY DATE_FORMAT(date_time, 'yyyy-MM-dd')
+SQL
+      ;;
+    q16)
+      cat <<'SQL'
+SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM nexmark_bid GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')
+SQL
+      ;;
+    q17)
+      cat <<'SQL'
+SELECT auction, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, AVG(price) AS avg_price, SUM(price) AS sum_price FROM nexmark_bid GROUP BY auction, DATE_FORMAT(date_time, 'yyyy-MM-dd')
+SQL
+      ;;
+    q18)
+      cat <<'SQL'
+SELECT auction, bidder, price, channel, url, "dateTime", extra FROM (SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY date_time DESC) AS rank_number FROM nexmark_bid) dedup WHERE rank_number <= 1
+SQL
+      ;;
+    q19)
+      cat <<'SQL'
+SELECT auction, bidder, price, channel, url, "dateTime", extra FROM (SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rank_number FROM nexmark_bid) ranked WHERE rank_number <= 10
+SQL
+      ;;
+    q20)
+      cat <<'SQL'
+SELECT b.auction, b.bidder, b.price, b.channel, b.url, b.date_time AS "dateTime", b.extra, a.item_name AS "itemName", a.description, a.initial_bid AS "initialBid", a.reserve, a.date_time AS auction_time, a.expires, a.seller, a.category, a.extra AS auction_extra FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id WHERE a.category = 10
+SQL
+      ;;
+    q21)
+      cat <<'SQL'
+SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) END AS channel_id FROM nexmark_bid WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')
+SQL
+      ;;
+    q22)
+      cat <<'SQL'
+SELECT auction, bidder, price, channel, SPLIT_INDEX(url, '/', 3) AS dir1, SPLIT_INDEX(url, '/', 4) AS dir2, SPLIT_INDEX(url, '/', 5) AS dir3 FROM nexmark_bid
+SQL
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+floe_query_uses_alias_ctes() {
+  case "$1" in
+    q13|q14|q21|q22) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+floe_query_uses_legacy_ingest_views() {
+  case "$1" in
+    q13|q14|q21|q22) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 selected_queries() {
   local selector="$1"
   if [[ "${selector}" == "all" || "${selector}" == "nexmark_all" ]]; then
@@ -614,17 +741,21 @@ poll_floe_kafka_group_catchup() {
     fi
 
     if [[ "${ready}" == "1" ]] && has_source "${sources}" auction; then
-      local auction_count
-      auction_count="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT row_count FROM benchmark_ingest_auction")"
-      if [[ -z "${auction_count}" || ! "${auction_count}" =~ ^[0-9]+$ || ${auction_count} -lt ${AUCTION_ROWS} ]]; then
+      local auction_status
+      auction_status="$(docker exec "${REDPANDA_CONTAINER}" rpk group describe "${auction_group_id}" 2>/dev/null | awk -v t="${auction_topic}" '$1==t {print $3" "$5" "$6; exit}')"
+      local auction_current auction_end auction_lag
+      read -r auction_current auction_end auction_lag <<< "${auction_status}"
+      if [[ -z "${auction_current:-}" || -z "${auction_end:-}" || -z "${auction_lag:-}" || ! "${auction_current}" =~ ^[0-9]+$ || ! "${auction_end}" =~ ^[0-9]+$ || ! "${auction_lag}" =~ ^[0-9]+$ || ${auction_current} -lt ${AUCTION_ROWS} || ${auction_end} -lt ${AUCTION_ROWS} || ${auction_lag} -ne 0 ]]; then
         ready=0
       fi
     fi
 
     if [[ "${ready}" == "1" ]] && has_source "${sources}" person; then
-      local person_count
-      person_count="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT row_count FROM benchmark_ingest_person")"
-      if [[ -z "${person_count}" || ! "${person_count}" =~ ^[0-9]+$ || ${person_count} -lt ${PERSON_ROWS} ]]; then
+      local person_status
+      person_status="$(docker exec "${REDPANDA_CONTAINER}" rpk group describe "${person_group_id}" 2>/dev/null | awk -v t="${person_topic}" '$1==t {print $3" "$5" "$6; exit}')"
+      local person_current person_end person_lag
+      read -r person_current person_end person_lag <<< "${person_status}"
+      if [[ -z "${person_current:-}" || -z "${person_end:-}" || -z "${person_lag:-}" || ! "${person_current}" =~ ^[0-9]+$ || ! "${person_end}" =~ ^[0-9]+$ || ! "${person_lag}" =~ ^[0-9]+$ || ${person_current} -lt ${PERSON_ROWS} || ${person_end} -lt ${PERSON_ROWS} || ${person_lag} -ne 0 ]]; then
         ready=0
       fi
     fi
@@ -1755,41 +1886,55 @@ write_floe_program_sql() {
   local path="$1"
   local query_id="$2"
   local sources="$3"
-  local base_query
-  base_query="$(query_sql "${query_id}")"
-  local ctes=()
+  local query_text
 
   : > "${path}"
 
-  if has_source "${sources}" bid; then
-    ctes+=('bid AS (SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra FROM nexmark_bid)')
-    cat >> "${path}" <<'SQL'
+  if floe_query_uses_alias_ctes "${query_id}"; then
+    local base_query
+    base_query="$(query_sql "${query_id}")"
+    local ctes=()
+
+    if has_source "${sources}" bid; then
+      ctes+=('bid AS (SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra FROM nexmark_bid)')
+    fi
+
+    if has_source "${sources}" auction; then
+      ctes+=('auction AS (SELECT id, item_name AS "itemName", description, initial_bid AS "initialBid", reserve, date_time AS "dateTime", expires, seller, category, extra FROM nexmark_auction)')
+    fi
+
+    if has_source "${sources}" person; then
+      ctes+=('person AS (SELECT id, name, city, state, date_time AS "dateTime", extra FROM nexmark_person)')
+    fi
+
+    if floe_query_uses_legacy_ingest_views "${query_id}"; then
+      if has_source "${sources}" bid; then
+        cat >> "${path}" <<'SQL'
 CREATE MATERIALIZED VIEW benchmark_ingest_bid AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_bid;
 SQL
-  fi
+      fi
 
-  if has_source "${sources}" auction; then
-    ctes+=('auction AS (SELECT id, item_name AS "itemName", description, initial_bid AS "initialBid", reserve, date_time AS "dateTime", expires, seller, category, extra FROM nexmark_auction)')
-    cat >> "${path}" <<'SQL'
+      if has_source "${sources}" auction; then
+        cat >> "${path}" <<'SQL'
 CREATE MATERIALIZED VIEW benchmark_ingest_auction AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_auction;
 SQL
-  fi
+      fi
 
-  if has_source "${sources}" person; then
-    ctes+=('person AS (SELECT id, name, city, state, date_time AS "dateTime", extra FROM nexmark_person)')
-    cat >> "${path}" <<'SQL'
+      if has_source "${sources}" person; then
+        cat >> "${path}" <<'SQL'
 CREATE MATERIALIZED VIEW benchmark_ingest_person AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_person;
 SQL
-  fi
+      fi
+    fi
 
-  local query_text="${base_query}"
-  if (( ${#ctes[@]} > 0 )); then
     query_text="WITH ${ctes[0]}"
     local idx
     for ((idx = 1; idx < ${#ctes[@]}; idx++)); do
       query_text+=", ${ctes[idx]}"
     done
     query_text+=" ${base_query}"
+  else
+    query_text="$(query_sql_floe "${query_id}")"
   fi
 
   cat >> "${path}" <<SQL

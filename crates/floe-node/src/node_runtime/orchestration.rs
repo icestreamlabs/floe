@@ -935,6 +935,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         let mut last_mv_versions: HashMap<String, u64> = HashMap::new();
         let mut committed_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
         let mut latest_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
+        let mut committed_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
+        let mut committed_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
         let mut mv_last_update_at_ms: HashMap<String, u64> = tracked_mv_names
             .iter()
             .map(|view| (view.clone(), current_unix_time_ms()))
@@ -1467,13 +1469,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             for mv_version in &mv_versions {
                 mv_last_update_at_ms.insert(mv_version.view.clone(), committed_at_ms);
             }
+            advance_kafka_offset_commit_state(&mut committed_kafka_offsets, &tick_kafka_offsets);
+            advance_postgres_cdc_commit_state(&mut committed_postgres_lsns, &tick_postgres_lsns);
             record_mv_freshness_metrics(&mv_last_update_at_ms, current_unix_time_ms());
             metrics::record_last_committed_tick(epoch);
             metrics::record_checkpoint_age_seconds(0);
             last_checkpoint_commit_at = Instant::now();
             if !tick_kafka_offsets.is_empty() && !kafka_commit_senders_for_task.is_empty() {
                 let kafka_commit_start = Instant::now();
-                let commit = build_kafka_offset_commit(epoch, &tick_kafka_offsets);
+                let commit = build_kafka_offset_commit(epoch, &committed_kafka_offsets);
                 for sender in &kafka_commit_senders_for_task {
                     let _ = sender.send(commit.clone());
                 }
@@ -1484,7 +1488,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
             if !tick_postgres_lsns.is_empty() && !postgres_cdc_commit_senders_for_task.is_empty() {
                 let postgres_commit_start = Instant::now();
-                let commit = build_postgres_cdc_commit(epoch, &tick_postgres_lsns);
+                let commit = build_postgres_cdc_commit(epoch, &committed_postgres_lsns);
                 for sender in &postgres_cdc_commit_senders_for_task {
                     let _ = sender.send(commit.clone());
                 }
@@ -1665,6 +1669,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tracing::error!(error = %err, "cancellation propagation task joined with error");
     }
 
+    drop(source_bridge);
+    drop(query);
+    drop(mv_registry);
+    drop(outer_registry);
+
+    let close_result = db.close().await.map_err(anyhow::Error::new);
+
     if let Some(message) = runtime_failure
         .lock()
         .expect("runtime failure lock poisoned")
@@ -1672,6 +1683,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     {
         return Err(anyhow!(message));
     }
+
+    close_result?;
 
     server_result
 }

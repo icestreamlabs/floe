@@ -15,7 +15,7 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, Settings};
-use slatedb::{Db, Error as SlateError};
+use slatedb::{CloseReason, Db, Error as SlateError, ErrorKind};
 use tokio::fs;
 
 const TABLE_DEF_PREFIX: &str = "meta/table/";
@@ -300,6 +300,14 @@ impl SlateCatalog {
     pub fn db(&self) -> Arc<Db> {
         self.db.clone()
     }
+
+    pub async fn close(&self) -> Result<()> {
+        match self.db.close().await {
+            Ok(()) => Ok(()),
+            Err(err) if matches!(err.kind(), ErrorKind::Closed(CloseReason::Clean)) => Ok(()),
+            Err(err) => Err(anyhow!("failed to close SlateDB catalog: {err}")),
+        }
+    }
 }
 
 pub fn catalog_db(catalog: &SlateCatalog) -> Arc<Db> {
@@ -483,5 +491,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&vec![RowValue::Int64(1), RowValue::Int64(10)]));
         assert!(rows.contains(&vec![RowValue::Int64(2), RowValue::Int64(20)]));
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+        catalog.close().await.expect("close catalog");
+        catalog.close().await.expect("close catalog again");
     }
 }

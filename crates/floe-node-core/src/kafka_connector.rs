@@ -848,6 +848,7 @@ impl KafkaConnector {
             has_offsets = true;
         }
         if !has_offsets {
+            self.last_committed_tick_id = commit.tick_id;
             return Ok(());
         }
 

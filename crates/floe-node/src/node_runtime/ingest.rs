@@ -127,6 +127,16 @@ pub(super) fn event_postgres_lsn(
     }
 }
 
+pub(super) fn advance_kafka_offset_commit_state(
+    committed_offsets: &mut HashMap<(String, i32), i64>,
+    tick_offsets: &HashMap<(String, i32), i64>,
+) {
+    for (key, &offset) in tick_offsets {
+        let entry = committed_offsets.entry(key.clone()).or_insert(offset);
+        *entry = (*entry).max(offset);
+    }
+}
+
 pub(super) fn build_kafka_offset_commit(
     tick_id: u64,
     offsets: &HashMap<(String, i32), i64>,
@@ -165,6 +175,20 @@ pub(super) fn build_postgres_cdc_commit(
     PostgresCdcCommit {
         tick_id,
         slots: entries,
+    }
+}
+
+pub(super) fn advance_postgres_cdc_commit_state(
+    committed_slots: &mut HashMap<String, (u64, String)>,
+    tick_slots: &HashMap<String, (u64, String)>,
+) {
+    for (slot, (lsn_value, lsn_text)) in tick_slots {
+        let entry = committed_slots
+            .entry(slot.clone())
+            .or_insert_with(|| (*lsn_value, lsn_text.clone()));
+        if *lsn_value > entry.0 {
+            *entry = (*lsn_value, lsn_text.clone());
+        }
     }
 }
 

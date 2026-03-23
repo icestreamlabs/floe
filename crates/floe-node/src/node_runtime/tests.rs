@@ -226,6 +226,76 @@ fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
 }
 
 #[test]
+fn kafka_offset_commit_state_preserves_idle_topic_offsets() {
+    let mut committed = HashMap::new();
+    advance_kafka_offset_commit_state(
+        &mut committed,
+        &HashMap::from([
+            (("auction".to_string(), 0_i32), 41_i64),
+            (("person".to_string(), 0_i32), 17_i64),
+        ]),
+    );
+
+    advance_kafka_offset_commit_state(
+        &mut committed,
+        &HashMap::from([(("person".to_string(), 0_i32), 22_i64)]),
+    );
+
+    assert_eq!(
+        build_kafka_offset_commit(2, &committed),
+        KafkaOffsetCommit {
+            tick_id: 2,
+            offsets: vec![
+                KafkaTopicPartitionOffset {
+                    topic: "auction".to_string(),
+                    partition: 0,
+                    offset: 41,
+                },
+                KafkaTopicPartitionOffset {
+                    topic: "person".to_string(),
+                    partition: 0,
+                    offset: 22,
+                },
+            ],
+        }
+    );
+}
+
+#[test]
+fn postgres_cdc_commit_state_preserves_idle_slots() {
+    let mut committed = HashMap::new();
+    advance_postgres_cdc_commit_state(
+        &mut committed,
+        &HashMap::from([
+            ("slot_a".to_string(), (16_u64, "0/10".to_string())),
+            ("slot_b".to_string(), (32_u64, "0/20".to_string())),
+        ]),
+    );
+
+    advance_postgres_cdc_commit_state(
+        &mut committed,
+        &HashMap::from([("slot_b".to_string(), (48_u64, "0/30".to_string()))]),
+    );
+
+    assert_eq!(
+        build_postgres_cdc_commit(3, &committed),
+        PostgresCdcCommit {
+            tick_id: 3,
+            slots: vec![
+                PostgresSlotCommit {
+                    slot: "slot_a".to_string(),
+                    lsn: "0/10".to_string(),
+                },
+                PostgresSlotCommit {
+                    slot: "slot_b".to_string(),
+                    lsn: "0/30".to_string(),
+                },
+            ],
+        }
+    );
+}
+
+#[test]
 fn cli_connector_creation_flags_collects_explicit_connector_inputs() {
     let mut args = default_run_args();
     args.config = Some("node.toml".to_string());
