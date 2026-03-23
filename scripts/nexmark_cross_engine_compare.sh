@@ -132,6 +132,15 @@ input_rows_total_for_sources() {
   printf '%s\n' "${total}"
 }
 
+floe_result_row_target_for_query() {
+  case "$1" in
+    q15) printf '1\n' ;;
+    q16) printf '5\n' ;;
+    q17) printf '10000\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
 query_sql() {
   case "$1" in
     q0)
@@ -622,6 +631,66 @@ poll_floe_kafka_group_catchup() {
   done
 
   return 1
+}
+
+poll_floe_result_rows_at_least() {
+  local expected_rows="$1"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local result_rows
+    result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ && ${result_rows} -ge ${expected_rows} ]]; then
+      return 0
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
+poll_floe_query_completion() {
+  local query_id="$1"
+  local sources="$2"
+  local bid_group_id="$3"
+  local auction_group_id="$4"
+  local person_group_id="$5"
+  local bid_topic="$6"
+  local auction_topic="$7"
+  local person_topic="$8"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  if ! poll_floe_kafka_group_catchup \
+    "${sources}" \
+    "${bid_group_id}" \
+    "${auction_group_id}" \
+    "${person_group_id}" \
+    "${bid_topic}" \
+    "${auction_topic}" \
+    "${person_topic}"; then
+    return 1
+  fi
+
+  local expected_result_rows
+  expected_result_rows="$(floe_result_row_target_for_query "${query_id}")"
+  if [[ -n "${expected_result_rows}" ]] && ! poll_floe_result_rows_at_least "${expected_result_rows}"; then
+    return 1
+  fi
+
+  now_ms="$(date +%s%3N)"
+  POST_PRODUCE_WAIT_MS=$((now_ms - start_ms))
+  return 0
 }
 
 stop_floe_process() {
@@ -1680,7 +1749,6 @@ run_floe_query() {
 
   local config_path="${artifact_dir}/floe_config.json"
   local program_path="${artifact_dir}/program.sql"
-
   write_floe_config "${config_path}" "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}" "${bid_group_id}" "${auction_group_id}" "${person_group_id}"
   write_floe_program_sql "${program_path}" "${query_id}" "${sources}"
 
@@ -1715,10 +1783,10 @@ run_floe_query() {
   local input_rows
   input_rows="$(input_rows_total_for_sources "${sources}")"
 
-  local start_ms end_ms total_ms rows_per_sec result_rows
+  local start_ms end_ms total_ms rows_per_sec result_rows notes
   start_ms="$(date +%s%3N)"
   produce_for_query_sources "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}"
-  if ! poll_floe_kafka_group_catchup "${sources}" "${bid_group_id}" "${auction_group_id}" "${person_group_id}" "${bid_topic}" "${auction_topic}" "${person_topic}"; then
+  if ! poll_floe_query_completion "${query_id}" "${sources}" "${bid_group_id}" "${auction_group_id}" "${person_group_id}" "${bid_topic}" "${auction_topic}" "${person_topic}"; then
     stop_floe_process
     return 1
   fi
@@ -1732,9 +1800,13 @@ run_floe_query() {
 
   result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
   [[ -z "${result_rows}" ]] && result_rows="n/a"
+  notes="source_catchup_kafka_group_offsets"
+  if [[ -n "$(floe_result_row_target_for_query "${query_id}")" ]]; then
+    notes="source_catchup_kafka_group_offsets_and_result_visibility"
+  fi
 
   stop_floe_process
-  append_summary_row floe "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "source_catchup_kafka_group_offsets"
+  append_summary_row floe "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
 }
 
