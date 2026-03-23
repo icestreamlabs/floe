@@ -92,6 +92,25 @@ pub(crate) fn int_rows2(batches: &[RecordBatch]) -> Vec<Vec<i64>> {
     rows
 }
 
+pub(crate) fn int_rows_n(batches: &[RecordBatch], columns: usize) -> Vec<Vec<i64>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let arrays = (0..columns)
+            .map(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 column")
+            })
+            .collect::<Vec<_>>();
+        for row_idx in 0..batch.num_rows() {
+            rows.push(arrays.iter().map(|array| array.value(row_idx)).collect());
+        }
+    }
+    rows
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BidAuctionRow {
     pub(crate) bidder: i64,

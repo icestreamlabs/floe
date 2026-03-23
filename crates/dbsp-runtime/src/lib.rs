@@ -10,6 +10,7 @@
 pub mod aggregate;
 pub mod algebra;
 pub mod collections;
+pub mod count_aggregate;
 pub mod distinct;
 pub mod filter;
 pub mod filter_map;
@@ -31,6 +32,7 @@ pub use dbsp_storage::storage;
 pub use aggregate::DbspAggregate;
 pub use algebra::AbelianGroup;
 pub use collections::{OrderedBytes, ZSet, h};
+pub use count_aggregate::DbspCountAggregate;
 pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
@@ -40,6 +42,10 @@ pub use map::DbspMap;
 pub use operators::aggregate::{AggregateOp, AggregateSpec};
 pub use operators::asof_join::AsofJoinOp;
 pub use operators::consolidate::ConsolidateOp;
+pub use operators::count_aggregate::{
+    CountAggregateOp, CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
+    GroupedCountState,
+};
 pub use operators::distinct::DistinctOp;
 pub use operators::filter::FilterOp;
 pub use operators::group_by::GroupByOp;

@@ -492,6 +492,46 @@ where
         self.decode_value_weights(aggregate)
     }
 
+    pub async fn value_weight_for_key_value(&self, key: &K, value: &V) -> Result<i64> {
+        let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
+        let value_bytes = encode(value).context("encode Arrow-index lookup value")?;
+        if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
+            return Ok(cached.get(&value_bytes).copied().unwrap_or(0));
+        }
+
+        let refs = self.segment_refs_for_key(&key_bytes).await?;
+        let mut aggregate: ValueWeightMap = FastMap::default();
+
+        for (segment_id, postings) in refs {
+            let segment = self
+                .segment_for_id(segment_id)
+                .await
+                .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
+            for (row_index, delta) in postings {
+                let value_bytes = segment
+                    .value_bytes(row_index)
+                    .with_context(|| {
+                        format!("load row {row_index} from Arrow-index segment {segment_id}")
+                    })?
+                    .to_vec();
+                let next = aggregate
+                    .get(&value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&value_bytes);
+                } else {
+                    aggregate.insert(value_bytes, next);
+                }
+            }
+        }
+
+        let weight = aggregate.get(&value_bytes).copied().unwrap_or(0);
+        self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
+        Ok(weight)
+    }
+
     pub async fn keys_for_value(&self, value: &V) -> Result<Vec<(K, i64)>> {
         if !self.reverse_enabled {
             return Err(anyhow!("reverse index not enabled"));

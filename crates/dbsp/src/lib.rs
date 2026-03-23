@@ -20,8 +20,8 @@ pub mod semantic {
 }
 
 pub use dbsp_runtime::{
-    aggregate, algebra, collections, distinct, filter, filter_map, handles, join, map, operators,
-    relation_state, semijoin, stream, topk, topn, union, window,
+    aggregate, algebra, collections, count_aggregate, distinct, filter, filter_map, handles, join,
+    map, operators, relation_state, semijoin, stream, topk, topn, union, window,
 };
 pub use dbsp_storage::storage;
 
@@ -38,6 +38,7 @@ pub use circuit::{
     nexmark_person_alias_table, nexmark_person_table,
 };
 pub use collections::{ZSet, h};
+pub use count_aggregate::DbspCountAggregate;
 pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
@@ -45,6 +46,9 @@ pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use join::DbspJoin;
 pub use map::DbspMap;
 pub use operators::consolidate::ConsolidateOp;
+pub use operators::count_aggregate::{
+    CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
+};
 pub use operators::distinct::DistinctOp;
 pub use operators::filter::FilterOp;
 pub use operators::join::JoinOp;

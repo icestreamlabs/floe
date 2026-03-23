@@ -1,5 +1,18 @@
 use super::*;
 
+#[derive(Clone)]
+struct CountEvalLayout {
+    filters: Vec<dbsp::DbspExpression>,
+    expressions: Vec<dbsp::DbspExpression>,
+    plans: Vec<CountEvalPlan>,
+}
+
+#[derive(Clone, Copy)]
+struct CountEvalPlan {
+    filter_index: Option<usize>,
+    expr_index: Option<usize>,
+}
+
 impl DbspGraphBuilder {
     pub(crate) async fn compile_aggregate(
         &mut self,
@@ -22,6 +35,48 @@ impl DbspGraphBuilder {
                 err,
             );
         });
+
+        if aggregates
+            .iter()
+            .all(|agg| agg.function() == &DbspAggregateFunction::Count)
+        {
+            let slot_kinds = aggregates
+                .iter()
+                .map(|agg| {
+                    if agg.distinct() {
+                        dbsp::CountAggregateSlotKind::Distinct
+                    } else {
+                        dbsp::CountAggregateSlotKind::Linear
+                    }
+                })
+                .collect::<Vec<_>>();
+            let row_evaluator = build_count_row_evaluator(
+                Arc::clone(&input_schema),
+                group_keys.clone(),
+                aggregates.clone(),
+                graph_id.clone(),
+                "aggregate",
+            );
+
+            let count_aggregate = DbspCountAggregate::new::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
+                &upstream,
+                row_evaluator,
+                slot_kinds,
+                Some(aggregate_error_handler),
+            )
+            .await
+            .context("initialize DBSP count aggregate")?;
+
+            let mapped = self
+                .map_count_aggregate_output(
+                    &graph_id,
+                    &count_aggregate.stream(),
+                    task_events,
+                    "aggregate-project",
+                )
+                .await?;
+            return Ok(mapped.stream());
+        }
 
         let key_schema = Arc::clone(&input_schema);
         let key_graph_id = graph_id.clone();
@@ -130,62 +185,14 @@ impl DbspGraphBuilder {
         .await
         .context("initialize DBSP aggregate")?;
 
-        let project_events = task_events.clone();
-        let project_label = format!("aggregate-project:{graph_id}");
-        let project_graph_id = graph_id.clone();
-        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
-            report_graph_task_error(
-                &project_events,
-                &project_graph_id,
-                project_label.clone(),
-                err,
-            );
-        });
-        let project_graph_id = graph_id.clone();
-        let projector = move |pair: &(Vec<u8>, Vec<u8>)| -> Vec<u8> {
-            let mut key_values = match decode_projected_row_key(&pair.0) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate group key"
-                    );
-                    return Vec::new();
-                }
-            };
-            let aggregate_values = match decode_projected_row_key(&pair.1) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate values"
-                    );
-                    return Vec::new();
-                }
-            };
-            key_values.extend(aggregate_values);
-            match encode_projected_row_key(&key_values) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to encode aggregate row"
-                    );
-                    Vec::new()
-                }
-            }
-        };
-
-        let mapped = DbspMap::new::<(Vec<u8>, Vec<u8>), Vec<u8>, _>(
-            &aggregate.stream(),
-            projector,
-            Some(project_error_handler),
-        )
-        .await
-        .context("initialize aggregate output map")?;
+        let mapped = self
+            .map_aggregate_output(
+                &graph_id,
+                &aggregate.stream(),
+                task_events,
+                "aggregate-project",
+            )
+            .await?;
 
         Ok(mapped.stream())
     }
@@ -415,4 +422,319 @@ impl DbspGraphBuilder {
 
         Ok(mapped.stream())
     }
+}
+
+impl DbspGraphBuilder {
+    async fn map_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DbspMap> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(Vec<u8>, Vec<u8>)| -> Vec<u8> {
+            let mut key_values = match decode_projected_row_key(&pair.0) {
+                Ok(values) => values,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to decode aggregate group key"
+                    );
+                    return Vec::new();
+                }
+            };
+            let aggregate_values = match decode_projected_row_key(&pair.1) {
+                Ok(values) => values,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to decode aggregate values"
+                    );
+                    return Vec::new();
+                }
+            };
+            key_values.extend(aggregate_values);
+            match encode_projected_row_key(&key_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode aggregate row"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        DbspMap::new::<(Vec<u8>, Vec<u8>), Vec<u8>, _>(
+            aggregate_stream,
+            projector,
+            Some(project_error_handler),
+        )
+        .await
+        .context("initialize aggregate output map")
+    }
+
+    async fn map_count_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DbspMap> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(Vec<u8>, Vec<i64>)| -> Vec<u8> {
+            let mut key_values = match decode_projected_row_key(&pair.0) {
+                Ok(values) => values,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to decode aggregate group key"
+                    );
+                    return Vec::new();
+                }
+            };
+            key_values.extend(pair.1.iter().map(|value| ScalarValue::Int64(Some(*value))));
+            match encode_projected_row_key(&key_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode aggregate row"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        DbspMap::new::<(Vec<u8>, Vec<i64>), Vec<u8>, _>(
+            aggregate_stream,
+            projector,
+            Some(project_error_handler),
+        )
+        .await
+        .context("initialize count aggregate output map")
+    }
+}
+
+fn build_count_row_evaluator(
+    input_schema: Arc<RowSchema>,
+    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
+    aggregates: Vec<DbspAggregateExpr>,
+    graph_id: String,
+    context: &'static str,
+) -> impl Fn(&Vec<u8>) -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> + Send + Sync + 'static
+{
+    let layout = Arc::new(build_count_eval_layout(&aggregates));
+    move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
+        let row = match decode_projected_row_key(bytes) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode aggregate row for count aggregate"
+                );
+                return None;
+            }
+        };
+
+        let mut key_values = Vec::with_capacity(group_keys.len());
+        for key_expr in &group_keys {
+            let value =
+                match eval_scalar_expression(key_expr.expression(), &row, input_schema.as_ref()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate count aggregate group key expression"
+                        );
+                        return None;
+                    }
+                };
+            key_values.push(value);
+        }
+        let encoded_key = match encode_projected_row_key(&key_values) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to encode count aggregate group key"
+                );
+                return None;
+            }
+        };
+
+        let counts = evaluate_count_row_values(
+            layout.as_ref(),
+            &aggregates,
+            &row,
+            input_schema.as_ref(),
+            &graph_id,
+            context,
+        );
+        Some(dbsp::CountAggregateRow {
+            key: encoded_key,
+            slots: counts,
+        })
+    }
+}
+
+fn build_count_eval_layout(aggregates: &[DbspAggregateExpr]) -> CountEvalLayout {
+    let mut filters = Vec::new();
+    let mut expressions = Vec::new();
+    let mut plans = Vec::with_capacity(aggregates.len());
+
+    for agg in aggregates {
+        let filter_index = agg.filter().map(|filter| {
+            if let Some(existing) = filters
+                .iter()
+                .position(|existing: &dbsp::DbspExpression| existing.expr() == filter.expr())
+            {
+                existing
+            } else {
+                filters.push(filter.clone());
+                filters.len() - 1
+            }
+        });
+        let expr_index = agg.expression().map(|expr| {
+            if let Some(existing) = expressions
+                .iter()
+                .position(|existing: &dbsp::DbspExpression| existing.expr() == expr.expr())
+            {
+                existing
+            } else {
+                expressions.push(expr.clone());
+                expressions.len() - 1
+            }
+        });
+        plans.push(CountEvalPlan {
+            filter_index,
+            expr_index,
+        });
+    }
+
+    CountEvalLayout {
+        filters,
+        expressions,
+        plans,
+    }
+}
+
+fn evaluate_count_row_values(
+    layout: &CountEvalLayout,
+    aggregates: &[DbspAggregateExpr],
+    row: &[ScalarValue],
+    schema: &RowSchema,
+    graph_id: &str,
+    context: &str,
+) -> Vec<dbsp::CountAggregateSlotUpdate<Vec<u8>>> {
+    let mut filter_results = vec![false; layout.filters.len()];
+    for (index, filter) in layout.filters.iter().enumerate() {
+        filter_results[index] = match eval_expression(filter, row, schema) {
+            Ok(include) => include,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to evaluate {context} FILTER expression"
+                );
+                false
+            }
+        };
+    }
+
+    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_valid = vec![false; layout.expressions.len()];
+    for (index, expr) in layout.expressions.iter().enumerate() {
+        match eval_scalar_expression(expr, row, schema) {
+            Ok(value) => {
+                expression_values[index] = value;
+                expression_valid[index] = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to evaluate {context} aggregate expression"
+                );
+            }
+        }
+    }
+
+    aggregates
+        .iter()
+        .zip(layout.plans.iter())
+        .map(|(agg, plan)| {
+            if let Some(filter_index) = plan.filter_index
+                && !filter_results[filter_index]
+            {
+                return if agg.distinct() {
+                    dbsp::CountAggregateSlotUpdate::Distinct(None)
+                } else {
+                    dbsp::CountAggregateSlotUpdate::Linear(0)
+                };
+            }
+            match plan.expr_index {
+                Some(expr_index) => {
+                    if expression_valid[expr_index] && !expression_values[expr_index].is_null() {
+                        if agg.distinct() {
+                            let encoded = encode_projected_row_key(std::slice::from_ref(
+                                &expression_values[expr_index],
+                            ))
+                            .map(Some)
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    graph_id = %graph_id,
+                                    error = %err,
+                                    "failed to encode count aggregate DISTINCT value"
+                                );
+                                None
+                            });
+                            dbsp::CountAggregateSlotUpdate::Distinct(encoded)
+                        } else {
+                            dbsp::CountAggregateSlotUpdate::Linear(1)
+                        }
+                    } else {
+                        if agg.distinct() {
+                            dbsp::CountAggregateSlotUpdate::Distinct(None)
+                        } else {
+                            dbsp::CountAggregateSlotUpdate::Linear(0)
+                        }
+                    }
+                }
+                None => dbsp::CountAggregateSlotUpdate::Linear(1),
+            }
+        })
+        .collect()
 }

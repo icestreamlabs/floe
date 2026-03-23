@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod asof_join;
 pub mod consolidate;
+pub mod count_aggregate;
 pub mod distinct;
 pub mod filter;
 pub mod group_by;

@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicI64;
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
-use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
+use datafusion::functions_aggregate::expr_fn::{avg, count, count_distinct, max, min, sum};
+use datafusion::logical_expr::expr_fn::ExprFunctionExt;
 use datafusion::logical_expr::{Expr, JoinType, col, lit, table_scan};
 use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
@@ -1563,6 +1564,397 @@ async fn distinct_materializes_unique_rows() {
         vec![
             vec![ScalarValue::Int64(Some(7))],
             vec![ScalarValue::Int64(Some(42))]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn count_distinct_aggregate_materializes_mv() {
+    let db = test_db("count-distinct-aggregate").await;
+    let view_name = "mv_count_distinct_aggregate";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .aggregate(
+                vec![col("bidder")],
+                vec![
+                    count(col("price")).alias("cnt"),
+                    count_distinct(col("auction")).alias("distinct_auctions"),
+                ],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let view_handle = mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("cnt", DataType::Int64, true),
+        Field::new("distinct_auctions", DataType::Int64, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build count-distinct aggregate graph");
+
+    let mut version_rx = view_handle.version_watch();
+    version_rx.borrow_and_update();
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 42, 10), 1).expect("append");
+    bid_writer.append(&bid_row(1, 42, 20), 1).expect("append");
+    bid_writer.append(&bid_row(2, 42, 30), 1).expect("append");
+    bid_writer.append(&bid_row(3, 7, 5), 1).expect("append");
+    bid_writer.flush().await.expect("flush bids");
+
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("count-distinct aggregate update timeout")
+        .expect("count-distinct aggregate update");
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1)),
+            ],
+            vec![
+                ScalarValue::Int64(Some(42)),
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(2)),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn filtered_count_distinct_aggregate_materializes_mv() {
+    let db = test_db("filtered-count-distinct-aggregate").await;
+    let view_name = "mv_filtered_count_distinct_aggregate";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .aggregate(
+                vec![col("bidder")],
+                vec![
+                    count(col("price")).alias("cnt"),
+                    count(col("price"))
+                        .filter(col("price").lt(lit(20i64)))
+                        .build()
+                        .expect("filtered count")
+                        .alias("lt20_cnt"),
+                    count_distinct(col("auction")).alias("distinct_auctions"),
+                    count_distinct(col("auction"))
+                        .filter(col("price").lt(lit(20i64)))
+                        .build()
+                        .expect("filtered distinct count")
+                        .alias("lt20_distinct_auctions"),
+                ],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let view_handle = mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("cnt", DataType::Int64, true),
+        Field::new("lt20_cnt", DataType::Int64, true),
+        Field::new("distinct_auctions", DataType::Int64, true),
+        Field::new("lt20_distinct_auctions", DataType::Int64, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build filtered count-distinct aggregate graph");
+
+    let mut version_rx = view_handle.version_watch();
+    version_rx.borrow_and_update();
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 42, 10), 1).expect("append");
+    bid_writer.append(&bid_row(1, 42, 30), 1).expect("append");
+    bid_writer.append(&bid_row(2, 42, 15), 1).expect("append");
+    bid_writer.append(&bid_row(3, 7, 25), 1).expect("append");
+    bid_writer.flush().await.expect("flush bids");
+
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("filtered count-distinct aggregate update timeout")
+        .expect("filtered count-distinct aggregate update");
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+            ],
+            vec![
+                ScalarValue::Int64(Some(42)),
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(2)),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_view() {
+    let db = test_db("filtered-count-distinct-parallel").await;
+    let ingest_view_name = "mv_parallel_ingest_count";
+    let result_view_name = "mv_parallel_filtered_count_distinct";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let ingest_plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![count(col("price")).alias("row_count")],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let result_plan = {
+        let schema = nexmark_bid_schema();
+        let logical = table_scan(Some("nexmark_bid"), &schema, None)
+            .expect("scan")
+            .aggregate(
+                vec![col("bidder")],
+                vec![
+                    count(col("price")).alias("cnt"),
+                    count(col("price"))
+                        .filter(col("price").lt(lit(20i64)))
+                        .build()
+                        .expect("filtered count")
+                        .alias("lt20_cnt"),
+                    count_distinct(col("auction")).alias("distinct_auctions"),
+                    count_distinct(col("auction"))
+                        .filter(col("price").lt(lit(20i64)))
+                        .build()
+                        .expect("filtered distinct count")
+                        .alias("lt20_distinct_auctions"),
+                ],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let mut required_sources =
+        validate_dbsp_plan(&ingest_plan, &available_sources, ingest_view_name)
+            .expect("validate ingest plan")
+            .required_sources;
+    required_sources.extend(
+        validate_dbsp_plan(&result_plan, &available_sources, result_view_name)
+            .expect("validate result plan")
+            .required_sources,
+    );
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(ingest_view_name);
+    mv_registry.set_schema(
+        ingest_view_name,
+        arrow_schema(vec![Field::new("row_count", DataType::Int64, true)]),
+    );
+    let result_view_handle = mv_registry.register(result_view_name);
+    mv_registry.set_schema(
+        result_view_name,
+        arrow_schema(vec![
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("cnt", DataType::Int64, true),
+            Field::new("lt20_cnt", DataType::Int64, true),
+            Field::new("distinct_auctions", DataType::Int64, true),
+            Field::new("lt20_distinct_auctions", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+
+    builder
+        .build(BuildInputs {
+            graph_id: ingest_view_name,
+            view_name: ingest_view_name,
+            plan: &ingest_plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build ingest graph");
+
+    builder
+        .build(BuildInputs {
+            graph_id: result_view_name,
+            view_name: result_view_name,
+            plan: &result_plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build result graph");
+
+    let mut version_rx = result_view_handle.version_watch();
+    version_rx.borrow_and_update();
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 42, 10), 1).expect("append");
+    bid_writer.append(&bid_row(1, 42, 30), 1).expect("append");
+    bid_writer.append(&bid_row(2, 42, 15), 1).expect("append");
+    bid_writer.append(&bid_row(3, 7, 25), 1).expect("append");
+    bid_writer.flush().await.expect("flush bids");
+
+    timeout(Duration::from_millis(200), version_rx.changed())
+        .await
+        .expect("parallel filtered count-distinct aggregate update timeout")
+        .expect("parallel filtered count-distinct aggregate update");
+
+    let mut rows = materialized_rows(&mv_registry, result_view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+            ],
+            vec![
+                ScalarValue::Int64(Some(42)),
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(2)),
+            ],
         ]
     );
 }

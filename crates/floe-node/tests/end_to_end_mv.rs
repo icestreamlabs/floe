@@ -20,3 +20,5 @@ mod projection;
 mod restart;
 #[path = "end_to_end_mv/rows.rs"]
 mod rows;
+#[path = "end_to_end_mv/wrapped_aggregates.rs"]
+mod wrapped_aggregates;

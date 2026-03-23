@@ -10,10 +10,11 @@ use dbsp::operators::semijoin::SemiJoinMode;
 use dbsp::stream::runtime::RuntimeErrorHandler;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use dbsp::{
-    DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspDistinct, DbspDistinctNode,
-    DbspFilterMap, DbspJoin, DbspJoinNode, DbspJoinType, DbspMap, DbspProjectNode, DbspScalarType,
-    DbspSelectNode, DbspSemiJoin, DbspSourceNode, DbspTopN, DbspTopNNode, DbspUnion, DbspUnionNode,
-    DbspWindowAggregate, DbspWindowAggregateNode, DbspWindowPolicy, RowSchema, WindowKey,
+    DbspAggregate, DbspAggregateFunction, DbspAggregateNode, DbspCountAggregate, DbspDistinct,
+    DbspDistinctNode, DbspFilterMap, DbspJoin, DbspJoinNode, DbspJoinType, DbspMap,
+    DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSemiJoin, DbspSourceNode, DbspTopN,
+    DbspTopNNode, DbspUnion, DbspUnionNode, DbspWindowAggregate, DbspWindowAggregateNode,
+    DbspWindowPolicy, RowSchema, WindowKey,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
