@@ -53,6 +53,33 @@ impl From<TransientSourceBatch> for TransientMaterializeBatch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::DbspGraphBuilder;
+
+    #[test]
+    fn bootstraps_authoritative_zero_only_for_zero_frontier_zero_logical_version() {
+        assert!(DbspGraphBuilder::should_bootstrap_authoritative_zero(
+            0, None
+        ));
+        assert!(DbspGraphBuilder::should_bootstrap_authoritative_zero(
+            0,
+            Some(0)
+        ));
+        assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+            1, None
+        ));
+        assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+            0,
+            Some(1)
+        ));
+        assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+            2,
+            Some(0)
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FlushTrigger {
     MaxPendingDeltas,
@@ -276,6 +303,16 @@ fn into_owned_deltas(deltas: EncodedDeltaBatch) -> Vec<(Vec<u8>, i64)> {
 }
 
 impl DbspGraphBuilder {
+    fn should_bootstrap_authoritative_zero(
+        view_frontier: i64,
+        logical_version: Option<u64>,
+    ) -> bool {
+        if view_frontier != 0 {
+            return false;
+        }
+        logical_version.unwrap_or(0) == 0
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn materialize_view(
         &mut self,
@@ -315,8 +352,12 @@ impl DbspGraphBuilder {
             let handle = view_handle_stream.get(view_frontier).await?;
             let state = self.state_from_handle(&handle).await?;
             registry_handle.set_dbsp_state(state);
-            registry_handle.mark_state_non_authoritative();
             registry_handle.publish_version(view_frontier, handle.clone());
+            if Self::should_bootstrap_authoritative_zero(view_frontier, None) {
+                let _ = registry_handle.seed_authoritative_row_count_if_latest(0, 0);
+            } else {
+                registry_handle.mark_state_non_authoritative();
+            }
             mv_latest.insert(view_name.to_string(), (view_frontier, handle));
         } else {
             // Fresh non-overlay materializations can keep an exact in-memory count
@@ -619,9 +660,13 @@ impl DbspGraphBuilder {
                 let mut state = self.state_from_handle(&handle).await?;
                 state = state.with_logical_version(logical_version);
                 registry_handle.set_dbsp_state(state);
-                registry_handle.mark_state_non_authoritative();
                 registry_handle
                     .publish_version(i64::try_from(logical_version).unwrap_or(i64::MAX), handle);
+                if Self::should_bootstrap_authoritative_zero(view_frontier, Some(logical_version)) {
+                    let _ = registry_handle.seed_authoritative_row_count_if_latest(0, 0);
+                } else {
+                    registry_handle.mark_state_non_authoritative();
+                }
                 Some(logical_version)
             } else {
                 registry_handle.mark_state_authoritative();
@@ -835,9 +880,13 @@ impl DbspGraphBuilder {
                 let mut state = self.state_from_handle(&handle).await?;
                 state = state.with_logical_version(logical_version);
                 registry_handle.set_dbsp_state(state);
-                registry_handle.mark_state_non_authoritative();
                 registry_handle
                     .publish_version(i64::try_from(logical_version).unwrap_or(i64::MAX), handle);
+                if Self::should_bootstrap_authoritative_zero(view_frontier, Some(logical_version)) {
+                    let _ = registry_handle.seed_authoritative_row_count_if_latest(0, 0);
+                } else {
+                    registry_handle.mark_state_non_authoritative();
+                }
                 Some(logical_version)
             } else {
                 registry_handle.mark_state_authoritative();
@@ -1097,6 +1146,7 @@ impl DbspGraphBuilder {
             .with_context(|| {
                 format!("update overlay state cache for materialized view '{view_label}' at {ts}")
             })?;
+        registry.publish_logical_version(ts);
         pending_snapshot.record(ts, merged);
         let latency_ms = apply_start.elapsed().as_millis() as u64;
         metrics::observe_mv_update_latency_ms(latency_ms);
@@ -1258,12 +1308,16 @@ impl DbspGraphBuilder {
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
         let merge_start = Instant::now();
-        if !deltas.is_empty() {
-            if let Some((registry, version)) = authoritative_state {
+        if let Some((registry, version)) = authoritative_state {
+            if deltas.is_empty() {
+                registry.stage_authoritative_row_count_version(version);
+            } else {
                 registry
                     .apply_encoded_state_batch(version, &deltas)
                     .context("update authoritative materialized view state cache")?;
             }
+        }
+        if !deltas.is_empty() {
             // Transient segment outputs are already batch-transformed; feed rows straight
             // into MV overlay and let ZSetStream overlay consolidation handle duplicates.
             view.add_deltas(deltas);

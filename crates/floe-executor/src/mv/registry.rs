@@ -96,7 +96,9 @@ pub struct MaterializedViewHandle {
     name: String,
     state: RwLock<HashMap<EncodedRow, Diff>>,
     state_row_count: RwLock<i64>,
+    published_row_count: RwLock<i64>,
     state_row_count_version: RwLock<Option<i64>>,
+    staged_row_count_versions: RwLock<BTreeMap<i64, i64>>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
@@ -116,7 +118,9 @@ impl MaterializedViewHandle {
             name,
             state: RwLock::new(HashMap::new()),
             state_row_count: RwLock::new(0),
+            published_row_count: RwLock::new(0),
             state_row_count_version: RwLock::new(None),
+            staged_row_count_versions: RwLock::new(BTreeMap::new()),
             state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
             dbsp_state: RwLock::new(None),
@@ -198,6 +202,11 @@ impl MaterializedViewHandle {
 
     pub fn mark_state_non_authoritative(&self) {
         *self.state_authoritative.write().expect("mutex poisoned") = false;
+        self.staged_row_count_versions
+            .write()
+            .expect("mutex poisoned")
+            .clear();
+        *self.published_row_count.write().expect("mutex poisoned") = 0;
         *self
             .state_row_count_version
             .write()
@@ -211,8 +220,13 @@ impl MaterializedViewHandle {
         if self.latest_version() != Some(version) {
             return false;
         }
-        *self.state_row_count.write().expect("mutex poisoned") =
-            i64::try_from(row_count).unwrap_or(i64::MAX);
+        let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
+        *self.state_row_count.write().expect("mutex poisoned") = row_count;
+        *self.published_row_count.write().expect("mutex poisoned") = row_count;
+        self.staged_row_count_versions
+            .write()
+            .expect("mutex poisoned")
+            .retain(|candidate, _| *candidate > version);
         *self
             .state_row_count_version
             .write()
@@ -241,7 +255,9 @@ impl MaterializedViewHandle {
         {
             return None;
         }
-        self.authoritative_row_count()
+        Some(
+            usize::try_from(*self.published_row_count.read().expect("mutex poisoned")).unwrap_or(0),
+        )
     }
 
     pub fn advance_authoritative_row_count_version(&self, version: u64) {
@@ -251,13 +267,16 @@ impl MaterializedViewHandle {
         let Ok(version) = i64::try_from(version) else {
             return;
         };
-        if self.latest_version() != Some(version) {
-            return;
-        }
+        let row_count = *self.state_row_count.read().expect("mutex poisoned");
+        *self.published_row_count.write().expect("mutex poisoned") = row_count;
         *self
             .state_row_count_version
             .write()
             .expect("mutex poisoned") = Some(version);
+        self.staged_row_count_versions
+            .write()
+            .expect("mutex poisoned")
+            .retain(|candidate, _| *candidate > version);
     }
 
     pub fn apply_encoded_state_batch(&self, version: u64, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
@@ -267,11 +286,23 @@ impl MaterializedViewHandle {
         for (key, diff) in deltas {
             self.apply_encoded(key, *diff);
         }
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = i64::try_from(version).ok();
+        self.stage_authoritative_row_count_version(version);
         Ok(())
+    }
+
+    pub fn stage_authoritative_row_count_version(&self, version: u64) {
+        if !*self.state_authoritative.read().expect("mutex poisoned") {
+            return;
+        }
+        let Ok(version) = i64::try_from(version) else {
+            return;
+        };
+        let row_count = *self.state_row_count.read().expect("mutex poisoned");
+        self.staged_row_count_versions
+            .write()
+            .expect("mutex poisoned")
+            .insert(version, row_count);
+        self.promote_staged_row_count_if_visible(version);
     }
 
     pub fn set_dbsp_state(&self, state: DbspPersistedState) {
@@ -329,7 +360,6 @@ impl MaterializedViewHandle {
             apply_ms: apply_start.elapsed().as_millis() as u64,
         };
         drop(guard);
-        self.publish_logical_version(version as i64);
         stats
     }
 
@@ -341,7 +371,10 @@ impl MaterializedViewHandle {
     where
         I: IntoIterator<Item = (Vec<u8>, i64)>,
     {
-        self.append_shared_encoded_overlay_batch(version, Arc::new(deltas.into_iter().collect()))
+        let stats = self
+            .append_shared_encoded_overlay_batch(version, Arc::new(deltas.into_iter().collect()));
+        self.publish_logical_version(version as i64);
+        stats
     }
 
     pub fn encoded_overlay_batches(
@@ -414,6 +447,7 @@ impl MaterializedViewHandle {
             guard.insert(version, handle);
         }
         self.record_latest_version(version);
+        self.promote_staged_row_count_if_visible(version);
         self.prune_versions();
         tracing::debug!(
             view = %self.name,
@@ -425,6 +459,7 @@ impl MaterializedViewHandle {
 
     pub fn publish_logical_version(&self, version: i64) {
         self.record_latest_version(version);
+        self.promote_staged_row_count_if_visible(version);
         tracing::debug!(
             view = %self.name,
             version,
@@ -543,6 +578,31 @@ impl MaterializedViewHandle {
             *guard = Some(version);
         }
         let _ = self.version_watch.send_replace(Some(version));
+    }
+
+    fn promote_staged_row_count_if_visible(&self, version: i64) {
+        if !*self.state_authoritative.read().expect("mutex poisoned") {
+            return;
+        }
+        if self.latest_version() != Some(version) {
+            return;
+        }
+        let row_count = {
+            let mut staged = self
+                .staged_row_count_versions
+                .write()
+                .expect("mutex poisoned");
+            let Some(row_count) = staged.get(&version).copied() else {
+                return;
+            };
+            staged.retain(|candidate, _| *candidate > version);
+            row_count
+        };
+        *self.published_row_count.write().expect("mutex poisoned") = row_count;
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = Some(version);
     }
 }
 
@@ -781,6 +841,9 @@ mod tests {
         view.apply_encoded_state_batch(2, &[(key, -1)])
             .expect("apply delete delta");
         assert_eq!(view.authoritative_row_count(), Some(0));
+        assert_eq!(view.authoritative_row_count_for(1), Some(1));
+
+        view.publish_logical_version(2);
         assert_eq!(view.authoritative_row_count_for(1), None);
         assert_eq!(view.authoritative_row_count_for(2), Some(0));
     }
@@ -812,5 +875,28 @@ mod tests {
 
         assert_eq!(view.authoritative_row_count_for(4), None);
         assert_eq!(view.authoritative_row_count_for(5), Some(2));
+    }
+
+    #[test]
+    fn authoritative_row_count_preserves_visible_version_while_next_version_is_staged() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_visible_count");
+        view.mark_state_authoritative();
+        view.publish_logical_version(1);
+
+        let row = vec![ScalarValue::Int64(Some(1))];
+        let key = encode_projected_row_key(&row).expect("encode row");
+        view.apply_encoded_state_batch(1, &[(key.clone(), 1)])
+            .expect("apply visible delta");
+        assert_eq!(view.authoritative_row_count_for(1), Some(1));
+
+        view.apply_encoded_state_batch(2, &[(key, 1)])
+            .expect("apply staged delta");
+        assert_eq!(view.authoritative_row_count(), Some(2));
+        assert_eq!(view.authoritative_row_count_for(1), Some(1));
+        assert_eq!(view.authoritative_row_count_for(2), None);
+
+        view.publish_logical_version(2);
+        assert_eq!(view.authoritative_row_count_for(2), Some(2));
     }
 }

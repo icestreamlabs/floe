@@ -658,6 +658,111 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
 }
 
 #[tokio::test]
+async fn materialized_view_provider_keeps_latest_visible_count_while_next_version_is_staged() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_count_staged_visibility");
+    view.mark_state_authoritative();
+    view.publish_logical_version(1);
+
+    let first = vec![ScalarValue::Int64(Some(1))];
+    view.apply_encoded_state_batch(
+        1,
+        &[(encode_projected_row_key(&first).expect("encode row"), 1)],
+    )
+    .expect("apply visible row");
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider =
+        MaterializedViewTableProvider::new(registry, "mv_count_staged_visibility", schema);
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "mv_count_staged_visibility",
+        Arc::new(provider) as Arc<dyn TableProvider>,
+    )
+    .expect("register mv provider");
+
+    let second = vec![ScalarValue::Int64(Some(2))];
+    view.apply_encoded_state_batch(
+        2,
+        &[(encode_projected_row_key(&second).expect("encode row"), 1)],
+    )
+    .expect("apply staged row");
+
+    let while_staged = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
+        .await
+        .expect("build staged count query")
+        .collect()
+        .await
+        .expect("collect staged count query");
+    let count_while_staged = while_staged[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count_while_staged, 1);
+
+    view.publish_logical_version(2);
+    let after_publish = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
+        .await
+        .expect("build published count query")
+        .collect()
+        .await
+        .expect("collect published count query");
+    let count_after_publish = after_publish[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count_after_publish, 2);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_uses_cached_count_on_first_overlay_visible_version() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_overlay_first_visible_count");
+    view.mark_state_authoritative();
+    view.publish_logical_version(0);
+
+    let row = vec![ScalarValue::Int64(Some(7))];
+    let encoded = encode_projected_row_key(&row).expect("encode row");
+    view.append_shared_encoded_overlay_batch(1, Arc::new(vec![(encoded.clone(), 1)]));
+    view.apply_encoded_state_batch(1, &[(encoded, 1)])
+        .expect("apply authoritative overlay row");
+    view.publish_logical_version(1);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider =
+        MaterializedViewTableProvider::new(registry, "mv_overlay_first_visible_count", schema);
+    let session = SessionContext::new();
+    session
+        .register_table(
+            "mv_overlay_first_visible_count",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("register mv provider");
+
+    let result = session
+        .sql("SELECT COUNT(*) AS row_count FROM mv_overlay_first_visible_count")
+        .await
+        .expect("build count query")
+        .collect()
+        .await
+        .expect("collect count query");
+    let count = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count, 1);
+    assert_eq!(view.authoritative_row_count_for(1), Some(1));
+}
+
+#[tokio::test]
 async fn source_provider_emits_rows() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(
