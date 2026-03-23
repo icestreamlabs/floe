@@ -670,11 +670,13 @@ poll_floe_result_rows_stable_nonzero() {
   local start_ms now_ms
   start_ms="$(date +%s%3N)"
 
-  local previous_rows=""
+  local previous_signature=""
   local stable_polls=0
   local saw_nonzero=0
   local result_rows
-  local required_stable_polls=3
+  local result_version
+  local signature
+  local required_stable_polls=8
 
   local _
   for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
@@ -688,16 +690,19 @@ poll_floe_result_rows_stable_nonzero() {
       if (( result_rows > 0 )); then
         saw_nonzero=1
       fi
+      result_version="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT __mv_version::BIGINT FROM benchmark_result LIMIT 1")"
+      if [[ -n "${result_version}" && "${result_version}" =~ ^[0-9]+$ ]]; then
+        signature="${result_rows}:${result_version}"
+        if [[ "${signature}" == "${previous_signature}" ]]; then
+          stable_polls=$((stable_polls + 1))
+        else
+          previous_signature="${signature}"
+          stable_polls=1
+        fi
 
-      if [[ "${result_rows}" == "${previous_rows}" ]]; then
-        stable_polls=$((stable_polls + 1))
-      else
-        previous_rows="${result_rows}"
-        stable_polls=1
-      fi
-
-      if [[ "${saw_nonzero}" == "1" && ${stable_polls} -ge ${required_stable_polls} ]]; then
-        return 0
+        if [[ "${saw_nonzero}" == "1" && ${stable_polls} -ge ${required_stable_polls} ]]; then
+          return 0
+        fi
       fi
     fi
 
