@@ -95,17 +95,13 @@ impl DbspGraphBuilder {
                 return None;
             }
 
-            let mut outputs = Vec::with_capacity(aggregates.len());
-            for agg in &aggregates {
-                let output = evaluate_aggregate_value(
-                    agg,
-                    &decoded,
-                    agg_schema.as_ref(),
-                    &agg_graph_id,
-                    "aggregate",
-                );
-                outputs.push(output);
-            }
+            let outputs = evaluate_aggregate_values(
+                &aggregates,
+                &decoded,
+                agg_schema.as_ref(),
+                &agg_graph_id,
+                "aggregate",
+            );
 
             match encode_projected_row_key(&outputs) {
                 Ok(encoded) => Some(encoded),
@@ -320,17 +316,13 @@ impl DbspGraphBuilder {
                 return None;
             }
 
-            let mut outputs = Vec::with_capacity(aggregates.len());
-            for agg in &aggregates {
-                let output = evaluate_aggregate_value(
-                    agg,
-                    &decoded,
-                    agg_schema.as_ref(),
-                    &agg_graph_id,
-                    "window aggregate",
-                );
-                outputs.push(output);
-            }
+            let outputs = evaluate_aggregate_values(
+                &aggregates,
+                &decoded,
+                agg_schema.as_ref(),
+                &agg_graph_id,
+                "window aggregate",
+            );
 
             match encode_projected_row_key(&outputs) {
                 Ok(encoded) => Some(encoded),
