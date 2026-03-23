@@ -315,8 +315,13 @@ impl DbspGraphBuilder {
             let handle = view_handle_stream.get(view_frontier).await?;
             let state = self.state_from_handle(&handle).await?;
             registry_handle.set_dbsp_state(state);
+            registry_handle.mark_state_non_authoritative();
             registry_handle.publish_version(view_frontier, handle.clone());
             mv_latest.insert(view_name.to_string(), (view_frontier, handle));
+        } else {
+            // Fresh non-overlay materializations can keep an exact in-memory count
+            // cache by applying visible deltas incrementally until the first flush.
+            registry_handle.mark_state_authoritative();
         }
 
         let registry_clone = registry_handle.clone();
@@ -367,6 +372,10 @@ impl DbspGraphBuilder {
                     consolidation_mode,
                     delta_transform.as_ref(),
                     &delta_handle,
+                    Some((
+                        &registry_handle,
+                        u64::try_from(ts.max(0)).unwrap_or(u64::MAX),
+                    )),
                 )
                 .await
                 .with_context(|| format!("apply delta for view '{view_name}' at {ts}"))?;
@@ -1028,6 +1037,7 @@ impl DbspGraphBuilder {
             consolidation_mode,
             delta_transform,
             &delta_handle,
+            Some((registry, u64::try_from(ts.max(0)).unwrap_or(u64::MAX))),
         )
         .await
         .with_context(|| format!("apply delta for materialized view '{view_label}' at {ts}"))?;
@@ -1226,6 +1236,7 @@ impl DbspGraphBuilder {
         _consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
         delta_handle: &ZSetHandle,
+        authoritative_state: Option<(&Arc<MaterializedViewHandle>, u64)>,
     ) -> Result<DeltaApplyStats> {
         let load_start = Instant::now();
         let mut deltas = delta_zset_handle::<Vec<u8>>(table, dict_cache, delta_handle)
@@ -1248,6 +1259,11 @@ impl DbspGraphBuilder {
             .sum();
         let merge_start = Instant::now();
         if !deltas.is_empty() {
+            if let Some((registry, version)) = authoritative_state {
+                registry
+                    .apply_encoded_state_batch(version, &deltas)
+                    .context("update authoritative materialized view state cache")?;
+            }
             // Transient segment outputs are already batch-transformed; feed rows straight
             // into MV overlay and let ZSetStream overlay consolidation handle duplicates.
             view.add_deltas(deltas);

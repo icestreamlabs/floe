@@ -141,6 +141,14 @@ floe_result_row_target_for_query() {
   esac
 }
 
+floe_result_visibility_mode_for_query() {
+  case "$1" in
+    q15|q16|q17) printf 'exact_target\n' ;;
+    q18|q19) printf 'stable_nonzero\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
 query_sql() {
   case "$1" in
     q0)
@@ -658,6 +666,47 @@ poll_floe_result_rows_at_least() {
   return 1
 }
 
+poll_floe_result_rows_stable_nonzero() {
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local previous_rows=""
+  local stable_polls=0
+  local saw_nonzero=0
+  local result_rows
+  local required_stable_polls=3
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ ]]; then
+      if (( result_rows > 0 )); then
+        saw_nonzero=1
+      fi
+
+      if [[ "${result_rows}" == "${previous_rows}" ]]; then
+        stable_polls=$((stable_polls + 1))
+      else
+        previous_rows="${result_rows}"
+        stable_polls=1
+      fi
+
+      if [[ "${saw_nonzero}" == "1" && ${stable_polls} -ge ${required_stable_polls} ]]; then
+        return 0
+      fi
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
 poll_floe_query_completion() {
   local query_id="$1"
   local sources="$2"
@@ -682,11 +731,22 @@ poll_floe_query_completion() {
     return 1
   fi
 
-  local expected_result_rows
-  expected_result_rows="$(floe_result_row_target_for_query "${query_id}")"
-  if [[ -n "${expected_result_rows}" ]] && ! poll_floe_result_rows_at_least "${expected_result_rows}"; then
-    return 1
-  fi
+  local result_visibility_mode
+  result_visibility_mode="$(floe_result_visibility_mode_for_query "${query_id}")"
+  case "${result_visibility_mode}" in
+    exact_target)
+      local expected_result_rows
+      expected_result_rows="$(floe_result_row_target_for_query "${query_id}")"
+      if [[ -n "${expected_result_rows}" ]] && ! poll_floe_result_rows_at_least "${expected_result_rows}"; then
+        return 1
+      fi
+      ;;
+    stable_nonzero)
+      if ! poll_floe_result_rows_stable_nonzero; then
+        return 1
+      fi
+      ;;
+  esac
 
   now_ms="$(date +%s%3N)"
   POST_PRODUCE_WAIT_MS=$((now_ms - start_ms))
@@ -1801,7 +1861,7 @@ run_floe_query() {
   result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
   [[ -z "${result_rows}" ]] && result_rows="n/a"
   notes="source_catchup_kafka_group_offsets"
-  if [[ -n "$(floe_result_row_target_for_query "${query_id}")" ]]; then
+  if [[ -n "$(floe_result_visibility_mode_for_query "${query_id}")" ]]; then
     notes="source_catchup_kafka_group_offsets_and_result_visibility"
   fi
 

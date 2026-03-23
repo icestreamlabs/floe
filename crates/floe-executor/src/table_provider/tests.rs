@@ -53,6 +53,7 @@ async fn materialized_view_provider_emits_rows() {
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
     view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+    view.publish_logical_version(i64::try_from(version).expect("logical version"));
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, true),
@@ -122,6 +123,49 @@ async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() 
         .expect("build logical as of version");
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_hides_unpublished_dbsp_state() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_unpublished_state");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("mv-provider-unpublished-state", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let mut bridge = DbspBridge::new(db).await.expect("bridge");
+    let mut dbsp_view = bridge
+        .new_view(
+            "mv_unpublished_state",
+            StreamRetention::KeepLast { keep_last: 1 },
+        )
+        .await
+        .expect("dbsp view");
+    let row = vec![
+        ScalarValue::Int64(Some(9)),
+        ScalarValue::Utf8(Some("nine".into())),
+    ];
+    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    dbsp_view.flush().await.expect("flush unpublished state");
+    let handle_view = dbsp_view.latest_handle_view();
+    let (dict, table, namespace, version) = handle_view.into_parts();
+    view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_unpublished_state", schema);
+
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build unpublished snapshot");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 0);
 }
 
 #[tokio::test]
@@ -219,6 +263,7 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
     view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+    view.publish_logical_version(i64::try_from(version).expect("logical version"));
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, true),
@@ -274,6 +319,10 @@ async fn materialized_view_provider_empty_then_populated() {
         .get("mv_empty")
         .expect("view registered")
         .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
+    registry
+        .get("mv_empty")
+        .expect("view registered")
+        .publish_logical_version(i64::try_from(version).expect("logical version"));
 
     let populated = provider
         .build_batches_for_test()
@@ -551,6 +600,61 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_non_nu
         .expect("count array")
         .value(0);
     assert_eq!(count, 3);
+}
+
+#[tokio::test]
+async fn materialized_view_provider_hides_unpublished_authoritative_count_until_version_visible() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let view = registry.register("mv_count_visibility");
+    view.mark_state_authoritative();
+
+    let row = vec![ScalarValue::Int64(Some(7))];
+    view.apply_encoded_state_batch(
+        2,
+        &[(encode_projected_row_key(&row).expect("encode row"), 1)],
+    )
+    .expect("apply authoritative row");
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let provider = MaterializedViewTableProvider::new(registry, "mv_count_visibility", schema);
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "mv_count_visibility",
+        Arc::new(provider) as Arc<dyn TableProvider>,
+    )
+    .expect("register mv provider");
+
+    let before_publish = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_visibility")
+        .await
+        .expect("build pre-publish count query")
+        .collect()
+        .await
+        .expect("collect pre-publish count query");
+    let count_before = before_publish[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count_before, 0);
+
+    view.publish_logical_version(2);
+
+    let after_publish = ctx
+        .sql("SELECT COUNT(*) AS row_count FROM mv_count_visibility")
+        .await
+        .expect("build post-publish count query")
+        .collect()
+        .await
+        .expect("collect post-publish count query");
+    let count_after = after_publish[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0);
+    assert_eq!(count_after, 1);
 }
 
 #[tokio::test]

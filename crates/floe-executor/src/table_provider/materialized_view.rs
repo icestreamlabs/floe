@@ -182,7 +182,13 @@ impl MaterializedViewTableProvider {
             );
             return Ok((HashMap::new(), 0));
         };
-        let target_version = as_of_version.unwrap_or(state.logical_version());
+        let latest_visible_version = view
+            .latest_version()
+            .and_then(|version| u64::try_from(version).ok());
+        let target_version = match as_of_version.or(latest_visible_version) {
+            Some(version) => version,
+            None => return Ok((HashMap::new(), 0)),
+        };
         let snapshot = if let Some(dbsp_version) =
             Self::resolve_dbsp_version(view.as_ref(), &state, target_version)
         {

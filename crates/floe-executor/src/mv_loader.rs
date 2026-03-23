@@ -69,6 +69,10 @@ pub async fn load_or_register_mv(
             DbspPersistedState::new(dict, table, ns, version).with_logical_version(logical_version);
         handle.set_dbsp_state(state);
         handle.mark_state_non_authoritative();
+        handle.publish_version(
+            i64::try_from(logical_version).unwrap_or(i64::MAX),
+            latest_handle,
+        );
     }
 
     let provider = MaterializedViewTableProvider::new(
@@ -114,7 +118,10 @@ mod tests {
         let registry = Arc::new(MaterializedViewRegistry::new());
         let handle = registry.register(VIEW_NAME.to_string());
         registry.set_schema(VIEW_NAME.to_string(), Arc::clone(&schema));
-        handle.set_dbsp_state(state);
+        handle.set_dbsp_state(state.clone());
+        handle.publish_logical_version(
+            i64::try_from(state.logical_version()).expect("logical version"),
+        );
 
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
         let session = SessionContext::new();
