@@ -12,6 +12,7 @@ pub mod algebra;
 pub mod collections;
 pub mod count_aggregate;
 pub mod distinct;
+mod ephemeral_state;
 pub mod filter;
 pub mod filter_map;
 pub mod handles;

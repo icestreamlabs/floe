@@ -10,6 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::VersionedZSet;
+use crate::ephemeral_state::build_ephemeral_state_table;
 use crate::handles::ZSetHandle;
 use crate::operators::topn::TopNOp;
 use crate::relation_state::RelationState;
@@ -95,7 +96,11 @@ impl DbspTopN {
             version: 0,
         };
 
-        let state = RelationState::empty(table.clone(), format!("topn_state_{topn_id}")).await?;
+        let state = RelationState::empty(
+            build_ephemeral_state_table(&format!("topn_state_{topn_id}")).await?,
+            format!("topn_state_{topn_id}"),
+        )
+        .await?;
         let output_dict = Arc::new(
             Dictionary::<K>::with_table(table.clone(), output_ns.clone(), None)
                 .await
