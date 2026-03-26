@@ -78,6 +78,35 @@ impl DbspGraphBuilder {
             return Ok(mapped.stream());
         }
 
+        if let Some(slot_kinds) = build_incremental_aggregate_slot_kinds(&aggregates) {
+            let row_evaluator = build_incremental_aggregate_row_evaluator(
+                Arc::clone(&input_schema),
+                group_keys.clone(),
+                aggregates.clone(),
+                graph_id.clone(),
+                "aggregate",
+            );
+
+            let incremental_aggregate = dbsp::DbspIncrementalAggregate::new::<Vec<u8>, Vec<u8>, _>(
+                &upstream,
+                row_evaluator,
+                slot_kinds,
+                Some(aggregate_error_handler),
+            )
+            .await
+            .context("initialize DBSP incremental aggregate")?;
+
+            let mapped = self
+                .map_incremental_aggregate_output(
+                    &graph_id,
+                    &incremental_aggregate.stream(),
+                    task_events,
+                    "aggregate-project",
+                )
+                .await?;
+            return Ok(mapped.stream());
+        }
+
         let key_schema = Arc::clone(&input_schema);
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
@@ -543,6 +572,60 @@ impl DbspGraphBuilder {
         .await
         .context("initialize count aggregate output map")
     }
+
+    async fn map_incremental_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DbspMap> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(Vec<u8>, Vec<dbsp::AggregateValue>)| -> Vec<u8> {
+            let mut key_values = match decode_projected_row_key(&pair.0) {
+                Ok(values) => values,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to decode aggregate group key"
+                    );
+                    return Vec::new();
+                }
+            };
+            key_values.extend(pair.1.iter().map(scalar_from_incremental_aggregate_value));
+            match encode_projected_row_key(&key_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode aggregate row"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        DbspMap::new::<(Vec<u8>, Vec<dbsp::AggregateValue>), Vec<u8>, _>(
+            aggregate_stream,
+            projector,
+            Some(project_error_handler),
+        )
+        .await
+        .context("initialize incremental aggregate output map")
+    }
 }
 
 fn build_count_row_evaluator(
@@ -737,4 +820,233 @@ fn evaluate_count_row_values(
             }
         })
         .collect()
+}
+
+fn build_incremental_aggregate_slot_kinds(
+    aggregates: &[DbspAggregateExpr],
+) -> Option<Vec<dbsp::IncrementalAggregateSlotKind>> {
+    let mut slot_kinds = Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        let kind = match agg.function() {
+            DbspAggregateFunction::Count if agg.distinct() => {
+                dbsp::IncrementalAggregateSlotKind::CountDistinct
+            }
+            DbspAggregateFunction::Count => dbsp::IncrementalAggregateSlotKind::Count,
+            DbspAggregateFunction::Sum => dbsp::IncrementalAggregateSlotKind::Sum(
+                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+            ),
+            DbspAggregateFunction::Avg => dbsp::IncrementalAggregateSlotKind::Avg,
+            DbspAggregateFunction::Min => dbsp::IncrementalAggregateSlotKind::Min(
+                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+            ),
+            DbspAggregateFunction::Max => dbsp::IncrementalAggregateSlotKind::Max(
+                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+            ),
+        };
+        slot_kinds.push(kind);
+    }
+    Some(slot_kinds)
+}
+
+fn build_incremental_aggregate_row_evaluator(
+    input_schema: Arc<RowSchema>,
+    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
+    aggregates: Vec<DbspAggregateExpr>,
+    graph_id: String,
+    context: &'static str,
+) -> impl Fn(&Vec<u8>) -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> + Send + Sync + 'static {
+    let layout = Arc::new(build_count_eval_layout(&aggregates));
+    move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
+        let row = match decode_projected_row_key(bytes) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode aggregate row for incremental aggregate"
+                );
+                return None;
+            }
+        };
+
+        let mut key_values = Vec::with_capacity(group_keys.len());
+        for key_expr in &group_keys {
+            let value =
+                match eval_scalar_expression(key_expr.expression(), &row, input_schema.as_ref()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate incremental aggregate group key expression"
+                        );
+                        return None;
+                    }
+                };
+            key_values.push(value);
+        }
+        let encoded_key = match encode_projected_row_key(&key_values) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to encode incremental aggregate group key"
+                );
+                return None;
+            }
+        };
+
+        let slots = evaluate_incremental_aggregate_row_values(
+            layout.as_ref(),
+            &aggregates,
+            &row,
+            input_schema.as_ref(),
+            &graph_id,
+            context,
+        );
+        Some(dbsp::IncrementalAggregateRow {
+            key: encoded_key,
+            slots,
+        })
+    }
+}
+
+fn evaluate_incremental_aggregate_row_values(
+    layout: &CountEvalLayout,
+    aggregates: &[DbspAggregateExpr],
+    row: &[ScalarValue],
+    schema: &RowSchema,
+    graph_id: &str,
+    context: &str,
+) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
+    let mut filter_results = vec![false; layout.filters.len()];
+    for (index, filter) in layout.filters.iter().enumerate() {
+        filter_results[index] = match eval_expression(filter, row, schema) {
+            Ok(include) => include,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to evaluate {context} FILTER expression"
+                );
+                false
+            }
+        };
+    }
+
+    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_valid = vec![false; layout.expressions.len()];
+    for (index, expr) in layout.expressions.iter().enumerate() {
+        match eval_scalar_expression(expr, row, schema) {
+            Ok(value) => {
+                expression_values[index] = value;
+                expression_valid[index] = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to evaluate {context} aggregate expression"
+                );
+            }
+        }
+    }
+
+    aggregates
+        .iter()
+        .zip(layout.plans.iter())
+        .map(|(agg, plan)| {
+            if let Some(filter_index) = plan.filter_index
+                && !filter_results[filter_index]
+            {
+                return match agg.function() {
+                    DbspAggregateFunction::Count if !agg.distinct() => {
+                        dbsp::IncrementalAggregateSlotUpdate::Count(0)
+                    }
+                    _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
+                };
+            }
+
+            match agg.function() {
+                DbspAggregateFunction::Count if !agg.distinct() => match plan.expr_index {
+                    Some(expr_index) => {
+                        if expression_valid[expr_index] && !expression_values[expr_index].is_null()
+                        {
+                            dbsp::IncrementalAggregateSlotUpdate::Count(1)
+                        } else {
+                            dbsp::IncrementalAggregateSlotUpdate::Count(0)
+                        }
+                    }
+                    None => dbsp::IncrementalAggregateSlotUpdate::Count(1),
+                },
+                _ => match plan.expr_index {
+                    Some(expr_index) if expression_valid[expr_index] => {
+                        dbsp::IncrementalAggregateSlotUpdate::Value(
+                            incremental_aggregate_value_from_scalar(
+                                &expression_values[expr_index],
+                                graph_id,
+                                context,
+                            ),
+                        )
+                    }
+                    _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
+                },
+            }
+        })
+        .collect()
+}
+
+fn aggregate_value_type_from_dbsp_type(
+    value_type: &DbspScalarType,
+) -> Option<dbsp::AggregateValueType> {
+    match value_type {
+        DbspScalarType::Int64 => Some(dbsp::AggregateValueType::Int64),
+        DbspScalarType::TimestampMillis => Some(dbsp::AggregateValueType::TimestampMillis),
+        DbspScalarType::Utf8 => Some(dbsp::AggregateValueType::Utf8),
+        DbspScalarType::Bool => None,
+    }
+}
+
+fn incremental_aggregate_value_from_scalar(
+    value: &ScalarValue,
+    graph_id: &str,
+    context: &str,
+) -> Option<dbsp::AggregateValue> {
+    match value {
+        ScalarValue::Int64(Some(value)) => Some(dbsp::AggregateValue::Int64(*value)),
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
+            Some(dbsp::AggregateValue::TimestampMillis(*value))
+        }
+        ScalarValue::Utf8(Some(value)) => Some(dbsp::AggregateValue::Utf8(value.clone())),
+        ScalarValue::Int64(None)
+        | ScalarValue::TimestampMillisecond(None, _)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::Null => None,
+        other => {
+            tracing::warn!(
+                graph_id = %graph_id,
+                value = ?other,
+                "unsupported {context} aggregate value for incremental aggregate"
+            );
+            None
+        }
+    }
+}
+
+fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateValue) -> ScalarValue {
+    match value {
+        dbsp::AggregateValue::Null(value_type) => match value_type {
+            dbsp::AggregateValueType::Int64 => ScalarValue::Int64(None),
+            dbsp::AggregateValueType::TimestampMillis => {
+                ScalarValue::TimestampMillisecond(None, None)
+            }
+            dbsp::AggregateValueType::Utf8 => ScalarValue::Utf8(None),
+        },
+        dbsp::AggregateValue::Int64(value) => ScalarValue::Int64(Some(*value)),
+        dbsp::AggregateValue::TimestampMillis(value) => {
+            ScalarValue::TimestampMillisecond(Some(*value), None)
+        }
+        dbsp::AggregateValue::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
+    }
 }

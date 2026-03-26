@@ -1,3 +1,4 @@
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9,9 +10,13 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::operators::topn::TopNOp;
+use crate::operators::incremental_aggregate::{
+    AggregateValue, GroupedIncrementalAggregateState, IncrementalAggregateOp,
+    IncrementalAggregateRow, IncrementalAggregateSlotKind,
+};
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -23,96 +28,99 @@ use crate::stream::util::{
     build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
-/// TopN wrapper that drives TopNOp over handle streams (row-number semantics).
-pub struct DbspTopN {
+type RowEvaluator<V, K> = Arc<dyn Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync>;
+
+pub struct DbspIncrementalAggregate {
     stream: DeltaHandleStream,
 }
 
-impl DbspTopN {
-    pub async fn new<K, P, O, FP, FO>(
+impl DbspIncrementalAggregate {
+    pub async fn new<K, V, FRow>(
         input: &DeltaHandleStream,
-        partition_key: FP,
-        order_key: FO,
-        limit: usize,
-        offset: usize,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
         error_handler: Option<RuntimeErrorHandler>,
     ) -> anyhow::Result<Self>
     where
         K: Archive
             + Clone
             + Eq
-            + std::hash::Hash
-            + Ord
+            + Hash
             + Send
             + Sync
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        P: Ord + Clone + Send + Sync + 'static,
-        O: Ord + Clone + Send + Sync + 'static,
-        FP: Fn(&K) -> Option<P> + Send + Sync + Clone + 'static,
-        FO: Fn(&K) -> Option<O> + Send + Sync + Clone + 'static,
-    {
-        Self::new_with_key_extractor(
-            input,
-            move |key: &K| (partition_key(key), order_key(key)),
-            limit,
-            offset,
-            error_handler,
-        )
-        .await
-    }
-
-    pub async fn new_with_key_extractor<K, P, O, F>(
-        input: &DeltaHandleStream,
-        key_extractor: F,
-        limit: usize,
-        offset: usize,
-        error_handler: Option<RuntimeErrorHandler>,
-    ) -> anyhow::Result<Self>
-    where
-        K: Archive
+        V: Archive
             + Clone
             + Eq
-            + std::hash::Hash
-            + Ord
+            + Hash
             + Send
             + Sync
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        P: Ord + Clone + Send + Sync + 'static,
-        O: Ord + Clone + Send + Sync + 'static,
-        F: Fn(&K) -> (Option<P>, Option<O>) + Send + Sync + Clone + 'static,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
     {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
-        let topn_id = NEXT_TOPN_ID.fetch_add(1, Ordering::Relaxed);
-        let output_ns = format!("topn_output_{topn_id}");
+        let aggregate_id = NEXT_INCREMENTAL_AGGREGATE_ID.fetch_add(1, Ordering::Relaxed);
+        let output_ns = format!("incremental_aggregate_output_{aggregate_id}");
         let empty_handle = ZSetHandle {
             ns: output_ns.clone(),
             version: 0,
         };
 
-        let state = RelationState::empty(table.clone(), format!("topn_state_{topn_id}")).await?;
+        let state = RelationState::<(K, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            format!("incremental_aggregate_state_{aggregate_id}"),
+        )
+        .await?;
         let output_dict = Arc::new(
-            Dictionary::<K>::with_table(table.clone(), output_ns.clone(), None)
-                .await
-                .context("create output dictionary for topn")?,
+            Dictionary::<(K, Vec<AggregateValue>)>::with_table(
+                table.clone(),
+                output_ns.clone(),
+                None,
+            )
+            .await
+            .context("create output dictionary for incremental aggregate")?,
         );
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
-            .context("create output zset for topn")?;
-        let key_extractor = Arc::new(key_extractor);
+            .context("create output zset for incremental aggregate")?;
+        let distinct_index = slot_kinds
+            .iter()
+            .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
+            .then(|| {
+                IndexedBatchZSet::new(
+                    table.clone(),
+                    format!("incremental_aggregate_distinct_{aggregate_id}"),
+                )
+            });
+        let input_index = slot_kinds
+            .iter()
+            .any(|kind| {
+                matches!(
+                    kind,
+                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+                )
+            })
+            .then(|| {
+                IndexedBatchZSet::new(
+                    table.clone(),
+                    format!("incremental_aggregate_index_{aggregate_id}"),
+                )
+            });
 
-        let topn_op = Arc::new(AsyncMutex::new(TopNOp::new_with_key_extractor(
+        let aggregate_op = Arc::new(AsyncMutex::new(IncrementalAggregateOp::new(
             state,
             table.clone(),
+            Arc::new(row_evaluator) as RowEvaluator<V, K>,
             output,
-            key_extractor,
-            limit,
-            offset,
+            slot_kinds,
+            distinct_index,
+            input_index,
         )));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
@@ -123,7 +131,7 @@ impl DbspTopN {
         let mut output_handles = Vec::with_capacity(history.len());
         for (ts, handle) in history.into_iter().enumerate() {
             let out_handle = {
-                let mut op_guard = topn_op.lock().await;
+                let mut op_guard = aggregate_op.lock().await;
                 op_guard
                     .on_step(ts as i64, std::slice::from_ref(&handle))
                     .await?
@@ -135,7 +143,7 @@ impl DbspTopN {
         let mut stream = build_exact_stream_from_values(
             table.clone(),
             handle_group,
-            "topn_output_stream/",
+            "incremental_aggregate_output_stream/",
             frontier,
             horizon,
             &output_handles,
@@ -147,14 +155,14 @@ impl DbspTopN {
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
-            let op = Arc::clone(&topn_op);
+            let op = Arc::clone(&aggregate_op);
             let writer = Arc::clone(&writer);
             let empty_handle = empty_handle.clone();
             let handles_vec = handles.to_vec();
             Box::pin(async move {
                 if handles_vec.len() != 1 {
                     return Err(anyhow::anyhow!(
-                        "topn runtime expected 1 handle, got {}",
+                        "incremental aggregate runtime expected 1 handle, got {}",
                         handles_vec.len()
                     ));
                 }
@@ -179,7 +187,7 @@ impl DbspTopN {
         tokio::spawn(async move {
             loop {
                 if let Err(err) = runtime.step().await {
-                    report_runtime_error(&error_handler, "topn", err);
+                    report_runtime_error(&error_handler, "incremental_aggregate", err);
                     break;
                 }
             }
@@ -215,4 +223,4 @@ impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
     }
 }
 
-static NEXT_TOPN_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_INCREMENTAL_AGGREGATE_ID: AtomicUsize = AtomicUsize::new(0);

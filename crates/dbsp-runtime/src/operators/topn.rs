@@ -21,6 +21,7 @@ use crate::stream::util::{compute_delta, delta_zset_handle};
 
 type PartitionKeyFn<K, P> = Arc<dyn Fn(&K) -> Option<P> + Send + Sync>;
 type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
+type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 
 /// Top-N operator that applies row-number semantics: it counts multiplicity and
 /// supports OFFSET, matching ORDER BY/LIMIT/OFFSET behavior.
@@ -48,10 +49,8 @@ where
     partition_output_cache: BTreeMap<P, HashMap<K, i64>>,
     // In-memory ordering index for top-N row semantics; rebuilt from storage on restart.
     order_index: Option<BTreeMap<P, BTreeMap<(O, K), i64>>>,
-    row_partition_cache: HashMap<K, Option<P>>,
-    row_order_cache: HashMap<K, Option<O>>,
-    partition_key: PartitionKeyFn<K, P>,
-    order_key: OrderKeyFn<K, O>,
+    row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
+    key_parts: KeyPartsFn<K, P, O>,
     limit: usize,
     offset: usize,
 }
@@ -80,6 +79,18 @@ where
         limit: usize,
         offset: usize,
     ) -> Self {
+        let key_parts = Arc::new(move |key: &K| (partition_key(key), order_key(key)));
+        Self::new_with_key_extractor(state, table, output, key_parts, limit, offset)
+    }
+
+    pub fn new_with_key_extractor(
+        state: RelationState<K>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: KeyPartsFn<K, P, O>,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
         Self {
             state,
             table,
@@ -89,10 +100,8 @@ where
             output_cache: HashMap::new(),
             partition_output_cache: BTreeMap::new(),
             order_index: None,
-            row_partition_cache: HashMap::new(),
-            row_order_cache: HashMap::new(),
-            partition_key,
-            order_key,
+            row_key_cache: HashMap::new(),
+            key_parts,
             limit,
             offset,
         }
@@ -169,8 +178,7 @@ where
             if weight <= 0 {
                 continue;
             }
-            let partition_key = self.partition_key_for(&key);
-            let order_key = self.order_key_for(&key);
+            let (partition_key, order_key) = self.keys_for(&key);
             if let (Some(partition_key), Some(order_key)) = (partition_key, order_key) {
                 index
                     .entry(partition_key)
@@ -182,22 +190,12 @@ where
         Ok(())
     }
 
-    fn partition_key_for(&mut self, key: &K) -> Option<P> {
-        if let Some(cached) = self.row_partition_cache.get(key) {
+    fn keys_for(&mut self, key: &K) -> (Option<P>, Option<O>) {
+        if let Some(cached) = self.row_key_cache.get(key) {
             return cached.clone();
         }
-        let computed = (self.partition_key)(key);
-        self.row_partition_cache
-            .insert(key.clone(), computed.clone());
-        computed
-    }
-
-    fn order_key_for(&mut self, key: &K) -> Option<O> {
-        if let Some(cached) = self.row_order_cache.get(key) {
-            return cached.clone();
-        }
-        let computed = (self.order_key)(key);
-        self.row_order_cache.insert(key.clone(), computed.clone());
+        let computed = (self.key_parts)(key);
+        self.row_key_cache.insert(key.clone(), computed.clone());
         computed
     }
 
@@ -329,7 +327,7 @@ where
                 .unwrap_or(0);
             let new_weight = existing + diff_weight;
             let (partition_key, order_key) = if existing > 0 || new_weight > 0 {
-                (self.partition_key_for(key), self.order_key_for(key))
+                self.keys_for(key)
             } else {
                 (None, None)
             };
@@ -414,8 +412,7 @@ where
             self.order_index = Some(order_index);
         }
         for key in cache_prune {
-            self.row_partition_cache.remove(&key);
-            self.row_order_cache.remove(&key);
+            self.row_key_cache.remove(&key);
         }
 
         let order_index = self

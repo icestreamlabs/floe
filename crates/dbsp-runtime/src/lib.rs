@@ -15,6 +15,7 @@ pub mod distinct;
 pub mod filter;
 pub mod filter_map;
 pub mod handles;
+pub mod incremental_aggregate;
 pub mod join;
 pub mod map;
 mod metrics;
@@ -37,6 +38,7 @@ pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
+pub use incremental_aggregate::DbspIncrementalAggregate;
 pub use join::DbspJoin;
 pub use map::DbspMap;
 pub use operators::aggregate::{AggregateOp, AggregateSpec};
@@ -49,6 +51,11 @@ pub use operators::count_aggregate::{
 pub use operators::distinct::DistinctOp;
 pub use operators::filter::FilterOp;
 pub use operators::group_by::GroupByOp;
+pub use operators::incremental_aggregate::{
+    AggregateValue, AggregateValueType, GroupedIncrementalAggregateState, IncrementalAggregateOp,
+    IncrementalAggregateRow, IncrementalAggregateSlotKind, IncrementalAggregateSlotState,
+    IncrementalAggregateSlotUpdate,
+};
 pub use operators::index::ArrangeByKeyOp;
 pub use operators::join::JoinOp;
 pub use operators::join_range::JoinRangeOp;

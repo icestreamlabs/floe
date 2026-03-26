@@ -5,6 +5,7 @@ pub mod count_aggregate;
 pub mod distinct;
 pub mod filter;
 pub mod group_by;
+pub mod incremental_aggregate;
 pub mod index;
 pub mod join;
 pub mod join_range;
