@@ -134,6 +134,21 @@ input_rows_total_for_sources() {
 
 floe_result_row_target_for_query() {
   case "$1" in
+    q18)
+      # The bid producer assigns a unique bidder per bid, so
+      # (auction, bidder) is unique for every bid row.
+      printf '%s\n' "${BID_ROWS}"
+      ;;
+    q19)
+      # The bid producer distributes bids round-robin across 10k auctions.
+      # Once BID_ROWS exceeds 100k, each auction has at least 10 bids and the
+      # ROW_NUMBER() <= 10 result cardinality saturates at 100k rows.
+      if (( BID_ROWS <= 100000 )); then
+        printf '%s\n' "${BID_ROWS}"
+      else
+        printf '100000\n'
+      fi
+      ;;
     q15) printf '1\n' ;;
     q16) printf '5\n' ;;
     q17) printf '10000\n' ;;
@@ -143,8 +158,7 @@ floe_result_row_target_for_query() {
 
 floe_result_visibility_mode_for_query() {
   case "$1" in
-    q15|q16|q17) printf 'exact_target\n' ;;
-    q18|q19) printf 'stable_nonzero\n' ;;
+    q15|q16|q17|q18|q19) printf 'exact_target\n' ;;
     *) printf '\n' ;;
   esac
 }
@@ -797,52 +811,6 @@ poll_floe_result_rows_at_least() {
   return 1
 }
 
-poll_floe_result_rows_stable_nonzero() {
-  local start_ms now_ms
-  start_ms="$(date +%s%3N)"
-
-  local previous_signature=""
-  local stable_polls=0
-  local saw_nonzero=0
-  local result_rows
-  local result_version
-  local signature
-  local required_stable_polls=8
-
-  local _
-  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
-    now_ms="$(date +%s%3N)"
-    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
-      return 1
-    fi
-
-    result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
-    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ ]]; then
-      if (( result_rows > 0 )); then
-        saw_nonzero=1
-      fi
-      result_version="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT __mv_version::BIGINT FROM benchmark_result LIMIT 1")"
-      if [[ -n "${result_version}" && "${result_version}" =~ ^[0-9]+$ ]]; then
-        signature="${result_rows}:${result_version}"
-        if [[ "${signature}" == "${previous_signature}" ]]; then
-          stable_polls=$((stable_polls + 1))
-        else
-          previous_signature="${signature}"
-          stable_polls=1
-        fi
-
-        if [[ "${saw_nonzero}" == "1" && ${stable_polls} -ge ${required_stable_polls} ]]; then
-          return 0
-        fi
-      fi
-    fi
-
-    sleep_ms "${POLL_INTERVAL_MS}"
-  done
-
-  return 1
-}
-
 poll_floe_query_completion() {
   local query_id="$1"
   local sources="$2"
@@ -874,11 +842,6 @@ poll_floe_query_completion() {
       local expected_result_rows
       expected_result_rows="$(floe_result_row_target_for_query "${query_id}")"
       if [[ -n "${expected_result_rows}" ]] && ! poll_floe_result_rows_at_least "${expected_result_rows}"; then
-        return 1
-      fi
-      ;;
-    stable_nonzero)
-      if ! poll_floe_result_rows_stable_nonzero; then
         return 1
       fi
       ;;
