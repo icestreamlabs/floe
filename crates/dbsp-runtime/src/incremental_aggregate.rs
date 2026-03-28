@@ -12,6 +12,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::algebra::AbelianGroup;
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
+use crate::ephemeral_state::build_ephemeral_state_table;
 use crate::handles::ZSetHandle;
 use crate::operators::incremental_aggregate::{
     AggregateValue, GroupedIncrementalAggregateState, IncrementalAggregateOp,
@@ -32,6 +33,30 @@ type RowEvaluator<V, K> = Arc<dyn Fn(&V) -> Option<IncrementalAggregateRow<K>> +
 
 pub struct DbspIncrementalAggregate {
     stream: DeltaHandleStream,
+}
+
+pub struct DbspTransientIncrementalAggregate<K, V>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    op: AsyncMutex<IncrementalAggregateOp<K, V>>,
 }
 
 impl DbspIncrementalAggregate {
@@ -200,6 +225,104 @@ impl DbspIncrementalAggregate {
 
     pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
+    }
+}
+
+impl<K, V> DbspTransientIncrementalAggregate<K, V>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub async fn new<FRow>(
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+    ) -> anyhow::Result<Self>
+    where
+        FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
+    {
+        let aggregate_id = NEXT_INCREMENTAL_AGGREGATE_ID.fetch_add(1, Ordering::Relaxed);
+        let table = build_ephemeral_state_table(&format!(
+            "transient_incremental_aggregate_state_{aggregate_id}"
+        ))
+        .await?;
+        let state = RelationState::<(K, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            format!("transient_incremental_aggregate_state_{aggregate_id}"),
+        )
+        .await?;
+        let output_ns = format!("transient_incremental_aggregate_output_{aggregate_id}");
+        let output_dict = Arc::new(
+            Dictionary::<(K, Vec<AggregateValue>)>::with_table(
+                table.clone(),
+                output_ns.clone(),
+                None,
+            )
+            .await
+            .context("create output dictionary for transient incremental aggregate")?,
+        );
+        let output = VersionedZSet::new(output_dict, table.clone(), output_ns)
+            .await
+            .context("create output zset for transient incremental aggregate")?;
+        let distinct_index = slot_kinds
+            .iter()
+            .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
+            .then(|| {
+                IndexedBatchZSet::new(
+                    table.clone(),
+                    format!("transient_incremental_aggregate_distinct_{aggregate_id}"),
+                )
+            });
+        let input_index = slot_kinds
+            .iter()
+            .any(|kind| {
+                matches!(
+                    kind,
+                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+                )
+            })
+            .then(|| {
+                IndexedBatchZSet::new(
+                    table.clone(),
+                    format!("transient_incremental_aggregate_index_{aggregate_id}"),
+                )
+            });
+
+        Ok(Self {
+            op: AsyncMutex::new(IncrementalAggregateOp::new(
+                state,
+                table,
+                Arc::new(row_evaluator) as RowEvaluator<V, K>,
+                output,
+                slot_kinds,
+                distinct_index,
+                input_index,
+            )),
+        })
+    }
+
+    pub async fn apply_deltas(
+        &self,
+        delta_values: Vec<(V, i64)>,
+    ) -> anyhow::Result<Vec<((K, Vec<AggregateValue>), i64)>> {
+        let mut op = self.op.lock().await;
+        let deltas = op.apply_delta_values(delta_values).await?;
+        Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
     }
 }
 

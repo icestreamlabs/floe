@@ -37,7 +37,7 @@ pub enum AggregateValue {
 }
 
 impl AggregateValue {
-    fn cmp_non_null(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    pub(crate) fn cmp_non_null(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(right)),
             (Self::TimestampMillis(left), Self::TimestampMillis(right)) => Some(left.cmp(right)),
@@ -46,14 +46,14 @@ impl AggregateValue {
         }
     }
 
-    fn as_numeric(&self) -> Option<i64> {
+    pub(crate) fn as_numeric(&self) -> Option<i64> {
         match self {
             Self::Int64(value) | Self::TimestampMillis(value) => Some(*value),
             Self::Null(_) | Self::Utf8(_) => None,
         }
     }
 
-    fn from_numeric(value: i64, value_type: &AggregateValueType) -> Self {
+    pub(crate) fn from_numeric(value: i64, value_type: &AggregateValueType) -> Self {
         match value_type {
             AggregateValueType::Int64 => Self::Int64(value),
             AggregateValueType::TimestampMillis => Self::TimestampMillis(value),
@@ -61,7 +61,7 @@ impl AggregateValue {
         }
     }
 
-    fn null(value_type: &AggregateValueType) -> Self {
+    pub(crate) fn null(value_type: &AggregateValueType) -> Self {
         Self::Null(value_type.clone())
     }
 }
@@ -105,7 +105,7 @@ pub enum IncrementalAggregateSlotState {
 }
 
 impl IncrementalAggregateSlotState {
-    fn zero(kind: &IncrementalAggregateSlotKind) -> Self {
+    pub(crate) fn zero(kind: &IncrementalAggregateSlotKind) -> Self {
         match kind {
             IncrementalAggregateSlotKind::Count => Self::Count { count: 0 },
             IncrementalAggregateSlotKind::CountDistinct => Self::CountDistinct { count: 0 },
@@ -127,7 +127,7 @@ pub struct GroupedIncrementalAggregateState {
 }
 
 impl GroupedIncrementalAggregateState {
-    fn zero(slot_kinds: &[IncrementalAggregateSlotKind]) -> Self {
+    pub(crate) fn zero(slot_kinds: &[IncrementalAggregateSlotKind]) -> Self {
         Self {
             total_rows: 0,
             slots: slot_kinds
@@ -137,11 +137,14 @@ impl GroupedIncrementalAggregateState {
         }
     }
 
-    fn is_present(&self) -> bool {
+    pub(crate) fn is_present(&self) -> bool {
         self.total_rows != 0
     }
 
-    fn output_values(&self, slot_kinds: &[IncrementalAggregateSlotKind]) -> Vec<AggregateValue> {
+    pub(crate) fn output_values(
+        &self,
+        slot_kinds: &[IncrementalAggregateSlotKind],
+    ) -> Vec<AggregateValue> {
         self.slots
             .iter()
             .zip(slot_kinds.iter())
@@ -397,6 +400,255 @@ where
         Ok(versioned.handle_for_version(plan.version))
     }
 
+    pub async fn apply_delta_values(
+        &mut self,
+        delta_values: Vec<(V, i64)>,
+    ) -> Result<HashMap<(K, Vec<AggregateValue>), i64>> {
+        if delta_values.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let coalesced = self.coalesce_deltas(delta_values);
+        if coalesced.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        struct ParsedRow<K, V> {
+            key: K,
+            slots: Vec<IncrementalAggregateSlotUpdate>,
+            weight: i64,
+            _marker: std::marker::PhantomData<V>,
+        }
+
+        let mut parsed_rows = Vec::with_capacity(coalesced.len());
+        let mut affected_keys = HashSet::new();
+        let mut recompute_keys = HashSet::new();
+        let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, AggregateValue), i64> =
+            HashMap::new();
+        let mut index_updates = Vec::new();
+
+        for (value, weight) in coalesced {
+            if weight == 0 {
+                continue;
+            }
+            let Some(row_update) = (self.row_evaluator)(&value) else {
+                continue;
+            };
+            if row_update.slots.len() != self.slot_kinds.len() {
+                tracing::warn!(
+                    expected = self.slot_kinds.len(),
+                    actual = row_update.slots.len(),
+                    "incremental aggregate row evaluator returned unexpected slot vector width"
+                );
+                continue;
+            }
+            if self.has_extrema() && weight < 0 {
+                recompute_keys.insert(row_update.key.clone());
+            }
+            if self.input_index.is_some() {
+                index_updates.push((row_update.key.clone(), value.clone(), weight));
+            }
+            for (slot_idx, slot) in row_update.slots.iter().enumerate() {
+                if matches!(
+                    self.slot_kinds[slot_idx],
+                    IncrementalAggregateSlotKind::CountDistinct
+                ) && let IncrementalAggregateSlotUpdate::Value(Some(distinct_value)) = slot
+                {
+                    let distinct_key = DistinctGroupKey {
+                        group_key: row_update.key.clone(),
+                        slot: slot_idx as u32,
+                    };
+                    let entry = distinct_deltas
+                        .entry((distinct_key, distinct_value.clone()))
+                        .or_insert(0);
+                    *entry += weight;
+                }
+            }
+            affected_keys.insert(row_update.key.clone());
+            parsed_rows.push(ParsedRow {
+                key: row_update.key,
+                slots: row_update.slots,
+                weight,
+                _marker: std::marker::PhantomData,
+            });
+        }
+
+        if affected_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        if let Some(input_index) = self.input_index.as_ref()
+            && !index_updates.is_empty()
+        {
+            input_index
+                .apply_deltas(index_updates)
+                .await
+                .context("update incremental aggregate input index")?;
+        }
+
+        let mut distinct_count_adjustments: HashMap<K, Vec<i64>> = HashMap::new();
+        if !distinct_deltas.is_empty() {
+            let distinct_index = self
+                .distinct_index
+                .as_ref()
+                .context("incremental aggregate distinct index missing")?;
+            let mut distinct_updates = Vec::with_capacity(distinct_deltas.len());
+            for ((distinct_key, distinct_value), delta) in distinct_deltas {
+                if delta == 0 {
+                    continue;
+                }
+                let old_weight = distinct_index
+                    .value_weight_for_key_value(&distinct_key, &distinct_value)
+                    .await
+                    .context("load incremental aggregate distinct multiplicity")?;
+                let new_weight = old_weight + delta;
+                let adjustments = distinct_count_adjustments
+                    .entry(distinct_key.group_key.clone())
+                    .or_insert_with(|| vec![0; self.slot_kinds.len()]);
+                if old_weight > 0 && new_weight <= 0 {
+                    adjustments[distinct_key.slot as usize] -= 1;
+                } else if old_weight <= 0 && new_weight > 0 {
+                    adjustments[distinct_key.slot as usize] += 1;
+                }
+                distinct_updates.push((distinct_key, distinct_value, delta));
+            }
+            if !distinct_updates.is_empty() {
+                distinct_index
+                    .apply_deltas(distinct_updates)
+                    .await
+                    .context("update incremental aggregate distinct index")?;
+            }
+        }
+
+        self.ensure_state_cache()
+            .await
+            .context("load incremental aggregate cache")?;
+
+        let mut parsed_by_key: HashMap<K, Vec<ParsedRow<K, V>>> = HashMap::new();
+        for parsed in parsed_rows {
+            parsed_by_key
+                .entry(parsed.key.clone())
+                .or_default()
+                .push(parsed);
+        }
+
+        let zero_state = GroupedIncrementalAggregateState::zero(&self.slot_kinds);
+        let mut state_deltas: HashMap<(K, GroupedIncrementalAggregateState), i64> = HashMap::new();
+        let mut output_deltas: HashMap<(K, Vec<AggregateValue>), i64> = HashMap::new();
+        let mut cache_updates = Vec::new();
+
+        {
+            let state_cache = self
+                .state_cache
+                .as_ref()
+                .context("incremental aggregate cache missing")?;
+
+            for key in affected_keys {
+                let old_state = state_cache.get(&key).cloned();
+                let new_state = if recompute_keys.contains(&key) {
+                    self.recompute_group_state(&key)
+                        .await
+                        .with_context(|| format!("recompute incremental aggregate state for key"))?
+                } else {
+                    let mut next = old_state.clone().unwrap_or_else(|| zero_state.clone());
+                    if let Some(rows) = parsed_by_key.get(&key) {
+                        for parsed in rows {
+                            next.total_rows += parsed.weight;
+                            for (slot_idx, slot) in parsed.slots.iter().enumerate() {
+                                self.apply_slot_update(&mut next, slot_idx, slot, parsed.weight);
+                            }
+                        }
+                    }
+                    if let Some(adjustments) = distinct_count_adjustments.get(&key) {
+                        for (slot_idx, adjustment) in adjustments.iter().enumerate() {
+                            if *adjustment == 0 {
+                                continue;
+                            }
+                            if let IncrementalAggregateSlotState::CountDistinct { count } =
+                                &mut next.slots[slot_idx]
+                            {
+                                *count += *adjustment;
+                            }
+                        }
+                    }
+                    if next.is_present() { Some(next) } else { None }
+                };
+
+                if old_state == new_state {
+                    continue;
+                }
+
+                match (&old_state, &new_state) {
+                    (Some(old), Some(new)) => {
+                        state_deltas.insert((key.clone(), old.clone()), -1);
+                        state_deltas.insert((key.clone(), new.clone()), 1);
+                    }
+                    (Some(old), None) => {
+                        state_deltas.insert((key.clone(), old.clone()), -1);
+                    }
+                    (None, Some(new)) => {
+                        state_deltas.insert((key.clone(), new.clone()), 1);
+                    }
+                    (None, None) => {}
+                }
+
+                let old_output = old_state
+                    .as_ref()
+                    .map(|state| state.output_values(&self.slot_kinds));
+                let new_output = new_state
+                    .as_ref()
+                    .map(|state| state.output_values(&self.slot_kinds));
+                match (old_output, new_output) {
+                    (Some(old), Some(new)) if old == new => {}
+                    (Some(old), Some(new)) => {
+                        output_deltas.insert((key.clone(), old), -1);
+                        output_deltas.insert((key.clone(), new), 1);
+                    }
+                    (Some(old), None) => {
+                        output_deltas.insert((key.clone(), old), -1);
+                    }
+                    (None, Some(new)) => {
+                        output_deltas.insert((key.clone(), new), 1);
+                    }
+                    (None, None) => {}
+                }
+
+                cache_updates.push((key, new_state));
+            }
+        }
+
+        if state_deltas.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let base_version = self
+            .state
+            .integrated
+            .current_handle()
+            .map(|handle| handle.version);
+        let new_integrated_handle = Self::apply_deltas_to_versioned(
+            &mut self.state.integrated,
+            &state_deltas,
+            base_version,
+            "integrated",
+        )
+        .await
+        .context("update incremental aggregate integrated state")?;
+        self.state.update_handle(new_integrated_handle);
+
+        if let Some(state_cache) = self.state_cache.as_mut() {
+            for (key, value) in cache_updates {
+                if let Some(value) = value {
+                    state_cache.insert(key, value);
+                } else {
+                    state_cache.remove(&key);
+                }
+            }
+        }
+
+        Ok(output_deltas)
+    }
+
     fn apply_slot_update(
         &self,
         state: &mut GroupedIncrementalAggregateState,
@@ -598,249 +850,7 @@ where
             delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for incremental aggregate")?;
-
-        if delta_values.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
-        }
-
-        let coalesced = self.coalesce_deltas(delta_values);
-        if coalesced.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
-        }
-
-        struct ParsedRow<K, V> {
-            key: K,
-            slots: Vec<IncrementalAggregateSlotUpdate>,
-            weight: i64,
-            _marker: std::marker::PhantomData<V>,
-        }
-
-        let mut parsed_rows = Vec::with_capacity(coalesced.len());
-        let mut affected_keys = HashSet::new();
-        let mut recompute_keys = HashSet::new();
-        let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, AggregateValue), i64> =
-            HashMap::new();
-        let mut index_updates = Vec::new();
-
-        for (value, weight) in coalesced {
-            if weight == 0 {
-                continue;
-            }
-            let Some(row_update) = (self.row_evaluator)(&value) else {
-                continue;
-            };
-            if row_update.slots.len() != self.slot_kinds.len() {
-                tracing::warn!(
-                    expected = self.slot_kinds.len(),
-                    actual = row_update.slots.len(),
-                    "incremental aggregate row evaluator returned unexpected slot vector width"
-                );
-                continue;
-            }
-            if self.has_extrema() && weight < 0 {
-                recompute_keys.insert(row_update.key.clone());
-            }
-            if self.input_index.is_some() {
-                index_updates.push((row_update.key.clone(), value.clone(), weight));
-            }
-            for (slot_idx, slot) in row_update.slots.iter().enumerate() {
-                if matches!(
-                    self.slot_kinds[slot_idx],
-                    IncrementalAggregateSlotKind::CountDistinct
-                ) && let IncrementalAggregateSlotUpdate::Value(Some(distinct_value)) = slot
-                {
-                    let distinct_key = DistinctGroupKey {
-                        group_key: row_update.key.clone(),
-                        slot: slot_idx as u32,
-                    };
-                    let entry = distinct_deltas
-                        .entry((distinct_key, distinct_value.clone()))
-                        .or_insert(0);
-                    *entry += weight;
-                }
-            }
-            affected_keys.insert(row_update.key.clone());
-            parsed_rows.push(ParsedRow {
-                key: row_update.key,
-                slots: row_update.slots,
-                weight,
-                _marker: std::marker::PhantomData,
-            });
-        }
-
-        if affected_keys.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
-        }
-
-        if let Some(input_index) = self.input_index.as_ref()
-            && !index_updates.is_empty()
-        {
-            input_index
-                .apply_deltas(index_updates)
-                .await
-                .context("update incremental aggregate input index")?;
-        }
-
-        let mut distinct_count_adjustments: HashMap<K, Vec<i64>> = HashMap::new();
-        if !distinct_deltas.is_empty() {
-            let distinct_index = self
-                .distinct_index
-                .as_ref()
-                .context("incremental aggregate distinct index missing")?;
-            let mut distinct_updates = Vec::with_capacity(distinct_deltas.len());
-            for ((distinct_key, distinct_value), delta) in distinct_deltas {
-                if delta == 0 {
-                    continue;
-                }
-                let old_weight = distinct_index
-                    .value_weight_for_key_value(&distinct_key, &distinct_value)
-                    .await
-                    .context("load incremental aggregate distinct multiplicity")?;
-                let new_weight = old_weight + delta;
-                let adjustments = distinct_count_adjustments
-                    .entry(distinct_key.group_key.clone())
-                    .or_insert_with(|| vec![0; self.slot_kinds.len()]);
-                if old_weight > 0 && new_weight <= 0 {
-                    adjustments[distinct_key.slot as usize] -= 1;
-                } else if old_weight <= 0 && new_weight > 0 {
-                    adjustments[distinct_key.slot as usize] += 1;
-                }
-                distinct_updates.push((distinct_key, distinct_value, delta));
-            }
-            if !distinct_updates.is_empty() {
-                distinct_index
-                    .apply_deltas(distinct_updates)
-                    .await
-                    .context("update incremental aggregate distinct index")?;
-            }
-        }
-
-        self.ensure_state_cache()
-            .await
-            .context("load incremental aggregate cache")?;
-
-        let mut parsed_by_key: HashMap<K, Vec<ParsedRow<K, V>>> = HashMap::new();
-        for parsed in parsed_rows {
-            parsed_by_key
-                .entry(parsed.key.clone())
-                .or_default()
-                .push(parsed);
-        }
-
-        let zero_state = GroupedIncrementalAggregateState::zero(&self.slot_kinds);
-        let mut state_deltas: HashMap<(K, GroupedIncrementalAggregateState), i64> = HashMap::new();
-        let mut output_deltas: HashMap<(K, Vec<AggregateValue>), i64> = HashMap::new();
-        let mut cache_updates = Vec::new();
-
-        {
-            let state_cache = self
-                .state_cache
-                .as_ref()
-                .context("incremental aggregate cache missing")?;
-
-            for key in affected_keys {
-                let old_state = state_cache.get(&key).cloned();
-                let new_state = if recompute_keys.contains(&key) {
-                    self.recompute_group_state(&key)
-                        .await
-                        .with_context(|| format!("recompute incremental aggregate state for key"))?
-                } else {
-                    let mut next = old_state.clone().unwrap_or_else(|| zero_state.clone());
-                    if let Some(rows) = parsed_by_key.get(&key) {
-                        for parsed in rows {
-                            next.total_rows += parsed.weight;
-                            for (slot_idx, slot) in parsed.slots.iter().enumerate() {
-                                self.apply_slot_update(&mut next, slot_idx, slot, parsed.weight);
-                            }
-                        }
-                    }
-                    if let Some(adjustments) = distinct_count_adjustments.get(&key) {
-                        for (slot_idx, adjustment) in adjustments.iter().enumerate() {
-                            if *adjustment == 0 {
-                                continue;
-                            }
-                            if let IncrementalAggregateSlotState::CountDistinct { count } =
-                                &mut next.slots[slot_idx]
-                            {
-                                *count += *adjustment;
-                            }
-                        }
-                    }
-                    if next.is_present() { Some(next) } else { None }
-                };
-
-                if old_state == new_state {
-                    continue;
-                }
-
-                match (&old_state, &new_state) {
-                    (Some(old), Some(new)) => {
-                        state_deltas.insert((key.clone(), old.clone()), -1);
-                        state_deltas.insert((key.clone(), new.clone()), 1);
-                    }
-                    (Some(old), None) => {
-                        state_deltas.insert((key.clone(), old.clone()), -1);
-                    }
-                    (None, Some(new)) => {
-                        state_deltas.insert((key.clone(), new.clone()), 1);
-                    }
-                    (None, None) => {}
-                }
-
-                let old_output = old_state
-                    .as_ref()
-                    .map(|state| state.output_values(&self.slot_kinds));
-                let new_output = new_state
-                    .as_ref()
-                    .map(|state| state.output_values(&self.slot_kinds));
-                match (old_output, new_output) {
-                    (Some(old), Some(new)) if old == new => {}
-                    (Some(old), Some(new)) => {
-                        output_deltas.insert((key.clone(), old), -1);
-                        output_deltas.insert((key.clone(), new), 1);
-                    }
-                    (Some(old), None) => {
-                        output_deltas.insert((key.clone(), old), -1);
-                    }
-                    (None, Some(new)) => {
-                        output_deltas.insert((key.clone(), new), 1);
-                    }
-                    (None, None) => {}
-                }
-
-                cache_updates.push((key, new_state));
-            }
-        }
-
-        if state_deltas.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
-        }
-
-        let base_version = self
-            .state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_integrated_handle = Self::apply_deltas_to_versioned(
-            &mut self.state.integrated,
-            &state_deltas,
-            base_version,
-            "integrated",
-        )
-        .await
-        .context("update incremental aggregate integrated state")?;
-        self.state.update_handle(new_integrated_handle);
-
-        if let Some(state_cache) = self.state_cache.as_mut() {
-            for (key, value) in cache_updates {
-                if let Some(value) = value {
-                    state_cache.insert(key, value);
-                } else {
-                    state_cache.remove(&key);
-                }
-            }
-        }
-
+        let output_deltas = self.apply_delta_values(delta_values).await?;
         if output_deltas.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
         }

@@ -13,8 +13,8 @@ use dbsp::handles::ZSetHandle;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
-    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspExpression, DbspNodeKind,
-    DbspTopNNode, OrderExpr, RowSchema, StreamRetention,
+    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
+    DbspNodeKind, DbspTopNNode, OrderExpr, RowSchema, StreamRetention,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,10 @@ use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
+use super::compile::{
+    build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
+    scalar_from_incremental_aggregate_value,
+};
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
 use super::vectorized_filter_project::{
@@ -204,6 +208,41 @@ impl DbspGraphBuilder {
             .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
 
         if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
+            if let Some(transient_aggregate_root) =
+                try_build_transient_source_aggregate_root_materialization(
+                    inputs.plan,
+                    inputs.plan.root,
+                    inputs.outer_transient_streams,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    self.graph_id(),
+                )
+                .await?
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_aggregate_root.source_name,
+                    optimized_nodes = ?transient_aggregate_root.optimized_nodes,
+                    "using transient aggregate root materialization with source batch journal"
+                );
+                let identity_transform: Arc<DeltaTransformFn> = Arc::new(|deltas| Ok(deltas));
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    transient_aggregate_root.receiver,
+                    identity_transform,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
             if let Some(transient_topn_root) = try_build_transient_source_topn_root_materialization(
                 inputs.plan,
                 inputs.plan.root,
@@ -984,6 +1023,12 @@ struct TransientSourceTopNRootMaterialization {
     transform: Arc<DeltaTransformFn>,
 }
 
+struct TransientSourceAggregateRootMaterialization {
+    source_name: String,
+    optimized_nodes: Vec<usize>,
+    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+}
+
 struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
@@ -994,6 +1039,14 @@ struct TransientJoinInputOptimization {
 struct TransientSourceTopNRootShape {
     source_root: TransientSourceRootMaterialization,
     topn: DbspTopNNode,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone)]
+struct TransientSourceAggregateRootShape {
+    source_root: TransientSourceRootMaterialization,
+    aggregate: DbspAggregateNode,
     optimized_nodes: Vec<usize>,
     transform: Arc<DeltaTransformFn>,
 }
@@ -1438,6 +1491,9 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
     if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
     }
@@ -1976,6 +2032,225 @@ fn try_build_transient_source_topn_root_shape(
         }
         _ => Ok(None),
     }
+}
+
+fn try_build_transient_source_aggregate_root_shape(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceAggregateRootShape>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::Aggregate(aggregate) => {
+            let input_idx = first_input(root, "aggregate")?;
+            let Some(source_root) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            if build_incremental_aggregate_slot_kinds(aggregate.aggregates()).is_none() {
+                return Ok(None);
+            }
+            let mut optimized_nodes = source_root.optimized_nodes.clone();
+            optimized_nodes.push(root_idx);
+            Ok(Some(TransientSourceAggregateRootShape {
+                source_root,
+                aggregate: aggregate.clone(),
+                optimized_nodes,
+                transform: Arc::new(|deltas| Ok(deltas)),
+            }))
+        }
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(mut shape) = try_build_transient_source_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) = try_build_transient_source_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_filter_transform(select)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) =
+                    try_build_transient_source_aggregate_root_shape(plan, select_input_idx)?
+                else {
+                    return Ok(None);
+                };
+                shape.transform = compose_delta_transforms(
+                    Arc::clone(&shape.transform),
+                    build_filter_map_transform(select, project)?,
+                );
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) = try_build_transient_source_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_map_transform(project)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn try_build_transient_source_aggregate_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+    outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+    graph_id: &str,
+) -> Result<Option<TransientSourceAggregateRootMaterialization>> {
+    let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, root_idx)? else {
+        return Ok(None);
+    };
+    let Some(upstream) = outer_transient_streams
+        .get(&shape.source_root.source_name)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let receiver = build_transient_aggregate_receiver(
+        graph_id,
+        &shape.aggregate,
+        upstream,
+        Arc::clone(&shape.source_root.transform),
+        Arc::clone(&shape.transform),
+        cancel,
+        task_events,
+    )
+    .await?;
+    Ok(Some(TransientSourceAggregateRootMaterialization {
+        source_name: shape.source_root.source_name,
+        optimized_nodes: shape.optimized_nodes,
+        receiver,
+    }))
+}
+
+async fn build_transient_aggregate_receiver(
+    graph_id: &str,
+    aggregate: &DbspAggregateNode,
+    upstream: TransientSourceHandleStream,
+    input_transform: Arc<DeltaTransformFn>,
+    output_transform: Arc<DeltaTransformFn>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let slot_kinds =
+        build_incremental_aggregate_slot_kinds(aggregate.aggregates()).ok_or_else(|| {
+            anyhow!("aggregate is not eligible for transient incremental aggregation")
+        })?;
+    let row_evaluator = build_incremental_aggregate_row_evaluator(
+        Arc::clone(aggregate.input_schema()),
+        aggregate.group_keys().to_vec(),
+        aggregate.aggregates().to_vec(),
+        graph_id.to_string(),
+        "transient_aggregate",
+    );
+    let aggregate_processor = Arc::new(
+        dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(row_evaluator, slot_kinds)
+            .await
+            .context("initialize transient incremental aggregate")?,
+    );
+
+    let mut upstream_rx = upstream.subscribe();
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let graph_id = graph_id.to_string();
+    let task_label = format!("transient-aggregate:{graph_id}");
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let final_deltas = match output_transform(encoded_output) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(final_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+fn encode_incremental_aggregate_output_deltas(
+    deltas: Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut encoded = Vec::with_capacity(deltas.len());
+    for ((key, values), diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let mut row = decode_projected_row_key(&key)?;
+        row.extend(values.iter().map(scalar_from_incremental_aggregate_value));
+        encoded.push((encode_projected_row_key(&row)?, diff));
+    }
+    Ok(encoded)
 }
 
 fn try_build_transient_source_topn_root_materialization(

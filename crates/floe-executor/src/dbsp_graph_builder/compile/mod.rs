@@ -162,6 +162,11 @@ mod join_phase;
 mod set_ops_topn_phase;
 mod source_map_phase;
 
+pub(crate) use aggregate_window_phase::{
+    build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
+    scalar_from_incremental_aggregate_value,
+};
+
 async fn log_handle_rows(
     label: &str,
     handle: &ZSetHandle,

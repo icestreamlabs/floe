@@ -822,7 +822,7 @@ fn evaluate_count_row_values(
         .collect()
 }
 
-fn build_incremental_aggregate_slot_kinds(
+pub(crate) fn build_incremental_aggregate_slot_kinds(
     aggregates: &[DbspAggregateExpr],
 ) -> Option<Vec<dbsp::IncrementalAggregateSlotKind>> {
     let mut slot_kinds = Vec::with_capacity(aggregates.len());
@@ -848,7 +848,7 @@ fn build_incremental_aggregate_slot_kinds(
     Some(slot_kinds)
 }
 
-fn build_incremental_aggregate_row_evaluator(
+pub(crate) fn build_incremental_aggregate_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
     aggregates: Vec<DbspAggregateExpr>,
@@ -1034,7 +1034,7 @@ fn incremental_aggregate_value_from_scalar(
     }
 }
 
-fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateValue) -> ScalarValue {
+pub(crate) fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateValue) -> ScalarValue {
     match value {
         dbsp::AggregateValue::Null(value_type) => match value_type {
             dbsp::AggregateValueType::Int64 => ScalarValue::Int64(None),
