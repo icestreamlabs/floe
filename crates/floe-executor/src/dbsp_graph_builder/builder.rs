@@ -1035,6 +1035,12 @@ struct TransientJoinInputOptimization {
     receiver: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
 }
 
+struct TransientJoinPipelineRootMaterialization {
+    left_input_idx: usize,
+    right_input_idx: usize,
+    steps: Vec<TransientPipelineStepSpec>,
+}
+
 #[derive(Clone)]
 struct TransientSourceTopNRootShape {
     source_root: TransientSourceRootMaterialization,
@@ -1049,6 +1055,12 @@ struct TransientSourceAggregateRootShape {
     aggregate: DbspAggregateNode,
     optimized_nodes: Vec<usize>,
     transform: Arc<DeltaTransformFn>,
+}
+
+enum TransientPipelineStepSpec {
+    Transform,
+    Aggregate,
+    TopN,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1499,6 +1511,27 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
     }
     if let Some(shape) = find_transient_source_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_name().to_string()])));
+    }
+    if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
+        && shape
+            .steps
+            .iter()
+            .any(|step| !matches!(step, TransientPipelineStepSpec::Transform))
+    {
+        let Some(left_root) =
+            try_build_transient_source_root_materialization(plan, shape.left_input_idx)?
+        else {
+            return Ok(None);
+        };
+        let Some(right_root) =
+            try_build_transient_source_root_materialization(plan, shape.right_input_idx)?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(BTreeSet::from([
+            left_root.source_name,
+            right_root.source_name,
+        ])));
     }
 
     let persistence_policy = PersistencePolicy::for_plan(plan);
@@ -2253,6 +2286,103 @@ fn encode_incremental_aggregate_output_deltas(
     Ok(encoded)
 }
 
+fn try_build_transient_join_pipeline_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientJoinPipelineRootMaterialization>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::Join(join) => {
+            if !matches!(join.join_type, dbsp::DbspJoinType::Inner)
+                || !has_single_consumer(plan, root_idx)
+            {
+                return Ok(None);
+            }
+            let (left_input_idx, right_input_idx) = join_inputs(root)?;
+            Ok(Some(TransientJoinPipelineRootMaterialization {
+                left_input_idx,
+                right_input_idx,
+                steps: Vec::new(),
+            }))
+        }
+        DbspNodeKind::Aggregate(aggregate) => {
+            if build_incremental_aggregate_slot_kinds(aggregate.aggregates()).is_none() {
+                return Ok(None);
+            }
+            let input_idx = first_input(root, "aggregate")?;
+            let Some(mut shape) =
+                try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.steps.push(TransientPipelineStepSpec::Aggregate);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::TopN(topn) => {
+            let input_idx = first_input(root, "topn")?;
+            let Some(mut shape) =
+                try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let _ = topn;
+            shape.steps.push(TransientPipelineStepSpec::TopN);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(shape) =
+                try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) =
+                try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let _ = select;
+            shape.steps.push(TransientPipelineStepSpec::Transform);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) =
+                    try_build_transient_join_pipeline_root_materialization(plan, select_input_idx)?
+                else {
+                    return Ok(None);
+                };
+                let _ = (select, project);
+                shape.steps.push(TransientPipelineStepSpec::Transform);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) =
+                try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let _ = project;
+            shape.steps.push(TransientPipelineStepSpec::Transform);
+            Ok(Some(shape))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn try_build_transient_source_topn_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,
@@ -2552,7 +2682,9 @@ mod tests {
     use std::time::Duration;
 
     use datafusion::common::Column;
+    use datafusion::datasource::{TableProvider, empty::EmptyTable};
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
+    use datafusion::prelude::SessionContext;
     use dbsp::DbspJoin;
     use dbsp::join::TransientJoinInputBatch;
     use dbsp::storage::{KeyValueTable, SlateTable};
@@ -2631,6 +2763,53 @@ mod tests {
         assert!(
             try_build_direct_join_output_projection(join, &transient_opt.steps).is_some(),
             "expected benchmark join root to expose a direct output projection: {plan:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn q4_join_aggregate_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT category, AVG(max) \
+             FROM (SELECT MAX(b.price) AS max, a.category \
+                   FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+                   WHERE b.date_time BETWEEN a.date_time AND a.expires \
+                   GROUP BY a.id, a.category) per_auction \
+             GROUP BY category",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q6_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT seller, AVG(price) AS moving_avg_price \
+             FROM (SELECT a.seller, b.price, b.date_time, \
+                          ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum \
+                   FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+                   WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
+             WHERE rownum <= 1 \
+             GROUP BY seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
     }
 
@@ -3833,6 +4012,24 @@ mod tests {
             .expect("project")
             .build()
             .expect("logical plan")
+    }
+
+    async fn sql_plan_with_auction_and_bid(sql: &str) -> LogicalPlan {
+        let ctx = SessionContext::new();
+        let bid_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_bid_table().schema().to_arrow_schema(),
+        ));
+        let auction_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_auction_table().schema().to_arrow_schema(),
+        ));
+        ctx.register_table("nexmark_bid", bid_provider)
+            .expect("register nexmark_bid");
+        ctx.register_table("nexmark_auction", auction_provider)
+            .expect("register nexmark_auction");
+        ctx.state()
+            .create_logical_plan(sql)
+            .await
+            .expect("build logical plan")
     }
 
     async fn assert_tick_matches_transform(
