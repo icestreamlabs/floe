@@ -1,0 +1,452 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use rkyv::Archive;
+use rkyv::Deserialize as RkyvDeserialize;
+use rkyv::Serialize as RkyvSerialize;
+use rkyv::bytecheck::CheckBytes;
+use slatedb::WriteBatch;
+
+use crate::collections::IndexedBatchZSet;
+use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::handles::ZSetHandle;
+use crate::storage::KeyValueTable;
+use crate::storage::dictionary::Dictionary;
+use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::runtime::DeltaOperator;
+use crate::stream::util::delta_zset_handle;
+
+type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
+
+/// Partition-local top-1 operator used for ROW_NUMBER() <= 1 style queries.
+///
+/// It keeps a persisted index of rows per partition and recomputes the winner
+/// only for partitions touched in the current batch.
+pub struct PartitionedTop1Op<K, P, O>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Clone + Ord + Send + Sync + 'static,
+{
+    pub input_index: IndexedBatchZSet<P, K>,
+    pub table: Arc<dyn KeyValueTable>,
+    output: VersionedZSet<K>,
+    dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    partition_output_cache: BTreeMap<P, K>,
+    row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
+    key_parts: KeyPartsFn<K, P, O>,
+}
+
+impl<K, P, O> PartitionedTop1Op<K, P, O>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Clone + Ord + Send + Sync + 'static,
+{
+    pub fn new_with_key_extractor(
+        input_index: IndexedBatchZSet<P, K>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: KeyPartsFn<K, P, O>,
+    ) -> Self {
+        Self {
+            input_index,
+            table,
+            output,
+            dict_cache: HashMap::new(),
+            partition_output_cache: BTreeMap::new(),
+            row_key_cache: HashMap::new(),
+            key_parts,
+        }
+    }
+
+    fn keys_for(&mut self, key: &K) -> (Option<P>, Option<O>) {
+        if let Some(cached) = self.row_key_cache.get(key) {
+            return cached.clone();
+        }
+        let computed = (self.key_parts)(key);
+        self.row_key_cache.insert(key.clone(), computed.clone());
+        computed
+    }
+
+    async fn recompute_partition_top1(&mut self, partition_key: &P) -> Result<Option<K>> {
+        let values = self
+            .input_index
+            .values_for_key(partition_key)
+            .await
+            .context("load top1 partition values")?;
+        let mut best: Option<(O, K)> = None;
+        for (row, weight) in values {
+            if weight <= 0 {
+                continue;
+            }
+            let (_, Some(order_key)) = self.keys_for(&row) else {
+                continue;
+            };
+            match &best {
+                Some((best_order, best_row))
+                    if (order_key.clone(), row.clone())
+                        >= (best_order.clone(), best_row.clone()) => {}
+                _ => best = Some((order_key, row)),
+            }
+        }
+        Ok(best.map(|(_, row)| row))
+    }
+
+    async fn apply_deltas_to_versioned(
+        versioned: &mut VersionedZSet<K>,
+        deltas: &HashMap<K, i64>,
+        base: Option<u64>,
+    ) -> Result<ZSetHandle> {
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in deltas {
+            if *delta == 0 {
+                continue;
+            }
+            let id = dict_batch
+                .intern(key)
+                .await
+                .context("intern key while staging top1 delta")?;
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
+        }
+        drop(dict_batch);
+
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.retain(|(_, delta)| *delta != 0);
+            if bucket_deltas.is_empty() {
+                continue;
+            }
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
+        }
+
+        if segments.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
+            }
+            return Ok(versioned.handle_for_version(0));
+        }
+
+        let mut batch = WriteBatch::new();
+        let plan = versioned
+            .enqueue_version_with_base(segments, base, 0, &mut batch)
+            .await
+            .context("schedule top1 version update")?;
+        versioned
+            .table()
+            .write_batch(batch)
+            .await
+            .context("write top1 version update")?;
+        versioned.apply_version_plan(&plan);
+        Ok(versioned.handle_for_version(plan.version))
+    }
+}
+
+#[async_trait]
+impl<K, P, O> DeltaOperator for PartitionedTop1Op<K, P, O>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    P: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Clone + Ord + Send + Sync + 'static,
+{
+    async fn on_step(
+        &mut self,
+        _ts: i64,
+        inputs: &[ZSetHandle],
+    ) -> anyhow::Result<Option<ZSetHandle>> {
+        let delta_handle = inputs
+            .first()
+            .cloned()
+            .context("top1 operator requires one input delta handle")?;
+
+        let delta_values =
+            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+                .await
+                .context("load delta for top1")?;
+        if delta_values.is_empty() {
+            return Ok(Some(self.output.handle_for_version(0)));
+        }
+
+        let mut delta_map = HashMap::new();
+        let mut affected_partitions = BTreeSet::new();
+        let mut index_updates = Vec::new();
+        for (key, diff_weight) in delta_values {
+            let entry = delta_map.entry(key.clone()).or_insert(0);
+            *entry += diff_weight;
+            if *entry == 0 {
+                delta_map.remove(&key);
+            }
+        }
+        if delta_map.is_empty() {
+            return Ok(Some(self.output.handle_for_version(0)));
+        }
+
+        for (key, diff_weight) in &delta_map {
+            let (Some(partition_key), _) = self.keys_for(key) else {
+                continue;
+            };
+            affected_partitions.insert(partition_key.clone());
+            index_updates.push((partition_key, key.clone(), *diff_weight));
+        }
+        if affected_partitions.is_empty() {
+            return Ok(Some(self.output.handle_for_version(0)));
+        }
+
+        self.input_index
+            .apply_deltas(index_updates)
+            .await
+            .context("update top1 input index")?;
+
+        let mut output_delta = HashMap::new();
+        for partition_key in affected_partitions {
+            let old_top = self.partition_output_cache.get(&partition_key).cloned();
+            let new_top = self.recompute_partition_top1(&partition_key).await?;
+            if old_top == new_top {
+                continue;
+            }
+            if let Some(old_row) = old_top {
+                *output_delta.entry(old_row).or_insert(0) -= 1;
+            }
+            if let Some(new_row) = new_top.clone() {
+                *output_delta.entry(new_row).or_insert(0) += 1;
+            }
+            if let Some(new_row) = new_top {
+                self.partition_output_cache.insert(partition_key, new_row);
+            } else {
+                self.partition_output_cache.remove(&partition_key);
+            }
+        }
+        output_delta.retain(|_, delta| *delta != 0);
+        if output_delta.is_empty() {
+            return Ok(Some(self.output.handle_for_version(0)));
+        }
+
+        let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None)
+            .await
+            .context("persist top1 output delta")?;
+        Ok(Some(output_handle))
+    }
+}
+
+fn bucket_for(id: u64) -> u16 {
+    (id >> 48) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collections::zset::VersionedZSet;
+    use crate::stream::util::materialize_zset_handle;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+
+    async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, store).await.expect("open db"));
+        Arc::new(crate::storage::SlateTable::new(db))
+    }
+
+    async fn stage_version(
+        dict: Arc<Dictionary<i64>>,
+        table: Arc<dyn KeyValueTable>,
+        namespace: &str,
+        deltas: &[(i64, i64)],
+    ) -> ZSetHandle {
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in deltas {
+            let id = dict_batch.intern(key).await.expect("intern key");
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
+        }
+        drop(dict_batch);
+
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.retain(|(_, delta)| *delta != 0);
+            if bucket_deltas.is_empty() {
+                continue;
+            }
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
+        }
+
+        let dict = Arc::clone(&dict);
+        let mut zset = VersionedZSet::new(dict, table, namespace.to_string())
+            .await
+            .expect("build zset");
+        let version = zset.create_version(segments).await.expect("create version");
+        zset.handle_for_version(version)
+    }
+
+    #[tokio::test]
+    async fn partitioned_top1_tracks_latest_per_partition() {
+        let table = build_table("partitioned-top1-latest").await;
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "input_top1_latest".to_string(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "output_top1_latest".to_string(), None)
+                .await
+                .expect("output dict"),
+        );
+        let output =
+            VersionedZSet::new(output_dict, table.clone(), "output_top1_latest".to_string())
+                .await
+                .expect("output zset");
+        let input_index = IndexedBatchZSet::new(table.clone(), "top1_input_latest");
+        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
+        let mut op = PartitionedTop1Op::new_with_key_extractor(
+            input_index,
+            table.clone(),
+            output,
+            key_parts,
+        );
+
+        let handle = stage_version(
+            input_dict,
+            table.clone(),
+            "input_top1_latest",
+            &[(11, 1), (12, 1), (21, 1), (23, 1)],
+        )
+        .await;
+        let out = op
+            .on_step(1, &[handle])
+            .await
+            .expect("step")
+            .expect("output handle");
+        let rows = materialize_zset_handle::<i64>(table, &mut HashMap::new(), &out)
+            .await
+            .expect("materialize output");
+        assert_eq!(rows.get(&11), Some(&1));
+        assert_eq!(rows.get(&21), Some(&1));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn partitioned_top1_recomputes_on_delete() {
+        let table = build_table("partitioned-top1-delete").await;
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "input_top1_delete".to_string(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), "output_top1_delete".to_string(), None)
+                .await
+                .expect("output dict"),
+        );
+        let output =
+            VersionedZSet::new(output_dict, table.clone(), "output_top1_delete".to_string())
+                .await
+                .expect("output zset");
+        let input_index = IndexedBatchZSet::new(table.clone(), "top1_input_delete");
+        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
+        let mut op = PartitionedTop1Op::new_with_key_extractor(
+            input_index,
+            table.clone(),
+            output,
+            key_parts,
+        );
+
+        let first = stage_version(
+            Arc::clone(&input_dict),
+            table.clone(),
+            "input_top1_delete",
+            &[(11, 1), (12, 1)],
+        )
+        .await;
+        op.on_step(1, &[first]).await.expect("first step");
+
+        let second =
+            stage_version(input_dict, table.clone(), "input_top1_delete", &[(11, -1)]).await;
+        let out = op
+            .on_step(2, &[second])
+            .await
+            .expect("second step")
+            .expect("output handle");
+        let rows = materialize_zset_handle::<i64>(table, &mut HashMap::new(), &out)
+            .await
+            .expect("materialize output");
+        assert_eq!(rows.get(&11), Some(&-1));
+        assert_eq!(rows.get(&12), Some(&1));
+        assert_eq!(rows.len(), 2);
+    }
+}

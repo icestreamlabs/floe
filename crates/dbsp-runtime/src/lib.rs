@@ -24,6 +24,7 @@ pub mod operators;
 pub mod relation_state;
 pub mod semijoin;
 pub mod stream;
+pub mod top1;
 pub mod topk;
 pub mod topn;
 pub mod union;
@@ -63,6 +64,7 @@ pub use operators::join_range::JoinRangeOp;
 pub use operators::map::MapOp;
 pub use operators::rolling_aggregate::RollingAggregateOp;
 pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
+pub use operators::top1::PartitionedTop1Op;
 pub use operators::topk::TopKOp;
 pub use operators::topn::TopNOp;
 pub use operators::union::UnionOp;
@@ -73,6 +75,7 @@ pub use semijoin::DbspSemiJoin;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
+pub use top1::DbspPartitionedTop1;
 pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;

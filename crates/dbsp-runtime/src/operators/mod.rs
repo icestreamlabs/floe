@@ -12,6 +12,7 @@ pub mod join_range;
 pub mod map;
 pub mod rolling_aggregate;
 pub mod semijoin;
+pub mod top1;
 pub mod topk;
 pub mod topn;
 pub mod union;

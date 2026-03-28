@@ -57,6 +57,7 @@ impl DbspGraphBuilder {
         let schema = Arc::clone(node.output_schema());
         let limit = node.limit();
         let offset = node.offset();
+        let partitioned = !partition_exprs.is_empty();
         let graph_id = self.graph_id().to_string();
         let task_events = task_events.clone();
         let task_label = format!("topn:{graph_id}");
@@ -159,6 +160,18 @@ impl DbspGraphBuilder {
                 )),
             )
         };
+
+        if limit == 1 && offset == 0 && partitioned {
+            let top1 = dbsp::DbspPartitionedTop1::new_with_key_extractor::<
+                Vec<u8>,
+                Vec<u8>,
+                TopNKey,
+                _,
+            >(&upstream, key_parts, Some(error_handler))
+            .await
+            .context("initialize DBSP partitioned top1")?;
+            return Ok(top1.stream());
+        }
 
         let topn = DbspTopN::new_with_key_extractor::<Vec<u8>, Vec<u8>, TopNKey, _>(
             &upstream,

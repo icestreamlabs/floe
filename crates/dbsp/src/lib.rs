@@ -21,8 +21,8 @@ pub mod semantic {
 
 pub use dbsp_runtime::{
     aggregate, algebra, collections, count_aggregate, distinct, filter, filter_map, handles,
-    incremental_aggregate, join, map, operators, relation_state, semijoin, stream, topk, topn,
-    union, window,
+    incremental_aggregate, join, map, operators, relation_state, semijoin, stream, top1, topk,
+    topn, union, window,
 };
 pub use dbsp_storage::storage;
 
@@ -59,6 +59,7 @@ pub use operators::incremental_aggregate::{
 };
 pub use operators::join::JoinOp;
 pub use operators::map::MapOp;
+pub use operators::top1::PartitionedTop1Op;
 pub use operators::topk::TopKOp;
 pub use operators::topn::TopNOp;
 pub use operators::window::WindowKey;
@@ -67,6 +68,7 @@ pub use semijoin::DbspSemiJoin;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
+pub use top1::DbspPartitionedTop1;
 pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;
