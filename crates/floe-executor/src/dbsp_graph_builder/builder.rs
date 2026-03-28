@@ -6,15 +6,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
-    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspNodeKind, RowSchema, StreamRetention,
+    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspExpression, DbspNodeKind,
+    DbspTopNNode, OrderExpr, RowSchema, StreamRetention,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
@@ -29,7 +31,7 @@ use crate::encoding::{
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
-use crate::task_events::GraphTaskSender;
+use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
@@ -202,6 +204,37 @@ impl DbspGraphBuilder {
             .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
 
         if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
+            if let Some(transient_topn_root) = try_build_transient_source_topn_root_materialization(
+                inputs.plan,
+                inputs.plan.root,
+                inputs.outer_transient_streams,
+                &inputs.cancel,
+                &inputs.task_events,
+                self.graph_id(),
+            )? {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_topn_root.source_name,
+                    optimized_nodes = ?transient_topn_root.optimized_nodes,
+                    "using transient topn root materialization with source batch journal"
+                );
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    transient_topn_root.receiver,
+                    Arc::clone(&transient_topn_root.transform),
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
             if let Some(transient_root) =
                 try_build_transient_source_root_materialization(inputs.plan, inputs.plan.root)?
             {
@@ -937,9 +970,17 @@ fn apply_transient_segment_vectorized(
     Ok(deltas)
 }
 
+#[derive(Clone)]
 struct TransientSourceRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+struct TransientSourceTopNRootMaterialization {
+    source_name: String,
+    optimized_nodes: Vec<usize>,
+    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     transform: Arc<DeltaTransformFn>,
 }
 
@@ -947,6 +988,407 @@ struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+}
+
+#[derive(Clone)]
+struct TransientSourceTopNRootShape {
+    source_root: TransientSourceRootMaterialization,
+    topn: DbspTopNNode,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TransientTopNSortSpec {
+    ascending: bool,
+    nulls_first: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TransientTopNValue {
+    Null,
+    Int64(i64),
+    Timestamp(i64),
+    Utf8(String),
+    Bool(bool),
+}
+
+impl TransientTopNValue {
+    fn from_scalar(value: &ScalarValue) -> Result<Self> {
+        match value {
+            ScalarValue::Int64(Some(v)) => Ok(Self::Int64(*v)),
+            ScalarValue::Int64(None) => Ok(Self::Null),
+            ScalarValue::TimestampMillisecond(Some(v), _) => Ok(Self::Timestamp(*v)),
+            ScalarValue::TimestampMillisecond(None, _) => Ok(Self::Null),
+            ScalarValue::Utf8(Some(v)) => Ok(Self::Utf8(v.clone())),
+            ScalarValue::Utf8(None) => Ok(Self::Null),
+            ScalarValue::Boolean(Some(v)) => Ok(Self::Bool(*v)),
+            ScalarValue::Boolean(None) | ScalarValue::Null => Ok(Self::Null),
+            other => Err(anyhow!("unsupported transient topn sort value {other:?}")),
+        }
+    }
+}
+
+impl Ord for TransientTopNValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use TransientTopNValue::*;
+        let rank = |value: &TransientTopNValue| -> u8 {
+            match value {
+                Null => 0,
+                Int64(_) => 1,
+                Timestamp(_) => 2,
+                Utf8(_) => 3,
+                Bool(_) => 4,
+            }
+        };
+
+        let left_rank = rank(self);
+        let right_rank = rank(other);
+        if left_rank != right_rank {
+            return left_rank.cmp(&right_rank);
+        }
+
+        match (self, other) {
+            (Null, Null) => std::cmp::Ordering::Equal,
+            (Int64(a), Int64(b)) => a.cmp(b),
+            (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            (Utf8(a), Utf8(b)) => a.cmp(b),
+            (Bool(a), Bool(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for TransientTopNValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TransientTopNKey {
+    specs: Arc<Vec<TransientTopNSortSpec>>,
+    values: Vec<TransientTopNValue>,
+    tie_breaker: Vec<u8>,
+}
+
+impl TransientTopNKey {
+    fn new(
+        specs: Arc<Vec<TransientTopNSortSpec>>,
+        values: Vec<TransientTopNValue>,
+        tie_breaker: Vec<u8>,
+    ) -> Self {
+        Self {
+            specs,
+            values,
+            tie_breaker,
+        }
+    }
+}
+
+impl Ord for TransientTopNKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (idx, spec) in self.specs.iter().enumerate() {
+            let left = self.values.get(idx);
+            let right = other.values.get(idx);
+            let (left, right) = match (left, right) {
+                (Some(left), Some(right)) => (left, right),
+                _ => continue,
+            };
+
+            let cmp = match (left, right) {
+                (TransientTopNValue::Null, TransientTopNValue::Null) => std::cmp::Ordering::Equal,
+                (TransientTopNValue::Null, _) => {
+                    if spec.nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (_, TransientTopNValue::Null) => {
+                    if spec.nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                _ => {
+                    let cmp = left.cmp(right);
+                    if spec.ascending { cmp } else { cmp.reverse() }
+                }
+            };
+
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+
+        self.tie_breaker.cmp(&other.tie_breaker)
+    }
+}
+
+impl PartialOrd for TransientTopNKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct TransientTopNProcessor {
+    graph_id: String,
+    schema: Arc<RowSchema>,
+    partition_exprs: Arc<Vec<DbspExpression>>,
+    order_exprs: Arc<Vec<OrderExpr>>,
+    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    limit: usize,
+    offset: usize,
+    row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
+    input_weights: HashMap<Vec<u8>, i64>,
+    order_index: BTreeMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
+    partition_output_cache: BTreeMap<Vec<u8>, HashMap<Vec<u8>, i64>>,
+}
+
+impl TransientTopNProcessor {
+    fn new(graph_id: impl Into<String>, topn: &DbspTopNNode) -> Self {
+        let order_specs = Arc::new(
+            topn.order_by()
+                .iter()
+                .map(|expr| TransientTopNSortSpec {
+                    ascending: expr.ascending(),
+                    nulls_first: expr.nulls_first(),
+                })
+                .collect(),
+        );
+        Self {
+            graph_id: graph_id.into(),
+            schema: Arc::clone(topn.output_schema()),
+            partition_exprs: Arc::new(topn.partition_by().to_vec()),
+            order_exprs: Arc::new(topn.order_by().to_vec()),
+            order_specs,
+            limit: topn.limit(),
+            offset: topn.offset(),
+            row_key_cache: HashMap::new(),
+            input_weights: HashMap::new(),
+            order_index: BTreeMap::new(),
+            partition_output_cache: BTreeMap::new(),
+        }
+    }
+
+    fn apply_deltas(&mut self, deltas: Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> {
+        let mut affected_partitions = BTreeSet::new();
+        for (row_key, diff) in deltas {
+            if diff == 0 {
+                continue;
+            }
+            let (partition_key, order_key) = self.keys_for(&row_key);
+            let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
+                continue;
+            };
+            affected_partitions.insert(partition_key.clone());
+
+            let previous_weight = self.input_weights.get(&row_key).copied().unwrap_or(0);
+            let next_weight = previous_weight.saturating_add(diff);
+            if next_weight <= 0 {
+                self.input_weights.remove(&row_key);
+            } else {
+                self.input_weights.insert(row_key.clone(), next_weight);
+            }
+
+            let partition_index = self.order_index.entry(partition_key.clone()).or_default();
+            if next_weight <= 0 {
+                partition_index.remove(&(order_key.clone(), row_key.clone()));
+                if partition_index.is_empty() {
+                    self.order_index.remove(&partition_key);
+                }
+            } else {
+                partition_index.insert((order_key, row_key), next_weight);
+            }
+        }
+
+        let mut output_deltas = HashMap::new();
+        for partition_key in affected_partitions {
+            let previous_output = self
+                .partition_output_cache
+                .remove(&partition_key)
+                .unwrap_or_default();
+            let next_output = self
+                .order_index
+                .get(&partition_key)
+                .map(|partition_index| self.compute_partition_topn(partition_index))
+                .unwrap_or_default();
+            accumulate_weight_deltas(&mut output_deltas, &previous_output, &next_output);
+            if !next_output.is_empty() {
+                self.partition_output_cache
+                    .insert(partition_key, next_output);
+            }
+        }
+
+        Ok(output_deltas
+            .into_iter()
+            .filter(|(_, diff)| *diff != 0)
+            .collect())
+    }
+
+    fn compute_partition_topn(
+        &self,
+        partition_index: &BTreeMap<(TransientTopNKey, Vec<u8>), i64>,
+    ) -> HashMap<Vec<u8>, i64> {
+        if self.limit == 0 {
+            return HashMap::new();
+        }
+
+        let mut remaining_skip = self.offset;
+        let mut remaining_take = self.limit;
+        let mut output = HashMap::new();
+
+        for ((_order_key, row_key), weight) in partition_index {
+            if remaining_take == 0 {
+                break;
+            }
+
+            let mut remaining_weight = *weight;
+            if remaining_skip > 0 {
+                let available = usize::try_from(remaining_weight).unwrap_or(usize::MAX);
+                let skip = remaining_skip.min(available);
+                remaining_skip -= skip;
+                remaining_weight -= skip as i64;
+            }
+
+            if remaining_weight <= 0 {
+                continue;
+            }
+
+            let available = usize::try_from(remaining_weight).unwrap_or(usize::MAX);
+            let take = remaining_take.min(available);
+            if take > 0 {
+                output.insert(row_key.clone(), take as i64);
+                remaining_take -= take;
+            }
+        }
+
+        output
+    }
+
+    fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
+        if let Some(cached) = self.row_key_cache.get(row_key) {
+            return cached.clone();
+        }
+        let computed = self.compute_key_parts(row_key);
+        self.row_key_cache.insert(row_key.clone(), computed.clone());
+        computed
+    }
+
+    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
+        let row = match decode_projected_row_key(row_key) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %self.graph_id,
+                    error = %err,
+                    "failed to decode transient topn row"
+                );
+                return (None, None);
+            }
+        };
+
+        let mut partition_values = Vec::with_capacity(self.partition_exprs.len());
+        if !self.partition_exprs.is_empty() {
+            for expr in self.partition_exprs.iter() {
+                let value = match eval_scalar_expression(expr, &row, self.schema.as_ref()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %self.graph_id,
+                            error = %err,
+                            "failed to evaluate transient topn partition expression"
+                        );
+                        return (None, None);
+                    }
+                };
+                partition_values.push(value);
+            }
+        }
+        let partition_key = if self.partition_exprs.is_empty() {
+            Some(Vec::new())
+        } else {
+            match encode_projected_row_key(&partition_values) {
+                Ok(encoded) => Some(encoded),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %self.graph_id,
+                        error = %err,
+                        "failed to encode transient topn partition key"
+                    );
+                    return (None, None);
+                }
+            }
+        };
+
+        let mut values = Vec::with_capacity(self.order_exprs.len());
+        for expr in self.order_exprs.iter() {
+            let value = match eval_scalar_expression(expr.expression(), &row, self.schema.as_ref())
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %self.graph_id,
+                        error = %err,
+                        "failed to evaluate transient topn order expression"
+                    );
+                    return (partition_key, None);
+                }
+            };
+            match TransientTopNValue::from_scalar(&value) {
+                Ok(value) => values.push(value),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %self.graph_id,
+                        error = %err,
+                        "failed to map transient topn order value"
+                    );
+                    return (partition_key, None);
+                }
+            }
+        }
+
+        (
+            partition_key,
+            Some(TransientTopNKey::new(
+                Arc::clone(&self.order_specs),
+                values,
+                row_key.clone(),
+            )),
+        )
+    }
+}
+
+fn accumulate_weight_deltas(
+    output_deltas: &mut HashMap<Vec<u8>, i64>,
+    previous_output: &HashMap<Vec<u8>, i64>,
+    next_output: &HashMap<Vec<u8>, i64>,
+) {
+    for (row_key, previous_weight) in previous_output {
+        let next_weight = next_output.get(row_key).copied().unwrap_or(0);
+        let delta = next_weight.saturating_sub(*previous_weight);
+        if delta != 0 {
+            let entry = output_deltas.entry(row_key.clone()).or_insert(0);
+            *entry = entry.saturating_add(delta);
+            if *entry == 0 {
+                output_deltas.remove(row_key);
+            }
+        }
+    }
+    for (row_key, next_weight) in next_output {
+        if previous_output.contains_key(row_key) {
+            continue;
+        }
+        if *next_weight != 0 {
+            let entry = output_deltas.entry(row_key.clone()).or_insert(0);
+            *entry = entry.saturating_add(*next_weight);
+            if *entry == 0 {
+                output_deltas.remove(row_key);
+            }
+        }
+    }
 }
 
 enum TransientSourceRootShape {
@@ -996,6 +1438,9 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
     if let Some(shape) = find_transient_source_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_name().to_string()])));
     }
@@ -1447,6 +1892,185 @@ fn try_build_transient_source_root_materialization(
         optimized_nodes,
         transform,
     }))
+}
+
+fn try_build_transient_source_topn_root_shape(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceTopNRootShape>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::TopN(topn) => {
+            let input_idx = first_input(root, "topn")?;
+            let Some(source_root) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let mut optimized_nodes = source_root.optimized_nodes.clone();
+            optimized_nodes.push(root_idx);
+            Ok(Some(TransientSourceTopNRootShape {
+                source_root,
+                topn: topn.clone(),
+                optimized_nodes,
+                transform: Arc::new(|deltas| Ok(deltas)),
+            }))
+        }
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(mut shape) = try_build_transient_source_topn_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) = try_build_transient_source_topn_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_filter_transform(select)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) =
+                    try_build_transient_source_topn_root_shape(plan, select_input_idx)?
+                else {
+                    return Ok(None);
+                };
+                shape.transform = compose_delta_transforms(
+                    Arc::clone(&shape.transform),
+                    build_filter_map_transform(select, project)?,
+                );
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) = try_build_transient_source_topn_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_map_transform(project)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_build_transient_source_topn_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+    outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+    graph_id: &str,
+) -> Result<Option<TransientSourceTopNRootMaterialization>> {
+    let Some(shape) = try_build_transient_source_topn_root_shape(plan, root_idx)? else {
+        return Ok(None);
+    };
+    let Some(upstream) = outer_transient_streams
+        .get(&shape.source_root.source_name)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let receiver = build_transient_topn_receiver(
+        graph_id,
+        &shape.topn,
+        upstream,
+        Arc::clone(&shape.source_root.transform),
+        cancel,
+        task_events,
+    );
+    Ok(Some(TransientSourceTopNRootMaterialization {
+        source_name: shape.source_root.source_name,
+        optimized_nodes: shape.optimized_nodes,
+        receiver,
+        transform: shape.transform,
+    }))
+}
+
+fn compose_delta_transforms(
+    first: Arc<DeltaTransformFn>,
+    second: Arc<DeltaTransformFn>,
+) -> Arc<DeltaTransformFn> {
+    Arc::new(move |deltas| {
+        let deltas = first(deltas)?;
+        second(deltas)
+    })
+}
+
+fn build_transient_topn_receiver(
+    graph_id: &str,
+    topn: &DbspTopNNode,
+    upstream: TransientSourceHandleStream,
+    input_transform: Arc<DeltaTransformFn>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+    let mut upstream_rx = upstream.subscribe();
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let graph_id = graph_id.to_string();
+    let task_label = format!("transient-topn:{graph_id}");
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+    let mut processor = TransientTopNProcessor::new(graph_id.clone(), topn);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let output_deltas = match processor.apply_deltas(input_deltas) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(output_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    rx
 }
 
 fn find_transient_source_root_shape(
