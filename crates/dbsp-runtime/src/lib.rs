@@ -35,7 +35,7 @@ pub use dbsp_storage::storage;
 pub use aggregate::DbspAggregate;
 pub use algebra::AbelianGroup;
 pub use collections::{OrderedBytes, ZSet, h};
-pub use count_aggregate::DbspCountAggregate;
+pub use count_aggregate::{DbspCountAggregate, DbspTransientCountAggregate};
 pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;

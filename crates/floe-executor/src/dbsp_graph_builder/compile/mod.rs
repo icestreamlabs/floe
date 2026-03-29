@@ -163,6 +163,7 @@ mod set_ops_topn_phase;
 mod source_map_phase;
 
 pub(crate) use aggregate_window_phase::{
+    build_count_aggregate_slot_kinds, build_count_row_evaluator,
     build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
     scalar_from_incremental_aggregate_value,
 };

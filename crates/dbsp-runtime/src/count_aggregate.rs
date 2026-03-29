@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +15,8 @@ use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::count_aggregate::{
-    CountAggregateOp, CountAggregateRow, CountAggregateSlotKind, GroupedCountState,
+    CountAggregateOp, CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
+    DistinctGroupKey, GroupedCountState,
 };
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
@@ -31,6 +33,51 @@ type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> +
 
 pub struct DbspCountAggregate {
     stream: DeltaHandleStream,
+}
+
+struct TransientCountAggregateState<K, V, D>
+where
+    K: Clone + Eq + Hash,
+    V: Clone + Eq + Hash,
+    D: Clone + Eq + Hash,
+{
+    row_evaluator: RowEvaluator<V, K, D>,
+    slot_kinds: Vec<CountAggregateSlotKind>,
+    grouped_state: HashMap<K, GroupedCountState>,
+    distinct_weights: HashMap<(DistinctGroupKey<K>, D), i64>,
+}
+
+pub struct DbspTransientCountAggregate<K, V, D>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    D: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    state: AsyncMutex<TransientCountAggregateState<K, V, D>>,
 }
 
 impl DbspCountAggregate {
@@ -189,6 +236,231 @@ impl DbspCountAggregate {
 
     pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
+    }
+}
+
+impl<K, V, D> DbspTransientCountAggregate<K, V, D>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    D: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub async fn new<FRow>(
+        row_evaluator: FRow,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+    ) -> anyhow::Result<Self>
+    where
+        FRow: Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
+    {
+        Ok(Self {
+            state: AsyncMutex::new(TransientCountAggregateState {
+                row_evaluator: Arc::new(row_evaluator) as RowEvaluator<V, K, D>,
+                slot_kinds,
+                grouped_state: HashMap::new(),
+                distinct_weights: HashMap::new(),
+            }),
+        })
+    }
+
+    pub async fn apply_deltas(
+        &self,
+        delta_values: Vec<(V, i64)>,
+    ) -> anyhow::Result<Vec<((K, Vec<i64>), i64)>> {
+        let mut state = self.state.lock().await;
+        let deltas = state.apply_deltas(delta_values);
+        Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
+    }
+}
+
+impl<K, V, D> TransientCountAggregateState<K, V, D>
+where
+    K: Clone + Eq + Hash,
+    V: Clone + Eq + Hash,
+    D: Clone + Eq + Hash,
+{
+    fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64> {
+        let mut merged = HashMap::new();
+        for (row, weight) in deltas {
+            let entry = merged.entry(row.clone()).or_insert(0);
+            *entry += weight;
+            if *entry == 0 {
+                merged.remove(&row);
+            }
+        }
+        merged
+    }
+
+    fn apply_deltas(&mut self, delta_values: Vec<(V, i64)>) -> HashMap<(K, Vec<i64>), i64> {
+        if delta_values.is_empty() {
+            return HashMap::new();
+        }
+
+        let coalesced = self.coalesce_deltas(delta_values);
+        if coalesced.is_empty() {
+            return HashMap::new();
+        }
+
+        let arity = self.slot_kinds.len();
+        let mut grouped_deltas: HashMap<K, GroupedCountState> = HashMap::new();
+        let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, D), i64> = HashMap::new();
+        for (value, weight) in coalesced {
+            if weight == 0 {
+                continue;
+            }
+            let Some(row_update) = (self.row_evaluator)(&value) else {
+                continue;
+            };
+            if row_update.slots.len() != arity {
+                tracing::warn!(
+                    expected = arity,
+                    actual = row_update.slots.len(),
+                    "transient count aggregate row evaluator returned unexpected slot vector width"
+                );
+                continue;
+            }
+
+            let entry = grouped_deltas
+                .entry(row_update.key.clone())
+                .or_insert_with(|| GroupedCountState::zero(arity));
+            entry.total_rows += weight;
+            for (slot_idx, slot) in row_update.slots.into_iter().enumerate() {
+                match (&self.slot_kinds[slot_idx], slot) {
+                    (CountAggregateSlotKind::Linear, CountAggregateSlotUpdate::Linear(value)) => {
+                        entry.counts[slot_idx] += value * weight;
+                    }
+                    (
+                        CountAggregateSlotKind::Distinct,
+                        CountAggregateSlotUpdate::Distinct(Some(distinct_value)),
+                    ) => {
+                        let distinct_key = DistinctGroupKey {
+                            group_key: row_update.key.clone(),
+                            slot: slot_idx as u32,
+                        };
+                        let delta_entry = distinct_deltas
+                            .entry((distinct_key, distinct_value))
+                            .or_insert(0);
+                        *delta_entry += weight;
+                    }
+                    (
+                        CountAggregateSlotKind::Distinct,
+                        CountAggregateSlotUpdate::Distinct(None),
+                    ) => {}
+                    (expected_kind, actual) => {
+                        tracing::warn!(
+                            ?expected_kind,
+                            slot_idx,
+                            actual_kind = match actual {
+                                CountAggregateSlotUpdate::Linear(_) => "linear",
+                                CountAggregateSlotUpdate::Distinct(_) => "distinct",
+                            },
+                            "transient count aggregate row evaluator returned mismatched slot kind"
+                        );
+                    }
+                }
+            }
+        }
+
+        if grouped_deltas.is_empty() && distinct_deltas.is_empty() {
+            return HashMap::new();
+        }
+
+        for ((distinct_key, distinct_value), delta) in distinct_deltas {
+            if delta == 0 {
+                continue;
+            }
+            let old_weight = self
+                .distinct_weights
+                .get(&(distinct_key.clone(), distinct_value.clone()))
+                .copied()
+                .unwrap_or(0);
+            let new_weight = old_weight + delta;
+            let entry = grouped_deltas
+                .entry(distinct_key.group_key.clone())
+                .or_insert_with(|| GroupedCountState::zero(arity));
+            if old_weight > 0 && new_weight <= 0 {
+                entry.counts[distinct_key.slot as usize] -= 1;
+            } else if old_weight <= 0 && new_weight > 0 {
+                entry.counts[distinct_key.slot as usize] += 1;
+            }
+            if new_weight == 0 {
+                self.distinct_weights
+                    .remove(&(distinct_key, distinct_value));
+            } else {
+                self.distinct_weights
+                    .insert((distinct_key, distinct_value), new_weight);
+            }
+        }
+
+        let mut output_deltas: HashMap<(K, Vec<i64>), i64> = HashMap::new();
+        for (key, delta_state) in grouped_deltas {
+            let old_state = self.grouped_state.get(&key).cloned();
+            let new_state = match old_state.as_ref() {
+                Some(old) => {
+                    let next = old.apply_delta(&delta_state);
+                    if next.is_present() { Some(next) } else { None }
+                }
+                None => {
+                    if delta_state.is_present() {
+                        Some(delta_state)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if old_state == new_state {
+                continue;
+            }
+
+            let old_output = old_state.as_ref().map(|state| state.counts.clone());
+            let new_output = new_state.as_ref().map(|state| state.counts.clone());
+            match (old_output, new_output) {
+                (Some(old), Some(new)) if old == new => {}
+                (Some(old), Some(new)) => {
+                    output_deltas.insert((key.clone(), old), -1);
+                    output_deltas.insert((key.clone(), new), 1);
+                }
+                (Some(old), None) => {
+                    output_deltas.insert((key.clone(), old), -1);
+                }
+                (None, Some(new)) => {
+                    output_deltas.insert((key.clone(), new), 1);
+                }
+                (None, None) => {}
+            }
+
+            if let Some(new_state) = new_state {
+                self.grouped_state.insert(key, new_state);
+            } else {
+                self.grouped_state.remove(&key);
+            }
+        }
+
+        output_deltas
     }
 }
 

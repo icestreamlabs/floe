@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicI64;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::Column;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
@@ -35,6 +35,7 @@ use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::compile::{
+    build_count_aggregate_slot_kinds, build_count_row_evaluator,
     build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
     scalar_from_incremental_aggregate_value,
 };
@@ -1988,8 +1989,7 @@ fn try_build_transient_source_root_materialization(
     match &root.kind {
         DbspNodeKind::Passthrough => {
             let input_idx = first_input(root, "passthrough")?;
-            let Some(mut shape) =
-                try_build_transient_source_root_materialization(plan, input_idx)?
+            let Some(mut shape) = try_build_transient_source_root_materialization(plan, input_idx)?
             else {
                 return Ok(None);
             };
@@ -1998,8 +1998,7 @@ fn try_build_transient_source_root_materialization(
         }
         DbspNodeKind::Select(select) => {
             let input_idx = first_input(root, "select")?;
-            let Some(mut shape) =
-                try_build_transient_source_root_materialization(plan, input_idx)?
+            let Some(mut shape) = try_build_transient_source_root_materialization(plan, input_idx)?
             else {
                 return Ok(None);
             };
@@ -2262,78 +2261,169 @@ async fn build_transient_aggregate_receiver(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let slot_kinds =
-        build_incremental_aggregate_slot_kinds(aggregate.aggregates()).ok_or_else(|| {
-            anyhow!("aggregate is not eligible for transient incremental aggregation")
-        })?;
-    let row_evaluator = build_incremental_aggregate_row_evaluator(
-        Arc::clone(aggregate.input_schema()),
-        aggregate.group_keys().to_vec(),
-        aggregate.aggregates().to_vec(),
-        graph_id.to_string(),
-        "transient_aggregate",
-    );
-    let aggregate_processor = Arc::new(
-        dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(row_evaluator, slot_kinds)
-            .await
-            .context("initialize transient incremental aggregate")?,
-    );
-
     let mut upstream_rx = upstream.subscribe();
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-aggregate:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    if aggregate
+        .aggregates()
+        .iter()
+        .all(|agg| agg.function() == &dbsp::DbspAggregateFunction::Count)
+    {
+        let slot_kinds = build_count_aggregate_slot_kinds(aggregate.aggregates());
+        let row_evaluator = build_count_row_evaluator(
+            Arc::clone(aggregate.input_schema()),
+            aggregate.group_keys().to_vec(),
+            aggregate.aggregates().to_vec(),
+            graph_id.clone(),
+            "transient_count_aggregate",
+        );
+        let aggregate_processor = Arc::new(
+            dbsp::DbspTransientCountAggregate::<Vec<u8>, Vec<u8>, Vec<u8>>::new(
+                row_evaluator,
+                slot_kinds,
+            )
+            .await
+            .context("initialize transient count aggregate")?,
+        );
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                maybe_batch = upstream_rx.recv() => {
-                    let Some(batch) = maybe_batch else {
-                        break;
-                    };
-                    let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    maybe_batch = upstream_rx.recv() => {
+                        let Some(batch) = maybe_batch else {
+                            break;
+                        };
+                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let encoded_output = match encode_count_aggregate_output_deltas(aggregate_deltas) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let final_deltas = match output_transform(encoded_output) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if tx.send(TransientMaterializeBatch {
+                            version: batch.version,
+                            deltas: Arc::new(final_deltas),
+                        }).is_err() {
                             break;
                         }
-                    };
-                    let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
-                    let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
-                    let final_deltas = match output_transform(encoded_output) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
-                    if tx.send(TransientMaterializeBatch {
-                        version: batch.version,
-                        deltas: Arc::new(final_deltas),
-                    }).is_err() {
-                        break;
                     }
                 }
             }
-        }
-    });
+        });
+    } else {
+        let slot_kinds = build_incremental_aggregate_slot_kinds(aggregate.aggregates())
+            .ok_or_else(|| {
+                anyhow!("aggregate is not eligible for transient incremental aggregation")
+            })?;
+        let row_evaluator = build_incremental_aggregate_row_evaluator(
+            Arc::clone(aggregate.input_schema()),
+            aggregate.group_keys().to_vec(),
+            aggregate.aggregates().to_vec(),
+            graph_id.clone(),
+            "transient_aggregate",
+        );
+        let aggregate_processor = Arc::new(
+            dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(
+                row_evaluator,
+                slot_kinds,
+            )
+            .await
+            .context("initialize transient incremental aggregate")?,
+        );
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    maybe_batch = upstream_rx.recv() => {
+                        let Some(batch) = maybe_batch else {
+                            break;
+                        };
+                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let final_deltas = match output_transform(encoded_output) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if tx.send(TransientMaterializeBatch {
+                            version: batch.version,
+                            deltas: Arc::new(final_deltas),
+                        }).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     Ok(rx)
+}
+
+fn encode_count_aggregate_output_deltas(
+    deltas: Vec<((Vec<u8>, Vec<i64>), i64)>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut encoded = Vec::with_capacity(deltas.len());
+    for ((key, values), diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let mut row = decode_projected_row_key(&key)?;
+        row.extend(
+            values
+                .into_iter()
+                .map(|value| ScalarValue::Int64(Some(value))),
+        );
+        encoded.push((encode_projected_row_key(&row)?, diff));
+    }
+    Ok(encoded)
 }
 
 fn encode_incremental_aggregate_output_deltas(
@@ -2612,7 +2702,7 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
     let schema = Arc::clone(node.output_schema());
     if !predicate_requires_scalar_fallback(&predicate)
         && let Ok(evaluator) =
-        VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema))
+            VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema))
     {
         let evaluator = Arc::new(evaluator);
         return Ok(Arc::new(move |delta_values| {
@@ -2642,7 +2732,7 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
     let schema = Arc::clone(node.input_schema());
     if !projection_requires_scalar_fallback(expressions.as_ref())
         && let Ok(evaluator) =
-        VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
+            VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
     {
         let evaluator = Arc::new(evaluator);
         return Ok(Arc::new(move |delta_values| {
@@ -2782,13 +2872,11 @@ mod tests {
     use std::sync::atomic::AtomicI64;
     use std::time::Duration;
 
-    use datafusion::common::Result as DataFusionResult;
     use datafusion::common::Column;
+    use datafusion::common::Result as DataFusionResult;
     use datafusion::datasource::{TableProvider, empty::EmptyTable};
     use datafusion::logical_expr::expr_fn::create_udf;
-    use datafusion::logical_expr::{
-        ColumnarValue, ScalarFunctionImplementation, Volatility,
-    };
+    use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility};
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
     use datafusion::scalar::ScalarValue;

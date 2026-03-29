@@ -43,25 +43,25 @@ pub struct CountAggregateRow<K, D> {
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DistinctGroupKey<K> {
-    group_key: K,
-    slot: u32,
+    pub(crate) group_key: K,
+    pub(crate) slot: u32,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct GroupedCountState {
-    total_rows: i64,
-    counts: Vec<i64>,
+    pub(crate) total_rows: i64,
+    pub(crate) counts: Vec<i64>,
 }
 
 impl GroupedCountState {
-    fn zero(arity: usize) -> Self {
+    pub(crate) fn zero(arity: usize) -> Self {
         Self {
             total_rows: 0,
             counts: vec![0; arity],
         }
     }
 
-    fn apply_delta(&self, delta: &GroupedCountState) -> Self {
+    pub(crate) fn apply_delta(&self, delta: &GroupedCountState) -> Self {
         let mut next = self.clone();
         next.total_rows += delta.total_rows;
         for (dst, src) in next.counts.iter_mut().zip(delta.counts.iter()) {
@@ -70,7 +70,7 @@ impl GroupedCountState {
         next
     }
 
-    fn is_present(&self) -> bool {
+    pub(crate) fn is_present(&self) -> bool {
         self.total_rows != 0
     }
 }
@@ -279,61 +279,18 @@ where
         );
         Ok(versioned.handle_for_version(plan.version))
     }
-}
 
-#[async_trait]
-impl<K, V, D> DeltaOperator for CountAggregateOp<K, V, D>
-where
-    K: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    V: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    D: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    async fn on_step(
+    pub async fn apply_delta_values(
         &mut self,
-        _ts: i64,
-        inputs: &[ZSetHandle],
-    ) -> anyhow::Result<Option<ZSetHandle>> {
-        let delta_handle = inputs
-            .first()
-            .cloned()
-            .context("count aggregate operator requires one input delta handle")?;
-
-        let delta_values =
-            delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
-                .await
-                .context("load delta for count aggregate")?;
-
+        delta_values: Vec<(V, i64)>,
+    ) -> Result<HashMap<(K, Vec<i64>), i64>> {
         if delta_values.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
+            return Ok(HashMap::new());
         }
 
         let coalesced = self.coalesce_deltas(delta_values);
         if coalesced.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
+            return Ok(HashMap::new());
         }
 
         let arity = self.slot_kinds.len();
@@ -397,7 +354,7 @@ where
         }
 
         if grouped_deltas.is_empty() && distinct_deltas.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
+            return Ok(HashMap::new());
         }
 
         if !distinct_deltas.is_empty() {
@@ -435,7 +392,7 @@ where
         }
 
         if grouped_deltas.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
+            return Ok(HashMap::new());
         }
 
         self.ensure_state_cache()
@@ -507,7 +464,7 @@ where
         }
 
         if state_deltas.is_empty() {
-            return Ok(Some(self.output.handle_for_version(0)));
+            return Ok(HashMap::new());
         }
 
         let base_version = self
@@ -535,6 +492,57 @@ where
             }
         }
 
+        Ok(output_deltas)
+    }
+}
+
+#[async_trait]
+impl<K, V, D> DeltaOperator for CountAggregateOp<K, V, D>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    D: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn on_step(
+        &mut self,
+        _ts: i64,
+        inputs: &[ZSetHandle],
+    ) -> anyhow::Result<Option<ZSetHandle>> {
+        let delta_handle = inputs
+            .first()
+            .cloned()
+            .context("count aggregate operator requires one input delta handle")?;
+
+        let delta_values =
+            delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+                .await
+                .context("load delta for count aggregate")?;
+
+        let output_deltas = self.apply_delta_values(delta_values).await?;
         if output_deltas.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
         }

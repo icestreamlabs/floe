@@ -40,16 +40,7 @@ impl DbspGraphBuilder {
             .iter()
             .all(|agg| agg.function() == &DbspAggregateFunction::Count)
         {
-            let slot_kinds = aggregates
-                .iter()
-                .map(|agg| {
-                    if agg.distinct() {
-                        dbsp::CountAggregateSlotKind::Distinct
-                    } else {
-                        dbsp::CountAggregateSlotKind::Linear
-                    }
-                })
-                .collect::<Vec<_>>();
+            let slot_kinds = build_count_aggregate_slot_kinds(&aggregates);
             let row_evaluator = build_count_row_evaluator(
                 Arc::clone(&input_schema),
                 group_keys.clone(),
@@ -628,7 +619,22 @@ impl DbspGraphBuilder {
     }
 }
 
-fn build_count_row_evaluator(
+pub(crate) fn build_count_aggregate_slot_kinds(
+    aggregates: &[DbspAggregateExpr],
+) -> Vec<dbsp::CountAggregateSlotKind> {
+    aggregates
+        .iter()
+        .map(|agg| {
+            if agg.distinct() {
+                dbsp::CountAggregateSlotKind::Distinct
+            } else {
+                dbsp::CountAggregateSlotKind::Linear
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn build_count_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
     aggregates: Vec<DbspAggregateExpr>,
