@@ -1949,39 +1949,103 @@ fn try_build_transient_source_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,
 ) -> Result<Option<TransientSourceRootMaterialization>> {
-    let Some(shape) = find_transient_source_root_shape(plan, root_idx)? else {
+    if let Some(shape) = find_transient_source_root_shape(plan, root_idx)? {
+        let source_name = shape.source_name().to_string();
+        let optimized_nodes = match &shape {
+            TransientSourceRootShape::Source {
+                optimized_nodes, ..
+            }
+            | TransientSourceRootShape::Select {
+                optimized_nodes, ..
+            }
+            | TransientSourceRootShape::Project {
+                optimized_nodes, ..
+            }
+            | TransientSourceRootShape::FilterMap {
+                optimized_nodes, ..
+            } => optimized_nodes.clone(),
+        };
+        let transform = match shape {
+            TransientSourceRootShape::Source { .. } => {
+                Ok(Arc::new(|deltas| Ok(deltas)) as Arc<DeltaTransformFn>)
+            }
+            TransientSourceRootShape::Select { select, .. } => build_filter_transform(&select),
+            TransientSourceRootShape::Project { project, .. } => build_map_transform(&project),
+            TransientSourceRootShape::FilterMap {
+                select, project, ..
+            } => build_filter_map_transform(&select, &project),
+        }?;
+        return Ok(Some(TransientSourceRootMaterialization {
+            source_name,
+            optimized_nodes,
+            transform,
+        }));
+    }
+
+    let Some(root) = plan.node(root_idx) else {
         return Ok(None);
     };
-    let source_name = shape.source_name().to_string();
-    let optimized_nodes = match &shape {
-        TransientSourceRootShape::Source {
-            optimized_nodes, ..
+    match &root.kind {
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(mut shape) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
         }
-        | TransientSourceRootShape::Select {
-            optimized_nodes, ..
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_filter_transform(select)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
         }
-        | TransientSourceRootShape::Project {
-            optimized_nodes, ..
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) =
+                    try_build_transient_source_root_materialization(plan, select_input_idx)?
+                else {
+                    return Ok(None);
+                };
+                shape.transform = compose_delta_transforms(
+                    Arc::clone(&shape.transform),
+                    build_filter_map_transform(select, project)?,
+                );
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) = try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_map_transform(project)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
         }
-        | TransientSourceRootShape::FilterMap {
-            optimized_nodes, ..
-        } => optimized_nodes.clone(),
-    };
-    let transform = match shape {
-        TransientSourceRootShape::Source { .. } => {
-            Ok(Arc::new(|deltas| Ok(deltas)) as Arc<DeltaTransformFn>)
-        }
-        TransientSourceRootShape::Select { select, .. } => build_filter_transform(&select),
-        TransientSourceRootShape::Project { project, .. } => build_map_transform(&project),
-        TransientSourceRootShape::FilterMap {
-            select, project, ..
-        } => build_filter_map_transform(&select, &project),
-    }?;
-    Ok(Some(TransientSourceRootMaterialization {
-        source_name,
-        optimized_nodes,
-        transform,
-    }))
+        _ => Ok(None),
+    }
 }
 
 fn try_build_transient_source_topn_root_shape(
@@ -2718,10 +2782,16 @@ mod tests {
     use std::sync::atomic::AtomicI64;
     use std::time::Duration;
 
+    use datafusion::common::Result as DataFusionResult;
     use datafusion::common::Column;
     use datafusion::datasource::{TableProvider, empty::EmptyTable};
+    use datafusion::logical_expr::expr_fn::create_udf;
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarFunctionImplementation, Volatility,
+    };
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
+    use datafusion::scalar::ScalarValue;
     use dbsp::DbspJoin;
     use dbsp::join::TransientJoinInputBatch;
     use dbsp::storage::{KeyValueTable, SlateTable};
@@ -2847,6 +2917,47 @@ mod tests {
         assert_eq!(
             transient_sources,
             BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q13_join_shape_left_input_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT b.auction, b.bidder, b.price, b.date_time AS \"dateTime\", a.seller AS value \
+             FROM (SELECT *, PROCTIME() AS p_time FROM nexmark_bid) b \
+             JOIN nexmark_auction AS a ON b.auction = a.id \
+             WHERE b.auction % 10000 = a.id % 10000",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        let persistence_policy = PersistencePolicy::for_plan(&plan);
+        let transient_opt = try_build_transient_segment_optimization(
+            &plan,
+            plan.root,
+            &HashMap::new(),
+            "benchmark_result",
+            true,
+            &persistence_policy,
+        )
+        .expect("transient optimization result")
+        .expect("transient optimization");
+        let join_node = plan
+            .node(transient_opt.durable_input_idx)
+            .expect("durable input node");
+        let (left_idx, right_idx) = join_inputs(join_node).expect("join inputs");
+
+        assert!(
+            try_build_transient_source_root_materialization(&plan, left_idx)
+                .expect("left transient input shape")
+                .is_some(),
+            "expected left q13 join input to be transient-eligible: {plan:#?}"
+        );
+        assert!(
+            try_build_transient_source_root_materialization(&plan, right_idx)
+                .expect("right transient input shape")
+                .is_some(),
+            "expected right q13 join input to be transient-eligible: {plan:#?}"
         );
     }
 
@@ -4063,10 +4174,30 @@ mod tests {
             .expect("register nexmark_bid");
         ctx.register_table("nexmark_auction", auction_provider)
             .expect("register nexmark_auction");
+        register_planner_test_udfs(&ctx);
         ctx.state()
             .create_logical_plan(sql)
             .await
             .expect("build logical plan")
+    }
+
+    fn register_planner_test_udfs(ctx: &SessionContext) {
+        let proctime: ScalarFunctionImplementation =
+            Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
+                    None, None,
+                )))
+            });
+        ctx.register_udf(create_udf(
+            "proctime",
+            vec![],
+            datafusion::arrow::datatypes::DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Millisecond,
+                None,
+            ),
+            Volatility::Volatile,
+            proctime,
+        ));
     }
 
     async fn assert_tick_matches_transform(
