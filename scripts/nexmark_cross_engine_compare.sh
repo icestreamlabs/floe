@@ -479,14 +479,12 @@ SQL
 
 floe_query_uses_alias_ctes() {
   case "$1" in
-    q13|q14|q21|q22) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 floe_query_uses_legacy_ingest_views() {
   case "$1" in
-    q13|q14|q21|q22) return 0 ;;
     *) return 1 ;;
   esac
 }

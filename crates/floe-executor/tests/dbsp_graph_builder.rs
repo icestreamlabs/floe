@@ -2,12 +2,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::common::Column;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, count_distinct, max, min, sum};
+use datafusion::logical_expr::expr_fn::create_udf;
 use datafusion::logical_expr::expr_fn::ExprFunctionExt;
-use datafusion::logical_expr::{Expr, JoinType, col, lit, table_scan};
+use datafusion::logical_expr::{
+    ColumnarValue, Expr, JoinType, ScalarFunctionImplementation, Volatility, col, lit, table_scan,
+};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
@@ -39,10 +43,71 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
     ctx.register_table("nexmark_bid", provider)
         .expect("register nexmark_bid");
+    register_planner_test_udfs(&ctx);
     ctx.state()
         .create_logical_plan(sql)
         .await
         .expect("build logical plan")
+}
+
+fn register_planner_test_udfs(ctx: &SessionContext) {
+    let passthrough_utf8: ScalarFunctionImplementation =
+        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))
+        });
+    let passthrough_int64: ScalarFunctionImplementation =
+        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))
+        });
+    let proctime: ScalarFunctionImplementation =
+        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
+                None, None,
+            )))
+        });
+    let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
+    ctx.register_udf(create_udf(
+        "proctime",
+        vec![],
+        ts,
+        Volatility::Volatile,
+        proctime,
+    ));
+    ctx.register_udf(create_udf(
+        "hour",
+        vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::clone(&passthrough_int64),
+    ));
+    ctx.register_udf(create_udf(
+        "date_format",
+        vec![DataType::Timestamp(TimeUnit::Millisecond, None), DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::clone(&passthrough_utf8),
+    ));
+    ctx.register_udf(create_udf(
+        "regexp_extract",
+        vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::clone(&passthrough_utf8),
+    ));
+    ctx.register_udf(create_udf(
+        "split_index",
+        vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::clone(&passthrough_utf8),
+    ));
+    ctx.register_udf(create_udf(
+        "count_char",
+        vec![DataType::Utf8, DataType::Utf8],
+        DataType::Int64,
+        Volatility::Immutable,
+        passthrough_int64,
+    ));
 }
 
 #[tokio::test]
@@ -1781,6 +1846,194 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
                 ScalarValue::Int64(Some(40)),
             ],
         ]
+    );
+}
+
+#[tokio::test]
+async fn source_projection_with_proctime_materializes_mv() {
+    let db = test_db("source-projection-proctime").await;
+    let view_name = "mv_source_projection_proctime";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan("SELECT bidder, PROCTIME() AS p_time FROM nexmark_bid").await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("p_time", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 42, 10), 1).expect("append");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick bid batch");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            ScalarValue::Int64(Some(42)),
+            ScalarValue::TimestampMillisecond(None, None),
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn source_filter_projection_with_count_char_materializes_from_transient_source_journal() {
+    let db = test_db("source-filter-projection-count-char").await;
+    let view_name = "mv_source_filter_projection_count_char";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT auction, bidder, price * 908 / 1000 AS price, \
+             CASE \
+               WHEN HOUR(date_time) >= 8 AND HOUR(date_time) <= 18 THEN 'dayTime' \
+               WHEN HOUR(date_time) <= 6 OR HOUR(date_time) >= 20 THEN 'nightTime' \
+               ELSE 'otherTime' \
+             END AS bid_time_type, \
+             date_time AS \"dateTime\", \
+             extra, \
+             COUNT_CHAR(extra, 'c') AS c_counts \
+             FROM nexmark_bid \
+             WHERE price * 908 / 1000 > 1000000 AND price * 908 / 1000 < 50000000",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new("bid_time_type", DataType::Utf8, true),
+            Field::new("dateTime", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("extra", DataType::Utf8, true),
+            Field::new("c_counts", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append(&bid_row(1, 42, 2_000_000), 1)
+        .expect("append matching bid");
+    bid_writer
+        .append(&bid_row(2, 7, 100), 1)
+        .expect("append filtered bid");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick bid batch");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(42)),
+            ScalarValue::Int64(Some(1_816_000)),
+            ScalarValue::Utf8(Some("nightTime".to_string())),
+            ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
+            ScalarValue::Utf8(Some("extra".to_string())),
+            ScalarValue::Int64(Some(0)),
+        ]]
     );
 }
 
