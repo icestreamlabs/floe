@@ -1752,6 +1752,117 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
 }
 
 #[tokio::test]
+async fn row_number_top1_with_post_projection_recomputes_from_transient_source_journal() {
+    let db = test_db("row-number-top1-transient-source").await;
+    let view_name = "mv_row_number_top1_transient_source";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \
+             FROM (SELECT auction, bidder, price, channel, url, date_time AS \"dateTime\", extra, \
+                   ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rank_number \
+                   FROM nexmark_bid) ranked \
+             WHERE rank_number <= 1",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new("channel", DataType::Utf8, true),
+            Field::new("url", DataType::Utf8, true),
+            Field::new(
+                "dateTime",
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("extra", DataType::Utf8, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient row-number top1 graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer.append(&bid_row(1, 10, 50), 1).expect("append");
+    bid_writer.append(&bid_row(1, 11, 20), 1).expect("append");
+    bid_writer.append(&bid_row(1, 12, 40), 1).expect("append");
+    bid_writer.append(&bid_row(2, 20, 5), 1).expect("append");
+    bid_writer.append(&bid_row(2, 21, 15), 1).expect("append");
+    bid_writer.append(&bid_row(2, 22, 10), 1).expect("append");
+    bid_writer.flush().await.expect("flush bids");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    rows.sort_by(|left, right| {
+        let left_key = (scalar_i64(left.first()), scalar_i64(left.get(2)));
+        let right_key = (scalar_i64(right.first()), scalar_i64(right.get(2)));
+        left_key.cmp(&right_key)
+    });
+    assert_eq!(rows, vec![bid_row(1, 10, 50), bid_row(2, 21, 15)]);
+
+    bid_writer
+        .append(&bid_row(1, 10, 50), -1)
+        .expect("remove top row");
+    bid_writer.flush().await.expect("flush removal");
+
+    wait_for_logical_version(&mv_registry, view_name, 2).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    rows.sort_by(|left, right| {
+        let left_key = (scalar_i64(left.first()), scalar_i64(left.get(2)));
+        let right_key = (scalar_i64(right.first()), scalar_i64(right.get(2)));
+        left_key.cmp(&right_key)
+    });
+    assert_eq!(rows, vec![bid_row(1, 12, 40), bid_row(2, 21, 15)]);
+}
+
+#[tokio::test]
 async fn aggregate_with_post_projection_materializes_from_transient_source_journal() {
     let db = test_db("aggregate-transient-source").await;
     let view_name = "mv_aggregate_transient_source";
