@@ -6,7 +6,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use datafusion::common::Column;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
@@ -4449,14 +4448,19 @@ fn find_transient_source_root_shape(
 fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>> {
     let predicate = node.predicate().clone();
     let schema = Arc::clone(node.output_schema());
-    if !predicate_requires_scalar_fallback(&predicate)
-        && let Ok(evaluator) =
-            VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema))
-    {
-        let evaluator = Arc::new(evaluator);
-        return Ok(Arc::new(move |delta_values| {
-            evaluator.transform_delta("source_batch_journal", delta_values)
-        }));
+    match VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema)) {
+        Ok(evaluator) => {
+            let evaluator = Arc::new(evaluator);
+            return Ok(Arc::new(move |delta_values| {
+                evaluator.transform_delta("source_batch_journal", delta_values)
+            }));
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "vectorized transient source filter unavailable; using scalar fallback"
+            );
+        }
     }
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
@@ -4479,14 +4483,19 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
 fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> {
     let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
     let schema = Arc::clone(node.input_schema());
-    if !projection_requires_scalar_fallback(expressions.as_ref())
-        && let Ok(evaluator) =
-            VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
-    {
-        let evaluator = Arc::new(evaluator);
-        return Ok(Arc::new(move |delta_values| {
-            evaluator.transform_delta("source_batch_journal", delta_values)
-        }));
+    match VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema)) {
+        Ok(evaluator) => {
+            let evaluator = Arc::new(evaluator);
+            return Ok(Arc::new(move |delta_values| {
+                evaluator.transform_delta("source_batch_journal", delta_values)
+            }));
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "vectorized transient source map unavailable; using scalar fallback"
+            );
+        }
     }
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
@@ -4520,18 +4529,23 @@ fn build_filter_map_transform(
     let filter_schema = Arc::clone(select.output_schema());
     let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
     let project_schema = Arc::clone(project.input_schema());
-    if !predicate_requires_scalar_fallback(&predicate)
-        && !projection_requires_scalar_fallback(expressions.as_ref())
-        && let Ok(evaluator) = VectorizedFilterProjectEvaluator::for_filter_map(
-            &predicate,
-            expressions.as_ref(),
-            Arc::clone(&project_schema),
-        )
-    {
-        let evaluator = Arc::new(evaluator);
-        return Ok(Arc::new(move |delta_values| {
-            evaluator.transform_delta("source_batch_journal", delta_values)
-        }));
+    match VectorizedFilterProjectEvaluator::for_filter_map(
+        &predicate,
+        expressions.as_ref(),
+        Arc::clone(&project_schema),
+    ) {
+        Ok(evaluator) => {
+            let evaluator = Arc::new(evaluator);
+            return Ok(Arc::new(move |delta_values| {
+                evaluator.transform_delta("source_batch_journal", delta_values)
+            }));
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "vectorized transient source filter_map unavailable; using scalar fallback"
+            );
+        }
     }
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
@@ -4568,37 +4582,6 @@ fn eval_predicate(
     schema: &RowSchema,
 ) -> Result<bool> {
     eval_expression(predicate.expression(), row, schema)
-}
-
-fn predicate_requires_scalar_fallback(predicate: &dbsp::DbspPredicate) -> bool {
-    expression_requires_scalar_fallback(predicate.expression().expr())
-}
-
-fn projection_requires_scalar_fallback(projections: &[DbspProjectExpr]) -> bool {
-    projections
-        .iter()
-        .any(|expr| expression_requires_scalar_fallback(expr.expression().expr()))
-}
-
-fn expression_requires_scalar_fallback(expr: &Expr) -> bool {
-    let mut requires_fallback = false;
-    let _ = expr.apply(|node| {
-        if let Expr::ScalarFunction(func) = node
-            && scalar_function_requires_scalar_fallback(func.name())
-        {
-            requires_fallback = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    requires_fallback
-}
-
-fn scalar_function_requires_scalar_fallback(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "proctime" | "regexp_extract" | "split_index" | "count_char" | "date_format"
-    )
 }
 
 fn eval_projection(
