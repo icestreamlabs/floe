@@ -165,37 +165,22 @@ impl DbspGraphBuilder {
 
         let agg_schema = Arc::clone(&input_schema);
         let agg_graph_id = graph_id.clone();
+        let agg_layout = Arc::new(build_count_eval_layout(&aggregates));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
             }
-            let mut decoded = Vec::with_capacity(values.len());
-            for (value, weight) in values {
-                if *weight == 0 {
-                    continue;
-                }
-                match decode_projected_row_key(value) {
-                    Ok(row) => decoded.push((row, *weight)),
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %agg_graph_id,
-                            error = %err,
-                            "failed to decode aggregate input row"
-                        );
-                    }
-                }
-            }
-            if decoded.is_empty() {
-                return None;
-            }
-
-            let outputs = evaluate_aggregate_values(
+            let outputs = evaluate_aggregate_values_from_encoded(
+                agg_layout.as_ref(),
                 &aggregates,
-                &decoded,
+                values,
                 agg_schema.as_ref(),
                 &agg_graph_id,
                 "aggregate",
             );
+            if outputs.is_empty() {
+                return None;
+            }
 
             match encode_projected_row_key(&outputs) {
                 Ok(encoded) => Some(encoded),
@@ -382,37 +367,22 @@ impl DbspGraphBuilder {
 
         let agg_schema = Arc::clone(&input_schema);
         let agg_graph_id = graph_id.clone();
+        let agg_layout = Arc::new(build_count_eval_layout(&aggregates));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
             }
-            let mut decoded = Vec::with_capacity(values.len());
-            for (value, weight) in values {
-                if *weight == 0 {
-                    continue;
-                }
-                match decode_projected_row_key(value) {
-                    Ok(row) => decoded.push((row, *weight)),
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %agg_graph_id,
-                            error = %err,
-                            "failed to decode window aggregate input row"
-                        );
-                    }
-                }
-            }
-            if decoded.is_empty() {
-                return None;
-            }
-
-            let outputs = evaluate_aggregate_values(
+            let outputs = evaluate_aggregate_values_from_encoded(
+                agg_layout.as_ref(),
                 &aggregates,
-                &decoded,
+                values,
                 agg_schema.as_ref(),
                 &agg_graph_id,
                 "window aggregate",
             );
+            if outputs.is_empty() {
+                return None;
+            }
 
             match encode_projected_row_key(&outputs) {
                 Ok(encoded) => Some(encoded),
@@ -890,6 +860,227 @@ fn evaluate_count_row_values(
                     }
                 }
                 None => dbsp::CountAggregateSlotUpdate::Linear(1),
+            }
+        })
+        .collect()
+}
+
+fn evaluate_aggregate_values_from_encoded(
+    layout: &CountEvalLayout,
+    aggregates: &[DbspAggregateExpr],
+    values: &[(Vec<u8>, i64)],
+    schema: &RowSchema,
+    graph_id: &str,
+    context: &str,
+) -> Vec<ScalarValue> {
+    if aggregates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut accumulators = Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        accumulators.push(match agg.function() {
+            DbspAggregateFunction::Count if agg.distinct() => AggregateAccumulator::CountDistinct {
+                weights: HashMap::new(),
+            },
+            DbspAggregateFunction::Count => AggregateAccumulator::Count { count: 0 },
+            DbspAggregateFunction::Sum => AggregateAccumulator::Sum {
+                sum: 0,
+                has_value: false,
+            },
+            DbspAggregateFunction::Avg => AggregateAccumulator::Avg { sum: 0, count: 0 },
+            DbspAggregateFunction::Min => AggregateAccumulator::Min { current: None },
+            DbspAggregateFunction::Max => AggregateAccumulator::Max { current: None },
+        });
+    }
+
+    let mut filter_results = vec![false; layout.filters.len()];
+    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_valid = vec![false; layout.expressions.len()];
+    let mut decoded_row_count = 0usize;
+
+    for (value, weight) in values {
+        if *weight == 0 {
+            continue;
+        }
+        let row = match decode_projected_row_key(value) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode {context} input row"
+                );
+                continue;
+            }
+        };
+        decoded_row_count = decoded_row_count.saturating_add(1);
+
+        for (index, filter) in layout.filters.iter().enumerate() {
+            filter_results[index] = match eval_expression(filter, &row, schema) {
+                Ok(include) => include,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} FILTER expression"
+                    );
+                    false
+                }
+            };
+        }
+
+        expression_valid.fill(false);
+        for (index, expr) in layout.expressions.iter().enumerate() {
+            match eval_scalar_expression(expr, &row, schema) {
+                Ok(value) => {
+                    expression_values[index] = value;
+                    expression_valid[index] = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} aggregate expression"
+                    );
+                }
+            }
+        }
+
+        for ((_, plan), accumulator) in aggregates
+            .iter()
+            .zip(layout.plans.iter())
+            .zip(accumulators.iter_mut())
+        {
+            if let Some(filter_index) = plan.filter_index
+                && !filter_results[filter_index]
+            {
+                continue;
+            }
+
+            match accumulator {
+                AggregateAccumulator::CountDistinct { weights } => {
+                    let Some(expr_index) = plan.expr_index else {
+                        continue;
+                    };
+                    if !expression_valid[expr_index] {
+                        continue;
+                    }
+                    let expr_value = expression_values[expr_index].clone();
+                    if expr_value.is_null() {
+                        continue;
+                    }
+                    let entry = weights.entry(expr_value.clone()).or_insert(0);
+                    *entry += *weight;
+                    if *entry == 0 {
+                        weights.remove(&expr_value);
+                    }
+                }
+                AggregateAccumulator::Count { count } => match plan.expr_index {
+                    Some(expr_index) => {
+                        if expression_valid[expr_index] && !expression_values[expr_index].is_null()
+                        {
+                            *count += *weight;
+                        }
+                    }
+                    None => *count += *weight,
+                },
+                AggregateAccumulator::Sum { sum, has_value } => {
+                    let Some(expr_index) = plan.expr_index else {
+                        continue;
+                    };
+                    if !expression_valid[expr_index] {
+                        continue;
+                    }
+                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                        *sum += number * *weight;
+                        *has_value = true;
+                    }
+                }
+                AggregateAccumulator::Avg { sum, count } => {
+                    let Some(expr_index) = plan.expr_index else {
+                        continue;
+                    };
+                    if !expression_valid[expr_index] {
+                        continue;
+                    }
+                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                        *sum += number * *weight;
+                        *count += *weight;
+                    }
+                }
+                AggregateAccumulator::Min { current } => {
+                    let Some(expr_index) = plan.expr_index else {
+                        continue;
+                    };
+                    if !expression_valid[expr_index] {
+                        continue;
+                    }
+                    let expr_value = expression_values[expr_index].clone();
+                    if expr_value.is_null() {
+                        continue;
+                    }
+                    let next = match current.take() {
+                        Some(existing) => match compare_scalar_values(&expr_value, &existing) {
+                            Some(std::cmp::Ordering::Less) => expr_value,
+                            Some(_) | None => existing,
+                        },
+                        None => expr_value,
+                    };
+                    *current = Some(next);
+                }
+                AggregateAccumulator::Max { current } => {
+                    let Some(expr_index) = plan.expr_index else {
+                        continue;
+                    };
+                    if !expression_valid[expr_index] {
+                        continue;
+                    }
+                    let expr_value = expression_values[expr_index].clone();
+                    if expr_value.is_null() {
+                        continue;
+                    }
+                    let next = match current.take() {
+                        Some(existing) => match compare_scalar_values(&expr_value, &existing) {
+                            Some(std::cmp::Ordering::Greater) => expr_value,
+                            Some(_) | None => existing,
+                        },
+                        None => expr_value,
+                    };
+                    *current = Some(next);
+                }
+            }
+        }
+    }
+
+    if decoded_row_count == 0 {
+        return Vec::new();
+    }
+
+    aggregates
+        .iter()
+        .zip(accumulators)
+        .map(|(agg, accumulator)| match accumulator {
+            AggregateAccumulator::CountDistinct { weights } => ScalarValue::Int64(Some(
+                weights.values().filter(|weight| **weight > 0).count() as i64,
+            )),
+            AggregateAccumulator::Count { count } => ScalarValue::Int64(Some(count)),
+            AggregateAccumulator::Sum { sum, has_value } => {
+                if has_value {
+                    scalar_from_i64(sum, agg.output_type())
+                } else {
+                    ScalarValue::Null
+                }
+            }
+            AggregateAccumulator::Avg { sum, count } => {
+                if count != 0 {
+                    ScalarValue::Int64(Some(sum / count))
+                } else {
+                    ScalarValue::Null
+                }
+            }
+            AggregateAccumulator::Min { current } | AggregateAccumulator::Max { current } => {
+                current.unwrap_or(ScalarValue::Null)
             }
         })
         .collect()

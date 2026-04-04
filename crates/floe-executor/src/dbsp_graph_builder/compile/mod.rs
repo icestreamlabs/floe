@@ -247,6 +247,7 @@ fn evaluate_aggregate_value(
     .unwrap_or(ScalarValue::Null)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct AggregateEvalPlan<'a> {
     agg: &'a DbspAggregateExpr,
@@ -263,6 +264,7 @@ enum AggregateAccumulator {
     Max { current: Option<ScalarValue> },
 }
 
+#[cfg(test)]
 fn evaluate_aggregate_values(
     aggregates: &[DbspAggregateExpr],
     decoded: &[(Vec<ScalarValue>, i64)],
