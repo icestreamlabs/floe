@@ -1,8 +1,11 @@
 use super::*;
 
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
+use crate::encoding::extract_encoded_row_columns;
 use crate::expression::ExpressionEvaluator;
 use crate::projection::ProjectionEvaluator;
+use datafusion::common::Column;
+use datafusion::logical_expr::Expr;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_source(
@@ -149,6 +152,43 @@ impl DbspGraphBuilder {
             graph_id = %graph_id,
             "using scalar map execution path"
         );
+        let direct_projection_columns =
+            direct_project_column_indices(expressions.as_ref(), schema.as_ref()).map(Arc::new);
+        if let Some(columns) = direct_projection_columns {
+            tracing::info!(
+                graph_id = %graph_id,
+                "using scalar map direct projection fast path"
+            );
+            let scalar_graph_id = graph_id.clone();
+            let transform =
+                move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                    let mut projected = Vec::with_capacity(delta_values.len());
+                    for (bytes, weight) in delta_values {
+                        let encoded = extract_encoded_row_columns(&bytes, columns.as_ref(), false)
+                            .with_context(|| {
+                                format!(
+                                    "extract source map projection columns for graph '{scalar_graph_id}'"
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "source map direct projection unexpectedly returned null result for graph '{scalar_graph_id}'"
+                                )
+                            })?;
+                        projected.push((encoded, weight));
+                    }
+                    Ok(projected)
+                };
+            let map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+                &upstream,
+                transform,
+                Some(error_handler),
+            )
+            .await
+            .context("initialize scalar DBSP map direct projection fast path")?;
+            return Ok(map.stream());
+        }
+
         let projector_eval = Arc::new(ProjectionEvaluator::new(
             Arc::clone(&schema),
             expressions.as_ref(),
@@ -238,14 +278,19 @@ impl DbspGraphBuilder {
             graph_id = %graph_id,
             "using scalar filter_map execution path"
         );
+        let direct_projection_columns =
+            direct_project_column_indices(expressions.as_ref(), project_schema.as_ref())
+                .map(Arc::new);
         let predicate_eval = Arc::new(ExpressionEvaluator::new(
             Arc::clone(&project_schema),
             predicate.expression(),
         ));
-        let projector_eval = Arc::new(ProjectionEvaluator::new(
-            Arc::clone(&project_schema),
-            expressions.as_ref(),
-        ));
+        let projector_eval = direct_projection_columns.is_none().then(|| {
+            Arc::new(ProjectionEvaluator::new(
+                Arc::clone(&project_schema),
+                expressions.as_ref(),
+            ))
+        });
         let scalar_graph_id = graph_id.clone();
         let transform =
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
@@ -261,14 +306,34 @@ impl DbspGraphBuilder {
                     })? {
                         continue;
                     }
-                    let mapped = projector_eval.project(&row).with_context(|| {
-                        format!(
-                            "evaluate source filter_map projection for graph '{scalar_graph_id}'"
-                        )
-                    })?;
-                    let encoded = encode_projected_row_key(&mapped).with_context(|| {
-                        format!("encode source filter_map projection for graph '{scalar_graph_id}'")
-                    })?;
+
+                    let encoded = if let Some(columns) = direct_projection_columns.as_ref() {
+                        extract_encoded_row_columns(&bytes, columns.as_ref(), false)
+                            .with_context(|| {
+                                format!(
+                                    "extract source filter_map projection columns for graph '{scalar_graph_id}'"
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "source filter_map direct projection unexpectedly returned null result for graph '{scalar_graph_id}'"
+                                )
+                            })?
+                    } else {
+                        let projector_eval = projector_eval
+                            .as_ref()
+                            .expect("projection evaluator should be present");
+                        let mapped = projector_eval.project(&row).with_context(|| {
+                            format!(
+                                "evaluate source filter_map projection for graph '{scalar_graph_id}'"
+                            )
+                        })?;
+                        encode_projected_row_key(&mapped).with_context(|| {
+                            format!(
+                                "encode source filter_map projection for graph '{scalar_graph_id}'"
+                            )
+                        })?
+                    };
                     projected.push((encoded, weight));
                 }
                 Ok(projected)
@@ -282,4 +347,39 @@ impl DbspGraphBuilder {
         .context("initialize scalar DBSP filter_map")?;
         Ok(filter_map.stream())
     }
+}
+
+fn direct_project_column_indices(
+    expressions: &[DbspProjectExpr],
+    schema: &RowSchema,
+) -> Option<Vec<usize>> {
+    expressions
+        .iter()
+        .map(|expr| direct_column_index(expr.expression(), schema))
+        .collect()
+}
+
+fn direct_column_index(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr.expr() {
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        other => direct_column_index_expression(other, schema),
+    }
+}
+
+fn direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => resolve_direct_column(schema, column),
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    schema
+        .field_index(&qualified)
+        .or_else(|| schema.field_index(&column.name))
 }
