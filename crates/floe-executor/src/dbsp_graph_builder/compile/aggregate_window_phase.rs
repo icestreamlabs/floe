@@ -662,17 +662,24 @@ pub(crate) fn build_count_row_evaluator(
     let layout = Arc::new(build_count_eval_layout(&aggregates));
     let direct_group_key_columns =
         direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
+    let key_needs_row = direct_group_key_columns.is_none();
+    let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
+    let decode_row = key_needs_row || slot_eval_needs_row;
     move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
-        let row = match decode_projected_row_key(bytes) {
-            Ok(row) => row,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode aggregate row for count aggregate"
-                );
-                return None;
+        let row = if decode_row {
+            match decode_projected_row_key(bytes) {
+                Ok(row) => Some(row),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to decode aggregate row for count aggregate"
+                    );
+                    return None;
+                }
             }
+        } else {
+            None
         };
 
         let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
@@ -689,23 +696,22 @@ pub(crate) fn build_count_row_evaluator(
                 }
             }
         } else {
+            let row = row.as_ref().expect("decoded row should be present");
             let mut key_values = Vec::with_capacity(group_keys.len());
             for key_expr in &group_keys {
-                let value = match eval_scalar_expression(
-                    key_expr.expression(),
-                    &row,
-                    input_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %graph_id,
-                            error = %err,
-                            "failed to evaluate count aggregate group key expression"
-                        );
-                        return None;
-                    }
-                };
+                let value =
+                    match eval_scalar_expression(key_expr.expression(), row, input_schema.as_ref())
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %graph_id,
+                                error = %err,
+                                "failed to evaluate count aggregate group key expression"
+                            );
+                            return None;
+                        }
+                    };
                 key_values.push(value);
             }
             match encode_projected_row_key(&key_values) {
@@ -721,10 +727,15 @@ pub(crate) fn build_count_row_evaluator(
             }
         };
 
+        let row_for_slot_eval = if slot_eval_needs_row {
+            row.as_deref().expect("decoded row should be present")
+        } else {
+            &[]
+        };
         let counts = evaluate_count_row_values(
             layout.as_ref(),
             &aggregates,
-            &row,
+            row_for_slot_eval,
             input_schema.as_ref(),
             &graph_id,
             context,
@@ -1122,17 +1133,24 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
     let layout = Arc::new(build_count_eval_layout(&aggregates));
     let direct_group_key_columns =
         direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
+    let key_needs_row = direct_group_key_columns.is_none();
+    let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
+    let decode_row = key_needs_row || slot_eval_needs_row;
     move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
-        let row = match decode_projected_row_key(bytes) {
-            Ok(row) => row,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode aggregate row for incremental aggregate"
-                );
-                return None;
+        let row = if decode_row {
+            match decode_projected_row_key(bytes) {
+                Ok(row) => Some(row),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to decode aggregate row for incremental aggregate"
+                    );
+                    return None;
+                }
             }
+        } else {
+            None
         };
 
         let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
@@ -1149,23 +1167,22 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
                 }
             }
         } else {
+            let row = row.as_ref().expect("decoded row should be present");
             let mut key_values = Vec::with_capacity(group_keys.len());
             for key_expr in &group_keys {
-                let value = match eval_scalar_expression(
-                    key_expr.expression(),
-                    &row,
-                    input_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %graph_id,
-                            error = %err,
-                            "failed to evaluate incremental aggregate group key expression"
-                        );
-                        return None;
-                    }
-                };
+                let value =
+                    match eval_scalar_expression(key_expr.expression(), row, input_schema.as_ref())
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %graph_id,
+                                error = %err,
+                                "failed to evaluate incremental aggregate group key expression"
+                            );
+                            return None;
+                        }
+                    };
                 key_values.push(value);
             }
             match encode_projected_row_key(&key_values) {
@@ -1181,10 +1198,15 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
             }
         };
 
+        let row_for_slot_eval = if slot_eval_needs_row {
+            row.as_deref().expect("decoded row should be present")
+        } else {
+            &[]
+        };
         let slots = evaluate_incremental_aggregate_row_values(
             layout.as_ref(),
             &aggregates,
-            &row,
+            row_for_slot_eval,
             input_schema.as_ref(),
             &graph_id,
             context,
