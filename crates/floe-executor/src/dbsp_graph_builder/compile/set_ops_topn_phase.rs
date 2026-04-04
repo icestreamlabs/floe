@@ -1,4 +1,7 @@
 use super::*;
+use crate::encoding::extract_encoded_row_columns;
+use datafusion::common::Column;
+use datafusion::logical_expr::Expr;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_union(
@@ -75,26 +78,54 @@ impl DbspGraphBuilder {
                 })
                 .collect::<Vec<_>>(),
         );
+        let direct_partition_columns = partition_exprs
+            .iter()
+            .map(|expr| direct_column_index(expr, schema.as_ref()))
+            .collect::<Option<Vec<_>>>()
+            .map(Arc::new);
+        let direct_order_columns = order_exprs
+            .iter()
+            .map(|expr| direct_column_index(expr.expression(), schema.as_ref()))
+            .collect::<Option<Vec<_>>>()
+            .map(Arc::new);
 
         let log_graph_id = graph_id.clone();
         let key_schema = Arc::clone(&schema);
         let key_parts = move |bytes: &Vec<u8>| -> (Option<Vec<u8>>, Option<TopNKey>) {
-            let row = match decode_projected_row_key(bytes) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %log_graph_id,
-                        error = %err,
-                        "failed to decode topn row"
-                    );
-                    return (None, None);
-                }
-            };
+            let mut decoded_row: Option<Vec<ScalarValue>> = None;
 
-            let mut partition_values = Vec::with_capacity(partition_exprs.len());
-            if !partition_exprs.is_empty() {
+            let partition_key = if partition_exprs.is_empty() {
+                Some(Vec::new())
+            } else if let Some(indices) = direct_partition_columns.as_ref() {
+                match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %log_graph_id,
+                            error = %err,
+                            "failed to extract topn partition key columns"
+                        );
+                        return (None, None);
+                    }
+                }
+            } else {
+                if decoded_row.is_none() {
+                    decoded_row = match decode_projected_row_key(bytes) {
+                        Ok(row) => Some(row),
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %log_graph_id,
+                                error = %err,
+                                "failed to decode topn row"
+                            );
+                            return (None, None);
+                        }
+                    };
+                }
+                let row = decoded_row.as_ref().expect("decoded row should be present");
+                let mut partition_values = Vec::with_capacity(partition_exprs.len());
                 for expr in partition_exprs.iter() {
-                    let value = match eval_scalar_expression(expr, &row, key_schema.as_ref()) {
+                    let value = match eval_scalar_expression(expr, row, key_schema.as_ref()) {
                         Ok(value) => value,
                         Err(err) => {
                             tracing::warn!(
@@ -107,10 +138,6 @@ impl DbspGraphBuilder {
                     };
                     partition_values.push(value);
                 }
-            }
-            let partition_key = if partition_exprs.is_empty() {
-                Some(Vec::new())
-            } else {
                 match encode_projected_row_key(&partition_values) {
                     Ok(encoded) => Some(encoded),
                     Err(err) => {
@@ -125,28 +152,81 @@ impl DbspGraphBuilder {
             };
 
             let mut values = Vec::with_capacity(order_exprs.len());
-            for expr in order_exprs.iter() {
-                let value =
-                    match eval_scalar_expression(expr.expression(), &row, key_schema.as_ref()) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %log_graph_id,
-                                error = %err,
-                                "failed to evaluate topn order expression"
-                            );
-                            return (partition_key, None);
-                        }
-                    };
-                match TopNValue::from_scalar(&value) {
-                    Ok(value) => values.push(value),
+            if let Some(indices) = direct_order_columns.as_ref() {
+                let selected = match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => return (partition_key, None),
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %log_graph_id,
                             error = %err,
-                            "failed to map topn order value"
+                            "failed to extract topn order key columns"
                         );
                         return (partition_key, None);
+                    }
+                };
+                let order_row = match decode_projected_row_key(&selected) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %log_graph_id,
+                            error = %err,
+                            "failed to decode extracted topn order key columns"
+                        );
+                        return (partition_key, None);
+                    }
+                };
+                for value in order_row {
+                    match TopNValue::from_scalar(&value) {
+                        Ok(value) => values.push(value),
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %log_graph_id,
+                                error = %err,
+                                "failed to map topn order value"
+                            );
+                            return (partition_key, None);
+                        }
+                    }
+                }
+            } else {
+                if decoded_row.is_none() {
+                    decoded_row = match decode_projected_row_key(bytes) {
+                        Ok(row) => Some(row),
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %log_graph_id,
+                                error = %err,
+                                "failed to decode topn row"
+                            );
+                            return (partition_key, None);
+                        }
+                    };
+                }
+                let row = decoded_row.as_ref().expect("decoded row should be present");
+                for expr in order_exprs.iter() {
+                    let value =
+                        match eval_scalar_expression(expr.expression(), row, key_schema.as_ref()) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                tracing::warn!(
+                                    graph_id = %log_graph_id,
+                                    error = %err,
+                                    "failed to evaluate topn order expression"
+                                );
+                                return (partition_key, None);
+                            }
+                        };
+                    match TopNValue::from_scalar(&value) {
+                        Ok(value) => values.push(value),
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %log_graph_id,
+                                error = %err,
+                                "failed to map topn order value"
+                            );
+                            return (partition_key, None);
+                        }
                     }
                 }
             }
@@ -184,4 +264,29 @@ impl DbspGraphBuilder {
         .context("initialize DBSP topn")?;
         Ok(topn.stream())
     }
+}
+
+fn direct_column_index(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr.expr() {
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        other => direct_column_index_expression(other, schema),
+    }
+}
+
+fn direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => resolve_direct_column(schema, column),
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    schema
+        .field_index(&qualified)
+        .or_else(|| schema.field_index(&column.name))
 }
