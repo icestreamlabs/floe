@@ -2,7 +2,7 @@ use super::*;
 
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::extract_encoded_row_columns;
-use crate::expression::ExpressionEvaluator;
+use crate::expression::{ExpressionEvaluator, scalar_to_bool};
 use crate::projection::ProjectionEvaluator;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
@@ -73,21 +73,62 @@ impl DbspGraphBuilder {
             graph_id = %graph_id,
             "using scalar filter execution path"
         );
-        let predicate_eval = Arc::new(ExpressionEvaluator::new(
-            Arc::clone(&schema),
-            predicate.expression(),
-        ));
+        let direct_predicate_bool_column =
+            direct_boolean_predicate_column(predicate.expression(), schema.as_ref());
+        let predicate_eval = direct_predicate_bool_column.is_none().then(|| {
+            Arc::new(ExpressionEvaluator::new(
+                Arc::clone(&schema),
+                predicate.expression(),
+            ))
+        });
         let scalar_graph_id = graph_id.clone();
         let transform =
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 let mut filtered = Vec::with_capacity(delta_values.len());
                 for (bytes, weight) in delta_values {
-                    let row = decode_projected_row_key(&bytes).with_context(|| {
-                        format!("decode source filter row for graph '{scalar_graph_id}'")
-                    })?;
-                    if predicate_eval.eval_bool(&row).with_context(|| {
-                        format!("evaluate source filter predicate for graph '{scalar_graph_id}'")
-                    })? {
+                    let include = if let Some(predicate_column) = direct_predicate_bool_column {
+                        let selected =
+                            extract_encoded_row_columns(&bytes, &[predicate_column], false)
+                                .with_context(|| {
+                                    format!(
+                                        "extract source filter predicate column for graph '{scalar_graph_id}'"
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "source filter direct predicate extraction unexpectedly returned null result for graph '{scalar_graph_id}'"
+                                    )
+                                })?;
+                        let selected_values = decode_projected_row_key(&selected).with_context(|| {
+                            format!(
+                                "decode extracted source filter predicate column for graph '{scalar_graph_id}'"
+                            )
+                        })?;
+                        let predicate_value = selected_values.first().ok_or_else(|| {
+                            anyhow!(
+                                "source filter direct predicate extraction produced no columns for graph '{scalar_graph_id}'"
+                            )
+                        })?;
+                        scalar_to_bool(predicate_value).with_context(|| {
+                            format!(
+                                "evaluate extracted source filter predicate for graph '{scalar_graph_id}'"
+                            )
+                        })?
+                    } else {
+                        let row = decode_projected_row_key(&bytes).with_context(|| {
+                            format!("decode source filter row for graph '{scalar_graph_id}'")
+                        })?;
+                        predicate_eval
+                            .as_ref()
+                            .expect("predicate evaluator should be present")
+                            .eval_bool(&row)
+                            .with_context(|| {
+                                format!(
+                                    "evaluate source filter predicate for graph '{scalar_graph_id}'"
+                                )
+                            })?
+                    };
+                    if include {
                         filtered.push((bytes, weight));
                     }
                 }
@@ -281,10 +322,14 @@ impl DbspGraphBuilder {
         let direct_projection_columns =
             direct_project_column_indices(expressions.as_ref(), project_schema.as_ref())
                 .map(Arc::new);
-        let predicate_eval = Arc::new(ExpressionEvaluator::new(
-            Arc::clone(&project_schema),
-            predicate.expression(),
-        ));
+        let direct_predicate_bool_column =
+            direct_boolean_predicate_column(predicate.expression(), project_schema.as_ref());
+        let predicate_eval = direct_predicate_bool_column.is_none().then(|| {
+            Arc::new(ExpressionEvaluator::new(
+                Arc::clone(&project_schema),
+                predicate.expression(),
+            ))
+        });
         let projector_eval = direct_projection_columns.is_none().then(|| {
             Arc::new(ProjectionEvaluator::new(
                 Arc::clone(&project_schema),
@@ -296,14 +341,53 @@ impl DbspGraphBuilder {
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 let mut projected = Vec::with_capacity(delta_values.len());
                 for (bytes, weight) in delta_values {
-                    let row = decode_projected_row_key(&bytes).with_context(|| {
-                        format!("decode source filter_map row for graph '{scalar_graph_id}'")
-                    })?;
-                    if !predicate_eval.eval_bool(&row).with_context(|| {
-                        format!(
-                            "evaluate source filter_map predicate for graph '{scalar_graph_id}'"
-                        )
-                    })? {
+                    let mut decoded_row: Option<Vec<ScalarValue>> = None;
+                    let include = if let Some(predicate_column) = direct_predicate_bool_column {
+                        let selected =
+                            extract_encoded_row_columns(&bytes, &[predicate_column], false)
+                                .with_context(|| {
+                                    format!(
+                                        "extract source filter_map predicate column for graph '{scalar_graph_id}'"
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "source filter_map direct predicate extraction unexpectedly returned null result for graph '{scalar_graph_id}'"
+                                    )
+                                })?;
+                        let selected_values = decode_projected_row_key(&selected).with_context(|| {
+                            format!(
+                                "decode extracted source filter_map predicate column for graph '{scalar_graph_id}'"
+                            )
+                        })?;
+                        let predicate_value = selected_values.first().ok_or_else(|| {
+                            anyhow!(
+                                "source filter_map direct predicate extraction produced no columns for graph '{scalar_graph_id}'"
+                            )
+                        })?;
+                        scalar_to_bool(predicate_value).with_context(|| {
+                            format!(
+                                "evaluate extracted source filter_map predicate for graph '{scalar_graph_id}'"
+                            )
+                        })?
+                    } else {
+                        decoded_row =
+                            Some(decode_projected_row_key(&bytes).with_context(|| {
+                                format!(
+                                    "decode source filter_map row for graph '{scalar_graph_id}'"
+                                )
+                            })?);
+                        predicate_eval
+                            .as_ref()
+                            .expect("predicate evaluator should be present")
+                            .eval_bool(decoded_row.as_ref().expect("decoded row should be present"))
+                            .with_context(|| {
+                                format!(
+                                    "evaluate source filter_map predicate for graph '{scalar_graph_id}'"
+                                )
+                            })?
+                    };
+                    if !include {
                         continue;
                     }
 
@@ -323,7 +407,16 @@ impl DbspGraphBuilder {
                         let projector_eval = projector_eval
                             .as_ref()
                             .expect("projection evaluator should be present");
-                        let mapped = projector_eval.project(&row).with_context(|| {
+                        if decoded_row.is_none() {
+                            decoded_row = Some(decode_projected_row_key(&bytes).with_context(|| {
+                                format!(
+                                    "decode source filter_map row for projection for graph '{scalar_graph_id}'"
+                                )
+                            })?);
+                        }
+                        let mapped = projector_eval
+                            .project(decoded_row.as_ref().expect("decoded row should be present"))
+                            .with_context(|| {
                             format!(
                                 "evaluate source filter_map projection for graph '{scalar_graph_id}'"
                             )
@@ -382,4 +475,17 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
+}
+
+fn direct_boolean_predicate_column(
+    predicate: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    let index = direct_column_index(predicate, schema)?;
+    let field = schema.field(index)?;
+    if field.data_type == DbspScalarType::Bool {
+        Some(index)
+    } else {
+        None
+    }
 }
