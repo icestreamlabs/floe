@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoding::extract_encoded_row_columns;
+use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
@@ -455,40 +455,39 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.clone();
         let projector = move |pair: &(WindowKey<Vec<u8>>, Vec<u8>)| -> Vec<u8> {
-            let mut key_values = match decode_projected_row_key(&pair.0.key) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode window aggregate group key"
-                    );
-                    return Vec::new();
-                }
-            };
-            let aggregate_values = match decode_projected_row_key(&pair.1) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode window aggregate values"
-                    );
-                    return Vec::new();
-                }
-            };
-            let mut output = Vec::with_capacity(2 + key_values.len() + aggregate_values.len());
-            output.push(ScalarValue::TimestampMillisecond(Some(pair.0.start), None));
-            output.push(ScalarValue::TimestampMillisecond(Some(pair.0.end), None));
-            output.append(&mut key_values);
-            output.extend(aggregate_values);
-            match encode_projected_row_key(&output) {
+            let window_bounds = [
+                ScalarValue::TimestampMillisecond(Some(pair.0.start), None),
+                ScalarValue::TimestampMillisecond(Some(pair.0.end), None),
+            ];
+            let encoded_window_bounds = match encode_projected_row_key(&window_bounds) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %project_graph_id,
                         error = %err,
-                        "failed to encode window aggregate row"
+                        "failed to encode window aggregate bounds"
+                    );
+                    return Vec::new();
+                }
+            };
+            let with_key = match concat_encoded_rows(&encoded_window_bounds, &pair.0.key) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate bounds and key"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&with_key, &pair.1) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate output values"
                     );
                     Vec::new()
                 }
@@ -528,36 +527,13 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.to_string();
         let projector = move |pair: &(Vec<u8>, Vec<u8>)| -> Vec<u8> {
-            let mut key_values = match decode_projected_row_key(&pair.0) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate group key"
-                    );
-                    return Vec::new();
-                }
-            };
-            let aggregate_values = match decode_projected_row_key(&pair.1) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate values"
-                    );
-                    return Vec::new();
-                }
-            };
-            key_values.extend(aggregate_values);
-            match encode_projected_row_key(&key_values) {
+            match concat_encoded_rows(&pair.0, &pair.1) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %project_graph_id,
                         error = %err,
-                        "failed to encode aggregate row"
+                        "failed to concatenate aggregate row segments"
                     );
                     Vec::new()
                 }
@@ -593,25 +569,29 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.to_string();
         let projector = move |pair: &(Vec<u8>, Vec<i64>)| -> Vec<u8> {
-            let mut key_values = match decode_projected_row_key(&pair.0) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate group key"
-                    );
-                    return Vec::new();
-                }
-            };
-            key_values.extend(pair.1.iter().map(|value| ScalarValue::Int64(Some(*value))));
-            match encode_projected_row_key(&key_values) {
+            let count_values = pair
+                .1
+                .iter()
+                .map(|value| ScalarValue::Int64(Some(*value)))
+                .collect::<Vec<_>>();
+            let encoded_count_values = match encode_projected_row_key(&count_values) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %project_graph_id,
                         error = %err,
-                        "failed to encode aggregate row"
+                        "failed to encode count aggregate values"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&pair.0, &encoded_count_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate count aggregate row segments"
                     );
                     Vec::new()
                 }
@@ -647,25 +627,29 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.to_string();
         let projector = move |pair: &(Vec<u8>, Vec<dbsp::AggregateValue>)| -> Vec<u8> {
-            let mut key_values = match decode_projected_row_key(&pair.0) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %project_graph_id,
-                        error = %err,
-                        "failed to decode aggregate group key"
-                    );
-                    return Vec::new();
-                }
-            };
-            key_values.extend(pair.1.iter().map(scalar_from_incremental_aggregate_value));
-            match encode_projected_row_key(&key_values) {
+            let aggregate_values = pair
+                .1
+                .iter()
+                .map(scalar_from_incremental_aggregate_value)
+                .collect::<Vec<_>>();
+            let encoded_aggregate_values = match encode_projected_row_key(&aggregate_values) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %project_graph_id,
                         error = %err,
-                        "failed to encode aggregate row"
+                        "failed to encode incremental aggregate values"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&pair.0, &encoded_aggregate_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate incremental aggregate row segments"
                     );
                     Vec::new()
                 }
