@@ -168,6 +168,8 @@ impl DbspGraphBuilder {
             direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
         let right_key_columns =
             direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let left_key_columns_for_outer = left_key_columns.clone();
+        let right_key_columns_for_outer = right_key_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
@@ -384,10 +386,25 @@ impl DbspGraphBuilder {
             let antijoin_right_exprs = Arc::clone(&antijoin_keys);
             let antijoin_left_schema = Arc::clone(&left_schema);
             let antijoin_right_schema = Arc::clone(&right_schema);
+            let antijoin_left_key_columns = left_key_columns_for_outer.clone();
+            let antijoin_right_key_columns = right_key_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
             let antijoin_left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                if let Some(indices) = antijoin_left_key_columns.as_ref() {
+                    return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
+                        Ok(selected) => selected,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_left_graph_id,
+                                error = %err,
+                                "failed to extract left outer join anti left key columns"
+                            );
+                            None
+                        }
+                    };
+                }
                 let left_row = match decode_projected_row_key(left_bytes) {
                     Ok(row) => row,
                     Err(err) => {
@@ -425,6 +442,19 @@ impl DbspGraphBuilder {
             };
 
             let antijoin_right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                if let Some(indices) = antijoin_right_key_columns.as_ref() {
+                    return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
+                        Ok(selected) => selected,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_right_graph_id,
+                                error = %err,
+                                "failed to extract left outer join anti right key columns"
+                            );
+                            None
+                        }
+                    };
+                }
                 let right_row = match decode_projected_row_key(right_bytes) {
                     Ok(row) => row,
                     Err(err) => {
@@ -485,29 +515,21 @@ impl DbspGraphBuilder {
             .context("initialize DBSP anti-join for LEFT/FULL OUTER join")?;
 
             let right_fields = right_schema.fields().to_vec();
+            let mut right_nulls = Vec::with_capacity(right_fields.len());
+            for field in &right_fields {
+                right_nulls.push(null_scalar_for_dbsp_type(&field.data_type));
+            }
+            let right_null_suffix = encode_projected_row_key(&right_nulls)
+                .context("encode left outer null-extension right template row")?;
             let null_extend_graph_id = graph_id.clone();
             let null_extend = move |left_bytes: &Vec<u8>| -> Vec<u8> {
-                let mut output = match decode_projected_row_key(left_bytes) {
-                    Ok(row) => row,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %null_extend_graph_id,
-                            error = %err,
-                            "failed to decode left outer anti row"
-                        );
-                        return Vec::new();
-                    }
-                };
-                for field in &right_fields {
-                    output.push(null_scalar_for_dbsp_type(&field.data_type));
-                }
-                match encode_projected_row_key(&output) {
+                match concat_encoded_rows(left_bytes, &right_null_suffix) {
                     Ok(encoded) => encoded,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %null_extend_graph_id,
                             error = %err,
-                            "failed to encode null-extended left outer row"
+                            "failed to concatenate null-extended left outer row"
                         );
                         Vec::new()
                     }
@@ -546,10 +568,25 @@ impl DbspGraphBuilder {
             let antijoin_right_exprs = Arc::clone(&antijoin_keys);
             let antijoin_left_schema = Arc::clone(&right_schema);
             let antijoin_right_schema = Arc::clone(&left_schema);
+            let antijoin_left_key_columns = right_key_columns_for_outer.clone();
+            let antijoin_right_key_columns = left_key_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
             let antijoin_left_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                if let Some(indices) = antijoin_left_key_columns.as_ref() {
+                    return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
+                        Ok(selected) => selected,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_left_graph_id,
+                                error = %err,
+                                "failed to extract right outer join anti right key columns"
+                            );
+                            None
+                        }
+                    };
+                }
                 let right_row = match decode_projected_row_key(right_bytes) {
                     Ok(row) => row,
                     Err(err) => {
@@ -587,6 +624,19 @@ impl DbspGraphBuilder {
             };
 
             let antijoin_right_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                if let Some(indices) = antijoin_right_key_columns.as_ref() {
+                    return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
+                        Ok(selected) => selected,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_right_graph_id,
+                                error = %err,
+                                "failed to extract right outer join anti left key columns"
+                            );
+                            None
+                        }
+                    };
+                }
                 let left_row = match decode_projected_row_key(left_bytes) {
                     Ok(row) => row,
                     Err(err) => {
@@ -647,31 +697,21 @@ impl DbspGraphBuilder {
             .context("initialize DBSP anti-join for RIGHT/FULL OUTER join")?;
 
             let left_fields = left_schema.fields().to_vec();
+            let mut left_nulls = Vec::with_capacity(left_fields.len());
+            for field in &left_fields {
+                left_nulls.push(null_scalar_for_dbsp_type(&field.data_type));
+            }
+            let left_null_prefix = encode_projected_row_key(&left_nulls)
+                .context("encode right outer null-extension left template row")?;
             let null_extend_graph_id = graph_id.clone();
             let null_extend = move |right_bytes: &Vec<u8>| -> Vec<u8> {
-                let right_row = match decode_projected_row_key(right_bytes) {
-                    Ok(row) => row,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %null_extend_graph_id,
-                            error = %err,
-                            "failed to decode right outer anti row"
-                        );
-                        return Vec::new();
-                    }
-                };
-                let mut output = Vec::with_capacity(left_fields.len() + right_row.len());
-                for field in &left_fields {
-                    output.push(null_scalar_for_dbsp_type(&field.data_type));
-                }
-                output.extend(right_row);
-                match encode_projected_row_key(&output) {
+                match concat_encoded_rows(&left_null_prefix, right_bytes) {
                     Ok(encoded) => encoded,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %null_extend_graph_id,
                             error = %err,
-                            "failed to encode null-extended right outer row"
+                            "failed to concatenate null-extended right outer row"
                         );
                         Vec::new()
                     }
