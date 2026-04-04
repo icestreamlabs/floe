@@ -1,4 +1,7 @@
 use super::*;
+use crate::encoding::extract_encoded_row_columns;
+use datafusion::common::Column;
+use datafusion::logical_expr::Expr;
 
 #[derive(Clone)]
 struct CountEvalLayout {
@@ -22,6 +25,8 @@ impl DbspGraphBuilder {
     ) -> Result<DeltaHandleStream> {
         let input_schema = Arc::clone(node.input_schema());
         let group_keys = node.group_keys().to_vec();
+        let direct_group_key_columns =
+            direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
         let aggregates = node.aggregates().to_vec();
         let graph_id = self.graph_id().to_string();
         let aggregate_events = task_events.clone();
@@ -99,8 +104,22 @@ impl DbspGraphBuilder {
         }
 
         let key_schema = Arc::clone(&input_schema);
+        let key_columns = direct_group_key_columns;
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = key_columns.as_ref() {
+                return match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %key_graph_id,
+                            error = %err,
+                            "failed to extract aggregate group key columns"
+                        );
+                        None
+                    }
+                };
+            }
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -226,6 +245,8 @@ impl DbspGraphBuilder {
         let aggregate = &node.aggregate;
         let input_schema = Arc::clone(aggregate.input_schema());
         let group_keys = aggregate.group_keys().to_vec();
+        let direct_group_key_columns =
+            direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
         let aggregates = aggregate.aggregates().to_vec();
         let (window_size, window_slide) = match &node.window.policy {
             DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
@@ -243,8 +264,22 @@ impl DbspGraphBuilder {
         });
 
         let key_schema = Arc::clone(&input_schema);
+        let key_columns = direct_group_key_columns;
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            if let Some(indices) = key_columns.as_ref() {
+                return match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %key_graph_id,
+                            error = %err,
+                            "failed to extract window aggregate group key columns"
+                        );
+                        None
+                    }
+                };
+            }
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -291,7 +326,35 @@ impl DbspGraphBuilder {
         let time_schema = Arc::clone(&input_schema);
         let time_graph_id = graph_id.clone();
         let time_expression = node.window.time_expression.clone();
+        let direct_time_column =
+            direct_column_index(&time_expression, input_schema.as_ref()).map(|index| [index]);
         let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
+            if let Some(index) = direct_time_column.as_ref() {
+                let selected = match extract_encoded_row_columns(bytes, index, false) {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => return None,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %time_graph_id,
+                            error = %err,
+                            "failed to extract window aggregate time column"
+                        );
+                        return None;
+                    }
+                };
+                let values = match decode_projected_row_key(&selected) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %time_graph_id,
+                            error = %err,
+                            "failed to decode extracted window aggregate time column"
+                        );
+                        return None;
+                    }
+                };
+                return values.first().and_then(scalar_to_i64);
+            }
             let row = match decode_projected_row_key(bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -643,6 +706,8 @@ pub(crate) fn build_count_row_evaluator(
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> + Send + Sync + 'static
 {
     let layout = Arc::new(build_count_eval_layout(&aggregates));
+    let direct_group_key_columns =
+        direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
     move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
         let row = match decode_projected_row_key(bytes) {
             Ok(row) => row,
@@ -656,10 +721,27 @@ pub(crate) fn build_count_row_evaluator(
             }
         };
 
-        let mut key_values = Vec::with_capacity(group_keys.len());
-        for key_expr in &group_keys {
-            let value =
-                match eval_scalar_expression(key_expr.expression(), &row, input_schema.as_ref()) {
+        let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
+            match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                Ok(Some(encoded_key)) => encoded_key,
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to extract count aggregate group key columns"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            let mut key_values = Vec::with_capacity(group_keys.len());
+            for key_expr in &group_keys {
+                let value = match eval_scalar_expression(
+                    key_expr.expression(),
+                    &row,
+                    input_schema.as_ref(),
+                ) {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
@@ -670,17 +752,18 @@ pub(crate) fn build_count_row_evaluator(
                         return None;
                     }
                 };
-            key_values.push(value);
-        }
-        let encoded_key = match encode_projected_row_key(&key_values) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to encode count aggregate group key"
-                );
-                return None;
+                key_values.push(value);
+            }
+            match encode_projected_row_key(&key_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to encode count aggregate group key"
+                    );
+                    return None;
+                }
             }
         };
 
@@ -862,6 +945,8 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
     context: &'static str,
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> + Send + Sync + 'static {
     let layout = Arc::new(build_count_eval_layout(&aggregates));
+    let direct_group_key_columns =
+        direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
     move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
         let row = match decode_projected_row_key(bytes) {
             Ok(row) => row,
@@ -875,10 +960,27 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
             }
         };
 
-        let mut key_values = Vec::with_capacity(group_keys.len());
-        for key_expr in &group_keys {
-            let value =
-                match eval_scalar_expression(key_expr.expression(), &row, input_schema.as_ref()) {
+        let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
+            match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+                Ok(Some(encoded_key)) => encoded_key,
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to extract incremental aggregate group key columns"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            let mut key_values = Vec::with_capacity(group_keys.len());
+            for key_expr in &group_keys {
+                let value = match eval_scalar_expression(
+                    key_expr.expression(),
+                    &row,
+                    input_schema.as_ref(),
+                ) {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
@@ -889,17 +991,18 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
                         return None;
                     }
                 };
-            key_values.push(value);
-        }
-        let encoded_key = match encode_projected_row_key(&key_values) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to encode incremental aggregate group key"
-                );
-                return None;
+                key_values.push(value);
+            }
+            match encode_projected_row_key(&key_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to encode incremental aggregate group key"
+                    );
+                    return None;
+                }
             }
         };
 
@@ -1055,4 +1158,39 @@ pub(crate) fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateVal
         }
         dbsp::AggregateValue::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
     }
+}
+
+fn direct_group_key_columns(
+    group_keys: &[dbsp::circuit::plan::GroupKeyExpr],
+    schema: &RowSchema,
+) -> Option<Vec<usize>> {
+    group_keys
+        .iter()
+        .map(|key_expr| direct_column_index(key_expr.expression(), schema))
+        .collect()
+}
+
+fn direct_column_index(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr.expr() {
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        other => direct_column_index_expression(other, schema),
+    }
+}
+
+fn direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => resolve_direct_column(schema, column),
+        Expr::Alias(alias) => direct_column_index_expression(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    schema
+        .field_index(&qualified)
+        .or_else(|| schema.field_index(&column.name))
 }
