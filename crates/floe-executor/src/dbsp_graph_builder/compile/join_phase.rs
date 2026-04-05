@@ -7,7 +7,6 @@ use crate::encoding::{
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
-use std::collections::BTreeSet;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_join(
@@ -261,33 +260,12 @@ impl DbspGraphBuilder {
         let defer_residual_to_post_filter = matches!(join_type, DbspJoinType::Inner)
             && residual.is_some()
             && direct_residual_bool_column.is_none();
-        let (residual_left_required_columns, residual_right_required_columns) =
-            if let Some(expr) = residual.as_ref() {
-                if direct_residual_bool_column.is_none() {
-                    let (left_required, right_required) = required_join_residual_input_columns(
-                        expr,
-                        output_schema.as_ref(),
-                        left_schema.len(),
-                    );
-                    (
-                        Some(Arc::new(left_required)),
-                        Some(Arc::new(right_required)),
-                    )
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
         let left_key_columns_for_outer = left_key_columns.clone();
         let right_key_columns_for_outer = right_key_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
-        let left_predicate_width = left_schema.len();
-        let right_predicate_width = right_schema.len();
-        let output_schema_for_predicate = Arc::clone(&output_schema);
         let left_output_projection = (left_join_schema.len() != left_schema.len())
             .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
         let right_output_projection = (right_join_schema.len() != right_schema.len())
@@ -322,9 +300,9 @@ impl DbspGraphBuilder {
         };
 
         let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-            let Some(expr) = residual.as_ref() else {
+            if residual.is_none() {
                 return true;
-            };
+            }
             if let Some(column) = direct_residual_bool_column {
                 return match eval_direct_join_predicate_boolean_column(
                     column,
@@ -345,56 +323,11 @@ impl DbspGraphBuilder {
             if defer_residual_to_post_filter {
                 return true;
             }
-            let left_row = match decode_sparse_row_for_columns(
-                left_bytes,
-                residual_left_required_columns
-                    .as_ref()
-                    .expect("residual left required columns should be present")
-                    .as_ref(),
-                left_predicate_width,
-            ) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to decode join left row"
-                    );
-                    return false;
-                }
-            };
-            let right_row = match decode_sparse_row_for_columns(
-                right_bytes,
-                residual_right_required_columns
-                    .as_ref()
-                    .expect("residual right required columns should be present")
-                    .as_ref(),
-                right_predicate_width,
-            ) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to decode join right row"
-                    );
-                    return false;
-                }
-            };
-            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-            combined.extend(left_row.into_iter());
-            combined.extend(right_row.into_iter());
-            match eval_expression(expr, &combined, output_schema_for_predicate.as_ref()) {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to evaluate join residual"
-                    );
-                    false
-                }
-            }
+            tracing::warn!(
+                graph_id = %predicate_graph_id,
+                "non-direct join residual should be evaluated by vectorized post-filter"
+            );
+            false
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
@@ -904,30 +837,31 @@ impl DbspGraphBuilder {
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
-        let (residual_left_required_columns, residual_right_required_columns) =
-            if let Some(expr) = residual.as_ref() {
-                if direct_residual_bool_column.is_none() {
-                    let (left_required, right_required) = required_join_residual_input_columns(
-                        expr,
-                        output_schema.as_ref(),
-                        left_schema.len(),
-                    );
-                    (
-                        Some(Arc::new(left_required)),
-                        Some(Arc::new(right_required)),
-                    )
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+        let defer_residual_to_post_filter =
+            residual.is_some() && direct_residual_bool_column.is_none();
+        let deferred_residual_evaluator = if defer_residual_to_post_filter {
+            let residual_expr = residual
+                .as_ref()
+                .expect("residual expression should be present")
+                .expr()
+                .clone();
+            let residual_predicate =
+                dbsp::DbspPredicate::try_new(residual_expr, Arc::clone(&output_schema))
+                    .context("analyze deferred transient join residual predicate")?;
+            Some(Arc::new(
+                VectorizedFilterProjectEvaluator::for_filter(
+                    &residual_predicate,
+                    Arc::clone(&output_schema),
+                )
+                .context("build vectorized deferred transient join residual evaluator")?,
+            ))
+        } else {
+            None
+        };
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
-        let left_predicate_width = left_schema.len();
-        let right_predicate_width = right_schema.len();
         let left_output_projection = (left_join_schema.len() != left_schema.len())
             .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
         let right_output_projection = (right_join_schema.len() != right_schema.len())
@@ -962,9 +896,9 @@ impl DbspGraphBuilder {
         };
 
         let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-            let Some(expr) = residual.as_ref() else {
+            if residual.is_none() {
                 return true;
-            };
+            }
             if let Some(column) = direct_residual_bool_column {
                 return match eval_direct_join_predicate_boolean_column(
                     column,
@@ -982,56 +916,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let left_row = match decode_sparse_row_for_columns(
-                left_bytes,
-                residual_left_required_columns
-                    .as_ref()
-                    .expect("residual left required columns should be present")
-                    .as_ref(),
-                left_predicate_width,
-            ) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to decode join left row"
-                    );
-                    return false;
-                }
-            };
-            let right_row = match decode_sparse_row_for_columns(
-                right_bytes,
-                residual_right_required_columns
-                    .as_ref()
-                    .expect("residual right required columns should be present")
-                    .as_ref(),
-                right_predicate_width,
-            ) {
-                Ok(row) => row,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to decode join right row"
-                    );
-                    return false;
-                }
-            };
-            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-            combined.extend(left_row.into_iter());
-            combined.extend(right_row.into_iter());
-            match eval_expression(expr, &combined, output_schema.as_ref()) {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %predicate_graph_id,
-                        error = %err,
-                        "failed to evaluate join residual"
-                    );
-                    false
-                }
+            if defer_residual_to_post_filter {
+                return true;
             }
+            tracing::warn!(
+                graph_id = %predicate_graph_id,
+                "non-direct transient join residual should be evaluated by vectorized post-filter"
+            );
+            false
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
@@ -1109,8 +1001,30 @@ impl DbspGraphBuilder {
             }
         };
 
+        let observer_graph_id = graph_id.clone();
+        let observer_events = task_events.clone();
+        let observer_label = format!("transient-join-post-filter:{graph_id}");
         let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
-            let _ = output_tx.send(TransientMaterializeBatch { version, deltas });
+            let filtered = if let Some(evaluator) = deferred_residual_evaluator.as_ref() {
+                match evaluator.transform_delta(&observer_graph_id, deltas.as_ref().clone()) {
+                    Ok(filtered) => filtered,
+                    Err(err) => {
+                        report_graph_task_error(
+                            &observer_events,
+                            &observer_graph_id,
+                            observer_label.clone(),
+                            err,
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                deltas.as_ref().clone()
+            };
+            let _ = output_tx.send(TransientMaterializeBatch {
+                version,
+                deltas: Arc::new(filtered),
+            });
         });
 
         DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
@@ -1179,53 +1093,6 @@ fn direct_join_predicate_boolean_column(
     } else {
         Some(JoinPredicateBooleanColumn::Right(output_index - left_width))
     }
-}
-
-fn required_join_residual_input_columns(
-    expr: &dbsp::circuit::plan::DbspExpression,
-    output_schema: &RowSchema,
-    left_width: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut left_columns = BTreeSet::new();
-    let mut right_columns = BTreeSet::new();
-    for column in expr.expr().column_refs() {
-        if let Some(output_idx) = resolve_direct_column(output_schema, &column) {
-            if output_idx < left_width {
-                left_columns.insert(output_idx);
-            } else {
-                right_columns.insert(output_idx - left_width);
-            }
-        }
-    }
-    (
-        left_columns.into_iter().collect(),
-        right_columns.into_iter().collect(),
-    )
-}
-
-fn decode_sparse_row_for_columns(
-    encoded: &[u8],
-    columns: &[usize],
-    row_width: usize,
-) -> Result<Vec<ScalarValue>> {
-    if columns.is_empty() {
-        return Ok(vec![ScalarValue::Null; row_width]);
-    }
-    let selected = extract_encoded_row_columns(encoded, columns, false)?
-        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
-    let values = decode_projected_row_key(&selected)?;
-    if values.len() != columns.len() {
-        return Err(anyhow!(
-            "sparse row extraction expected {} columns but decoded {}",
-            columns.len(),
-            values.len()
-        ));
-    }
-    let mut row = vec![ScalarValue::Null; row_width];
-    for (slot, column_idx) in columns.iter().copied().enumerate() {
-        row[column_idx] = values[slot].clone();
-    }
-    Ok(row)
 }
 
 fn eval_direct_join_predicate_boolean_column(
