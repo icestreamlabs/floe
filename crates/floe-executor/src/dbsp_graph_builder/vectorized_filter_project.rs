@@ -317,17 +317,7 @@ impl VectorizedFilterProjectEvaluator {
                     if diff == 0 {
                         continue;
                     }
-                    let projected_row = projection_columns
-                        .iter()
-                        .map(|column| {
-                            column
-                                .get(idx)
-                                .cloned()
-                                .ok_or_else(|| anyhow!("compiled projection row {idx} was missing"))
-                                .map(|value| value.to_scalar_value())
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let encoded = encode_projected_row_key(&projected_row)?;
+                    let encoded = encode_compiled_projection_row(&projection_columns, idx)?;
                     staged.push((encoded, diff));
                 }
                 consolidate_encoded_delta_batch(staged)
@@ -908,15 +898,6 @@ impl CompiledValue {
                 value,
                 data_type
             )),
-        }
-    }
-
-    fn to_scalar_value(&self) -> ScalarValue {
-        match self {
-            Self::Int64(value) => ScalarValue::Int64(*value),
-            Self::Utf8(value) => ScalarValue::Utf8(value.clone()),
-            Self::TimestampMillis(value) => ScalarValue::TimestampMillisecond(*value, None),
-            Self::Bool(value) => ScalarValue::Boolean(*value),
         }
     }
 
@@ -1789,6 +1770,49 @@ struct DecodedEncodedRow {
     decoded_values: Option<Vec<ScalarValue>>,
     compiled_values: Option<Vec<CompiledValue>>,
     projected_ranges: Option<Vec<Range<usize>>>,
+}
+
+fn encode_compiled_projection_row(columns: &[CompiledColumn], row_idx: usize) -> Result<Vec<u8>> {
+    let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (columns.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for column in columns {
+        let value = column
+            .get(row_idx)
+            .ok_or_else(|| anyhow!("compiled projection row {row_idx} was missing"))?;
+        encode_compiled_value(value, &mut encoded)?;
+    }
+    Ok(encoded)
+}
+
+fn encode_compiled_value(value: &CompiledValue, encoded: &mut Vec<u8>) -> Result<()> {
+    match value {
+        CompiledValue::Int64(Some(v)) => {
+            encoded.push(0x01);
+            encoded.extend_from_slice(&v.to_le_bytes());
+        }
+        CompiledValue::Int64(None) => encoded.push(0x05),
+        CompiledValue::Utf8(Some(text)) => {
+            encoded.push(0x02);
+            let bytes = text.as_bytes();
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
+            encoded.extend_from_slice(&len.to_le_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+        CompiledValue::Utf8(None) => encoded.push(0x06),
+        CompiledValue::TimestampMillis(Some(v)) => {
+            encoded.push(0x03);
+            encoded.extend_from_slice(&v.to_le_bytes());
+        }
+        CompiledValue::TimestampMillis(None) => encoded.push(0x07),
+        CompiledValue::Bool(Some(flag)) => {
+            encoded.push(0x04);
+            encoded.push(if *flag { 1 } else { 0 });
+        }
+        CompiledValue::Bool(None) => encoded.push(0x08),
+    }
+    Ok(())
 }
 
 fn consolidate_encoded_delta_batch(
