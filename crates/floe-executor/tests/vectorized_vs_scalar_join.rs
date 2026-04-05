@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -107,61 +106,8 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Vec<JoinedRow> {
     rows
 }
 
-fn scalar_cross_term_join(
-    left_state: &[(i64, &str)],
-    right_state: &[(i64, &str)],
-    left_delta: &[WeightedRow],
-    right_delta: &[WeightedRow],
-) -> Vec<JoinedRow> {
-    let mut output: HashMap<(i64, String, String), i64> = HashMap::new();
-
-    for (id, left_payload, left_weight) in left_delta {
-        for (right_id, right_payload) in right_state {
-            if id != right_id {
-                continue;
-            }
-            let key = (*id, left_payload.clone(), (*right_payload).to_string());
-            *output.entry(key).or_insert(0) += *left_weight;
-        }
-    }
-
-    for (left_id, left_payload) in left_state {
-        for (right_id, right_payload, right_weight) in right_delta {
-            if left_id != right_id {
-                continue;
-            }
-            let key = (*left_id, (*left_payload).to_string(), right_payload.clone());
-            *output.entry(key).or_insert(0) += *right_weight;
-        }
-    }
-
-    for (left_id, left_payload, left_weight) in left_delta {
-        for (right_id, right_payload, right_weight) in right_delta {
-            if left_id != right_id {
-                continue;
-            }
-            let key = (*left_id, left_payload.clone(), right_payload.clone());
-            *output.entry(key).or_insert(0) += left_weight * right_weight;
-        }
-    }
-
-    let mut rows = output
-        .into_iter()
-        .filter_map(|((id, left_payload, right_payload), weight)| {
-            (weight != 0).then_some((id, left_payload, right_payload, weight))
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-            .then(a.3.cmp(&b.3))
-    });
-    rows
-}
-
 #[tokio::test]
-async fn scalar_and_vectorized_cross_terms_match() -> Result<()> {
+async fn vectorized_cross_terms_match_expected() -> Result<()> {
     let left_state_schema = state_schema("left");
     let right_state_schema = state_schema("right");
     let left_delta_schema = delta_schema("left");
@@ -241,8 +187,6 @@ async fn scalar_and_vectorized_cross_terms_match() -> Result<()> {
     let vectorized = executor.run_tick().await?;
     let vectorized_rows = rows_from_batches(&vectorized.batches);
 
-    let scalar = scalar_cross_term_join(&left_state, &right_state, &left_delta, &right_delta);
-    assert_eq!(vectorized_rows, scalar);
     assert_eq!(
         vectorized_rows,
         vec![(2, "left-2".to_string(), "right-2".to_string(), 3)]
