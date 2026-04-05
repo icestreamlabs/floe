@@ -3014,6 +3014,34 @@ fn required_transient_topn_input_columns(
     columns.into_iter().collect()
 }
 
+fn required_expression_input_columns(expr: &DbspExpression, schema: &RowSchema) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    add_expr_input_columns(expr.expr(), schema, &mut columns);
+    columns.into_iter().collect()
+}
+
+fn required_projection_input_columns(
+    expressions: &[DbspProjectExpr],
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    for expr in expressions {
+        add_expr_input_columns(expr.expression().expr(), schema, &mut columns);
+    }
+    columns.into_iter().collect()
+}
+
+fn union_required_columns(left: Option<&[usize]>, right: Option<&[usize]>) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    if let Some(left_columns) = left {
+        columns.extend(left_columns.iter().copied());
+    }
+    if let Some(right_columns) = right {
+        columns.extend(right_columns.iter().copied());
+    }
+    columns.into_iter().collect()
+}
+
 fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
     for column in expr.column_refs() {
         if let Some(index) = schema.field_index(column.name.as_str()) {
@@ -4690,6 +4718,12 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
     }
     let direct_predicate_bool_column =
         transient_direct_boolean_predicate_column(&predicate, schema.as_ref());
+    let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
+        Arc::new(required_expression_input_columns(
+            predicate.expression(),
+            schema.as_ref(),
+        ))
+    });
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
@@ -4702,7 +4736,14 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
                     Err(_) => continue,
                 }
             } else {
-                let row = match decode_projected_row_key(&encoded) {
+                let row = match decode_sparse_row_for_columns(
+                    &encoded,
+                    predicate_required_columns
+                        .as_ref()
+                        .expect("predicate required columns should be present")
+                        .as_ref(),
+                    schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(_) => continue,
                 };
@@ -4741,6 +4782,12 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
         .map(|expr| projection_direct_column_index(expr, schema.as_ref()))
         .collect::<Option<Vec<_>>>()
         .map(Arc::new);
+    let projection_required_columns = direct_projection_columns.is_none().then(|| {
+        Arc::new(required_projection_input_columns(
+            expressions.as_ref(),
+            schema.as_ref(),
+        ))
+    });
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
@@ -4753,7 +4800,14 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
                     Ok(None) | Err(_) => continue,
                 }
             } else {
-                let row = match decode_projected_row_key(&encoded) {
+                let row = match decode_sparse_row_for_columns(
+                    &encoded,
+                    projection_required_columns
+                        .as_ref()
+                        .expect("projection required columns should be present")
+                        .as_ref(),
+                    schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(_) => continue,
                 };
@@ -4805,6 +4859,31 @@ fn build_filter_map_transform(
         .map(|expr| projection_direct_column_index(expr, project_schema.as_ref()))
         .collect::<Option<Vec<_>>>()
         .map(Arc::new);
+    let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
+        Arc::new(required_expression_input_columns(
+            predicate.expression(),
+            filter_schema.as_ref(),
+        ))
+    });
+    let projection_required_columns = direct_projection_columns.is_none().then(|| {
+        Arc::new(required_projection_input_columns(
+            expressions.as_ref(),
+            project_schema.as_ref(),
+        ))
+    });
+    let scalar_required_columns =
+        if direct_predicate_bool_column.is_none() || direct_projection_columns.is_none() {
+            Some(Arc::new(union_required_columns(
+                predicate_required_columns
+                    .as_ref()
+                    .map(|cols| cols.as_slice()),
+                projection_required_columns
+                    .as_ref()
+                    .map(|cols| cols.as_slice()),
+            )))
+        } else {
+            None
+        };
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
@@ -4818,7 +4897,14 @@ fn build_filter_map_transform(
                     Err(_) => continue,
                 }
             } else {
-                decoded_row = match decode_projected_row_key(&encoded) {
+                decoded_row = match decode_sparse_row_for_columns(
+                    &encoded,
+                    scalar_required_columns
+                        .as_ref()
+                        .expect("scalar required columns should be present")
+                        .as_ref(),
+                    project_schema.len(),
+                ) {
                     Ok(row) => Some(row),
                     Err(_) => continue,
                 };
@@ -4841,7 +4927,14 @@ fn build_filter_map_transform(
                 }
             } else {
                 if decoded_row.is_none() {
-                    decoded_row = match decode_projected_row_key(&encoded) {
+                    decoded_row = match decode_sparse_row_for_columns(
+                        &encoded,
+                        scalar_required_columns
+                            .as_ref()
+                            .expect("scalar required columns should be present")
+                            .as_ref(),
+                        project_schema.len(),
+                    ) {
                         Ok(row) => Some(row),
                         Err(_) => continue,
                     };

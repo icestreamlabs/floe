@@ -6,6 +6,7 @@ use crate::expression::{ExpressionEvaluator, scalar_to_bool};
 use crate::projection::ProjectionEvaluator;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use std::collections::BTreeSet;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_source(
@@ -81,6 +82,12 @@ impl DbspGraphBuilder {
                 predicate.expression(),
             ))
         });
+        let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
+            Arc::new(required_expression_input_columns(
+                predicate.expression(),
+                schema.as_ref(),
+            ))
+        });
         let scalar_graph_id = graph_id.clone();
         let transform =
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
@@ -115,7 +122,15 @@ impl DbspGraphBuilder {
                             )
                         })?
                     } else {
-                        let row = decode_projected_row_key(&bytes).with_context(|| {
+                        let row = decode_sparse_row_for_columns(
+                            &bytes,
+                            predicate_required_columns
+                                .as_ref()
+                                .expect("predicate required columns should be present")
+                                .as_ref(),
+                            schema.len(),
+                        )
+                        .with_context(|| {
                             format!("decode source filter row for graph '{scalar_graph_id}'")
                         })?;
                         predicate_eval
@@ -195,6 +210,12 @@ impl DbspGraphBuilder {
         );
         let direct_projection_columns =
             direct_project_column_indices(expressions.as_ref(), schema.as_ref()).map(Arc::new);
+        let projection_required_columns = direct_projection_columns.is_none().then(|| {
+            Arc::new(required_projection_input_columns(
+                expressions.as_ref(),
+                schema.as_ref(),
+            ))
+        });
         if let Some(columns) = direct_projection_columns {
             tracing::info!(
                 graph_id = %graph_id,
@@ -239,7 +260,15 @@ impl DbspGraphBuilder {
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 let mut projected = Vec::with_capacity(delta_values.len());
                 for (bytes, weight) in delta_values {
-                    let row = decode_projected_row_key(&bytes).with_context(|| {
+                    let row = decode_sparse_row_for_columns(
+                        &bytes,
+                        projection_required_columns
+                            .as_ref()
+                            .expect("projection required columns should be present")
+                            .as_ref(),
+                        schema.len(),
+                    )
+                    .with_context(|| {
                         format!("decode source map row for graph '{scalar_graph_id}'")
                     })?;
                     let mapped = projector_eval.project(&row).with_context(|| {
@@ -330,12 +359,37 @@ impl DbspGraphBuilder {
                 predicate.expression(),
             ))
         });
+        let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
+            Arc::new(required_expression_input_columns(
+                predicate.expression(),
+                project_schema.as_ref(),
+            ))
+        });
         let projector_eval = direct_projection_columns.is_none().then(|| {
             Arc::new(ProjectionEvaluator::new(
                 Arc::clone(&project_schema),
                 expressions.as_ref(),
             ))
         });
+        let projection_required_columns = direct_projection_columns.is_none().then(|| {
+            Arc::new(required_projection_input_columns(
+                expressions.as_ref(),
+                project_schema.as_ref(),
+            ))
+        });
+        let scalar_required_columns =
+            if direct_predicate_bool_column.is_none() || direct_projection_columns.is_none() {
+                Some(Arc::new(union_required_columns(
+                    predicate_required_columns
+                        .as_ref()
+                        .map(|cols| cols.as_slice()),
+                    projection_required_columns
+                        .as_ref()
+                        .map(|cols| cols.as_slice()),
+                )))
+            } else {
+                None
+            };
         let scalar_graph_id = graph_id.clone();
         let transform =
             move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
@@ -371,12 +425,21 @@ impl DbspGraphBuilder {
                             )
                         })?
                     } else {
-                        decoded_row =
-                            Some(decode_projected_row_key(&bytes).with_context(|| {
+                        decoded_row = Some(
+                            decode_sparse_row_for_columns(
+                                &bytes,
+                                scalar_required_columns
+                                    .as_ref()
+                                    .expect("scalar required columns should be present")
+                                    .as_ref(),
+                                project_schema.len(),
+                            )
+                            .with_context(|| {
                                 format!(
                                     "decode source filter_map row for graph '{scalar_graph_id}'"
                                 )
-                            })?);
+                            })?,
+                        );
                         predicate_eval
                             .as_ref()
                             .expect("predicate evaluator should be present")
@@ -408,11 +471,21 @@ impl DbspGraphBuilder {
                             .as_ref()
                             .expect("projection evaluator should be present");
                         if decoded_row.is_none() {
-                            decoded_row = Some(decode_projected_row_key(&bytes).with_context(|| {
-                                format!(
-                                    "decode source filter_map row for projection for graph '{scalar_graph_id}'"
+                            decoded_row = Some(
+                                decode_sparse_row_for_columns(
+                                    &bytes,
+                                    scalar_required_columns
+                                        .as_ref()
+                                        .expect("scalar required columns should be present")
+                                        .as_ref(),
+                                    project_schema.len(),
                                 )
-                            })?);
+                                .with_context(|| {
+                                    format!(
+                                        "decode source filter_map row for projection for graph '{scalar_graph_id}'"
+                                    )
+                                })?,
+                            );
                         }
                         let mapped = projector_eval
                             .project(decoded_row.as_ref().expect("decoded row should be present"))
@@ -488,4 +561,68 @@ fn direct_boolean_predicate_column(
     } else {
         None
     }
+}
+
+fn required_expression_input_columns(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    add_expr_input_columns(expr.expr(), schema, &mut columns);
+    columns.into_iter().collect()
+}
+
+fn required_projection_input_columns(
+    expressions: &[DbspProjectExpr],
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    for expr in expressions {
+        add_expr_input_columns(expr.expression().expr(), schema, &mut columns);
+    }
+    columns.into_iter().collect()
+}
+
+fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
+    for column in expr.column_refs() {
+        if let Some(index) = resolve_direct_column(schema, &column) {
+            columns.insert(index);
+        }
+    }
+}
+
+fn union_required_columns(left: Option<&[usize]>, right: Option<&[usize]>) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    if let Some(left_columns) = left {
+        columns.extend(left_columns.iter().copied());
+    }
+    if let Some(right_columns) = right {
+        columns.extend(right_columns.iter().copied());
+    }
+    columns.into_iter().collect()
+}
+
+fn decode_sparse_row_for_columns(
+    encoded: &[u8],
+    columns: &[usize],
+    row_width: usize,
+) -> Result<Vec<ScalarValue>> {
+    if columns.is_empty() {
+        return Ok(vec![ScalarValue::Null; row_width]);
+    }
+    let selected = extract_encoded_row_columns(encoded, columns, false)?
+        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    if values.len() != columns.len() {
+        return Err(anyhow!(
+            "sparse row extraction expected {} columns but decoded {}",
+            columns.len(),
+            values.len()
+        ));
+    }
+    let mut row = vec![ScalarValue::Null; row_width];
+    for (slot, column_idx) in columns.iter().copied().enumerate() {
+        row[column_idx] = values[slot].clone();
+    }
+    Ok(row)
 }
