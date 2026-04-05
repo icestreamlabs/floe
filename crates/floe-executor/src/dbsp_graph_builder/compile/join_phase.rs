@@ -6,6 +6,7 @@ use crate::encoding::{
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use std::collections::BTreeSet;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_join(
@@ -168,15 +169,51 @@ impl DbspGraphBuilder {
             direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
         let right_key_columns =
             direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let left_key_required_columns = left_key_columns.is_none().then(|| {
+            Arc::new(required_join_key_input_columns(
+                node,
+                left_schema.as_ref(),
+                JoinKeySide::Left,
+            ))
+        });
+        let right_key_required_columns = right_key_columns.is_none().then(|| {
+            Arc::new(required_join_key_input_columns(
+                node,
+                right_schema.as_ref(),
+                JoinKeySide::Right,
+            ))
+        });
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
+        let (residual_left_required_columns, residual_right_required_columns) =
+            if let Some(expr) = residual.as_ref() {
+                if direct_residual_bool_column.is_none() {
+                    let (left_required, right_required) = required_join_residual_input_columns(
+                        expr,
+                        output_schema.as_ref(),
+                        left_schema.len(),
+                    );
+                    (
+                        Some(Arc::new(left_required)),
+                        Some(Arc::new(right_required)),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
         let left_key_columns_for_outer = left_key_columns.clone();
         let right_key_columns_for_outer = right_key_columns.clone();
+        let left_key_required_columns_for_outer = left_key_required_columns.clone();
+        let right_key_required_columns_for_outer = right_key_required_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
+        let left_predicate_width = left_schema.len();
+        let right_predicate_width = right_schema.len();
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = left_key_columns.as_ref() {
@@ -192,7 +229,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let left_row = match decode_projected_row_key(left_bytes) {
+            let left_row = match decode_sparse_row_for_columns(
+                left_bytes,
+                left_key_required_columns
+                    .as_ref()
+                    .expect("left key required columns should be present")
+                    .as_ref(),
+                left_key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -252,7 +296,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let right_row = match decode_projected_row_key(right_bytes) {
+            let right_row = match decode_sparse_row_for_columns(
+                right_bytes,
+                right_key_required_columns
+                    .as_ref()
+                    .expect("right key required columns should be present")
+                    .as_ref(),
+                right_key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -319,7 +370,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let left_row = match decode_projected_row_key(left_bytes) {
+            let left_row = match decode_sparse_row_for_columns(
+                left_bytes,
+                residual_left_required_columns
+                    .as_ref()
+                    .expect("residual left required columns should be present")
+                    .as_ref(),
+                left_predicate_width,
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -330,7 +388,14 @@ impl DbspGraphBuilder {
                     return false;
                 }
             };
-            let right_row = match decode_projected_row_key(right_bytes) {
+            let right_row = match decode_sparse_row_for_columns(
+                right_bytes,
+                residual_right_required_columns
+                    .as_ref()
+                    .expect("residual right required columns should be present")
+                    .as_ref(),
+                right_predicate_width,
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -408,6 +473,8 @@ impl DbspGraphBuilder {
             let antijoin_right_schema = Arc::clone(&right_schema);
             let antijoin_left_key_columns = left_key_columns_for_outer.clone();
             let antijoin_right_key_columns = right_key_columns_for_outer.clone();
+            let antijoin_left_key_required_columns = left_key_required_columns_for_outer.clone();
+            let antijoin_right_key_required_columns = right_key_required_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
@@ -425,7 +492,14 @@ impl DbspGraphBuilder {
                         }
                     };
                 }
-                let left_row = match decode_projected_row_key(left_bytes) {
+                let left_row = match decode_sparse_row_for_columns(
+                    left_bytes,
+                    antijoin_left_key_required_columns
+                        .as_ref()
+                        .expect("left outer anti left key required columns should be present")
+                        .as_ref(),
+                    antijoin_left_schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(err) => {
                         tracing::warn!(
@@ -475,7 +549,14 @@ impl DbspGraphBuilder {
                         }
                     };
                 }
-                let right_row = match decode_projected_row_key(right_bytes) {
+                let right_row = match decode_sparse_row_for_columns(
+                    right_bytes,
+                    antijoin_right_key_required_columns
+                        .as_ref()
+                        .expect("left outer anti right key required columns should be present")
+                        .as_ref(),
+                    antijoin_right_schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(err) => {
                         tracing::warn!(
@@ -590,6 +671,8 @@ impl DbspGraphBuilder {
             let antijoin_right_schema = Arc::clone(&left_schema);
             let antijoin_left_key_columns = right_key_columns_for_outer.clone();
             let antijoin_right_key_columns = left_key_columns_for_outer.clone();
+            let antijoin_left_key_required_columns = right_key_required_columns_for_outer.clone();
+            let antijoin_right_key_required_columns = left_key_required_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
@@ -607,7 +690,14 @@ impl DbspGraphBuilder {
                         }
                     };
                 }
-                let right_row = match decode_projected_row_key(right_bytes) {
+                let right_row = match decode_sparse_row_for_columns(
+                    right_bytes,
+                    antijoin_left_key_required_columns
+                        .as_ref()
+                        .expect("right outer anti right key required columns should be present")
+                        .as_ref(),
+                    antijoin_left_schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(err) => {
                         tracing::warn!(
@@ -657,7 +747,14 @@ impl DbspGraphBuilder {
                         }
                     };
                 }
-                let left_row = match decode_projected_row_key(left_bytes) {
+                let left_row = match decode_sparse_row_for_columns(
+                    left_bytes,
+                    antijoin_right_key_required_columns
+                        .as_ref()
+                        .expect("right outer anti left key required columns should be present")
+                        .as_ref(),
+                    antijoin_right_schema.len(),
+                ) {
                     Ok(row) => row,
                     Err(err) => {
                         tracing::warn!(
@@ -827,13 +924,47 @@ impl DbspGraphBuilder {
             direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
         let right_key_columns =
             direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let left_key_required_columns = left_key_columns.is_none().then(|| {
+            Arc::new(required_join_key_input_columns(
+                node,
+                left_schema.as_ref(),
+                JoinKeySide::Left,
+            ))
+        });
+        let right_key_required_columns = right_key_columns.is_none().then(|| {
+            Arc::new(required_join_key_input_columns(
+                node,
+                right_schema.as_ref(),
+                JoinKeySide::Right,
+            ))
+        });
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
+        let (residual_left_required_columns, residual_right_required_columns) =
+            if let Some(expr) = residual.as_ref() {
+                if direct_residual_bool_column.is_none() {
+                    let (left_required, right_required) = required_join_residual_input_columns(
+                        expr,
+                        output_schema.as_ref(),
+                        left_schema.len(),
+                    );
+                    (
+                        Some(Arc::new(left_required)),
+                        Some(Arc::new(right_required)),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
+        let left_predicate_width = left_schema.len();
+        let right_predicate_width = right_schema.len();
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = left_key_columns.as_ref() {
@@ -849,7 +980,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let left_row = match decode_projected_row_key(left_bytes) {
+            let left_row = match decode_sparse_row_for_columns(
+                left_bytes,
+                left_key_required_columns
+                    .as_ref()
+                    .expect("left key required columns should be present")
+                    .as_ref(),
+                left_key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -909,7 +1047,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let right_row = match decode_projected_row_key(right_bytes) {
+            let right_row = match decode_sparse_row_for_columns(
+                right_bytes,
+                right_key_required_columns
+                    .as_ref()
+                    .expect("right key required columns should be present")
+                    .as_ref(),
+                right_key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -976,7 +1121,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let left_row = match decode_projected_row_key(left_bytes) {
+            let left_row = match decode_sparse_row_for_columns(
+                left_bytes,
+                residual_left_required_columns
+                    .as_ref()
+                    .expect("residual left required columns should be present")
+                    .as_ref(),
+                left_predicate_width,
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -987,7 +1139,14 @@ impl DbspGraphBuilder {
                     return false;
                 }
             };
-            let right_row = match decode_projected_row_key(right_bytes) {
+            let right_row = match decode_sparse_row_for_columns(
+                right_bytes,
+                residual_right_required_columns
+                    .as_ref()
+                    .expect("residual right required columns should be present")
+                    .as_ref(),
+                right_predicate_width,
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -1132,6 +1291,77 @@ fn direct_join_predicate_boolean_column(
     } else {
         Some(JoinPredicateBooleanColumn::Right(output_index - left_width))
     }
+}
+
+fn required_join_key_input_columns(
+    node: &DbspJoinNode,
+    schema: &RowSchema,
+    side: JoinKeySide,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    for key in &node.keys {
+        let expr = match side {
+            JoinKeySide::Left => key.left_expression(),
+            JoinKeySide::Right => key.right_expression(),
+        };
+        add_expr_input_columns(expr.expr(), schema, &mut columns);
+    }
+    columns.into_iter().collect()
+}
+
+fn required_join_residual_input_columns(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    output_schema: &RowSchema,
+    left_width: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut left_columns = BTreeSet::new();
+    let mut right_columns = BTreeSet::new();
+    for column in expr.expr().column_refs() {
+        if let Some(output_idx) = resolve_direct_column(output_schema, &column) {
+            if output_idx < left_width {
+                left_columns.insert(output_idx);
+            } else {
+                right_columns.insert(output_idx - left_width);
+            }
+        }
+    }
+    (
+        left_columns.into_iter().collect(),
+        right_columns.into_iter().collect(),
+    )
+}
+
+fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
+    for column in expr.column_refs() {
+        if let Some(index) = resolve_direct_column(schema, &column) {
+            columns.insert(index);
+        }
+    }
+}
+
+fn decode_sparse_row_for_columns(
+    encoded: &[u8],
+    columns: &[usize],
+    row_width: usize,
+) -> Result<Vec<ScalarValue>> {
+    if columns.is_empty() {
+        return Ok(vec![ScalarValue::Null; row_width]);
+    }
+    let selected = extract_encoded_row_columns(encoded, columns, false)?
+        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    if values.len() != columns.len() {
+        return Err(anyhow!(
+            "sparse row extraction expected {} columns but decoded {}",
+            columns.len(),
+            values.len()
+        ));
+    }
+    let mut row = vec![ScalarValue::Null; row_width];
+    for (slot, column_idx) in columns.iter().copied().enumerate() {
+        row[column_idx] = values[slot].clone();
+    }
+    Ok(row)
 }
 
 fn eval_direct_join_predicate_boolean_column(
