@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::Instant;
@@ -15,7 +15,7 @@ use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
-    DbspNodeKind, DbspTopNNode, OrderExpr, RowSchema, StreamRetention,
+    DbspNodeKind, DbspPredicate, DbspTopNNode, OrderExpr, RowSchema, StreamRetention,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -4079,6 +4079,8 @@ async fn build_transient_aggregate_receiver(
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let mut upstream_rx = upstream.subscribe();
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let (precompute_evaluator, aggregate_input_schema, aggregate_expression_columns) =
+        build_transient_aggregate_precompute(aggregate)?;
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-aggregate:{graph_id}");
     let task_events = task_events.clone();
@@ -4090,9 +4092,10 @@ async fn build_transient_aggregate_receiver(
     {
         let slot_kinds = build_count_aggregate_slot_kinds(aggregate.aggregates());
         let row_evaluator = build_count_row_evaluator(
-            Arc::clone(aggregate.input_schema()),
+            Arc::clone(&aggregate_input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
+            Arc::clone(&aggregate_expression_columns),
             graph_id.clone(),
             "transient_count_aggregate",
         );
@@ -4104,6 +4107,7 @@ async fn build_transient_aggregate_receiver(
             .await
             .context("initialize transient count aggregate")?,
         );
+        let precompute_evaluator = precompute_evaluator.clone();
 
         tokio::spawn(async move {
             loop {
@@ -4119,6 +4123,17 @@ async fn build_transient_aggregate_receiver(
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
+                        };
+                        let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
+                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            }
+                        } else {
+                            input_deltas
                         };
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
@@ -4157,9 +4172,10 @@ async fn build_transient_aggregate_receiver(
                 anyhow!("aggregate is not eligible for transient incremental aggregation")
             })?;
         let row_evaluator = build_incremental_aggregate_row_evaluator(
-            Arc::clone(aggregate.input_schema()),
+            Arc::clone(&aggregate_input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
+            Arc::clone(&aggregate_expression_columns),
             graph_id.clone(),
             "transient_aggregate",
         );
@@ -4171,6 +4187,7 @@ async fn build_transient_aggregate_receiver(
             .await
             .context("initialize transient incremental aggregate")?,
         );
+        let precompute_evaluator = precompute_evaluator.clone();
 
         tokio::spawn(async move {
             loop {
@@ -4186,6 +4203,17 @@ async fn build_transient_aggregate_receiver(
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
+                        };
+                        let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
+                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            }
+                        } else {
+                            input_deltas
                         };
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
@@ -4221,6 +4249,117 @@ async fn build_transient_aggregate_receiver(
     }
 
     Ok(rx)
+}
+
+fn build_transient_aggregate_precompute(
+    aggregate: &DbspAggregateNode,
+) -> Result<(
+    Option<Arc<VectorizedFilterProjectEvaluator>>,
+    Arc<RowSchema>,
+    Arc<HashMap<String, usize>>,
+)> {
+    let input_schema = Arc::clone(aggregate.input_schema());
+    let mut expressions = Vec::new();
+    expressions.extend(
+        aggregate
+            .group_keys()
+            .iter()
+            .map(|group_key| group_key.expression().clone()),
+    );
+    for agg in aggregate.aggregates() {
+        if let Some(filter) = agg.filter() {
+            expressions.push(filter.clone());
+        }
+        if let Some(expr) = agg.expression() {
+            expressions.push(expr.clone());
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut non_direct_expressions = Vec::new();
+    for expr in &expressions {
+        if transient_aggregate_direct_column_index(expr, input_schema.as_ref()).is_some() {
+            continue;
+        }
+        let key = transient_aggregate_expression_lookup_key(expr.expr());
+        if seen.insert(key.clone()) {
+            non_direct_expressions.push((key, expr.expr().clone()));
+        }
+    }
+    if non_direct_expressions.is_empty() {
+        return Ok((None, input_schema, Arc::new(HashMap::new())));
+    }
+
+    let mut items = Vec::with_capacity(input_schema.len() + non_direct_expressions.len());
+    for field in input_schema.fields() {
+        items.push(dbsp::circuit::plan::ProjectItem {
+            expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+            alias: Some(field.name.clone()),
+        });
+    }
+
+    let mut expression_columns = HashMap::with_capacity(non_direct_expressions.len());
+    let mut next_index = input_schema.len();
+    for (index, (key, expr)) in non_direct_expressions.into_iter().enumerate() {
+        let alias = format!("__floe_transient_aggregate_expr_{index}");
+        items.push(dbsp::circuit::plan::ProjectItem {
+            expr,
+            alias: Some(alias),
+        });
+        expression_columns.insert(key, next_index);
+        next_index += 1;
+    }
+
+    let project_node = DbspProjectNode::try_new(Arc::clone(&input_schema), items)
+        .context("build transient aggregate expression precompute projection")?;
+    let predicate = DbspPredicate::try_new(
+        Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+        Arc::clone(&input_schema),
+    )
+    .context("build transient aggregate precompute predicate")?;
+    let evaluator = VectorizedFilterProjectEvaluator::for_filter_map(
+        &predicate,
+        project_node.expressions(),
+        Arc::clone(&input_schema),
+    )
+    .context("initialize transient aggregate precompute evaluator")?;
+    Ok((
+        Some(Arc::new(evaluator)),
+        Arc::clone(project_node.output_schema()),
+        Arc::new(expression_columns),
+    ))
+}
+
+fn transient_aggregate_direct_column_index(
+    expression: &DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expression.expr() {
+        Expr::Alias(alias) => {
+            transient_aggregate_direct_column_index_expression(alias.expr.as_ref(), schema)
+        }
+        other => transient_aggregate_direct_column_index_expression(other, schema),
+    }
+}
+
+fn transient_aggregate_direct_column_index_expression(
+    expr: &Expr,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => projection_resolve_direct_column(schema, column),
+        Expr::Alias(alias) => {
+            transient_aggregate_direct_column_index_expression(alias.expr.as_ref(), schema)
+        }
+        _ => None,
+    }
+}
+
+fn transient_aggregate_expression_lookup_key(expr: &Expr) -> String {
+    match expr {
+        Expr::Alias(alias) => transient_aggregate_expression_lookup_key(alias.expr.as_ref()),
+        other => other.to_string(),
+    }
 }
 
 fn encode_count_aggregate_output_deltas(

@@ -2,7 +2,9 @@ use super::*;
 use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+type ExpressionColumnMap = HashMap<String, usize>;
 
 #[derive(Clone)]
 struct CountEvalLayout {
@@ -24,20 +26,40 @@ impl DbspGraphBuilder {
     pub(crate) async fn compile_aggregate(
         &mut self,
         node: &DbspAggregateNode,
-        upstream: DeltaHandleStream,
+        mut upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let input_schema = Arc::clone(node.input_schema());
         let group_keys = node.group_keys().to_vec();
-        let direct_group_key_columns =
-            direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
-        let non_direct_group_key_columns = direct_group_key_columns.is_none().then(|| {
-            Arc::new(required_group_key_input_columns(
-                &group_keys,
-                input_schema.as_ref(),
-            ))
-        });
         let aggregates = node.aggregates().to_vec();
+        let mut precompute_expressions = Vec::new();
+        precompute_expressions.extend(group_keys.iter().map(|key| key.expression().clone()));
+        for agg in &aggregates {
+            if let Some(filter) = agg.filter() {
+                precompute_expressions.push(filter.clone());
+            }
+            if let Some(expr) = agg.expression() {
+                precompute_expressions.push(expr.clone());
+            }
+        }
+        let (precomputed_upstream, eval_schema, expression_columns) = self
+            .precompute_aggregate_window_expressions(
+                upstream,
+                Arc::clone(&input_schema),
+                &precompute_expressions,
+                task_events,
+                "aggregate",
+            )
+            .await?;
+        upstream = precomputed_upstream;
+        let direct_group_key_columns = Arc::new(
+            direct_group_key_columns(
+                &group_keys,
+                eval_schema.as_ref(),
+                expression_columns.as_ref(),
+            )
+            .ok_or_else(|| anyhow!("failed to resolve vectorized aggregate group key columns"))?,
+        );
         let graph_id = self.graph_id().to_string();
         let aggregate_events = task_events.clone();
         let aggregate_label = format!("aggregate:{graph_id}");
@@ -57,9 +79,10 @@ impl DbspGraphBuilder {
         {
             let slot_kinds = build_count_aggregate_slot_kinds(&aggregates);
             let row_evaluator = build_count_row_evaluator(
-                Arc::clone(&input_schema),
+                Arc::clone(&eval_schema),
                 group_keys.clone(),
                 aggregates.clone(),
+                Arc::clone(&expression_columns),
                 graph_id.clone(),
                 "aggregate",
             );
@@ -86,9 +109,10 @@ impl DbspGraphBuilder {
 
         if let Some(slot_kinds) = build_incremental_aggregate_slot_kinds(&aggregates) {
             let row_evaluator = build_incremental_aggregate_row_evaluator(
-                Arc::clone(&input_schema),
+                Arc::clone(&eval_schema),
                 group_keys.clone(),
                 aggregates.clone(),
+                Arc::clone(&expression_columns),
                 graph_id.clone(),
                 "aggregate",
             );
@@ -113,77 +137,29 @@ impl DbspGraphBuilder {
             return Ok(mapped.stream());
         }
 
-        let key_schema = Arc::clone(&input_schema);
-        let key_columns = direct_group_key_columns;
-        let key_required_columns = non_direct_group_key_columns;
+        let key_columns = Arc::clone(&direct_group_key_columns);
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = key_columns.as_ref() {
-                return match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %key_graph_id,
-                            error = %err,
-                            "failed to extract aggregate group key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let row = match decode_sparse_row_for_columns(
-                bytes,
-                key_required_columns
-                    .as_ref()
-                    .expect("non-direct key required columns should be present")
-                    .as_ref(),
-                key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(bytes, key_columns.as_ref(), false) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %key_graph_id,
                         error = %err,
-                        "failed to decode aggregate row for group key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_values = Vec::with_capacity(group_keys.len());
-            for key_expr in &group_keys {
-                let value = match eval_scalar_expression(
-                    key_expr.expression(),
-                    &row,
-                    key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %key_graph_id,
-                            error = %err,
-                            "failed to evaluate aggregate group key expression"
-                        );
-                        return None;
-                    }
-                };
-                key_values.push(value);
-            }
-            match encode_projected_row_key(&key_values) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %key_graph_id,
-                        error = %err,
-                        "failed to encode aggregate group key"
+                        "failed to extract aggregate group key columns"
                     );
                     None
                 }
             }
         };
 
-        let agg_schema = Arc::clone(&input_schema);
+        let agg_schema = Arc::clone(&eval_schema);
         let agg_graph_id = graph_id.clone();
-        let agg_layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
+        let agg_layout = Arc::new(build_count_eval_layout(
+            &aggregates,
+            eval_schema.as_ref(),
+            expression_columns.as_ref(),
+        ));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
@@ -242,21 +218,45 @@ impl DbspGraphBuilder {
     pub(crate) async fn compile_window_aggregate(
         &mut self,
         node: &DbspWindowAggregateNode,
-        upstream: DeltaHandleStream,
+        mut upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let aggregate = &node.aggregate;
         let input_schema = Arc::clone(aggregate.input_schema());
         let group_keys = aggregate.group_keys().to_vec();
-        let direct_group_key_columns =
-            direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
-        let non_direct_group_key_columns = direct_group_key_columns.is_none().then(|| {
-            Arc::new(required_group_key_input_columns(
-                &group_keys,
-                input_schema.as_ref(),
-            ))
-        });
         let aggregates = aggregate.aggregates().to_vec();
+        let time_expression = node.window.time_expression.clone();
+        let mut precompute_expressions = Vec::new();
+        precompute_expressions.extend(group_keys.iter().map(|key| key.expression().clone()));
+        precompute_expressions.push(time_expression.clone());
+        for agg in &aggregates {
+            if let Some(filter) = agg.filter() {
+                precompute_expressions.push(filter.clone());
+            }
+            if let Some(expr) = agg.expression() {
+                precompute_expressions.push(expr.clone());
+            }
+        }
+        let (precomputed_upstream, eval_schema, expression_columns) = self
+            .precompute_aggregate_window_expressions(
+                upstream,
+                Arc::clone(&input_schema),
+                &precompute_expressions,
+                task_events,
+                "window_aggregate",
+            )
+            .await?;
+        upstream = precomputed_upstream;
+        let direct_group_key_columns = Arc::new(
+            direct_group_key_columns(
+                &group_keys,
+                eval_schema.as_ref(),
+                expression_columns.as_ref(),
+            )
+            .ok_or_else(|| {
+                anyhow!("failed to resolve vectorized window aggregate group key columns")
+            })?,
+        );
         let (window_size, window_slide) = match &node.window.policy {
             DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
             DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
@@ -272,147 +272,63 @@ impl DbspGraphBuilder {
             report_graph_task_error(&window_events, &window_graph_id, window_label.clone(), err);
         });
 
-        let key_schema = Arc::clone(&input_schema);
-        let key_columns = direct_group_key_columns;
-        let key_required_columns = non_direct_group_key_columns;
+        let key_columns = Arc::clone(&direct_group_key_columns);
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = key_columns.as_ref() {
-                return match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %key_graph_id,
-                            error = %err,
-                            "failed to extract window aggregate group key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let row = match decode_sparse_row_for_columns(
-                bytes,
-                key_required_columns
-                    .as_ref()
-                    .expect("non-direct key required columns should be present")
-                    .as_ref(),
-                key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(bytes, key_columns.as_ref(), false) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %key_graph_id,
                         error = %err,
-                        "failed to decode window aggregate row for group key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_values = Vec::with_capacity(group_keys.len());
-            for key_expr in &group_keys {
-                let value = match eval_scalar_expression(
-                    key_expr.expression(),
-                    &row,
-                    key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %key_graph_id,
-                            error = %err,
-                            "failed to evaluate window aggregate group key expression"
-                        );
-                        return None;
-                    }
-                };
-                key_values.push(value);
-            }
-            match encode_projected_row_key(&key_values) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %key_graph_id,
-                        error = %err,
-                        "failed to encode window aggregate group key"
+                        "failed to extract window aggregate group key columns"
                     );
                     None
                 }
             }
         };
 
-        let time_schema = Arc::clone(&input_schema);
         let time_graph_id = graph_id.clone();
-        let time_expression = node.window.time_expression.clone();
-        let direct_time_column =
-            direct_column_index(&time_expression, input_schema.as_ref()).map(|index| [index]);
-        let non_direct_time_columns = direct_time_column.is_none().then(|| {
-            Arc::new(required_expression_input_columns(
-                &time_expression,
-                input_schema.as_ref(),
-            ))
-        });
+        let direct_time_column = resolved_expression_column_index(
+            &time_expression,
+            eval_schema.as_ref(),
+            expression_columns.as_ref(),
+        )
+        .ok_or_else(|| anyhow!("failed to resolve vectorized window aggregate time column"))?;
         let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
-            if let Some(index) = direct_time_column.as_ref() {
-                let selected = match extract_encoded_row_columns(bytes, index, false) {
-                    Ok(Some(selected)) => selected,
-                    Ok(None) => return None,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %time_graph_id,
-                            error = %err,
-                            "failed to extract window aggregate time column"
-                        );
-                        return None;
-                    }
-                };
-                let values = match decode_projected_row_key(&selected) {
-                    Ok(values) => values,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %time_graph_id,
-                            error = %err,
-                            "failed to decode extracted window aggregate time column"
-                        );
-                        return None;
-                    }
-                };
-                return values.first().and_then(scalar_to_i64);
-            }
-            let row = match decode_sparse_row_for_columns(
-                bytes,
-                non_direct_time_columns
-                    .as_ref()
-                    .expect("non-direct time required columns should be present")
-                    .as_ref(),
-                time_schema.len(),
-            ) {
-                Ok(row) => row,
+            let selected = match extract_encoded_row_columns(bytes, &[direct_time_column], false) {
+                Ok(Some(selected)) => selected,
+                Ok(None) => return None,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %time_graph_id,
                         error = %err,
-                        "failed to decode window aggregate row for time expression"
+                        "failed to extract window aggregate time column"
                     );
                     return None;
                 }
             };
-            let value = match eval_scalar_expression(&time_expression, &row, time_schema.as_ref()) {
-                Ok(value) => value,
+            let values = match decode_projected_row_key(&selected) {
+                Ok(values) => values,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %time_graph_id,
                         error = %err,
-                        "failed to evaluate window aggregate time expression"
+                        "failed to decode extracted window aggregate time column"
                     );
                     return None;
                 }
             };
-            scalar_to_i64(&value)
+            values.first().and_then(scalar_to_i64)
         };
 
-        let agg_schema = Arc::clone(&input_schema);
+        let agg_schema = Arc::clone(&eval_schema);
         let agg_graph_id = graph_id.clone();
-        let agg_layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
+        let agg_layout = Arc::new(build_count_eval_layout(
+            &aggregates,
+            eval_schema.as_ref(),
+            expression_columns.as_ref(),
+        ));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
@@ -522,6 +438,60 @@ impl DbspGraphBuilder {
 }
 
 impl DbspGraphBuilder {
+    async fn precompute_aggregate_window_expressions(
+        &mut self,
+        upstream: DeltaHandleStream,
+        input_schema: Arc<RowSchema>,
+        expressions: &[dbsp::DbspExpression],
+        task_events: &GraphTaskSender,
+        alias_prefix: &str,
+    ) -> Result<(DeltaHandleStream, Arc<RowSchema>, Arc<ExpressionColumnMap>)> {
+        let mut seen = HashSet::new();
+        let mut non_direct_expressions = Vec::new();
+        for expr in expressions {
+            if direct_column_index(expr, input_schema.as_ref()).is_some() {
+                continue;
+            }
+            let key = expression_lookup_key(expr.expr());
+            if seen.insert(key.clone()) {
+                non_direct_expressions.push((key, expr.expr().clone()));
+            }
+        }
+        if non_direct_expressions.is_empty() {
+            return Ok((upstream, input_schema, Arc::new(HashMap::new())));
+        }
+
+        let mut items = Vec::with_capacity(input_schema.len() + non_direct_expressions.len());
+        for field in input_schema.fields() {
+            items.push(dbsp::circuit::plan::ProjectItem {
+                expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                alias: Some(field.name.clone()),
+            });
+        }
+
+        let mut expression_columns = HashMap::with_capacity(non_direct_expressions.len());
+        let mut next_index = input_schema.len();
+        for (index, (key, expr)) in non_direct_expressions.into_iter().enumerate() {
+            let alias = format!("__floe_{alias_prefix}_expr_{index}");
+            items.push(dbsp::circuit::plan::ProjectItem {
+                expr,
+                alias: Some(alias),
+            });
+            expression_columns.insert(key, next_index);
+            next_index += 1;
+        }
+
+        let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&input_schema), items)
+            .with_context(|| format!("build {alias_prefix} expression precompute projection"))?;
+        let precompute_schema = Arc::clone(precompute.output_schema());
+        let precomputed = self
+            .compile_map(&precompute, upstream, task_events)
+            .await
+            .with_context(|| format!("initialize {alias_prefix} expression precompute map"))?;
+
+        Ok((precomputed, precompute_schema, Arc::new(expression_columns)))
+    }
+
     async fn map_aggregate_output(
         &self,
         graph_id: &str,
@@ -700,34 +670,27 @@ pub(crate) fn build_count_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
     aggregates: Vec<DbspAggregateExpr>,
+    expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> + Send + Sync + 'static
 {
-    let layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
-    let direct_group_key_columns =
-        direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
-    let key_needs_row = direct_group_key_columns.is_none();
-    let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
-    let decode_row = key_needs_row || slot_eval_needs_row;
-    let eval_required_columns = if decode_row {
-        let mut columns = BTreeSet::new();
-        columns.extend(layout.required_input_columns.iter().copied());
-        if key_needs_row {
-            for key_expr in &group_keys {
-                add_expr_input_columns(
-                    key_expr.expression().expr(),
-                    input_schema.as_ref(),
-                    &mut columns,
-                );
-            }
-        }
-        Some(Arc::new(columns.into_iter().collect::<Vec<_>>()))
-    } else {
-        None
-    };
+    let layout = Arc::new(build_count_eval_layout(
+        &aggregates,
+        input_schema.as_ref(),
+        expression_columns.as_ref(),
+    ));
+    let direct_group_key_columns = direct_group_key_columns(
+        &group_keys,
+        input_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .map(Arc::new);
+    let slot_eval_needs_row = !layout.required_input_columns.is_empty();
+    let eval_required_columns =
+        slot_eval_needs_row.then(|| Arc::new(layout.required_input_columns.clone()));
     move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
-        let row = if decode_row {
+        let row = if slot_eval_needs_row {
             match decode_sparse_row_for_columns(
                 bytes,
                 eval_required_columns
@@ -750,48 +713,23 @@ pub(crate) fn build_count_row_evaluator(
             None
         };
 
-        let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
-            match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-                Ok(Some(encoded_key)) => encoded_key,
-                Ok(None) => return None,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to extract count aggregate group key columns"
-                    );
-                    return None;
-                }
-            }
-        } else {
-            let row = row.as_ref().expect("decoded row should be present");
-            let mut key_values = Vec::with_capacity(group_keys.len());
-            for key_expr in &group_keys {
-                let value =
-                    match eval_scalar_expression(key_expr.expression(), row, input_schema.as_ref())
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %graph_id,
-                                error = %err,
-                                "failed to evaluate count aggregate group key expression"
-                            );
-                            return None;
-                        }
-                    };
-                key_values.push(value);
-            }
-            match encode_projected_row_key(&key_values) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to encode count aggregate group key"
-                    );
-                    return None;
-                }
+        let Some(indices) = direct_group_key_columns.as_ref() else {
+            tracing::warn!(
+                graph_id = %graph_id,
+                "failed to resolve vectorized count aggregate group key columns"
+            );
+            return None;
+        };
+        let encoded_key = match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+            Ok(Some(encoded_key)) => encoded_key,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to extract count aggregate group key columns"
+                );
+                return None;
             }
         };
 
@@ -818,6 +756,7 @@ pub(crate) fn build_count_row_evaluator(
 fn build_count_eval_layout(
     aggregates: &[DbspAggregateExpr],
     schema: &RowSchema,
+    expression_columns: &ExpressionColumnMap,
 ) -> CountEvalLayout {
     let mut filters = Vec::new();
     let mut filter_direct_columns = Vec::new();
@@ -835,8 +774,11 @@ fn build_count_eval_layout(
                 existing
             } else {
                 filters.push(filter.clone());
-                filter_direct_columns.push(direct_column_index(filter, schema));
-                add_expr_input_columns(filter.expr(), schema, &mut required_input_columns);
+                let column = resolved_expression_column_index(filter, schema, expression_columns);
+                if let Some(column_idx) = column {
+                    required_input_columns.insert(column_idx);
+                }
+                filter_direct_columns.push(column);
                 filters.len() - 1
             }
         });
@@ -848,8 +790,11 @@ fn build_count_eval_layout(
                 existing
             } else {
                 expressions.push(expr.clone());
-                expression_direct_columns.push(direct_column_index(expr, schema));
-                add_expr_input_columns(expr.expr(), schema, &mut required_input_columns);
+                let column = resolved_expression_column_index(expr, schema, expression_columns);
+                if let Some(column_idx) = column {
+                    required_input_columns.insert(column_idx);
+                }
+                expression_direct_columns.push(column);
                 expressions.len() - 1
             }
         });
@@ -873,7 +818,7 @@ fn evaluate_count_row_values(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
     row: &[ScalarValue],
-    schema: &RowSchema,
+    _schema: &RowSchema,
     graph_id: &str,
     context: &str,
 ) -> Vec<dbsp::CountAggregateSlotUpdate<Vec<u8>>> {
@@ -893,17 +838,12 @@ fn evaluate_count_row_values(
                 }
             };
         } else {
-            filter_results[index] = match eval_expression(filter, row, schema) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} FILTER expression"
-                    );
-                    false
-                }
-            };
+            tracing::warn!(
+                graph_id = %graph_id,
+                expression = ?filter.expr(),
+                "unresolved {context} FILTER expression without vectorized precompute column"
+            );
+            filter_results[index] = false;
         }
     }
 
@@ -916,19 +856,11 @@ fn evaluate_count_row_values(
                 expression_valid[index] = true;
             }
         } else {
-            match eval_scalar_expression(expr, row, schema) {
-                Ok(value) => {
-                    expression_values[index] = value;
-                    expression_valid[index] = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} aggregate expression"
-                    );
-                }
-            }
+            tracing::warn!(
+                graph_id = %graph_id,
+                expression = ?expr.expr(),
+                "unresolved {context} aggregate expression without vectorized precompute column"
+            );
         }
     }
 
@@ -1049,17 +981,12 @@ fn evaluate_aggregate_values_from_encoded(
                     }
                 };
             } else {
-                filter_results[index] = match eval_expression(filter, &row, schema) {
-                    Ok(include) => include,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %graph_id,
-                            error = %err,
-                            "failed to evaluate {context} FILTER expression"
-                        );
-                        false
-                    }
-                };
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    expression = ?filter.expr(),
+                    "unresolved {context} FILTER expression without vectorized precompute column"
+                );
+                filter_results[index] = false;
             }
         }
 
@@ -1071,19 +998,11 @@ fn evaluate_aggregate_values_from_encoded(
                     expression_valid[index] = true;
                 }
             } else {
-                match eval_scalar_expression(expr, &row, schema) {
-                    Ok(value) => {
-                        expression_values[index] = value;
-                        expression_valid[index] = true;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %graph_id,
-                            error = %err,
-                            "failed to evaluate {context} aggregate expression"
-                        );
-                    }
-                }
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    expression = ?expr.expr(),
+                    "unresolved {context} aggregate expression without vectorized precompute column"
+                );
             }
         }
 
@@ -1256,33 +1175,26 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
     aggregates: Vec<DbspAggregateExpr>,
+    expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> + Send + Sync + 'static {
-    let layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
-    let direct_group_key_columns =
-        direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
-    let key_needs_row = direct_group_key_columns.is_none();
-    let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
-    let decode_row = key_needs_row || slot_eval_needs_row;
-    let eval_required_columns = if decode_row {
-        let mut columns = BTreeSet::new();
-        columns.extend(layout.required_input_columns.iter().copied());
-        if key_needs_row {
-            for key_expr in &group_keys {
-                add_expr_input_columns(
-                    key_expr.expression().expr(),
-                    input_schema.as_ref(),
-                    &mut columns,
-                );
-            }
-        }
-        Some(Arc::new(columns.into_iter().collect::<Vec<_>>()))
-    } else {
-        None
-    };
+    let layout = Arc::new(build_count_eval_layout(
+        &aggregates,
+        input_schema.as_ref(),
+        expression_columns.as_ref(),
+    ));
+    let direct_group_key_columns = direct_group_key_columns(
+        &group_keys,
+        input_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .map(Arc::new);
+    let slot_eval_needs_row = !layout.required_input_columns.is_empty();
+    let eval_required_columns =
+        slot_eval_needs_row.then(|| Arc::new(layout.required_input_columns.clone()));
     move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
-        let row = if decode_row {
+        let row = if slot_eval_needs_row {
             match decode_sparse_row_for_columns(
                 bytes,
                 eval_required_columns
@@ -1305,48 +1217,23 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
             None
         };
 
-        let encoded_key = if let Some(indices) = direct_group_key_columns.as_ref() {
-            match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-                Ok(Some(encoded_key)) => encoded_key,
-                Ok(None) => return None,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to extract incremental aggregate group key columns"
-                    );
-                    return None;
-                }
-            }
-        } else {
-            let row = row.as_ref().expect("decoded row should be present");
-            let mut key_values = Vec::with_capacity(group_keys.len());
-            for key_expr in &group_keys {
-                let value =
-                    match eval_scalar_expression(key_expr.expression(), row, input_schema.as_ref())
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %graph_id,
-                                error = %err,
-                                "failed to evaluate incremental aggregate group key expression"
-                            );
-                            return None;
-                        }
-                    };
-                key_values.push(value);
-            }
-            match encode_projected_row_key(&key_values) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to encode incremental aggregate group key"
-                    );
-                    return None;
-                }
+        let Some(indices) = direct_group_key_columns.as_ref() else {
+            tracing::warn!(
+                graph_id = %graph_id,
+                "failed to resolve vectorized incremental aggregate group key columns"
+            );
+            return None;
+        };
+        let encoded_key = match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
+            Ok(Some(encoded_key)) => encoded_key,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to extract incremental aggregate group key columns"
+                );
+                return None;
             }
         };
 
@@ -1374,7 +1261,7 @@ fn evaluate_incremental_aggregate_row_values(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
     row: &[ScalarValue],
-    schema: &RowSchema,
+    _schema: &RowSchema,
     graph_id: &str,
     context: &str,
 ) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
@@ -1394,17 +1281,12 @@ fn evaluate_incremental_aggregate_row_values(
                 }
             };
         } else {
-            filter_results[index] = match eval_expression(filter, row, schema) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} FILTER expression"
-                    );
-                    false
-                }
-            };
+            tracing::warn!(
+                graph_id = %graph_id,
+                expression = ?filter.expr(),
+                "unresolved {context} FILTER expression without vectorized precompute column"
+            );
+            filter_results[index] = false;
         }
     }
 
@@ -1417,19 +1299,11 @@ fn evaluate_incremental_aggregate_row_values(
                 expression_valid[index] = true;
             }
         } else {
-            match eval_scalar_expression(expr, row, schema) {
-                Ok(value) => {
-                    expression_values[index] = value;
-                    expression_valid[index] = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} aggregate expression"
-                    );
-                }
-            }
+            tracing::warn!(
+                graph_id = %graph_id,
+                expression = ?expr.expr(),
+                "unresolved {context} aggregate expression without vectorized precompute column"
+            );
         }
     }
 
@@ -1534,10 +1408,13 @@ pub(crate) fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateVal
 fn direct_group_key_columns(
     group_keys: &[dbsp::circuit::plan::GroupKeyExpr],
     schema: &RowSchema,
+    expression_columns: &ExpressionColumnMap,
 ) -> Option<Vec<usize>> {
     group_keys
         .iter()
-        .map(|key_expr| direct_column_index(key_expr.expression(), schema))
+        .map(|key_expr| {
+            resolved_expression_column_index(key_expr.expression(), schema, expression_columns)
+        })
         .collect()
 }
 
@@ -1566,31 +1443,22 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
         .or_else(|| schema.field_index(&column.name))
 }
 
-fn required_group_key_input_columns(
-    group_keys: &[dbsp::circuit::plan::GroupKeyExpr],
-    schema: &RowSchema,
-) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    for key_expr in group_keys {
-        add_expr_input_columns(key_expr.expression().expr(), schema, &mut columns);
-    }
-    columns.into_iter().collect()
-}
-
-fn required_expression_input_columns(
+fn resolved_expression_column_index(
     expr: &dbsp::circuit::plan::DbspExpression,
     schema: &RowSchema,
-) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    add_expr_input_columns(expr.expr(), schema, &mut columns);
-    columns.into_iter().collect()
+    expression_columns: &ExpressionColumnMap,
+) -> Option<usize> {
+    direct_column_index(expr, schema).or_else(|| {
+        expression_columns
+            .get(&expression_lookup_key(expr.expr()))
+            .copied()
+    })
 }
 
-fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
-    for column in expr.column_refs() {
-        if let Some(index) = schema.field_index(column.name.as_str()) {
-            columns.insert(index);
-        }
+fn expression_lookup_key(expr: &Expr) -> String {
+    match expr {
+        Expr::Alias(alias) => expression_lookup_key(alias.expr.as_ref()),
+        other => other.to_string(),
     }
 }
 
