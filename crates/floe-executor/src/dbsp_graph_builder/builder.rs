@@ -15,7 +15,7 @@ use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
-    DbspNodeKind, DbspPredicate, DbspTopNNode, RowSchema, StreamRetention,
+    DbspNodeKind, DbspPredicate, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -26,8 +26,8 @@ use crate::dbsp_plan::{
 };
 use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
-    EncodedRowProjectionColumn, EncodedRowProjectionSource, concat_encoded_rows,
-    decode_projected_row_key, encode_projected_row_key, extract_encoded_row_columns,
+    EncodedRowProjectionColumn, EncodedRowProjectionSource, EncodedRowScalar, concat_encoded_rows,
+    encode_projected_row_key, extract_encoded_row_columns, extract_encoded_row_scalar,
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
@@ -1080,17 +1080,21 @@ enum TransientTopNValue {
 }
 
 impl TransientTopNValue {
-    fn from_scalar(value: &ScalarValue) -> Result<Self> {
-        match value {
-            ScalarValue::Int64(Some(v)) => Ok(Self::Int64(*v)),
-            ScalarValue::Int64(None) => Ok(Self::Null),
-            ScalarValue::TimestampMillisecond(Some(v), _) => Ok(Self::Timestamp(*v)),
-            ScalarValue::TimestampMillisecond(None, _) => Ok(Self::Null),
-            ScalarValue::Utf8(Some(v)) => Ok(Self::Utf8(v.clone())),
-            ScalarValue::Utf8(None) => Ok(Self::Null),
-            ScalarValue::Boolean(Some(v)) => Ok(Self::Bool(*v)),
-            ScalarValue::Boolean(None) | ScalarValue::Null => Ok(Self::Null),
-            other => Err(anyhow!("unsupported transient topn sort value {other:?}")),
+    fn from_encoded_scalar(
+        scalar: Option<EncodedRowScalar>,
+        expected_type: &DbspScalarType,
+    ) -> Result<Self> {
+        match (scalar, expected_type) {
+            (None, _) => Ok(Self::Null),
+            (Some(EncodedRowScalar::Int64(value)), DbspScalarType::Int64) => Ok(Self::Int64(value)),
+            (Some(EncodedRowScalar::TimestampMillis(value)), DbspScalarType::TimestampMillis) => {
+                Ok(Self::Timestamp(value))
+            }
+            (Some(EncodedRowScalar::Utf8(value)), DbspScalarType::Utf8) => Ok(Self::Utf8(value)),
+            (Some(EncodedRowScalar::Bool(value)), DbspScalarType::Bool) => Ok(Self::Bool(value)),
+            (Some(other), expected) => Err(anyhow!(
+                "transient topn order key type mismatch: expected {expected:?}, decoded {other:?}"
+            )),
         }
     }
 }
@@ -1203,6 +1207,7 @@ impl PartialOrd for TransientTopNKey {
 struct TransientTopNKeyLayout {
     partition_columns: Arc<Vec<usize>>,
     order_columns: Arc<Vec<usize>>,
+    order_types: Arc<Vec<DbspScalarType>>,
     precompute_evaluator: Option<Arc<VectorizedFilterProjectEvaluator>>,
 }
 
@@ -1210,6 +1215,7 @@ struct TransientTopNProcessor {
     graph_id: String,
     partition_key_columns: Arc<Vec<usize>>,
     order_key_columns: Arc<Vec<usize>>,
+    order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
     offset: usize,
@@ -1225,6 +1231,7 @@ struct TransientTop1Processor {
     graph_id: String,
     partition_key_columns: Arc<Vec<usize>>,
     order_key_columns: Arc<Vec<usize>>,
+    order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
     order_index: HashMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
@@ -1250,6 +1257,7 @@ impl TransientTopNProcessor {
             graph_id: graph_id.into(),
             partition_key_columns: Arc::clone(&key_layout.partition_columns),
             order_key_columns: Arc::clone(&key_layout.order_columns),
+            order_value_types: Arc::clone(&key_layout.order_types),
             order_specs,
             limit: topn.limit(),
             offset: topn.offset(),
@@ -1422,6 +1430,7 @@ impl TransientTopNProcessor {
             Arc::clone(&self.order_specs),
             self.partition_key_columns.as_ref(),
             self.order_key_columns.as_ref(),
+            self.order_value_types.as_ref(),
             row_key,
         )
     }
@@ -1446,6 +1455,7 @@ impl TransientTop1Processor {
             graph_id: graph_id.into(),
             partition_key_columns: Arc::clone(&key_layout.partition_columns),
             order_key_columns: Arc::clone(&key_layout.order_columns),
+            order_value_types: Arc::clone(&key_layout.order_types),
             order_specs,
             row_key_cache: HashMap::new(),
             order_index: HashMap::new(),
@@ -1531,6 +1541,7 @@ impl TransientTop1Processor {
             Arc::clone(&self.order_specs),
             self.partition_key_columns.as_ref(),
             self.order_key_columns.as_ref(),
+            self.order_value_types.as_ref(),
             row_key,
         )
     }
@@ -1646,6 +1657,7 @@ struct TransientBatchTopNProcessor {
     graph_id: String,
     partition_key_columns: Arc<Vec<usize>>,
     order_key_columns: Arc<Vec<usize>>,
+    order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
     row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
@@ -1673,6 +1685,7 @@ impl TransientBatchTopNProcessor {
             graph_id: graph_id.into(),
             partition_key_columns: Arc::clone(&key_layout.partition_columns),
             order_key_columns: Arc::clone(&key_layout.order_columns),
+            order_value_types: Arc::clone(&key_layout.order_types),
             order_specs,
             limit: topn.limit(),
             row_key_cache: HashMap::new(),
@@ -2058,6 +2071,7 @@ impl TransientBatchTopNProcessor {
             Arc::clone(&self.order_specs),
             self.partition_key_columns.as_ref(),
             self.order_key_columns.as_ref(),
+            self.order_value_types.as_ref(),
             row_key,
         )
     }
@@ -2754,6 +2768,7 @@ fn compute_transient_topn_key_parts(
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     partition_key_columns: &[usize],
     order_key_columns: &[usize],
+    order_value_types: &[DbspScalarType],
     row_key: &Vec<u8>,
 ) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
     let partition_key = if partition_key_columns.is_empty() {
@@ -2773,31 +2788,19 @@ fn compute_transient_topn_key_parts(
     };
 
     let mut values = Vec::with_capacity(order_key_columns.len());
-    let selected = match extract_encoded_row_columns(row_key, order_key_columns, false) {
-        Ok(Some(selected)) => selected,
-        Ok(None) => return (partition_key, None),
-        Err(err) => {
-            tracing::warn!(
-                graph_id = %graph_id,
-                error = %err,
-                "failed to extract transient topn order key columns"
-            );
-            return (partition_key, None);
-        }
-    };
-    let order_row = match decode_projected_row_key(&selected) {
-        Ok(values) => values,
-        Err(err) => {
-            tracing::warn!(
-                graph_id = %graph_id,
-                error = %err,
-                "failed to decode extracted transient topn order key columns"
-            );
-            return (partition_key, None);
-        }
-    };
-    for value in order_row {
-        match TransientTopNValue::from_scalar(&value) {
+    for (column_idx, expected_type) in order_key_columns.iter().zip(order_value_types.iter()) {
+        let scalar = match extract_encoded_row_scalar(row_key, *column_idx) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to extract transient topn order key column"
+                );
+                return (partition_key, None);
+            }
+        };
+        match TransientTopNValue::from_encoded_scalar(scalar, expected_type) {
             Ok(value) => values.push(value),
             Err(err) => {
                 tracing::warn!(
@@ -2846,9 +2849,25 @@ fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNK
             ),
             order_columns: Arc::new(
                 direct_order_columns
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .collect::<Option<Vec<_>>>()
                     .expect("all direct transient topn order columns should be present"),
+            ),
+            order_types: Arc::new(
+                direct_order_columns
+                    .iter()
+                    .copied()
+                    .collect::<Option<Vec<_>>>()
+                    .expect("all direct transient topn order columns should be present")
+                    .into_iter()
+                    .map(|column_idx| {
+                        input_schema
+                            .field(column_idx)
+                            .map(|field| field.data_type.clone())
+                            .expect("transient topn order key column index should be in bounds")
+                    })
+                    .collect(),
             ),
             precompute_evaluator: None,
         });
@@ -2925,10 +2944,23 @@ fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNK
         Arc::clone(&input_schema),
     )
     .context("initialize transient topn precompute evaluator")?;
+    let projected_schema = project_node.output_schema();
+    let order_types = order_columns
+        .iter()
+        .map(|column_idx| {
+            projected_schema
+                .field(*column_idx)
+                .map(|field| field.data_type.clone())
+                .ok_or_else(|| {
+                    anyhow!("transient topn order key column index {column_idx} out of bounds")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(TransientTopNKeyLayout {
         partition_columns: Arc::new(partition_columns),
         order_columns: Arc::new(order_columns),
+        order_types: Arc::new(order_types),
         precompute_evaluator: Some(Arc::new(evaluator)),
     })
 }

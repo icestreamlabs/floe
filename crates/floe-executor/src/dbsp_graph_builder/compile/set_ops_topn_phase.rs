@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoding::extract_encoded_row_columns;
+use crate::encoding::{EncodedRowScalar, extract_encoded_row_columns, extract_encoded_row_scalar};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
@@ -161,10 +161,24 @@ impl DbspGraphBuilder {
 
         let partition_key_columns = Arc::new(partition_key_columns);
         let order_key_columns = Arc::new(order_key_columns);
+        let order_value_types = Arc::new(
+            order_key_columns
+                .iter()
+                .map(|column_idx| {
+                    key_schema
+                        .field(*column_idx)
+                        .map(|field| field.data_type.clone())
+                        .ok_or_else(|| {
+                            anyhow!("topn order key column index {column_idx} out of bounds")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         let needs_trim_projection = needs_precompute;
 
         let log_graph_id = graph_id.clone();
         let order_key_columns_for_log = Arc::clone(&order_key_columns);
+        let order_value_types_for_log = Arc::clone(&order_value_types);
         let partition_key_columns_for_log = Arc::clone(&partition_key_columns);
         let key_parts = move |bytes: &Vec<u8>| -> (Option<Vec<u8>>, Option<TopNKey>) {
             let partition_key = if partition_exprs.is_empty() {
@@ -188,33 +202,22 @@ impl DbspGraphBuilder {
             };
 
             let mut values = Vec::with_capacity(order_exprs.len());
-            let selected =
-                match extract_encoded_row_columns(bytes, order_key_columns_for_log.as_ref(), false)
-                {
-                    Ok(Some(selected)) => selected,
-                    Ok(None) => return (partition_key, None),
+            for (column_idx, expected_type) in order_key_columns_for_log
+                .iter()
+                .zip(order_value_types_for_log.iter())
+            {
+                let scalar = match extract_encoded_row_scalar(bytes, *column_idx) {
+                    Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %log_graph_id,
                             error = %err,
-                            "failed to extract topn order key columns"
+                            "failed to extract topn order key column"
                         );
                         return (partition_key, None);
                     }
                 };
-            let order_row = match decode_projected_row_key(&selected) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %log_graph_id,
-                        error = %err,
-                        "failed to decode extracted topn order key columns"
-                    );
-                    return (partition_key, None);
-                }
-            };
-            for value in order_row {
-                match TopNValue::from_scalar(&value) {
+                match topn_value_from_encoded_scalar(scalar, expected_type) {
                     Ok(value) => values.push(value),
                     Err(err) => {
                         tracing::warn!(
@@ -316,4 +319,24 @@ fn build_trim_projection_node(
         })
         .collect::<Vec<_>>();
     dbsp::DbspProjectNode::try_new(topn_schema, items)
+}
+
+fn topn_value_from_encoded_scalar(
+    scalar: Option<EncodedRowScalar>,
+    expected_type: &DbspScalarType,
+) -> Result<TopNValue> {
+    match (scalar, expected_type) {
+        (None, _) => Ok(TopNValue::Null),
+        (Some(EncodedRowScalar::Int64(value)), DbspScalarType::Int64) => {
+            Ok(TopNValue::Int64(value))
+        }
+        (Some(EncodedRowScalar::TimestampMillis(value)), DbspScalarType::TimestampMillis) => {
+            Ok(TopNValue::Timestamp(value))
+        }
+        (Some(EncodedRowScalar::Utf8(value)), DbspScalarType::Utf8) => Ok(TopNValue::Utf8(value)),
+        (Some(EncodedRowScalar::Bool(value)), DbspScalarType::Bool) => Ok(TopNValue::Bool(value)),
+        (Some(other), expected) => Err(anyhow!(
+            "topn order key type mismatch: expected {expected:?}, decoded {other:?}"
+        )),
+    }
 }

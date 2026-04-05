@@ -13,6 +13,14 @@ pub(crate) struct EncodedRowProjectionColumn {
     pub index: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum EncodedRowScalar {
+    Int64(i64),
+    Utf8(String),
+    TimestampMillis(i64),
+    Bool(bool),
+}
+
 /// Encode a projected row into deterministic bytes for DBSP keys.
 pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
@@ -190,6 +198,76 @@ pub fn extract_encoded_row_columns(
     Ok(Some(out))
 }
 
+pub(crate) fn extract_encoded_row_scalar(
+    bytes: &[u8],
+    target_index: usize,
+) -> Result<Option<EncodedRowScalar>> {
+    let mut values = extract_encoded_row_scalars(bytes, &[target_index])?;
+    values
+        .pop()
+        .ok_or_else(|| anyhow!("missing extracted scalar for index {target_index}"))
+}
+
+pub(crate) fn extract_encoded_row_scalars(
+    bytes: &[u8],
+    indices: &[usize],
+) -> Result<Vec<Option<EncodedRowScalar>>> {
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let count = encoded_row_column_count(bytes)?;
+    if indices.iter().any(|index| *index >= count) {
+        return Err(anyhow!(
+            "encoded row has {count} columns but a requested index was out of bounds"
+        ));
+    }
+
+    let mut requested = indices
+        .iter()
+        .enumerate()
+        .map(|(slot, index)| (*index, slot))
+        .collect::<Vec<_>>();
+    requested.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut decoded = vec![None; indices.len()];
+    let mut request_idx = 0usize;
+    let mut cursor = 4usize;
+
+    for column_idx in 0..count {
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        let value_cursor = cursor;
+        let end = encoded_field_end(bytes, cursor, tag)?;
+
+        while request_idx < requested.len() && requested[request_idx].0 == column_idx {
+            let slot = requested[request_idx].1;
+            decoded[slot] = decode_encoded_scalar(bytes, value_cursor, tag)?;
+            request_idx += 1;
+        }
+        cursor = end;
+    }
+
+    Ok(decoded)
+}
+
+pub(crate) fn extract_encoded_row_i64_like_column(
+    bytes: &[u8],
+    target_index: usize,
+) -> Result<Option<i64>> {
+    match extract_encoded_row_scalar(bytes, target_index)? {
+        Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value)) => {
+            Ok(Some(value))
+        }
+        Some(other) => Err(anyhow!(
+            "expected i64-like encoded field at index {target_index}, found {other:?}"
+        )),
+        None => Ok(None),
+    }
+}
+
 pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
     let left_count = encoded_row_column_count(left)?;
     let right_count = encoded_row_column_count(right)?;
@@ -287,6 +365,49 @@ fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
                 .get(cursor)
                 .ok_or_else(|| anyhow!("missing boolean payload"))?;
             Ok(cursor + 1)
+        }
+        _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
+    }
+}
+
+fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<EncodedRowScalar>> {
+    match tag {
+        0x00 | 0x05 | 0x06 | 0x07 | 0x08 => Ok(None),
+        0x01 => {
+            let end = cursor + 8;
+            let chunk = bytes
+                .get(cursor..end)
+                .ok_or_else(|| anyhow!("truncated int64"))?;
+            let value = i64::from_le_bytes(chunk.try_into().unwrap());
+            Ok(Some(EncodedRowScalar::Int64(value)))
+        }
+        0x02 => {
+            let len_bytes = bytes
+                .get(cursor..cursor + 4)
+                .ok_or_else(|| anyhow!("truncated string length"))?;
+            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            let start = cursor + 4;
+            let end = start + len;
+            let chunk = bytes
+                .get(start..end)
+                .ok_or_else(|| anyhow!("truncated string payload"))?;
+            let text =
+                std::str::from_utf8(chunk).map_err(|err| anyhow!("utf8 decode error: {err}"))?;
+            Ok(Some(EncodedRowScalar::Utf8(text.to_string())))
+        }
+        0x03 => {
+            let end = cursor + 8;
+            let chunk = bytes
+                .get(cursor..end)
+                .ok_or_else(|| anyhow!("truncated timestamp"))?;
+            let value = i64::from_le_bytes(chunk.try_into().unwrap());
+            Ok(Some(EncodedRowScalar::TimestampMillis(value)))
+        }
+        0x04 => {
+            let flag = *bytes
+                .get(cursor)
+                .ok_or_else(|| anyhow!("missing boolean payload"))?;
+            Ok(Some(EncodedRowScalar::Bool(flag != 0)))
         }
         _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
     }
