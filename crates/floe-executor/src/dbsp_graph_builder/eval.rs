@@ -1,11 +1,16 @@
+#[cfg(test)]
 use anyhow::Result;
+#[cfg(test)]
 use datafusion::scalar::ScalarValue;
+#[cfg(test)]
 use dbsp::{DbspExpression, RowSchema};
 
+#[cfg(test)]
 use crate::expression_eval::eval_df_expr;
 #[cfg(test)]
 use crate::expression_eval::scalar_to_bool;
 
+#[cfg(test)]
 pub(super) fn eval_scalar_expression(
     expr: &DbspExpression,
     row: &[ScalarValue],

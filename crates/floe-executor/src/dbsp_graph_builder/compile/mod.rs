@@ -24,6 +24,8 @@ use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
+#[cfg(test)]
+use super::eval::{eval_expression, eval_scalar_expression};
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TopNSortSpec {
     ascending: bool,
