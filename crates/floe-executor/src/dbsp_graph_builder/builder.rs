@@ -21,9 +21,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
-use crate::dbsp_graph_builder::eval::eval_scalar_expression;
 #[cfg(test)]
 use crate::dbsp_graph_builder::eval::eval_expression;
+use crate::dbsp_graph_builder::eval::eval_scalar_expression;
 use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };

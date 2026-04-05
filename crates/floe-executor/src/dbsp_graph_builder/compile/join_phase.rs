@@ -1,5 +1,6 @@
 use super::*;
 use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
+use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
     EncodedRowProjectionColumn, concat_encoded_rows, extract_encoded_row_columns,
     project_joined_encoded_rows,
@@ -21,6 +22,7 @@ impl DbspGraphBuilder {
         let right_schema = Arc::clone(&node.right_schema);
         let join_type = node.join_type.clone();
         let residual = node.residual.clone();
+        let residual_for_post_filter = residual.clone();
         let output_schema = Arc::clone(&node.output_schema);
         if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
             return Err(anyhow!(
@@ -186,6 +188,9 @@ impl DbspGraphBuilder {
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
+        let defer_residual_to_post_filter = matches!(join_type, DbspJoinType::Inner)
+            && residual.is_some()
+            && direct_residual_bool_column.is_none();
         let (residual_left_required_columns, residual_right_required_columns) =
             if let Some(expr) = residual.as_ref() {
                 if direct_residual_bool_column.is_none() {
@@ -214,6 +219,7 @@ impl DbspGraphBuilder {
         let projector_graph_id = graph_id.clone();
         let left_predicate_width = left_schema.len();
         let right_predicate_width = right_schema.len();
+        let output_schema_for_predicate = Arc::clone(&output_schema);
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = left_key_columns.as_ref() {
@@ -370,6 +376,9 @@ impl DbspGraphBuilder {
                     }
                 };
             }
+            if defer_residual_to_post_filter {
+                return true;
+            }
             let left_row = match decode_sparse_row_for_columns(
                 left_bytes,
                 residual_left_required_columns
@@ -409,7 +418,7 @@ impl DbspGraphBuilder {
             let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
             combined.extend(left_row.into_iter());
             combined.extend(right_row.into_iter());
-            match eval_expression(expr, &combined, output_schema.as_ref()) {
+            match eval_expression(expr, &combined, output_schema_for_predicate.as_ref()) {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::warn!(
@@ -460,6 +469,46 @@ impl DbspGraphBuilder {
         }
         let join_stream = join.stream();
         if matches!(join_type, DbspJoinType::Inner) {
+            if defer_residual_to_post_filter {
+                let residual_expr = residual_for_post_filter
+                    .as_ref()
+                    .expect("residual expression should be present")
+                    .expr()
+                    .clone();
+                let residual_predicate =
+                    dbsp::DbspPredicate::try_new(residual_expr, Arc::clone(&output_schema))
+                        .context("analyze deferred join residual predicate")?;
+                let residual_evaluator = Arc::new(
+                    VectorizedFilterProjectEvaluator::for_filter(
+                        &residual_predicate,
+                        Arc::clone(&output_schema),
+                    )
+                    .context("build vectorized deferred join residual evaluator")?,
+                );
+                let residual_graph_id = graph_id.clone();
+                let residual_filter_events = task_events.clone();
+                let residual_filter_graph_id = graph_id.clone();
+                let residual_filter_label = format!("join-post-filter:{graph_id}");
+                let residual_filter_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+                    report_graph_task_error(
+                        &residual_filter_events,
+                        &residual_filter_graph_id,
+                        residual_filter_label.clone(),
+                        err,
+                    );
+                });
+                let residual_transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<
+                    Vec<(Vec<u8>, i64)>,
+                > { residual_evaluator.transform_delta(&residual_graph_id, delta_values) };
+                let residual_filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+                    &join_stream,
+                    residual_transform,
+                    Some(residual_filter_error_handler),
+                )
+                .await
+                .context("initialize deferred vectorized join residual filter")?;
+                return Ok(residual_filter.stream());
+            }
             return Ok(join_stream);
         }
 
