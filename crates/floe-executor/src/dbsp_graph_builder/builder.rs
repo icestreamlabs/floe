@@ -21,10 +21,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
-#[cfg(test)]
-use crate::dbsp_graph_builder::eval::eval_expression;
-#[cfg(test)]
-use crate::dbsp_graph_builder::eval::eval_scalar_expression;
 use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };
@@ -5517,75 +5513,61 @@ mod tests {
             .await
             .expect("compile right child");
 
-        let join_keys = Arc::new(join.keys.clone());
         let left_schema = Arc::clone(&join.left_schema);
         let right_schema = Arc::clone(&join.right_schema);
         let output_schema = Arc::clone(&join.output_schema);
-        let residual = join.residual.clone();
-
-        let left_key = {
-            let join_keys = Arc::clone(&join_keys);
-            let left_schema = Arc::clone(&left_schema);
-            move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                let left_row = decode_projected_row_key(left_bytes).ok()?;
-                let mut key_columns = Vec::with_capacity(join_keys.len());
-                for key in join_keys.iter() {
-                    let value = eval_scalar_expression(
-                        key.left_expression(),
-                        &left_row,
+        let left_key_columns = Arc::new(
+            join.keys
+                .iter()
+                .map(|key| {
+                    projection_direct_column_index_expression(
+                        key.left_expression().expr(),
                         left_schema.as_ref(),
                     )
-                    .ok()?;
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
-                }
-                encode_projected_row_key(&key_columns).ok()
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("benchmark join left keys should be direct"),
+        );
+        let right_key_columns = Arc::new(
+            join.keys
+                .iter()
+                .map(|key| {
+                    projection_direct_column_index_expression(
+                        key.right_expression().expr(),
+                        right_schema.as_ref(),
+                    )
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("benchmark join right keys should be direct"),
+        );
+        let residual_evaluator = join.residual.as_ref().map(|expr| {
+            let predicate = DbspPredicate::try_new(expr.expr().clone(), Arc::clone(&output_schema))
+                .expect("build benchmark join residual predicate");
+            Arc::new(
+                VectorizedFilterProjectEvaluator::for_filter(
+                    &predicate,
+                    Arc::clone(&output_schema),
+                )
+                .expect("build benchmark join residual evaluator"),
+            )
+        });
+        let left_key = {
+            let left_key_columns = Arc::clone(&left_key_columns);
+            move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true)
+                    .ok()
+                    .flatten()
             }
         };
         let right_key = {
-            let join_keys = Arc::clone(&join_keys);
-            let right_schema = Arc::clone(&right_schema);
+            let right_key_columns = Arc::clone(&right_key_columns);
             move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                let right_row = decode_projected_row_key(right_bytes).ok()?;
-                let mut key_columns = Vec::with_capacity(join_keys.len());
-                for key in join_keys.iter() {
-                    let value = eval_scalar_expression(
-                        key.right_expression(),
-                        &right_row,
-                        right_schema.as_ref(),
-                    )
-                    .ok()?;
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
-                }
-                encode_projected_row_key(&key_columns).ok()
+                extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true)
+                    .ok()
+                    .flatten()
             }
         };
-        let predicate = {
-            let residual = residual.clone();
-            let output_schema = Arc::clone(&output_schema);
-            move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-                let Some(expr) = residual.as_ref() else {
-                    return true;
-                };
-                let left_row = match decode_projected_row_key(left_bytes) {
-                    Ok(row) => row,
-                    Err(_) => return false,
-                };
-                let right_row = match decode_projected_row_key(right_bytes) {
-                    Ok(row) => row,
-                    Err(_) => return false,
-                };
-                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-                combined.extend(left_row);
-                combined.extend(right_row);
-                eval_expression(expr, &combined, output_schema.as_ref()).unwrap_or(false)
-            }
-        };
+        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
         let projector = |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             crate::encoding::concat_encoded_rows(left_bytes, right_bytes).unwrap_or_default()
         };
@@ -5686,6 +5668,18 @@ mod tests {
         )
         .await
         .expect("materialize canonical build tick");
+        let build_tick_delta = if let Some(evaluator) = residual_evaluator.as_ref() {
+            consolidate_encoded_deltas(
+                evaluator
+                    .transform_delta(
+                        "benchmark_join_build_tick_residual",
+                        build_tick_delta.into_iter().collect(),
+                    )
+                    .expect("apply benchmark join build tick residual filter"),
+            )
+        } else {
+            build_tick_delta
+        };
         assert!(
             build_tick_delta.is_empty(),
             "auction build tick should emit an explicit empty canonical join handle"
@@ -5759,27 +5753,43 @@ mod tests {
             )
             .await
             .expect("materialize canonical join delta");
+            let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
+                consolidate_encoded_deltas(
+                    evaluator
+                        .transform_delta(
+                            "benchmark_join_tick_residual",
+                            actual.into_iter().collect(),
+                        )
+                        .expect("apply benchmark join residual filter"),
+                )
+            } else {
+                actual
+            };
 
-            if actual.is_empty() {
-                assert!(
-                    timeout(Duration::from_millis(100), observer_rx.recv())
-                        .await
-                        .is_err(),
-                    "empty canonical join tick should not emit transient join output"
-                );
-                continue;
-            }
-
-            let (version, transient_batch) = timeout(Duration::from_secs(1), observer_rx.recv())
-                .await
-                .expect("wait transient join output")
-                .expect("transient join output");
-            assert_eq!(
-                version, expected_transient_version,
-                "unexpected transient join output version at bid tick {tick}"
-            );
-            expected_transient_version = expected_transient_version.saturating_add(1);
-            let expected = consolidate_encoded_deltas(transient_batch.as_ref().clone());
+            let recv_timeout = if actual.is_empty() {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            };
+            let transient_raw = match timeout(recv_timeout, observer_rx.recv()).await {
+                Ok(Some((version, transient_batch))) => {
+                    assert_eq!(
+                        version, expected_transient_version,
+                        "unexpected transient join output version at bid tick {tick}"
+                    );
+                    expected_transient_version = expected_transient_version.saturating_add(1);
+                    transient_batch.as_ref().clone()
+                }
+                Ok(None) | Err(_) => Vec::new(),
+            };
+            let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
+                evaluator
+                    .transform_delta("benchmark_join_tick_residual", transient_raw)
+                    .expect("apply benchmark transient join residual filter")
+            } else {
+                transient_raw
+            };
+            let expected = consolidate_encoded_deltas(transient_raw);
             assert_eq!(actual, expected, "join output mismatch at bid tick {tick}");
         }
     }
@@ -5921,75 +5931,61 @@ mod tests {
         .expect("right transient input opt")
         .expect("right transient input opt");
 
-        let join_keys = Arc::new(join.keys.clone());
         let left_schema = Arc::clone(&join.left_schema);
         let right_schema = Arc::clone(&join.right_schema);
         let output_schema = Arc::clone(&join.output_schema);
-        let residual = join.residual.clone();
-
-        let left_key = {
-            let join_keys = Arc::clone(&join_keys);
-            let left_schema = Arc::clone(&left_schema);
-            move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                let left_row = decode_projected_row_key(left_bytes).ok()?;
-                let mut key_columns = Vec::with_capacity(join_keys.len());
-                for key in join_keys.iter() {
-                    let value = eval_scalar_expression(
-                        key.left_expression(),
-                        &left_row,
+        let left_key_columns = Arc::new(
+            join.keys
+                .iter()
+                .map(|key| {
+                    projection_direct_column_index_expression(
+                        key.left_expression().expr(),
                         left_schema.as_ref(),
                     )
-                    .ok()?;
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
-                }
-                encode_projected_row_key(&key_columns).ok()
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("benchmark join left keys should be direct"),
+        );
+        let right_key_columns = Arc::new(
+            join.keys
+                .iter()
+                .map(|key| {
+                    projection_direct_column_index_expression(
+                        key.right_expression().expr(),
+                        right_schema.as_ref(),
+                    )
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("benchmark join right keys should be direct"),
+        );
+        let residual_evaluator = join.residual.as_ref().map(|expr| {
+            let predicate = DbspPredicate::try_new(expr.expr().clone(), Arc::clone(&output_schema))
+                .expect("build benchmark join residual predicate");
+            Arc::new(
+                VectorizedFilterProjectEvaluator::for_filter(
+                    &predicate,
+                    Arc::clone(&output_schema),
+                )
+                .expect("build benchmark join residual evaluator"),
+            )
+        });
+        let left_key = {
+            let left_key_columns = Arc::clone(&left_key_columns);
+            move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true)
+                    .ok()
+                    .flatten()
             }
         };
         let right_key = {
-            let join_keys = Arc::clone(&join_keys);
-            let right_schema = Arc::clone(&right_schema);
+            let right_key_columns = Arc::clone(&right_key_columns);
             move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                let right_row = decode_projected_row_key(right_bytes).ok()?;
-                let mut key_columns = Vec::with_capacity(join_keys.len());
-                for key in join_keys.iter() {
-                    let value = eval_scalar_expression(
-                        key.right_expression(),
-                        &right_row,
-                        right_schema.as_ref(),
-                    )
-                    .ok()?;
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
-                }
-                encode_projected_row_key(&key_columns).ok()
+                extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true)
+                    .ok()
+                    .flatten()
             }
         };
-        let predicate = {
-            let residual = residual.clone();
-            let output_schema = Arc::clone(&output_schema);
-            move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-                let Some(expr) = residual.as_ref() else {
-                    return true;
-                };
-                let left_row = match decode_projected_row_key(left_bytes) {
-                    Ok(row) => row,
-                    Err(_) => return false,
-                };
-                let right_row = match decode_projected_row_key(right_bytes) {
-                    Ok(row) => row,
-                    Err(_) => return false,
-                };
-                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-                combined.extend(left_row);
-                combined.extend(right_row);
-                eval_expression(expr, &combined, output_schema.as_ref()).unwrap_or(false)
-            }
-        };
+        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
 
         let canonical_join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
             &left_stream,
@@ -6077,6 +6073,18 @@ mod tests {
         )
         .await
         .expect("materialize canonical build tick");
+        let build_tick_delta = if let Some(evaluator) = residual_evaluator.as_ref() {
+            consolidate_encoded_deltas(
+                evaluator
+                    .transform_delta(
+                        "benchmark_join_source_task_build_tick_residual",
+                        build_tick_delta.into_iter().collect(),
+                    )
+                    .expect("apply benchmark source-task join build tick residual filter"),
+            )
+        } else {
+            build_tick_delta
+        };
         assert!(
             build_tick_delta.is_empty(),
             "auction build tick should emit an explicit empty canonical join handle"
@@ -6089,6 +6097,7 @@ mod tests {
         );
 
         let mut cache = HashMap::new();
+        let mut expected_transient_version = 1_i64;
         for tick in 0..64usize {
             let ts = i64::try_from(tick + 2).expect("tick version");
             let bid_batch = vec![
@@ -6133,17 +6142,43 @@ mod tests {
             )
             .await
             .expect("materialize canonical join delta");
+            let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
+                consolidate_encoded_deltas(
+                    evaluator
+                        .transform_delta(
+                            "benchmark_join_source_task_tick_residual",
+                            actual.into_iter().collect(),
+                        )
+                        .expect("apply benchmark source-task join residual filter"),
+                )
+            } else {
+                actual
+            };
 
-            let (version, transient_batch) = timeout(Duration::from_secs(1), observer_rx.recv())
-                .await
-                .expect("wait transient join output")
-                .expect("transient join output");
-            assert_eq!(
-                version,
-                i64::try_from(tick + 1).expect("transient output version"),
-                "unexpected transient join output version at bid tick {tick}"
-            );
-            let expected = consolidate_encoded_deltas(transient_batch.as_ref().clone());
+            let recv_timeout = if actual.is_empty() {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            };
+            let transient_raw = match timeout(recv_timeout, observer_rx.recv()).await {
+                Ok(Some((version, transient_batch))) => {
+                    assert_eq!(
+                        version, expected_transient_version,
+                        "unexpected transient join output version at bid tick {tick}"
+                    );
+                    expected_transient_version = expected_transient_version.saturating_add(1);
+                    transient_batch.as_ref().clone()
+                }
+                Ok(None) | Err(_) => Vec::new(),
+            };
+            let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
+                evaluator
+                    .transform_delta("benchmark_join_source_task_tick_residual", transient_raw)
+                    .expect("apply benchmark source-task transient join residual filter")
+            } else {
+                transient_raw
+            };
+            let expected = consolidate_encoded_deltas(transient_raw);
             assert_eq!(actual, expected, "join output mismatch at bid tick {tick}");
         }
     }

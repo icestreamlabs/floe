@@ -3,6 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
+use datafusion::common::Column;
+#[cfg(test)]
+use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspAggregateExpr, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
@@ -20,12 +24,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::DbspBridge;
+#[cfg(test)]
+use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
 #[cfg(test)]
-use super::eval::{eval_expression, eval_scalar_expression};
+use dbsp::DbspPredicate;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TopNSortSpec {
     ascending: bool,
@@ -265,6 +271,39 @@ enum AggregateAccumulator {
 }
 
 #[cfg(test)]
+fn aggregate_eval_direct_column_index(
+    expr: &dbsp::DbspExpression,
+    schema: &RowSchema,
+) -> Option<usize> {
+    match expr.expr() {
+        Expr::Alias(alias) => aggregate_eval_direct_column_index_expr(alias.expr.as_ref(), schema),
+        other => aggregate_eval_direct_column_index_expr(other, schema),
+    }
+}
+
+#[cfg(test)]
+fn aggregate_eval_direct_column_index_expr(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => {
+            let qualified = column.flat_name();
+            schema
+                .field_index(&qualified)
+                .or_else(|| schema.field_index(&column.name))
+        }
+        Expr::Alias(alias) => aggregate_eval_direct_column_index_expr(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn aggregate_eval_expr_key(expr: &Expr) -> String {
+    match expr {
+        Expr::Alias(alias) => aggregate_eval_expr_key(alias.expr.as_ref()),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
 fn evaluate_aggregate_values(
     aggregates: &[DbspAggregateExpr],
     decoded: &[(Vec<ScalarValue>, i64)],
@@ -276,8 +315,122 @@ fn evaluate_aggregate_values(
         return Vec::new();
     }
 
+    let mut encoded = Vec::with_capacity(decoded.len());
+    for (row, weight) in decoded {
+        match encode_projected_row_key(row) {
+            Ok(encoded_row) => encoded.push((encoded_row, *weight)),
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to encode {context} test input row"
+                );
+            }
+        }
+    }
+
+    let input_schema = Arc::new(schema.clone());
+    let mut expr_column_map = HashMap::new();
+    let mut unique_non_direct = Vec::new();
+    let mut seen_non_direct = HashMap::new();
+    for agg in aggregates {
+        if let Some(filter) = agg.filter()
+            && aggregate_eval_direct_column_index(filter, schema).is_none()
+        {
+            let key = aggregate_eval_expr_key(filter.expr());
+            if !seen_non_direct.contains_key(&key) {
+                unique_non_direct.push((key.clone(), filter.expr().clone()));
+                seen_non_direct.insert(key, ());
+            }
+        }
+        if let Some(expr) = agg.expression()
+            && aggregate_eval_direct_column_index(expr, schema).is_none()
+        {
+            let key = aggregate_eval_expr_key(expr.expr());
+            if !seen_non_direct.contains_key(&key) {
+                unique_non_direct.push((key.clone(), expr.expr().clone()));
+                seen_non_direct.insert(key, ());
+            }
+        }
+    }
+
+    let mut eval_schema = Arc::clone(&input_schema);
+    if !unique_non_direct.is_empty() {
+        let mut items = Vec::with_capacity(input_schema.len() + unique_non_direct.len());
+        for field in input_schema.fields() {
+            items.push(dbsp::circuit::plan::ProjectItem {
+                expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                alias: Some(field.name.clone()),
+            });
+        }
+        let mut next_index = input_schema.len();
+        for (index, (key, expr)) in unique_non_direct.into_iter().enumerate() {
+            let alias = format!("__floe_test_agg_expr_{index}");
+            items.push(dbsp::circuit::plan::ProjectItem {
+                expr,
+                alias: Some(alias),
+            });
+            expr_column_map.insert(key, next_index);
+            next_index += 1;
+        }
+        let project = match DbspProjectNode::try_new(Arc::clone(&input_schema), items) {
+            Ok(project) => project,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to build {context} test aggregate projection"
+                );
+                return vec![ScalarValue::Null; aggregates.len()];
+            }
+        };
+        eval_schema = Arc::clone(project.output_schema());
+        let predicate = match DbspPredicate::try_new(
+            Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+            Arc::clone(&input_schema),
+        ) {
+            Ok(predicate) => predicate,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to build {context} test aggregate predicate"
+                );
+                return vec![ScalarValue::Null; aggregates.len()];
+            }
+        };
+        let evaluator = match VectorizedFilterProjectEvaluator::for_filter_map(
+            &predicate,
+            project.expressions(),
+            Arc::clone(&input_schema),
+        ) {
+            Ok(evaluator) => evaluator,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to initialize {context} test aggregate evaluator"
+                );
+                return vec![ScalarValue::Null; aggregates.len()];
+            }
+        };
+        encoded = match evaluator.transform_delta(graph_id, encoded) {
+            Ok(delta) => delta,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to apply {context} test aggregate projection"
+                );
+                return vec![ScalarValue::Null; aggregates.len()];
+            }
+        };
+    }
+
     let mut filters: Vec<&dbsp::DbspExpression> = Vec::new();
+    let mut filter_columns = Vec::new();
     let mut expressions: Vec<&dbsp::DbspExpression> = Vec::new();
+    let mut expression_columns = Vec::new();
     let mut plans = Vec::with_capacity(aggregates.len());
     let mut accumulators = Vec::with_capacity(aggregates.len());
 
@@ -290,6 +443,13 @@ fn evaluate_aggregate_values(
                 existing
             } else {
                 filters.push(filter);
+                let column = aggregate_eval_direct_column_index(filter, eval_schema.as_ref())
+                    .or_else(|| {
+                        expr_column_map
+                            .get(&aggregate_eval_expr_key(filter.expr()))
+                            .copied()
+                    });
+                filter_columns.push(column);
                 filters.len() - 1
             }
         });
@@ -301,6 +461,13 @@ fn evaluate_aggregate_values(
                 existing
             } else {
                 expressions.push(expr);
+                let column = aggregate_eval_direct_column_index(expr, eval_schema.as_ref())
+                    .or_else(|| {
+                        expr_column_map
+                            .get(&aggregate_eval_expr_key(expr.expr()))
+                            .copied()
+                    });
+                expression_columns.push(column);
                 expressions.len() - 1
             }
         });
@@ -328,39 +495,59 @@ fn evaluate_aggregate_values(
     let mut expression_values = vec![ScalarValue::Null; expressions.len()];
     let mut expression_valid = vec![false; expressions.len()];
 
-    for (row, weight) in decoded {
-        if *weight == 0 {
+    for (encoded_row, weight) in encoded {
+        if weight == 0 {
             continue;
         }
+        let row = match decode_projected_row_key(&encoded_row) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode {context} test aggregate row"
+                );
+                continue;
+            }
+        };
 
         for (index, filter) in filters.iter().enumerate() {
-            filter_results[index] = match eval_expression(filter, row, schema) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} FILTER expression"
-                    );
-                    false
-                }
-            };
+            if let Some(column_idx) = filter_columns[index] {
+                let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
+                filter_results[index] = match crate::expression::scalar_to_bool(value) {
+                    Ok(include) => include,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} FILTER expression"
+                        );
+                        false
+                    }
+                };
+            } else {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    expression = ?filter.expr(),
+                    "missing precomputed FILTER column in {context} test aggregate evaluation"
+                );
+                filter_results[index] = false;
+            }
         }
 
         expression_valid.fill(false);
         for (index, expr) in expressions.iter().enumerate() {
-            match eval_scalar_expression(expr, row, schema) {
-                Ok(value) => {
-                    expression_values[index] = value;
+            if let Some(column_idx) = expression_columns[index] {
+                if let Some(value) = row.get(column_idx) {
+                    expression_values[index] = value.clone();
                     expression_valid[index] = true;
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} aggregate expression"
-                    );
-                }
+            } else {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    expression = ?expr.expr(),
+                    "missing precomputed aggregate expression column in {context} test evaluation"
+                );
             }
         }
 
@@ -384,7 +571,7 @@ fn evaluate_aggregate_values(
                         continue;
                     }
                     let entry = weights.entry(value.clone()).or_insert(0);
-                    *entry += *weight;
+                    *entry += weight;
                     if *entry == 0 {
                         weights.remove(&value);
                     }
@@ -393,10 +580,10 @@ fn evaluate_aggregate_values(
                     Some(expr_index) => {
                         if expression_valid[expr_index] && !expression_values[expr_index].is_null()
                         {
-                            *count += *weight;
+                            *count += weight;
                         }
                     }
-                    None => *count += *weight,
+                    None => *count += weight,
                 },
                 AggregateAccumulator::Sum { sum, has_value } => {
                     let Some(expr_index) = plan.expr_index else {
@@ -406,7 +593,7 @@ fn evaluate_aggregate_values(
                         continue;
                     }
                     if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
-                        *sum += number * *weight;
+                        *sum += number * weight;
                         *has_value = true;
                     }
                 }
@@ -418,8 +605,8 @@ fn evaluate_aggregate_values(
                         continue;
                     }
                     if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
-                        *sum += number * *weight;
-                        *count += *weight;
+                        *sum += number * weight;
+                        *count += weight;
                     }
                 }
                 AggregateAccumulator::Min { current } => {
