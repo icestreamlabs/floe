@@ -253,15 +253,8 @@ impl DbspGraphBuilder {
                 .expect("right key columns should be direct")
         };
 
-        let join_keys = Arc::new(node.keys.clone());
-        let left_key_exprs = Arc::clone(&join_keys);
-        let right_key_exprs = Arc::clone(&join_keys);
-        let left_key_schema = Arc::clone(&left_join_schema);
-        let right_key_schema = Arc::clone(&right_join_schema);
-        let left_key_columns = Some(Arc::new(left_key_columns_resolved));
-        let right_key_columns = Some(Arc::new(right_key_columns_resolved));
-        let left_key_required_columns: Option<Arc<Vec<usize>>> = None;
-        let right_key_required_columns: Option<Arc<Vec<usize>>> = None;
+        let left_key_columns = Arc::new(left_key_columns_resolved);
+        let right_key_columns = Arc::new(right_key_columns_resolved);
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
@@ -288,8 +281,6 @@ impl DbspGraphBuilder {
             };
         let left_key_columns_for_outer = left_key_columns.clone();
         let right_key_columns_for_outer = right_key_columns.clone();
-        let left_key_required_columns_for_outer = left_key_required_columns.clone();
-        let right_key_required_columns_for_outer = right_key_required_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
@@ -303,66 +294,13 @@ impl DbspGraphBuilder {
             .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = left_key_columns.as_ref() {
-                return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %left_graph_id,
-                            error = %err,
-                            "failed to extract join left key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let left_row = match decode_sparse_row_for_columns(
-                left_bytes,
-                left_key_required_columns
-                    .as_ref()
-                    .expect("left key required columns should be present")
-                    .as_ref(),
-                left_key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %left_graph_id,
                         error = %err,
-                        "failed to decode join left key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_columns = Vec::with_capacity(left_key_exprs.len());
-            for key in left_key_exprs.iter() {
-                let value = match eval_scalar_expression(
-                    key.left_expression(),
-                    &left_row,
-                    left_key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %left_graph_id,
-                            error = %err,
-                            "failed to evaluate join left key expression"
-                        );
-                        return None;
-                    }
-                };
-                if value.is_null() {
-                    return None;
-                }
-                key_columns.push(value);
-            }
-            match encode_projected_row_key(&key_columns) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %left_graph_id,
-                        error = %err,
-                        "failed to encode join left key"
+                        "failed to extract join left key columns"
                     );
                     None
                 }
@@ -370,66 +308,13 @@ impl DbspGraphBuilder {
         };
 
         let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = right_key_columns.as_ref() {
-                return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %right_graph_id,
-                            error = %err,
-                            "failed to extract join right key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let right_row = match decode_sparse_row_for_columns(
-                right_bytes,
-                right_key_required_columns
-                    .as_ref()
-                    .expect("right key required columns should be present")
-                    .as_ref(),
-                right_key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %right_graph_id,
                         error = %err,
-                        "failed to decode join right key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_columns = Vec::with_capacity(right_key_exprs.len());
-            for key in right_key_exprs.iter() {
-                let value = match eval_scalar_expression(
-                    key.right_expression(),
-                    &right_row,
-                    right_key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %right_graph_id,
-                            error = %err,
-                            "failed to evaluate join right key expression"
-                        );
-                        return None;
-                    }
-                };
-                if value.is_null() {
-                    return None;
-                }
-                key_columns.push(value);
-            }
-            match encode_projected_row_key(&key_columns) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %right_graph_id,
-                        error = %err,
-                        "failed to encode join right key"
+                        "failed to extract join right key columns"
                     );
                     None
                 }
@@ -640,130 +525,45 @@ impl DbspGraphBuilder {
         let mut union_inputs = vec![join_stream];
 
         if matches!(join_type, DbspJoinType::LeftOuter | DbspJoinType::FullOuter) {
-            let antijoin_keys = Arc::new(node.keys.clone());
-            let antijoin_left_exprs = Arc::clone(&antijoin_keys);
-            let antijoin_right_exprs = Arc::clone(&antijoin_keys);
-            let antijoin_left_schema = Arc::clone(&left_schema);
-            let antijoin_right_schema = Arc::clone(&right_schema);
             let antijoin_left_key_columns = left_key_columns_for_outer.clone();
             let antijoin_right_key_columns = right_key_columns_for_outer.clone();
-            let antijoin_left_key_required_columns = left_key_required_columns_for_outer.clone();
-            let antijoin_right_key_required_columns = right_key_required_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
             let antijoin_left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                if let Some(indices) = antijoin_left_key_columns.as_ref() {
-                    return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
-                        Ok(selected) => selected,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to extract left outer join anti left key columns"
-                            );
-                            None
-                        }
-                    };
-                }
-                let left_row = match decode_sparse_row_for_columns(
+                match extract_encoded_row_columns(
                     left_bytes,
-                    antijoin_left_key_required_columns
-                        .as_ref()
-                        .expect("left outer anti left key required columns should be present")
-                        .as_ref(),
-                    antijoin_left_schema.len(),
+                    antijoin_left_key_columns.as_ref(),
+                    true,
                 ) {
-                    Ok(row) => row,
+                    Ok(selected) => selected,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %antijoin_left_graph_id,
                             error = %err,
-                            "failed to decode left outer join anti left key"
+                            "failed to extract left outer join anti left key columns"
                         );
-                        return None;
+                        None
                     }
-                };
-                let mut key_columns = Vec::with_capacity(antijoin_left_exprs.len());
-                for key in antijoin_left_exprs.iter() {
-                    let value = match eval_scalar_expression(
-                        key.left_expression(),
-                        &left_row,
-                        antijoin_left_schema.as_ref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to evaluate left outer join anti left key expression"
-                            );
-                            return None;
-                        }
-                    };
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
                 }
-                encode_projected_row_key(&key_columns).ok()
             };
 
             let antijoin_right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                if let Some(indices) = antijoin_right_key_columns.as_ref() {
-                    return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
-                        Ok(selected) => selected,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to extract left outer join anti right key columns"
-                            );
-                            None
-                        }
-                    };
-                }
-                let right_row = match decode_sparse_row_for_columns(
+                match extract_encoded_row_columns(
                     right_bytes,
-                    antijoin_right_key_required_columns
-                        .as_ref()
-                        .expect("left outer anti right key required columns should be present")
-                        .as_ref(),
-                    antijoin_right_schema.len(),
+                    antijoin_right_key_columns.as_ref(),
+                    true,
                 ) {
-                    Ok(row) => row,
+                    Ok(selected) => selected,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %antijoin_right_graph_id,
                             error = %err,
-                            "failed to decode left outer join anti right key"
+                            "failed to extract left outer join anti right key columns"
                         );
-                        return None;
+                        None
                     }
-                };
-                let mut key_columns = Vec::with_capacity(antijoin_right_exprs.len());
-                for key in antijoin_right_exprs.iter() {
-                    let value = match eval_scalar_expression(
-                        key.right_expression(),
-                        &right_row,
-                        antijoin_right_schema.as_ref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to evaluate left outer join anti right key expression"
-                            );
-                            return None;
-                        }
-                    };
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
                 }
-                encode_projected_row_key(&key_columns).ok()
             };
 
             let antijoin_events = task_events.clone();
@@ -838,130 +638,45 @@ impl DbspGraphBuilder {
             join_type,
             DbspJoinType::RightOuter | DbspJoinType::FullOuter
         ) {
-            let antijoin_keys = Arc::new(node.keys.clone());
-            let antijoin_left_exprs = Arc::clone(&antijoin_keys);
-            let antijoin_right_exprs = Arc::clone(&antijoin_keys);
-            let antijoin_left_schema = Arc::clone(&right_schema);
-            let antijoin_right_schema = Arc::clone(&left_schema);
             let antijoin_left_key_columns = right_key_columns_for_outer.clone();
             let antijoin_right_key_columns = left_key_columns_for_outer.clone();
-            let antijoin_left_key_required_columns = right_key_required_columns_for_outer.clone();
-            let antijoin_right_key_required_columns = left_key_required_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
             let antijoin_left_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                if let Some(indices) = antijoin_left_key_columns.as_ref() {
-                    return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
-                        Ok(selected) => selected,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to extract right outer join anti right key columns"
-                            );
-                            None
-                        }
-                    };
-                }
-                let right_row = match decode_sparse_row_for_columns(
+                match extract_encoded_row_columns(
                     right_bytes,
-                    antijoin_left_key_required_columns
-                        .as_ref()
-                        .expect("right outer anti right key required columns should be present")
-                        .as_ref(),
-                    antijoin_left_schema.len(),
+                    antijoin_left_key_columns.as_ref(),
+                    true,
                 ) {
-                    Ok(row) => row,
+                    Ok(selected) => selected,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %antijoin_left_graph_id,
                             error = %err,
-                            "failed to decode right outer join anti right key"
+                            "failed to extract right outer join anti right key columns"
                         );
-                        return None;
+                        None
                     }
-                };
-                let mut key_columns = Vec::with_capacity(antijoin_left_exprs.len());
-                for key in antijoin_left_exprs.iter() {
-                    let value = match eval_scalar_expression(
-                        key.right_expression(),
-                        &right_row,
-                        antijoin_left_schema.as_ref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to evaluate right outer join anti right key expression"
-                            );
-                            return None;
-                        }
-                    };
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
                 }
-                encode_projected_row_key(&key_columns).ok()
             };
 
             let antijoin_right_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                if let Some(indices) = antijoin_right_key_columns.as_ref() {
-                    return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
-                        Ok(selected) => selected,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to extract right outer join anti left key columns"
-                            );
-                            None
-                        }
-                    };
-                }
-                let left_row = match decode_sparse_row_for_columns(
+                match extract_encoded_row_columns(
                     left_bytes,
-                    antijoin_right_key_required_columns
-                        .as_ref()
-                        .expect("right outer anti left key required columns should be present")
-                        .as_ref(),
-                    antijoin_right_schema.len(),
+                    antijoin_right_key_columns.as_ref(),
+                    true,
                 ) {
-                    Ok(row) => row,
+                    Ok(selected) => selected,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %antijoin_right_graph_id,
                             error = %err,
-                            "failed to decode right outer join anti left key"
+                            "failed to extract right outer join anti left key columns"
                         );
-                        return None;
+                        None
                     }
-                };
-                let mut key_columns = Vec::with_capacity(antijoin_right_exprs.len());
-                for key in antijoin_right_exprs.iter() {
-                    let value = match eval_scalar_expression(
-                        key.left_expression(),
-                        &left_row,
-                        antijoin_right_schema.as_ref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to evaluate right outer join anti left key expression"
-                            );
-                            return None;
-                        }
-                    };
-                    if value.is_null() {
-                        return None;
-                    }
-                    key_columns.push(value);
                 }
-                encode_projected_row_key(&key_columns).ok()
             };
 
             let antijoin_events = task_events.clone();
@@ -1184,15 +899,8 @@ impl DbspGraphBuilder {
             right_transient = None;
         }
 
-        let join_keys = Arc::new(node.keys.clone());
-        let left_key_exprs = Arc::clone(&join_keys);
-        let right_key_exprs = Arc::clone(&join_keys);
-        let left_key_schema = Arc::clone(&left_join_schema);
-        let right_key_schema = Arc::clone(&right_join_schema);
-        let left_key_columns = Some(Arc::new(left_key_columns_resolved));
-        let right_key_columns = Some(Arc::new(right_key_columns_resolved));
-        let left_key_required_columns: Option<Arc<Vec<usize>>> = None;
-        let right_key_required_columns: Option<Arc<Vec<usize>>> = None;
+        let left_key_columns = Arc::new(left_key_columns_resolved);
+        let right_key_columns = Arc::new(right_key_columns_resolved);
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
@@ -1226,66 +934,13 @@ impl DbspGraphBuilder {
             .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = left_key_columns.as_ref() {
-                return match extract_encoded_row_columns(left_bytes, indices.as_ref(), true) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %left_graph_id,
-                            error = %err,
-                            "failed to extract join left key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let left_row = match decode_sparse_row_for_columns(
-                left_bytes,
-                left_key_required_columns
-                    .as_ref()
-                    .expect("left key required columns should be present")
-                    .as_ref(),
-                left_key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %left_graph_id,
                         error = %err,
-                        "failed to decode join left key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_columns = Vec::with_capacity(left_key_exprs.len());
-            for key in left_key_exprs.iter() {
-                let value = match eval_scalar_expression(
-                    key.left_expression(),
-                    &left_row,
-                    left_key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %left_graph_id,
-                            error = %err,
-                            "failed to evaluate join left key expression"
-                        );
-                        return None;
-                    }
-                };
-                if value.is_null() {
-                    return None;
-                }
-                key_columns.push(value);
-            }
-            match encode_projected_row_key(&key_columns) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %left_graph_id,
-                        error = %err,
-                        "failed to encode join left key"
+                        "failed to extract join left key columns"
                     );
                     None
                 }
@@ -1293,66 +948,13 @@ impl DbspGraphBuilder {
         };
 
         let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            if let Some(indices) = right_key_columns.as_ref() {
-                return match extract_encoded_row_columns(right_bytes, indices.as_ref(), true) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %right_graph_id,
-                            error = %err,
-                            "failed to extract join right key columns"
-                        );
-                        None
-                    }
-                };
-            }
-            let right_row = match decode_sparse_row_for_columns(
-                right_bytes,
-                right_key_required_columns
-                    .as_ref()
-                    .expect("right key required columns should be present")
-                    .as_ref(),
-                right_key_schema.len(),
-            ) {
-                Ok(row) => row,
+            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %right_graph_id,
                         error = %err,
-                        "failed to decode join right key"
-                    );
-                    return None;
-                }
-            };
-            let mut key_columns = Vec::with_capacity(right_key_exprs.len());
-            for key in right_key_exprs.iter() {
-                let value = match eval_scalar_expression(
-                    key.right_expression(),
-                    &right_row,
-                    right_key_schema.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %right_graph_id,
-                            error = %err,
-                            "failed to evaluate join right key expression"
-                        );
-                        return None;
-                    }
-                };
-                if value.is_null() {
-                    return None;
-                }
-                key_columns.push(value);
-            }
-            match encode_projected_row_key(&key_columns) {
-                Ok(encoded) => Some(encoded),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %right_graph_id,
-                        error = %err,
-                        "failed to encode join right key"
+                        "failed to extract join right key columns"
                     );
                     None
                 }
