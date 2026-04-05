@@ -168,6 +168,9 @@ impl DbspGraphBuilder {
             direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
         let right_key_columns =
             direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
+            direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
+        });
         let left_key_columns_for_outer = left_key_columns.clone();
         let right_key_columns_for_outer = right_key_columns.clone();
         let left_graph_id = graph_id.clone();
@@ -299,6 +302,23 @@ impl DbspGraphBuilder {
             let Some(expr) = residual.as_ref() else {
                 return true;
             };
+            if let Some(column) = direct_residual_bool_column {
+                return match eval_direct_join_predicate_boolean_column(
+                    column,
+                    left_bytes,
+                    right_bytes,
+                ) {
+                    Ok(include) => include,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %predicate_graph_id,
+                            error = %err,
+                            "failed to evaluate direct join residual boolean column"
+                        );
+                        false
+                    }
+                };
+            }
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -807,6 +827,9 @@ impl DbspGraphBuilder {
             direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
         let right_key_columns =
             direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
+        let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
+            direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
+        });
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let predicate_graph_id = graph_id.clone();
@@ -936,6 +959,23 @@ impl DbspGraphBuilder {
             let Some(expr) = residual.as_ref() else {
                 return true;
             };
+            if let Some(column) = direct_residual_bool_column {
+                return match eval_direct_join_predicate_boolean_column(
+                    column,
+                    left_bytes,
+                    right_bytes,
+                ) {
+                    Ok(include) => include,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %predicate_graph_id,
+                            error = %err,
+                            "failed to evaluate direct join residual boolean column"
+                        );
+                        false
+                    }
+                };
+            }
             let left_row = match decode_projected_row_key(left_bytes) {
                 Ok(row) => row,
                 Err(err) => {
@@ -1032,6 +1072,12 @@ enum JoinKeySide {
     Right,
 }
 
+#[derive(Clone, Copy)]
+enum JoinPredicateBooleanColumn {
+    Left(usize),
+    Right(usize),
+}
+
 fn direct_join_key_columns(
     node: &DbspJoinNode,
     schema: &RowSchema,
@@ -1069,4 +1115,39 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
+}
+
+fn direct_join_predicate_boolean_column(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    output_schema: &RowSchema,
+    left_width: usize,
+) -> Option<JoinPredicateBooleanColumn> {
+    let output_index = direct_column_index(expr, output_schema)?;
+    let field = output_schema.field(output_index)?;
+    if field.data_type != dbsp::circuit::types::DbspScalarType::Bool {
+        return None;
+    }
+    if output_index < left_width {
+        Some(JoinPredicateBooleanColumn::Left(output_index))
+    } else {
+        Some(JoinPredicateBooleanColumn::Right(output_index - left_width))
+    }
+}
+
+fn eval_direct_join_predicate_boolean_column(
+    column: JoinPredicateBooleanColumn,
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+) -> Result<bool> {
+    let (source_bytes, source_index) = match column {
+        JoinPredicateBooleanColumn::Left(index) => (left_bytes, index),
+        JoinPredicateBooleanColumn::Right(index) => (right_bytes, index),
+    };
+    let selected = extract_encoded_row_columns(source_bytes, &[source_index], false)?
+        .ok_or_else(|| anyhow!("direct join predicate boolean column extraction returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    let value = values.first().ok_or_else(|| {
+        anyhow!("direct join predicate boolean column extraction returned no value")
+    })?;
+    Ok(crate::expression::scalar_to_bool(value)?)
 }
