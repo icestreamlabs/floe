@@ -1,7 +1,9 @@
 use super::*;
 use crate::encoding::extract_encoded_row_columns;
+use anyhow::anyhow;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use std::collections::BTreeSet;
 
 impl DbspGraphBuilder {
     pub(crate) async fn compile_union(
@@ -88,6 +90,16 @@ impl DbspGraphBuilder {
             .map(|expr| direct_column_index(expr.expression(), schema.as_ref()))
             .collect::<Option<Vec<_>>>()
             .map(Arc::new);
+        let non_direct_required_columns =
+            if direct_partition_columns.is_some() && direct_order_columns.is_some() {
+                None
+            } else {
+                Some(Arc::new(required_topn_input_columns(
+                    partition_exprs.as_ref(),
+                    order_exprs.as_ref(),
+                    schema.as_ref(),
+                )?))
+            };
 
         let log_graph_id = graph_id.clone();
         let key_schema = Arc::clone(&schema);
@@ -110,7 +122,14 @@ impl DbspGraphBuilder {
                 }
             } else {
                 if decoded_row.is_none() {
-                    decoded_row = match decode_projected_row_key(bytes) {
+                    decoded_row = match decode_sparse_row_for_columns(
+                        bytes,
+                        non_direct_required_columns
+                            .as_ref()
+                            .expect("non-direct required columns should be present")
+                            .as_ref(),
+                        key_schema.len(),
+                    ) {
                         Ok(row) => Some(row),
                         Err(err) => {
                             tracing::warn!(
@@ -191,7 +210,14 @@ impl DbspGraphBuilder {
                 }
             } else {
                 if decoded_row.is_none() {
-                    decoded_row = match decode_projected_row_key(bytes) {
+                    decoded_row = match decode_sparse_row_for_columns(
+                        bytes,
+                        non_direct_required_columns
+                            .as_ref()
+                            .expect("non-direct required columns should be present")
+                            .as_ref(),
+                        key_schema.len(),
+                    ) {
                         Ok(row) => Some(row),
                         Err(err) => {
                             tracing::warn!(
@@ -289,4 +315,61 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
+}
+
+fn required_topn_input_columns(
+    partition_exprs: &[dbsp::circuit::plan::DbspExpression],
+    order_exprs: &[dbsp::OrderExpr],
+    schema: &RowSchema,
+) -> Result<Vec<usize>> {
+    let mut columns = BTreeSet::new();
+    for expr in partition_exprs {
+        add_expr_input_columns(expr.expr(), schema, &mut columns)?;
+    }
+    for expr in order_exprs {
+        add_expr_input_columns(expr.expression().expr(), schema, &mut columns)?;
+    }
+    Ok(columns.into_iter().collect())
+}
+
+fn add_expr_input_columns(
+    expr: &Expr,
+    schema: &RowSchema,
+    columns: &mut BTreeSet<usize>,
+) -> Result<()> {
+    for column in expr.column_refs() {
+        let index = schema.field_index(column.name.as_str()).ok_or_else(|| {
+            anyhow!(
+                "column '{}' was not found while deriving topn required input columns",
+                column.name
+            )
+        })?;
+        columns.insert(index);
+    }
+    Ok(())
+}
+
+fn decode_sparse_row_for_columns(
+    encoded: &[u8],
+    columns: &[usize],
+    row_width: usize,
+) -> Result<Vec<ScalarValue>> {
+    if columns.is_empty() {
+        return Ok(vec![ScalarValue::Null; row_width]);
+    }
+    let selected = extract_encoded_row_columns(encoded, columns, false)?
+        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    if values.len() != columns.len() {
+        return Err(anyhow!(
+            "sparse row extraction expected {} columns but decoded {}",
+            columns.len(),
+            values.len()
+        ));
+    }
+    let mut row = vec![ScalarValue::Null; row_width];
+    for (slot, column_idx) in columns.iter().copied().enumerate() {
+        row[column_idx] = values[slot].clone();
+    }
+    Ok(row)
 }

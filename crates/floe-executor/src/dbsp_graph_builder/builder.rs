@@ -1207,6 +1207,7 @@ struct TransientTopNProcessor {
     direct_partition_columns: Option<Vec<usize>>,
     order_exprs: Arc<Vec<OrderExpr>>,
     direct_order_columns: Option<Vec<usize>>,
+    non_direct_required_columns: Option<Vec<usize>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
     offset: usize,
@@ -1225,6 +1226,7 @@ struct TransientTop1Processor {
     direct_partition_columns: Option<Vec<usize>>,
     order_exprs: Arc<Vec<OrderExpr>>,
     direct_order_columns: Option<Vec<usize>>,
+    non_direct_required_columns: Option<Vec<usize>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
     order_index: HashMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
@@ -1234,6 +1236,28 @@ struct TransientTop1Processor {
 impl TransientTopNProcessor {
     fn new(graph_id: impl Into<String>, topn: &DbspTopNNode) -> Self {
         let schema = Arc::clone(topn.output_schema());
+        let direct_partition_columns = topn
+            .partition_by()
+            .iter()
+            .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
+            .collect::<Option<Vec<_>>>();
+        let direct_order_columns = topn
+            .order_by()
+            .iter()
+            .map(|expr| {
+                projection_direct_column_index_expression(expr.expression().expr(), schema.as_ref())
+            })
+            .collect::<Option<Vec<_>>>();
+        let non_direct_required_columns =
+            if direct_partition_columns.is_some() && direct_order_columns.is_some() {
+                None
+            } else {
+                Some(required_transient_topn_input_columns(
+                    topn.partition_by(),
+                    topn.order_by(),
+                    schema.as_ref(),
+                ))
+            };
         let order_specs = Arc::new(
             topn.order_by()
                 .iter()
@@ -1247,22 +1271,10 @@ impl TransientTopNProcessor {
             graph_id: graph_id.into(),
             schema: Arc::clone(&schema),
             partition_exprs: Arc::new(topn.partition_by().to_vec()),
-            direct_partition_columns: topn
-                .partition_by()
-                .iter()
-                .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
-                .collect(),
+            direct_partition_columns,
             order_exprs: Arc::new(topn.order_by().to_vec()),
-            direct_order_columns: topn
-                .order_by()
-                .iter()
-                .map(|expr| {
-                    projection_direct_column_index_expression(
-                        expr.expression().expr(),
-                        schema.as_ref(),
-                    )
-                })
-                .collect(),
+            direct_order_columns,
+            non_direct_required_columns,
             order_specs,
             limit: topn.limit(),
             offset: topn.offset(),
@@ -1438,6 +1450,7 @@ impl TransientTopNProcessor {
             Arc::clone(&self.order_specs),
             self.direct_partition_columns.as_deref(),
             self.direct_order_columns.as_deref(),
+            self.non_direct_required_columns.as_deref(),
             row_key,
         )
     }
@@ -1446,6 +1459,28 @@ impl TransientTopNProcessor {
 impl TransientTop1Processor {
     fn new(graph_id: impl Into<String>, topn: &DbspTopNNode) -> Self {
         let schema = Arc::clone(topn.output_schema());
+        let direct_partition_columns = topn
+            .partition_by()
+            .iter()
+            .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
+            .collect::<Option<Vec<_>>>();
+        let direct_order_columns = topn
+            .order_by()
+            .iter()
+            .map(|expr| {
+                projection_direct_column_index_expression(expr.expression().expr(), schema.as_ref())
+            })
+            .collect::<Option<Vec<_>>>();
+        let non_direct_required_columns =
+            if direct_partition_columns.is_some() && direct_order_columns.is_some() {
+                None
+            } else {
+                Some(required_transient_topn_input_columns(
+                    topn.partition_by(),
+                    topn.order_by(),
+                    schema.as_ref(),
+                ))
+            };
         let order_specs = Arc::new(
             topn.order_by()
                 .iter()
@@ -1459,22 +1494,10 @@ impl TransientTop1Processor {
             graph_id: graph_id.into(),
             schema: Arc::clone(&schema),
             partition_exprs: Arc::new(topn.partition_by().to_vec()),
-            direct_partition_columns: topn
-                .partition_by()
-                .iter()
-                .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
-                .collect(),
+            direct_partition_columns,
             order_exprs: Arc::new(topn.order_by().to_vec()),
-            direct_order_columns: topn
-                .order_by()
-                .iter()
-                .map(|expr| {
-                    projection_direct_column_index_expression(
-                        expr.expression().expr(),
-                        schema.as_ref(),
-                    )
-                })
-                .collect(),
+            direct_order_columns,
+            non_direct_required_columns,
             order_specs,
             row_key_cache: HashMap::new(),
             order_index: HashMap::new(),
@@ -1563,6 +1586,7 @@ impl TransientTop1Processor {
             Arc::clone(&self.order_specs),
             self.direct_partition_columns.as_deref(),
             self.direct_order_columns.as_deref(),
+            self.non_direct_required_columns.as_deref(),
             row_key,
         )
     }
@@ -1681,6 +1705,7 @@ struct TransientBatchTopNProcessor {
     direct_partition_columns: Option<Vec<usize>>,
     order_exprs: Arc<Vec<OrderExpr>>,
     direct_order_columns: Option<Vec<usize>>,
+    non_direct_required_columns: Option<Vec<usize>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
     row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
@@ -1692,6 +1717,28 @@ struct TransientBatchTopNProcessor {
 impl TransientBatchTopNProcessor {
     fn new(graph_id: impl Into<String>, topn: &DbspTopNNode) -> Self {
         let schema = Arc::clone(topn.output_schema());
+        let direct_partition_columns = topn
+            .partition_by()
+            .iter()
+            .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
+            .collect::<Option<Vec<_>>>();
+        let direct_order_columns = topn
+            .order_by()
+            .iter()
+            .map(|expr| {
+                projection_direct_column_index_expression(expr.expression().expr(), schema.as_ref())
+            })
+            .collect::<Option<Vec<_>>>();
+        let non_direct_required_columns =
+            if direct_partition_columns.is_some() && direct_order_columns.is_some() {
+                None
+            } else {
+                Some(required_transient_topn_input_columns(
+                    topn.partition_by(),
+                    topn.order_by(),
+                    schema.as_ref(),
+                ))
+            };
         let order_specs = Arc::new(
             topn.order_by()
                 .iter()
@@ -1705,22 +1752,10 @@ impl TransientBatchTopNProcessor {
             graph_id: graph_id.into(),
             schema: Arc::clone(&schema),
             partition_exprs: Arc::new(topn.partition_by().to_vec()),
-            direct_partition_columns: topn
-                .partition_by()
-                .iter()
-                .map(|expr| projection_direct_column_index_expression(expr.expr(), schema.as_ref()))
-                .collect(),
+            direct_partition_columns,
             order_exprs: Arc::new(topn.order_by().to_vec()),
-            direct_order_columns: topn
-                .order_by()
-                .iter()
-                .map(|expr| {
-                    projection_direct_column_index_expression(
-                        expr.expression().expr(),
-                        schema.as_ref(),
-                    )
-                })
-                .collect(),
+            direct_order_columns,
+            non_direct_required_columns,
             order_specs,
             limit: topn.limit(),
             row_key_cache: HashMap::new(),
@@ -2109,6 +2144,7 @@ impl TransientBatchTopNProcessor {
             Arc::clone(&self.order_specs),
             self.direct_partition_columns.as_deref(),
             self.direct_order_columns.as_deref(),
+            self.non_direct_required_columns.as_deref(),
             row_key,
         )
     }
@@ -2808,6 +2844,7 @@ fn compute_transient_topn_key_parts(
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     direct_partition_columns: Option<&[usize]>,
     direct_order_columns: Option<&[usize]>,
+    non_direct_required_columns: Option<&[usize]>,
     row_key: &Vec<u8>,
 ) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
     let mut decoded_row: Option<Vec<ScalarValue>> = None;
@@ -2828,7 +2865,11 @@ fn compute_transient_topn_key_parts(
         }
     } else {
         if decoded_row.is_none() {
-            decoded_row = match decode_projected_row_key(row_key) {
+            decoded_row = match decode_sparse_row_for_columns(
+                row_key,
+                non_direct_required_columns.unwrap_or(&[]),
+                schema.len(),
+            ) {
                 Ok(row) => Some(row),
                 Err(err) => {
                     tracing::warn!(
@@ -2909,7 +2950,11 @@ fn compute_transient_topn_key_parts(
         }
     } else {
         if decoded_row.is_none() {
-            decoded_row = match decode_projected_row_key(row_key) {
+            decoded_row = match decode_sparse_row_for_columns(
+                row_key,
+                non_direct_required_columns.unwrap_or(&[]),
+                schema.len(),
+            ) {
                 Ok(row) => Some(row),
                 Err(err) => {
                     tracing::warn!(
@@ -2952,6 +2997,54 @@ fn compute_transient_topn_key_parts(
         partition_key,
         Some(TransientTopNKey::new(order_specs, values, row_key.clone())),
     )
+}
+
+fn required_transient_topn_input_columns(
+    partition_exprs: &[DbspExpression],
+    order_exprs: &[OrderExpr],
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    for expr in partition_exprs {
+        add_expr_input_columns(expr.expr(), schema, &mut columns);
+    }
+    for expr in order_exprs {
+        add_expr_input_columns(expr.expression().expr(), schema, &mut columns);
+    }
+    columns.into_iter().collect()
+}
+
+fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
+    for column in expr.column_refs() {
+        if let Some(index) = schema.field_index(column.name.as_str()) {
+            columns.insert(index);
+        }
+    }
+}
+
+fn decode_sparse_row_for_columns(
+    encoded: &[u8],
+    columns: &[usize],
+    row_width: usize,
+) -> Result<Vec<ScalarValue>> {
+    if columns.is_empty() {
+        return decode_projected_row_key(encoded);
+    }
+    let selected = extract_encoded_row_columns(encoded, columns, false)?
+        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    if values.len() != columns.len() {
+        bail!(
+            "sparse row extraction expected {} columns but decoded {}",
+            columns.len(),
+            values.len()
+        );
+    }
+    let mut row = vec![ScalarValue::Null; row_width];
+    for (slot, column_idx) in columns.iter().copied().enumerate() {
+        row[column_idx] = values[slot].clone();
+    }
+    Ok(row)
 }
 
 fn accumulate_weight_deltas(
