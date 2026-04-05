@@ -2,6 +2,7 @@ use super::*;
 use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use std::collections::BTreeSet;
 
 #[derive(Clone)]
 struct CountEvalLayout {
@@ -9,6 +10,7 @@ struct CountEvalLayout {
     filter_direct_columns: Vec<Option<usize>>,
     expressions: Vec<dbsp::DbspExpression>,
     expression_direct_columns: Vec<Option<usize>>,
+    required_input_columns: Vec<usize>,
     plans: Vec<CountEvalPlan>,
 }
 
@@ -29,6 +31,12 @@ impl DbspGraphBuilder {
         let group_keys = node.group_keys().to_vec();
         let direct_group_key_columns =
             direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
+        let non_direct_group_key_columns = direct_group_key_columns.is_none().then(|| {
+            Arc::new(required_group_key_input_columns(
+                &group_keys,
+                input_schema.as_ref(),
+            ))
+        });
         let aggregates = node.aggregates().to_vec();
         let graph_id = self.graph_id().to_string();
         let aggregate_events = task_events.clone();
@@ -107,6 +115,7 @@ impl DbspGraphBuilder {
 
         let key_schema = Arc::clone(&input_schema);
         let key_columns = direct_group_key_columns;
+        let key_required_columns = non_direct_group_key_columns;
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = key_columns.as_ref() {
@@ -122,7 +131,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let row = match decode_projected_row_key(bytes) {
+            let row = match decode_sparse_row_for_columns(
+                bytes,
+                key_required_columns
+                    .as_ref()
+                    .expect("non-direct key required columns should be present")
+                    .as_ref(),
+                key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -234,6 +250,12 @@ impl DbspGraphBuilder {
         let group_keys = aggregate.group_keys().to_vec();
         let direct_group_key_columns =
             direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
+        let non_direct_group_key_columns = direct_group_key_columns.is_none().then(|| {
+            Arc::new(required_group_key_input_columns(
+                &group_keys,
+                input_schema.as_ref(),
+            ))
+        });
         let aggregates = aggregate.aggregates().to_vec();
         let (window_size, window_slide) = match &node.window.policy {
             DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
@@ -252,6 +274,7 @@ impl DbspGraphBuilder {
 
         let key_schema = Arc::clone(&input_schema);
         let key_columns = direct_group_key_columns;
+        let key_required_columns = non_direct_group_key_columns;
         let key_graph_id = graph_id.clone();
         let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = key_columns.as_ref() {
@@ -267,7 +290,14 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            let row = match decode_projected_row_key(bytes) {
+            let row = match decode_sparse_row_for_columns(
+                bytes,
+                key_required_columns
+                    .as_ref()
+                    .expect("non-direct key required columns should be present")
+                    .as_ref(),
+                key_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -315,6 +345,12 @@ impl DbspGraphBuilder {
         let time_expression = node.window.time_expression.clone();
         let direct_time_column =
             direct_column_index(&time_expression, input_schema.as_ref()).map(|index| [index]);
+        let non_direct_time_columns = direct_time_column.is_none().then(|| {
+            Arc::new(required_expression_input_columns(
+                &time_expression,
+                input_schema.as_ref(),
+            ))
+        });
         let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
             if let Some(index) = direct_time_column.as_ref() {
                 let selected = match extract_encoded_row_columns(bytes, index, false) {
@@ -342,7 +378,14 @@ impl DbspGraphBuilder {
                 };
                 return values.first().and_then(scalar_to_i64);
             }
-            let row = match decode_projected_row_key(bytes) {
+            let row = match decode_sparse_row_for_columns(
+                bytes,
+                non_direct_time_columns
+                    .as_ref()
+                    .expect("non-direct time required columns should be present")
+                    .as_ref(),
+                time_schema.len(),
+            ) {
                 Ok(row) => row,
                 Err(err) => {
                     tracing::warn!(
@@ -667,9 +710,32 @@ pub(crate) fn build_count_row_evaluator(
     let key_needs_row = direct_group_key_columns.is_none();
     let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
     let decode_row = key_needs_row || slot_eval_needs_row;
+    let eval_required_columns = if decode_row {
+        let mut columns = BTreeSet::new();
+        columns.extend(layout.required_input_columns.iter().copied());
+        if key_needs_row {
+            for key_expr in &group_keys {
+                add_expr_input_columns(
+                    key_expr.expression().expr(),
+                    input_schema.as_ref(),
+                    &mut columns,
+                );
+            }
+        }
+        Some(Arc::new(columns.into_iter().collect::<Vec<_>>()))
+    } else {
+        None
+    };
     move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
         let row = if decode_row {
-            match decode_projected_row_key(bytes) {
+            match decode_sparse_row_for_columns(
+                bytes,
+                eval_required_columns
+                    .as_ref()
+                    .expect("required columns should be present when decoding rows")
+                    .as_ref(),
+                input_schema.len(),
+            ) {
                 Ok(row) => Some(row),
                 Err(err) => {
                     tracing::warn!(
@@ -757,6 +823,7 @@ fn build_count_eval_layout(
     let mut filter_direct_columns = Vec::new();
     let mut expressions = Vec::new();
     let mut expression_direct_columns = Vec::new();
+    let mut required_input_columns = BTreeSet::new();
     let mut plans = Vec::with_capacity(aggregates.len());
 
     for agg in aggregates {
@@ -769,6 +836,7 @@ fn build_count_eval_layout(
             } else {
                 filters.push(filter.clone());
                 filter_direct_columns.push(direct_column_index(filter, schema));
+                add_expr_input_columns(filter.expr(), schema, &mut required_input_columns);
                 filters.len() - 1
             }
         });
@@ -781,6 +849,7 @@ fn build_count_eval_layout(
             } else {
                 expressions.push(expr.clone());
                 expression_direct_columns.push(direct_column_index(expr, schema));
+                add_expr_input_columns(expr.expr(), schema, &mut required_input_columns);
                 expressions.len() - 1
             }
         });
@@ -795,6 +864,7 @@ fn build_count_eval_layout(
         filter_direct_columns,
         expressions,
         expression_direct_columns,
+        required_input_columns: required_input_columns.into_iter().collect(),
         plans,
     }
 }
@@ -947,7 +1017,11 @@ fn evaluate_aggregate_values_from_encoded(
         if *weight == 0 {
             continue;
         }
-        let row = match decode_projected_row_key(value) {
+        let row = match decode_sparse_row_for_columns(
+            value,
+            layout.required_input_columns.as_slice(),
+            schema.len(),
+        ) {
             Ok(row) => row,
             Err(err) => {
                 tracing::warn!(
@@ -1191,9 +1265,32 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
     let key_needs_row = direct_group_key_columns.is_none();
     let slot_eval_needs_row = !layout.filters.is_empty() || !layout.expressions.is_empty();
     let decode_row = key_needs_row || slot_eval_needs_row;
+    let eval_required_columns = if decode_row {
+        let mut columns = BTreeSet::new();
+        columns.extend(layout.required_input_columns.iter().copied());
+        if key_needs_row {
+            for key_expr in &group_keys {
+                add_expr_input_columns(
+                    key_expr.expression().expr(),
+                    input_schema.as_ref(),
+                    &mut columns,
+                );
+            }
+        }
+        Some(Arc::new(columns.into_iter().collect::<Vec<_>>()))
+    } else {
+        None
+    };
     move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
         let row = if decode_row {
-            match decode_projected_row_key(bytes) {
+            match decode_sparse_row_for_columns(
+                bytes,
+                eval_required_columns
+                    .as_ref()
+                    .expect("required columns should be present when decoding rows")
+                    .as_ref(),
+                input_schema.len(),
+            ) {
                 Ok(row) => Some(row),
                 Err(err) => {
                     tracing::warn!(
@@ -1467,4 +1564,57 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
+}
+
+fn required_group_key_input_columns(
+    group_keys: &[dbsp::circuit::plan::GroupKeyExpr],
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    for key_expr in group_keys {
+        add_expr_input_columns(key_expr.expression().expr(), schema, &mut columns);
+    }
+    columns.into_iter().collect()
+}
+
+fn required_expression_input_columns(
+    expr: &dbsp::circuit::plan::DbspExpression,
+    schema: &RowSchema,
+) -> Vec<usize> {
+    let mut columns = BTreeSet::new();
+    add_expr_input_columns(expr.expr(), schema, &mut columns);
+    columns.into_iter().collect()
+}
+
+fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
+    for column in expr.column_refs() {
+        if let Some(index) = schema.field_index(column.name.as_str()) {
+            columns.insert(index);
+        }
+    }
+}
+
+fn decode_sparse_row_for_columns(
+    encoded: &[u8],
+    columns: &[usize],
+    row_width: usize,
+) -> Result<Vec<ScalarValue>> {
+    if columns.is_empty() {
+        return Ok(vec![ScalarValue::Null; row_width]);
+    }
+    let selected = extract_encoded_row_columns(encoded, columns, false)?
+        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    if values.len() != columns.len() {
+        return Err(anyhow!(
+            "sparse row extraction expected {} columns but decoded {}",
+            columns.len(),
+            values.len()
+        ));
+    }
+    let mut row = vec![ScalarValue::Null; row_width];
+    for (slot, column_idx) in columns.iter().copied().enumerate() {
+        row[column_idx] = values[slot].clone();
+    }
+    Ok(row)
 }

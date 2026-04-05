@@ -3028,7 +3028,7 @@ fn decode_sparse_row_for_columns(
     row_width: usize,
 ) -> Result<Vec<ScalarValue>> {
     if columns.is_empty() {
-        return decode_projected_row_key(encoded);
+        return Ok(vec![ScalarValue::Null; row_width]);
     }
     let selected = extract_encoded_row_columns(encoded, columns, false)?
         .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
