@@ -21,7 +21,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
-use crate::dbsp_graph_builder::eval::{eval_expression, eval_scalar_expression};
+use crate::dbsp_graph_builder::eval::eval_scalar_expression;
+#[cfg(test)]
+use crate::dbsp_graph_builder::eval::eval_expression;
 use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };
@@ -3014,34 +3016,6 @@ fn required_transient_topn_input_columns(
     columns.into_iter().collect()
 }
 
-fn required_expression_input_columns(expr: &DbspExpression, schema: &RowSchema) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    add_expr_input_columns(expr.expr(), schema, &mut columns);
-    columns.into_iter().collect()
-}
-
-fn required_projection_input_columns(
-    expressions: &[DbspProjectExpr],
-    schema: &RowSchema,
-) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    for expr in expressions {
-        add_expr_input_columns(expr.expression().expr(), schema, &mut columns);
-    }
-    columns.into_iter().collect()
-}
-
-fn union_required_columns(left: Option<&[usize]>, right: Option<&[usize]>) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    if let Some(left_columns) = left {
-        columns.extend(left_columns.iter().copied());
-    }
-    if let Some(right_columns) = right {
-        columns.extend(right_columns.iter().copied());
-    }
-    columns.into_iter().collect()
-}
-
 fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
     for column in expr.column_refs() {
         if let Some(index) = schema.field_index(column.name.as_str()) {
@@ -4702,127 +4676,24 @@ fn find_transient_source_root_shape(
 fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>> {
     let predicate = node.predicate().clone();
     let schema = Arc::clone(node.output_schema());
-    match VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema)) {
-        Ok(evaluator) => {
-            let evaluator = Arc::new(evaluator);
-            return Ok(Arc::new(move |delta_values| {
-                evaluator.transform_delta("source_batch_journal", delta_values)
-            }));
-        }
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "vectorized transient source filter unavailable; using scalar fallback"
-            );
-        }
-    }
-    let direct_predicate_bool_column =
-        transient_direct_boolean_predicate_column(&predicate, schema.as_ref());
-    let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
-        Arc::new(required_expression_input_columns(
-            predicate.expression(),
-            schema.as_ref(),
-        ))
-    });
+    let evaluator = Arc::new(
+        VectorizedFilterProjectEvaluator::for_filter(&predicate, Arc::clone(&schema))
+            .context("build vectorized transient source filter evaluator")?,
+    );
     Ok(Arc::new(move |delta_values| {
-        let mut staged = Vec::with_capacity(delta_values.len());
-        for (encoded, diff) in delta_values {
-            if diff == 0 {
-                continue;
-            }
-            let include = if let Some(column_idx) = direct_predicate_bool_column {
-                match eval_encoded_boolean_predicate_column(&encoded, column_idx) {
-                    Ok(include) => include,
-                    Err(_) => continue,
-                }
-            } else {
-                let row = match decode_sparse_row_for_columns(
-                    &encoded,
-                    predicate_required_columns
-                        .as_ref()
-                        .expect("predicate required columns should be present")
-                        .as_ref(),
-                    schema.len(),
-                ) {
-                    Ok(row) => row,
-                    Err(_) => continue,
-                };
-                match eval_predicate(&predicate, &row, schema.as_ref()) {
-                    Ok(include) => include,
-                    Err(_) => continue,
-                }
-            };
-            if include {
-                staged.push((encoded, diff));
-            }
-        }
-        Ok(staged)
+        evaluator.transform_delta("source_batch_journal", delta_values)
     }))
 }
 
 fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> {
     let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
     let schema = Arc::clone(node.input_schema());
-    match VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema)) {
-        Ok(evaluator) => {
-            let evaluator = Arc::new(evaluator);
-            return Ok(Arc::new(move |delta_values| {
-                evaluator.transform_delta("source_batch_journal", delta_values)
-            }));
-        }
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "vectorized transient source map unavailable; using scalar fallback"
-            );
-        }
-    }
-    let direct_projection_columns = expressions
-        .iter()
-        .map(|expr| projection_direct_column_index(expr, schema.as_ref()))
-        .collect::<Option<Vec<_>>>()
-        .map(Arc::new);
-    let projection_required_columns = direct_projection_columns.is_none().then(|| {
-        Arc::new(required_projection_input_columns(
-            expressions.as_ref(),
-            schema.as_ref(),
-        ))
-    });
+    let evaluator = Arc::new(
+        VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
+            .context("build vectorized transient source map evaluator")?,
+    );
     Ok(Arc::new(move |delta_values| {
-        let mut staged = Vec::with_capacity(delta_values.len());
-        for (encoded, diff) in delta_values {
-            if diff == 0 {
-                continue;
-            }
-            let encoded = if let Some(columns) = direct_projection_columns.as_ref() {
-                match extract_encoded_row_columns(&encoded, columns.as_ref(), false) {
-                    Ok(Some(projected)) => projected,
-                    Ok(None) | Err(_) => continue,
-                }
-            } else {
-                let row = match decode_sparse_row_for_columns(
-                    &encoded,
-                    projection_required_columns
-                        .as_ref()
-                        .expect("projection required columns should be present")
-                        .as_ref(),
-                    schema.len(),
-                ) {
-                    Ok(row) => row,
-                    Err(_) => continue,
-                };
-                let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
-                    Ok(projected) => projected,
-                    Err(_) => continue,
-                };
-                match encode_projected_row_key(&projected) {
-                    Ok(encoded) => encoded,
-                    Err(_) => continue,
-                }
-            };
-            staged.push((encoded, diff));
-        }
-        Ok(staged)
+        evaluator.transform_delta("source_batch_journal", delta_values)
     }))
 }
 
@@ -4831,173 +4702,19 @@ fn build_filter_map_transform(
     project: &DbspProjectNode,
 ) -> Result<Arc<DeltaTransformFn>> {
     let predicate = select.predicate().clone();
-    let filter_schema = Arc::clone(select.output_schema());
     let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
     let project_schema = Arc::clone(project.input_schema());
-    match VectorizedFilterProjectEvaluator::for_filter_map(
-        &predicate,
-        expressions.as_ref(),
-        Arc::clone(&project_schema),
-    ) {
-        Ok(evaluator) => {
-            let evaluator = Arc::new(evaluator);
-            return Ok(Arc::new(move |delta_values| {
-                evaluator.transform_delta("source_batch_journal", delta_values)
-            }));
-        }
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "vectorized transient source filter_map unavailable; using scalar fallback"
-            );
-        }
-    }
-    let direct_predicate_bool_column =
-        transient_direct_boolean_predicate_column(&predicate, filter_schema.as_ref());
-    let direct_projection_columns = expressions
-        .iter()
-        .map(|expr| projection_direct_column_index(expr, project_schema.as_ref()))
-        .collect::<Option<Vec<_>>>()
-        .map(Arc::new);
-    let predicate_required_columns = direct_predicate_bool_column.is_none().then(|| {
-        Arc::new(required_expression_input_columns(
-            predicate.expression(),
-            filter_schema.as_ref(),
-        ))
-    });
-    let projection_required_columns = direct_projection_columns.is_none().then(|| {
-        Arc::new(required_projection_input_columns(
+    let evaluator = Arc::new(
+        VectorizedFilterProjectEvaluator::for_filter_map(
+            &predicate,
             expressions.as_ref(),
-            project_schema.as_ref(),
-        ))
-    });
-    let scalar_required_columns =
-        if direct_predicate_bool_column.is_none() || direct_projection_columns.is_none() {
-            Some(Arc::new(union_required_columns(
-                predicate_required_columns
-                    .as_ref()
-                    .map(|cols| cols.as_slice()),
-                projection_required_columns
-                    .as_ref()
-                    .map(|cols| cols.as_slice()),
-            )))
-        } else {
-            None
-        };
+            Arc::clone(&project_schema),
+        )
+        .context("build vectorized transient source filter_map evaluator")?,
+    );
     Ok(Arc::new(move |delta_values| {
-        let mut staged = Vec::with_capacity(delta_values.len());
-        for (encoded, diff) in delta_values {
-            if diff == 0 {
-                continue;
-            }
-            let mut decoded_row: Option<Vec<ScalarValue>> = None;
-            let include = if let Some(column_idx) = direct_predicate_bool_column {
-                match eval_encoded_boolean_predicate_column(&encoded, column_idx) {
-                    Ok(include) => include,
-                    Err(_) => continue,
-                }
-            } else {
-                decoded_row = match decode_sparse_row_for_columns(
-                    &encoded,
-                    scalar_required_columns
-                        .as_ref()
-                        .expect("scalar required columns should be present")
-                        .as_ref(),
-                    project_schema.len(),
-                ) {
-                    Ok(row) => Some(row),
-                    Err(_) => continue,
-                };
-                match eval_predicate(
-                    &predicate,
-                    decoded_row.as_ref().expect("decoded row should be present"),
-                    filter_schema.as_ref(),
-                ) {
-                    Ok(include) => include,
-                    Err(_) => continue,
-                }
-            };
-            if !include {
-                continue;
-            }
-            let encoded = if let Some(columns) = direct_projection_columns.as_ref() {
-                match extract_encoded_row_columns(&encoded, columns.as_ref(), false) {
-                    Ok(Some(projected)) => projected,
-                    Ok(None) | Err(_) => continue,
-                }
-            } else {
-                if decoded_row.is_none() {
-                    decoded_row = match decode_sparse_row_for_columns(
-                        &encoded,
-                        scalar_required_columns
-                            .as_ref()
-                            .expect("scalar required columns should be present")
-                            .as_ref(),
-                        project_schema.len(),
-                    ) {
-                        Ok(row) => Some(row),
-                        Err(_) => continue,
-                    };
-                }
-                let projected = match eval_projection(
-                    expressions.as_ref(),
-                    decoded_row.as_ref().expect("decoded row should be present"),
-                    project_schema.as_ref(),
-                ) {
-                    Ok(projected) => projected,
-                    Err(_) => continue,
-                };
-                match encode_projected_row_key(&projected) {
-                    Ok(encoded) => encoded,
-                    Err(_) => continue,
-                }
-            };
-            staged.push((encoded, diff));
-        }
-        Ok(staged)
+        evaluator.transform_delta("source_batch_journal", delta_values)
     }))
-}
-
-fn eval_predicate(
-    predicate: &dbsp::DbspPredicate,
-    row: &[datafusion::scalar::ScalarValue],
-    schema: &RowSchema,
-) -> Result<bool> {
-    eval_expression(predicate.expression(), row, schema)
-}
-
-fn eval_projection(
-    expressions: &[DbspProjectExpr],
-    row: &[datafusion::scalar::ScalarValue],
-    schema: &RowSchema,
-) -> Result<Vec<datafusion::scalar::ScalarValue>> {
-    expressions
-        .iter()
-        .map(|expr| eval_scalar_expression(expr.expression(), row, schema))
-        .collect()
-}
-
-fn transient_direct_boolean_predicate_column(
-    predicate: &dbsp::DbspPredicate,
-    schema: &RowSchema,
-) -> Option<usize> {
-    let index = projection_direct_column_index_expression(predicate.expression().expr(), schema)?;
-    let field = schema.field(index)?;
-    if field.data_type == dbsp::circuit::types::DbspScalarType::Bool {
-        Some(index)
-    } else {
-        None
-    }
-}
-
-fn eval_encoded_boolean_predicate_column(encoded: &[u8], column_idx: usize) -> Result<bool> {
-    let selected = extract_encoded_row_columns(encoded, &[column_idx], false)?
-        .ok_or_else(|| anyhow!("direct predicate column extraction returned null"))?;
-    let values = decode_projected_row_key(&selected)?;
-    let value = values
-        .first()
-        .ok_or_else(|| anyhow!("direct predicate column extraction returned no value"))?;
-    crate::expression::scalar_to_bool(value)
 }
 
 #[cfg(test)]
