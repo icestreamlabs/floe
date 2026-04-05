@@ -162,29 +162,106 @@ impl DbspGraphBuilder {
             }
         });
 
+        let mut left_join_input = left;
+        let mut right_join_input = right;
+        let mut left_join_schema = Arc::clone(&left_schema);
+        let mut right_join_schema = Arc::clone(&right_schema);
+        let left_key_column_options = node
+            .keys
+            .iter()
+            .map(|key| direct_column_index(key.left_expression(), left_schema.as_ref()))
+            .collect::<Vec<_>>();
+        let right_key_column_options = node
+            .keys
+            .iter()
+            .map(|key| direct_column_index(key.right_expression(), right_schema.as_ref()))
+            .collect::<Vec<_>>();
+        let left_key_columns_resolved = if left_key_column_options.iter().any(Option::is_none) {
+            let mut items = Vec::with_capacity(left_schema.len() + node.keys.len());
+            for field in left_schema.fields() {
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                });
+            }
+            let mut key_columns = Vec::with_capacity(node.keys.len());
+            let mut next_index = left_schema.len();
+            for (index, key) in node.keys.iter().enumerate() {
+                if let Some(column_idx) = left_key_column_options[index] {
+                    key_columns.push(column_idx);
+                    continue;
+                }
+                let alias = format!("__floe_join_left_key_expr_{index}");
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: key.left_expression().expr().clone(),
+                    alias: Some(alias),
+                });
+                key_columns.push(next_index);
+                next_index += 1;
+            }
+            let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&left_schema), items)
+                .context("build join left key precompute projection")?;
+            left_join_schema = Arc::clone(precompute.output_schema());
+            left_join_input = self
+                .compile_map(&precompute, left_join_input, task_events)
+                .await
+                .context("initialize join left key precompute map")?;
+            key_columns
+        } else {
+            left_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .expect("left key columns should be direct")
+        };
+        let right_key_columns_resolved = if right_key_column_options.iter().any(Option::is_none) {
+            let mut items = Vec::with_capacity(right_schema.len() + node.keys.len());
+            for field in right_schema.fields() {
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                });
+            }
+            let mut key_columns = Vec::with_capacity(node.keys.len());
+            let mut next_index = right_schema.len();
+            for (index, key) in node.keys.iter().enumerate() {
+                if let Some(column_idx) = right_key_column_options[index] {
+                    key_columns.push(column_idx);
+                    continue;
+                }
+                let alias = format!("__floe_join_right_key_expr_{index}");
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: key.right_expression().expr().clone(),
+                    alias: Some(alias),
+                });
+                key_columns.push(next_index);
+                next_index += 1;
+            }
+            let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&right_schema), items)
+                .context("build join right key precompute projection")?;
+            right_join_schema = Arc::clone(precompute.output_schema());
+            right_join_input = self
+                .compile_map(&precompute, right_join_input, task_events)
+                .await
+                .context("initialize join right key precompute map")?;
+            key_columns
+        } else {
+            right_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .expect("right key columns should be direct")
+        };
+
         let join_keys = Arc::new(node.keys.clone());
         let left_key_exprs = Arc::clone(&join_keys);
         let right_key_exprs = Arc::clone(&join_keys);
-        let left_key_schema = Arc::clone(&left_schema);
-        let right_key_schema = Arc::clone(&right_schema);
-        let left_key_columns =
-            direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
-        let right_key_columns =
-            direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
-        let left_key_required_columns = left_key_columns.is_none().then(|| {
-            Arc::new(required_join_key_input_columns(
-                node,
-                left_schema.as_ref(),
-                JoinKeySide::Left,
-            ))
-        });
-        let right_key_required_columns = right_key_columns.is_none().then(|| {
-            Arc::new(required_join_key_input_columns(
-                node,
-                right_schema.as_ref(),
-                JoinKeySide::Right,
-            ))
-        });
+        let left_key_schema = Arc::clone(&left_join_schema);
+        let right_key_schema = Arc::clone(&right_join_schema);
+        let left_key_columns = Some(Arc::new(left_key_columns_resolved));
+        let right_key_columns = Some(Arc::new(right_key_columns_resolved));
+        let left_key_required_columns: Option<Arc<Vec<usize>>> = None;
+        let right_key_required_columns: Option<Arc<Vec<usize>>> = None;
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
@@ -220,6 +297,10 @@ impl DbspGraphBuilder {
         let left_predicate_width = left_schema.len();
         let right_predicate_width = right_schema.len();
         let output_schema_for_predicate = Arc::clone(&output_schema);
+        let left_output_projection = (left_join_schema.len() != left_schema.len())
+            .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
+        let right_output_projection = (right_join_schema.len() != right_schema.len())
+            .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = left_key_columns.as_ref() {
@@ -432,7 +513,51 @@ impl DbspGraphBuilder {
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            match concat_encoded_rows(left_bytes, right_bytes) {
+            let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
+                match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            "join left output projection unexpectedly returned null"
+                        );
+                        return Vec::new();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project join left output columns"
+                        );
+                        return Vec::new();
+                    }
+                }
+            } else {
+                left_bytes.clone()
+            };
+            let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
+                match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            "join right output projection unexpectedly returned null"
+                        );
+                        return Vec::new();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project join right output columns"
+                        );
+                        return Vec::new();
+                    }
+                }
+            } else {
+                right_bytes.clone()
+            };
+            match concat_encoded_rows(&left_encoded, &right_encoded) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -446,8 +571,8 @@ impl DbspGraphBuilder {
         };
 
         let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-            &left,
-            &right,
+            &left_join_input,
+            &right_join_input,
             left_key,
             right_key,
             predicate,
@@ -654,8 +779,8 @@ impl DbspGraphBuilder {
             });
 
             let antijoin = DbspSemiJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-                &left,
-                &right,
+                &left_join_input,
+                &right_join_input,
                 antijoin_left_key,
                 antijoin_right_key,
                 SemiJoinMode::Anti,
@@ -852,8 +977,8 @@ impl DbspGraphBuilder {
             });
 
             let antijoin = DbspSemiJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-                &right,
-                &left,
+                &right_join_input,
+                &left_join_input,
                 antijoin_left_key,
                 antijoin_right_key,
                 SemiJoinMode::Anti,
@@ -928,12 +1053,12 @@ impl DbspGraphBuilder {
     pub(crate) async fn compile_transient_join_root_materialization(
         &mut self,
         node: &DbspJoinNode,
-        left: DeltaHandleStream,
-        right: DeltaHandleStream,
-        left_transient: Option<
+        mut left: DeltaHandleStream,
+        mut right: DeltaHandleStream,
+        mut left_transient: Option<
             tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
         >,
-        right_transient: Option<
+        mut right_transient: Option<
             tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
         >,
         output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
@@ -964,29 +1089,110 @@ impl DbspGraphBuilder {
             report_graph_task_error(&join_events, &join_graph_id, join_label.clone(), err);
         });
 
+        let mut left_join_schema = Arc::clone(&left_schema);
+        let mut right_join_schema = Arc::clone(&right_schema);
+        let left_key_column_options = node
+            .keys
+            .iter()
+            .map(|key| direct_column_index(key.left_expression(), left_schema.as_ref()))
+            .collect::<Vec<_>>();
+        let right_key_column_options = node
+            .keys
+            .iter()
+            .map(|key| direct_column_index(key.right_expression(), right_schema.as_ref()))
+            .collect::<Vec<_>>();
+        let left_key_columns_resolved = if left_key_column_options.iter().any(Option::is_none) {
+            let mut items = Vec::with_capacity(left_schema.len() + node.keys.len());
+            for field in left_schema.fields() {
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                });
+            }
+            let mut key_columns = Vec::with_capacity(node.keys.len());
+            let mut next_index = left_schema.len();
+            for (index, key) in node.keys.iter().enumerate() {
+                if let Some(column_idx) = left_key_column_options[index] {
+                    key_columns.push(column_idx);
+                    continue;
+                }
+                let alias = format!("__floe_transient_join_left_key_expr_{index}");
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: key.left_expression().expr().clone(),
+                    alias: Some(alias),
+                });
+                key_columns.push(next_index);
+                next_index += 1;
+            }
+            let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&left_schema), items)
+                .context("build transient join left key precompute projection")?;
+            left_join_schema = Arc::clone(precompute.output_schema());
+            left = self
+                .compile_map(&precompute, left, task_events)
+                .await
+                .context("initialize transient join left key precompute map")?;
+            key_columns
+        } else {
+            left_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .expect("left key columns should be direct")
+        };
+        let right_key_columns_resolved = if right_key_column_options.iter().any(Option::is_none) {
+            let mut items = Vec::with_capacity(right_schema.len() + node.keys.len());
+            for field in right_schema.fields() {
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                });
+            }
+            let mut key_columns = Vec::with_capacity(node.keys.len());
+            let mut next_index = right_schema.len();
+            for (index, key) in node.keys.iter().enumerate() {
+                if let Some(column_idx) = right_key_column_options[index] {
+                    key_columns.push(column_idx);
+                    continue;
+                }
+                let alias = format!("__floe_transient_join_right_key_expr_{index}");
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: key.right_expression().expr().clone(),
+                    alias: Some(alias),
+                });
+                key_columns.push(next_index);
+                next_index += 1;
+            }
+            let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&right_schema), items)
+                .context("build transient join right key precompute projection")?;
+            right_join_schema = Arc::clone(precompute.output_schema());
+            right = self
+                .compile_map(&precompute, right, task_events)
+                .await
+                .context("initialize transient join right key precompute map")?;
+            key_columns
+        } else {
+            right_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .expect("right key columns should be direct")
+        };
+        if left_join_schema.len() != left_schema.len()
+            || right_join_schema.len() != right_schema.len()
+        {
+            left_transient = None;
+            right_transient = None;
+        }
+
         let join_keys = Arc::new(node.keys.clone());
         let left_key_exprs = Arc::clone(&join_keys);
         let right_key_exprs = Arc::clone(&join_keys);
-        let left_key_schema = Arc::clone(&left_schema);
-        let right_key_schema = Arc::clone(&right_schema);
-        let left_key_columns =
-            direct_join_key_columns(node, left_schema.as_ref(), JoinKeySide::Left).map(Arc::new);
-        let right_key_columns =
-            direct_join_key_columns(node, right_schema.as_ref(), JoinKeySide::Right).map(Arc::new);
-        let left_key_required_columns = left_key_columns.is_none().then(|| {
-            Arc::new(required_join_key_input_columns(
-                node,
-                left_schema.as_ref(),
-                JoinKeySide::Left,
-            ))
-        });
-        let right_key_required_columns = right_key_columns.is_none().then(|| {
-            Arc::new(required_join_key_input_columns(
-                node,
-                right_schema.as_ref(),
-                JoinKeySide::Right,
-            ))
-        });
+        let left_key_schema = Arc::clone(&left_join_schema);
+        let right_key_schema = Arc::clone(&right_join_schema);
+        let left_key_columns = Some(Arc::new(left_key_columns_resolved));
+        let right_key_columns = Some(Arc::new(right_key_columns_resolved));
+        let left_key_required_columns: Option<Arc<Vec<usize>>> = None;
+        let right_key_required_columns: Option<Arc<Vec<usize>>> = None;
         let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
             direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
         });
@@ -1014,6 +1220,10 @@ impl DbspGraphBuilder {
         let projector_graph_id = graph_id.clone();
         let left_predicate_width = left_schema.len();
         let right_predicate_width = right_schema.len();
+        let left_output_projection = (left_join_schema.len() != left_schema.len())
+            .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
+        let right_output_projection = (right_join_schema.len() != right_schema.len())
+            .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
             if let Some(indices) = left_key_columns.as_ref() {
@@ -1223,9 +1433,56 @@ impl DbspGraphBuilder {
         };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+            let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
+                match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            "transient join left output projection unexpectedly returned null"
+                        );
+                        return Vec::new();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project transient join left output columns"
+                        );
+                        return Vec::new();
+                    }
+                }
+            } else {
+                left_bytes.clone()
+            };
+            let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
+                match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            "transient join right output projection unexpectedly returned null"
+                        );
+                        return Vec::new();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project transient join right output columns"
+                        );
+                        return Vec::new();
+                    }
+                }
+            } else {
+                right_bytes.clone()
+            };
             if let Some(columns) = output_projection.as_ref() {
-                return match project_joined_encoded_rows(left_bytes, right_bytes, columns.as_ref())
-                {
+                return match project_joined_encoded_rows(
+                    &left_encoded,
+                    &right_encoded,
+                    columns.as_ref(),
+                ) {
                     Ok(encoded) => encoded,
                     Err(err) => {
                         tracing::warn!(
@@ -1237,7 +1494,7 @@ impl DbspGraphBuilder {
                     }
                 };
             }
-            match concat_encoded_rows(left_bytes, right_bytes) {
+            match concat_encoded_rows(&left_encoded, &right_encoded) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -1275,29 +1532,9 @@ impl DbspGraphBuilder {
 }
 
 #[derive(Clone, Copy)]
-enum JoinKeySide {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy)]
 enum JoinPredicateBooleanColumn {
     Left(usize),
     Right(usize),
-}
-
-fn direct_join_key_columns(
-    node: &DbspJoinNode,
-    schema: &RowSchema,
-    side: JoinKeySide,
-) -> Option<Vec<usize>> {
-    node.keys
-        .iter()
-        .map(|key| match side {
-            JoinKeySide::Left => direct_column_index(key.left_expression(), schema),
-            JoinKeySide::Right => direct_column_index(key.right_expression(), schema),
-        })
-        .collect()
 }
 
 fn direct_column_index(
@@ -1342,22 +1579,6 @@ fn direct_join_predicate_boolean_column(
     }
 }
 
-fn required_join_key_input_columns(
-    node: &DbspJoinNode,
-    schema: &RowSchema,
-    side: JoinKeySide,
-) -> Vec<usize> {
-    let mut columns = BTreeSet::new();
-    for key in &node.keys {
-        let expr = match side {
-            JoinKeySide::Left => key.left_expression(),
-            JoinKeySide::Right => key.right_expression(),
-        };
-        add_expr_input_columns(expr.expr(), schema, &mut columns);
-    }
-    columns.into_iter().collect()
-}
-
 fn required_join_residual_input_columns(
     expr: &dbsp::circuit::plan::DbspExpression,
     output_schema: &RowSchema,
@@ -1378,14 +1599,6 @@ fn required_join_residual_input_columns(
         left_columns.into_iter().collect(),
         right_columns.into_iter().collect(),
     )
-}
-
-fn add_expr_input_columns(expr: &Expr, schema: &RowSchema, columns: &mut BTreeSet<usize>) {
-    for column in expr.column_refs() {
-        if let Some(index) = resolve_direct_column(schema, &column) {
-            columns.insert(index);
-        }
-    }
 }
 
 fn decode_sparse_row_for_columns(
