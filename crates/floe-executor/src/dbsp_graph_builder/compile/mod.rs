@@ -47,22 +47,6 @@ enum TopNValue {
     Bool(bool),
 }
 
-impl TopNValue {
-    fn from_scalar(value: &ScalarValue) -> Result<Self> {
-        match value {
-            ScalarValue::Int64(Some(v)) => Ok(Self::Int64(*v)),
-            ScalarValue::Int64(None) => Ok(Self::Null),
-            ScalarValue::TimestampMillisecond(Some(v), _) => Ok(Self::Timestamp(*v)),
-            ScalarValue::TimestampMillisecond(None, _) => Ok(Self::Null),
-            ScalarValue::Utf8(Some(v)) => Ok(Self::Utf8(v.clone())),
-            ScalarValue::Utf8(None) => Ok(Self::Null),
-            ScalarValue::Boolean(Some(v)) => Ok(Self::Bool(*v)),
-            ScalarValue::Boolean(None) | ScalarValue::Null => Ok(Self::Null),
-            other => Err(anyhow!("unsupported sort value {other:?}")),
-        }
-    }
-}
-
 impl Ord for TopNValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use TopNValue::*;
@@ -212,6 +196,7 @@ fn null_scalar_for_dbsp_type(data_type: &DbspScalarType) -> ScalarValue {
     }
 }
 
+#[cfg(test)]
 fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
     match value {
         ScalarValue::Int64(Some(v)) => Some(*v),
@@ -220,6 +205,7 @@ fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
 fn compare_scalar_values(left: &ScalarValue, right: &ScalarValue) -> Option<std::cmp::Ordering> {
     match (left, right) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => Some(l.cmp(r)),
@@ -261,6 +247,7 @@ struct AggregateEvalPlan<'a> {
     expr_index: Option<usize>,
 }
 
+#[cfg(test)]
 enum AggregateAccumulator {
     Count { count: i64 },
     CountDistinct { weights: HashMap<ScalarValue, i64> },

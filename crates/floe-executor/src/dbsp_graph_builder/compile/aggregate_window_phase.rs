@@ -1,5 +1,8 @@
 use super::*;
-use crate::encoding::{concat_encoded_rows, extract_encoded_row_columns};
+use crate::encoding::{
+    EncodedRowScalar, concat_encoded_rows, extract_encoded_row_columns,
+    extract_encoded_row_i64_like_column, extract_encoded_row_scalars,
+};
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -13,6 +16,7 @@ struct CountEvalLayout {
     expressions: Vec<dbsp::DbspExpression>,
     expression_direct_columns: Vec<Option<usize>>,
     required_input_columns: Vec<usize>,
+    required_input_positions: HashMap<usize, usize>,
     plans: Vec<CountEvalPlan>,
 }
 
@@ -20,6 +24,29 @@ struct CountEvalLayout {
 struct CountEvalPlan {
     filter_index: Option<usize>,
     expr_index: Option<usize>,
+}
+
+enum EncodedAggregateAccumulator {
+    Count {
+        count: i64,
+    },
+    CountDistinct {
+        weights: HashMap<EncodedRowScalar, i64>,
+    },
+    Sum {
+        sum: i64,
+        has_value: bool,
+    },
+    Avg {
+        sum: i64,
+        count: i64,
+    },
+    Min {
+        current: Option<EncodedRowScalar>,
+    },
+    Max {
+        current: Option<EncodedRowScalar>,
+    },
 }
 
 impl DbspGraphBuilder {
@@ -153,7 +180,6 @@ impl DbspGraphBuilder {
             }
         };
 
-        let agg_schema = Arc::clone(&eval_schema);
         let agg_graph_id = graph_id.clone();
         let agg_layout = Arc::new(build_count_eval_layout(
             &aggregates,
@@ -168,7 +194,6 @@ impl DbspGraphBuilder {
                 agg_layout.as_ref(),
                 &aggregates,
                 values,
-                agg_schema.as_ref(),
                 &agg_graph_id,
                 "aggregate",
             );
@@ -296,33 +321,19 @@ impl DbspGraphBuilder {
         )
         .ok_or_else(|| anyhow!("failed to resolve vectorized window aggregate time column"))?;
         let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
-            let selected = match extract_encoded_row_columns(bytes, &[direct_time_column], false) {
-                Ok(Some(selected)) => selected,
-                Ok(None) => return None,
+            match extract_encoded_row_i64_like_column(bytes, direct_time_column) {
+                Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %time_graph_id,
                         error = %err,
                         "failed to extract window aggregate time column"
                     );
-                    return None;
+                    None
                 }
-            };
-            let values = match decode_projected_row_key(&selected) {
-                Ok(values) => values,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %time_graph_id,
-                        error = %err,
-                        "failed to decode extracted window aggregate time column"
-                    );
-                    return None;
-                }
-            };
-            values.first().and_then(scalar_to_i64)
+            }
         };
 
-        let agg_schema = Arc::clone(&eval_schema);
         let agg_graph_id = graph_id.clone();
         let agg_layout = Arc::new(build_count_eval_layout(
             &aggregates,
@@ -337,7 +348,6 @@ impl DbspGraphBuilder {
                 agg_layout.as_ref(),
                 &aggregates,
                 values,
-                agg_schema.as_ref(),
                 &agg_graph_id,
                 "window aggregate",
             );
@@ -686,33 +696,7 @@ pub(crate) fn build_count_row_evaluator(
         expression_columns.as_ref(),
     )
     .map(Arc::new);
-    let slot_eval_needs_row = !layout.required_input_columns.is_empty();
-    let eval_required_columns =
-        slot_eval_needs_row.then(|| Arc::new(layout.required_input_columns.clone()));
     move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
-        let row = if slot_eval_needs_row {
-            match decode_sparse_row_for_columns(
-                bytes,
-                eval_required_columns
-                    .as_ref()
-                    .expect("required columns should be present when decoding rows")
-                    .as_ref(),
-                input_schema.len(),
-            ) {
-                Ok(row) => Some(row),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to decode aggregate row for count aggregate"
-                    );
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-
         let Some(indices) = direct_group_key_columns.as_ref() else {
             tracing::warn!(
                 graph_id = %graph_id,
@@ -733,15 +717,10 @@ pub(crate) fn build_count_row_evaluator(
             }
         };
 
-        let row_for_slot_eval = if slot_eval_needs_row {
-            row.as_deref().expect("decoded row should be present")
-        } else {
-            &[]
-        };
         let counts = evaluate_count_row_values(
             layout.as_ref(),
             &aggregates,
-            row_for_slot_eval,
+            bytes,
             input_schema.as_ref(),
             &graph_id,
             context,
@@ -804,12 +783,21 @@ fn build_count_eval_layout(
         });
     }
 
+    let required_input_columns = required_input_columns.into_iter().collect::<Vec<_>>();
+    let required_input_positions = required_input_columns
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, column)| (column, slot))
+        .collect::<HashMap<_, _>>();
+
     CountEvalLayout {
         filters,
         filter_direct_columns,
         expressions,
         expression_direct_columns,
-        required_input_columns: required_input_columns.into_iter().collect(),
+        required_input_columns,
+        required_input_positions,
         plans,
     }
 }
@@ -817,16 +805,41 @@ fn build_count_eval_layout(
 fn evaluate_count_row_values(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
-    row: &[ScalarValue],
+    row_bytes: &[u8],
     _schema: &RowSchema,
     graph_id: &str,
     context: &str,
 ) -> Vec<dbsp::CountAggregateSlotUpdate<Vec<u8>>> {
+    let decoded =
+        match extract_encoded_row_scalars(row_bytes, layout.required_input_columns.as_slice()) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode {context} count aggregate row inputs"
+                );
+                return aggregates
+                    .iter()
+                    .map(|agg| {
+                        if agg.distinct() {
+                            dbsp::CountAggregateSlotUpdate::Distinct(None)
+                        } else {
+                            dbsp::CountAggregateSlotUpdate::Linear(0)
+                        }
+                    })
+                    .collect();
+            }
+        };
+
     let mut filter_results = vec![false; layout.filters.len()];
     for (index, filter) in layout.filters.iter().enumerate() {
         if let Some(column_idx) = layout.filter_direct_columns[index] {
-            let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
-            filter_results[index] = match crate::expression::scalar_to_bool(value) {
+            let decoded_idx = layout.required_input_positions.get(&column_idx).copied();
+            let value = decoded_idx
+                .and_then(|slot| decoded.get(slot))
+                .and_then(|scalar| scalar.as_ref());
+            filter_results[index] = match bool_from_encoded_scalar(value) {
                 Ok(include) => include,
                 Err(err) => {
                     tracing::warn!(
@@ -836,7 +849,7 @@ fn evaluate_count_row_values(
                     );
                     false
                 }
-            };
+            }
         } else {
             tracing::warn!(
                 graph_id = %graph_id,
@@ -847,12 +860,12 @@ fn evaluate_count_row_values(
         }
     }
 
-    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_values = vec![None; layout.expressions.len()];
     let mut expression_valid = vec![false; layout.expressions.len()];
     for (index, expr) in layout.expressions.iter().enumerate() {
         if let Some(column_idx) = layout.expression_direct_columns[index] {
-            if let Some(value) = row.get(column_idx) {
-                expression_values[index] = value.clone();
+            if let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied() {
+                expression_values[index] = decoded.get(decoded_idx).cloned().flatten();
                 expression_valid[index] = true;
             }
         } else {
@@ -879,20 +892,23 @@ fn evaluate_count_row_values(
             }
             match plan.expr_index {
                 Some(expr_index) => {
-                    if expression_valid[expr_index] && !expression_values[expr_index].is_null() {
+                    if expression_valid[expr_index] && expression_values[expr_index].is_some() {
                         if agg.distinct() {
-                            let encoded = encode_projected_row_key(std::slice::from_ref(
-                                &expression_values[expr_index],
-                            ))
-                            .map(Some)
-                            .unwrap_or_else(|err| {
-                                tracing::warn!(
-                                    graph_id = %graph_id,
-                                    error = %err,
-                                    "failed to encode count aggregate DISTINCT value"
-                                );
-                                None
-                            });
+                            let encoded =
+                                expression_values[expr_index].as_ref().and_then(|value| {
+                                    encode_projected_row_key(std::slice::from_ref(
+                                        &scalar_from_encoded_scalar(value),
+                                    ))
+                                    .map(Some)
+                                    .unwrap_or_else(|err| {
+                                        tracing::warn!(
+                                            graph_id = %graph_id,
+                                            error = %err,
+                                            "failed to encode count aggregate DISTINCT value"
+                                        );
+                                        None
+                                    })
+                                });
                             dbsp::CountAggregateSlotUpdate::Distinct(encoded)
                         } else {
                             dbsp::CountAggregateSlotUpdate::Linear(1)
@@ -915,7 +931,6 @@ fn evaluate_aggregate_values_from_encoded(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
     values: &[(Vec<u8>, i64)],
-    schema: &RowSchema,
     graph_id: &str,
     context: &str,
 ) -> Vec<ScalarValue> {
@@ -926,22 +941,24 @@ fn evaluate_aggregate_values_from_encoded(
     let mut accumulators = Vec::with_capacity(aggregates.len());
     for agg in aggregates {
         accumulators.push(match agg.function() {
-            DbspAggregateFunction::Count if agg.distinct() => AggregateAccumulator::CountDistinct {
-                weights: HashMap::new(),
-            },
-            DbspAggregateFunction::Count => AggregateAccumulator::Count { count: 0 },
-            DbspAggregateFunction::Sum => AggregateAccumulator::Sum {
+            DbspAggregateFunction::Count if agg.distinct() => {
+                EncodedAggregateAccumulator::CountDistinct {
+                    weights: HashMap::new(),
+                }
+            }
+            DbspAggregateFunction::Count => EncodedAggregateAccumulator::Count { count: 0 },
+            DbspAggregateFunction::Sum => EncodedAggregateAccumulator::Sum {
                 sum: 0,
                 has_value: false,
             },
-            DbspAggregateFunction::Avg => AggregateAccumulator::Avg { sum: 0, count: 0 },
-            DbspAggregateFunction::Min => AggregateAccumulator::Min { current: None },
-            DbspAggregateFunction::Max => AggregateAccumulator::Max { current: None },
+            DbspAggregateFunction::Avg => EncodedAggregateAccumulator::Avg { sum: 0, count: 0 },
+            DbspAggregateFunction::Min => EncodedAggregateAccumulator::Min { current: None },
+            DbspAggregateFunction::Max => EncodedAggregateAccumulator::Max { current: None },
         });
     }
 
     let mut filter_results = vec![false; layout.filters.len()];
-    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_values = vec![None; layout.expressions.len()];
     let mut expression_valid = vec![false; layout.expressions.len()];
     let mut decoded_row_count = 0usize;
 
@@ -949,27 +966,27 @@ fn evaluate_aggregate_values_from_encoded(
         if *weight == 0 {
             continue;
         }
-        let row = match decode_sparse_row_for_columns(
-            value,
-            layout.required_input_columns.as_slice(),
-            schema.len(),
-        ) {
-            Ok(row) => row,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode {context} input row"
-                );
-                continue;
-            }
-        };
+        let decoded =
+            match extract_encoded_row_scalars(value, layout.required_input_columns.as_slice()) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to decode {context} input row"
+                    );
+                    continue;
+                }
+            };
         decoded_row_count = decoded_row_count.saturating_add(1);
 
         for (index, filter) in layout.filters.iter().enumerate() {
             if let Some(column_idx) = layout.filter_direct_columns[index] {
-                let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
-                filter_results[index] = match crate::expression::scalar_to_bool(value) {
+                let decoded_idx = layout.required_input_positions.get(&column_idx).copied();
+                let value = decoded_idx
+                    .and_then(|slot| decoded.get(slot))
+                    .and_then(|scalar| scalar.as_ref());
+                filter_results[index] = match bool_from_encoded_scalar(value) {
                     Ok(include) => include,
                     Err(err) => {
                         tracing::warn!(
@@ -993,8 +1010,9 @@ fn evaluate_aggregate_values_from_encoded(
         expression_valid.fill(false);
         for (index, expr) in layout.expressions.iter().enumerate() {
             if let Some(column_idx) = layout.expression_direct_columns[index] {
-                if let Some(value) = row.get(column_idx) {
-                    expression_values[index] = value.clone();
+                if let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied()
+                {
+                    expression_values[index] = decoded.get(decoded_idx).cloned().flatten();
                     expression_valid[index] = true;
                 }
             } else {
@@ -1018,69 +1036,70 @@ fn evaluate_aggregate_values_from_encoded(
             }
 
             match accumulator {
-                AggregateAccumulator::CountDistinct { weights } => {
+                EncodedAggregateAccumulator::CountDistinct { weights } => {
                     let Some(expr_index) = plan.expr_index else {
                         continue;
                     };
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let expr_value = expression_values[expr_index].clone();
-                    if expr_value.is_null() {
+                    let Some(expr_value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let entry = weights.entry(expr_value.clone()).or_insert(0);
                     *entry += *weight;
                     if *entry == 0 {
                         weights.remove(&expr_value);
                     }
                 }
-                AggregateAccumulator::Count { count } => match plan.expr_index {
+                EncodedAggregateAccumulator::Count { count } => match plan.expr_index {
                     Some(expr_index) => {
-                        if expression_valid[expr_index] && !expression_values[expr_index].is_null()
-                        {
+                        if expression_valid[expr_index] && expression_values[expr_index].is_some() {
                             *count += *weight;
                         }
                     }
                     None => *count += *weight,
                 },
-                AggregateAccumulator::Sum { sum, has_value } => {
+                EncodedAggregateAccumulator::Sum { sum, has_value } => {
                     let Some(expr_index) = plan.expr_index else {
                         continue;
                     };
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                    if let Some(number) =
+                        i64_from_encoded_scalar(expression_values[expr_index].as_ref())
+                    {
                         *sum += number * *weight;
                         *has_value = true;
                     }
                 }
-                AggregateAccumulator::Avg { sum, count } => {
+                EncodedAggregateAccumulator::Avg { sum, count } => {
                     let Some(expr_index) = plan.expr_index else {
                         continue;
                     };
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                    if let Some(number) =
+                        i64_from_encoded_scalar(expression_values[expr_index].as_ref())
+                    {
                         *sum += number * *weight;
                         *count += *weight;
                     }
                 }
-                AggregateAccumulator::Min { current } => {
+                EncodedAggregateAccumulator::Min { current } => {
                     let Some(expr_index) = plan.expr_index else {
                         continue;
                     };
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let expr_value = expression_values[expr_index].clone();
-                    if expr_value.is_null() {
+                    let Some(expr_value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let next = match current.take() {
-                        Some(existing) => match compare_scalar_values(&expr_value, &existing) {
+                        Some(existing) => match compare_encoded_scalars(&expr_value, &existing) {
                             Some(std::cmp::Ordering::Less) => expr_value,
                             Some(_) | None => existing,
                         },
@@ -1088,19 +1107,18 @@ fn evaluate_aggregate_values_from_encoded(
                     };
                     *current = Some(next);
                 }
-                AggregateAccumulator::Max { current } => {
+                EncodedAggregateAccumulator::Max { current } => {
                     let Some(expr_index) = plan.expr_index else {
                         continue;
                     };
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let expr_value = expression_values[expr_index].clone();
-                    if expr_value.is_null() {
+                    let Some(expr_value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let next = match current.take() {
-                        Some(existing) => match compare_scalar_values(&expr_value, &existing) {
+                        Some(existing) => match compare_encoded_scalars(&expr_value, &existing) {
                             Some(std::cmp::Ordering::Greater) => expr_value,
                             Some(_) | None => existing,
                         },
@@ -1120,27 +1138,29 @@ fn evaluate_aggregate_values_from_encoded(
         .iter()
         .zip(accumulators)
         .map(|(agg, accumulator)| match accumulator {
-            AggregateAccumulator::CountDistinct { weights } => ScalarValue::Int64(Some(
+            EncodedAggregateAccumulator::CountDistinct { weights } => ScalarValue::Int64(Some(
                 weights.values().filter(|weight| **weight > 0).count() as i64,
             )),
-            AggregateAccumulator::Count { count } => ScalarValue::Int64(Some(count)),
-            AggregateAccumulator::Sum { sum, has_value } => {
+            EncodedAggregateAccumulator::Count { count } => ScalarValue::Int64(Some(count)),
+            EncodedAggregateAccumulator::Sum { sum, has_value } => {
                 if has_value {
                     scalar_from_i64(sum, agg.output_type())
                 } else {
                     ScalarValue::Null
                 }
             }
-            AggregateAccumulator::Avg { sum, count } => {
+            EncodedAggregateAccumulator::Avg { sum, count } => {
                 if count != 0 {
                     ScalarValue::Int64(Some(sum / count))
                 } else {
                     ScalarValue::Null
                 }
             }
-            AggregateAccumulator::Min { current } | AggregateAccumulator::Max { current } => {
-                current.unwrap_or(ScalarValue::Null)
-            }
+            EncodedAggregateAccumulator::Min { current }
+            | EncodedAggregateAccumulator::Max { current } => current
+                .as_ref()
+                .map(scalar_from_encoded_scalar)
+                .unwrap_or(ScalarValue::Null),
         })
         .collect()
 }
@@ -1190,33 +1210,7 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
         expression_columns.as_ref(),
     )
     .map(Arc::new);
-    let slot_eval_needs_row = !layout.required_input_columns.is_empty();
-    let eval_required_columns =
-        slot_eval_needs_row.then(|| Arc::new(layout.required_input_columns.clone()));
     move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
-        let row = if slot_eval_needs_row {
-            match decode_sparse_row_for_columns(
-                bytes,
-                eval_required_columns
-                    .as_ref()
-                    .expect("required columns should be present when decoding rows")
-                    .as_ref(),
-                input_schema.len(),
-            ) {
-                Ok(row) => Some(row),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to decode aggregate row for incremental aggregate"
-                    );
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-
         let Some(indices) = direct_group_key_columns.as_ref() else {
             tracing::warn!(
                 graph_id = %graph_id,
@@ -1237,15 +1231,10 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
             }
         };
 
-        let row_for_slot_eval = if slot_eval_needs_row {
-            row.as_deref().expect("decoded row should be present")
-        } else {
-            &[]
-        };
         let slots = evaluate_incremental_aggregate_row_values(
             layout.as_ref(),
             &aggregates,
-            row_for_slot_eval,
+            bytes,
             input_schema.as_ref(),
             &graph_id,
             context,
@@ -1260,16 +1249,40 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
 fn evaluate_incremental_aggregate_row_values(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
-    row: &[ScalarValue],
+    row_bytes: &[u8],
     _schema: &RowSchema,
     graph_id: &str,
     context: &str,
 ) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
+    let decoded =
+        match extract_encoded_row_scalars(row_bytes, layout.required_input_columns.as_slice()) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "failed to decode {context} incremental aggregate row inputs"
+                );
+                return aggregates
+                    .iter()
+                    .map(|agg| match agg.function() {
+                        DbspAggregateFunction::Count if !agg.distinct() => {
+                            dbsp::IncrementalAggregateSlotUpdate::Count(0)
+                        }
+                        _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
+                    })
+                    .collect();
+            }
+        };
+
     let mut filter_results = vec![false; layout.filters.len()];
     for (index, filter) in layout.filters.iter().enumerate() {
         if let Some(column_idx) = layout.filter_direct_columns[index] {
-            let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
-            filter_results[index] = match crate::expression::scalar_to_bool(value) {
+            let decoded_idx = layout.required_input_positions.get(&column_idx).copied();
+            let value = decoded_idx
+                .and_then(|slot| decoded.get(slot))
+                .and_then(|scalar| scalar.as_ref());
+            filter_results[index] = match bool_from_encoded_scalar(value) {
                 Ok(include) => include,
                 Err(err) => {
                     tracing::warn!(
@@ -1290,12 +1303,12 @@ fn evaluate_incremental_aggregate_row_values(
         }
     }
 
-    let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
+    let mut expression_values = vec![None; layout.expressions.len()];
     let mut expression_valid = vec![false; layout.expressions.len()];
     for (index, expr) in layout.expressions.iter().enumerate() {
         if let Some(column_idx) = layout.expression_direct_columns[index] {
-            if let Some(value) = row.get(column_idx) {
-                expression_values[index] = value.clone();
+            if let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied() {
+                expression_values[index] = decoded.get(decoded_idx).cloned().flatten();
                 expression_valid[index] = true;
             }
         } else {
@@ -1325,8 +1338,7 @@ fn evaluate_incremental_aggregate_row_values(
             match agg.function() {
                 DbspAggregateFunction::Count if !agg.distinct() => match plan.expr_index {
                     Some(expr_index) => {
-                        if expression_valid[expr_index] && !expression_values[expr_index].is_null()
-                        {
+                        if expression_valid[expr_index] && expression_values[expr_index].is_some() {
                             dbsp::IncrementalAggregateSlotUpdate::Count(1)
                         } else {
                             dbsp::IncrementalAggregateSlotUpdate::Count(0)
@@ -1337,8 +1349,8 @@ fn evaluate_incremental_aggregate_row_values(
                 _ => match plan.expr_index {
                     Some(expr_index) if expression_valid[expr_index] => {
                         dbsp::IncrementalAggregateSlotUpdate::Value(
-                            incremental_aggregate_value_from_scalar(
-                                &expression_values[expr_index],
+                            incremental_aggregate_value_from_encoded_scalar(
+                                expression_values[expr_index].as_ref(),
                                 graph_id,
                                 context,
                             ),
@@ -1349,6 +1361,49 @@ fn evaluate_incremental_aggregate_row_values(
             }
         })
         .collect()
+}
+
+fn bool_from_encoded_scalar(value: Option<&EncodedRowScalar>) -> Result<bool> {
+    match value {
+        Some(EncodedRowScalar::Bool(flag)) => Ok(*flag),
+        None => Ok(false),
+        Some(other) => Err(anyhow!("expected boolean value, found {other:?}")),
+    }
+}
+
+fn i64_from_encoded_scalar(value: Option<&EncodedRowScalar>) -> Option<i64> {
+    match value {
+        Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value)) => {
+            Some(*value)
+        }
+        _ => None,
+    }
+}
+
+fn compare_encoded_scalars(
+    left: &EncodedRowScalar,
+    right: &EncodedRowScalar,
+) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (EncodedRowScalar::Int64(l), EncodedRowScalar::Int64(r)) => Some(l.cmp(r)),
+        (EncodedRowScalar::TimestampMillis(l), EncodedRowScalar::TimestampMillis(r)) => {
+            Some(l.cmp(r))
+        }
+        (EncodedRowScalar::Utf8(l), EncodedRowScalar::Utf8(r)) => Some(l.cmp(r)),
+        (EncodedRowScalar::Bool(l), EncodedRowScalar::Bool(r)) => Some(l.cmp(r)),
+        _ => None,
+    }
+}
+
+fn scalar_from_encoded_scalar(value: &EncodedRowScalar) -> ScalarValue {
+    match value {
+        EncodedRowScalar::Int64(value) => ScalarValue::Int64(Some(*value)),
+        EncodedRowScalar::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
+        EncodedRowScalar::TimestampMillis(value) => {
+            ScalarValue::TimestampMillisecond(Some(*value), None)
+        }
+        EncodedRowScalar::Bool(value) => ScalarValue::Boolean(Some(*value)),
+    }
 }
 
 fn aggregate_value_type_from_dbsp_type(
@@ -1362,21 +1417,18 @@ fn aggregate_value_type_from_dbsp_type(
     }
 }
 
-fn incremental_aggregate_value_from_scalar(
-    value: &ScalarValue,
+fn incremental_aggregate_value_from_encoded_scalar(
+    value: Option<&EncodedRowScalar>,
     graph_id: &str,
     context: &str,
 ) -> Option<dbsp::AggregateValue> {
     match value {
-        ScalarValue::Int64(Some(value)) => Some(dbsp::AggregateValue::Int64(*value)),
-        ScalarValue::TimestampMillisecond(Some(value), _) => {
+        Some(EncodedRowScalar::Int64(value)) => Some(dbsp::AggregateValue::Int64(*value)),
+        Some(EncodedRowScalar::TimestampMillis(value)) => {
             Some(dbsp::AggregateValue::TimestampMillis(*value))
         }
-        ScalarValue::Utf8(Some(value)) => Some(dbsp::AggregateValue::Utf8(value.clone())),
-        ScalarValue::Int64(None)
-        | ScalarValue::TimestampMillisecond(None, _)
-        | ScalarValue::Utf8(None)
-        | ScalarValue::Null => None,
+        Some(EncodedRowScalar::Utf8(value)) => Some(dbsp::AggregateValue::Utf8(value.clone())),
+        None => None,
         other => {
             tracing::warn!(
                 graph_id = %graph_id,
@@ -1460,29 +1512,4 @@ fn expression_lookup_key(expr: &Expr) -> String {
         Expr::Alias(alias) => expression_lookup_key(alias.expr.as_ref()),
         other => other.to_string(),
     }
-}
-
-fn decode_sparse_row_for_columns(
-    encoded: &[u8],
-    columns: &[usize],
-    row_width: usize,
-) -> Result<Vec<ScalarValue>> {
-    if columns.is_empty() {
-        return Ok(vec![ScalarValue::Null; row_width]);
-    }
-    let selected = extract_encoded_row_columns(encoded, columns, false)?
-        .ok_or_else(|| anyhow!("sparse row extraction unexpectedly returned null"))?;
-    let values = decode_projected_row_key(&selected)?;
-    if values.len() != columns.len() {
-        return Err(anyhow!(
-            "sparse row extraction expected {} columns but decoded {}",
-            columns.len(),
-            values.len()
-        ));
-    }
-    let mut row = vec![ScalarValue::Null; row_width];
-    for (slot, column_idx) in columns.iter().copied().enumerate() {
-        row[column_idx] = values[slot].clone();
-    }
-    Ok(row)
 }
