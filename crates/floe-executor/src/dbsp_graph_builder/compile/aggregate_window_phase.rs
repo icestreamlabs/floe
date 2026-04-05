@@ -6,7 +6,9 @@ use datafusion::logical_expr::Expr;
 #[derive(Clone)]
 struct CountEvalLayout {
     filters: Vec<dbsp::DbspExpression>,
+    filter_direct_columns: Vec<Option<usize>>,
     expressions: Vec<dbsp::DbspExpression>,
+    expression_direct_columns: Vec<Option<usize>>,
     plans: Vec<CountEvalPlan>,
 }
 
@@ -165,7 +167,7 @@ impl DbspGraphBuilder {
 
         let agg_schema = Arc::clone(&input_schema);
         let agg_graph_id = graph_id.clone();
-        let agg_layout = Arc::new(build_count_eval_layout(&aggregates));
+        let agg_layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
@@ -367,7 +369,7 @@ impl DbspGraphBuilder {
 
         let agg_schema = Arc::clone(&input_schema);
         let agg_graph_id = graph_id.clone();
-        let agg_layout = Arc::new(build_count_eval_layout(&aggregates));
+        let agg_layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
         let aggregator = move |_key: &Vec<u8>, values: &[(Vec<u8>, i64)]| -> Option<Vec<u8>> {
             if values.is_empty() {
                 return None;
@@ -659,7 +661,7 @@ pub(crate) fn build_count_row_evaluator(
     context: &'static str,
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> + Send + Sync + 'static
 {
-    let layout = Arc::new(build_count_eval_layout(&aggregates));
+    let layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
     let direct_group_key_columns =
         direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
     let key_needs_row = direct_group_key_columns.is_none();
@@ -747,9 +749,14 @@ pub(crate) fn build_count_row_evaluator(
     }
 }
 
-fn build_count_eval_layout(aggregates: &[DbspAggregateExpr]) -> CountEvalLayout {
+fn build_count_eval_layout(
+    aggregates: &[DbspAggregateExpr],
+    schema: &RowSchema,
+) -> CountEvalLayout {
     let mut filters = Vec::new();
+    let mut filter_direct_columns = Vec::new();
     let mut expressions = Vec::new();
+    let mut expression_direct_columns = Vec::new();
     let mut plans = Vec::with_capacity(aggregates.len());
 
     for agg in aggregates {
@@ -761,6 +768,7 @@ fn build_count_eval_layout(aggregates: &[DbspAggregateExpr]) -> CountEvalLayout 
                 existing
             } else {
                 filters.push(filter.clone());
+                filter_direct_columns.push(direct_column_index(filter, schema));
                 filters.len() - 1
             }
         });
@@ -772,6 +780,7 @@ fn build_count_eval_layout(aggregates: &[DbspAggregateExpr]) -> CountEvalLayout 
                 existing
             } else {
                 expressions.push(expr.clone());
+                expression_direct_columns.push(direct_column_index(expr, schema));
                 expressions.len() - 1
             }
         });
@@ -783,7 +792,9 @@ fn build_count_eval_layout(aggregates: &[DbspAggregateExpr]) -> CountEvalLayout 
 
     CountEvalLayout {
         filters,
+        filter_direct_columns,
         expressions,
+        expression_direct_columns,
         plans,
     }
 }
@@ -798,33 +809,55 @@ fn evaluate_count_row_values(
 ) -> Vec<dbsp::CountAggregateSlotUpdate<Vec<u8>>> {
     let mut filter_results = vec![false; layout.filters.len()];
     for (index, filter) in layout.filters.iter().enumerate() {
-        filter_results[index] = match eval_expression(filter, row, schema) {
-            Ok(include) => include,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to evaluate {context} FILTER expression"
-                );
-                false
-            }
-        };
+        if let Some(column_idx) = layout.filter_direct_columns[index] {
+            let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
+            filter_results[index] = match crate::expression::scalar_to_bool(value) {
+                Ok(include) => include,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} direct FILTER column"
+                    );
+                    false
+                }
+            };
+        } else {
+            filter_results[index] = match eval_expression(filter, row, schema) {
+                Ok(include) => include,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} FILTER expression"
+                    );
+                    false
+                }
+            };
+        }
     }
 
     let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
     let mut expression_valid = vec![false; layout.expressions.len()];
     for (index, expr) in layout.expressions.iter().enumerate() {
-        match eval_scalar_expression(expr, row, schema) {
-            Ok(value) => {
-                expression_values[index] = value;
+        if let Some(column_idx) = layout.expression_direct_columns[index] {
+            if let Some(value) = row.get(column_idx) {
+                expression_values[index] = value.clone();
                 expression_valid[index] = true;
             }
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to evaluate {context} aggregate expression"
-                );
+        } else {
+            match eval_scalar_expression(expr, row, schema) {
+                Ok(value) => {
+                    expression_values[index] = value;
+                    expression_valid[index] = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} aggregate expression"
+                    );
+                }
             }
         }
     }
@@ -928,32 +961,54 @@ fn evaluate_aggregate_values_from_encoded(
         decoded_row_count = decoded_row_count.saturating_add(1);
 
         for (index, filter) in layout.filters.iter().enumerate() {
-            filter_results[index] = match eval_expression(filter, &row, schema) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} FILTER expression"
-                    );
-                    false
-                }
-            };
+            if let Some(column_idx) = layout.filter_direct_columns[index] {
+                let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
+                filter_results[index] = match crate::expression::scalar_to_bool(value) {
+                    Ok(include) => include,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} direct FILTER column"
+                        );
+                        false
+                    }
+                };
+            } else {
+                filter_results[index] = match eval_expression(filter, &row, schema) {
+                    Ok(include) => include,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} FILTER expression"
+                        );
+                        false
+                    }
+                };
+            }
         }
 
         expression_valid.fill(false);
         for (index, expr) in layout.expressions.iter().enumerate() {
-            match eval_scalar_expression(expr, &row, schema) {
-                Ok(value) => {
-                    expression_values[index] = value;
+            if let Some(column_idx) = layout.expression_direct_columns[index] {
+                if let Some(value) = row.get(column_idx) {
+                    expression_values[index] = value.clone();
                     expression_valid[index] = true;
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} aggregate expression"
-                    );
+            } else {
+                match eval_scalar_expression(expr, &row, schema) {
+                    Ok(value) => {
+                        expression_values[index] = value;
+                        expression_valid[index] = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %graph_id,
+                            error = %err,
+                            "failed to evaluate {context} aggregate expression"
+                        );
+                    }
                 }
             }
         }
@@ -1130,7 +1185,7 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
     graph_id: String,
     context: &'static str,
 ) -> impl Fn(&Vec<u8>) -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> + Send + Sync + 'static {
-    let layout = Arc::new(build_count_eval_layout(&aggregates));
+    let layout = Arc::new(build_count_eval_layout(&aggregates, input_schema.as_ref()));
     let direct_group_key_columns =
         direct_group_key_columns(&group_keys, input_schema.as_ref()).map(Arc::new);
     let key_needs_row = direct_group_key_columns.is_none();
@@ -1228,33 +1283,55 @@ fn evaluate_incremental_aggregate_row_values(
 ) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
     let mut filter_results = vec![false; layout.filters.len()];
     for (index, filter) in layout.filters.iter().enumerate() {
-        filter_results[index] = match eval_expression(filter, row, schema) {
-            Ok(include) => include,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to evaluate {context} FILTER expression"
-                );
-                false
-            }
-        };
+        if let Some(column_idx) = layout.filter_direct_columns[index] {
+            let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
+            filter_results[index] = match crate::expression::scalar_to_bool(value) {
+                Ok(include) => include,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} direct FILTER column"
+                    );
+                    false
+                }
+            };
+        } else {
+            filter_results[index] = match eval_expression(filter, row, schema) {
+                Ok(include) => include,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} FILTER expression"
+                    );
+                    false
+                }
+            };
+        }
     }
 
     let mut expression_values = vec![ScalarValue::Null; layout.expressions.len()];
     let mut expression_valid = vec![false; layout.expressions.len()];
     for (index, expr) in layout.expressions.iter().enumerate() {
-        match eval_scalar_expression(expr, row, schema) {
-            Ok(value) => {
-                expression_values[index] = value;
+        if let Some(column_idx) = layout.expression_direct_columns[index] {
+            if let Some(value) = row.get(column_idx) {
+                expression_values[index] = value.clone();
                 expression_valid[index] = true;
             }
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to evaluate {context} aggregate expression"
-                );
+        } else {
+            match eval_scalar_expression(expr, row, schema) {
+                Ok(value) => {
+                    expression_values[index] = value;
+                    expression_valid[index] = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "failed to evaluate {context} aggregate expression"
+                    );
+                }
             }
         }
     }
