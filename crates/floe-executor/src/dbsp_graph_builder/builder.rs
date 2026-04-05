@@ -27,8 +27,8 @@ use crate::dbsp_plan::{
 };
 use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
-    EncodedRowProjectionColumn, EncodedRowProjectionSource, decode_projected_row_key,
-    encode_projected_row_key, extract_encoded_row_columns,
+    EncodedRowProjectionColumn, EncodedRowProjectionSource, concat_encoded_rows,
+    decode_projected_row_key, encode_projected_row_key, extract_encoded_row_columns,
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
@@ -4136,13 +4136,13 @@ fn encode_count_aggregate_output_deltas(
         if diff == 0 {
             continue;
         }
-        let mut row = decode_projected_row_key(&key)?;
-        row.extend(
-            values
-                .into_iter()
-                .map(|value| ScalarValue::Int64(Some(value))),
-        );
-        encoded.push((encode_projected_row_key(&row)?, diff));
+        let aggregate_values = values
+            .into_iter()
+            .map(|value| ScalarValue::Int64(Some(value)))
+            .collect::<Vec<_>>();
+        let encoded_aggregate_values = encode_projected_row_key(&aggregate_values)?;
+        let row = concat_encoded_rows(&key, &encoded_aggregate_values)?;
+        encoded.push((row, diff));
     }
     Ok(encoded)
 }
@@ -4155,9 +4155,13 @@ fn encode_incremental_aggregate_output_deltas(
         if diff == 0 {
             continue;
         }
-        let mut row = decode_projected_row_key(&key)?;
-        row.extend(values.iter().map(scalar_from_incremental_aggregate_value));
-        encoded.push((encode_projected_row_key(&row)?, diff));
+        let aggregate_values = values
+            .iter()
+            .map(scalar_from_incremental_aggregate_value)
+            .collect::<Vec<_>>();
+        let encoded_aggregate_values = encode_projected_row_key(&aggregate_values)?;
+        let row = concat_encoded_rows(&key, &encoded_aggregate_values)?;
+        encoded.push((row, diff));
     }
     Ok(encoded)
 }
@@ -4591,17 +4595,30 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
             );
         }
     }
+    let direct_predicate_bool_column =
+        transient_direct_boolean_predicate_column(&predicate, schema.as_ref());
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
             if diff == 0 {
                 continue;
             }
-            let row = match decode_projected_row_key(&encoded) {
-                Ok(row) => row,
-                Err(_) => continue,
+            let include = if let Some(column_idx) = direct_predicate_bool_column {
+                match eval_encoded_boolean_predicate_column(&encoded, column_idx) {
+                    Ok(include) => include,
+                    Err(_) => continue,
+                }
+            } else {
+                let row = match decode_projected_row_key(&encoded) {
+                    Ok(row) => row,
+                    Err(_) => continue,
+                };
+                match eval_predicate(&predicate, &row, schema.as_ref()) {
+                    Ok(include) => include,
+                    Err(_) => continue,
+                }
             };
-            if matches!(eval_predicate(&predicate, &row, schema.as_ref()), Ok(true)) {
+            if include {
                 staged.push((encoded, diff));
             }
         }
@@ -4626,23 +4643,35 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
             );
         }
     }
+    let direct_projection_columns = expressions
+        .iter()
+        .map(|expr| projection_direct_column_index(expr, schema.as_ref()))
+        .collect::<Option<Vec<_>>>()
+        .map(Arc::new);
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
             if diff == 0 {
                 continue;
             }
-            let row = match decode_projected_row_key(&encoded) {
-                Ok(row) => row,
-                Err(_) => continue,
-            };
-            let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
-                Ok(projected) => projected,
-                Err(_) => continue,
-            };
-            let encoded = match encode_projected_row_key(&projected) {
-                Ok(encoded) => encoded,
-                Err(_) => continue,
+            let encoded = if let Some(columns) = direct_projection_columns.as_ref() {
+                match extract_encoded_row_columns(&encoded, columns.as_ref(), false) {
+                    Ok(Some(projected)) => projected,
+                    Ok(None) | Err(_) => continue,
+                }
+            } else {
+                let row = match decode_projected_row_key(&encoded) {
+                    Ok(row) => row,
+                    Err(_) => continue,
+                };
+                let projected = match eval_projection(expressions.as_ref(), &row, schema.as_ref()) {
+                    Ok(projected) => projected,
+                    Err(_) => continue,
+                };
+                match encode_projected_row_key(&projected) {
+                    Ok(encoded) => encoded,
+                    Err(_) => continue,
+                }
             };
             staged.push((encoded, diff));
         }
@@ -4676,28 +4705,66 @@ fn build_filter_map_transform(
             );
         }
     }
+    let direct_predicate_bool_column =
+        transient_direct_boolean_predicate_column(&predicate, filter_schema.as_ref());
+    let direct_projection_columns = expressions
+        .iter()
+        .map(|expr| projection_direct_column_index(expr, project_schema.as_ref()))
+        .collect::<Option<Vec<_>>>()
+        .map(Arc::new);
     Ok(Arc::new(move |delta_values| {
         let mut staged = Vec::with_capacity(delta_values.len());
         for (encoded, diff) in delta_values {
             if diff == 0 {
                 continue;
             }
-            let row = match decode_projected_row_key(&encoded) {
-                Ok(row) => row,
-                Err(_) => continue,
+            let mut decoded_row: Option<Vec<ScalarValue>> = None;
+            let include = if let Some(column_idx) = direct_predicate_bool_column {
+                match eval_encoded_boolean_predicate_column(&encoded, column_idx) {
+                    Ok(include) => include,
+                    Err(_) => continue,
+                }
+            } else {
+                decoded_row = match decode_projected_row_key(&encoded) {
+                    Ok(row) => Some(row),
+                    Err(_) => continue,
+                };
+                match eval_predicate(
+                    &predicate,
+                    decoded_row.as_ref().expect("decoded row should be present"),
+                    filter_schema.as_ref(),
+                ) {
+                    Ok(include) => include,
+                    Err(_) => continue,
+                }
             };
-            match eval_predicate(&predicate, &row, filter_schema.as_ref()) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => continue,
+            if !include {
+                continue;
             }
-            let projected =
-                match eval_projection(expressions.as_ref(), &row, project_schema.as_ref()) {
+            let encoded = if let Some(columns) = direct_projection_columns.as_ref() {
+                match extract_encoded_row_columns(&encoded, columns.as_ref(), false) {
+                    Ok(Some(projected)) => projected,
+                    Ok(None) | Err(_) => continue,
+                }
+            } else {
+                if decoded_row.is_none() {
+                    decoded_row = match decode_projected_row_key(&encoded) {
+                        Ok(row) => Some(row),
+                        Err(_) => continue,
+                    };
+                }
+                let projected = match eval_projection(
+                    expressions.as_ref(),
+                    decoded_row.as_ref().expect("decoded row should be present"),
+                    project_schema.as_ref(),
+                ) {
                     Ok(projected) => projected,
                     Err(_) => continue,
                 };
-            let encoded = match encode_projected_row_key(&projected) {
-                Ok(encoded) => encoded,
-                Err(_) => continue,
+                match encode_projected_row_key(&projected) {
+                    Ok(encoded) => encoded,
+                    Err(_) => continue,
+                }
             };
             staged.push((encoded, diff));
         }
@@ -4722,6 +4789,29 @@ fn eval_projection(
         .iter()
         .map(|expr| eval_scalar_expression(expr.expression(), row, schema))
         .collect()
+}
+
+fn transient_direct_boolean_predicate_column(
+    predicate: &dbsp::DbspPredicate,
+    schema: &RowSchema,
+) -> Option<usize> {
+    let index = projection_direct_column_index_expression(predicate.expression().expr(), schema)?;
+    let field = schema.field(index)?;
+    if field.data_type == dbsp::circuit::types::DbspScalarType::Bool {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn eval_encoded_boolean_predicate_column(encoded: &[u8], column_idx: usize) -> Result<bool> {
+    let selected = extract_encoded_row_columns(encoded, &[column_idx], false)?
+        .ok_or_else(|| anyhow!("direct predicate column extraction returned null"))?;
+    let values = decode_projected_row_key(&selected)?;
+    let value = values
+        .first()
+        .ok_or_else(|| anyhow!("direct predicate column extraction returned no value"))?;
+    crate::expression::scalar_to_bool(value)
 }
 
 #[cfg(test)]
