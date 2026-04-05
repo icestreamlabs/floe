@@ -254,17 +254,12 @@ impl DbspGraphBuilder {
 
         let left_key_columns = Arc::new(left_key_columns_resolved);
         let right_key_columns = Arc::new(right_key_columns_resolved);
-        let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
-            direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
-        });
-        let defer_residual_to_post_filter = matches!(join_type, DbspJoinType::Inner)
-            && residual.is_some()
-            && direct_residual_bool_column.is_none();
+        let defer_residual_to_post_filter =
+            matches!(join_type, DbspJoinType::Inner) && residual.is_some();
         let left_key_columns_for_outer = left_key_columns.clone();
         let right_key_columns_for_outer = right_key_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
-        let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
         let left_output_projection = (left_join_schema.len() != left_schema.len())
             .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
@@ -299,36 +294,7 @@ impl DbspGraphBuilder {
             }
         };
 
-        let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-            if residual.is_none() {
-                return true;
-            }
-            if let Some(column) = direct_residual_bool_column {
-                return match eval_direct_join_predicate_boolean_column(
-                    column,
-                    left_bytes,
-                    right_bytes,
-                ) {
-                    Ok(include) => include,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %predicate_graph_id,
-                            error = %err,
-                            "failed to evaluate direct join residual boolean column"
-                        );
-                        false
-                    }
-                };
-            }
-            if defer_residual_to_post_filter {
-                return true;
-            }
-            tracing::warn!(
-                graph_id = %predicate_graph_id,
-                "non-direct join residual should be evaluated by vectorized post-filter"
-            );
-            false
-        };
+        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
@@ -834,11 +800,7 @@ impl DbspGraphBuilder {
 
         let left_key_columns = Arc::new(left_key_columns_resolved);
         let right_key_columns = Arc::new(right_key_columns_resolved);
-        let direct_residual_bool_column = residual.as_ref().and_then(|expr| {
-            direct_join_predicate_boolean_column(expr, output_schema.as_ref(), left_schema.len())
-        });
-        let defer_residual_to_post_filter =
-            residual.is_some() && direct_residual_bool_column.is_none();
+        let defer_residual_to_post_filter = residual.is_some();
         let deferred_residual_evaluator = if defer_residual_to_post_filter {
             let residual_expr = residual
                 .as_ref()
@@ -860,7 +822,6 @@ impl DbspGraphBuilder {
         };
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
-        let predicate_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
         let left_output_projection = (left_join_schema.len() != left_schema.len())
             .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
@@ -895,36 +856,7 @@ impl DbspGraphBuilder {
             }
         };
 
-        let predicate = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> bool {
-            if residual.is_none() {
-                return true;
-            }
-            if let Some(column) = direct_residual_bool_column {
-                return match eval_direct_join_predicate_boolean_column(
-                    column,
-                    left_bytes,
-                    right_bytes,
-                ) {
-                    Ok(include) => include,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %predicate_graph_id,
-                            error = %err,
-                            "failed to evaluate direct join residual boolean column"
-                        );
-                        false
-                    }
-                };
-            }
-            if defer_residual_to_post_filter {
-                return true;
-            }
-            tracing::warn!(
-                graph_id = %predicate_graph_id,
-                "non-direct transient join residual should be evaluated by vectorized post-filter"
-            );
-            false
-        };
+        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
@@ -1047,12 +979,6 @@ impl DbspGraphBuilder {
     }
 }
 
-#[derive(Clone, Copy)]
-enum JoinPredicateBooleanColumn {
-    Left(usize),
-    Right(usize),
-}
-
 fn direct_column_index(
     expr: &dbsp::circuit::plan::DbspExpression,
     schema: &RowSchema,
@@ -1076,39 +1002,4 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
-}
-
-fn direct_join_predicate_boolean_column(
-    expr: &dbsp::circuit::plan::DbspExpression,
-    output_schema: &RowSchema,
-    left_width: usize,
-) -> Option<JoinPredicateBooleanColumn> {
-    let output_index = direct_column_index(expr, output_schema)?;
-    let field = output_schema.field(output_index)?;
-    if field.data_type != dbsp::circuit::types::DbspScalarType::Bool {
-        return None;
-    }
-    if output_index < left_width {
-        Some(JoinPredicateBooleanColumn::Left(output_index))
-    } else {
-        Some(JoinPredicateBooleanColumn::Right(output_index - left_width))
-    }
-}
-
-fn eval_direct_join_predicate_boolean_column(
-    column: JoinPredicateBooleanColumn,
-    left_bytes: &[u8],
-    right_bytes: &[u8],
-) -> Result<bool> {
-    let (source_bytes, source_index) = match column {
-        JoinPredicateBooleanColumn::Left(index) => (left_bytes, index),
-        JoinPredicateBooleanColumn::Right(index) => (right_bytes, index),
-    };
-    let selected = extract_encoded_row_columns(source_bytes, &[source_index], false)?
-        .ok_or_else(|| anyhow!("direct join predicate boolean column extraction returned null"))?;
-    let values = decode_projected_row_key(&selected)?;
-    let value = values.first().ok_or_else(|| {
-        anyhow!("direct join predicate boolean column extraction returned no value")
-    })?;
-    Ok(crate::expression::scalar_to_bool(value)?)
 }
