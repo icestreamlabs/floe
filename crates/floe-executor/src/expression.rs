@@ -5,7 +5,7 @@ use datafusion::scalar::ScalarValue;
 use dbsp::circuit::{DbspExpression, RowSchema};
 
 use crate::expression_eval::eval_df_expr;
-pub(crate) use crate::expression_eval::{scalar_equals, scalar_to_bool};
+pub(crate) use crate::expression_eval::scalar_to_bool;
 
 use crate::stream_types::Row;
 
