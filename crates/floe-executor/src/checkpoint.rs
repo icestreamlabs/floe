@@ -711,14 +711,20 @@ pub async fn recover_materialized_views(
 mod tests {
     use super::*;
     use crate::dbsp_bridge::DbspBridge;
-    use crate::encoding::encode_projected_row_key;
-    use datafusion::scalar::ScalarValue;
     use dbsp::storage::SlateTable;
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeSet;
 
     use crate::source_journal::SourceBatchJournal;
+
+    fn encoded_i64_row(value: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 1 + 8);
+        encoded.extend_from_slice(&(1_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded
+    }
 
     async fn checkpoint_manager(graph_id: &str) -> CheckpointManager {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -863,8 +869,7 @@ mod tests {
             .await
             .expect("dbsp view");
 
-        let row = vec![ScalarValue::Int64(Some(5))];
-        dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode row"), 1);
+        dbsp_view.add_delta(encoded_i64_row(5), 1);
         let handle = dbsp_view.flush().await.expect("flush base version");
         let latest_view = dbsp_view.latest_handle_view();
         let (dict, table, namespace, version) = latest_view.into_parts();
@@ -902,8 +907,7 @@ mod tests {
             .await
             .expect("dbsp view");
 
-        let row = vec![ScalarValue::Int64(Some(11))];
-        dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode row"), 1);
+        dbsp_view.add_delta(encoded_i64_row(11), 1);
         let handle = dbsp_view.flush().await.expect("flush base version");
 
         let manifest = CheckpointManifest {
