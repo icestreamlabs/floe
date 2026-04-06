@@ -22,7 +22,6 @@ use crate::encoding::decode_projected_row_key;
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
-use crate::stream_types::Row;
 use floe_sql_parser::{FloeStatement, parse_floe_statement};
 
 /// Alias for the DataFusion session context.
@@ -371,7 +370,7 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     version_time: Option<i64>,
 ) -> PgResult<Vec<TailBatch>> {
     let snapshot = mv.snapshot_for(version).await?;
-    let rows = rows_from_snapshot(snapshot)?;
+    let rows = rows_from_snapshot(snapshot, schema.fields().len())?;
     build_tail_batches(rows, schema, version_time)
 }
 
@@ -386,9 +385,9 @@ async fn materialize_delta_batches<M: MaterializedView>(
     let deltas = mv.delta_for(version).await?;
     let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
     let rows_decode_start = Instant::now();
-    let rows = rows_from_delta(deltas)?;
+    let rows = rows_from_delta(deltas, schema.fields().len())?;
     let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
-    let rows_len = rows.len();
+    let rows_len = rows.ops.len();
     let batch_build_start = Instant::now();
     let batches = build_tail_batches(rows, schema, version_time)?;
     let batch_build_ms = batch_build_start.elapsed().as_millis() as u64;
@@ -407,8 +406,19 @@ async fn materialize_delta_batches<M: MaterializedView>(
     Ok(batches)
 }
 
-fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<(Row, i16)>> {
-    let mut rows = Vec::new();
+struct TailDecodedRows {
+    columns: Vec<Vec<ScalarValue>>,
+    ops: Vec<i16>,
+}
+
+fn rows_from_snapshot(
+    snapshot: HashMap<Vec<u8>, i64>,
+    column_count: usize,
+) -> PgResult<TailDecodedRows> {
+    let mut decoded_rows = TailDecodedRows {
+        columns: vec![Vec::new(); column_count],
+        ops: Vec::new(),
+    };
     for (key, diff) in snapshot {
         if diff < 0 {
             bail!("materialized view snapshot contains negative diff {diff}");
@@ -417,16 +427,29 @@ fn rows_from_snapshot(snapshot: HashMap<Vec<u8>, i64>) -> PgResult<Vec<(Row, i16
             continue;
         }
         let decoded = decode_projected_row_key(&key)?;
+        if decoded.len() != column_count {
+            bail!(
+                "decoded row has {} columns but schema has {}",
+                decoded.len(),
+                column_count
+            );
+        }
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
         for _ in 0..count {
-            rows.push((decoded.clone(), 1));
+            for (idx, value) in decoded.iter().enumerate() {
+                decoded_rows.columns[idx].push(value.clone());
+            }
+            decoded_rows.ops.push(1);
         }
     }
-    Ok(rows)
+    Ok(decoded_rows)
 }
 
-fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>) -> PgResult<Vec<(Row, i16)>> {
-    let mut rows = Vec::new();
+fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, column_count: usize) -> PgResult<TailDecodedRows> {
+    let mut decoded_rows = TailDecodedRows {
+        columns: vec![Vec::new(); column_count],
+        ops: Vec::new(),
+    };
     for (key, diff) in deltas {
         if diff == 0 {
             continue;
@@ -434,60 +457,38 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>) -> PgResult<Vec<(Row, i16)>> {
         let op = if diff > 0 { 1 } else { -1 };
         let count = diff.checked_abs().context("delta diff overflow")? as usize;
         let decoded = decode_projected_row_key(&key)?;
-        for _ in 0..count {
-            rows.push((decoded.clone(), op));
-        }
-    }
-    Ok(rows)
-}
-
-fn build_tail_batches(
-    rows: Vec<(Row, i16)>,
-    schema: SchemaRef,
-    version_time: Option<i64>,
-) -> PgResult<Vec<TailBatch>> {
-    let (rows, ops): (Vec<Row>, Vec<i16>) = rows.into_iter().unzip();
-    let batches = build_record_batches(rows, schema)?;
-    let mut offset = 0usize;
-    let mut result = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let row_count = batch.num_rows();
-        let ops_slice = ops
-            .get(offset..offset + row_count)
-            .context("tail ops length mismatch")?
-            .to_vec();
-        let times = vec![version_time; row_count];
-        offset += row_count;
-        result.push(TailBatch {
-            version: 0,
-            batch,
-            ops: ops_slice,
-            times,
-        });
-    }
-    ensure!(offset == ops.len(), "tail ops length mismatch");
-    Ok(result)
-}
-
-fn build_record_batches(rows: Vec<Row>, schema: SchemaRef) -> PgResult<Vec<RecordBatch>> {
-    if rows.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(schema)]);
-    }
-    let column_count = schema.fields().len();
-    let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(rows.len()); column_count];
-    for row in rows {
-        if row.len() != column_count {
+        if decoded.len() != column_count {
             bail!(
-                "row has {} columns but schema has {}",
-                row.len(),
+                "decoded row has {} columns but schema has {}",
+                decoded.len(),
                 column_count
             );
         }
-        for (idx, value) in row.into_iter().enumerate() {
-            columns[idx].push(value);
+        for _ in 0..count {
+            for (idx, value) in decoded.iter().enumerate() {
+                decoded_rows.columns[idx].push(value.clone());
+            }
+            decoded_rows.ops.push(op);
         }
     }
-    let arrays: Vec<ArrayRef> = columns
+    Ok(decoded_rows)
+}
+
+fn build_tail_batches(
+    rows: TailDecodedRows,
+    schema: SchemaRef,
+    version_time: Option<i64>,
+) -> PgResult<Vec<TailBatch>> {
+    if rows.ops.is_empty() {
+        return Ok(vec![TailBatch {
+            version: 0,
+            batch: RecordBatch::new_empty(schema),
+            ops: Vec::new(),
+            times: Vec::new(),
+        }]);
+    }
+    let arrays: Vec<ArrayRef> = rows
+        .columns
         .into_iter()
         .enumerate()
         .map(|(idx, col)| {
@@ -496,7 +497,16 @@ fn build_record_batches(rows: Vec<Row>, schema: SchemaRef) -> PgResult<Vec<Recor
         })
         .collect::<PgResult<_>>()?;
     let batch = RecordBatch::try_new(schema, arrays)?;
-    Ok(vec![batch])
+    ensure!(
+        rows.ops.len() == batch.num_rows(),
+        "tail ops length mismatch"
+    );
+    Ok(vec![TailBatch {
+        version: 0,
+        times: vec![version_time; batch.num_rows()],
+        batch,
+        ops: rows.ops,
+    }])
 }
 
 #[cfg(test)]
@@ -506,6 +516,7 @@ mod tests {
     use crate::encoding::encode_projected_row_key;
     use crate::materialized_view::DbspPersistedState;
     use crate::mv::registry::MaterializedViewRegistry;
+    use crate::stream_types::Row;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use dbsp::StreamRetention;

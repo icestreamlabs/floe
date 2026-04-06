@@ -84,13 +84,13 @@ impl SourceTableProvider {
             projection,
             limit,
             None,
-            move |row| {
+            Some(move |row: &crate::stream_types::Row| {
                 if let (Some(filter), Some(index)) = (primary_key_filter, primary_key_index) {
                     row.get(index).is_some_and(|value| filter.matches(value))
                 } else {
                     true
                 }
-            },
+            }),
         )
     }
 

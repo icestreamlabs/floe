@@ -7,7 +7,7 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::scalar::ScalarValue;
 
-use crate::encoding::decode_projected_row_key;
+use crate::encoding::{decode_projected_row_key, extract_encoded_row_columns};
 use crate::stream_types::Row;
 
 use super::MV_VERSION_COLUMN;
@@ -86,7 +86,7 @@ pub(super) fn build_batches_from_encoded_snapshot<F>(
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     mv_version: Option<u64>,
-    row_filter: F,
+    row_filter: Option<F>,
 ) -> DFResult<(SchemaRef, Vec<RecordBatch>)>
 where
     F: Fn(&Row) -> bool,
@@ -103,6 +103,19 @@ where
         vec![Vec::with_capacity(SCAN_BATCH_ROW_LIMIT); projected_indices.len()];
     let mut rows_in_batch = 0usize;
     let mut total_rows = 0usize;
+    let mut projection_source_indices = projected_indices
+        .iter()
+        .copied()
+        .filter(|source_idx| Some(*source_idx) != mv_version_index)
+        .collect::<Vec<_>>();
+    projection_source_indices.sort_unstable();
+    projection_source_indices.dedup();
+    let projection_source_positions = projection_source_indices
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, source_idx)| (source_idx, slot))
+        .collect::<std::collections::HashMap<_, _>>();
     'snapshot: for (key, diff) in snapshot {
         if diff < 0 {
             return Err(DataFusionError::Execution(format!(
@@ -112,18 +125,40 @@ where
         if diff == 0 {
             continue;
         }
-        let decoded = decode_projected_row_key(&key)
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        if decoded.len() != decoded_row_len {
-            return Err(DataFusionError::Execution(format!(
-                "decoded row has {} columns but expected {}",
-                decoded.len(),
-                decoded_row_len
-            )));
-        }
-        if !row_filter(&decoded) {
-            continue;
-        }
+        let decoded = if let Some(filter) = row_filter.as_ref() {
+            let decoded = decode_projected_row_key(&key)
+                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+            if decoded.len() != decoded_row_len {
+                return Err(DataFusionError::Execution(format!(
+                    "decoded row has {} columns but expected {}",
+                    decoded.len(),
+                    decoded_row_len
+                )));
+            }
+            if !filter(&decoded) {
+                continue;
+            }
+            Some(decoded)
+        } else {
+            None
+        };
+        let projected_values = if decoded.is_none() && !projection_source_indices.is_empty() {
+            let selected =
+                extract_encoded_row_columns(&key, projection_source_indices.as_slice(), false)
+                    .map_err(|err| DataFusionError::Execution(err.to_string()))?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "projected encoded row unexpectedly contained NULL selection"
+                                .to_string(),
+                        )
+                    })?;
+            Some(
+                decode_projected_row_key(&selected)
+                    .map_err(|err| DataFusionError::Execution(err.to_string()))?,
+            )
+        } else {
+            None
+        };
         for _ in 0..diff {
             if let Some(limit) = limit
                 && total_rows >= limit
@@ -137,12 +172,30 @@ where
             for (column_idx, source_idx) in projected_indices.iter().enumerate() {
                 let value = if Some(*source_idx) == mv_version_index {
                     ScalarValue::UInt64(Some(mv_version.unwrap_or(0)))
-                } else {
+                } else if let Some(decoded) = decoded.as_ref() {
                     decoded.get(*source_idx).cloned().ok_or_else(|| {
                         DataFusionError::Execution(format!(
                             "row does not contain projected column index {source_idx}"
                         ))
                     })?
+                } else {
+                    let projected_slot = projection_source_positions
+                        .get(source_idx)
+                        .copied()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "projection source column index {source_idx} was not decoded"
+                            ))
+                        })?;
+                    projected_values
+                        .as_ref()
+                        .and_then(|values| values.get(projected_slot))
+                        .cloned()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "row does not contain projected column index {source_idx}"
+                            ))
+                        })?
                 };
                 columns[column_idx].push(value);
             }
