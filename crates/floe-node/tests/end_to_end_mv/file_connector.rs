@@ -66,11 +66,11 @@ async fn file_connector_ingests_and_queries() -> Result<()> {
             let Some(decoder) = decoders.get(event.source()) else {
                 continue;
             };
-            let (row, _ts) = decoder.decode(&event)?;
+            let (encoded, _ts) = decoder.encode_row_key(&event)?;
             let Some(writer) = harness.outer.writer_mut(event.source()) else {
                 continue;
             };
-            writer.append(&row, 1)?;
+            writer.append_encoded(encoded, 1)?;
         }
     }
     harness.outer.tick_all().await?;

@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::scalar::ScalarValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 use serde_json::Value;
 
-use crate::stream_types::{Row, Timestamp};
+use crate::stream_types::Timestamp;
 
 trait PayloadRefExt<'a> {
     fn require_payload(self, message: &'static str) -> Result<&'a Value>;
@@ -51,41 +50,6 @@ impl SourceRowDecoder {
         &self.definition
     }
 
-    pub fn decode(&self, event: &SourceEvent) -> Result<(Row, Option<Timestamp>)> {
-        if event.source() != self.definition.name() {
-            bail!(
-                "event source {} does not match definition {}",
-                event.source(),
-                self.definition.name()
-            );
-        }
-        let payload = SourceEvent::payload(event)
-            .require_payload("source payload must be present for decoded events")?;
-        let object = payload
-            .as_object()
-            .context("source payload must be a JSON object")?;
-        let mut row = Vec::with_capacity(self.definition.columns().len());
-        let mut event_ts = None;
-        for column in self.definition.columns() {
-            let scalar = match object.get(column.name()) {
-                Some(value) => convert_value(column.data_type(), value, column.nullable())?,
-                None if column.nullable() => null_scalar(column.data_type()),
-                None => {
-                    bail!("missing field '{}' in source payload", column.name());
-                }
-            };
-            if event_ts.is_none()
-                && matches!(column.data_type(), SourceDataType::TimestampMillis)
-                && let ScalarValue::TimestampMillisecond(Some(ms), _) = scalar
-                && ms >= 0
-            {
-                event_ts = Some(ms as u64);
-            }
-            row.push(scalar);
-        }
-        Ok((row, event_ts))
-    }
-
     pub fn encode_row_key(&self, event: &SourceEvent) -> Result<(Vec<u8>, Option<Timestamp>)> {
         if event.source() != self.definition.name() {
             bail!(
@@ -127,50 +91,6 @@ impl SourceRowDecoder {
             .and_then(|columns| columns.get(idx))
             .copied()
             .unwrap_or(true)
-    }
-}
-
-fn convert_value(data_type: &SourceDataType, value: &Value, nullable: bool) -> Result<ScalarValue> {
-    if value.is_null() {
-        if nullable {
-            return Ok(null_scalar(data_type));
-        }
-        bail!("null value violates non-nullable column");
-    }
-    match data_type {
-        SourceDataType::Int64 => {
-            let number = value
-                .as_i64()
-                .with_context(|| format!("expected integer value, found {value}"))?;
-            Ok(ScalarValue::Int64(Some(number)))
-        }
-        SourceDataType::Utf8 => {
-            let string = value
-                .as_str()
-                .with_context(|| format!("expected string value, found {value}"))?;
-            Ok(ScalarValue::Utf8(Some(string.to_string())))
-        }
-        SourceDataType::Bool => {
-            let boolean = value
-                .as_bool()
-                .with_context(|| format!("expected boolean value, found {value}"))?;
-            Ok(ScalarValue::Boolean(Some(boolean)))
-        }
-        SourceDataType::TimestampMillis => {
-            let number = value
-                .as_i64()
-                .with_context(|| format!("expected integer timestamp, found {value}"))?;
-            Ok(ScalarValue::TimestampMillisecond(Some(number), None))
-        }
-    }
-}
-
-fn null_scalar(data_type: &SourceDataType) -> ScalarValue {
-    match data_type {
-        SourceDataType::Int64 => ScalarValue::Int64(None),
-        SourceDataType::Utf8 => ScalarValue::Utf8(None),
-        SourceDataType::Bool => ScalarValue::Boolean(None),
-        SourceDataType::TimestampMillis => ScalarValue::TimestampMillisecond(None, None),
     }
 }
 
@@ -253,12 +173,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::encoding::{
-        EncodedRowScalar, decode_all_encoded_row_scalars, encode_projected_row_key,
-    };
+    use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 
     #[test]
-    fn decodes_nexmark_bid_event() {
+    fn encodes_nexmark_bid_event() {
         let definition = SourceDefinition::new(
             "nexmark_bid",
             vec![
@@ -286,25 +204,26 @@ mod tests {
             }),
         );
 
-        let (row, ts) = decoder.decode(&event).expect("decode");
+        let (encoded, ts) = decoder.encode_row_key(&event).expect("encode");
+        let row = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
         assert_eq!(row.len(), 7);
-        assert_eq!(row[0], ScalarValue::Int64(Some(100)));
-        assert_eq!(row[1], ScalarValue::Int64(Some(42)));
-        assert_eq!(row[2], ScalarValue::Int64(Some(99)));
-        assert_eq!(row[3], ScalarValue::Utf8(Some("web".to_string())));
+        assert_eq!(row[0], Some(EncodedRowScalar::Int64(100)));
+        assert_eq!(row[1], Some(EncodedRowScalar::Int64(42)));
+        assert_eq!(row[2], Some(EncodedRowScalar::Int64(99)));
+        assert_eq!(row[3], Some(EncodedRowScalar::Utf8("web".to_string())));
         assert_eq!(
             row[4],
-            ScalarValue::Utf8(Some("http://example.com".to_string()))
+            Some(EncodedRowScalar::Utf8("http://example.com".to_string()))
         );
         assert_eq!(
             row[5],
-            ScalarValue::TimestampMillisecond(Some(1_600_000_000), None)
+            Some(EncodedRowScalar::TimestampMillis(1_600_000_000))
         );
         assert_eq!(ts, Some(1_600_000_000_u64));
     }
 
     #[test]
-    fn decodes_boolean_column() {
+    fn encodes_boolean_column() {
         let definition = SourceDefinition::new(
             "flags",
             vec![
@@ -322,10 +241,11 @@ mod tests {
             }),
         );
 
-        let (row, ts) = decoder.decode(&event).expect("decode");
+        let (encoded, ts) = decoder.encode_row_key(&event).expect("encode");
+        let row = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
         assert_eq!(row.len(), 2);
-        assert_eq!(row[0], ScalarValue::Int64(Some(1)));
-        assert_eq!(row[1], ScalarValue::Boolean(Some(true)));
+        assert_eq!(row[0], Some(EncodedRowScalar::Int64(1)));
+        assert_eq!(row[1], Some(EncodedRowScalar::Bool(true)));
         assert_eq!(ts, None);
     }
 
@@ -342,9 +262,9 @@ mod tests {
         let decoder = SourceRowDecoder::new(definition);
         let event = SourceEvent::new("orders", json!({"id": 1}));
         let err = decoder
-            .decode(&event)
+            .encode_row_key(&event)
             .expect_err("missing price should fail");
-        assert!(err.to_string().contains("missing field 'price'"));
+        assert!(err.to_string().contains("missing field in source payload"));
     }
 
     #[test]
@@ -361,7 +281,7 @@ mod tests {
         let decoder = SourceRowDecoder::new(definition);
         let event = SourceEvent::new("orders", json!({"id": "oops"}));
         let err = decoder
-            .decode(&event)
+            .encode_row_key(&event)
             .expect_err("type mismatch should fail");
         assert!(err.to_string().contains("expected integer value"));
     }
@@ -378,7 +298,9 @@ mod tests {
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
         let event = SourceEvent::new("orders", json!({"id": null, "note": null}));
-        let err = decoder.decode(&event).expect_err("null id should fail");
+        let err = decoder
+            .encode_row_key(&event)
+            .expect_err("null id should fail");
         assert!(
             err.to_string()
                 .contains("null value violates non-nullable column")
@@ -386,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_encoding_matches_row_encoding() {
+    fn direct_encoding_produces_expected_scalars_and_timestamp() {
         let definition = SourceDefinition::new(
             "orders",
             vec![
@@ -408,11 +330,19 @@ mod tests {
             }),
         );
 
-        let (row, decoded_ts) = decoder.decode(&event).expect("decode");
-        let expected = encode_projected_row_key(&row).expect("encode row");
         let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
-        assert_eq!(encoded, expected);
-        assert_eq!(direct_ts, decoded_ts);
+        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        assert_eq!(decoded[0], Some(EncodedRowScalar::Int64(42)));
+        assert_eq!(
+            decoded[1],
+            Some(EncodedRowScalar::Utf8("hello".to_string()))
+        );
+        assert_eq!(
+            decoded[2],
+            Some(EncodedRowScalar::TimestampMillis(1_700_000_000))
+        );
+        assert_eq!(decoded[3], Some(EncodedRowScalar::Bool(true)));
+        assert_eq!(direct_ts, Some(1_700_000_000_u64));
     }
 
     #[test]
