@@ -8,6 +8,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::scalar::ScalarValue;
 
+use crate::encoding::EncodedRowScalar;
+
 pub(crate) enum ScalarColumnBuilder {
     Int64(Int64Builder),
     Utf8(StringBuilder),
@@ -114,6 +116,75 @@ impl ScalarColumnBuilder {
                 } else {
                     return Err(anyhow!(
                         "expected NULL scalar for Null column, found {value:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_encoded_scalar(&mut self, value: Option<&EncodedRowScalar>) -> Result<()> {
+        match self {
+            Self::Int64(builder) => match value {
+                Some(EncodedRowScalar::Int64(value)) => builder.append_value(*value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Int64 encoded scalar for Int64 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Utf8(builder) => match value {
+                Some(EncodedRowScalar::Utf8(value)) => builder.append_value(value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Utf8 encoded scalar for Utf8 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::TimestampMillis { builder, .. } => match value {
+                Some(EncodedRowScalar::TimestampMillis(value)) => builder.append_value(*value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected TimestampMillis encoded scalar for timestamp(ms) column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Bool(builder) => match value {
+                Some(EncodedRowScalar::Bool(value)) => builder.append_value(*value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Bool encoded scalar for boolean column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Binary(builder) => {
+                if value.is_none() {
+                    builder.append_null();
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to binary column builder"
+                    ));
+                }
+            }
+            Self::UInt64(builder) => {
+                if value.is_none() {
+                    builder.append_null();
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to UInt64 column builder"
+                    ));
+                }
+            }
+            Self::Null { len } => {
+                if value.is_none() {
+                    *len += 1;
+                } else {
+                    return Err(anyhow!(
+                        "expected NULL encoded scalar for Null column, found {value:?}"
                     ));
                 }
             }

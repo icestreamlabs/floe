@@ -7,7 +7,7 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::scalar::ScalarValue;
 
-use crate::encoding::{extract_encoded_row_scalars, scalar_value_from_encoded_scalar};
+use crate::encoding::extract_encoded_row_scalars;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::Row;
 
@@ -162,15 +162,18 @@ pub(super) fn build_batches_from_encoded_snapshot(
                                 "projection source column index {source_idx} was not decoded"
                             ))
                         })?;
-                    projected_values
+                    let encoded_value = projected_values
                         .as_ref()
                         .and_then(|values| values.get(projected_slot))
-                        .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
                         .ok_or_else(|| {
                             DataFusionError::Execution(format!(
                                 "row does not contain projected column index {source_idx}"
                             ))
-                        })?
+                        })?;
+                    builders[column_idx]
+                        .append_encoded_scalar(encoded_value.as_ref())
+                        .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+                    continue;
                 };
                 builders[column_idx]
                     .append(&value)
