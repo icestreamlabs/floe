@@ -5,13 +5,13 @@ use anyhow::{Result, anyhow, bail};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::scalar::ScalarValue;
 
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
+use crate::encoding::decode_all_encoded_row_scalars;
 use crate::metrics;
 use crate::scalar_array_builder::ScalarColumnBuilder;
-use crate::stream_types::{Diff, Row};
+use crate::stream_types::Diff;
 
 #[derive(Clone, Copy, Debug)]
 pub enum FlushReason {
@@ -92,17 +92,18 @@ impl DeltaBatchBuffer {
 
     pub fn push(
         &mut self,
-        row: Row,
+        row: Vec<u8>,
         weight: Diff,
         key: Option<Vec<u8>>,
     ) -> Result<Option<RecordBatch>> {
         if weight == 0 {
             return Ok(None);
         }
-        if row.len() != self.base_schema.fields().len() {
+        let decoded = decode_all_encoded_row_scalars(&row)?;
+        if decoded.len() != self.base_schema.fields().len() {
             return Err(anyhow!(
-                "row has {} columns but schema has {}",
-                row.len(),
+                "encoded row has {} columns but schema has {}",
+                decoded.len(),
                 self.base_schema.fields().len()
             ));
         }
@@ -117,9 +118,9 @@ impl DeltaBatchBuffer {
             (None, None) => {}
         }
 
-        self.estimated_bytes += estimate_row_bytes(&row);
-        for (idx, value) in row.into_iter().enumerate() {
-            self.columns[idx].append(&value)?;
+        self.estimated_bytes += estimate_encoded_row_bytes(&row);
+        for (idx, value) in decoded.iter().enumerate() {
+            self.columns[idx].append_encoded_scalar(value.as_ref())?;
         }
         self.row_count += 1;
         self.weights.push(weight);
@@ -167,14 +168,14 @@ impl DeltaBatchBuffer {
         if let Some(keys) = self.keys.as_mut() {
             let mut key_builder = ScalarColumnBuilder::new(&DataType::Binary, keys.len())?;
             for key in keys.drain(..) {
-                key_builder.append(&ScalarValue::Binary(Some(key)))?;
+                key_builder.append_binary_value(&key)?;
             }
             arrays.push(key_builder.finish_array());
         }
 
         let mut weight_builder = ScalarColumnBuilder::new(&DataType::Int64, self.weights.len())?;
         for weight in self.weights.drain(..) {
-            weight_builder.append(&ScalarValue::Int64(Some(weight)))?;
+            weight_builder.append_i64_value(weight)?;
         }
         arrays.push(weight_builder.finish_array());
 
@@ -193,12 +194,8 @@ impl DeltaBatchBuffer {
     }
 }
 
-fn estimate_row_bytes(row: &Row) -> usize {
-    let mut bytes = size_of::<Diff>();
-    for value in row {
-        bytes += value.size();
-    }
-    bytes
+fn estimate_encoded_row_bytes(row: &[u8]) -> usize {
+    size_of::<Diff>() + row.len()
 }
 
 #[cfg(test)]
@@ -212,11 +209,16 @@ mod tests {
         ]))
     }
 
-    fn row(id: i64, name: &str) -> Row {
-        vec![
-            ScalarValue::Int64(Some(id)),
-            ScalarValue::Utf8(Some(name.to_string())),
-        ]
+    fn row(id: i64, name: &str) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 9 + 8 + name.len());
+        encoded.extend_from_slice(&(2_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&id.to_le_bytes());
+        encoded.push(0x02);
+        let bytes = name.as_bytes();
+        encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(bytes);
+        encoded
     }
 
     #[test]

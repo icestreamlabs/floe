@@ -9,29 +9,22 @@ use dbsp::{
 };
 
 use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
-use crate::encoding::encode_projected_row_key;
-use crate::stream_types::{Diff, Row};
+use crate::encoding::extract_encoded_row_columns;
+use crate::stream_types::Diff;
 
 pub fn source_primary_key_columns(source_name: &str) -> Option<Vec<usize>> {
     source_table(source_name).map(|table| table.primary_key().columns().to_vec())
 }
 
-pub fn encode_primary_key(row: &Row, key_columns: &[usize]) -> Result<Vec<u8>> {
-    let key_row = key_columns
-        .iter()
-        .map(|index| {
-            row.get(*index)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing key column at index {index}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    encode_projected_row_key(&key_row)
+pub fn encode_primary_key(row: &[u8], key_columns: &[usize]) -> Result<Vec<u8>> {
+    extract_encoded_row_columns(row, key_columns, true)?
+        .ok_or_else(|| anyhow!("primary-key column evaluated to NULL"))
 }
 
 pub fn build_source_delta_batch(
     source_name: &str,
     base_schema: SchemaRef,
-    rows: impl IntoIterator<Item = (Row, Diff)>,
+    rows: impl IntoIterator<Item = (Vec<u8>, Diff)>,
 ) -> Result<RecordBatch> {
     let key_columns = source_primary_key_columns(source_name);
     build_delta_batch(base_schema, rows, key_columns.as_deref())
@@ -39,7 +32,7 @@ pub fn build_source_delta_batch(
 
 pub fn build_delta_batch(
     base_schema: SchemaRef,
-    rows: impl IntoIterator<Item = (Row, Diff)>,
+    rows: impl IntoIterator<Item = (Vec<u8>, Diff)>,
     key_columns: Option<&[usize]>,
 ) -> Result<RecordBatch> {
     let include_key = key_columns.is_some();
@@ -77,7 +70,6 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Array, BinaryArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::scalar::ScalarValue;
 
     fn person_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -86,11 +78,16 @@ mod tests {
         ]))
     }
 
-    fn person_row(id: i64, name: &str) -> Row {
-        vec![
-            ScalarValue::Int64(Some(id)),
-            ScalarValue::Utf8(Some(name.to_string())),
-        ]
+    fn person_row(id: i64, name: &str) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 9 + 8 + name.len());
+        encoded.extend_from_slice(&(2_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&id.to_le_bytes());
+        encoded.push(0x02);
+        let bytes = name.as_bytes();
+        encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(bytes);
+        encoded
     }
 
     #[test]

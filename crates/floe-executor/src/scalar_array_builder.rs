@@ -6,7 +6,6 @@ use datafusion::arrow::array::{
     TimestampMillisecondBuilder, UInt64Builder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::scalar::ScalarValue;
 use floe_core::RowValue;
 
 use crate::encoding::EncodedRowScalar;
@@ -53,75 +52,6 @@ impl ScalarColumnBuilder {
                 "unsupported scalar column type for typed array builder: {other:?}"
             )),
         }
-    }
-
-    pub(crate) fn append(&mut self, value: &ScalarValue) -> Result<()> {
-        match self {
-            Self::Int64(builder) => match value {
-                ScalarValue::Int64(v) => builder.append_option(*v),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected Int64 scalar for Int64 column, found {other:?}"
-                    ));
-                }
-            },
-            Self::Utf8(builder) => match value {
-                ScalarValue::Utf8(v) => builder.append_option(v.as_deref()),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected Utf8 scalar for Utf8 column, found {other:?}"
-                    ));
-                }
-            },
-            Self::TimestampMillis { builder, .. } => match value {
-                ScalarValue::TimestampMillisecond(v, _) => builder.append_option(*v),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected TimestampMillisecond scalar for timestamp(ms) column, found {other:?}"
-                    ));
-                }
-            },
-            Self::Bool(builder) => match value {
-                ScalarValue::Boolean(v) => builder.append_option(*v),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected Boolean scalar for boolean column, found {other:?}"
-                    ));
-                }
-            },
-            Self::Binary(builder) => match value {
-                ScalarValue::Binary(v) => builder.append_option(v.as_deref()),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected Binary scalar for binary column, found {other:?}"
-                    ));
-                }
-            },
-            Self::UInt64(builder) => match value {
-                ScalarValue::UInt64(v) => builder.append_option(*v),
-                other if other.is_null() => builder.append_null(),
-                other => {
-                    return Err(anyhow!(
-                        "expected UInt64 scalar for UInt64 column, found {other:?}"
-                    ));
-                }
-            },
-            Self::Null { len } => {
-                if value.is_null() {
-                    *len += 1;
-                } else {
-                    return Err(anyhow!(
-                        "expected NULL scalar for Null column, found {value:?}"
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn append_row_value(&mut self, value: &RowValue) -> Result<()> {
@@ -180,6 +110,30 @@ impl ScalarColumnBuilder {
             other => Err(anyhow!(
                 "expected UInt64 column builder when appending u64 value, found {:?}",
                 std::mem::discriminant(other)
+            )),
+        }
+    }
+
+    pub(crate) fn append_i64_value(&mut self, value: i64) -> Result<()> {
+        match self {
+            Self::Int64(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "expected Int64 column builder when appending i64 value"
+            )),
+        }
+    }
+
+    pub(crate) fn append_binary_value(&mut self, value: &[u8]) -> Result<()> {
+        match self {
+            Self::Binary(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "expected Binary column builder when appending binary value"
             )),
         }
     }

@@ -5,7 +5,6 @@ use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::TableProvider;
 use datafusion::execution::context::SessionContext;
-use datafusion::scalar::ScalarValue;
 
 use floe_executor::{
     ConsolidationMode, DynamicStateTableProvider, VectorizedPlanExecutor, build_delta_batch,
@@ -26,18 +25,28 @@ fn right_schema() -> SchemaRef {
     ]))
 }
 
-fn person_row(id: i64, name: &str) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(id)),
-        ScalarValue::Utf8(Some(name.to_string())),
-    ]
+fn person_row(id: i64, name: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 9 + 8 + name.len());
+    encoded.extend_from_slice(&(2_u32).to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&id.to_le_bytes());
+    encoded.push(0x02);
+    let bytes = name.as_bytes();
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
+    encoded
 }
 
-fn right_row(id: i64, tag: &str) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(id)),
-        ScalarValue::Utf8(Some(tag.to_string())),
-    ]
+fn right_row(id: i64, tag: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 9 + 8 + tag.len());
+    encoded.extend_from_slice(&(2_u32).to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&id.to_le_bytes());
+    encoded.push(0x02);
+    let bytes = tag.as_bytes();
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
+    encoded
 }
 
 #[tokio::test]
