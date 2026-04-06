@@ -3231,37 +3231,38 @@ async fn wait_for_visible_row_count(
     .expect("wait for visible rows");
 }
 
-fn sort_rows_by_first_column(rows: &mut [Vec<ScalarValue>]) {
+type TestRow = Vec<Option<EncodedRowScalar>>;
+
+fn sort_rows_by_first_column(rows: &mut [TestRow]) {
     rows.sort_by_key(|row| match row.first() {
-        Some(ScalarValue::Int64(Some(value))) => *value,
-        Some(ScalarValue::TimestampMillisecond(Some(value), _)) => *value,
+        Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
+            *value
+        }
         _ => 0,
     });
 }
 
-fn int_row(values: &[i64]) -> Vec<ScalarValue> {
+fn int_row(values: &[i64]) -> TestRow {
     values
         .iter()
         .copied()
-        .map(|value| ScalarValue::Int64(Some(value)))
+        .map(EncodedRowScalar::Int64)
+        .map(Some)
         .collect()
 }
 
-fn int_utf8_row(id: i64, label: Option<&str>) -> Vec<ScalarValue> {
+fn int_utf8_row(id: i64, label: Option<&str>) -> TestRow {
     vec![
-        ScalarValue::Int64(Some(id)),
+        Some(EncodedRowScalar::Int64(id)),
         match label {
-            Some(label) => ScalarValue::Utf8(Some(label.to_string())),
-            None => ScalarValue::Utf8(None),
+            Some(label) => Some(EncodedRowScalar::Utf8(label.to_string())),
+            None => None,
         },
     ]
 }
 
-fn int_and_null_timestamp_row(id: i64) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(id)),
-        ScalarValue::TimestampMillisecond(None, None),
-    ]
+fn int_and_null_timestamp_row(id: i64) -> TestRow {
+    vec![Some(EncodedRowScalar::Int64(id)), None]
 }
 
 fn count_char_projection_row(
@@ -3272,28 +3273,32 @@ fn count_char_projection_row(
     date_time_ms: i64,
     extra: &str,
     c_counts: i64,
-) -> Vec<ScalarValue> {
+) -> TestRow {
     vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Int64(Some(bidder)),
-        ScalarValue::Int64(Some(projected_price)),
-        ScalarValue::Utf8(Some(bid_time_type.to_string())),
-        ScalarValue::TimestampMillisecond(Some(date_time_ms), None),
-        ScalarValue::Utf8(Some(extra.to_string())),
-        ScalarValue::Int64(Some(c_counts)),
+        Some(EncodedRowScalar::Int64(auction)),
+        Some(EncodedRowScalar::Int64(bidder)),
+        Some(EncodedRowScalar::Int64(projected_price)),
+        Some(EncodedRowScalar::Utf8(bid_time_type.to_string())),
+        Some(EncodedRowScalar::TimestampMillis(date_time_ms)),
+        Some(EncodedRowScalar::Utf8(extra.to_string())),
+        Some(EncodedRowScalar::Int64(c_counts)),
     ]
 }
 
-fn scalar_i64(value: Option<&ScalarValue>) -> i64 {
+fn scalar_i64(value: Option<&Option<EncodedRowScalar>>) -> i64 {
     match value {
-        Some(ScalarValue::Int64(Some(value))) => *value,
+        Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
+            *value
+        }
         _ => 0,
     }
 }
 
-fn scalar_timestamp_millis(value: Option<&ScalarValue>) -> i64 {
+fn scalar_timestamp_millis(value: Option<&Option<EncodedRowScalar>>) -> i64 {
     match value {
-        Some(ScalarValue::TimestampMillisecond(Some(value), _)) => *value,
+        Some(Some(EncodedRowScalar::TimestampMillis(value) | EncodedRowScalar::Int64(value))) => {
+            *value
+        }
         _ => 0,
     }
 }
@@ -3378,8 +3383,8 @@ fn encoded_auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec
     ])
 }
 
-fn bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> Vec<ScalarValue> {
-    decode_row_to_scalars(&encoded_bid_row_with_ts(
+fn bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> TestRow {
+    decode_row_to_values(&encoded_bid_row_with_ts(
         auction,
         bidder,
         price,
@@ -3387,7 +3392,7 @@ fn bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> 
     ))
 }
 
-fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
+fn bid_row(auction: i64, bidder: i64, price: i64) -> TestRow {
     bid_row_with_ts(auction, bidder, price, 1_700_000_000_000)
 }
 
@@ -3408,16 +3413,13 @@ fn nexmark_auction_schema() -> Arc<Schema> {
     nexmark_auction_table().schema().to_arrow_schema()
 }
 
-async fn materialized_rows(
-    registry: &MaterializedViewRegistry,
-    view_name: &str,
-) -> Vec<Vec<ScalarValue>> {
+async fn materialized_rows(registry: &MaterializedViewRegistry, view_name: &str) -> Vec<TestRow> {
     let handle = registry.get(view_name).expect("view registered");
     let snapshot = handle.snapshot_encoded();
     let mut rows = Vec::new();
     for (key, diff) in snapshot {
         if diff > 0 {
-            let row = decode_row_to_scalars(&key);
+            let row = decode_row_to_values(&key);
             for _ in 0..diff {
                 rows.push(row.clone());
             }
@@ -3426,10 +3428,7 @@ async fn materialized_rows(
     rows
 }
 
-async fn visible_rows(
-    registry: &MaterializedViewRegistry,
-    view_name: &str,
-) -> Vec<Vec<ScalarValue>> {
+async fn visible_rows(registry: &MaterializedViewRegistry, view_name: &str) -> Vec<TestRow> {
     let handle = registry.get(view_name).expect("view registered");
     if handle.dbsp_state().is_some() {
         return materialized_rows(registry, view_name).await;
@@ -3438,7 +3437,7 @@ async fn visible_rows(
     let mut rows = Vec::new();
     for (encoded, diff) in handle.snapshot_encoded() {
         if diff > 0 {
-            let row = decode_row_to_scalars(&encoded);
+            let row = decode_row_to_values(&encoded);
             for _ in 0..diff {
                 rows.push(row.clone());
             }
@@ -3447,22 +3446,6 @@ async fn visible_rows(
     rows
 }
 
-fn decode_row_to_scalars(encoded: &[u8]) -> Vec<ScalarValue> {
-    decode_all_encoded_row_scalars(encoded)
-        .expect("decode row")
-        .into_iter()
-        .map(encoded_scalar_to_scalar_value)
-        .collect()
-}
-
-fn encoded_scalar_to_scalar_value(value: Option<EncodedRowScalar>) -> ScalarValue {
-    match value {
-        Some(EncodedRowScalar::Int64(value)) => ScalarValue::Int64(Some(value)),
-        Some(EncodedRowScalar::Utf8(value)) => ScalarValue::Utf8(Some(value)),
-        Some(EncodedRowScalar::TimestampMillis(value)) => {
-            ScalarValue::TimestampMillisecond(Some(value), None)
-        }
-        Some(EncodedRowScalar::Bool(value)) => ScalarValue::Boolean(Some(value)),
-        None => ScalarValue::Null,
-    }
+fn decode_row_to_values(encoded: &[u8]) -> TestRow {
+    decode_all_encoded_row_scalars(encoded).expect("decode row")
 }
