@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
-use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Column, DFSchema};
@@ -15,8 +17,6 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
-
-use crate::encoding::encode_projected_row_key;
 
 #[derive(Clone)]
 pub(crate) struct VectorizedFilterProjectEvaluator {
@@ -346,11 +346,7 @@ impl VectorizedFilterProjectEvaluator {
                     if diff == 0 {
                         continue;
                     }
-                    let mut projected_row = Vec::with_capacity(projection_arrays.len());
-                    for array in &projection_arrays {
-                        projected_row.push(ScalarValue::try_from_array(array, idx)?);
-                    }
-                    let encoded = encode_projected_row_key(&projected_row)?;
+                    let encoded = encode_physical_projection_row(&projection_arrays, idx)?;
                     staged.push((encoded, diff));
                 }
                 consolidate_encoded_delta_batch(staged)
@@ -1811,6 +1807,90 @@ fn encode_compiled_value(value: &CompiledValue, encoded: &mut Vec<u8>) -> Result
             encoded.push(if *flag { 1 } else { 0 });
         }
         CompiledValue::Bool(None) => encoded.push(0x08),
+    }
+    Ok(())
+}
+
+fn encode_physical_projection_row(columns: &[ArrayRef], row_idx: usize) -> Result<Vec<u8>> {
+    let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (columns.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for column in columns {
+        encode_array_scalar_value(column, row_idx, &mut encoded)?;
+    }
+    Ok(encoded)
+}
+
+fn encode_array_scalar_value(
+    column: &ArrayRef,
+    row_idx: usize,
+    encoded: &mut Vec<u8>,
+) -> Result<()> {
+    if row_idx >= column.len() {
+        return Err(anyhow!("projection row index {row_idx} was out of bounds"));
+    }
+    if column.is_null(row_idx) {
+        match column.data_type() {
+            DataType::Int64 => encoded.push(0x05),
+            DataType::Utf8 => encoded.push(0x06),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => encoded.push(0x07),
+            DataType::Boolean => encoded.push(0x08),
+            DataType::Null => encoded.push(0x00),
+            other => {
+                return Err(anyhow!(
+                    "unsupported projection type in vectorized physical encoder: {other:?}"
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    match column.data_type() {
+        DataType::Int64 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 projection array"))?;
+            encoded.push(0x01);
+            encoded.extend_from_slice(&array.value(row_idx).to_le_bytes());
+        }
+        DataType::Utf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 projection array"))?;
+            let text = array.value(row_idx);
+            let bytes = text.as_bytes();
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
+            encoded.push(0x02);
+            encoded.extend_from_slice(&len.to_le_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let array = column
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow!("expected timestamp(ms) projection array"))?;
+            encoded.push(0x03);
+            encoded.extend_from_slice(&array.value(row_idx).to_le_bytes());
+        }
+        DataType::Boolean => {
+            let array = column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected boolean projection array"))?;
+            encoded.push(0x04);
+            encoded.push(if array.value(row_idx) { 1 } else { 0 });
+        }
+        DataType::Null => {
+            encoded.push(0x00);
+        }
+        other => {
+            return Err(anyhow!(
+                "unsupported projection type in vectorized physical encoder: {other:?}"
+            ));
+        }
     }
     Ok(())
 }
