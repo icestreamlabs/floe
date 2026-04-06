@@ -14,7 +14,7 @@ pub(crate) struct EncodedRowProjectionColumn {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum EncodedRowScalar {
+pub enum EncodedRowScalar {
     Int64(i64),
     Utf8(String),
     TimestampMillis(i64),
@@ -178,9 +178,7 @@ pub(crate) fn extract_encoded_row_scalars(
     Ok(decoded)
 }
 
-pub(crate) fn decode_all_encoded_row_scalars(
-    bytes: &[u8],
-) -> Result<Vec<Option<EncodedRowScalar>>> {
+pub fn decode_all_encoded_row_scalars(bytes: &[u8]) -> Result<Vec<Option<EncodedRowScalar>>> {
     let count = encoded_row_column_count(bytes)?;
     let indices = (0..count).collect::<Vec<_>>();
     extract_encoded_row_scalars(bytes, indices.as_slice())

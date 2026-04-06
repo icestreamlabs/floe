@@ -24,6 +24,7 @@ use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
     nexmark_person_table, validate_dbsp_plan,
 };
+use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::source_journal::SourceBatchJournal;
@@ -3579,67 +3580,21 @@ async fn visible_rows(
 }
 
 fn decode_row_to_scalars(encoded: &[u8]) -> Vec<ScalarValue> {
-    let count = u32::from_le_bytes(
-        encoded
-            .get(0..4)
-            .expect("encoded row header")
-            .try_into()
-            .expect("encoded row header width"),
-    ) as usize;
-    let mut row = Vec::with_capacity(count);
-    let mut cursor = 4usize;
-    for _ in 0..count {
-        let tag = *encoded.get(cursor).expect("encoded field tag");
-        cursor += 1;
-        match tag {
-            0x00 => row.push(ScalarValue::Null),
-            0x01 => {
-                let chunk = encoded
-                    .get(cursor..cursor + 8)
-                    .expect("encoded int64 payload");
-                row.push(ScalarValue::Int64(Some(i64::from_le_bytes(
-                    chunk.try_into().expect("int64 payload"),
-                ))));
-                cursor += 8;
-            }
-            0x02 => {
-                let len_bytes = encoded
-                    .get(cursor..cursor + 4)
-                    .expect("encoded utf8 length");
-                let len =
-                    u32::from_le_bytes(len_bytes.try_into().expect("utf8 length payload")) as usize;
-                cursor += 4;
-                let bytes = encoded
-                    .get(cursor..cursor + len)
-                    .expect("encoded utf8 payload");
-                let text = std::str::from_utf8(bytes).expect("utf8 payload");
-                row.push(ScalarValue::Utf8(Some(text.to_string())));
-                cursor += len;
-            }
-            0x03 => {
-                let chunk = encoded
-                    .get(cursor..cursor + 8)
-                    .expect("encoded timestamp payload");
-                row.push(ScalarValue::TimestampMillisecond(
-                    Some(i64::from_le_bytes(
-                        chunk.try_into().expect("timestamp payload"),
-                    )),
-                    None,
-                ));
-                cursor += 8;
-            }
-            0x04 => {
-                let flag = *encoded.get(cursor).expect("encoded bool payload");
-                row.push(ScalarValue::Boolean(Some(flag != 0)));
-                cursor += 1;
-            }
-            0x05 => row.push(ScalarValue::Int64(None)),
-            0x06 => row.push(ScalarValue::Utf8(None)),
-            0x07 => row.push(ScalarValue::TimestampMillisecond(None, None)),
-            0x08 => row.push(ScalarValue::Boolean(None)),
-            other => panic!("unknown encoded tag: {other:#x}"),
+    decode_all_encoded_row_scalars(encoded)
+        .expect("decode row")
+        .into_iter()
+        .map(encoded_scalar_to_scalar_value)
+        .collect()
+}
+
+fn encoded_scalar_to_scalar_value(value: Option<EncodedRowScalar>) -> ScalarValue {
+    match value {
+        Some(EncodedRowScalar::Int64(value)) => ScalarValue::Int64(Some(value)),
+        Some(EncodedRowScalar::Utf8(value)) => ScalarValue::Utf8(Some(value)),
+        Some(EncodedRowScalar::TimestampMillis(value)) => {
+            ScalarValue::TimestampMillisecond(Some(value), None)
         }
+        Some(EncodedRowScalar::Bool(value)) => ScalarValue::Boolean(Some(value)),
+        None => ScalarValue::Null,
     }
-    assert_eq!(cursor, encoded.len(), "encoded row trailing bytes");
-    row
 }
