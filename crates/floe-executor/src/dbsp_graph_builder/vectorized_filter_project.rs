@@ -18,6 +18,8 @@ use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
 
+use crate::scalar_array_builder::ScalarColumnBuilder;
+
 #[derive(Clone)]
 pub(crate) struct VectorizedFilterProjectEvaluator {
     input_schema: datafusion::arrow::datatypes::SchemaRef,
@@ -1563,7 +1565,14 @@ fn build_sparse_input_batch(
         .enumerate()
         .map(|(idx, field)| {
             if let Some(slot) = decoded_input_slots[idx] {
-                ScalarValue::iter_to_array(std::mem::take(&mut decoded_columns[slot]))
+                let mut builder = ScalarColumnBuilder::new(field.data_type(), row_count)
+                    .with_context(|| format!("initialize vectorized input column builder {idx}"))?;
+                for value in std::mem::take(&mut decoded_columns[slot]) {
+                    builder.append(&value).with_context(|| {
+                        format!("append value into vectorized input column {idx}")
+                    })?;
+                }
+                Ok::<ArrayRef, anyhow::Error>(builder.finish_array())
                     .with_context(|| format!("build vectorized input column {idx}"))
             } else {
                 placeholder_scalar(field.data_type())?
