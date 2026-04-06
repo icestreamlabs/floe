@@ -13,7 +13,9 @@ use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
 use tracing::field;
 
-use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+use crate::encoding::{
+    decode_all_encoded_row_scalars, encode_projected_row_key, scalar_value_from_encoded_scalar,
+};
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -187,11 +189,12 @@ impl MaterializedViewHandle {
             .expect("mutex poisoned")
             .iter()
             .map(|(key, diff)| {
-                (
-                    decode_projected_row_key(key)
-                        .expect("materialized view authoritative state should contain valid rows"),
-                    *diff,
-                )
+                let decoded = decode_all_encoded_row_scalars(key)
+                    .expect("materialized view authoritative state should contain valid rows")
+                    .iter()
+                    .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
+                    .collect::<Vec<_>>();
+                (decoded, *diff)
             })
             .collect()
     }
