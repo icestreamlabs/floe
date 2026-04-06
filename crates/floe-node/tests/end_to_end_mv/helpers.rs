@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
 use dbsp::handles::ZSetHandleView;
-use floe_executor::encoding::decode_projected_row_key;
+use floe_executor::encoding::extract_encoded_row_i64_like_column;
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
@@ -194,32 +194,20 @@ pub(crate) async fn rows_at_version(
         if diff <= 0 {
             continue;
         }
-        let decoded = decode_projected_row_key(&key)
-            .with_context(|| format!("decode row key for view '{view}'"))?;
-        let ints = row_values_to_ints(&decoded, 3)?;
+        let ints = (0..3)
+            .map(|idx| {
+                extract_encoded_row_i64_like_column(&key, idx)
+                    .with_context(|| format!("extract int column {idx} for view '{view}'"))
+                    .and_then(|value| {
+                        value.with_context(|| {
+                            format!("unexpected NULL int column {idx} for view '{view}'")
+                        })
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
         for _ in 0..diff {
             rows.push(ints.clone());
         }
     }
     Ok(rows)
-}
-
-fn row_values_to_ints(values: &[ScalarValue], count: usize) -> Result<Vec<i64>> {
-    let mut out = Vec::with_capacity(count);
-    for value in values.iter().take(count) {
-        match value {
-            ScalarValue::Int64(Some(v)) => out.push(*v),
-            ScalarValue::Null => {
-                return Err(anyhow::anyhow!(
-                    "unexpected NULL value while decoding materialized view row"
-                ));
-            }
-            other => {
-                return Err(anyhow::anyhow!(
-                    "unexpected ScalarValue while decoding row: {other:?}"
-                ));
-            }
-        }
-    }
-    Ok(out)
 }

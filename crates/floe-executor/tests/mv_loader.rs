@@ -16,7 +16,7 @@ use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, ValidatedPlan, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
-use floe_executor::encoding::{decode_projected_row_key, encode_projected_row_key};
+use floe_executor::encoding::{encode_projected_row_key, extract_encoded_row_i64_like_column};
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
@@ -338,8 +338,13 @@ async fn rows_at_version(registry: &Arc<MaterializedViewRegistry>, version: u64)
         if diff <= 0 {
             continue;
         }
-        let decoded = decode_projected_row_key(&key).expect("decode mv row");
-        let ints = row_values_to_ints(&decoded, 3);
+        let ints = (0..3)
+            .map(|idx| {
+                extract_encoded_row_i64_like_column(&key, idx)
+                    .expect("extract int column")
+                    .expect("non-null int column")
+            })
+            .collect::<Vec<_>>();
         for _ in 0..diff {
             rows.push(ints.clone());
         }
@@ -435,15 +440,4 @@ fn first_n_int_columns(batches: &[RecordBatch], column_count: usize) -> Vec<Vec<
 async fn test_db(name: &str) -> Arc<Db> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     Arc::new(Db::open(name, store).await.expect("open SlateDB"))
-}
-
-fn row_values_to_ints(values: &[ScalarValue], count: usize) -> Vec<i64> {
-    values
-        .iter()
-        .take(count)
-        .map(|value| match value {
-            ScalarValue::Int64(Some(v)) => *v,
-            other => panic!("expected Int64 scalar, found {other:?}"),
-        })
-        .collect()
 }

@@ -15,7 +15,7 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
-use dbsp::handles::{ZSetHandle, ZSetHandleView};
+use dbsp::handles::ZSetHandle;
 use dbsp::storage::SlateTable;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
@@ -24,7 +24,6 @@ use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
     nexmark_person_table, validate_dbsp_plan,
 };
-use floe_executor::encoding::decode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::source_journal::SourceBatchJournal;
@@ -3420,20 +3419,12 @@ async fn materialized_rows(
     view_name: &str,
 ) -> Vec<Vec<ScalarValue>> {
     let handle = registry.get(view_name).expect("view registered");
-    let state = handle.dbsp_state().expect("mv state");
-    let view = ZSetHandleView::new(
-        state.dictionary(),
-        state.table(),
-        state.namespace().to_string(),
-        state.version(),
-    );
-    let snapshot = view.materialize().await.expect("materialize view");
+    let snapshot = handle.snapshot();
     let mut rows = Vec::new();
     for (key, diff) in snapshot {
-        let decoded = decode_projected_row_key(&key).expect("decode row");
         if diff > 0 {
             for _ in 0..diff {
-                rows.push(decoded.clone());
+                rows.push(key.clone());
             }
         }
     }

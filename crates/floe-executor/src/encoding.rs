@@ -70,81 +70,6 @@ pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub fn decode_projected_row_key(bytes: &[u8]) -> Result<Vec<ScalarValue>> {
-    if bytes.len() < 4 {
-        return Err(anyhow!("encoded key too short"));
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut cursor = 4;
-    let mut columns = Vec::with_capacity(count);
-    for _ in 0..count {
-        if cursor >= bytes.len() {
-            return Err(anyhow!("unexpected end of key while decoding tag"));
-        }
-        let tag = bytes[cursor];
-        cursor += 1;
-        match tag {
-            0x00 => {
-                columns.push(ScalarValue::Null);
-            }
-            0x01 => {
-                let end = cursor + 8;
-                let chunk = bytes
-                    .get(cursor..end)
-                    .ok_or_else(|| anyhow!("truncated int64"))?;
-                let value = i64::from_le_bytes(chunk.try_into().unwrap());
-                columns.push(ScalarValue::Int64(Some(value)));
-                cursor = end;
-            }
-            0x02 => {
-                let len_bytes = bytes
-                    .get(cursor..cursor + 4)
-                    .ok_or_else(|| anyhow!("truncated string length"))?;
-                let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-                cursor += 4;
-                let end = cursor + len;
-                let chunk = bytes
-                    .get(cursor..end)
-                    .ok_or_else(|| anyhow!("truncated string payload"))?;
-                let text = std::str::from_utf8(chunk)
-                    .map_err(|err| anyhow!("utf8 decode error: {err}"))?;
-                columns.push(ScalarValue::Utf8(Some(text.to_string())));
-                cursor = end;
-            }
-            0x03 => {
-                let end = cursor + 8;
-                let chunk = bytes
-                    .get(cursor..end)
-                    .ok_or_else(|| anyhow!("truncated timestamp"))?;
-                let value = i64::from_le_bytes(chunk.try_into().unwrap());
-                columns.push(ScalarValue::TimestampMillisecond(Some(value), None));
-                cursor = end;
-            }
-            0x04 => {
-                let flag = *bytes
-                    .get(cursor)
-                    .ok_or_else(|| anyhow!("missing boolean payload"))?;
-                columns.push(ScalarValue::Boolean(Some(flag != 0)));
-                cursor += 1;
-            }
-            0x05 => {
-                columns.push(ScalarValue::Int64(None));
-            }
-            0x06 => {
-                columns.push(ScalarValue::Utf8(None));
-            }
-            0x07 => {
-                columns.push(ScalarValue::TimestampMillisecond(None, None));
-            }
-            0x08 => {
-                columns.push(ScalarValue::Boolean(None));
-            }
-            _ => return Err(anyhow!("unknown column tag {tag:#x} in MV key")),
-        }
-    }
-    Ok(columns)
-}
-
 pub fn extract_encoded_row_columns(
     bytes: &[u8],
     indices: &[usize],
@@ -273,7 +198,7 @@ pub(crate) fn scalar_value_from_encoded_scalar(value: Option<&EncodedRowScalar>)
     }
 }
 
-pub(crate) fn extract_encoded_row_i64_like_column(
+pub fn extract_encoded_row_i64_like_column(
     bytes: &[u8],
     target_index: usize,
 ) -> Result<Option<i64>> {
@@ -497,16 +422,24 @@ mod tests {
             ScalarValue::Boolean(Some(false)),
         ];
         let encoded = encode_projected_row_key(&row).expect("encode");
-        let decoded = decode_projected_row_key(&encoded).expect("decode");
-        assert_eq!(row, decoded);
+        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
+        assert_eq!(
+            decoded,
+            vec![
+                Some(EncodedRowScalar::Int64(10)),
+                Some(EncodedRowScalar::Utf8("abc".into())),
+                Some(EncodedRowScalar::TimestampMillis(1234)),
+                Some(EncodedRowScalar::Bool(false))
+            ]
+        );
     }
 
     #[test]
     fn encodes_null_values() {
         let row = vec![ScalarValue::Null, ScalarValue::Int64(None)];
         let encoded = encode_projected_row_key(&row).expect("encode");
-        let decoded = decode_projected_row_key(&encoded).expect("decode");
-        assert_eq!(decoded, row);
+        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
+        assert_eq!(decoded, vec![None, None]);
     }
 
     #[test]
@@ -521,12 +454,12 @@ mod tests {
         let selected = extract_encoded_row_columns(&encoded, &[3, 0], true)
             .expect("extract")
             .expect("non-null key");
-        let decoded = decode_projected_row_key(&selected).expect("decode");
+        let decoded = decode_all_encoded_row_scalars(&selected).expect("decode");
         assert_eq!(
             decoded,
             vec![
-                ScalarValue::Boolean(Some(false)),
-                ScalarValue::Int64(Some(10))
+                Some(EncodedRowScalar::Bool(false)),
+                Some(EncodedRowScalar::Int64(10))
             ]
         );
     }
@@ -557,14 +490,14 @@ mod tests {
         .expect("encode right");
 
         let combined = concat_encoded_rows(&left, &right).expect("concat");
-        let decoded = decode_projected_row_key(&combined).expect("decode combined");
+        let decoded = decode_all_encoded_row_scalars(&combined).expect("decode combined");
         assert_eq!(
             decoded,
             vec![
-                ScalarValue::Int64(Some(10)),
-                ScalarValue::Utf8(Some("left".into())),
-                ScalarValue::Boolean(Some(true)),
-                ScalarValue::TimestampMillisecond(Some(55), None),
+                Some(EncodedRowScalar::Int64(10)),
+                Some(EncodedRowScalar::Utf8("left".into())),
+                Some(EncodedRowScalar::Bool(true)),
+                Some(EncodedRowScalar::TimestampMillis(55)),
             ]
         );
     }
@@ -606,15 +539,15 @@ mod tests {
             ],
         )
         .expect("project");
-        let decoded = decode_projected_row_key(&projected).expect("decode projected");
+        let decoded = decode_all_encoded_row_scalars(&projected).expect("decode projected");
 
         assert_eq!(
             decoded,
             vec![
-                ScalarValue::Int64(Some(99)),
-                ScalarValue::Int64(Some(10)),
-                ScalarValue::TimestampMillisecond(Some(55), None),
-                ScalarValue::Boolean(Some(true)),
+                Some(EncodedRowScalar::Int64(99)),
+                Some(EncodedRowScalar::Int64(10)),
+                Some(EncodedRowScalar::TimestampMillis(55)),
+                Some(EncodedRowScalar::Bool(true)),
             ]
         );
     }
