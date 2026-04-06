@@ -27,6 +27,7 @@ use floe_executor::{
 };
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
+#[cfg(test)]
 use floe_node_core::generator;
 use floe_node_core::kafka_connector::{
     KafkaConnector, KafkaConnectorConfig, KafkaOffsetCommit, KafkaTopicPartitionOffset,
@@ -61,10 +62,8 @@ use crate::config::{
 };
 use crate::{cli, config, http_ingest, metrics, sinks};
 
-static INGEST_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
-const INGEST_LOG_SAMPLE_EVERY: u64 = 512;
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
 const SLATEDB_CONFIG_ENV: &str = "FLOE_SLATEDB_CONFIG";
