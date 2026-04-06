@@ -7,9 +7,7 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::scalar::ScalarValue;
 
-use crate::encoding::{
-    decode_all_encoded_row_scalars, extract_encoded_row_scalars, scalar_value_from_encoded_scalar,
-};
+use crate::encoding::{extract_encoded_row_scalars, scalar_value_from_encoded_scalar};
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::Row;
 
@@ -88,23 +86,18 @@ pub(super) fn project_schema(
     Ok((Arc::new(Schema::new(fields)), indices))
 }
 
-pub(super) fn build_batches_from_encoded_snapshot<F>(
+pub(super) fn build_batches_from_encoded_snapshot(
     snapshot: std::collections::HashMap<Vec<u8>, i64>,
     schema: SchemaRef,
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     mv_version: Option<u64>,
-    row_filter: Option<F>,
-) -> DFResult<(SchemaRef, Vec<RecordBatch>)>
-where
-    F: Fn(&Row) -> bool,
-{
+) -> DFResult<(SchemaRef, Vec<RecordBatch>)> {
     let (projected_schema, projected_indices) = project_schema(&schema, projection)?;
     let mv_version_index = schema
         .fields()
         .iter()
         .position(|field| field.name() == MV_VERSION_COLUMN);
-    let decoded_row_len = mv_version_index.unwrap_or(schema.fields().len());
     let mut batches = Vec::new();
     let zero_column_projection = projected_indices.is_empty();
     let mut builders = projected_schema
@@ -139,28 +132,7 @@ where
         if diff == 0 {
             continue;
         }
-        let decoded = if let Some(filter) = row_filter.as_ref() {
-            let decoded_scalars = decode_all_encoded_row_scalars(&key)
-                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-            if decoded_scalars.len() != decoded_row_len {
-                return Err(DataFusionError::Execution(format!(
-                    "decoded row has {} columns but expected {}",
-                    decoded_scalars.len(),
-                    decoded_row_len
-                )));
-            }
-            let decoded = decoded_scalars
-                .iter()
-                .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
-                .collect::<Vec<_>>();
-            if !filter(&decoded) {
-                continue;
-            }
-            Some(decoded)
-        } else {
-            None
-        };
-        let projected_values = if decoded.is_none() && !projection_source_indices.is_empty() {
+        let projected_values = if !projection_source_indices.is_empty() {
             Some(
                 extract_encoded_row_scalars(&key, projection_source_indices.as_slice())
                     .map_err(|err| DataFusionError::Execution(err.to_string()))?,
@@ -181,12 +153,6 @@ where
             for (column_idx, source_idx) in projected_indices.iter().enumerate() {
                 let value = if Some(*source_idx) == mv_version_index {
                     ScalarValue::UInt64(Some(mv_version.unwrap_or(0)))
-                } else if let Some(decoded) = decoded.as_ref() {
-                    decoded.get(*source_idx).cloned().ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "row does not contain projected column index {source_idx}"
-                        ))
-                    })?
                 } else {
                     let projected_slot = projection_source_positions
                         .get(source_idx)

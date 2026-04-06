@@ -109,7 +109,6 @@ impl MaterializedViewTableProvider {
             projection,
             limit,
             Some(version),
-            Option::<fn(&crate::stream_types::Row) -> bool>::None,
         )
     }
 

@@ -97,14 +97,7 @@ impl SourceTableProvider {
         } else {
             snapshot
         };
-        build_batches_from_encoded_snapshot(
-            snapshot,
-            self.schema.clone(),
-            projection,
-            limit,
-            None,
-            Option::<fn(&crate::stream_types::Row) -> bool>::None,
-        )
+        build_batches_from_encoded_snapshot(snapshot, self.schema.clone(), projection, limit, None)
     }
 
     #[cfg(test)]
