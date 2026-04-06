@@ -1,25 +1,21 @@
 use datafusion::arrow::array::{Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::scalar::ScalarValue;
 
-pub(crate) fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
+pub(crate) fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<u8> {
     bid_row_nullable(Some(auction), Some(bidder), price)
 }
 
-pub(crate) fn bid_row_nullable(
-    auction: Option<i64>,
-    bidder: Option<i64>,
-    price: i64,
-) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(auction),
-        ScalarValue::Int64(bidder),
-        ScalarValue::Int64(Some(price)),
-        ScalarValue::Utf8(Some("channel".to_string())),
-        ScalarValue::Utf8(Some("http://example.com".to_string())),
-        ScalarValue::TimestampMillisecond(Some(1_600_000_000), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
+pub(crate) fn bid_row_nullable(auction: Option<i64>, bidder: Option<i64>, price: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 64);
+    encoded.extend_from_slice(&(7_u32).to_le_bytes());
+    append_optional_i64(&mut encoded, auction);
+    append_optional_i64(&mut encoded, bidder);
+    append_i64(&mut encoded, price);
+    append_utf8(&mut encoded, "channel");
+    append_utf8(&mut encoded, "http://example.com");
+    append_timestamp_millis(&mut encoded, 1_600_000_000);
+    append_utf8(&mut encoded, "extra");
+    encoded
 }
 
 pub(crate) fn auction_row(
@@ -28,19 +24,44 @@ pub(crate) fn auction_row(
     category: i64,
     expires_ms: i64,
     item_name: &str,
-) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Utf8(Some(item_name.to_string())),
-        ScalarValue::Utf8(Some("description".to_string())),
-        ScalarValue::Int64(Some(10)),
-        ScalarValue::Int64(Some(15)),
-        ScalarValue::Int64(Some(seller)),
-        ScalarValue::Int64(Some(category)),
-        ScalarValue::TimestampMillisecond(Some(expires_ms), None),
-        ScalarValue::TimestampMillisecond(Some(expires_ms - 1), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
+) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 96);
+    encoded.extend_from_slice(&(10_u32).to_le_bytes());
+    append_i64(&mut encoded, auction);
+    append_utf8(&mut encoded, item_name);
+    append_utf8(&mut encoded, "description");
+    append_i64(&mut encoded, 10);
+    append_i64(&mut encoded, 15);
+    append_i64(&mut encoded, seller);
+    append_i64(&mut encoded, category);
+    append_timestamp_millis(&mut encoded, expires_ms);
+    append_timestamp_millis(&mut encoded, expires_ms - 1);
+    append_utf8(&mut encoded, "extra");
+    encoded
+}
+
+fn append_i64(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_optional_i64(encoded: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        Some(value) => append_i64(encoded, value),
+        None => encoded.push(0x05),
+    }
+}
+
+fn append_timestamp_millis(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x03);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_utf8(encoded: &mut Vec<u8>, value: &str) {
+    encoded.push(0x02);
+    let bytes = value.as_bytes();
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
 }
 
 pub(crate) fn int_rows(batches: &[RecordBatch]) -> Vec<Vec<i64>> {
