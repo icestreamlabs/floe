@@ -18,7 +18,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoding::{decode_all_encoded_row_scalars, scalar_value_from_encoded_scalar};
+use crate::encoding::decode_all_encoded_row_scalars;
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
@@ -444,8 +444,7 @@ fn rows_from_snapshot(
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                let scalar = scalar_value_from_encoded_scalar(value.as_ref());
-                decoded_rows.builders[idx].append(&scalar)?;
+                decoded_rows.builders[idx].append_encoded_scalar(value.as_ref())?;
             }
             decoded_rows.ops.push(1);
         }
@@ -480,8 +479,7 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<
         }
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                let scalar = scalar_value_from_encoded_scalar(value.as_ref());
-                decoded_rows.builders[idx].append(&scalar)?;
+                decoded_rows.builders[idx].append_encoded_scalar(value.as_ref())?;
             }
             decoded_rows.ops.push(op);
         }
