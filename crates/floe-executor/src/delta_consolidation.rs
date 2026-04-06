@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{BinaryArray, BooleanBuilder, Int64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Int64Array, StringArray,
+    TimestampMillisecondArray,
+};
 use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Result as DFResult, internal_err};
 use datafusion::datasource::MemTable;
 use datafusion::functions_aggregate::expr_fn::{min, sum};
 use datafusion::prelude::{Expr, SessionContext, col};
-use datafusion::scalar::ScalarValue;
 
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
@@ -154,7 +156,10 @@ fn validate_key_payload_consistency(batches: &[RecordBatch], schema: &SchemaRef)
         })
         .collect::<Vec<_>>();
 
-    let mut payload_by_key: HashMap<Vec<u8>, Vec<ScalarValue>> = HashMap::new();
+    let payload_count = u32::try_from(payload_indices.len()).map_err(|_| {
+        datafusion::error::DataFusionError::Internal("payload too wide".to_string())
+    })?;
+    let mut payload_by_key: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -162,12 +167,13 @@ fn validate_key_payload_consistency(batches: &[RecordBatch], schema: &SchemaRef)
         let Some(keys) = batch.column(key_idx).as_any().downcast_ref::<BinaryArray>() else {
             return internal_err!("{} column must be Binary", KEY_COLUMN_NAME);
         };
+        let payload_columns = payload_indices
+            .iter()
+            .map(|idx| batch.column(*idx).clone())
+            .collect::<Vec<_>>();
         for row in 0..batch.num_rows() {
             let key = keys.value(row).to_vec();
-            let payload = payload_indices
-                .iter()
-                .map(|idx| ScalarValue::try_from_array(batch.column(*idx), row))
-                .collect::<DFResult<Vec<_>>>()?;
+            let payload = encode_payload_row(payload_columns.as_slice(), row, payload_count)?;
             match payload_by_key.entry(key) {
                 Entry::Vacant(entry) => {
                     entry.insert(payload);
@@ -184,6 +190,81 @@ fn validate_key_payload_consistency(batches: &[RecordBatch], schema: &SchemaRef)
         }
     }
 
+    Ok(())
+}
+
+fn encode_payload_row(columns: &[ArrayRef], row: usize, payload_count: u32) -> DFResult<Vec<u8>> {
+    let mut payload = Vec::with_capacity(4 + (columns.len() * 9));
+    payload.extend_from_slice(&payload_count.to_le_bytes());
+    for column in columns {
+        encode_payload_cell(column, row, &mut payload)?;
+    }
+    Ok(payload)
+}
+
+fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> DFResult<()> {
+    if row >= column.len() {
+        return internal_err!("payload row index out of bounds while consolidating by key");
+    }
+    if column.is_null(row) {
+        match column.data_type() {
+            DataType::Int64 => payload.push(0x05),
+            DataType::Utf8 => payload.push(0x06),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => payload.push(0x07),
+            DataType::Boolean => payload.push(0x08),
+            DataType::Null => payload.push(0x00),
+            other => {
+                return internal_err!(
+                    "unsupported payload type for by-key consolidation: {other:?}"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    match column.data_type() {
+        DataType::Int64 => {
+            let Some(values) = column.as_any().downcast_ref::<Int64Array>() else {
+                return internal_err!("expected Int64 payload array");
+            };
+            payload.push(0x01);
+            payload.extend_from_slice(&values.value(row).to_le_bytes());
+        }
+        DataType::Utf8 => {
+            let Some(values) = column.as_any().downcast_ref::<StringArray>() else {
+                return internal_err!("expected Utf8 payload array");
+            };
+            payload.push(0x02);
+            let bytes = values.value(row).as_bytes();
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                datafusion::error::DataFusionError::Internal(
+                    "utf8 payload value too large".to_string(),
+                )
+            })?;
+            payload.extend_from_slice(&len.to_le_bytes());
+            payload.extend_from_slice(bytes);
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let Some(values) = column.as_any().downcast_ref::<TimestampMillisecondArray>() else {
+                return internal_err!("expected timestamp(ms) payload array");
+            };
+            payload.push(0x03);
+            payload.extend_from_slice(&values.value(row).to_le_bytes());
+        }
+        DataType::Boolean => {
+            let Some(values) = column.as_any().downcast_ref::<BooleanArray>() else {
+                return internal_err!("expected boolean payload array");
+            };
+            payload.push(0x04);
+            payload.push(if values.value(row) { 1 } else { 0 });
+        }
+        DataType::Null => {
+            payload.push(0x00);
+        }
+        other => {
+            return internal_err!("unsupported payload type for by-key consolidation: {other:?}");
+        }
+    }
     Ok(())
 }
 
