@@ -10,8 +10,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-#[cfg(test)]
-use datafusion::scalar::ScalarValue;
 use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
@@ -522,10 +520,8 @@ fn build_tail_batches(
 mod tests {
     use super::*;
     use crate::dbsp_bridge::DbspBridge;
-    use crate::encoding::encode_projected_row_key;
     use crate::materialized_view::DbspPersistedState;
     use crate::mv::registry::MaterializedViewRegistry;
-    use crate::stream_types::Row;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use dbsp::StreamRetention;
@@ -541,8 +537,12 @@ mod tests {
         )]))
     }
 
-    fn scalar_row(value: i64) -> Row {
-        vec![ScalarValue::Int64(Some(value))]
+    fn encoded_i64_row(value: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 1 + 8);
+        encoded.extend_from_slice(&(1_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded
     }
 
     async fn append_version(
@@ -550,9 +550,7 @@ mod tests {
         values: &[i64],
     ) -> PgResult<dbsp::handles::ZSetHandle> {
         for value in values {
-            let row = scalar_row(*value);
-            let encoded = encode_projected_row_key(&row)?;
-            view.add_delta(encoded, 1);
+            view.add_delta(encoded_i64_row(*value), 1);
         }
         view.flush().await
     }
@@ -562,9 +560,7 @@ mod tests {
         deltas: &[(i64, i64)],
     ) -> PgResult<dbsp::handles::ZSetHandle> {
         for (value, diff) in deltas {
-            let row = scalar_row(*value);
-            let encoded = encode_projected_row_key(&row)?;
-            view.add_delta(encoded, *diff);
+            view.add_delta(encoded_i64_row(*value), *diff);
         }
         view.flush().await
     }
