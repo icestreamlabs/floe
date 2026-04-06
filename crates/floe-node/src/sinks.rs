@@ -12,7 +12,6 @@ use datafusion::arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::scalar::ScalarValue;
 use floe_executor::FloeQueryContext;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::checkpoint::SinkCursor;
@@ -545,33 +544,10 @@ fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
         return Ok(serde_json::Value::from(values.value(row_idx)));
     }
 
-    let scalar = ScalarValue::try_from_array(array, row_idx)?;
-    Ok(scalar_to_json(&scalar))
-}
-
-fn scalar_to_json(value: &ScalarValue) -> serde_json::Value {
-    match value {
-        ScalarValue::Boolean(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Int8(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Int16(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Int32(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Int64(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::UInt8(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::UInt16(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::UInt32(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::UInt64(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Float32(Some(v)) => serde_json::Value::from(*v as f64),
-        ScalarValue::Float64(Some(v)) => serde_json::Value::from(*v),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-            serde_json::Value::from(v.clone())
-        }
-        ScalarValue::TimestampMicrosecond(Some(v), _)
-        | ScalarValue::TimestampMillisecond(Some(v), _)
-        | ScalarValue::TimestampNanosecond(Some(v), _)
-        | ScalarValue::TimestampSecond(Some(v), _) => serde_json::Value::from(*v),
-        ScalarValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(other.to_string()),
-    }
+    bail!(
+        "unsupported sink column type for JSON conversion: {:?}",
+        array.data_type()
+    )
 }
 #[cfg(test)]
 mod tests {
