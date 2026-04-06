@@ -78,19 +78,32 @@ impl SourceTableProvider {
     )> {
         let snapshot = self.load_snapshot().await?;
         let primary_key_index = self.primary_key_index;
+        let snapshot = if let (Some(filter), Some(index)) = (primary_key_filter, primary_key_index)
+        {
+            let mut filtered = HashMap::with_capacity(snapshot.len());
+            for (key, diff) in snapshot {
+                if diff <= 0 {
+                    filtered.insert(key, diff);
+                    continue;
+                }
+                if filter
+                    .matches_encoded_row(&key, index)
+                    .map_err(to_datafusion_error)?
+                {
+                    filtered.insert(key, diff);
+                }
+            }
+            filtered
+        } else {
+            snapshot
+        };
         build_batches_from_encoded_snapshot(
             snapshot,
             self.schema.clone(),
             projection,
             limit,
             None,
-            Some(move |row: &crate::stream_types::Row| {
-                if let (Some(filter), Some(index)) = (primary_key_filter, primary_key_index) {
-                    row.get(index).is_some_and(|value| filter.matches(value))
-                } else {
-                    true
-                }
-            }),
+            Option::<fn(&crate::stream_types::Row) -> bool>::None,
         )
     }
 

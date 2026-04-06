@@ -1,5 +1,8 @@
+use anyhow::Result;
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion::scalar::ScalarValue;
+
+use crate::encoding::{EncodedRowScalar, extract_encoded_row_scalar};
 
 use super::MV_VERSION_COLUMN;
 
@@ -35,12 +38,17 @@ pub(super) fn parse_mv_version_expr(expr: &Expr) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 pub(super) struct PrimaryKeyFilter {
-    values: Vec<ScalarValue>,
+    values: Vec<EncodedRowScalar>,
 }
 
 impl PrimaryKeyFilter {
-    pub fn matches(&self, value: &ScalarValue) -> bool {
-        self.values.iter().any(|candidate| candidate == value)
+    pub fn matches_encoded(&self, value: Option<&EncodedRowScalar>) -> bool {
+        value.is_some_and(|value| self.values.iter().any(|candidate| candidate == value))
+    }
+
+    pub fn matches_encoded_row(&self, row_key: &[u8], column_index: usize) -> Result<bool> {
+        let value = extract_encoded_row_scalar(row_key, column_index)?;
+        Ok(self.matches_encoded(value.as_ref()))
     }
 }
 
@@ -73,12 +81,14 @@ pub(super) fn parse_primary_key_expr(
         && binary.op == Operator::Eq
     {
         if is_named_column(binary.left.as_ref(), primary_key_column) {
-            return literal_to_scalar(binary.right.as_ref()).map(|value| PrimaryKeyFilter {
-                values: vec![value],
+            return literal_to_encoded_scalar(binary.right.as_ref()).map(|value| {
+                PrimaryKeyFilter {
+                    values: vec![value],
+                }
             });
         }
         if is_named_column(binary.right.as_ref(), primary_key_column) {
-            return literal_to_scalar(binary.left.as_ref()).map(|value| PrimaryKeyFilter {
+            return literal_to_encoded_scalar(binary.left.as_ref()).map(|value| PrimaryKeyFilter {
                 values: vec![value],
             });
         }
@@ -90,7 +100,7 @@ pub(super) fn parse_primary_key_expr(
     {
         let mut values = Vec::with_capacity(in_list.list.len());
         for item in &in_list.list {
-            values.push(literal_to_scalar(item)?);
+            values.push(literal_to_encoded_scalar(item)?);
         }
         if !values.is_empty() {
             return Some(PrimaryKeyFilter { values });
@@ -115,9 +125,21 @@ fn literal_to_u64(expr: &Expr) -> Option<u64> {
     }
 }
 
-fn literal_to_scalar(expr: &Expr) -> Option<ScalarValue> {
+fn literal_to_encoded_scalar(expr: &Expr) -> Option<EncodedRowScalar> {
     match expr {
-        Expr::Literal(value, _) => Some(value.clone()),
+        Expr::Literal(value, _) => scalar_to_encoded(value),
+        _ => None,
+    }
+}
+
+fn scalar_to_encoded(value: &ScalarValue) -> Option<EncodedRowScalar> {
+    match value {
+        ScalarValue::Int64(Some(value)) => Some(EncodedRowScalar::Int64(*value)),
+        ScalarValue::Utf8(Some(value)) => Some(EncodedRowScalar::Utf8(value.clone())),
+        ScalarValue::TimestampMillisecond(Some(value), _) => {
+            Some(EncodedRowScalar::TimestampMillis(*value))
+        }
+        ScalarValue::Boolean(Some(value)) => Some(EncodedRowScalar::Bool(*value)),
         _ => None,
     }
 }
@@ -135,8 +157,8 @@ mod tests {
             Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
         ));
         let filter = parse_primary_key_expr(&expr, "id").expect("pk eq filter");
-        assert!(filter.matches(&ScalarValue::Int64(Some(42))));
-        assert!(!filter.matches(&ScalarValue::Int64(Some(7))));
+        assert!(filter.matches_encoded(Some(&EncodedRowScalar::Int64(42))));
+        assert!(!filter.matches_encoded(Some(&EncodedRowScalar::Int64(7))));
     }
 
     #[test]
@@ -150,8 +172,8 @@ mod tests {
             negated: false,
         });
         let filter = parse_primary_key_expr(&expr, "id").expect("pk in filter");
-        assert!(filter.matches(&ScalarValue::Int64(Some(1))));
-        assert!(filter.matches(&ScalarValue::Int64(Some(2))));
-        assert!(!filter.matches(&ScalarValue::Int64(Some(3))));
+        assert!(filter.matches_encoded(Some(&EncodedRowScalar::Int64(1))));
+        assert!(filter.matches_encoded(Some(&EncodedRowScalar::Int64(2))));
+        assert!(!filter.matches_encoded(Some(&EncodedRowScalar::Int64(3))));
     }
 }
