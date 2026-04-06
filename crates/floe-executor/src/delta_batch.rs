@@ -38,7 +38,8 @@ pub struct DeltaBatchBuffer {
     base_schema: SchemaRef,
     delta_schema: SchemaRef,
     config: DeltaBatchConfig,
-    rows: Vec<Row>,
+    columns: Vec<Vec<ScalarValue>>,
+    row_count: usize,
     weights: Vec<Diff>,
     keys: Option<Vec<Vec<u8>>>,
     estimated_bytes: usize,
@@ -65,6 +66,7 @@ impl DeltaBatchBuffer {
             .iter()
             .map(|field| (**field).clone())
             .collect();
+        let base_width = base_schema.fields().len();
         if include_key {
             fields.push(Field::new(KEY_COLUMN_NAME, DataType::Binary, false));
         }
@@ -75,7 +77,8 @@ impl DeltaBatchBuffer {
             base_schema,
             delta_schema,
             config,
-            rows: Vec::new(),
+            columns: vec![Vec::new(); base_width],
+            row_count: 0,
             weights: Vec::new(),
             keys: include_key.then(Vec::new),
             estimated_bytes: 0,
@@ -110,7 +113,10 @@ impl DeltaBatchBuffer {
         }
 
         self.estimated_bytes += estimate_row_bytes(&row);
-        self.rows.push(row);
+        for (idx, value) in row.into_iter().enumerate() {
+            self.columns[idx].push(value);
+        }
+        self.row_count += 1;
         self.weights.push(weight);
 
         if let Some(reason) = self.should_flush() {
@@ -124,7 +130,7 @@ impl DeltaBatchBuffer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.row_count == 0
     }
 
     pub fn delta_schema(&self) -> SchemaRef {
@@ -132,7 +138,7 @@ impl DeltaBatchBuffer {
     }
 
     fn should_flush(&self) -> Option<FlushReason> {
-        if self.rows.len() >= self.config.max_rows {
+        if self.row_count >= self.config.max_rows {
             return Some(FlushReason::MaxRows);
         }
         if self.estimated_bytes >= self.config.max_bytes {
@@ -142,24 +148,16 @@ impl DeltaBatchBuffer {
     }
 
     fn flush(&mut self, reason: FlushReason) -> Result<Option<RecordBatch>> {
-        if self.rows.is_empty() {
+        if self.row_count == 0 {
             return Ok(None);
         }
 
-        let mut columns: Vec<Vec<ScalarValue>> =
-            vec![Vec::with_capacity(self.rows.len()); self.base_schema.fields().len()];
-
-        for row in self.rows.drain(..) {
-            for (idx, value) in row.into_iter().enumerate() {
-                columns[idx].push(value);
-            }
-        }
-
-        let mut arrays: Vec<ArrayRef> = columns
-            .into_iter()
+        let mut arrays: Vec<ArrayRef> = self
+            .columns
+            .iter_mut()
             .enumerate()
             .map(|(idx, col)| {
-                ScalarValue::iter_to_array(col)
+                ScalarValue::iter_to_array(std::mem::take(col))
                     .map_err(|err| anyhow!("convert delta column {idx} to array: {err}"))
             })
             .collect::<Result<_>>()?;
@@ -190,6 +188,7 @@ impl DeltaBatchBuffer {
 
         let rows = batch.num_rows();
         let bytes = self.estimated_bytes;
+        self.row_count = 0;
         self.estimated_bytes = 0;
         metrics::observe_delta_batch(rows, bytes);
         metrics::inc_delta_batch_flushes();
