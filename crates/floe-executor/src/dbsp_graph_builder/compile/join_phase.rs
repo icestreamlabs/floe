@@ -488,12 +488,7 @@ impl DbspGraphBuilder {
             .await
             .context("initialize DBSP anti-join for LEFT/FULL OUTER join")?;
 
-            let right_fields = right_schema.fields().to_vec();
-            let mut right_nulls = Vec::with_capacity(right_fields.len());
-            for field in &right_fields {
-                right_nulls.push(null_scalar_for_dbsp_type(&field.data_type));
-            }
-            let right_null_suffix = encode_projected_row_key(&right_nulls)
+            let right_null_suffix = encode_null_row_template(right_schema.as_ref())
                 .context("encode left outer null-extension right template row")?;
             let null_extend_graph_id = graph_id.clone();
             let null_extend = move |left_bytes: &Vec<u8>| -> Vec<u8> {
@@ -601,12 +596,7 @@ impl DbspGraphBuilder {
             .await
             .context("initialize DBSP anti-join for RIGHT/FULL OUTER join")?;
 
-            let left_fields = left_schema.fields().to_vec();
-            let mut left_nulls = Vec::with_capacity(left_fields.len());
-            for field in &left_fields {
-                left_nulls.push(null_scalar_for_dbsp_type(&field.data_type));
-            }
-            let left_null_prefix = encode_projected_row_key(&left_nulls)
+            let left_null_prefix = encode_null_row_template(left_schema.as_ref())
                 .context("encode right outer null-extension left template row")?;
             let null_extend_graph_id = graph_id.clone();
             let null_extend = move |right_bytes: &Vec<u8>| -> Vec<u8> {
@@ -977,6 +967,21 @@ impl DbspGraphBuilder {
 
         Ok(())
     }
+}
+
+fn encode_null_row_template(schema: &RowSchema) -> Result<Vec<u8>> {
+    let count = u32::try_from(schema.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + schema.len());
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for field in schema.fields() {
+        match field.data_type {
+            DbspScalarType::Int64 => encoded.push(0x05),
+            DbspScalarType::Utf8 => encoded.push(0x06),
+            DbspScalarType::TimestampMillis => encoded.push(0x07),
+            DbspScalarType::Bool => encoded.push(0x08),
+        }
+    }
+    Ok(encoded)
 }
 
 fn direct_column_index(

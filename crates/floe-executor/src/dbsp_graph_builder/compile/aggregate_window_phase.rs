@@ -388,11 +388,7 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.clone();
         let projector = move |pair: &(WindowKey<Vec<u8>>, Vec<u8>)| -> Vec<u8> {
-            let window_bounds = [
-                ScalarValue::TimestampMillisecond(Some(pair.0.start), None),
-                ScalarValue::TimestampMillisecond(Some(pair.0.end), None),
-            ];
-            let encoded_window_bounds = match encode_projected_row_key(&window_bounds) {
+            let encoded_window_bounds = match encode_window_bounds(pair.0.start, pair.0.end) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -556,12 +552,7 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.to_string();
         let projector = move |pair: &(Vec<u8>, Vec<i64>)| -> Vec<u8> {
-            let count_values = pair
-                .1
-                .iter()
-                .map(|value| ScalarValue::Int64(Some(*value)))
-                .collect::<Vec<_>>();
-            let encoded_count_values = match encode_projected_row_key(&count_values) {
+            let encoded_count_values = match encode_count_values(&pair.1) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -614,12 +605,7 @@ impl DbspGraphBuilder {
         });
         let project_graph_id = graph_id.to_string();
         let projector = move |pair: &(Vec<u8>, Vec<dbsp::AggregateValue>)| -> Vec<u8> {
-            let aggregate_values = pair
-                .1
-                .iter()
-                .map(scalar_from_incremental_aggregate_value)
-                .collect::<Vec<_>>();
-            let encoded_aggregate_values = match encode_projected_row_key(&aggregate_values) {
+            let encoded_aggregate_values = match encode_incremental_aggregate_values(&pair.1) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -1441,6 +1427,52 @@ fn append_untyped_null(encoded: &mut Vec<u8>) {
     encoded.push(0x00);
 }
 
+fn encode_window_bounds(start: i64, end: i64) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(4 + 2 * 9);
+    encoded.extend_from_slice(&2_u32.to_le_bytes());
+    append_encoded_timestamp(start, &mut encoded);
+    append_encoded_timestamp(end, &mut encoded);
+    Ok(encoded)
+}
+
+fn encode_count_values(values: &[i64]) -> Result<Vec<u8>> {
+    let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (values.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        append_encoded_i64(*value, &mut encoded);
+    }
+    Ok(encoded)
+}
+
+fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Result<Vec<u8>> {
+    let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (values.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        match value {
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Int64) => encoded.push(0x05),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::TimestampMillis) => {
+                encoded.push(0x07);
+            }
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => encoded.push(0x06),
+            dbsp::AggregateValue::Int64(value) => append_encoded_i64(*value, &mut encoded),
+            dbsp::AggregateValue::TimestampMillis(value) => {
+                append_encoded_timestamp(*value, &mut encoded);
+            }
+            dbsp::AggregateValue::Utf8(value) => {
+                encoded.push(0x02);
+                let bytes = value.as_bytes();
+                let len = u32::try_from(bytes.len())
+                    .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
+                encoded.extend_from_slice(&len.to_le_bytes());
+                encoded.extend_from_slice(bytes);
+            }
+        }
+    }
+    Ok(encoded)
+}
+
 fn append_encoded_sum_like_value(
     value: i64,
     output_type: &DbspScalarType,
@@ -1489,23 +1521,6 @@ fn incremental_aggregate_value_from_encoded_scalar(
             );
             None
         }
-    }
-}
-
-pub(crate) fn scalar_from_incremental_aggregate_value(value: &dbsp::AggregateValue) -> ScalarValue {
-    match value {
-        dbsp::AggregateValue::Null(value_type) => match value_type {
-            dbsp::AggregateValueType::Int64 => ScalarValue::Int64(None),
-            dbsp::AggregateValueType::TimestampMillis => {
-                ScalarValue::TimestampMillisecond(None, None)
-            }
-            dbsp::AggregateValueType::Utf8 => ScalarValue::Utf8(None),
-        },
-        dbsp::AggregateValue::Int64(value) => ScalarValue::Int64(Some(*value)),
-        dbsp::AggregateValue::TimestampMillis(value) => {
-            ScalarValue::TimestampMillisecond(Some(*value), None)
-        }
-        dbsp::AggregateValue::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
     }
 }
 

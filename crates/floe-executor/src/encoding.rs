@@ -186,6 +186,7 @@ pub(crate) fn decode_all_encoded_row_scalars(
     extract_encoded_row_scalars(bytes, indices.as_slice())
 }
 
+#[cfg(test)]
 pub(crate) fn scalar_value_from_encoded_scalar(value: Option<&EncodedRowScalar>) -> ScalarValue {
     match value {
         Some(EncodedRowScalar::Int64(value)) => ScalarValue::Int64(Some(*value)),

@@ -27,7 +27,7 @@ use crate::dbsp_plan::{
 use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, EncodedRowScalar, concat_encoded_rows,
-    encode_projected_row_key, extract_encoded_row_columns, extract_encoded_row_scalar,
+    extract_encoded_row_columns, extract_encoded_row_scalar,
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
@@ -36,7 +36,6 @@ use crate::task_events::{GraphTaskSender, report_graph_task_error};
 use super::compile::{
     build_count_aggregate_slot_kinds, build_count_row_evaluator,
     build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
-    scalar_from_incremental_aggregate_value,
 };
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
@@ -4293,11 +4292,7 @@ fn encode_count_aggregate_output_deltas(
         if diff == 0 {
             continue;
         }
-        let aggregate_values = values
-            .into_iter()
-            .map(|value| ScalarValue::Int64(Some(value)))
-            .collect::<Vec<_>>();
-        let encoded_aggregate_values = encode_projected_row_key(&aggregate_values)?;
+        let encoded_aggregate_values = encode_i64_values(&values)?;
         let row = concat_encoded_rows(&key, &encoded_aggregate_values)?;
         encoded.push((row, diff));
     }
@@ -4312,13 +4307,52 @@ fn encode_incremental_aggregate_output_deltas(
         if diff == 0 {
             continue;
         }
-        let aggregate_values = values
-            .iter()
-            .map(scalar_from_incremental_aggregate_value)
-            .collect::<Vec<_>>();
-        let encoded_aggregate_values = encode_projected_row_key(&aggregate_values)?;
+        let encoded_aggregate_values = encode_incremental_aggregate_values(&values)?;
         let row = concat_encoded_rows(&key, &encoded_aggregate_values)?;
         encoded.push((row, diff));
+    }
+    Ok(encoded)
+}
+
+fn encode_i64_values(values: &[i64]) -> Result<Vec<u8>> {
+    let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (values.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Result<Vec<u8>> {
+    let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (values.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        match value {
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Int64) => encoded.push(0x05),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::TimestampMillis) => {
+                encoded.push(0x07);
+            }
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => encoded.push(0x06),
+            dbsp::AggregateValue::Int64(value) => {
+                encoded.push(0x01);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            dbsp::AggregateValue::TimestampMillis(value) => {
+                encoded.push(0x03);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            dbsp::AggregateValue::Utf8(value) => {
+                encoded.push(0x02);
+                let bytes = value.as_bytes();
+                let len = u32::try_from(bytes.len())
+                    .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
+                encoded.extend_from_slice(&len.to_le_bytes());
+                encoded.extend_from_slice(bytes);
+            }
+        }
     }
     Ok(encoded)
 }

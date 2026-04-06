@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::common::Column;
 #[cfg(test)]
 use datafusion::logical_expr::Expr;
+#[cfg(test)]
 use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspAggregateExpr, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
@@ -26,9 +27,11 @@ use tokio_util::sync::CancellationToken;
 use crate::dbsp_bridge::DbspBridge;
 #[cfg(test)]
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
+use crate::encoding::decode_all_encoded_row_scalars;
+#[cfg(test)]
+use crate::encoding::encode_projected_row_key;
 #[cfg(test)]
 use crate::encoding::{EncodedRowScalar, scalar_value_from_encoded_scalar};
-use crate::encoding::{decode_all_encoded_row_scalars, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
@@ -157,7 +160,6 @@ mod source_map_phase;
 pub(crate) use aggregate_window_phase::{
     build_count_aggregate_slot_kinds, build_count_row_evaluator,
     build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
-    scalar_from_incremental_aggregate_value,
 };
 
 async fn log_handle_rows(
@@ -187,15 +189,6 @@ async fn log_handle_rows(
         "handle rows"
     );
     Ok(())
-}
-
-fn null_scalar_for_dbsp_type(data_type: &DbspScalarType) -> ScalarValue {
-    match data_type {
-        DbspScalarType::Int64 => ScalarValue::Int64(None),
-        DbspScalarType::Utf8 => ScalarValue::Utf8(None),
-        DbspScalarType::TimestampMillis => ScalarValue::TimestampMillisecond(None, None),
-        DbspScalarType::Bool => ScalarValue::Boolean(None),
-    }
 }
 
 #[cfg(test)]
