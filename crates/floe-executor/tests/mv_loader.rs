@@ -6,7 +6,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{col, table_scan};
-use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use dbsp::circuit::CircuitPlan;
 use dbsp::handles::ZSetHandleView;
@@ -16,7 +15,7 @@ use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, ValidatedPlan, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
-use floe_executor::encoding::{encode_projected_row_key, extract_encoded_row_i64_like_column};
+use floe_executor::encoding::extract_encoded_row_i64_like_column;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
@@ -38,7 +37,7 @@ struct BuiltViewFixture {
 
 #[tokio::test]
 async fn load_or_register_mv_makes_view_queryable() {
-    let fixture = build_q1_fixture("mv-loader-registers", vec![bid_row(1, 2, 50)]).await;
+    let fixture = build_q1_fixture("mv-loader-registers", vec![encode_bid_row(1, 2, 50)]).await;
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
     let query = FloeQueryContext::new(Arc::clone(&catalog));
     let session = query.session();
@@ -79,18 +78,7 @@ async fn load_or_register_mv_registers_overlay_only_view() {
         ])),
     );
     let handle = registry.register(VIEW_NAME.to_string());
-    handle.append_encoded_overlay_batch(
-        1,
-        vec![(
-            encode_projected_row_key(&[
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(100)),
-            ])
-            .expect("encode overlay row"),
-            1,
-        )],
-    );
+    handle.append_encoded_overlay_batch(1, vec![(encode_q1_row(1, 2, 100), 1)]);
 
     let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
     load_or_register_mv(&session, Arc::clone(&registry), &mut bridge, VIEW_NAME)
@@ -112,7 +100,8 @@ async fn load_or_register_mv_registers_overlay_only_view() {
 
 #[tokio::test]
 async fn mv_loader_reads_persisted_base_plus_overlay() {
-    let fixture = build_q1_fixture("mv-loader-hybrid-overlay", vec![bid_row(1, 2, 50)]).await;
+    let fixture =
+        build_q1_fixture("mv-loader-hybrid-overlay", vec![encode_bid_row(1, 2, 50)]).await;
     let registry = Arc::new(MaterializedViewRegistry::new());
     registry.set_schema(VIEW_NAME, Arc::clone(&fixture.schema));
     let source_handle = fixture.registry.get(VIEW_NAME).expect("source handle");
@@ -136,15 +125,7 @@ async fn mv_loader_reads_persisted_base_plus_overlay() {
     );
     handle.append_encoded_overlay_batch(
         logical_base_version + 1,
-        vec![(
-            encode_projected_row_key(&[
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(140)),
-            ])
-            .expect("encode row"),
-            1,
-        )],
+        vec![(encode_q1_row(2, 3, 140), 1)],
     );
 
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
@@ -170,7 +151,7 @@ async fn mv_loader_reads_persisted_base_plus_overlay() {
 async fn mv_loader_supports_as_of_filter() {
     let fixture = build_q1_fixture(
         "mv-loader-as-of",
-        vec![bid_row(1, 2, 50), bid_row(2, 3, 70)],
+        vec![encode_bid_row(1, 2, 50), encode_bid_row(2, 3, 70)],
     )
     .await;
     let version_one = fixture.versions[0];
@@ -215,7 +196,7 @@ async fn mv_loader_supports_as_of_filter() {
 async fn mv_loader_recovers_after_registry_restart() {
     let fixture = build_q1_fixture(
         "mv-loader-restart",
-        vec![bid_row(1, 2, 50), bid_row(2, 3, 70)],
+        vec![encode_bid_row(1, 2, 50), encode_bid_row(2, 3, 70)],
     )
     .await;
     let schema = Arc::clone(&fixture.schema);
@@ -261,7 +242,7 @@ async fn mv_loader_recovers_after_registry_restart() {
     assert_eq!(int_rows(&batches), vec![vec![1, 2, 100], vec![2, 3, 140]]);
 }
 
-async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> BuiltViewFixture {
+async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<u8>>) -> BuiltViewFixture {
     let db = test_db(test_name).await;
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
     let plan = build_q1_plan();
@@ -282,8 +263,7 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
     {
         let writer = outer.writer_mut(SOURCE_NAME).expect("bid writer");
         for row in bids {
-            let encoded = encode_projected_row_key(&row).expect("encode row");
-            writer.append_encoded(encoded, 1).expect("append row");
+            writer.append_encoded(row, 1).expect("append row");
             let handle = writer.flush().await.expect("flush row");
             versions.push(handle.version);
         }
@@ -392,16 +372,44 @@ fn gather_transient_streams(
     map
 }
 
-fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Int64(Some(bidder)),
-        ScalarValue::Int64(Some(price)),
-        ScalarValue::Utf8(Some("channel".to_string())),
-        ScalarValue::Utf8(Some("url".to_string())),
-        ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
+fn encode_q1_row(auction: i64, bidder: i64, price: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + (3 * 9));
+    encoded.extend_from_slice(&(3_u32).to_le_bytes());
+    append_i64(&mut encoded, auction);
+    append_i64(&mut encoded, bidder);
+    append_i64(&mut encoded, price);
+    encoded
+}
+
+fn encode_bid_row(auction: i64, bidder: i64, price: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + (4 * 9) + 32);
+    encoded.extend_from_slice(&(7_u32).to_le_bytes());
+    append_i64(&mut encoded, auction);
+    append_i64(&mut encoded, bidder);
+    append_i64(&mut encoded, price);
+    append_utf8(&mut encoded, "channel");
+    append_utf8(&mut encoded, "url");
+    append_timestamp_millis(&mut encoded, 1_700_000_000_000);
+    append_utf8(&mut encoded, "extra");
+    encoded
+}
+
+fn append_i64(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_timestamp_millis(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x03);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_utf8(encoded: &mut Vec<u8>, value: &str) {
+    encoded.push(0x02);
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len()).expect("utf8 field length");
+    encoded.extend_from_slice(&len.to_le_bytes());
+    encoded.extend_from_slice(bytes);
 }
 
 fn int_rows(batches: &[RecordBatch]) -> Vec<Vec<i64>> {

@@ -97,12 +97,10 @@ pub async fn load_or_register_mv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::encode_projected_row_key;
     use anyhow::Result;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::scalar::ScalarValue;
     use dbsp::StreamRetention;
     use object_store::memory::InMemory;
     use slatedb::Db;
@@ -113,7 +111,13 @@ mod tests {
     async fn registers_provider_when_state_warm() -> Result<()> {
         let db = test_db("mv-loader-warm").await;
         let schema = test_schema();
-        let state = seed_view(Arc::clone(&db), &[row(1)], Arc::clone(&schema), false).await?;
+        let state = seed_view(
+            Arc::clone(&db),
+            &[encoded_i64_row(1)],
+            Arc::clone(&schema),
+            false,
+        )
+        .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         let handle = registry.register(VIEW_NAME.to_string());
@@ -137,7 +141,7 @@ mod tests {
         let schema = test_schema();
         let _ = seed_view(
             Arc::clone(&db),
-            &[row(2), row(3)],
+            &[encoded_i64_row(2), encoded_i64_row(3)],
             Arc::clone(&schema),
             false,
         )
@@ -163,7 +167,13 @@ mod tests {
     async fn recovers_schema_from_persisted_metadata() -> Result<()> {
         let db = test_db("mv-loader-schema").await;
         let schema = test_schema();
-        let _ = seed_view(Arc::clone(&db), &[row(4)], Arc::clone(&schema), true).await?;
+        let _ = seed_view(
+            Arc::clone(&db),
+            &[encoded_i64_row(4)],
+            Arc::clone(&schema),
+            true,
+        )
+        .await?;
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
@@ -182,9 +192,14 @@ mod tests {
     async fn errors_when_schema_unavailable() {
         let db = test_db("mv-loader-error").await;
         let schema = test_schema();
-        let _ = seed_view(Arc::clone(&db), &[row(5)], Arc::clone(&schema), false)
-            .await
-            .expect("seed view");
+        let _ = seed_view(
+            Arc::clone(&db),
+            &[encoded_i64_row(5)],
+            Arc::clone(&schema),
+            false,
+        )
+        .await
+        .expect("seed view");
 
         let registry = Arc::new(MaterializedViewRegistry::new());
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
@@ -203,13 +218,17 @@ mod tests {
         )]))
     }
 
-    fn row(value: i64) -> Vec<ScalarValue> {
-        vec![ScalarValue::Int64(Some(value))]
+    fn encoded_i64_row(value: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 1 + 8);
+        encoded.extend_from_slice(&(1_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded
     }
 
     async fn seed_view(
         db: Arc<Db>,
-        rows: &[Vec<ScalarValue>],
+        rows: &[Vec<u8>],
         schema: SchemaRef,
         persist_schema: bool,
     ) -> Result<DbspPersistedState> {
@@ -218,8 +237,7 @@ mod tests {
             .new_view(VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
             .await?;
         for row in rows {
-            let key = encode_projected_row_key(row)?;
-            view.add_delta(key, 1);
+            view.add_delta(row.clone(), 1);
         }
         view.flush().await?;
         if persist_schema {
