@@ -9,8 +9,6 @@ pub mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
 pub mod encoding;
-pub mod expression;
-mod expression_eval;
 pub mod materialized_view;
 mod metrics;
 pub mod mv;
