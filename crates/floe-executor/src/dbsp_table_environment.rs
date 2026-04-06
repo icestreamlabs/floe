@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use datafusion::scalar::ScalarValue;
 use dbsp::circuit::tables::{
     nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
     nexmark_person_alias_table, nexmark_person_table,
@@ -13,7 +12,6 @@ use dbsp::{StreamRetention, ZSetStream};
 use nexmark::event::{Auction, Bid, Event, Person};
 use slatedb::Db;
 
-use crate::encoding::encode_projected_row_key;
 use crate::namespaces;
 
 /// Holds the base ZSet streams for Nexmark tables.
@@ -85,25 +83,6 @@ impl DbspTableEnvironment {
         let key = encode_bid_row(bid)?;
         self.bid.add_delta(key, 1);
         Ok(())
-    }
-
-    pub fn ingest_row(&mut self, table_name: &str, row: &[ScalarValue]) -> Result<()> {
-        let key = encode_projected_row_key(row)?;
-        match table_name {
-            "nexmark_person" | "person" => {
-                self.person.add_delta(key, 1);
-                Ok(())
-            }
-            "nexmark_auction" | "auction" => {
-                self.auction.add_delta(key, 1);
-                Ok(())
-            }
-            "nexmark_bid" | "bid" => {
-                self.bid.add_delta(key, 1);
-                Ok(())
-            }
-            other => Err(anyhow!("unknown table '{other}' for ingestion")),
-        }
     }
 
     /// Flushes all base streams, persisting pending deltas.
