@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+#[cfg(test)]
 use datafusion::scalar::ScalarValue;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +23,8 @@ pub enum EncodedRowScalar {
 }
 
 /// Encode a projected row into deterministic bytes for DBSP keys.
-pub fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
     let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
     buf.extend_from_slice(&count.to_le_bytes());
