@@ -186,7 +186,7 @@ async fn filter_and_projection_materializes_mv() {
     assert_eq!(outputs.required_sources, required_sources);
 
     let rows = materialized_rows(&mv_registry, view_name).await;
-    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
+    assert_eq!(rows, vec![int_row(&[99])]);
 }
 
 #[tokio::test]
@@ -277,7 +277,7 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
     wait_for_visible_row_count(&mv_registry, view_name, 1).await;
 
     let rows = visible_rows(&mv_registry, view_name).await;
-    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(99))]]);
+    assert_eq!(rows, vec![int_row(&[99])]);
 
     let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
         .await
@@ -422,13 +422,7 @@ async fn inner_join_materializes_mv() {
     assert_eq!(outputs.required_sources, required_sources);
 
     let rows = materialized_rows(&mv_registry, view_name).await;
-    assert_eq!(
-        rows,
-        vec![vec![
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("alice".to_string())),
-        ]]
-    );
+    assert_eq!(rows, vec![int_utf8_row(10, Some("alice"))]);
 }
 
 #[tokio::test]
@@ -585,31 +579,13 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    rows.sort_by_key(|row| match row.get(1) {
-        Some(ScalarValue::Int64(Some(value))) => *value,
-        _ => 0,
-    });
+    rows.sort_by_key(|row| scalar_i64(row.get(1)));
     assert_eq!(
         rows,
         vec![
-            vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(8)),
-                ScalarValue::Int64(Some(30)),
-                ScalarValue::Int64(Some(100)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(9)),
-                ScalarValue::Int64(Some(40)),
-                ScalarValue::Int64(Some(100)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(42)),
-                ScalarValue::Int64(Some(10)),
-                ScalarValue::Int64(Some(100)),
-            ],
+            int_row(&[1, 8, 30, 100]),
+            int_row(&[1, 9, 40, 100]),
+            int_row(&[1, 42, 10, 100])
         ]
     );
 }
@@ -736,20 +712,12 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
     wait_for_visible_row_count(&mv_registry, view_name, expected_rows).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
-    rows.sort_by_key(|row| match row.get(1) {
-        Some(ScalarValue::Int64(Some(value))) => *value,
-        _ => 0,
-    });
+    rows.sort_by_key(|row| scalar_i64(row.get(1)));
     assert_eq!(rows.len(), expected_rows);
     for (idx, row) in rows.iter().enumerate() {
         assert_eq!(
             row,
-            &vec![
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(1_000 + idx as i64)),
-                ScalarValue::Int64(Some(10 + idx as i64)),
-                ScalarValue::Int64(Some(100)),
-            ]
+            &int_row(&[1, 1_000 + idx as i64, 10 + idx as i64, 100])
         );
     }
 }
@@ -904,10 +872,7 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
     wait_for_visible_row_count(&mv_registry, view_name, expected_rows).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
-    rows.sort_by_key(|row| match row.get(1) {
-        Some(ScalarValue::Int64(Some(value))) => *value,
-        _ => 0,
-    });
+    rows.sort_by_key(|row| scalar_i64(row.get(1)));
 
     let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
         .await
@@ -953,10 +918,7 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
     wait_for_visible_row_count(&restarted_mv_registry, view_name, expected_rows).await;
 
     let mut restarted_rows = visible_rows(&restarted_mv_registry, view_name).await;
-    restarted_rows.sort_by_key(|row| match row.get(1) {
-        Some(ScalarValue::Int64(Some(value))) => *value,
-        _ => 0,
-    });
+    restarted_rows.sort_by_key(|row| scalar_i64(row.get(1)));
     assert_eq!(restarted_rows, rows);
 }
 
@@ -1059,13 +1021,7 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
     wait_for_visible_row_count(&mv_registry, view_name, 1).await;
 
     let rows = visible_rows(&mv_registry, view_name).await;
-    assert_eq!(
-        rows,
-        vec![vec![
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("alice".to_string())),
-        ]]
-    );
+    assert_eq!(rows, vec![int_utf8_row(10, Some("alice"))]);
 }
 
 #[tokio::test]
@@ -1169,13 +1125,7 @@ async fn left_outer_join_materializes_null_extended_rows() {
     sort_rows_by_first_column(&mut rows);
     assert_eq!(
         rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(10)),
-                ScalarValue::Utf8(Some("alice".to_string())),
-            ],
-            vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)],
-        ]
+        vec![int_utf8_row(10, Some("alice")), int_utf8_row(11, None)]
     );
 }
 
@@ -1276,7 +1226,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
     wait_for_logical_version(&mv_registry, view_name, 1).await;
     assert_eq!(
         visible_rows(&mv_registry, view_name).await,
-        vec![vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)]]
+        vec![int_utf8_row(11, None)]
     );
 
     {
@@ -1294,7 +1244,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
     wait_for_logical_version(&mv_registry, view_name, 2).await;
     assert_eq!(
         visible_rows(&mv_registry, view_name).await,
-        vec![vec![ScalarValue::Int64(Some(11)), ScalarValue::Utf8(None)]]
+        vec![int_utf8_row(11, None)]
     );
 
     {
@@ -1312,10 +1262,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
     wait_for_logical_version(&mv_registry, view_name, 3).await;
     assert_eq!(
         visible_rows(&mv_registry, view_name).await,
-        vec![vec![
-            ScalarValue::Int64(Some(11)),
-            ScalarValue::Utf8(Some("bob".to_string())),
-        ]]
+        vec![int_utf8_row(11, Some("bob"))]
     );
 }
 
@@ -1418,22 +1365,8 @@ async fn aggregate_materializes_mv() {
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     let mut expected = vec![
-        vec![
-            ScalarValue::Int64(Some(7)),
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-        ],
-        vec![
-            ScalarValue::Int64(Some(42)),
-            ScalarValue::Int64(Some(2)),
-            ScalarValue::Int64(Some(40)),
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Int64(Some(30)),
-            ScalarValue::Int64(Some(20)),
-        ],
+        int_row(&[7, 1, 5, 5, 5, 5]),
+        int_row(&[42, 2, 40, 10, 30, 20]),
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
@@ -1451,22 +1384,8 @@ async fn aggregate_materializes_mv() {
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     let mut expected = vec![
-        vec![
-            ScalarValue::Int64(Some(7)),
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-            ScalarValue::Int64(Some(5)),
-        ],
-        vec![
-            ScalarValue::Int64(Some(42)),
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Int64(Some(10)),
-        ],
+        int_row(&[7, 1, 5, 5, 5, 5]),
+        int_row(&[42, 1, 10, 10, 10, 10]),
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
@@ -1551,13 +1470,7 @@ async fn topn_materializes_mv() {
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![ScalarValue::Int64(Some(30))],
-            vec![ScalarValue::Int64(Some(30))],
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[30]), int_row(&[30])]);
 }
 
 #[tokio::test]
@@ -1643,13 +1556,7 @@ async fn topn_materializes_mv_from_transient_source_journal() {
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![ScalarValue::Int64(Some(30))],
-            vec![ScalarValue::Int64(Some(30))],
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[30]), int_row(&[30])]);
 }
 
 #[tokio::test]
@@ -2139,21 +2046,7 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(10)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(75)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(11)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(40)),
-            ],
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[10, 2, 75]), int_row(&[11, 1, 40])]);
 }
 
 #[tokio::test]
@@ -2233,13 +2126,7 @@ async fn source_projection_with_proctime_materializes_mv() {
     wait_for_visible_row_count(&mv_registry, view_name, 1).await;
 
     let rows = visible_rows(&mv_registry, view_name).await;
-    assert_eq!(
-        rows,
-        vec![vec![
-            ScalarValue::Int64(Some(42)),
-            ScalarValue::TimestampMillisecond(None, None),
-        ]]
-    );
+    assert_eq!(rows, vec![int_and_null_timestamp_row(42)]);
 }
 
 #[tokio::test]
@@ -2342,15 +2229,15 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
     let rows = visible_rows(&mv_registry, view_name).await;
     assert_eq!(
         rows,
-        vec![vec![
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(42)),
-            ScalarValue::Int64(Some(1_816_000)),
-            ScalarValue::Utf8(Some("nightTime".to_string())),
-            ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-            ScalarValue::Utf8(Some("extra".to_string())),
-            ScalarValue::Int64(Some(0)),
-        ]]
+        vec![count_char_projection_row(
+            1,
+            42,
+            1_816_000,
+            "nightTime",
+            1_700_000_000_000,
+            "extra",
+            0,
+        )]
     );
 }
 
@@ -2440,13 +2327,7 @@ async fn distinct_materializes_unique_rows() {
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![ScalarValue::Int64(Some(7))],
-            vec![ScalarValue::Int64(Some(42))]
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[7]), int_row(&[42])]);
 }
 
 #[tokio::test]
@@ -2544,21 +2425,7 @@ async fn count_distinct_aggregate_materializes_mv() {
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(7)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(1)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(42)),
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(2)),
-            ],
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 3, 2])]);
 }
 
 #[tokio::test]
@@ -2651,21 +2518,7 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(7)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(1)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(42)),
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(2)),
-            ],
-        ]
-    );
+    assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 3, 2])]);
 }
 
 #[tokio::test]
@@ -2777,22 +2630,7 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
     sort_rows_by_first_column(&mut rows);
     assert_eq!(
         rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(7)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(0)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(0)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(42)),
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(2)),
-            ],
-        ]
+        vec![int_row(&[7, 1, 0, 1, 0]), int_row(&[42, 3, 2, 2, 2])]
     );
 }
 
@@ -2952,22 +2790,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
     sort_rows_by_first_column(&mut rows);
     assert_eq!(
         rows,
-        vec![
-            vec![
-                ScalarValue::Int64(Some(7)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(0)),
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(0)),
-            ],
-            vec![
-                ScalarValue::Int64(Some(42)),
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(2)),
-            ],
-        ]
+        vec![int_row(&[7, 1, 0, 1, 0]), int_row(&[42, 3, 2, 2, 2])]
     );
 }
 
@@ -3065,7 +2888,7 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
         .expect("distinct aggregate update");
 
     let rows = materialized_rows(&mv_registry, view_name).await;
-    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(3))]]);
+    assert_eq!(rows, vec![int_row(&[3])]);
 }
 
 #[tokio::test]
@@ -3414,6 +3237,51 @@ fn sort_rows_by_first_column(rows: &mut [Vec<ScalarValue>]) {
         Some(ScalarValue::TimestampMillisecond(Some(value), _)) => *value,
         _ => 0,
     });
+}
+
+fn int_row(values: &[i64]) -> Vec<ScalarValue> {
+    values
+        .iter()
+        .copied()
+        .map(|value| ScalarValue::Int64(Some(value)))
+        .collect()
+}
+
+fn int_utf8_row(id: i64, label: Option<&str>) -> Vec<ScalarValue> {
+    vec![
+        ScalarValue::Int64(Some(id)),
+        match label {
+            Some(label) => ScalarValue::Utf8(Some(label.to_string())),
+            None => ScalarValue::Utf8(None),
+        },
+    ]
+}
+
+fn int_and_null_timestamp_row(id: i64) -> Vec<ScalarValue> {
+    vec![
+        ScalarValue::Int64(Some(id)),
+        ScalarValue::TimestampMillisecond(None, None),
+    ]
+}
+
+fn count_char_projection_row(
+    auction: i64,
+    bidder: i64,
+    projected_price: i64,
+    bid_time_type: &str,
+    date_time_ms: i64,
+    extra: &str,
+    c_counts: i64,
+) -> Vec<ScalarValue> {
+    vec![
+        ScalarValue::Int64(Some(auction)),
+        ScalarValue::Int64(Some(bidder)),
+        ScalarValue::Int64(Some(projected_price)),
+        ScalarValue::Utf8(Some(bid_time_type.to_string())),
+        ScalarValue::TimestampMillisecond(Some(date_time_ms), None),
+        ScalarValue::Utf8(Some(extra.to_string())),
+        ScalarValue::Int64(Some(c_counts)),
+    ]
 }
 
 fn scalar_i64(value: Option<&ScalarValue>) -> i64 {
