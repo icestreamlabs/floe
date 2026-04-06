@@ -27,11 +27,9 @@ use tokio_util::sync::CancellationToken;
 use crate::dbsp_bridge::DbspBridge;
 #[cfg(test)]
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
+#[cfg(test)]
+use crate::encoding::EncodedRowScalar;
 use crate::encoding::decode_all_encoded_row_scalars;
-#[cfg(test)]
-use crate::encoding::encode_projected_row_key;
-#[cfg(test)]
-use crate::encoding::{EncodedRowScalar, scalar_value_from_encoded_scalar};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
@@ -218,21 +216,21 @@ fn compare_encoded_scalar_values(
 #[cfg(test)]
 fn evaluate_aggregate_value(
     agg: &DbspAggregateExpr,
-    decoded: &[(Vec<ScalarValue>, i64)],
+    encoded_rows: &[(Vec<u8>, i64)],
     schema: &RowSchema,
     graph_id: &str,
     context: &str,
-) -> ScalarValue {
+) -> Option<EncodedRowScalar> {
     evaluate_aggregate_values(
         std::slice::from_ref(agg),
-        decoded,
+        encoded_rows,
         schema,
         graph_id,
         context,
     )
     .into_iter()
     .next()
-    .unwrap_or(ScalarValue::Null)
+    .unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -303,28 +301,15 @@ fn aggregate_eval_expr_key(expr: &Expr) -> String {
 #[cfg(test)]
 fn evaluate_aggregate_values(
     aggregates: &[DbspAggregateExpr],
-    decoded: &[(Vec<ScalarValue>, i64)],
+    encoded_rows: &[(Vec<u8>, i64)],
     schema: &RowSchema,
     graph_id: &str,
     context: &str,
-) -> Vec<ScalarValue> {
+) -> Vec<Option<EncodedRowScalar>> {
     if aggregates.is_empty() {
         return Vec::new();
     }
-
-    let mut encoded = Vec::with_capacity(decoded.len());
-    for (row, weight) in decoded {
-        match encode_projected_row_key(row) {
-            Ok(encoded_row) => encoded.push((encoded_row, *weight)),
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to encode {context} test input row"
-                );
-            }
-        }
-    }
+    let mut encoded = encoded_rows.to_vec();
 
     let input_schema = Arc::new(schema.clone());
     let mut expr_column_map = HashMap::new();
@@ -378,7 +363,7 @@ fn evaluate_aggregate_values(
                     error = %err,
                     "failed to build {context} test aggregate projection"
                 );
-                return vec![ScalarValue::Null; aggregates.len()];
+                return vec![None; aggregates.len()];
             }
         };
         eval_schema = Arc::clone(project.output_schema());
@@ -393,7 +378,7 @@ fn evaluate_aggregate_values(
                     error = %err,
                     "failed to build {context} test aggregate predicate"
                 );
-                return vec![ScalarValue::Null; aggregates.len()];
+                return vec![None; aggregates.len()];
             }
         };
         let evaluator = match VectorizedFilterProjectEvaluator::for_filter_map(
@@ -408,7 +393,7 @@ fn evaluate_aggregate_values(
                     error = %err,
                     "failed to initialize {context} test aggregate evaluator"
                 );
-                return vec![ScalarValue::Null; aggregates.len()];
+                return vec![None; aggregates.len()];
             }
         };
         encoded = match evaluator.transform_delta(graph_id, encoded) {
@@ -419,7 +404,7 @@ fn evaluate_aggregate_values(
                     error = %err,
                     "failed to apply {context} test aggregate projection"
                 );
-                return vec![ScalarValue::Null; aggregates.len()];
+                return vec![None; aggregates.len()];
             }
         };
     }
@@ -655,45 +640,44 @@ fn evaluate_aggregate_values(
         .iter()
         .zip(accumulators.into_iter())
         .map(|(plan, accumulator)| match accumulator {
-            AggregateAccumulator::CountDistinct { weights } => ScalarValue::Int64(Some(
+            AggregateAccumulator::CountDistinct { weights } => Some(EncodedRowScalar::Int64(
                 weights.values().filter(|weight| **weight > 0).count() as i64,
             )),
-            AggregateAccumulator::Count { count } => ScalarValue::Int64(Some(count)),
+            AggregateAccumulator::Count { count } => Some(EncodedRowScalar::Int64(count)),
             AggregateAccumulator::Sum { sum, has_value } => {
                 if has_value {
-                    scalar_from_i64(sum, plan.agg.output_type())
+                    Some(scalar_from_i64(sum, plan.agg.output_type()))
                 } else {
-                    ScalarValue::Null
+                    None
                 }
             }
             AggregateAccumulator::Avg { sum, count } => {
                 if count != 0 {
-                    ScalarValue::Int64(Some(sum / count))
+                    Some(EncodedRowScalar::Int64(sum / count))
                 } else {
-                    ScalarValue::Null
+                    None
                 }
             }
             AggregateAccumulator::Min { current } | AggregateAccumulator::Max { current } => {
-                scalar_value_from_encoded_scalar(current.as_ref())
+                current
             }
         })
         .collect()
 }
 
 #[cfg(test)]
-fn scalar_from_i64(value: i64, output_type: &DbspScalarType) -> ScalarValue {
+fn scalar_from_i64(value: i64, output_type: &DbspScalarType) -> EncodedRowScalar {
     match output_type {
-        DbspScalarType::Int64 => ScalarValue::Int64(Some(value)),
-        DbspScalarType::TimestampMillis => ScalarValue::TimestampMillisecond(Some(value), None),
-        _ => ScalarValue::Int64(Some(value)),
+        DbspScalarType::Int64 => EncodedRowScalar::Int64(value),
+        DbspScalarType::TimestampMillis => EncodedRowScalar::TimestampMillis(value),
+        _ => EncodedRowScalar::Int64(value),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate_aggregate_value, evaluate_aggregate_values};
+    use super::{EncodedRowScalar, evaluate_aggregate_value, evaluate_aggregate_values};
     use datafusion::logical_expr::{col, lit};
-    use datafusion::scalar::ScalarValue;
     use dbsp::circuit::schema::{Field, RowSchema};
     use dbsp::circuit::types::DbspScalarType;
     use dbsp::{DbspAggregateFunction, DbspAggregateNode};
@@ -705,6 +689,37 @@ mod tests {
             .map(|(name, ty)| Field::new(name, ty, true))
             .collect();
         RowSchema::try_new(fields).expect("schema")
+    }
+
+    fn encode_test_row(columns: &[Option<EncodedRowScalar>]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let count = u32::try_from(columns.len()).expect("column count fits u32");
+        encoded.extend_from_slice(&count.to_le_bytes());
+        for value in columns {
+            match value {
+                None => encoded.push(0x00),
+                Some(EncodedRowScalar::Int64(value)) => {
+                    encoded.push(0x01);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                Some(EncodedRowScalar::Utf8(value)) => {
+                    encoded.push(0x02);
+                    let bytes = value.as_bytes();
+                    let len = u32::try_from(bytes.len()).expect("utf8 length fits u32");
+                    encoded.extend_from_slice(&len.to_le_bytes());
+                    encoded.extend_from_slice(bytes);
+                }
+                Some(EncodedRowScalar::TimestampMillis(value)) => {
+                    encoded.push(0x03);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                Some(EncodedRowScalar::Bool(value)) => {
+                    encoded.push(0x04);
+                    encoded.push(if *value { 1 } else { 0 });
+                }
+            }
+        }
+        encoded
     }
 
     #[test]
@@ -727,37 +742,62 @@ mod tests {
         .expect("aggregate node");
         let expr = &aggregate.aggregates()[0];
 
-        let decoded = vec![
+        let encoded_rows = vec![
             (
-                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(1))],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(1)),
+                ]),
                 2,
             ),
             (
-                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(2))],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(2)),
+                ]),
                 1,
             ),
             (
-                vec![ScalarValue::Int64(Some(200)), ScalarValue::Int64(Some(3))],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(200)),
+                    Some(EncodedRowScalar::Int64(3)),
+                ]),
                 1,
             ),
         ];
-        let value =
-            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
-        assert_eq!(value, ScalarValue::Int64(Some(2)));
+        let value = evaluate_aggregate_value(
+            expr,
+            &encoded_rows,
+            input_schema.as_ref(),
+            "test",
+            "aggregate",
+        );
+        assert_eq!(value, Some(EncodedRowScalar::Int64(2)));
 
-        let decoded = vec![
+        let encoded_rows = vec![
             (
-                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(1))],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(1)),
+                ]),
                 1,
             ),
             (
-                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(2))],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(2)),
+                ]),
                 -1,
             ),
         ];
-        let value =
-            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
-        assert_eq!(value, ScalarValue::Int64(Some(1)));
+        let value = evaluate_aggregate_value(
+            expr,
+            &encoded_rows,
+            input_schema.as_ref(),
+            "test",
+            "aggregate",
+        );
+        assert_eq!(value, Some(EncodedRowScalar::Int64(1)));
     }
 
     #[test]
@@ -776,13 +816,24 @@ mod tests {
         )
         .expect("aggregate node");
         let expr = &aggregate.aggregates()[0];
-        let decoded = vec![
-            (vec![ScalarValue::Utf8(Some("alpha".to_string()))], 1),
-            (vec![ScalarValue::Utf8(Some("zeta".to_string()))], 1),
+        let encoded_rows = vec![
+            (
+                encode_test_row(&[Some(EncodedRowScalar::Utf8("alpha".to_string()))]),
+                1,
+            ),
+            (
+                encode_test_row(&[Some(EncodedRowScalar::Utf8("zeta".to_string()))]),
+                1,
+            ),
         ];
-        let value =
-            evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate");
-        assert_eq!(value, ScalarValue::Utf8(Some("zeta".to_string())));
+        let value = evaluate_aggregate_value(
+            expr,
+            &encoded_rows,
+            input_schema.as_ref(),
+            "test",
+            "aggregate",
+        );
+        assert_eq!(value, Some(EncodedRowScalar::Utf8("zeta".to_string())));
     }
 
     #[test]
@@ -827,36 +878,36 @@ mod tests {
             ],
         )
         .expect("aggregate node");
-        let decoded = vec![
+        let encoded_rows = vec![
             (
-                vec![
-                    ScalarValue::Int64(Some(10)),
-                    ScalarValue::Int64(Some(1)),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(1)),
+                    Some(EncodedRowScalar::Int64(100)),
+                ]),
                 2,
             ),
             (
-                vec![
-                    ScalarValue::Int64(Some(250)),
-                    ScalarValue::Int64(Some(2)),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(250)),
+                    Some(EncodedRowScalar::Int64(2)),
+                    Some(EncodedRowScalar::Int64(100)),
+                ]),
                 1,
             ),
             (
-                vec![
-                    ScalarValue::Int64(Some(80)),
-                    ScalarValue::Int64(Some(1)),
-                    ScalarValue::Int64(Some(200)),
-                ],
+                encode_test_row(&[
+                    Some(EncodedRowScalar::Int64(80)),
+                    Some(EncodedRowScalar::Int64(1)),
+                    Some(EncodedRowScalar::Int64(200)),
+                ]),
                 1,
             ),
         ];
 
         let multi = evaluate_aggregate_values(
             aggregate.aggregates(),
-            &decoded,
+            &encoded_rows,
             input_schema.as_ref(),
             "test",
             "aggregate",
@@ -865,7 +916,13 @@ mod tests {
             .aggregates()
             .iter()
             .map(|expr| {
-                evaluate_aggregate_value(expr, &decoded, input_schema.as_ref(), "test", "aggregate")
+                evaluate_aggregate_value(
+                    expr,
+                    &encoded_rows,
+                    input_schema.as_ref(),
+                    "test",
+                    "aggregate",
+                )
             })
             .collect::<Vec<_>>();
         assert_eq!(multi, single);
