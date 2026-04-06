@@ -7,6 +7,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::scalar::ScalarValue;
+use floe_core::RowValue;
 
 use crate::encoding::EncodedRowScalar;
 
@@ -118,6 +119,53 @@ impl ScalarColumnBuilder {
                         "expected NULL scalar for Null column, found {value:?}"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_row_value(&mut self, value: &RowValue) -> Result<()> {
+        match self {
+            Self::Int64(builder) => match value {
+                RowValue::Int64(v) => builder.append_value(*v),
+                other => {
+                    return Err(anyhow!(
+                        "expected Int64 row value for Int64 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Utf8(builder) => match value {
+                RowValue::Utf8(v) => builder.append_value(v),
+                other => {
+                    return Err(anyhow!(
+                        "expected Utf8 row value for Utf8 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::TimestampMillis { builder, .. } => match value {
+                RowValue::TimestampMillis(v) => builder.append_value(*v),
+                other => {
+                    return Err(anyhow!(
+                        "expected TimestampMillis row value for timestamp(ms) column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Bool(builder) => match value {
+                RowValue::Bool(v) => builder.append_value(*v),
+                other => {
+                    return Err(anyhow!(
+                        "expected Bool row value for boolean column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Binary(_) => {
+                return Err(anyhow!("cannot append RowValue into binary column builder"));
+            }
+            Self::UInt64(_) => {
+                return Err(anyhow!("cannot append RowValue into UInt64 column builder"));
+            }
+            Self::Null { .. } => {
+                return Err(anyhow!("cannot append RowValue into Null column builder"));
             }
         }
         Ok(())

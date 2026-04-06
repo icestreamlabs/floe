@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -9,7 +8,6 @@ use datafusion::scalar::ScalarValue;
 
 use crate::encoding::extract_encoded_row_scalars;
 use crate::scalar_array_builder::ScalarColumnBuilder;
-use crate::stream_types::Row;
 
 use super::MV_VERSION_COLUMN;
 
@@ -17,43 +15,6 @@ const SCAN_BATCH_ROW_LIMIT: usize = 1024;
 
 pub(super) fn to_datafusion_error(err: anyhow::Error) -> DataFusionError {
     DataFusionError::Execution(err.to_string())
-}
-
-pub(super) fn build_scalar_batches(rows: Vec<Row>, schema: SchemaRef) -> Result<Vec<RecordBatch>> {
-    if rows.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(schema)]);
-    }
-
-    let column_count = schema.fields().len();
-    let mut builders = schema
-        .fields()
-        .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), rows.len()))
-        .collect::<Result<Vec<_>>>()?;
-
-    for row in rows {
-        if row.len() != column_count {
-            return Err(anyhow!(
-                "row has {} columns but schema has {}",
-                row.len(),
-                column_count
-            ));
-        }
-        for (idx, value) in row.into_iter().enumerate() {
-            builders[idx].append(&value)?;
-        }
-    }
-
-    let arrays = builders
-        .iter_mut()
-        .enumerate()
-        .map(|(idx, builder)| {
-            Ok::<ArrayRef, anyhow::Error>(builder.finish_array())
-                .with_context(|| format!("convert column {idx} to array"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let batch = RecordBatch::try_new(schema, arrays).map_err(anyhow::Error::from)?;
-    Ok(vec![batch])
 }
 
 pub(super) fn append_mv_version_field(schema: &SchemaRef) -> SchemaRef {

@@ -2,6 +2,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use anyhow::anyhow;
+use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::memory::MemTable;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
@@ -11,7 +14,8 @@ use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
 
 use super::filters::parse_mv_version_expr;
-use super::helpers::{build_scalar_batches, to_datafusion_error};
+use super::helpers::to_datafusion_error;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 
 pub struct SlateTableProvider {
     storage: Arc<SlateCatalog>,
@@ -87,31 +91,45 @@ impl TableProvider for SlateTableProvider {
             rows.truncate(limit);
         }
 
-        let scalar_rows = rows
-            .into_iter()
-            .map(row_values_to_scalar_row)
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map_err(to_datafusion_error)?;
-
         let batches =
-            build_scalar_batches(scalar_rows, self.schema.clone()).map_err(to_datafusion_error)?;
+            build_row_value_batches(rows, self.schema.clone()).map_err(to_datafusion_error)?;
         let mem_table = MemTable::try_new(self.schema.clone(), vec![batches])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
 
-fn row_values_to_scalar_row(values: Vec<RowValue>) -> anyhow::Result<crate::stream_types::Row> {
-    let mut row = Vec::with_capacity(values.len());
-    for value in values {
-        let scalar = match value {
-            RowValue::Int64(v) => datafusion::scalar::ScalarValue::Int64(Some(v)),
-            RowValue::Bool(flag) => datafusion::scalar::ScalarValue::Boolean(Some(flag)),
-            RowValue::Utf8(text) => datafusion::scalar::ScalarValue::Utf8(Some(text)),
-            RowValue::TimestampMillis(value) => {
-                datafusion::scalar::ScalarValue::TimestampMillisecond(Some(value), None)
-            }
-        };
-        row.push(scalar);
+fn build_row_value_batches(
+    rows: Vec<Vec<RowValue>>,
+    schema: datafusion::arrow::datatypes::SchemaRef,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    if rows.is_empty() {
+        return Ok(vec![RecordBatch::new_empty(schema)]);
     }
-    Ok(row)
+
+    let column_count = schema.fields().len();
+    let mut builders = schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), rows.len()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for row in rows {
+        if row.len() != column_count {
+            return Err(anyhow!(
+                "row has {} columns but schema has {}",
+                row.len(),
+                column_count
+            ));
+        }
+        for (idx, value) in row.iter().enumerate() {
+            builders[idx].append_row_value(value)?;
+        }
+    }
+
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<ArrayRef>>();
+    let batch = RecordBatch::try_new(schema, arrays).map_err(anyhow::Error::from)?;
+    Ok(vec![batch])
 }
