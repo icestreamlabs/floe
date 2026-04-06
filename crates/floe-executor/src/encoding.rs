@@ -1,6 +1,4 @@
 use anyhow::{Result, anyhow};
-#[cfg(test)]
-use datafusion::scalar::ScalarValue;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EncodedRowProjectionSource {
@@ -20,56 +18,6 @@ pub enum EncodedRowScalar {
     Utf8(String),
     TimestampMillis(i64),
     Bool(bool),
-}
-
-/// Encode a projected row into deterministic bytes for DBSP keys.
-#[cfg(test)]
-pub(crate) fn encode_projected_row_key(columns: &[ScalarValue]) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(64);
-    let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
-    buf.extend_from_slice(&count.to_le_bytes());
-    for value in columns {
-        match value {
-            ScalarValue::Null => {
-                // Backward-compatible untyped NULL marker.
-                buf.push(0x00);
-            }
-            ScalarValue::Int64(Some(v)) => {
-                buf.push(0x01);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            ScalarValue::Int64(None) => {
-                buf.push(0x05);
-            }
-            ScalarValue::Utf8(Some(text)) => {
-                buf.push(0x02);
-                let bytes = text.as_bytes();
-                let len = u32::try_from(bytes.len())
-                    .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            ScalarValue::Utf8(None) => {
-                buf.push(0x06);
-            }
-            ScalarValue::TimestampMillisecond(Some(v), _) => {
-                buf.push(0x03);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            ScalarValue::TimestampMillisecond(None, _) => {
-                buf.push(0x07);
-            }
-            ScalarValue::Boolean(Some(flag)) => {
-                buf.push(0x04);
-                buf.push(if *flag { 1 } else { 0 });
-            }
-            ScalarValue::Boolean(None) => {
-                buf.push(0x08);
-            }
-            other => return Err(anyhow!("unsupported ScalarValue in MV key: {other:?}")),
-        }
-    }
-    Ok(buf)
 }
 
 pub fn extract_encoded_row_columns(
@@ -390,26 +338,71 @@ fn collect_encoded_field_spans(
 mod tests {
     use super::*;
 
+    enum TestEncodedField<'a> {
+        Null,
+        Int64(i64),
+        Int64Null,
+        Utf8(&'a str),
+        Utf8Null,
+        TimestampMillis(i64),
+        TimestampNull,
+        Bool(bool),
+        BoolNull,
+    }
+
+    fn encode_test_row(fields: &[TestEncodedField<'_>]) -> Vec<u8> {
+        let count = u32::try_from(fields.len()).expect("field count fits u32");
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&count.to_le_bytes());
+        for field in fields {
+            match field {
+                TestEncodedField::Null => encoded.push(0x00),
+                TestEncodedField::Int64(value) => {
+                    encoded.push(0x01);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                TestEncodedField::Int64Null => encoded.push(0x05),
+                TestEncodedField::Utf8(value) => {
+                    encoded.push(0x02);
+                    let bytes = value.as_bytes();
+                    let len = u32::try_from(bytes.len()).expect("utf8 length fits u32");
+                    encoded.extend_from_slice(&len.to_le_bytes());
+                    encoded.extend_from_slice(bytes);
+                }
+                TestEncodedField::Utf8Null => encoded.push(0x06),
+                TestEncodedField::TimestampMillis(value) => {
+                    encoded.push(0x03);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                TestEncodedField::TimestampNull => encoded.push(0x07),
+                TestEncodedField::Bool(value) => {
+                    encoded.push(0x04);
+                    encoded.push(if *value { 1 } else { 0 });
+                }
+                TestEncodedField::BoolNull => encoded.push(0x08),
+            }
+        }
+        encoded
+    }
+
     #[test]
     fn encodes_simple_rows() {
-        let row = vec![
-            ScalarValue::Int64(Some(42)),
-            ScalarValue::Utf8(Some("abc".into())),
-            ScalarValue::Boolean(Some(true)),
-        ];
-        let encoded = encode_projected_row_key(&row).expect("encode");
+        let encoded = encode_test_row(&[
+            TestEncodedField::Int64(42),
+            TestEncodedField::Utf8("abc"),
+            TestEncodedField::Bool(true),
+        ]);
         assert!(!encoded.is_empty());
     }
 
     #[test]
     fn round_trips_rows() {
-        let row = vec![
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("abc".into())),
-            ScalarValue::TimestampMillisecond(Some(1234), None),
-            ScalarValue::Boolean(Some(false)),
-        ];
-        let encoded = encode_projected_row_key(&row).expect("encode");
+        let encoded = encode_test_row(&[
+            TestEncodedField::Int64(10),
+            TestEncodedField::Utf8("abc"),
+            TestEncodedField::TimestampMillis(1234),
+            TestEncodedField::Bool(false),
+        ]);
         let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
         assert_eq!(
             decoded,
@@ -424,21 +417,19 @@ mod tests {
 
     #[test]
     fn encodes_null_values() {
-        let row = vec![ScalarValue::Null, ScalarValue::Int64(None)];
-        let encoded = encode_projected_row_key(&row).expect("encode");
+        let encoded = encode_test_row(&[TestEncodedField::Null, TestEncodedField::Int64Null]);
         let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
         assert_eq!(decoded, vec![None, None]);
     }
 
     #[test]
     fn extracts_selected_columns_without_full_decode() {
-        let row = vec![
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("abc".into())),
-            ScalarValue::TimestampMillisecond(Some(1234), None),
-            ScalarValue::Boolean(Some(false)),
-        ];
-        let encoded = encode_projected_row_key(&row).expect("encode");
+        let encoded = encode_test_row(&[
+            TestEncodedField::Int64(10),
+            TestEncodedField::Utf8("abc"),
+            TestEncodedField::TimestampMillis(1234),
+            TestEncodedField::Bool(false),
+        ]);
         let selected = extract_encoded_row_columns(&encoded, &[3, 0], true)
             .expect("extract")
             .expect("non-null key");
@@ -454,11 +445,8 @@ mod tests {
 
     #[test]
     fn selecting_null_key_column_returns_none_when_non_null_required() {
-        let row = vec![
-            ScalarValue::Int64(None),
-            ScalarValue::Utf8(Some("abc".into())),
-        ];
-        let encoded = encode_projected_row_key(&row).expect("encode");
+        let encoded =
+            encode_test_row(&[TestEncodedField::Int64Null, TestEncodedField::Utf8("abc")]);
         let selected =
             extract_encoded_row_columns(&encoded, &[0], true).expect("extract nullable key");
         assert!(selected.is_none());
@@ -466,16 +454,11 @@ mod tests {
 
     #[test]
     fn concatenates_encoded_rows_without_decode_reencode() {
-        let left = encode_projected_row_key(&[
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("left".into())),
-        ])
-        .expect("encode left");
-        let right = encode_projected_row_key(&[
-            ScalarValue::Boolean(Some(true)),
-            ScalarValue::TimestampMillisecond(Some(55), None),
-        ])
-        .expect("encode right");
+        let left = encode_test_row(&[TestEncodedField::Int64(10), TestEncodedField::Utf8("left")]);
+        let right = encode_test_row(&[
+            TestEncodedField::Bool(true),
+            TestEncodedField::TimestampMillis(55),
+        ]);
 
         let combined = concat_encoded_rows(&left, &right).expect("concat");
         let decoded = decode_all_encoded_row_scalars(&combined).expect("decode combined");
@@ -492,17 +475,15 @@ mod tests {
 
     #[test]
     fn projects_joined_rows_without_full_decode() {
-        let left = encode_projected_row_key(&[
-            ScalarValue::Int64(Some(10)),
-            ScalarValue::Utf8(Some("left".into())),
-            ScalarValue::Boolean(Some(true)),
-        ])
-        .expect("encode left");
-        let right = encode_projected_row_key(&[
-            ScalarValue::TimestampMillisecond(Some(55), None),
-            ScalarValue::Int64(Some(99)),
-        ])
-        .expect("encode right");
+        let left = encode_test_row(&[
+            TestEncodedField::Int64(10),
+            TestEncodedField::Utf8("left"),
+            TestEncodedField::Bool(true),
+        ]);
+        let right = encode_test_row(&[
+            TestEncodedField::TimestampMillis(55),
+            TestEncodedField::Int64(99),
+        ]);
 
         let projected = project_joined_encoded_rows(
             &left,
@@ -538,5 +519,16 @@ mod tests {
                 Some(EncodedRowScalar::Bool(true)),
             ]
         );
+    }
+
+    #[test]
+    fn encodes_typed_null_variants() {
+        let encoded = encode_test_row(&[
+            TestEncodedField::Utf8Null,
+            TestEncodedField::TimestampNull,
+            TestEncodedField::BoolNull,
+        ]);
+        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode null variants");
+        assert_eq!(decoded, vec![None, None, None]);
     }
 }
