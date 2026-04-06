@@ -282,7 +282,8 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<ScalarValue>>) -> Built
     {
         let writer = outer.writer_mut(SOURCE_NAME).expect("bid writer");
         for row in bids {
-            writer.append(&row, 1).expect("append row");
+            let encoded = encode_projected_row_key(&row).expect("encode row");
+            writer.append_encoded(encoded, 1).expect("append row");
             let handle = writer.flush().await.expect("flush row");
             versions.push(handle.version);
         }

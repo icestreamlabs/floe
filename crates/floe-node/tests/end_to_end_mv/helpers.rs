@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use datafusion::scalar::ScalarValue;
 use dbsp::handles::ZSetHandleView;
-use floe_executor::encoding::extract_encoded_row_i64_like_column;
+use floe_executor::encoding::{encode_projected_row_key, extract_encoded_row_i64_like_column};
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
@@ -85,7 +85,8 @@ pub(crate) async fn append_weighted_row(
     let writer = outer
         .writer_mut(source)
         .with_context(|| format!("{source} source writer must exist"))?;
-    writer.append(&row, weight)?;
+    let encoded = encode_projected_row_key(&row)?;
+    writer.append_encoded(encoded, weight)?;
     let handles = outer.tick_all().await?;
     let handle = handles
         .into_iter()
