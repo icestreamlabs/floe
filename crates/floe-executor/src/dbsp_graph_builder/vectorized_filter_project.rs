@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+    new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -18,6 +19,7 @@ use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
 
+use crate::encoding::EncodedRowScalar;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 
 #[derive(Clone)]
@@ -465,8 +467,7 @@ impl VectorizedFilterProjectEvaluator {
             ));
         }
         let mut cursor = 4usize;
-        let mut decoded_values =
-            decode_scalar_values.then(|| vec![ScalarValue::Null; self.decoded_input_count]);
+        let mut decoded_values = decode_scalar_values.then(|| vec![None; self.decoded_input_count]);
         let mut compiled_values = decode_compiled_values.then(|| {
             self.decoded_input_value_types
                 .iter()
@@ -484,12 +485,20 @@ impl VectorizedFilterProjectEvaluator {
             let start = cursor;
             let end = encoded_field_end(encoded, start)?;
             if let Some(slot) = self.decoded_input_slots[input_idx] {
+                let decoded_scalar = if decoded_values.is_some() || compiled_values.is_some() {
+                    Some(decode_encoded_field_as_encoded_scalar(
+                        &encoded[start..end],
+                        self.decoded_input_value_types[slot],
+                    )?)
+                } else {
+                    None
+                };
                 if let Some(values) = decoded_values.as_mut() {
-                    values[slot] = decode_encoded_field(&encoded[start..end])?;
+                    values[slot] = decoded_scalar.clone().flatten();
                 }
                 if let Some(values) = compiled_values.as_mut() {
-                    values[slot] = decode_encoded_field_as_compiled_value(
-                        &encoded[start..end],
+                    values[slot] = compiled_value_from_encoded_scalar(
+                        decoded_scalar.as_ref().and_then(Option::as_ref),
                         self.decoded_input_value_types[slot],
                     )?;
                 }
@@ -1556,7 +1565,7 @@ fn build_decoded_input_value_types(
 fn build_sparse_input_batch(
     schema: &datafusion::arrow::datatypes::SchemaRef,
     decoded_input_slots: &[Option<usize>],
-    mut decoded_columns: Vec<Vec<ScalarValue>>,
+    mut decoded_columns: Vec<Vec<Option<EncodedRowScalar>>>,
     row_count: usize,
 ) -> Result<RecordBatch> {
     let arrays: Vec<ArrayRef> = schema
@@ -1568,16 +1577,16 @@ fn build_sparse_input_batch(
                 let mut builder = ScalarColumnBuilder::new(field.data_type(), row_count)
                     .with_context(|| format!("initialize vectorized input column builder {idx}"))?;
                 for value in std::mem::take(&mut decoded_columns[slot]) {
-                    builder.append(&value).with_context(|| {
-                        format!("append value into vectorized input column {idx}")
-                    })?;
+                    builder
+                        .append_encoded_scalar(value.as_ref())
+                        .with_context(|| {
+                            format!("append value into vectorized input column {idx}")
+                        })?;
                 }
                 Ok::<ArrayRef, anyhow::Error>(builder.finish_array())
                     .with_context(|| format!("build vectorized input column {idx}"))
             } else {
-                placeholder_scalar(field.data_type())?
-                    .to_array_of_size(row_count)
-                    .context("build placeholder vectorized input column")
+                Ok::<ArrayRef, anyhow::Error>(new_null_array(field.data_type(), row_count))
             }
         })
         .collect::<Result<_>>()?;
@@ -1597,21 +1606,6 @@ fn build_compiled_input_batch(
         }
     }
     CompiledInputBatch { columns, row_count }
-}
-
-fn placeholder_scalar(data_type: &DataType) -> Result<ScalarValue> {
-    match data_type {
-        DataType::Int64 => Ok(ScalarValue::Int64(Some(0))),
-        DataType::Utf8 => Ok(ScalarValue::Utf8(Some(String::new()))),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(ScalarValue::TimestampMillisecond(Some(0), None))
-        }
-        DataType::Boolean => Ok(ScalarValue::Boolean(Some(false))),
-        DataType::Null => Ok(ScalarValue::Null),
-        other => Err(anyhow!(
-            "unsupported placeholder type in vectorized input batch: {other:?}"
-        )),
-    }
 }
 
 fn encoded_field_end(bytes: &[u8], start: usize) -> Result<usize> {
@@ -1650,65 +1644,18 @@ fn encoded_field_end(bytes: &[u8], start: usize) -> Result<usize> {
     }
 }
 
-fn decode_encoded_field(field: &[u8]) -> Result<ScalarValue> {
-    let tag = *field
-        .first()
-        .ok_or_else(|| anyhow!("encoded field must contain a tag"))?;
-    match tag {
-        0x00 => Ok(ScalarValue::Null),
-        0x01 => {
-            let chunk = field.get(1..9).ok_or_else(|| anyhow!("truncated int64"))?;
-            Ok(ScalarValue::Int64(Some(i64::from_le_bytes(
-                chunk.try_into().unwrap(),
-            ))))
-        }
-        0x02 => {
-            let len_bytes = field
-                .get(1..5)
-                .ok_or_else(|| anyhow!("truncated string length"))?;
-            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            let chunk = field
-                .get(5..5 + len)
-                .ok_or_else(|| anyhow!("truncated string payload"))?;
-            let text =
-                std::str::from_utf8(chunk).map_err(|err| anyhow!("utf8 decode error: {err}"))?;
-            Ok(ScalarValue::Utf8(Some(text.to_string())))
-        }
-        0x03 => {
-            let chunk = field
-                .get(1..9)
-                .ok_or_else(|| anyhow!("truncated timestamp"))?;
-            Ok(ScalarValue::TimestampMillisecond(
-                Some(i64::from_le_bytes(chunk.try_into().unwrap())),
-                None,
-            ))
-        }
-        0x04 => {
-            let flag = *field
-                .get(1)
-                .ok_or_else(|| anyhow!("missing boolean payload"))?;
-            Ok(ScalarValue::Boolean(Some(flag != 0)))
-        }
-        0x05 => Ok(ScalarValue::Int64(None)),
-        0x06 => Ok(ScalarValue::Utf8(None)),
-        0x07 => Ok(ScalarValue::TimestampMillisecond(None, None)),
-        0x08 => Ok(ScalarValue::Boolean(None)),
-        _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
-    }
-}
-
-fn decode_encoded_field_as_compiled_value(
+fn decode_encoded_field_as_encoded_scalar(
     field: &[u8],
     data_type: CompiledValueType,
-) -> Result<CompiledValue> {
+) -> Result<Option<EncodedRowScalar>> {
     let tag = *field
         .first()
         .ok_or_else(|| anyhow!("encoded field must contain a tag"))?;
     match (data_type, tag) {
-        (_, 0x00) => Ok(CompiledValue::null(data_type)),
+        (_, 0x00) => Ok(None),
         (CompiledValueType::Int64, 0x01) => {
             let chunk = field.get(1..9).ok_or_else(|| anyhow!("truncated int64"))?;
-            Ok(CompiledValue::Int64(Some(i64::from_le_bytes(
+            Ok(Some(EncodedRowScalar::Int64(i64::from_le_bytes(
                 chunk.try_into().unwrap(),
             ))))
         }
@@ -1722,13 +1669,13 @@ fn decode_encoded_field_as_compiled_value(
                 .ok_or_else(|| anyhow!("truncated string payload"))?;
             let text =
                 std::str::from_utf8(chunk).map_err(|err| anyhow!("utf8 decode error: {err}"))?;
-            Ok(CompiledValue::Utf8(Some(text.to_string())))
+            Ok(Some(EncodedRowScalar::Utf8(text.to_string())))
         }
         (CompiledValueType::TimestampMillis, 0x03) => {
             let chunk = field
                 .get(1..9)
                 .ok_or_else(|| anyhow!("truncated timestamp"))?;
-            Ok(CompiledValue::TimestampMillis(Some(i64::from_le_bytes(
+            Ok(Some(EncodedRowScalar::TimestampMillis(i64::from_le_bytes(
                 chunk.try_into().unwrap(),
             ))))
         }
@@ -1736,14 +1683,38 @@ fn decode_encoded_field_as_compiled_value(
             let flag = *field
                 .get(1)
                 .ok_or_else(|| anyhow!("missing boolean payload"))?;
-            Ok(CompiledValue::Bool(Some(flag != 0)))
+            Ok(Some(EncodedRowScalar::Bool(flag != 0)))
         }
-        (CompiledValueType::Int64, 0x05) => Ok(CompiledValue::Int64(None)),
-        (CompiledValueType::Utf8, 0x06) => Ok(CompiledValue::Utf8(None)),
-        (CompiledValueType::TimestampMillis, 0x07) => Ok(CompiledValue::TimestampMillis(None)),
-        (CompiledValueType::Bool, 0x08) => Ok(CompiledValue::Bool(None)),
+        (CompiledValueType::Int64, 0x05)
+        | (CompiledValueType::Utf8, 0x06)
+        | (CompiledValueType::TimestampMillis, 0x07)
+        | (CompiledValueType::Bool, 0x08) => Ok(None),
         _ => Err(anyhow!(
             "encoded field tag {tag:#x} did not match compiled type {data_type:?}"
+        )),
+    }
+}
+
+fn compiled_value_from_encoded_scalar(
+    value: Option<&EncodedRowScalar>,
+    data_type: CompiledValueType,
+) -> Result<CompiledValue> {
+    match (data_type, value) {
+        (_, None) => Ok(CompiledValue::null(data_type)),
+        (CompiledValueType::Int64, Some(EncodedRowScalar::Int64(value))) => {
+            Ok(CompiledValue::Int64(Some(*value)))
+        }
+        (CompiledValueType::Utf8, Some(EncodedRowScalar::Utf8(value))) => {
+            Ok(CompiledValue::Utf8(Some(value.clone())))
+        }
+        (CompiledValueType::TimestampMillis, Some(EncodedRowScalar::TimestampMillis(value))) => {
+            Ok(CompiledValue::TimestampMillis(Some(*value)))
+        }
+        (CompiledValueType::Bool, Some(EncodedRowScalar::Bool(value))) => {
+            Ok(CompiledValue::Bool(Some(*value)))
+        }
+        (_, Some(other)) => Err(anyhow!(
+            "encoded scalar {other:?} did not match compiled type {data_type:?}"
         )),
     }
 }
@@ -1772,7 +1743,7 @@ struct PreparedEncodedInput {
 }
 
 struct DecodedEncodedRow {
-    decoded_values: Option<Vec<ScalarValue>>,
+    decoded_values: Option<Vec<Option<EncodedRowScalar>>>,
     compiled_values: Option<Vec<CompiledValue>>,
     projected_ranges: Option<Vec<Range<usize>>>,
 }
