@@ -7,10 +7,10 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
+#[cfg(test)]
 use datafusion::scalar::ScalarValue;
 use futures::Stream;
 #[cfg(test)]
@@ -22,6 +22,7 @@ use crate::encoding::{decode_all_encoded_row_scalars, scalar_value_from_encoded_
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use floe_sql_parser::{FloeStatement, parse_floe_statement};
 
 /// Alias for the DataFusion session context.
@@ -370,7 +371,7 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     version_time: Option<i64>,
 ) -> PgResult<Vec<TailBatch>> {
     let snapshot = mv.snapshot_for(version).await?;
-    let rows = rows_from_snapshot(snapshot, schema.fields().len())?;
+    let rows = rows_from_snapshot(snapshot, &schema)?;
     build_tail_batches(rows, schema, version_time)
 }
 
@@ -385,7 +386,7 @@ async fn materialize_delta_batches<M: MaterializedView>(
     let deltas = mv.delta_for(version).await?;
     let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
     let rows_decode_start = Instant::now();
-    let rows = rows_from_delta(deltas, schema.fields().len())?;
+    let rows = rows_from_delta(deltas, &schema)?;
     let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
     let rows_len = rows.ops.len();
     let batch_build_start = Instant::now();
@@ -407,16 +408,22 @@ async fn materialize_delta_batches<M: MaterializedView>(
 }
 
 struct TailDecodedRows {
-    columns: Vec<Vec<ScalarValue>>,
+    builders: Vec<ScalarColumnBuilder>,
     ops: Vec<i16>,
 }
 
 fn rows_from_snapshot(
     snapshot: HashMap<Vec<u8>, i64>,
-    column_count: usize,
+    schema: &SchemaRef,
 ) -> PgResult<TailDecodedRows> {
+    let column_count = schema.fields().len();
+    let builders = schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
+        .collect::<Result<Vec<_>>>()?;
     let mut decoded_rows = TailDecodedRows {
-        columns: vec![Vec::new(); column_count],
+        builders,
         ops: Vec::new(),
     };
     for (key, diff) in snapshot {
@@ -437,7 +444,8 @@ fn rows_from_snapshot(
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.columns[idx].push(scalar_value_from_encoded_scalar(value.as_ref()));
+                let scalar = scalar_value_from_encoded_scalar(value.as_ref());
+                decoded_rows.builders[idx].append(&scalar)?;
             }
             decoded_rows.ops.push(1);
         }
@@ -445,9 +453,15 @@ fn rows_from_snapshot(
     Ok(decoded_rows)
 }
 
-fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, column_count: usize) -> PgResult<TailDecodedRows> {
+fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<TailDecodedRows> {
+    let column_count = schema.fields().len();
+    let builders = schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
+        .collect::<Result<Vec<_>>>()?;
     let mut decoded_rows = TailDecodedRows {
-        columns: vec![Vec::new(); column_count],
+        builders,
         ops: Vec::new(),
     };
     for (key, diff) in deltas {
@@ -466,7 +480,8 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, column_count: usize) -> PgResult
         }
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.columns[idx].push(scalar_value_from_encoded_scalar(value.as_ref()));
+                let scalar = scalar_value_from_encoded_scalar(value.as_ref());
+                decoded_rows.builders[idx].append(&scalar)?;
             }
             decoded_rows.ops.push(op);
         }
@@ -487,15 +502,11 @@ fn build_tail_batches(
             times: Vec::new(),
         }]);
     }
-    let arrays: Vec<ArrayRef> = rows
-        .columns
+    let arrays = rows
+        .builders
         .into_iter()
-        .enumerate()
-        .map(|(idx, col)| {
-            ScalarValue::iter_to_array(col)
-                .with_context(|| format!("convert tail column {idx} to array"))
-        })
-        .collect::<PgResult<_>>()?;
+        .map(|mut builder| builder.finish_array())
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(schema, arrays)?;
     ensure!(
         rows.ops.len() == batch.num_rows(),

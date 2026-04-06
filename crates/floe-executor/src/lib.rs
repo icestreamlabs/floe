@@ -20,6 +20,7 @@ pub mod nexmark_sources;
 pub mod operator_state;
 pub mod operators;
 pub mod outer_stream;
+mod scalar_array_builder;
 pub mod source_decoder;
 pub mod source_journal;
 pub mod stream_types;

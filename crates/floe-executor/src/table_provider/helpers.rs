@@ -10,6 +10,7 @@ use datafusion::scalar::ScalarValue;
 use crate::encoding::{
     decode_all_encoded_row_scalars, extract_encoded_row_scalars, scalar_value_from_encoded_scalar,
 };
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::Row;
 
 use super::MV_VERSION_COLUMN;
@@ -26,7 +27,11 @@ pub(super) fn build_scalar_batches(rows: Vec<Row>, schema: SchemaRef) -> Result<
     }
 
     let column_count = schema.fields().len();
-    let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(rows.len()); column_count];
+    let mut builders = schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), rows.len()))
+        .collect::<Result<Vec<_>>>()?;
 
     for row in rows {
         if row.len() != column_count {
@@ -37,17 +42,18 @@ pub(super) fn build_scalar_batches(rows: Vec<Row>, schema: SchemaRef) -> Result<
             ));
         }
         for (idx, value) in row.into_iter().enumerate() {
-            columns[idx].push(value);
+            builders[idx].append(&value)?;
         }
     }
 
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_count);
-    for (idx, column) in columns.into_iter().enumerate() {
-        let array = ScalarValue::iter_to_array(column.into_iter())
-            .with_context(|| format!("convert column {idx} to array"))?;
-        arrays.push(array);
-    }
-
+    let arrays = builders
+        .iter_mut()
+        .enumerate()
+        .map(|(idx, builder)| {
+            Ok::<ArrayRef, anyhow::Error>(builder.finish_array())
+                .with_context(|| format!("convert column {idx} to array"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let batch = RecordBatch::try_new(schema, arrays).map_err(anyhow::Error::from)?;
     Ok(vec![batch])
 }
@@ -101,8 +107,14 @@ where
     let decoded_row_len = mv_version_index.unwrap_or(schema.fields().len());
     let mut batches = Vec::new();
     let zero_column_projection = projected_indices.is_empty();
-    let mut columns: Vec<Vec<ScalarValue>> =
-        vec![Vec::with_capacity(SCAN_BATCH_ROW_LIMIT); projected_indices.len()];
+    let mut builders = projected_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            ScalarColumnBuilder::new(field.data_type(), SCAN_BATCH_ROW_LIMIT)
+                .map_err(|err| DataFusionError::Execution(err.to_string()))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
     let mut rows_in_batch = 0usize;
     let mut total_rows = 0usize;
     let mut projection_source_indices = projected_indices
@@ -194,12 +206,19 @@ where
                             ))
                         })?
                 };
-                columns[column_idx].push(value);
+                builders[column_idx]
+                    .append(&value)
+                    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
             }
             rows_in_batch += 1;
             total_rows += 1;
             if rows_in_batch >= SCAN_BATCH_ROW_LIMIT {
-                flush_columns_to_batch(&mut columns, Arc::clone(&projected_schema), &mut batches)?;
+                flush_builders_to_batch(
+                    builders.as_mut_slice(),
+                    rows_in_batch,
+                    Arc::clone(&projected_schema),
+                    &mut batches,
+                )?;
                 rows_in_batch = 0;
             }
         }
@@ -213,7 +232,12 @@ where
         return Ok((projected_schema, batches));
     }
 
-    flush_columns_to_batch(&mut columns, Arc::clone(&projected_schema), &mut batches)?;
+    flush_builders_to_batch(
+        builders.as_mut_slice(),
+        rows_in_batch,
+        Arc::clone(&projected_schema),
+        &mut batches,
+    )?;
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(Arc::clone(&projected_schema)));
     }
@@ -270,21 +294,19 @@ pub(super) fn build_constant_projection_batches(
     Ok(batches)
 }
 
-fn flush_columns_to_batch(
-    columns: &mut [Vec<ScalarValue>],
+fn flush_builders_to_batch(
+    builders: &mut [ScalarColumnBuilder],
+    row_count: usize,
     schema: SchemaRef,
     batches: &mut Vec<RecordBatch>,
 ) -> DFResult<()> {
-    if columns.is_empty() || columns[0].is_empty() {
+    if row_count == 0 {
         return Ok(());
     }
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-    for column in columns.iter_mut() {
-        let values = std::mem::take(column);
-        let array = ScalarValue::iter_to_array(values.into_iter())
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        arrays.push(array);
-    }
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(schema, arrays)
         .map_err(|err| DataFusionError::Execution(err.to_string()))?;
     batches.push(batch);

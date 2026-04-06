@@ -10,6 +10,7 @@ use datafusion::scalar::ScalarValue;
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
 use crate::metrics;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::{Diff, Row};
 
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +39,7 @@ pub struct DeltaBatchBuffer {
     base_schema: SchemaRef,
     delta_schema: SchemaRef,
     config: DeltaBatchConfig,
-    columns: Vec<Vec<ScalarValue>>,
+    columns: Vec<ScalarColumnBuilder>,
     row_count: usize,
     weights: Vec<Diff>,
     keys: Option<Vec<Vec<u8>>>,
@@ -66,18 +67,22 @@ impl DeltaBatchBuffer {
             .iter()
             .map(|field| (**field).clone())
             .collect();
-        let base_width = base_schema.fields().len();
         if include_key {
             fields.push(Field::new(KEY_COLUMN_NAME, DataType::Binary, false));
         }
         fields.push(Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false));
         let delta_schema = Arc::new(Schema::new(fields));
+        let columns = base_schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), config.max_rows))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             base_schema,
             delta_schema,
             config,
-            columns: vec![Vec::new(); base_width],
+            columns,
             row_count: 0,
             weights: Vec::new(),
             keys: include_key.then(Vec::new),
@@ -114,7 +119,7 @@ impl DeltaBatchBuffer {
 
         self.estimated_bytes += estimate_row_bytes(&row);
         for (idx, value) in row.into_iter().enumerate() {
-            self.columns[idx].push(value);
+            self.columns[idx].append(&value)?;
         }
         self.row_count += 1;
         self.weights.push(weight);
@@ -156,32 +161,22 @@ impl DeltaBatchBuffer {
             .columns
             .iter_mut()
             .enumerate()
-            .map(|(idx, col)| {
-                ScalarValue::iter_to_array(std::mem::take(col))
-                    .map_err(|err| anyhow!("convert delta column {idx} to array: {err}"))
-            })
+            .map(|(_idx, col)| Ok(col.finish_array()))
             .collect::<Result<_>>()?;
 
         if let Some(keys) = self.keys.as_mut() {
-            let key_values = keys
-                .drain(..)
-                .map(|key| ScalarValue::Binary(Some(key)))
-                .collect::<Vec<_>>();
-            arrays.push(
-                ScalarValue::iter_to_array(key_values)
-                    .map_err(|err| anyhow!("convert delta key column to array: {err}"))?,
-            );
+            let mut key_builder = ScalarColumnBuilder::new(&DataType::Binary, keys.len())?;
+            for key in keys.drain(..) {
+                key_builder.append(&ScalarValue::Binary(Some(key)))?;
+            }
+            arrays.push(key_builder.finish_array());
         }
 
-        let weight_values = self
-            .weights
-            .drain(..)
-            .map(|weight| ScalarValue::Int64(Some(weight)))
-            .collect::<Vec<_>>();
-        arrays.push(
-            ScalarValue::iter_to_array(weight_values)
-                .map_err(|err| anyhow!("convert delta weight column to array: {err}"))?,
-        );
+        let mut weight_builder = ScalarColumnBuilder::new(&DataType::Int64, self.weights.len())?;
+        for weight in self.weights.drain(..) {
+            weight_builder.append(&ScalarValue::Int64(Some(weight)))?;
+        }
+        arrays.push(weight_builder.finish_array());
 
         let batch = RecordBatch::try_new(Arc::clone(&self.delta_schema), arrays)
             .map_err(anyhow::Error::from)?;
