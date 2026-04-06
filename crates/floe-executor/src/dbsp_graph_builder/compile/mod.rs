@@ -27,7 +27,7 @@ use crate::dbsp_bridge::DbspBridge;
 #[cfg(test)]
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 #[cfg(test)]
-use crate::encoding::decode_projected_row_key;
+use crate::encoding::{EncodedRowScalar, scalar_value_from_encoded_scalar};
 use crate::encoding::{decode_all_encoded_row_scalars, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
@@ -199,24 +199,25 @@ fn null_scalar_for_dbsp_type(data_type: &DbspScalarType) -> ScalarValue {
 }
 
 #[cfg(test)]
-fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
+fn encoded_scalar_to_i64(value: Option<&EncodedRowScalar>) -> Option<i64> {
     match value {
-        ScalarValue::Int64(Some(v)) => Some(*v),
-        ScalarValue::TimestampMillisecond(Some(v), _) => Some(*v),
+        Some(EncodedRowScalar::Int64(v) | EncodedRowScalar::TimestampMillis(v)) => Some(*v),
         _ => None,
     }
 }
 
 #[cfg(test)]
-fn compare_scalar_values(left: &ScalarValue, right: &ScalarValue) -> Option<std::cmp::Ordering> {
+fn compare_encoded_scalar_values(
+    left: &EncodedRowScalar,
+    right: &EncodedRowScalar,
+) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => Some(l.cmp(r)),
-        (
-            ScalarValue::TimestampMillisecond(Some(l), _),
-            ScalarValue::TimestampMillisecond(Some(r), _),
-        ) => Some(l.cmp(r)),
-        (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r))) => Some(l.cmp(r)),
-        (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => Some(l.cmp(r)),
+        (EncodedRowScalar::Int64(l), EncodedRowScalar::Int64(r)) => Some(l.cmp(r)),
+        (EncodedRowScalar::TimestampMillis(l), EncodedRowScalar::TimestampMillis(r)) => {
+            Some(l.cmp(r))
+        }
+        (EncodedRowScalar::Utf8(l), EncodedRowScalar::Utf8(r)) => Some(l.cmp(r)),
+        (EncodedRowScalar::Bool(l), EncodedRowScalar::Bool(r)) => Some(l.cmp(r)),
         _ => None,
     }
 }
@@ -251,12 +252,26 @@ struct AggregateEvalPlan<'a> {
 
 #[cfg(test)]
 enum AggregateAccumulator {
-    Count { count: i64 },
-    CountDistinct { weights: HashMap<ScalarValue, i64> },
-    Sum { sum: i64, has_value: bool },
-    Avg { sum: i64, count: i64 },
-    Min { current: Option<ScalarValue> },
-    Max { current: Option<ScalarValue> },
+    Count {
+        count: i64,
+    },
+    CountDistinct {
+        weights: HashMap<EncodedRowScalar, i64>,
+    },
+    Sum {
+        sum: i64,
+        has_value: bool,
+    },
+    Avg {
+        sum: i64,
+        count: i64,
+    },
+    Min {
+        current: Option<EncodedRowScalar>,
+    },
+    Max {
+        current: Option<EncodedRowScalar>,
+    },
 }
 
 #[cfg(test)]
@@ -481,14 +496,14 @@ fn evaluate_aggregate_values(
     }
 
     let mut filter_results = vec![false; filters.len()];
-    let mut expression_values = vec![ScalarValue::Null; expressions.len()];
+    let mut expression_values = vec![None; expressions.len()];
     let mut expression_valid = vec![false; expressions.len()];
 
     for (encoded_row, weight) in encoded {
         if weight == 0 {
             continue;
         }
-        let row = match decode_projected_row_key(&encoded_row) {
+        let row = match decode_all_encoded_row_scalars(&encoded_row) {
             Ok(row) => row,
             Err(err) => {
                 tracing::warn!(
@@ -502,13 +517,14 @@ fn evaluate_aggregate_values(
 
         for (index, filter) in filters.iter().enumerate() {
             if let Some(column_idx) = filter_columns[index] {
-                let value = row.get(column_idx).unwrap_or(&ScalarValue::Null);
-                filter_results[index] = match crate::expression::scalar_to_bool(value) {
-                    Ok(include) => include,
-                    Err(err) => {
+                let value = row.get(column_idx).and_then(|scalar| scalar.as_ref());
+                filter_results[index] = match value {
+                    Some(EncodedRowScalar::Bool(include)) => *include,
+                    None => false,
+                    Some(other) => {
                         tracing::warn!(
                             graph_id = %graph_id,
-                            error = %err,
+                            value = ?other,
                             "failed to evaluate {context} FILTER expression"
                         );
                         false
@@ -555,10 +571,9 @@ fn evaluate_aggregate_values(
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let value = expression_values[expr_index].clone();
-                    if value.is_null() {
+                    let Some(value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let entry = weights.entry(value.clone()).or_insert(0);
                     *entry += weight;
                     if *entry == 0 {
@@ -567,8 +582,7 @@ fn evaluate_aggregate_values(
                 }
                 AggregateAccumulator::Count { count } => match plan.expr_index {
                     Some(expr_index) => {
-                        if expression_valid[expr_index] && !expression_values[expr_index].is_null()
-                        {
+                        if expression_valid[expr_index] && expression_values[expr_index].is_some() {
                             *count += weight;
                         }
                     }
@@ -581,7 +595,9 @@ fn evaluate_aggregate_values(
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                    if let Some(number) =
+                        encoded_scalar_to_i64(expression_values[expr_index].as_ref())
+                    {
                         *sum += number * weight;
                         *has_value = true;
                     }
@@ -593,7 +609,9 @@ fn evaluate_aggregate_values(
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    if let Some(number) = scalar_to_i64(&expression_values[expr_index]) {
+                    if let Some(number) =
+                        encoded_scalar_to_i64(expression_values[expr_index].as_ref())
+                    {
                         *sum += number * weight;
                         *count += weight;
                     }
@@ -605,12 +623,11 @@ fn evaluate_aggregate_values(
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let value = expression_values[expr_index].clone();
-                    if value.is_null() {
+                    let Some(value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let next = match current.take() {
-                        Some(existing) => match compare_scalar_values(&value, &existing) {
+                        Some(existing) => match compare_encoded_scalar_values(&value, &existing) {
                             Some(std::cmp::Ordering::Less) => value,
                             Some(_) | None => existing,
                         },
@@ -625,12 +642,11 @@ fn evaluate_aggregate_values(
                     if !expression_valid[expr_index] {
                         continue;
                     }
-                    let value = expression_values[expr_index].clone();
-                    if value.is_null() {
+                    let Some(value) = expression_values[expr_index].clone() else {
                         continue;
-                    }
+                    };
                     let next = match current.take() {
-                        Some(existing) => match compare_scalar_values(&value, &existing) {
+                        Some(existing) => match compare_encoded_scalar_values(&value, &existing) {
                             Some(std::cmp::Ordering::Greater) => value,
                             Some(_) | None => existing,
                         },
@@ -665,7 +681,7 @@ fn evaluate_aggregate_values(
                 }
             }
             AggregateAccumulator::Min { current } | AggregateAccumulator::Max { current } => {
-                current.unwrap_or(ScalarValue::Null)
+                scalar_value_from_encoded_scalar(current.as_ref())
             }
         })
         .collect()
