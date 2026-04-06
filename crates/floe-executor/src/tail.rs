@@ -18,7 +18,9 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use crate::encoding::decode_projected_row_key;
+use crate::encoding::{decode_all_encoded_row_scalars, scalar_value_from_encoded_scalar};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
@@ -426,7 +428,7 @@ fn rows_from_snapshot(
         if diff == 0 {
             continue;
         }
-        let decoded = decode_projected_row_key(&key)?;
+        let decoded = decode_all_encoded_row_scalars(&key)?;
         if decoded.len() != column_count {
             bail!(
                 "decoded row has {} columns but schema has {}",
@@ -437,7 +439,7 @@ fn rows_from_snapshot(
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.columns[idx].push(value.clone());
+                decoded_rows.columns[idx].push(scalar_value_from_encoded_scalar(value.as_ref()));
             }
             decoded_rows.ops.push(1);
         }
@@ -456,7 +458,7 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, column_count: usize) -> PgResult
         }
         let op = if diff > 0 { 1 } else { -1 };
         let count = diff.checked_abs().context("delta diff overflow")? as usize;
-        let decoded = decode_projected_row_key(&key)?;
+        let decoded = decode_all_encoded_row_scalars(&key)?;
         if decoded.len() != column_count {
             bail!(
                 "decoded row has {} columns but schema has {}",
@@ -466,7 +468,7 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, column_count: usize) -> PgResult
         }
         for _ in 0..count {
             for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.columns[idx].push(value.clone());
+                decoded_rows.columns[idx].push(scalar_value_from_encoded_scalar(value.as_ref()));
             }
             decoded_rows.ops.push(op);
         }

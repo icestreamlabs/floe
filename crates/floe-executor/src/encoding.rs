@@ -253,6 +253,26 @@ pub(crate) fn extract_encoded_row_scalars(
     Ok(decoded)
 }
 
+pub(crate) fn decode_all_encoded_row_scalars(
+    bytes: &[u8],
+) -> Result<Vec<Option<EncodedRowScalar>>> {
+    let count = encoded_row_column_count(bytes)?;
+    let indices = (0..count).collect::<Vec<_>>();
+    extract_encoded_row_scalars(bytes, indices.as_slice())
+}
+
+pub(crate) fn scalar_value_from_encoded_scalar(value: Option<&EncodedRowScalar>) -> ScalarValue {
+    match value {
+        Some(EncodedRowScalar::Int64(value)) => ScalarValue::Int64(Some(*value)),
+        Some(EncodedRowScalar::Utf8(value)) => ScalarValue::Utf8(Some(value.clone())),
+        Some(EncodedRowScalar::TimestampMillis(value)) => {
+            ScalarValue::TimestampMillisecond(Some(*value), None)
+        }
+        Some(EncodedRowScalar::Bool(value)) => ScalarValue::Boolean(Some(*value)),
+        None => ScalarValue::Null,
+    }
+}
+
 pub(crate) fn extract_encoded_row_i64_like_column(
     bytes: &[u8],
     target_index: usize,

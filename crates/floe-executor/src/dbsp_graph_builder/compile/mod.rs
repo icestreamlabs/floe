@@ -28,7 +28,7 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 #[cfg(test)]
 use crate::encoding::decode_projected_row_key;
-use crate::encoding::{EncodedRowScalar, encode_projected_row_key, extract_encoded_row_scalars};
+use crate::encoding::{decode_all_encoded_row_scalars, encode_projected_row_key};
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
@@ -187,15 +187,6 @@ async fn log_handle_rows(
         "handle rows"
     );
     Ok(())
-}
-
-fn decode_all_encoded_row_scalars(bytes: &[u8]) -> Result<Vec<Option<EncodedRowScalar>>> {
-    if bytes.len() < 4 {
-        return Err(anyhow!("encoded key too short"));
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let indices = (0..count).collect::<Vec<_>>();
-    extract_encoded_row_scalars(bytes, indices.as_slice())
 }
 
 fn null_scalar_for_dbsp_type(data_type: &DbspScalarType) -> ScalarValue {

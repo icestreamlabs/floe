@@ -7,7 +7,9 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::scalar::ScalarValue;
 
-use crate::encoding::{decode_projected_row_key, extract_encoded_row_columns};
+use crate::encoding::{
+    decode_all_encoded_row_scalars, extract_encoded_row_scalars, scalar_value_from_encoded_scalar,
+};
 use crate::stream_types::Row;
 
 use super::MV_VERSION_COLUMN;
@@ -126,15 +128,19 @@ where
             continue;
         }
         let decoded = if let Some(filter) = row_filter.as_ref() {
-            let decoded = decode_projected_row_key(&key)
+            let decoded_scalars = decode_all_encoded_row_scalars(&key)
                 .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-            if decoded.len() != decoded_row_len {
+            if decoded_scalars.len() != decoded_row_len {
                 return Err(DataFusionError::Execution(format!(
                     "decoded row has {} columns but expected {}",
-                    decoded.len(),
+                    decoded_scalars.len(),
                     decoded_row_len
                 )));
             }
+            let decoded = decoded_scalars
+                .iter()
+                .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
+                .collect::<Vec<_>>();
             if !filter(&decoded) {
                 continue;
             }
@@ -143,17 +149,8 @@ where
             None
         };
         let projected_values = if decoded.is_none() && !projection_source_indices.is_empty() {
-            let selected =
-                extract_encoded_row_columns(&key, projection_source_indices.as_slice(), false)
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))?
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "projected encoded row unexpectedly contained NULL selection"
-                                .to_string(),
-                        )
-                    })?;
             Some(
-                decode_projected_row_key(&selected)
+                extract_encoded_row_scalars(&key, projection_source_indices.as_slice())
                     .map_err(|err| DataFusionError::Execution(err.to_string()))?,
             )
         } else {
@@ -190,7 +187,7 @@ where
                     projected_values
                         .as_ref()
                         .and_then(|values| values.get(projected_slot))
-                        .cloned()
+                        .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
                         .ok_or_else(|| {
                             DataFusionError::Execution(format!(
                                 "row does not contain projected column index {source_idx}"
