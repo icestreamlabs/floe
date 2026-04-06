@@ -3510,27 +3510,16 @@ fn encoded_auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec
 }
 
 fn bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Int64(Some(bidder)),
-        ScalarValue::Int64(Some(price)),
-        ScalarValue::Utf8(Some("channel".to_string())),
-        ScalarValue::Utf8(Some("url".to_string())),
-        ScalarValue::TimestampMillisecond(Some(date_time_ms), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
+    decode_row_to_scalars(&encoded_bid_row_with_ts(
+        auction,
+        bidder,
+        price,
+        date_time_ms,
+    ))
 }
 
 fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(auction)),
-        ScalarValue::Int64(Some(bidder)),
-        ScalarValue::Int64(Some(price)),
-        ScalarValue::Utf8(Some("channel".to_string())),
-        ScalarValue::Utf8(Some("url".to_string())),
-        ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
+    bid_row_with_ts(auction, bidder, price, 1_700_000_000_000)
 }
 
 async fn test_db(name: &str) -> Arc<Db> {
