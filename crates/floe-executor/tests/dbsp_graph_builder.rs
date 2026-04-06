@@ -24,7 +24,6 @@ use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
     nexmark_person_table, validate_dbsp_plan,
 };
-use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::source_journal::SourceBatchJournal;
@@ -148,17 +147,11 @@ async fn filter_and_projection_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 99)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 99), 1)
         .expect("append bidder 42");
     bid_writer.flush().await.expect("flush first step");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 7, 50)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 7, 50), 1)
         .expect("append bidder 7");
     bid_writer.flush().await.expect("flush second step");
 
@@ -262,16 +255,10 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
     {
         let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 42, 99)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 42, 99), 1)
             .expect("append bidder 42");
         writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 7, 50)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 7, 50), 1)
             .expect("append bidder 7");
         let batch = writer
             .pending_transient_batch(1)
@@ -389,10 +376,7 @@ async fn inner_join_materializes_mv() {
         .writer_mut("nexmark_person")
         .expect("person writer");
     person_writer
-        .append_encoded(
-            encode_projected_row_key(&person_row(100, "alice")).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_person_row(100, "alice"), 1)
         .expect("append alice");
     person_writer.flush().await.expect("flush person");
 
@@ -400,10 +384,7 @@ async fn inner_join_materializes_mv() {
         .writer_mut("nexmark_auction")
         .expect("auction writer");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row(10, 100)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row(10, 100), 1)
         .expect("append auction");
     auction_writer.flush().await.expect("flush auction");
 
@@ -541,16 +522,10 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
         .writer_mut("nexmark_auction")
         .expect("auction writer");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row_with_category(1, 100, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row_with_category(1, 100, 10), 1)
         .expect("append matching auction");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row_with_category(2, 200, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row_with_category(2, 200, 5), 1)
         .expect("append filtered auction");
     registry
         .tick_all_with_version(1)
@@ -560,22 +535,13 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     {
         let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 42, 10), 1)
             .expect("append first matching bid");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 7, 20)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 7, 20), 1)
             .expect("append filtered bid");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 8, 30)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 8, 30), 1)
             .expect("append second matching bid");
     }
     registry
@@ -589,16 +555,10 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     {
         let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 9, 40)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 9, 40), 1)
             .expect("append later matching bid");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 10, 50)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 10, 50), 1)
             .expect("append later filtered bid");
     }
     registry
@@ -612,10 +572,7 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     {
         let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 11, 60)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 11, 60), 1)
             .expect("append no-op filtered bid");
     }
     registry
@@ -750,16 +707,10 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
         .writer_mut("nexmark_auction")
         .expect("auction writer");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row_with_category(1, 100, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row_with_category(1, 100, 10), 1)
         .expect("append matching auction");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row_with_category(2, 200, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row_with_category(2, 200, 5), 1)
         .expect("append filtered auction");
     registry
         .tick_all_with_version(1)
@@ -770,18 +721,10 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
     for idx in 0..expected_rows {
         let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 1_000 + idx as i64, 10 + idx as i64))
-                    .expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 1_000 + idx as i64, 10 + idx as i64), 1)
             .expect("append matching bid");
         bid_writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 2_000 + idx as i64, 20 + idx as i64))
-                    .expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 2_000 + idx as i64, 20 + idx as i64), 1)
             .expect("append filtered bid");
         registry
             .tick_all_with_version(i64::try_from(idx + 2).expect("version"))
@@ -905,18 +848,10 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
             .writer_mut("nexmark_auction")
             .expect("auction writer");
         auction_writer
-            .append_encoded(
-                encode_projected_row_key(&auction_row_with_category(1, 100, 10))
-                    .expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_auction_row_with_category(1, 100, 10), 1)
             .expect("append matching auction");
         auction_writer
-            .append_encoded(
-                encode_projected_row_key(&auction_row_with_category(2, 200, 5))
-                    .expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_auction_row_with_category(2, 200, 5), 1)
             .expect("append filtered auction");
         let batch = auction_writer
             .pending_transient_batch(1)
@@ -940,18 +875,10 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
         {
             let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
             bid_writer
-                .append_encoded(
-                    encode_projected_row_key(&bid_row(1, 1_000 + idx as i64, 10 + idx as i64))
-                        .expect("encode row"),
-                    1,
-                )
+                .append_encoded(encoded_bid_row(1, 1_000 + idx as i64, 10 + idx as i64), 1)
                 .expect("append matching bid");
             bid_writer
-                .append_encoded(
-                    encode_projected_row_key(&bid_row(2, 2_000 + idx as i64, 20 + idx as i64))
-                        .expect("encode row"),
-                    1,
-                )
+                .append_encoded(encoded_bid_row(2, 2_000 + idx as i64, 20 + idx as i64), 1)
                 .expect("append filtered bid");
             let batch = bid_writer
                 .pending_transient_batch(version)
@@ -1084,10 +1011,7 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
         .writer_mut("nexmark_person")
         .expect("person writer");
     person_writer
-        .append_encoded(
-            encode_projected_row_key(&person_row(100, "alice")).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_person_row(100, "alice"), 1)
         .expect("append alice");
     person_writer.flush().await.expect("flush person");
 
@@ -1095,10 +1019,7 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
         .writer_mut("nexmark_auction")
         .expect("auction writer");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row(10, 100)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row(10, 100), 1)
         .expect("append auction");
     auction_writer.flush().await.expect("flush auction");
 
@@ -1198,10 +1119,7 @@ async fn left_outer_join_materializes_null_extended_rows() {
         .writer_mut("nexmark_person")
         .expect("person writer");
     person_writer
-        .append_encoded(
-            encode_projected_row_key(&person_row(100, "alice")).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_person_row(100, "alice"), 1)
         .expect("append alice");
     person_writer.flush().await.expect("flush person");
 
@@ -1209,16 +1127,10 @@ async fn left_outer_join_materializes_null_extended_rows() {
         .writer_mut("nexmark_auction")
         .expect("auction writer");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row(10, 100)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row(10, 100), 1)
         .expect("append matched auction");
     auction_writer
-        .append_encoded(
-            encode_projected_row_key(&auction_row(11, 999)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_auction_row(11, 999), 1)
         .expect("append unmatched auction");
     auction_writer.flush().await.expect("flush auctions");
 
@@ -1353,10 +1265,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
             .writer_mut("nexmark_auction")
             .expect("auction writer");
         auction_writer
-            .append_encoded(
-                encode_projected_row_key(&auction_row(11, 999)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_auction_row(11, 999), 1)
             .expect("append unmatched auction");
     }
     registry
@@ -1374,10 +1283,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
             .writer_mut("nexmark_person")
             .expect("person writer");
         person_writer
-            .append_encoded(
-                encode_projected_row_key(&person_row(100, "alice")).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_person_row(100, "alice"), 1)
             .expect("append unrelated person");
     }
     registry
@@ -1395,10 +1301,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
             .writer_mut("nexmark_person")
             .expect("person writer");
         person_writer
-            .append_encoded(
-                encode_projected_row_key(&person_row(999, "bob")).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_person_row(999, "bob"), 1)
             .expect("append matching person");
     }
     registry
@@ -1496,22 +1399,13 @@ async fn aggregate_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append bidder 42");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 30), 1)
         .expect("append bidder 42");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 5), 1)
         .expect("append bidder 7");
     bid_writer.flush().await.expect("flush bids");
 
@@ -1544,10 +1438,7 @@ async fn aggregate_materializes_mv() {
     assert_eq!(rows, expected);
 
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 30)).expect("encode row"),
-            -1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 30), -1)
         .expect("remove bidder 42");
     bid_writer.flush().await.expect("flush removal");
 
@@ -1617,28 +1508,16 @@ async fn topn_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 7, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 7, 10), 1)
         .expect("append 10");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 8, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 8, 30), 1)
         .expect("append 30");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 9, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 9, 20), 1)
         .expect("append 20");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(4, 10, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(4, 10, 30), 1)
         .expect("append 30 again");
     bid_writer.flush().await.expect("flush bids");
 
@@ -1745,28 +1624,16 @@ async fn topn_materializes_mv_from_transient_source_journal() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 7, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 7, 10), 1)
         .expect("append 10");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 8, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 8, 30), 1)
         .expect("append 30");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 9, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 9, 20), 1)
         .expect("append 20");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(4, 10, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(4, 10, 30), 1)
         .expect("append 30 again");
     bid_writer.flush().await.expect("flush bids");
 
@@ -1860,40 +1727,22 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 10, 50)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 10, 50), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 11, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 11, 20), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 12, 40)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 12, 40), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 20, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 20, 5), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 21, 15)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 21, 15), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 22, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 22, 10), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2001,40 +1850,22 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 10, 50)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 10, 50), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 11, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 11, 20), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 12, 40)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 12, 40), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 20, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 20, 5), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 21, 15)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 21, 15), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 22, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 22, 10), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2050,10 +1881,7 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
     assert_eq!(rows, vec![bid_row(1, 10, 50), bid_row(2, 21, 15)]);
 
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 10, 50)).expect("encode row"),
-            -1,
-        )
+        .append_encoded(encoded_bid_row(1, 10, 50), -1)
         .expect("remove top row");
     bid_writer.flush().await.expect("flush removal");
 
@@ -2146,39 +1974,19 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(1, 10, 50, 1_700_000_000_000))
-                .expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(1, 10, 50, 1_700_000_000_000), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(1, 10, 60, 1_700_000_100_000))
-                .expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(1, 10, 60, 1_700_000_100_000), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(1, 11, 20, 1_700_000_050_000))
-                .expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(1, 11, 20, 1_700_000_050_000), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(2, 20, 5, 1_700_000_010_000))
-                .expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(2, 20, 5, 1_700_000_010_000), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(2, 20, 15, 1_700_000_005_000))
-                .expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(2, 20, 15, 1_700_000_005_000), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2209,11 +2017,7 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
     );
 
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row_with_ts(1, 10, 60, 1_700_000_100_000))
-                .expect("encode row"),
-            -1,
-        )
+        .append_encoded(encoded_bid_row_with_ts(1, 10, 60, 1_700_000_100_000), -1)
         .expect("remove top row");
     bid_writer.flush().await.expect("flush removal");
 
@@ -2319,22 +2123,13 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 10, 50)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 10, 50), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 10, 25)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 10, 25), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 11, 40)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 11, 40), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2426,10 +2221,7 @@ async fn source_projection_with_proctime_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     registry
         .tick_all_with_version(1)
@@ -2533,16 +2325,10 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 2_000_000)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 2_000_000), 1)
         .expect("append matching bid");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 7, 100)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 7, 100), 1)
         .expect("append filtered bid");
     registry
         .tick_all_with_version(1)
@@ -2636,22 +2422,13 @@ async fn distinct_materializes_unique_rows() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append first bidder");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 20), 1)
         .expect("append duplicate bidder");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 30), 1)
         .expect("append second bidder");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2746,28 +2523,16 @@ async fn count_distinct_aggregate_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 20), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 30), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 5), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -2867,28 +2632,16 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 20), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 30), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 5)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 5), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -3001,28 +2754,16 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 30), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 15)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 15), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 25)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 25), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -3188,28 +2929,16 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 30), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 15)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 15), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(3, 7, 25)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(3, 7, 25), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -3316,28 +3045,16 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     // Unique (auction, bidder) pairs: (1,42), (1,7), (2,7) => count 3.
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 10)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 10), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 20)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 20), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 7, 30)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 7, 30), 1)
         .expect("append");
     bid_writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 7, 40)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 7, 40), 1)
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
@@ -3383,17 +3100,11 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 
     let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(1, 42, 80)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(1, 42, 80), 1)
         .expect("append row");
     writer.flush().await.expect("flush one");
     writer
-        .append_encoded(
-            encode_projected_row_key(&bid_row(2, 42, 81)).expect("encode row"),
-            1,
-        )
+        .append_encoded(encoded_bid_row(2, 42, 81), 1)
         .expect("append second");
     writer.flush().await.expect("flush two");
 
@@ -3516,10 +3227,7 @@ async fn cancel_stops_materialized_view_updates() {
     {
         let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(1, 42, 99)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(1, 42, 99), 1)
             .expect("append first");
         writer.flush().await.expect("flush first");
     }
@@ -3535,10 +3243,7 @@ async fn cancel_stops_materialized_view_updates() {
     {
         let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
         writer
-            .append_encoded(
-                encode_projected_row_key(&bid_row(2, 42, 100)).expect("encode row"),
-                1,
-            )
+            .append_encoded(encoded_bid_row(2, 42, 100), 1)
             .expect("append second");
         writer.flush().await.expect("flush second");
     }
@@ -3724,6 +3429,86 @@ fn scalar_timestamp_millis(value: Option<&ScalarValue>) -> i64 {
     }
 }
 
+enum EncodedTestField<'a> {
+    Int64(i64),
+    Utf8(&'a str),
+    TimestampMillis(i64),
+}
+
+fn encode_test_row(columns: &[EncodedTestField<'_>]) -> Vec<u8> {
+    let count = u32::try_from(columns.len()).expect("encoded test row column count");
+    let mut encoded = Vec::with_capacity(4 + (columns.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for column in columns {
+        match column {
+            EncodedTestField::Int64(value) => {
+                encoded.push(0x01);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            EncodedTestField::Utf8(value) => {
+                encoded.push(0x02);
+                let bytes = value.as_bytes();
+                let len = u32::try_from(bytes.len()).expect("encoded utf8 length");
+                encoded.extend_from_slice(&len.to_le_bytes());
+                encoded.extend_from_slice(bytes);
+            }
+            EncodedTestField::TimestampMillis(value) => {
+                encoded.push(0x03);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    encoded
+}
+
+fn encoded_bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(auction),
+        EncodedTestField::Int64(bidder),
+        EncodedTestField::Int64(price),
+        EncodedTestField::Utf8("channel"),
+        EncodedTestField::Utf8("url"),
+        EncodedTestField::TimestampMillis(date_time_ms),
+        EncodedTestField::Utf8("extra"),
+    ])
+}
+
+fn encoded_bid_row(auction: i64, bidder: i64, price: i64) -> Vec<u8> {
+    encoded_bid_row_with_ts(auction, bidder, price, 1_700_000_000_000)
+}
+
+fn encoded_person_row(id: i64, name: &str) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(id),
+        EncodedTestField::Utf8(name),
+        EncodedTestField::Utf8("email"),
+        EncodedTestField::Utf8("card"),
+        EncodedTestField::Utf8("city"),
+        EncodedTestField::Utf8("state"),
+        EncodedTestField::TimestampMillis(1_700_000_000_000),
+        EncodedTestField::Utf8("extra"),
+    ])
+}
+
+fn encoded_auction_row(id: i64, seller: i64) -> Vec<u8> {
+    encoded_auction_row_with_category(id, seller, 5)
+}
+
+fn encoded_auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(id),
+        EncodedTestField::Utf8("item"),
+        EncodedTestField::Utf8("desc"),
+        EncodedTestField::Int64(10),
+        EncodedTestField::Int64(20),
+        EncodedTestField::Int64(seller),
+        EncodedTestField::Int64(category),
+        EncodedTestField::TimestampMillis(1_700_000_000_000),
+        EncodedTestField::TimestampMillis(1_700_000_100_000),
+        EncodedTestField::Utf8("extra"),
+    ])
+}
+
 fn bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: i64) -> Vec<ScalarValue> {
     vec![
         ScalarValue::Int64(Some(auction)),
@@ -3744,38 +3529,6 @@ fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<ScalarValue> {
         ScalarValue::Utf8(Some("channel".to_string())),
         ScalarValue::Utf8(Some("url".to_string())),
         ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
-}
-
-fn person_row(id: i64, name: &str) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(id)),
-        ScalarValue::Utf8(Some(name.to_string())),
-        ScalarValue::Utf8(Some("email".to_string())),
-        ScalarValue::Utf8(Some("card".to_string())),
-        ScalarValue::Utf8(Some("city".to_string())),
-        ScalarValue::Utf8(Some("state".to_string())),
-        ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-        ScalarValue::Utf8(Some("extra".to_string())),
-    ]
-}
-
-fn auction_row(id: i64, seller: i64) -> Vec<ScalarValue> {
-    auction_row_with_category(id, seller, 5)
-}
-
-fn auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec<ScalarValue> {
-    vec![
-        ScalarValue::Int64(Some(id)),
-        ScalarValue::Utf8(Some("item".to_string())),
-        ScalarValue::Utf8(Some("desc".to_string())),
-        ScalarValue::Int64(Some(10)),
-        ScalarValue::Int64(Some(20)),
-        ScalarValue::Int64(Some(seller)),
-        ScalarValue::Int64(Some(category)),
-        ScalarValue::TimestampMillisecond(Some(1_700_000_000_000), None),
-        ScalarValue::TimestampMillisecond(Some(1_700_000_100_000), None),
         ScalarValue::Utf8(Some("extra".to_string())),
     ]
 }
