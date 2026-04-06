@@ -14,13 +14,33 @@ use object_store::{ObjectStore, memory::InMemory};
 use slatedb::Db;
 
 use crate::dbsp_bridge::DbspBridge;
-use crate::encoding::encode_projected_row_key;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::table_provider::MaterializedViewTableProvider;
 
 use super::filters::extract_mv_version_filter;
 use super::{MV_VERSION_COLUMN, SourceTableProvider};
+
+fn encode_i64_row(value: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 1 + 8);
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+    encoded
+}
+
+fn encode_i64_utf8_row(id: i64, label: &str) -> Vec<u8> {
+    let label_bytes = label.as_bytes();
+    let label_len = u32::try_from(label_bytes.len()).expect("label length fits u32");
+    let mut encoded = Vec::with_capacity(4 + 1 + 8 + 1 + 4 + label_bytes.len());
+    encoded.extend_from_slice(&2_u32.to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&id.to_le_bytes());
+    encoded.push(0x02);
+    encoded.extend_from_slice(&label_len.to_le_bytes());
+    encoded.extend_from_slice(label_bytes);
+    encoded
+}
 
 #[tokio::test]
 async fn materialized_view_provider_emits_rows() {
@@ -34,21 +54,15 @@ async fn materialized_view_provider_emits_rows() {
         .new_view("mv_test", StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("dbsp view");
-    let row_one = vec![
-        ScalarValue::Int64(Some(1)),
-        ScalarValue::Utf8(Some("one".into())),
-    ];
-    dbsp_view.add_delta(encode_projected_row_key(&row_one).expect("encode"), 1);
+    let row_one = encode_i64_utf8_row(1, "one");
+    dbsp_view.add_delta(row_one, 1);
     let version_one = dbsp_view
         .flush()
         .await
         .expect("flush first version")
         .version;
-    let row_two = vec![
-        ScalarValue::Int64(Some(2)),
-        ScalarValue::Utf8(Some("two".into())),
-    ];
-    dbsp_view.add_delta(encode_projected_row_key(&row_two).expect("encode"), 1);
+    let row_two = encode_i64_utf8_row(2, "two");
+    dbsp_view.add_delta(row_two, 1);
     dbsp_view.flush().await.expect("flush second version");
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
@@ -96,11 +110,8 @@ async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() 
         )
         .await
         .expect("dbsp view");
-    let row = vec![
-        ScalarValue::Int64(Some(7)),
-        ScalarValue::Utf8(Some("seven".into())),
-    ];
-    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    let row = encode_i64_utf8_row(7, "seven");
+    dbsp_view.add_delta(row, 1);
     let handle = dbsp_view.flush().await.expect("flush logical version test");
     let logical_version = 42_i64;
     view.publish_version(logical_version, handle.clone());
@@ -144,11 +155,8 @@ async fn materialized_view_provider_hides_unpublished_dbsp_state() {
         )
         .await
         .expect("dbsp view");
-    let row = vec![
-        ScalarValue::Int64(Some(9)),
-        ScalarValue::Utf8(Some("nine".into())),
-    ];
-    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    let row = encode_i64_utf8_row(9, "nine");
+    dbsp_view.add_delta(row, 1);
     dbsp_view.flush().await.expect("flush unpublished state");
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
@@ -187,11 +195,8 @@ async fn materialized_view_provider_resolves_published_empty_logical_versions() 
         )
         .await
         .expect("dbsp view");
-    let row = vec![
-        ScalarValue::Int64(Some(9)),
-        ScalarValue::Utf8(Some("nine".into())),
-    ];
-    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    let row = encode_i64_utf8_row(9, "nine");
+    dbsp_view.add_delta(row, 1);
     let handle = dbsp_view.flush().await.expect("flush base version");
     let latest_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = latest_view.into_parts();
@@ -243,22 +248,8 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
         )
         .await
         .expect("dbsp view");
-    dbsp_view.add_delta(
-        encode_projected_row_key(&vec![
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Utf8(Some("one".into())),
-        ])
-        .expect("encode one"),
-        1,
-    );
-    dbsp_view.add_delta(
-        encode_projected_row_key(&vec![
-            ScalarValue::Int64(Some(2)),
-            ScalarValue::Utf8(Some("two".into())),
-        ])
-        .expect("encode two"),
-        1,
-    );
+    dbsp_view.add_delta(encode_i64_utf8_row(1, "one"), 1);
+    dbsp_view.add_delta(encode_i64_utf8_row(2, "two"), 1);
     dbsp_view.flush().await.expect("flush");
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
@@ -310,8 +301,7 @@ async fn materialized_view_provider_empty_then_populated() {
         .new_view("mv_empty", StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("view");
-    let row = vec![ScalarValue::Int64(Some(5))];
-    dbsp_view.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    dbsp_view.add_delta(encode_i64_row(5), 1);
     dbsp_view.flush().await.expect("flush view");
     let handle_view = dbsp_view.latest_handle_view();
     let (dict, table, namespace, version) = handle_view.into_parts();
@@ -352,10 +342,7 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_latest
         .await
         .expect("dbsp view");
     for id in [1_i64, 2_i64, 3_i64] {
-        dbsp_view.add_delta(
-            encode_projected_row_key(&vec![ScalarValue::Int64(Some(id))]).expect("encode row"),
-            1,
-        );
+        dbsp_view.add_delta(encode_i64_row(id), 1);
     }
     dbsp_view.flush().await.expect("flush count recovery");
     let handle_view = dbsp_view.latest_handle_view();
@@ -401,10 +388,7 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_overla
         .await
         .expect("dbsp view");
     for id in [1_i64, 2_i64] {
-        dbsp_view.add_delta(
-            encode_projected_row_key(&vec![ScalarValue::Int64(Some(id))]).expect("encode row"),
-            1,
-        );
+        dbsp_view.add_delta(encode_i64_row(id), 1);
     }
     dbsp_view.flush().await.expect("flush overlay base");
     let handle_view = dbsp_view.latest_handle_view();
@@ -418,10 +402,7 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_overla
     view.publish_logical_version(i64::try_from(handle_version).expect("logical version"));
     view.append_encoded_overlay_batch(
         handle_version.saturating_add(1),
-        vec![(
-            encode_projected_row_key(&vec![ScalarValue::Int64(Some(3))]).expect("encode row"),
-            1,
-        )],
+        vec![(encode_i64_row(3), 1)],
     );
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
@@ -446,13 +427,7 @@ async fn materialized_view_provider_invalidates_stale_authoritative_count_after_
     let view = registry.register("mv_stale_count_recovery");
     view.publish_logical_version(0);
     assert!(view.seed_authoritative_row_count_if_latest(0, 0));
-    view.append_encoded_overlay_batch(
-        1,
-        vec![(
-            encode_projected_row_key(&vec![ScalarValue::Int64(Some(9))]).expect("encode row"),
-            1,
-        )],
-    );
+    view.append_encoded_overlay_batch(1, vec![(encode_i64_row(9), 1)]);
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let provider = MaterializedViewTableProvider::new(
@@ -478,12 +453,8 @@ async fn materialized_view_provider_builds_mv_version_only_batches_from_authorit
     view.mark_state_authoritative();
     view.publish_logical_version(7);
     for id in [1_i64, 2_i64, 3_i64] {
-        let row = vec![ScalarValue::Int64(Some(id))];
-        view.apply_encoded_state_batch(
-            7,
-            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
-        )
-        .expect("apply authoritative row");
+        view.apply_encoded_state_batch(7, &[(encode_i64_row(id), 1)])
+            .expect("apply authoritative row");
     }
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
@@ -526,12 +497,8 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_state(
     view.mark_state_authoritative();
     view.publish_logical_version(11);
     for id in [1_i64, 2_i64, 3_i64] {
-        let row = vec![ScalarValue::Int64(Some(id))];
-        view.apply_encoded_state_batch(
-            11,
-            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
-        )
-        .expect("apply authoritative row");
+        view.apply_encoded_state_batch(11, &[(encode_i64_row(id), 1)])
+            .expect("apply authoritative row");
     }
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
@@ -568,12 +535,8 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_non_nu
     view.mark_state_authoritative();
     view.publish_logical_version(11);
     for id in [1_i64, 2_i64, 3_i64] {
-        let row = vec![ScalarValue::Int64(Some(id))];
-        view.apply_encoded_state_batch(
-            11,
-            &[(encode_projected_row_key(&row).expect("encode row"), 1)],
-        )
-        .expect("apply authoritative row");
+        view.apply_encoded_state_batch(11, &[(encode_i64_row(id), 1)])
+            .expect("apply authoritative row");
     }
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -608,12 +571,8 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
     let view = registry.register("mv_count_visibility");
     view.mark_state_authoritative();
 
-    let row = vec![ScalarValue::Int64(Some(7))];
-    view.apply_encoded_state_batch(
-        2,
-        &[(encode_projected_row_key(&row).expect("encode row"), 1)],
-    )
-    .expect("apply authoritative row");
+    view.apply_encoded_state_batch(2, &[(encode_i64_row(7), 1)])
+        .expect("apply authoritative row");
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let provider = MaterializedViewTableProvider::new(registry, "mv_count_visibility", schema);
@@ -664,12 +623,8 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
     view.mark_state_authoritative();
     view.publish_logical_version(1);
 
-    let first = vec![ScalarValue::Int64(Some(1))];
-    view.apply_encoded_state_batch(
-        1,
-        &[(encode_projected_row_key(&first).expect("encode row"), 1)],
-    )
-    .expect("apply visible row");
+    view.apply_encoded_state_batch(1, &[(encode_i64_row(1), 1)])
+        .expect("apply visible row");
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let provider =
@@ -681,12 +636,8 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
     )
     .expect("register mv provider");
 
-    let second = vec![ScalarValue::Int64(Some(2))];
-    view.apply_encoded_state_batch(
-        2,
-        &[(encode_projected_row_key(&second).expect("encode row"), 1)],
-    )
-    .expect("apply staged row");
+    view.apply_encoded_state_batch(2, &[(encode_i64_row(2), 1)])
+        .expect("apply staged row");
 
     let while_staged = ctx
         .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
@@ -727,8 +678,7 @@ async fn materialized_view_provider_uses_cached_count_on_first_overlay_visible_v
     view.mark_state_authoritative();
     view.publish_logical_version(0);
 
-    let row = vec![ScalarValue::Int64(Some(7))];
-    let encoded = encode_projected_row_key(&row).expect("encode row");
+    let encoded = encode_i64_row(7);
     view.append_shared_encoded_overlay_batch(1, Arc::new(vec![(encoded.clone(), 1)]));
     view.apply_encoded_state_batch(1, &[(encoded, 1)])
         .expect("apply authoritative overlay row");
@@ -779,11 +729,7 @@ async fn source_provider_emits_rows() {
         )
         .await
         .expect("stream");
-    let row = vec![
-        ScalarValue::Int64(Some(42)),
-        ScalarValue::Utf8(Some("chan".into())),
-    ];
-    stream.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    stream.add_delta(encode_i64_utf8_row(42, "chan"), 1);
     stream.flush().await.expect("flush");
 
     let bridge = Arc::new(tokio::sync::Mutex::new(bridge));
@@ -827,16 +773,8 @@ async fn source_provider_applies_projection_and_limit_in_scan() {
         .new_stream(namespace, dbsp::StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("stream");
-    let row_one = vec![
-        ScalarValue::Int64(Some(1)),
-        ScalarValue::Utf8(Some("a".into())),
-    ];
-    let row_two = vec![
-        ScalarValue::Int64(Some(2)),
-        ScalarValue::Utf8(Some("b".into())),
-    ];
-    stream.add_delta(encode_projected_row_key(&row_one).expect("encode one"), 1);
-    stream.add_delta(encode_projected_row_key(&row_two).expect("encode two"), 1);
+    stream.add_delta(encode_i64_utf8_row(1, "a"), 1);
+    stream.add_delta(encode_i64_utf8_row(2, "b"), 1);
     stream.flush().await.expect("flush");
 
     let bridge = Arc::new(tokio::sync::Mutex::new(bridge));
@@ -881,10 +819,7 @@ async fn source_provider_preserves_row_count_for_empty_projection() {
         .await
         .expect("stream");
     for id in [1_i64, 2_i64, 3_i64] {
-        stream.add_delta(
-            encode_projected_row_key(&vec![ScalarValue::Int64(Some(id))]).expect("encode"),
-            1,
-        );
+        stream.add_delta(encode_i64_row(id), 1);
     }
     stream.flush().await.expect("flush");
 
@@ -929,22 +864,8 @@ async fn source_provider_pushes_down_primary_key_filters() {
         .new_stream(namespace, dbsp::StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("stream");
-    let rows = [
-        vec![
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Utf8(Some("one".into())),
-        ],
-        vec![
-            ScalarValue::Int64(Some(2)),
-            ScalarValue::Utf8(Some("two".into())),
-        ],
-        vec![
-            ScalarValue::Int64(Some(3)),
-            ScalarValue::Utf8(Some("three".into())),
-        ],
-    ];
-    for row in rows {
-        stream.add_delta(encode_projected_row_key(&row).expect("encode"), 1);
+    for (id, label) in [(1_i64, "one"), (2_i64, "two"), (3_i64, "three")] {
+        stream.add_delta(encode_i64_utf8_row(id, label), 1);
     }
     stream.flush().await.expect("flush");
 
