@@ -171,6 +171,19 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
+    pub(crate) fn append_u64_value(&mut self, value: u64) -> Result<()> {
+        match self {
+            Self::UInt64(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            other => Err(anyhow!(
+                "expected UInt64 column builder when appending u64 value, found {:?}",
+                std::mem::discriminant(other)
+            )),
+        }
+    }
+
     pub(crate) fn append_encoded_scalar(&mut self, value: Option<&EncodedRowScalar>) -> Result<()> {
         match self {
             Self::Int64(builder) => match value {

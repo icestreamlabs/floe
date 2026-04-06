@@ -19,7 +19,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion::scalar::ScalarValue;
 use dbsp::handles::ZSetHandleView;
 
 use crate::materialized_view::{
@@ -29,7 +28,8 @@ use crate::materialized_view::{
 use super::MV_VERSION_COLUMN;
 use super::filters::{extract_mv_version_filter, parse_mv_version_expr};
 use super::helpers::{
-    append_mv_version_field, build_batches_from_encoded_snapshot, build_constant_projection_batches,
+    append_mv_version_field, build_batches_from_encoded_snapshot,
+    build_constant_u64_projection_batches,
 };
 
 #[derive(Clone)]
@@ -94,9 +94,9 @@ impl MaterializedViewTableProvider {
                     .map_err(|err| DataFusionError::Execution(err.to_string()))?;
                     return Ok((projected_schema, vec![batch]));
                 }
-                let batches = build_constant_projection_batches(
+                let batches = build_constant_u64_projection_batches(
                     Arc::clone(&projected_schema),
-                    ScalarValue::UInt64(Some(version)),
+                    version,
                     row_count,
                 )?;
                 return Ok((projected_schema, batches));

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::array::UInt64Builder;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::scalar::ScalarValue;
 
 use crate::encoding::extract_encoded_row_scalars;
 use crate::scalar_array_builder::ScalarColumnBuilder;
@@ -112,8 +112,10 @@ pub(super) fn build_batches_from_encoded_snapshot(
                 continue;
             }
             for (column_idx, source_idx) in projected_indices.iter().enumerate() {
-                let value = if Some(*source_idx) == mv_version_index {
-                    ScalarValue::UInt64(Some(mv_version.unwrap_or(0)))
+                if Some(*source_idx) == mv_version_index {
+                    builders[column_idx]
+                        .append_u64_value(mv_version.unwrap_or(0))
+                        .map_err(|err| DataFusionError::Execution(err.to_string()))?;
                 } else {
                     let projected_slot = projection_source_positions
                         .get(source_idx)
@@ -134,11 +136,7 @@ pub(super) fn build_batches_from_encoded_snapshot(
                     builders[column_idx]
                         .append_encoded_scalar(encoded_value.as_ref())
                         .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-                    continue;
-                };
-                builders[column_idx]
-                    .append(&value)
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+                }
             }
             rows_in_batch += 1;
             total_rows += 1;
@@ -174,9 +172,9 @@ pub(super) fn build_batches_from_encoded_snapshot(
     Ok((projected_schema, batches))
 }
 
-pub(super) fn build_constant_projection_batches(
+pub(super) fn build_constant_u64_projection_batches(
     schema: SchemaRef,
-    value: ScalarValue,
+    value: u64,
     row_count: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     if schema.fields().is_empty() {
@@ -186,17 +184,18 @@ pub(super) fn build_constant_projection_batches(
         return Ok(vec![batch]);
     }
 
+    for field in schema.fields() {
+        if field.data_type() != &DataType::UInt64 {
+            return Err(DataFusionError::Execution(format!(
+                "constant u64 projection requires UInt64 fields, found {:?}",
+                field.data_type()
+            )));
+        }
+    }
+
     if row_count == 0 {
-        let arrays: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .map(|_| {
-                value
-                    .clone()
-                    .to_array_of_size(0)
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))
-            })
-            .collect::<DFResult<_>>()?;
+        let array: ArrayRef = Arc::new(UInt64Builder::with_capacity(0).finish());
+        let arrays: Vec<ArrayRef> = vec![array; schema.fields().len()];
         let batch = RecordBatch::try_new(schema, arrays)
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
         return Ok(vec![batch]);
@@ -206,16 +205,12 @@ pub(super) fn build_constant_projection_batches(
     let mut remaining = row_count;
     while remaining > 0 {
         let batch_rows = remaining.min(SCAN_BATCH_ROW_LIMIT);
-        let arrays: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .map(|_| {
-                value
-                    .clone()
-                    .to_array_of_size(batch_rows)
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))
-            })
-            .collect::<DFResult<_>>()?;
+        let mut builder = UInt64Builder::with_capacity(batch_rows);
+        for _ in 0..batch_rows {
+            builder.append_value(value);
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let arrays: Vec<ArrayRef> = vec![array; schema.fields().len()];
         let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
         batches.push(batch);
