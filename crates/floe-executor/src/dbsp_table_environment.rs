@@ -195,46 +195,43 @@ async fn build_stream(
 }
 
 fn encode_person_row(person: &Person) -> Result<Vec<u8>> {
-    let row = vec![
-        ScalarValue::Int64(Some(person.id as i64)),
-        ScalarValue::Utf8(Some(person.name.clone())),
-        ScalarValue::Utf8(Some(person.email_address.clone())),
-        ScalarValue::Utf8(Some(person.credit_card.clone())),
-        ScalarValue::Utf8(Some(person.city.clone())),
-        ScalarValue::Utf8(Some(person.state.clone())),
-        ScalarValue::TimestampMillisecond(Some(ts_to_i64(person.date_time)?), None),
-        ScalarValue::Utf8(Some(person.extra.clone())),
-    ];
-    encode_projected_row_key(&row)
+    let mut encoded = begin_encoded_row(8)?;
+    encode_i64_field(&mut encoded, person.id as i64);
+    encode_utf8_field(&mut encoded, &person.name)?;
+    encode_utf8_field(&mut encoded, &person.email_address)?;
+    encode_utf8_field(&mut encoded, &person.credit_card)?;
+    encode_utf8_field(&mut encoded, &person.city)?;
+    encode_utf8_field(&mut encoded, &person.state)?;
+    encode_timestamp_field(&mut encoded, ts_to_i64(person.date_time)?);
+    encode_utf8_field(&mut encoded, &person.extra)?;
+    Ok(encoded)
 }
 
 pub fn encode_auction_row(auction: &Auction) -> Result<Vec<u8>> {
-    let row = vec![
-        ScalarValue::Int64(Some(auction.id as i64)),
-        ScalarValue::Utf8(Some(auction.item_name.clone())),
-        ScalarValue::Utf8(Some(auction.description.clone())),
-        ScalarValue::Int64(Some(as_i64(auction.initial_bid, "initial_bid")?)),
-        ScalarValue::Int64(Some(as_i64(auction.reserve, "reserve")?)),
-        ScalarValue::Int64(Some(auction.seller as i64)),
-        ScalarValue::Int64(Some(auction.category as i64)),
-        ScalarValue::TimestampMillisecond(Some(ts_to_i64(auction.expires)?), None),
-        ScalarValue::TimestampMillisecond(Some(ts_to_i64(auction.date_time)?), None),
-        ScalarValue::Utf8(Some(auction.extra.clone())),
-    ];
-    encode_projected_row_key(&row)
+    let mut encoded = begin_encoded_row(10)?;
+    encode_i64_field(&mut encoded, auction.id as i64);
+    encode_utf8_field(&mut encoded, &auction.item_name)?;
+    encode_utf8_field(&mut encoded, &auction.description)?;
+    encode_i64_field(&mut encoded, as_i64(auction.initial_bid, "initial_bid")?);
+    encode_i64_field(&mut encoded, as_i64(auction.reserve, "reserve")?);
+    encode_i64_field(&mut encoded, auction.seller as i64);
+    encode_i64_field(&mut encoded, auction.category as i64);
+    encode_timestamp_field(&mut encoded, ts_to_i64(auction.expires)?);
+    encode_timestamp_field(&mut encoded, ts_to_i64(auction.date_time)?);
+    encode_utf8_field(&mut encoded, &auction.extra)?;
+    Ok(encoded)
 }
 
 pub fn encode_bid_row(bid: &Bid) -> Result<Vec<u8>> {
-    let row = vec![
-        ScalarValue::Int64(Some(bid.auction as i64)),
-        ScalarValue::Int64(Some(bid.bidder as i64)),
-        ScalarValue::Int64(Some(as_i64(bid.price, "price")?)),
-        ScalarValue::Utf8(Some(bid.channel.clone())),
-        ScalarValue::Utf8(Some(bid.url.clone())),
-        ScalarValue::TimestampMillisecond(Some(ts_to_i64(bid.date_time)?), None),
-        ScalarValue::Utf8(Some(bid.extra.clone())),
-    ];
-    encode_projected_row_key(&row)
+    let mut encoded = begin_encoded_row(7)?;
+    encode_i64_field(&mut encoded, bid.auction as i64);
+    encode_i64_field(&mut encoded, bid.bidder as i64);
+    encode_i64_field(&mut encoded, as_i64(bid.price, "price")?);
+    encode_utf8_field(&mut encoded, &bid.channel)?;
+    encode_utf8_field(&mut encoded, &bid.url)?;
+    encode_timestamp_field(&mut encoded, ts_to_i64(bid.date_time)?);
+    encode_utf8_field(&mut encoded, &bid.extra)?;
+    Ok(encoded)
 }
 
 fn as_i64(value: usize, label: &str) -> Result<i64> {
@@ -243,4 +240,30 @@ fn as_i64(value: usize, label: &str) -> Result<i64> {
 
 fn ts_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| anyhow!("timestamp {value} exceeds i64 range"))
+}
+
+fn begin_encoded_row(column_count: usize) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(4 + column_count.saturating_mul(16));
+    let count = u32::try_from(column_count).context("too many columns to encode")?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+    Ok(encoded)
+}
+
+fn encode_i64_field(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_timestamp_field(encoded: &mut Vec<u8>, value: i64) {
+    encoded.push(0x03);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_utf8_field(encoded: &mut Vec<u8>, value: &str) -> Result<()> {
+    encoded.push(0x02);
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len()).context("utf8 value too large for encoded row")?;
+    encoded.extend_from_slice(&len.to_le_bytes());
+    encoded.extend_from_slice(bytes);
+    Ok(())
 }
