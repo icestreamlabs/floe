@@ -18,8 +18,6 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::encoding::decode_projected_row_key;
 use crate::encoding::{decode_all_encoded_row_scalars, scalar_value_from_encoded_scalar};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
@@ -805,9 +803,9 @@ mod tests {
             if diff == 0 {
                 continue;
             }
-            let row = decode_projected_row_key(&key)?;
-            let value = match row.get(0) {
-                Some(ScalarValue::Int64(Some(v))) => *v,
+            let row = decode_all_encoded_row_scalars(&key)?;
+            let value = match row.first().and_then(|value| value.as_ref()) {
+                Some(crate::encoding::EncodedRowScalar::Int64(v)) => *v,
                 _ => continue,
             };
             expected.insert(value, diff);

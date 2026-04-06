@@ -253,7 +253,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::encoding::{decode_projected_row_key, encode_projected_row_key};
+    use crate::encoding::{
+        EncodedRowScalar, decode_all_encoded_row_scalars, encode_projected_row_key,
+    };
 
     #[test]
     fn decodes_nexmark_bid_event() {
@@ -437,12 +439,12 @@ mod tests {
         );
 
         let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
-        let decoded = decode_projected_row_key(&encoded).expect("decode encoded row");
-        assert_eq!(decoded[0], ScalarValue::Int64(Some(42)));
-        assert_eq!(decoded[1], ScalarValue::Utf8(None));
+        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        assert_eq!(decoded[0], Some(EncodedRowScalar::Int64(42)));
+        assert_eq!(decoded[1], None);
         assert_eq!(
             decoded[2],
-            ScalarValue::TimestampMillisecond(Some(1_700_000_000), None)
+            Some(EncodedRowScalar::TimestampMillis(1_700_000_000))
         );
         assert_eq!(direct_ts, Some(1_700_000_000_u64));
     }
