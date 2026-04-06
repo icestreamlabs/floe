@@ -1,10 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use anyhow::{Context, Result};
-use datafusion::scalar::ScalarValue;
 use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
 use dbsp::{StreamRetention, ZSetStream};
 use tokio::sync::mpsc;
@@ -12,7 +10,6 @@ use tracing::field;
 
 use crate::codec::ensure_outer_stream_codec;
 use crate::dbsp_bridge::DbspBridge;
-use crate::encoding::encode_projected_row_key;
 use crate::namespaces;
 use crate::stream_types::{Diff, EncodedDelta, EncodedDeltaBatch};
 
@@ -119,27 +116,6 @@ impl OuterStreamWriter {
 
     pub fn durable_enabled(&self) -> bool {
         self.durable_enabled
-    }
-
-    pub fn append(&mut self, row: &[ScalarValue], diff: Diff) -> Result<()> {
-        if diff == 0 {
-            return Ok(());
-        }
-        let encode_start = Instant::now();
-        let key = encode_projected_row_key(row)?;
-        self.pending_encode_us = self
-            .pending_encode_us
-            .saturating_add(encode_start.elapsed().as_micros() as u64);
-        self.pending_transient_bytes = self
-            .pending_transient_bytes
-            .saturating_add(key.len() + std::mem::size_of::<i64>());
-        if self.durable_enabled {
-            Arc::make_mut(&mut self.pending_transient_deltas).push((key.clone(), diff));
-            self.stream.add_delta(key, diff);
-        } else {
-            Arc::make_mut(&mut self.pending_transient_deltas).push((key, diff));
-        }
-        Ok(())
     }
 
     pub fn append_encoded(&mut self, key: Vec<u8>, diff: Diff) -> Result<()> {
@@ -444,11 +420,14 @@ mod tests {
     use slatedb::Db;
     use std::sync::Arc;
 
-    fn row(values: &[i64]) -> Vec<ScalarValue> {
-        values
-            .iter()
-            .map(|v| ScalarValue::Int64(Some(*v)))
-            .collect()
+    fn encoded_i64_row(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + values.len().saturating_mul(9));
+        out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for value in values {
+            out.push(0x01);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
     }
 
     #[tokio::test]
@@ -465,7 +444,9 @@ mod tests {
             .await
             .expect("stream");
         let mut writer = OuterStreamWriter::new("bid", namespace.clone(), stream);
-        writer.append(&row(&[1, 2]), 1).expect("append");
+        writer
+            .append_encoded(encoded_i64_row(&[1, 2]), 1)
+            .expect("append");
         let handle = writer.flush().await.expect("flush");
         assert_eq!(handle.namespace, namespace);
         assert_eq!(handle.source, "bid");
