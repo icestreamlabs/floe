@@ -4,18 +4,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Row, Timestamp};
-use anyhow::{Context, Result};
+use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Timestamp};
+use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
 use tracing::field;
-
-use crate::encoding::{
-    decode_all_encoded_row_scalars, encode_projected_row_key, scalar_value_from_encoded_scalar,
-};
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -140,13 +136,8 @@ impl MaterializedViewHandle {
         &self.name
     }
 
-    pub fn apply(&self, row: Row, diff: Diff) -> Result<()> {
-        if diff == 0 {
-            return Ok(());
-        }
-        let key = encode_projected_row_key(&row).context("encode materialized view state row")?;
-        self.apply_encoded(&key, diff);
-        Ok(())
+    pub fn apply_encoded_row(&self, row: &[u8], diff: Diff) {
+        self.apply_encoded(row, diff);
     }
 
     fn apply_encoded(&self, key: &[u8], diff: Diff) {
@@ -183,20 +174,8 @@ impl MaterializedViewHandle {
         *self.watermark.read().expect("mutex poisoned")
     }
 
-    pub fn snapshot(&self) -> HashMap<Row, Diff> {
-        self.state
-            .read()
-            .expect("mutex poisoned")
-            .iter()
-            .map(|(key, diff)| {
-                let decoded = decode_all_encoded_row_scalars(key)
-                    .expect("materialized view authoritative state should contain valid rows")
-                    .iter()
-                    .map(|value| scalar_value_from_encoded_scalar(value.as_ref()))
-                    .collect::<Vec<_>>();
-                (decoded, *diff)
-            })
-            .collect()
+    pub fn snapshot_encoded(&self) -> HashMap<EncodedRow, Diff> {
+        self.state.read().expect("mutex poisoned").clone()
     }
 
     pub fn mark_state_authoritative(&self) {
@@ -721,21 +700,27 @@ impl DbspPersistedState {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::scalar::ScalarValue;
     use dbsp::handles::ZSetHandle;
 
     use super::*;
-    use crate::encoding::encode_projected_row_key;
+
+    fn encoded_i64_row(value: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 1 + 8);
+        encoded.extend_from_slice(&(1_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded
+    }
 
     #[test]
     fn registers_and_updates_view_state() {
         let registry = MaterializedViewRegistry::new();
         let view = registry.register("mv_test");
-        let row = vec![ScalarValue::Int64(Some(1))];
-        view.apply(row.clone(), 1).expect("apply insert");
-        assert_eq!(view.snapshot().get(&row), Some(&1));
-        view.apply(row.clone(), -1).expect("apply delete");
-        assert!(view.snapshot().is_empty());
+        let row = encoded_i64_row(1);
+        view.apply_encoded_row(&row, 1);
+        assert_eq!(view.snapshot_encoded().get(&row), Some(&1));
+        view.apply_encoded_row(&row, -1);
+        assert!(view.snapshot_encoded().is_empty());
         view.update_watermark(42);
         assert_eq!(view.watermark(), Some(42));
     }
@@ -834,8 +819,7 @@ mod tests {
         view.mark_state_authoritative();
         view.publish_logical_version(1);
 
-        let row = vec![ScalarValue::Int64(Some(1))];
-        let key = encode_projected_row_key(&row).expect("encode row");
+        let key = encoded_i64_row(1);
         view.apply_encoded_state_batch(1, &[(key.clone(), 1)])
             .expect("apply first delta");
         assert_eq!(view.authoritative_row_count(), Some(1));
@@ -887,8 +871,7 @@ mod tests {
         view.mark_state_authoritative();
         view.publish_logical_version(1);
 
-        let row = vec![ScalarValue::Int64(Some(1))];
-        let key = encode_projected_row_key(&row).expect("encode row");
+        let key = encoded_i64_row(1);
         view.apply_encoded_state_batch(1, &[(key.clone(), 1)])
             .expect("apply visible delta");
         assert_eq!(view.authoritative_row_count_for(1), Some(1));

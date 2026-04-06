@@ -48,7 +48,7 @@ pub use operator_state::{OperatorStateHandle, StateTable};
 pub use operators::MvSinkOp;
 pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::SourceRowDecoder;
-pub use stream_types::{Diff, Row, Timestamp};
+pub use stream_types::{Diff, Timestamp};
 pub use table_provider::{
     DynamicStateExec, DynamicStateTableProvider, MaterializedViewTableProvider, SlateTableProvider,
     SourceTableProvider,

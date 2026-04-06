@@ -3802,12 +3802,13 @@ async fn materialized_rows(
     view_name: &str,
 ) -> Vec<Vec<ScalarValue>> {
     let handle = registry.get(view_name).expect("view registered");
-    let snapshot = handle.snapshot();
+    let snapshot = handle.snapshot_encoded();
     let mut rows = Vec::new();
     for (key, diff) in snapshot {
         if diff > 0 {
+            let row = decode_row_to_scalars(&key);
             for _ in 0..diff {
-                rows.push(key.clone());
+                rows.push(row.clone());
             }
         }
     }
@@ -3824,12 +3825,79 @@ async fn visible_rows(
     }
 
     let mut rows = Vec::new();
-    for (row, diff) in handle.snapshot() {
+    for (encoded, diff) in handle.snapshot_encoded() {
         if diff > 0 {
+            let row = decode_row_to_scalars(&encoded);
             for _ in 0..diff {
                 rows.push(row.clone());
             }
         }
     }
     rows
+}
+
+fn decode_row_to_scalars(encoded: &[u8]) -> Vec<ScalarValue> {
+    let count = u32::from_le_bytes(
+        encoded
+            .get(0..4)
+            .expect("encoded row header")
+            .try_into()
+            .expect("encoded row header width"),
+    ) as usize;
+    let mut row = Vec::with_capacity(count);
+    let mut cursor = 4usize;
+    for _ in 0..count {
+        let tag = *encoded.get(cursor).expect("encoded field tag");
+        cursor += 1;
+        match tag {
+            0x00 => row.push(ScalarValue::Null),
+            0x01 => {
+                let chunk = encoded
+                    .get(cursor..cursor + 8)
+                    .expect("encoded int64 payload");
+                row.push(ScalarValue::Int64(Some(i64::from_le_bytes(
+                    chunk.try_into().expect("int64 payload"),
+                ))));
+                cursor += 8;
+            }
+            0x02 => {
+                let len_bytes = encoded
+                    .get(cursor..cursor + 4)
+                    .expect("encoded utf8 length");
+                let len =
+                    u32::from_le_bytes(len_bytes.try_into().expect("utf8 length payload")) as usize;
+                cursor += 4;
+                let bytes = encoded
+                    .get(cursor..cursor + len)
+                    .expect("encoded utf8 payload");
+                let text = std::str::from_utf8(bytes).expect("utf8 payload");
+                row.push(ScalarValue::Utf8(Some(text.to_string())));
+                cursor += len;
+            }
+            0x03 => {
+                let chunk = encoded
+                    .get(cursor..cursor + 8)
+                    .expect("encoded timestamp payload");
+                row.push(ScalarValue::TimestampMillisecond(
+                    Some(i64::from_le_bytes(
+                        chunk.try_into().expect("timestamp payload"),
+                    )),
+                    None,
+                ));
+                cursor += 8;
+            }
+            0x04 => {
+                let flag = *encoded.get(cursor).expect("encoded bool payload");
+                row.push(ScalarValue::Boolean(Some(flag != 0)));
+                cursor += 1;
+            }
+            0x05 => row.push(ScalarValue::Int64(None)),
+            0x06 => row.push(ScalarValue::Utf8(None)),
+            0x07 => row.push(ScalarValue::TimestampMillisecond(None, None)),
+            0x08 => row.push(ScalarValue::Boolean(None)),
+            other => panic!("unknown encoded tag: {other:#x}"),
+        }
+    }
+    assert_eq!(cursor, encoded.len(), "encoded row trailing bytes");
+    row
 }
