@@ -190,19 +190,15 @@ impl DbspGraphBuilder {
             if values.is_empty() {
                 return None;
             }
-            let outputs = evaluate_aggregate_values_from_encoded(
+            match encode_aggregate_values_from_encoded(
                 agg_layout.as_ref(),
                 &aggregates,
                 values,
                 &agg_graph_id,
                 "aggregate",
-            );
-            if outputs.is_empty() {
-                return None;
-            }
-
-            match encode_projected_row_key(&outputs) {
-                Ok(encoded) => Some(encoded),
+            ) {
+                Ok(Some(encoded)) => Some(encoded),
+                Ok(None) => None,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %agg_graph_id,
@@ -344,19 +340,15 @@ impl DbspGraphBuilder {
             if values.is_empty() {
                 return None;
             }
-            let outputs = evaluate_aggregate_values_from_encoded(
+            match encode_aggregate_values_from_encoded(
                 agg_layout.as_ref(),
                 &aggregates,
                 values,
                 &agg_graph_id,
                 "window aggregate",
-            );
-            if outputs.is_empty() {
-                return None;
-            }
-
-            match encode_projected_row_key(&outputs) {
-                Ok(encoded) => Some(encoded),
+            ) {
+                Ok(Some(encoded)) => Some(encoded),
+                Ok(None) => None,
                 Err(err) => {
                     tracing::warn!(
                         graph_id = %agg_graph_id,
@@ -896,18 +888,16 @@ fn evaluate_count_row_values(
                         if agg.distinct() {
                             let encoded =
                                 expression_values[expr_index].as_ref().and_then(|value| {
-                                    encode_projected_row_key(std::slice::from_ref(
-                                        &scalar_from_encoded_scalar(value),
-                                    ))
-                                    .map(Some)
-                                    .unwrap_or_else(|err| {
-                                        tracing::warn!(
-                                            graph_id = %graph_id,
-                                            error = %err,
-                                            "failed to encode count aggregate DISTINCT value"
-                                        );
-                                        None
-                                    })
+                                    encode_single_encoded_scalar_key(value)
+                                        .map(Some)
+                                        .unwrap_or_else(|err| {
+                                            tracing::warn!(
+                                                graph_id = %graph_id,
+                                                error = %err,
+                                                "failed to encode count aggregate DISTINCT value"
+                                            );
+                                            None
+                                        })
                                 });
                             dbsp::CountAggregateSlotUpdate::Distinct(encoded)
                         } else {
@@ -927,15 +917,15 @@ fn evaluate_count_row_values(
         .collect()
 }
 
-fn evaluate_aggregate_values_from_encoded(
+fn encode_aggregate_values_from_encoded(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
     values: &[(Vec<u8>, i64)],
     graph_id: &str,
     context: &str,
-) -> Vec<ScalarValue> {
+) -> Result<Option<Vec<u8>>> {
     if aggregates.is_empty() {
-        return Vec::new();
+        return Ok(None);
     }
 
     let mut accumulators = Vec::with_capacity(aggregates.len());
@@ -1131,38 +1121,49 @@ fn evaluate_aggregate_values_from_encoded(
     }
 
     if decoded_row_count == 0 {
-        return Vec::new();
+        return Ok(None);
     }
 
-    aggregates
-        .iter()
-        .zip(accumulators)
-        .map(|(agg, accumulator)| match accumulator {
-            EncodedAggregateAccumulator::CountDistinct { weights } => ScalarValue::Int64(Some(
-                weights.values().filter(|weight| **weight > 0).count() as i64,
-            )),
-            EncodedAggregateAccumulator::Count { count } => ScalarValue::Int64(Some(count)),
+    let count =
+        u32::try_from(aggregates.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut encoded = Vec::with_capacity(4 + (aggregates.len() * 9));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for (agg, accumulator) in aggregates.iter().zip(accumulators.into_iter()) {
+        match accumulator {
+            EncodedAggregateAccumulator::CountDistinct { weights } => {
+                append_encoded_i64(
+                    weights.values().filter(|weight| **weight > 0).count() as i64,
+                    &mut encoded,
+                );
+            }
+            EncodedAggregateAccumulator::Count { count } => {
+                append_encoded_i64(count, &mut encoded);
+            }
             EncodedAggregateAccumulator::Sum { sum, has_value } => {
                 if has_value {
-                    scalar_from_i64(sum, agg.output_type())
+                    append_encoded_sum_like_value(sum, agg.output_type(), &mut encoded)?;
                 } else {
-                    ScalarValue::Null
+                    append_untyped_null(&mut encoded);
                 }
             }
             EncodedAggregateAccumulator::Avg { sum, count } => {
                 if count != 0 {
-                    ScalarValue::Int64(Some(sum / count))
+                    append_encoded_i64(sum / count, &mut encoded);
                 } else {
-                    ScalarValue::Null
+                    append_untyped_null(&mut encoded);
                 }
             }
             EncodedAggregateAccumulator::Min { current }
-            | EncodedAggregateAccumulator::Max { current } => current
-                .as_ref()
-                .map(scalar_from_encoded_scalar)
-                .unwrap_or(ScalarValue::Null),
-        })
-        .collect()
+            | EncodedAggregateAccumulator::Max { current } => {
+                if let Some(value) = current.as_ref() {
+                    append_encoded_scalar(value, &mut encoded)?;
+                } else {
+                    append_untyped_null(&mut encoded);
+                }
+            }
+        }
+    }
+    Ok(Some(encoded))
 }
 
 pub(crate) fn build_incremental_aggregate_slot_kinds(
@@ -1395,15 +1396,66 @@ fn compare_encoded_scalars(
     }
 }
 
-fn scalar_from_encoded_scalar(value: &EncodedRowScalar) -> ScalarValue {
+fn append_encoded_scalar(value: &EncodedRowScalar, encoded: &mut Vec<u8>) -> Result<()> {
     match value {
-        EncodedRowScalar::Int64(value) => ScalarValue::Int64(Some(*value)),
-        EncodedRowScalar::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
-        EncodedRowScalar::TimestampMillis(value) => {
-            ScalarValue::TimestampMillisecond(Some(*value), None)
+        EncodedRowScalar::Int64(value) => {
+            append_encoded_i64(*value, encoded);
         }
-        EncodedRowScalar::Bool(value) => ScalarValue::Boolean(Some(*value)),
+        EncodedRowScalar::Utf8(value) => {
+            encoded.push(0x02);
+            let bytes = value.as_bytes();
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
+            encoded.extend_from_slice(&len.to_le_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+        EncodedRowScalar::TimestampMillis(value) => {
+            append_encoded_timestamp(*value, encoded);
+        }
+        EncodedRowScalar::Bool(value) => {
+            encoded.push(0x04);
+            encoded.push(if *value { 1 } else { 0 });
+        }
     }
+    Ok(())
+}
+
+fn encode_single_encoded_scalar_key(value: &EncodedRowScalar) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(13);
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    append_encoded_scalar(value, &mut encoded)?;
+    Ok(encoded)
+}
+
+fn append_encoded_i64(value: i64, encoded: &mut Vec<u8>) {
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_encoded_timestamp(value: i64, encoded: &mut Vec<u8>) {
+    encoded.push(0x03);
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_untyped_null(encoded: &mut Vec<u8>) {
+    encoded.push(0x00);
+}
+
+fn append_encoded_sum_like_value(
+    value: i64,
+    output_type: &DbspScalarType,
+    encoded: &mut Vec<u8>,
+) -> Result<()> {
+    match output_type {
+        DbspScalarType::Int64 => append_encoded_i64(value, encoded),
+        DbspScalarType::TimestampMillis => append_encoded_timestamp(value, encoded),
+        DbspScalarType::Utf8 | DbspScalarType::Bool => {
+            return Err(anyhow!(
+                "unsupported aggregate SUM output type for encoded output: {output_type:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn aggregate_value_type_from_dbsp_type(
