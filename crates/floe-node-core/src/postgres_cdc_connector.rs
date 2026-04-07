@@ -128,7 +128,7 @@ impl Connector for PostgresCdcConnector {
 
         let mut emitted = 0usize;
         let mut staged = Vec::new();
-        for row in rows {
+        rows.into_iter().try_for_each(|row| -> Result<()> {
             let lsn: String = row.try_get(0).context("read logical slot lsn")?;
             let txid: Option<i64> = row.try_get(1).context("read logical slot txid")?;
             let payload: String = row.try_get(2).context("read logical slot payload")?;
@@ -140,7 +140,7 @@ impl Connector for PostgresCdcConnector {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to parse wal2json payload");
-                    continue;
+                    return Ok(());
                 }
             };
             let txid = txid.and_then(|value| u64::try_from(value).ok());
@@ -152,7 +152,8 @@ impl Connector for PostgresCdcConnector {
                     txid,
                 })
             }));
-        }
+            Ok(())
+        })?;
 
         if !staged.is_empty() {
             ctx.send_batch(staged)

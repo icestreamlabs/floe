@@ -60,74 +60,56 @@ impl ScalarColumnBuilder {
         column_idx: usize,
     ) -> Result<()> {
         match self {
-            Self::Int64(builder) => {
-                for row in rows {
-                    match row.get(column_idx) {
-                        Some(RowValue::Int64(v)) => builder.append_value(*v),
-                        Some(other) => {
-                            return Err(anyhow!(
-                                "expected Int64 row value for Int64 column, found {other:?}"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow!(
-                                "row missing column index {column_idx} for Int64 column"
-                            ));
-                        }
-                    }
+            Self::Int64(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
+                Some(RowValue::Int64(v)) => {
+                    builder.append_value(*v);
+                    Ok(())
                 }
-            }
-            Self::Utf8(builder) => {
-                for row in rows {
-                    match row.get(column_idx) {
-                        Some(RowValue::Utf8(v)) => builder.append_value(v),
-                        Some(other) => {
-                            return Err(anyhow!(
-                                "expected Utf8 row value for Utf8 column, found {other:?}"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow!(
-                                "row missing column index {column_idx} for Utf8 column"
-                            ));
-                        }
-                    }
+                Some(other) => Err(anyhow!(
+                    "expected Int64 row value for Int64 column, found {other:?}"
+                )),
+                None => Err(anyhow!(
+                    "row missing column index {column_idx} for Int64 column"
+                )),
+            })?,
+            Self::Utf8(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
+                Some(RowValue::Utf8(v)) => {
+                    builder.append_value(v);
+                    Ok(())
                 }
-            }
+                Some(other) => Err(anyhow!(
+                    "expected Utf8 row value for Utf8 column, found {other:?}"
+                )),
+                None => Err(anyhow!(
+                    "row missing column index {column_idx} for Utf8 column"
+                )),
+            })?,
             Self::TimestampMillis { builder, .. } => {
-                for row in rows {
-                    match row.get(column_idx) {
-                        Some(RowValue::TimestampMillis(v)) => builder.append_value(*v),
-                        Some(other) => {
-                            return Err(anyhow!(
-                                "expected TimestampMillis row value for timestamp(ms) column, found {other:?}"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow!(
-                                "row missing column index {column_idx} for timestamp(ms) column"
-                            ));
-                        }
+                rows.iter().try_for_each(|row| match row.get(column_idx) {
+                    Some(RowValue::TimestampMillis(v)) => {
+                        builder.append_value(*v);
+                        Ok(())
                     }
-                }
+                    Some(other) => Err(anyhow!(
+                        "expected TimestampMillis row value for timestamp(ms) column, found {other:?}"
+                    )),
+                    None => Err(anyhow!(
+                        "row missing column index {column_idx} for timestamp(ms) column"
+                    )),
+                })?
             }
-            Self::Bool(builder) => {
-                for row in rows {
-                    match row.get(column_idx) {
-                        Some(RowValue::Bool(v)) => builder.append_value(*v),
-                        Some(other) => {
-                            return Err(anyhow!(
-                                "expected Bool row value for boolean column, found {other:?}"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow!(
-                                "row missing column index {column_idx} for boolean column"
-                            ));
-                        }
-                    }
+            Self::Bool(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
+                Some(RowValue::Bool(v)) => {
+                    builder.append_value(*v);
+                    Ok(())
                 }
-            }
+                Some(other) => Err(anyhow!(
+                    "expected Bool row value for boolean column, found {other:?}"
+                )),
+                None => Err(anyhow!(
+                    "row missing column index {column_idx} for boolean column"
+                )),
+            })?,
             Self::Binary(_) => {
                 return Err(anyhow!("cannot append RowValue into binary column builder"));
             }

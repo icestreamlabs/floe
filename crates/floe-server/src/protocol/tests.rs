@@ -319,12 +319,17 @@ async fn streaming_execute_respects_mv_version_filter() {
     }
     assert_eq!(
         rows.len(),
-        1,
-        "only the requested version should be streamed"
+        2,
+        "all rows in the requested version should be streamed"
     );
     assert_eq!(rows[0][0].as_deref(), Some("10"));
+    assert_eq!(rows[1][0].as_deref(), Some("20"));
     assert_eq!(
         rows[0][1].as_deref(),
+        Some(version_literal.to_string().as_str())
+    );
+    assert_eq!(
+        rows[1][1].as_deref(),
         Some(version_literal.to_string().as_str())
     );
 }
@@ -377,13 +382,9 @@ async fn seed_mv_state(
         .new_view(STREAM_VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
         .await
         .expect("create view");
-    let mut versions = Vec::new();
-    for value in rows {
-        let key = encode_i64_row(*value);
-        view.add_delta(key, 1);
-        let handle = view.flush().await.expect("flush view");
-        versions.push(handle.version);
-    }
+    view.add_deltas(rows.iter().copied().map(|value| (encode_i64_row(value), 1)));
+    let handle = view.flush().await.expect("flush view");
+    let versions = vec![handle.version];
     bridge
         .save_mv_schema(STREAM_VIEW_NAME, Arc::clone(&schema))
         .await
