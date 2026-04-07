@@ -34,9 +34,9 @@ pub use circuit::{
     DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode,
     DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef,
     KeyEncoder, OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem, Row, RowBuilder,
-    RowSchema, ScalarValue, TableDescriptor, encode_composite_key, encode_scalar,
-    nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
-    nexmark_person_alias_table, nexmark_person_table,
+    RowSchema, TableDescriptor, encode_composite_key, encode_scalar, nexmark_auction_alias_table,
+    nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table,
+    nexmark_person_table,
 };
 pub use collections::{ZSet, h};
 pub use count_aggregate::{DbspCountAggregate, DbspTransientCountAggregate};

@@ -137,7 +137,6 @@ fn null_i64_value(len: usize) -> ColumnarValue {
 }
 
 fn planner_udfs() -> Vec<ScalarUDF> {
-
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
             Ok(args

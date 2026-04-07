@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{
+    Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+};
 use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, WindowFunctionDefinition};
-use datafusion::scalar::ScalarValue;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DataFusionError};
 
@@ -1015,12 +1018,27 @@ impl<'cfg> PlannerContext<'cfg> {
     }
 
     fn parse_window_arg(&self, expr: &Expr) -> Result<i64, PlannerError> {
-        match expr {
-            Expr::Literal(ScalarValue::Int64(Some(value)), _) => Ok(*value),
-            _ => Err(PlannerError::UnsupportedPlan(
+        let Expr::Literal(value, _) = expr else {
+            return Err(PlannerError::UnsupportedPlan(
                 "window sizes must be literal Int64 milliseconds".to_string(),
-            )),
+            ));
+        };
+        let array = value.to_array().map_err(|_| {
+            PlannerError::UnsupportedPlan(
+                "window sizes must be literal Int64 milliseconds".to_string(),
+            )
+        })?;
+        let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            PlannerError::UnsupportedPlan(
+                "window sizes must be literal Int64 milliseconds".to_string(),
+            )
+        })?;
+        if values.is_null(0) {
+            return Err(PlannerError::UnsupportedPlan(
+                "window sizes must be literal Int64 milliseconds".to_string(),
+            ));
         }
+        Ok(values.value(0))
     }
 
     fn window_output_schema(
@@ -1280,16 +1298,16 @@ fn extract_row_number_limit(predicate: &Expr) -> Result<Option<(String, usize)>,
     };
 
     let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
-        (Expr::Column(column), Operator::LtEq, Expr::Literal(value, _)) => {
-            (column.name.clone(), value.clone(), false)
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
+            (column.name.clone(), literal, false)
         }
-        (Expr::Column(column), Operator::Lt, Expr::Literal(value, _)) => {
-            (column.name.clone(), value.clone(), true)
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => {
+            (column.name.clone(), literal, true)
         }
         _ => return Ok(None),
     };
 
-    let mut limit = scalar_to_positive_usize(&literal)?;
+    let mut limit = literal_to_positive_usize(literal)?;
     if exclusive {
         if limit == 0 {
             return Ok(None);
@@ -1310,22 +1328,22 @@ fn projection_expr_matches_rank(expr: &Expr, rank_column: &str) -> bool {
     }
 }
 
-fn scalar_to_positive_usize(value: &ScalarValue) -> Result<usize, PlannerError> {
-    let as_i128 = match value {
-        ScalarValue::Int8(Some(v)) => i128::from(*v),
-        ScalarValue::Int16(Some(v)) => i128::from(*v),
-        ScalarValue::Int32(Some(v)) => i128::from(*v),
-        ScalarValue::Int64(Some(v)) => i128::from(*v),
-        ScalarValue::UInt8(Some(v)) => i128::from(*v),
-        ScalarValue::UInt16(Some(v)) => i128::from(*v),
-        ScalarValue::UInt32(Some(v)) => i128::from(*v),
-        ScalarValue::UInt64(Some(v)) => i128::from(*v),
-        _ => {
-            return Err(PlannerError::UnsupportedPlan(
-                "ROW_NUMBER filter limit must be a positive integer literal".to_string(),
-            ));
-        }
+fn literal_to_positive_usize(expr: &Expr) -> Result<usize, PlannerError> {
+    let Expr::Literal(value, _) = expr else {
+        return Err(PlannerError::UnsupportedPlan(
+            "ROW_NUMBER filter limit must be a positive integer literal".to_string(),
+        ));
     };
+    let array = value.to_array().map_err(|_| {
+        PlannerError::UnsupportedPlan(
+            "ROW_NUMBER filter limit must be a positive integer literal".to_string(),
+        )
+    })?;
+    let as_i128 = array_to_i128(array.as_ref()).ok_or_else(|| {
+        PlannerError::UnsupportedPlan(
+            "ROW_NUMBER filter limit must be a positive integer literal".to_string(),
+        )
+    })?;
 
     if as_i128 <= 0 {
         return Err(PlannerError::UnsupportedPlan(
@@ -1335,4 +1353,32 @@ fn scalar_to_positive_usize(value: &ScalarValue) -> Result<usize, PlannerError> 
     usize::try_from(as_i128).map_err(|_| {
         PlannerError::UnsupportedPlan("ROW_NUMBER filter limit is out of range".to_string())
     })
+}
+
+fn array_to_i128(array: &dyn Array) -> Option<i128> {
+    if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return (!values.is_null(0)).then(|| i128::from(values.value(0)));
+    }
+    None
 }

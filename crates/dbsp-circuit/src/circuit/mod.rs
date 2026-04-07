@@ -22,4 +22,4 @@ pub use tables::{
     TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
     nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
-pub use types::{DbspScalarType, ScalarValue};
+pub use types::DbspScalarType;

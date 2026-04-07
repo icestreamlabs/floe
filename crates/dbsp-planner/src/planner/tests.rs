@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::arrow::array::{ArrayRef, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
@@ -12,7 +13,6 @@ use datafusion::logical_expr::{
     Signature, TableSource, TypeSignature, Volatility, col, lit,
 };
 use datafusion::prelude::SessionContext;
-use datafusion::scalar::ScalarValue;
 
 use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspJoinType, DbspNodeKind};
 use dbsp_circuit::circuit::tables::TableDescriptor;
@@ -35,6 +35,20 @@ fn table_source(table: &'static TableDescriptor) -> Arc<dyn TableSource> {
     Arc::new(LogicalTableSource::new(table.schema().to_arrow_schema()))
 }
 
+fn udf_batch_len(args: &[ColumnarValue]) -> usize {
+    args.iter()
+        .find_map(|arg| match arg {
+            ColumnarValue::Array(array) => Some(array.len()),
+            ColumnarValue::Scalar(_) => None,
+        })
+        .unwrap_or(1)
+}
+
+fn null_ts_value(len: usize) -> ColumnarValue {
+    let array: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![None; len]));
+    ColumnarValue::Array(array)
+}
+
 async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let ctx = SessionContext::new();
     for table in [
@@ -52,9 +66,10 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     }
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(args.first().cloned().unwrap_or(ColumnarValue::Scalar(
-                ScalarValue::TimestampMillisecond(None, None),
-            )))
+            Ok(args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_ts_value(udf_batch_len(args))))
         },
     );
     let ts = DataType::Timestamp(TimeUnit::Millisecond, None);

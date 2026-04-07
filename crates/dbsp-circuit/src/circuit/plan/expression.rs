@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use datafusion::arrow::array::{Array, StringArray};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
-use datafusion::scalar::ScalarValue as DfScalarValue;
 use datafusion_common::DFSchema;
 
 use crate::circuit::schema::RowSchema;
@@ -403,13 +403,21 @@ impl DbspExpression {
     }
 
     fn validate_like_operand(pattern_expr: &Expr) -> Result<()> {
-        match pattern_expr {
-            Expr::Literal(DfScalarValue::Utf8(Some(pattern)), _) => {
-                Self::validate_like_pattern(pattern)
-            }
-            Expr::Literal(_, _) => bail!("LIKE patterns must be UTF-8 strings"),
-            _ => bail!("LIKE pattern must be a literal string"),
+        let Expr::Literal(value, _) = pattern_expr else {
+            bail!("LIKE pattern must be a literal string");
+        };
+
+        let array = value
+            .to_array()
+            .map_err(|_| anyhow::anyhow!("LIKE patterns must be UTF-8 strings"))?;
+        let values = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("LIKE patterns must be UTF-8 strings"))?;
+        if values.is_null(0) {
+            bail!("LIKE patterns must be UTF-8 strings");
         }
+        Self::validate_like_pattern(values.value(0))
     }
 
     fn validate_like_pattern(pattern: &str) -> Result<()> {
