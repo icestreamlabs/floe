@@ -143,16 +143,15 @@ impl Connector for PostgresCdcConnector {
                     continue;
                 }
             };
-            for event in events {
-                let txid = txid.and_then(|value| u64::try_from(value).ok());
-                let event = event.with_resume_token(SourceResumeToken::PostgresCdc {
+            let txid = txid.and_then(|value| u64::try_from(value).ok());
+            emitted = emitted.saturating_add(events.len());
+            staged.extend(events.into_iter().map(|event| {
+                event.with_resume_token(SourceResumeToken::PostgresCdc {
                     slot: Some(self.config.slot.clone()),
                     lsn: lsn.clone(),
                     txid,
-                });
-                staged.push(event);
-                emitted = emitted.saturating_add(1);
-            }
+                })
+            }));
         }
 
         if !staged.is_empty() {

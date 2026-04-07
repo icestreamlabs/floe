@@ -16,9 +16,9 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
 #[cfg(test)]
 use crate::encoding::decode_all_encoded_row_scalars;
+use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
