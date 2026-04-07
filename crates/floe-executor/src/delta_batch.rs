@@ -8,7 +8,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
-use crate::encoding::decode_all_encoded_row_scalars;
+use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
 use crate::metrics;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::Diff;
@@ -44,6 +44,7 @@ pub struct DeltaBatchBuffer {
     weights: Vec<Diff>,
     keys: Option<Vec<Vec<u8>>>,
     estimated_bytes: usize,
+    decode_scratch: Vec<Option<EncodedRowScalar>>,
 }
 
 impl DeltaBatchBuffer {
@@ -87,6 +88,7 @@ impl DeltaBatchBuffer {
             weights: Vec::new(),
             keys: include_key.then(Vec::new),
             estimated_bytes: 0,
+            decode_scratch: Vec::new(),
         })
     }
 
@@ -99,11 +101,11 @@ impl DeltaBatchBuffer {
         if weight == 0 {
             return Ok(None);
         }
-        let decoded = decode_all_encoded_row_scalars(&row)?;
-        if decoded.len() != self.base_schema.fields().len() {
+        decode_all_encoded_row_scalars_into(&row, &mut self.decode_scratch)?;
+        if self.decode_scratch.len() != self.base_schema.fields().len() {
             return Err(anyhow!(
                 "encoded row has {} columns but schema has {}",
-                decoded.len(),
+                self.decode_scratch.len(),
                 self.base_schema.fields().len()
             ));
         }
@@ -119,7 +121,7 @@ impl DeltaBatchBuffer {
         }
 
         self.estimated_bytes += estimate_encoded_row_bytes(&row);
-        for (idx, value) in decoded.iter().enumerate() {
+        for (idx, value) in self.decode_scratch.iter().enumerate() {
             self.columns[idx].append_encoded_scalar(value.as_ref())?;
         }
         self.row_count += 1;

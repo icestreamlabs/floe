@@ -16,6 +16,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
+#[cfg(test)]
 use crate::encoding::decode_all_encoded_row_scalars;
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
@@ -424,6 +426,7 @@ fn rows_from_snapshot(
         builders,
         ops: Vec::new(),
     };
+    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
     for (key, diff) in snapshot {
         if diff < 0 {
             bail!("materialized view snapshot contains negative diff {diff}");
@@ -431,16 +434,16 @@ fn rows_from_snapshot(
         if diff == 0 {
             continue;
         }
-        let decoded = decode_all_encoded_row_scalars(&key)?;
-        if decoded.len() != column_count {
+        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
+        if decode_scratch.len() != column_count {
             bail!(
                 "decoded row has {} columns but schema has {}",
-                decoded.len(),
+                decode_scratch.len(),
                 column_count
             );
         }
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
-        for (idx, value) in decoded.iter().enumerate() {
+        for (idx, value) in decode_scratch.iter().enumerate() {
             decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
         }
         decoded_rows.ops.resize(decoded_rows.ops.len() + count, 1);
@@ -459,21 +462,22 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<
         builders,
         ops: Vec::new(),
     };
+    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
     for (key, diff) in deltas {
         if diff == 0 {
             continue;
         }
         let op = if diff > 0 { 1 } else { -1 };
         let count = diff.checked_abs().context("delta diff overflow")? as usize;
-        let decoded = decode_all_encoded_row_scalars(&key)?;
-        if decoded.len() != column_count {
+        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
+        if decode_scratch.len() != column_count {
             bail!(
                 "decoded row has {} columns but schema has {}",
-                decoded.len(),
+                decode_scratch.len(),
                 column_count
             );
         }
-        for (idx, value) in decoded.iter().enumerate() {
+        for (idx, value) in decode_scratch.iter().enumerate() {
             decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
         }
         decoded_rows.ops.resize(decoded_rows.ops.len() + count, op);

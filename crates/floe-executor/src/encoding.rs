@@ -129,9 +129,31 @@ pub(crate) fn extract_encoded_row_scalars(
 }
 
 pub fn decode_all_encoded_row_scalars(bytes: &[u8]) -> Result<Vec<Option<EncodedRowScalar>>> {
+    let mut decoded = Vec::new();
+    decode_all_encoded_row_scalars_into(bytes, &mut decoded)?;
+    Ok(decoded)
+}
+
+pub(crate) fn decode_all_encoded_row_scalars_into(
+    bytes: &[u8],
+    decoded: &mut Vec<Option<EncodedRowScalar>>,
+) -> Result<()> {
     let count = encoded_row_column_count(bytes)?;
-    let indices = (0..count).collect::<Vec<_>>();
-    extract_encoded_row_scalars(bytes, indices.as_slice())
+    decoded.clear();
+    decoded.resize(count, None);
+
+    let mut cursor = 4usize;
+    for slot in decoded.iter_mut() {
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        let value_cursor = cursor;
+        let end = encoded_field_end(bytes, cursor, tag)?;
+        *slot = decode_encoded_scalar(bytes, value_cursor, tag)?;
+        cursor = end;
+    }
+    Ok(())
 }
 
 pub fn extract_encoded_row_i64_like_column(
