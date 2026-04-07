@@ -443,6 +443,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         graph_id = %event.graph_id,
                         task = %event.task,
                         error = %event.error,
+                        error_chain = %format!("{:#}", event.error),
                         "graph background task failed"
                     );
                     record_runtime_failure(

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, Int64Builder, StringArray, TimestampMillisecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
@@ -153,12 +155,67 @@ fn planner_udfs() -> Vec<ScalarUDF> {
                 .unwrap_or_else(|| null_utf8_value(udf_batch_len(args))))
         },
     );
-    let scalar_int: ScalarFunctionImplementation = Arc::new(
+    let hour_udf: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(args
+            let len = udf_batch_len(args);
+            let ts = args
                 .first()
                 .cloned()
-                .unwrap_or_else(|| null_i64_value(udf_batch_len(args))))
+                .unwrap_or_else(|| null_ts_value(len))
+                .into_array(len)?;
+            let Some(ts) = ts.as_any().downcast_ref::<TimestampMillisecondArray>() else {
+                return Ok(null_i64_value(len));
+            };
+            let mut out = Int64Builder::with_capacity(len);
+            for row_idx in 0..len {
+                if ts.is_null(row_idx) {
+                    out.append_null();
+                } else {
+                    // Floor-division based UTC hour extraction from epoch millis.
+                    let millis = ts.value(row_idx);
+                    let hour = millis.div_euclid(3_600_000).rem_euclid(24);
+                    out.append_value(hour);
+                }
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
+        },
+    );
+    let count_char_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let text = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let needle = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let (Some(text), Some(needle)) = (
+                text.as_any().downcast_ref::<StringArray>(),
+                needle.as_any().downcast_ref::<StringArray>(),
+            ) else {
+                return Ok(null_i64_value(len));
+            };
+
+            let mut out = Int64Builder::with_capacity(len);
+            for row_idx in 0..len {
+                if text.is_null(row_idx) || needle.is_null(row_idx) {
+                    out.append_null();
+                    continue;
+                }
+                let haystack = text.value(row_idx);
+                let token = needle.value(row_idx);
+                let count = if token.is_empty() {
+                    0_i64
+                } else {
+                    i64::try_from(haystack.matches(token).count()).unwrap_or(i64::MAX)
+                };
+                out.append_value(count);
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
         },
     );
     let proctime: ScalarFunctionImplementation = Arc::new(
@@ -289,14 +346,14 @@ fn planner_udfs() -> Vec<ScalarUDF> {
             vec![ts],
             DataType::Int64,
             Volatility::Immutable,
-            Arc::clone(&scalar_int),
+            Arc::clone(&hour_udf),
         ),
         create_udf(
             "count_char",
             vec![DataType::Utf8, DataType::Utf8],
             DataType::Int64,
             Volatility::Immutable,
-            scalar_int,
+            count_char_udf,
         ),
     ]
 }

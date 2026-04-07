@@ -1609,6 +1609,18 @@ fn build_sparse_input_batch(
     mut decoded_columns: Vec<Vec<Option<EncodedRowScalar>>>,
     row_count: usize,
 ) -> Result<RecordBatch> {
+    let batch_schema = if decoded_input_slots.iter().any(Option::is_none) {
+        Arc::new(datafusion::arrow::datatypes::Schema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        Arc::clone(schema)
+    };
+
     let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -1631,7 +1643,7 @@ fn build_sparse_input_batch(
             }
         })
         .collect::<Result<_>>()?;
-    RecordBatch::try_new(Arc::clone(schema), arrays).context("build vectorized input batch")
+    RecordBatch::try_new(batch_schema, arrays).context("build vectorized input batch")
 }
 
 fn build_compiled_input_batch(
