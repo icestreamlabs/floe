@@ -54,40 +54,80 @@ impl ScalarColumnBuilder {
         }
     }
 
-    pub(crate) fn append_row_value(&mut self, value: &RowValue) -> Result<()> {
+    pub(crate) fn append_row_values_column(
+        &mut self,
+        rows: &[Vec<RowValue>],
+        column_idx: usize,
+    ) -> Result<()> {
         match self {
-            Self::Int64(builder) => match value {
-                RowValue::Int64(v) => builder.append_value(*v),
-                other => {
-                    return Err(anyhow!(
-                        "expected Int64 row value for Int64 column, found {other:?}"
-                    ));
+            Self::Int64(builder) => {
+                for row in rows {
+                    match row.get(column_idx) {
+                        Some(RowValue::Int64(v)) => builder.append_value(*v),
+                        Some(other) => {
+                            return Err(anyhow!(
+                                "expected Int64 row value for Int64 column, found {other:?}"
+                            ));
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "row missing column index {column_idx} for Int64 column"
+                            ));
+                        }
+                    }
                 }
-            },
-            Self::Utf8(builder) => match value {
-                RowValue::Utf8(v) => builder.append_value(v),
-                other => {
-                    return Err(anyhow!(
-                        "expected Utf8 row value for Utf8 column, found {other:?}"
-                    ));
+            }
+            Self::Utf8(builder) => {
+                for row in rows {
+                    match row.get(column_idx) {
+                        Some(RowValue::Utf8(v)) => builder.append_value(v),
+                        Some(other) => {
+                            return Err(anyhow!(
+                                "expected Utf8 row value for Utf8 column, found {other:?}"
+                            ));
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "row missing column index {column_idx} for Utf8 column"
+                            ));
+                        }
+                    }
                 }
-            },
-            Self::TimestampMillis { builder, .. } => match value {
-                RowValue::TimestampMillis(v) => builder.append_value(*v),
-                other => {
-                    return Err(anyhow!(
-                        "expected TimestampMillis row value for timestamp(ms) column, found {other:?}"
-                    ));
+            }
+            Self::TimestampMillis { builder, .. } => {
+                for row in rows {
+                    match row.get(column_idx) {
+                        Some(RowValue::TimestampMillis(v)) => builder.append_value(*v),
+                        Some(other) => {
+                            return Err(anyhow!(
+                                "expected TimestampMillis row value for timestamp(ms) column, found {other:?}"
+                            ));
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "row missing column index {column_idx} for timestamp(ms) column"
+                            ));
+                        }
+                    }
                 }
-            },
-            Self::Bool(builder) => match value {
-                RowValue::Bool(v) => builder.append_value(*v),
-                other => {
-                    return Err(anyhow!(
-                        "expected Bool row value for boolean column, found {other:?}"
-                    ));
+            }
+            Self::Bool(builder) => {
+                for row in rows {
+                    match row.get(column_idx) {
+                        Some(RowValue::Bool(v)) => builder.append_value(*v),
+                        Some(other) => {
+                            return Err(anyhow!(
+                                "expected Bool row value for boolean column, found {other:?}"
+                            ));
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "row missing column index {column_idx} for boolean column"
+                            ));
+                        }
+                    }
                 }
-            },
+            }
             Self::Binary(_) => {
                 return Err(anyhow!("cannot append RowValue into binary column builder"));
             }

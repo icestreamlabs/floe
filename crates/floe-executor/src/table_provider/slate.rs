@@ -113,7 +113,7 @@ fn build_row_value_batches(
         .map(|field| ScalarColumnBuilder::new(field.data_type(), rows.len()))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    for row in rows {
+    for row in &rows {
         if row.len() != column_count {
             return Err(anyhow!(
                 "row has {} columns but schema has {}",
@@ -121,9 +121,10 @@ fn build_row_value_batches(
                 column_count
             ));
         }
-        for (idx, value) in row.iter().enumerate() {
-            builders[idx].append_row_value(value)?;
-        }
+    }
+
+    for (idx, builder) in builders.iter_mut().enumerate() {
+        builder.append_row_values_column(&rows, idx)?;
     }
 
     let arrays = builders
