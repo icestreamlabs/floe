@@ -413,19 +413,29 @@ where
             return Ok(HashMap::new());
         }
 
-        struct ParsedRow<K, V> {
-            key: K,
-            slots: Vec<IncrementalAggregateSlotUpdate>,
-            weight: i64,
-            _marker: std::marker::PhantomData<V>,
+        #[derive(Clone, Debug)]
+        enum AggregatedSlotDelta {
+            Count { delta: i64 },
+            CountDistinct,
+            Sum { sum_delta: i64, non_null_delta: i64 },
+            Avg { sum_delta: i64, count_delta: i64 },
+            Min { candidate: Option<AggregateValue> },
+            Max { candidate: Option<AggregateValue> },
         }
 
-        let mut parsed_rows = Vec::with_capacity(coalesced.len());
+        #[derive(Clone, Debug)]
+        struct AggregatedKeyUpdates {
+            total_rows_delta: i64,
+            slot_deltas: Vec<AggregatedSlotDelta>,
+        }
+
         let mut affected_keys = HashSet::new();
         let mut recompute_keys = HashSet::new();
         let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, AggregateValue), i64> =
             HashMap::new();
         let mut index_updates = Vec::new();
+        let slot_kinds = &self.slot_kinds;
+        let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
         for (value, weight) in coalesced {
             if weight == 0 {
@@ -442,20 +452,23 @@ where
                 );
                 continue;
             }
+            let key = row_update.key;
+            let slots = row_update.slots;
             if self.has_extrema() && weight < 0 {
-                recompute_keys.insert(row_update.key.clone());
+                recompute_keys.insert(key.clone());
+                aggregated_updates_by_key.remove(&key);
             }
             if self.input_index.is_some() {
-                index_updates.push((row_update.key.clone(), value.clone(), weight));
+                index_updates.push((key.clone(), value.clone(), weight));
             }
-            for (slot_idx, slot) in row_update.slots.iter().enumerate() {
+            for (slot_idx, slot) in slots.iter().enumerate() {
                 if matches!(
                     self.slot_kinds[slot_idx],
                     IncrementalAggregateSlotKind::CountDistinct
                 ) && let IncrementalAggregateSlotUpdate::Value(Some(distinct_value)) = slot
                 {
                     let distinct_key = DistinctGroupKey {
-                        group_key: row_update.key.clone(),
+                        group_key: key.clone(),
                         slot: slot_idx as u32,
                     };
                     let entry = distinct_deltas
@@ -464,13 +477,118 @@ where
                     *entry += weight;
                 }
             }
-            affected_keys.insert(row_update.key.clone());
-            parsed_rows.push(ParsedRow {
-                key: row_update.key,
-                slots: row_update.slots,
-                weight,
-                _marker: std::marker::PhantomData,
-            });
+            affected_keys.insert(key.clone());
+            if recompute_keys.contains(&key) {
+                continue;
+            }
+
+            let updates =
+                aggregated_updates_by_key
+                    .entry(key)
+                    .or_insert_with(|| AggregatedKeyUpdates {
+                        total_rows_delta: 0,
+                        slot_deltas: slot_kinds
+                            .iter()
+                            .map(|kind| match kind {
+                                IncrementalAggregateSlotKind::Count => {
+                                    AggregatedSlotDelta::Count { delta: 0 }
+                                }
+                                IncrementalAggregateSlotKind::CountDistinct => {
+                                    AggregatedSlotDelta::CountDistinct
+                                }
+                                IncrementalAggregateSlotKind::Sum(_) => AggregatedSlotDelta::Sum {
+                                    sum_delta: 0,
+                                    non_null_delta: 0,
+                                },
+                                IncrementalAggregateSlotKind::Avg => AggregatedSlotDelta::Avg {
+                                    sum_delta: 0,
+                                    count_delta: 0,
+                                },
+                                IncrementalAggregateSlotKind::Min(_) => {
+                                    AggregatedSlotDelta::Min { candidate: None }
+                                }
+                                IncrementalAggregateSlotKind::Max(_) => {
+                                    AggregatedSlotDelta::Max { candidate: None }
+                                }
+                            })
+                            .collect(),
+                    });
+            updates.total_rows_delta += weight;
+            for (slot_idx, slot) in slots.iter().enumerate() {
+                match (&mut updates.slot_deltas[slot_idx], slot) {
+                    (
+                        AggregatedSlotDelta::Count { delta },
+                        IncrementalAggregateSlotUpdate::Count(value),
+                    ) => {
+                        *delta += value * weight;
+                    }
+                    (
+                        AggregatedSlotDelta::Sum {
+                            sum_delta,
+                            non_null_delta,
+                        },
+                        IncrementalAggregateSlotUpdate::Value(Some(value)),
+                    ) => {
+                        if let Some(number) = value.as_numeric() {
+                            *sum_delta += number * weight;
+                            *non_null_delta += weight;
+                        }
+                    }
+                    (
+                        AggregatedSlotDelta::Avg {
+                            sum_delta,
+                            count_delta,
+                        },
+                        IncrementalAggregateSlotUpdate::Value(Some(value)),
+                    ) => {
+                        if let Some(number) = value.as_numeric() {
+                            *sum_delta += number * weight;
+                            *count_delta += weight;
+                        }
+                    }
+                    (
+                        AggregatedSlotDelta::Min { candidate },
+                        IncrementalAggregateSlotUpdate::Value(Some(value)),
+                    ) if weight > 0 => match candidate.take() {
+                        Some(existing) => {
+                            *candidate = Some(match value.cmp_non_null(&existing) {
+                                Some(std::cmp::Ordering::Less) => value.clone(),
+                                Some(_) | None => existing,
+                            });
+                        }
+                        None => {
+                            *candidate = Some(value.clone());
+                        }
+                    },
+                    (
+                        AggregatedSlotDelta::Max { candidate },
+                        IncrementalAggregateSlotUpdate::Value(Some(value)),
+                    ) if weight > 0 => match candidate.take() {
+                        Some(existing) => {
+                            *candidate = Some(match value.cmp_non_null(&existing) {
+                                Some(std::cmp::Ordering::Greater) => value.clone(),
+                                Some(_) | None => existing,
+                            });
+                        }
+                        None => {
+                            *candidate = Some(value.clone());
+                        }
+                    },
+                    (
+                        AggregatedSlotDelta::CountDistinct,
+                        IncrementalAggregateSlotUpdate::Value(_),
+                    )
+                    | (_, IncrementalAggregateSlotUpdate::Value(None)) => {}
+                    (aggregated, slot) => {
+                        tracing::warn!(
+                            slot_idx,
+                            ?aggregated,
+                            ?slot,
+                            "incremental aggregate slot update shape mismatch during aggregation"
+                        );
+                    }
+                }
+            }
         }
 
         if affected_keys.is_empty() {
@@ -524,14 +642,6 @@ where
             .await
             .context("load incremental aggregate cache")?;
 
-        let mut parsed_by_key: HashMap<K, Vec<ParsedRow<K, V>>> = HashMap::new();
-        for parsed in parsed_rows {
-            parsed_by_key
-                .entry(parsed.key.clone())
-                .or_default()
-                .push(parsed);
-        }
-
         let zero_state = GroupedIncrementalAggregateState::zero(&self.slot_kinds);
         let mut state_deltas: HashMap<(K, GroupedIncrementalAggregateState), i64> = HashMap::new();
         let mut output_deltas: HashMap<(K, Vec<AggregateValue>), i64> = HashMap::new();
@@ -551,11 +661,89 @@ where
                         .with_context(|| format!("recompute incremental aggregate state for key"))?
                 } else {
                     let mut next = old_state.clone().unwrap_or_else(|| zero_state.clone());
-                    if let Some(rows) = parsed_by_key.get(&key) {
-                        for parsed in rows {
-                            next.total_rows += parsed.weight;
-                            for (slot_idx, slot) in parsed.slots.iter().enumerate() {
-                                self.apply_slot_update(&mut next, slot_idx, slot, parsed.weight);
+                    if let Some(updates) = aggregated_updates_by_key.get(&key) {
+                        next.total_rows += updates.total_rows_delta;
+                        for (slot_idx, slot_delta) in updates.slot_deltas.iter().enumerate() {
+                            match (&mut next.slots[slot_idx], slot_delta) {
+                                (
+                                    IncrementalAggregateSlotState::Count { count },
+                                    AggregatedSlotDelta::Count { delta },
+                                ) => {
+                                    *count += *delta;
+                                }
+                                (
+                                    IncrementalAggregateSlotState::CountDistinct { .. },
+                                    AggregatedSlotDelta::CountDistinct,
+                                ) => {}
+                                (
+                                    IncrementalAggregateSlotState::Sum {
+                                        sum,
+                                        non_null_count,
+                                    },
+                                    AggregatedSlotDelta::Sum {
+                                        sum_delta,
+                                        non_null_delta,
+                                    },
+                                ) => {
+                                    *sum += *sum_delta;
+                                    *non_null_count += *non_null_delta;
+                                }
+                                (
+                                    IncrementalAggregateSlotState::Avg { sum, count },
+                                    AggregatedSlotDelta::Avg {
+                                        sum_delta,
+                                        count_delta,
+                                    },
+                                ) => {
+                                    *sum += *sum_delta;
+                                    *count += *count_delta;
+                                }
+                                (
+                                    IncrementalAggregateSlotState::Min { current },
+                                    AggregatedSlotDelta::Min {
+                                        candidate: Some(candidate),
+                                    },
+                                ) => {
+                                    let next_value = match current.take() {
+                                        Some(existing) => match candidate.cmp_non_null(&existing) {
+                                            Some(std::cmp::Ordering::Less) => candidate.clone(),
+                                            Some(_) | None => existing,
+                                        },
+                                        None => candidate.clone(),
+                                    };
+                                    *current = Some(next_value);
+                                }
+                                (
+                                    IncrementalAggregateSlotState::Max { current },
+                                    AggregatedSlotDelta::Max {
+                                        candidate: Some(candidate),
+                                    },
+                                ) => {
+                                    let next_value = match current.take() {
+                                        Some(existing) => match candidate.cmp_non_null(&existing) {
+                                            Some(std::cmp::Ordering::Greater) => candidate.clone(),
+                                            Some(_) | None => existing,
+                                        },
+                                        None => candidate.clone(),
+                                    };
+                                    *current = Some(next_value);
+                                }
+                                (
+                                    IncrementalAggregateSlotState::Min { .. },
+                                    AggregatedSlotDelta::Min { candidate: None },
+                                )
+                                | (
+                                    IncrementalAggregateSlotState::Max { .. },
+                                    AggregatedSlotDelta::Max { candidate: None },
+                                ) => {}
+                                (state_slot, aggregate_slot) => {
+                                    tracing::warn!(
+                                        slot_idx,
+                                        ?state_slot,
+                                        ?aggregate_slot,
+                                        "incremental aggregate slot state/aggregate mismatch"
+                                    );
+                                }
                             }
                         }
                     }
