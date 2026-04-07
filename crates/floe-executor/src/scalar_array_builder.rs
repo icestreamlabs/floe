@@ -247,6 +247,118 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
+    pub(crate) fn append_encoded_scalar_repeated(
+        &mut self,
+        value: Option<&EncodedRowScalar>,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        match self {
+            Self::Int64(builder) => match value {
+                Some(EncodedRowScalar::Int64(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(*value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Int64 encoded scalar for Int64 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Utf8(builder) => match value {
+                Some(EncodedRowScalar::Utf8(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Utf8 encoded scalar for Utf8 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::TimestampMillis { builder, .. } => match value {
+                Some(EncodedRowScalar::TimestampMillis(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(*value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected TimestampMillis encoded scalar for timestamp(ms) column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Bool(builder) => match value {
+                Some(EncodedRowScalar::Bool(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(*value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Bool encoded scalar for boolean column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Binary(builder) => {
+                if value.is_none() {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to binary column builder"
+                    ));
+                }
+            }
+            Self::UInt64(builder) => {
+                if value.is_none() {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to UInt64 column builder"
+                    ));
+                }
+            }
+            Self::Null { len } => {
+                if value.is_none() {
+                    *len += count;
+                } else {
+                    return Err(anyhow!(
+                        "expected NULL encoded scalar for Null column, found {value:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_array(&mut self) -> ArrayRef {
         match self {
             Self::Int64(builder) => Arc::new(builder.finish()),

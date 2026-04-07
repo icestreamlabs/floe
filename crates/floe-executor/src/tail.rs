@@ -440,12 +440,10 @@ fn rows_from_snapshot(
             );
         }
         let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
-        for _ in 0..count {
-            for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.builders[idx].append_encoded_scalar(value.as_ref())?;
-            }
-            decoded_rows.ops.push(1);
+        for (idx, value) in decoded.iter().enumerate() {
+            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
         }
+        decoded_rows.ops.resize(decoded_rows.ops.len() + count, 1);
     }
     Ok(decoded_rows)
 }
@@ -475,12 +473,10 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<
                 column_count
             );
         }
-        for _ in 0..count {
-            for (idx, value) in decoded.iter().enumerate() {
-                decoded_rows.builders[idx].append_encoded_scalar(value.as_ref())?;
-            }
-            decoded_rows.ops.push(op);
+        for (idx, value) in decoded.iter().enumerate() {
+            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
         }
+        decoded_rows.ops.resize(decoded_rows.ops.len() + count, op);
     }
     Ok(decoded_rows)
 }
