@@ -173,7 +173,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
+    use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
+
+    fn decode_test_row(encoded: &[u8]) -> Vec<Option<EncodedRowScalar>> {
+        let mut decoded = Vec::new();
+        decode_all_encoded_row_scalars_into(encoded, &mut decoded).expect("decode encoded row");
+        decoded
+    }
 
     #[test]
     fn encodes_nexmark_bid_event() {
@@ -205,7 +211,7 @@ mod tests {
         );
 
         let (encoded, ts) = decoder.encode_row_key(&event).expect("encode");
-        let row = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        let row = decode_test_row(&encoded);
         assert_eq!(row.len(), 7);
         assert_eq!(row[0], Some(EncodedRowScalar::Int64(100)));
         assert_eq!(row[1], Some(EncodedRowScalar::Int64(42)));
@@ -242,7 +248,7 @@ mod tests {
         );
 
         let (encoded, ts) = decoder.encode_row_key(&event).expect("encode");
-        let row = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        let row = decode_test_row(&encoded);
         assert_eq!(row.len(), 2);
         assert_eq!(row[0], Some(EncodedRowScalar::Int64(1)));
         assert_eq!(row[1], Some(EncodedRowScalar::Bool(true)));
@@ -331,7 +337,7 @@ mod tests {
         );
 
         let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
-        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        let decoded = decode_test_row(&encoded);
         assert_eq!(decoded[0], Some(EncodedRowScalar::Int64(42)));
         assert_eq!(
             decoded[1],
@@ -369,7 +375,7 @@ mod tests {
         );
 
         let (encoded, direct_ts) = decoder.encode_row_key(&event).expect("direct encode");
-        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode encoded row");
+        let decoded = decode_test_row(&encoded);
         assert_eq!(decoded[0], Some(EncodedRowScalar::Int64(42)));
         assert_eq!(decoded[1], None);
         assert_eq!(

@@ -16,8 +16,6 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::encoding::decode_all_encoded_row_scalars;
 use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
@@ -810,12 +808,13 @@ mod tests {
         let view = MaterializedView::handle_for(handle.as_ref(), handle3_version)?;
         let snapshot = view.materialize().await?;
         let mut expected: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut decode_scratch = Vec::new();
         for (key, diff) in snapshot {
             if diff == 0 {
                 continue;
             }
-            let row = decode_all_encoded_row_scalars(&key)?;
-            let value = match row.first().and_then(|value| value.as_ref()) {
+            decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
+            let value = match decode_scratch.first().and_then(|value| value.as_ref()) {
                 Some(crate::encoding::EncodedRowScalar::Int64(v)) => *v,
                 _ => continue,
             };

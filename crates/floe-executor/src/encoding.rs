@@ -407,6 +407,12 @@ mod tests {
         encoded
     }
 
+    fn decode_test_row(encoded: &[u8]) -> Vec<Option<EncodedRowScalar>> {
+        let mut decoded = Vec::new();
+        decode_all_encoded_row_scalars_into(encoded, &mut decoded).expect("decode");
+        decoded
+    }
+
     #[test]
     fn encodes_simple_rows() {
         let encoded = encode_test_row(&[
@@ -425,7 +431,7 @@ mod tests {
             TestEncodedField::TimestampMillis(1234),
             TestEncodedField::Bool(false),
         ]);
-        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
+        let decoded = decode_test_row(&encoded);
         assert_eq!(
             decoded,
             vec![
@@ -440,7 +446,7 @@ mod tests {
     #[test]
     fn encodes_null_values() {
         let encoded = encode_test_row(&[TestEncodedField::Null, TestEncodedField::Int64Null]);
-        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode");
+        let decoded = decode_test_row(&encoded);
         assert_eq!(decoded, vec![None, None]);
     }
 
@@ -455,7 +461,7 @@ mod tests {
         let selected = extract_encoded_row_columns(&encoded, &[3, 0], true)
             .expect("extract")
             .expect("non-null key");
-        let decoded = decode_all_encoded_row_scalars(&selected).expect("decode");
+        let decoded = decode_test_row(&selected);
         assert_eq!(
             decoded,
             vec![
@@ -483,7 +489,7 @@ mod tests {
         ]);
 
         let combined = concat_encoded_rows(&left, &right).expect("concat");
-        let decoded = decode_all_encoded_row_scalars(&combined).expect("decode combined");
+        let decoded = decode_test_row(&combined);
         assert_eq!(
             decoded,
             vec![
@@ -530,7 +536,7 @@ mod tests {
             ],
         )
         .expect("project");
-        let decoded = decode_all_encoded_row_scalars(&projected).expect("decode projected");
+        let decoded = decode_test_row(&projected);
 
         assert_eq!(
             decoded,
@@ -550,7 +556,7 @@ mod tests {
             TestEncodedField::TimestampNull,
             TestEncodedField::BoolNull,
         ]);
-        let decoded = decode_all_encoded_row_scalars(&encoded).expect("decode null variants");
+        let decoded = decode_test_row(&encoded);
         assert_eq!(decoded, vec![None, None, None]);
     }
 }

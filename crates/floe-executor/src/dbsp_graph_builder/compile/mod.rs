@@ -27,7 +27,7 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 #[cfg(test)]
 use crate::encoding::EncodedRowScalar;
-use crate::encoding::decode_all_encoded_row_scalars;
+use crate::encoding::decode_all_encoded_row_scalars_into;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
@@ -172,8 +172,10 @@ async fn log_handle_rows(
     let materialized = handle_view.materialize().await?;
     let total = materialized.len();
     let mut rows = Vec::new();
+    let mut decode_scratch = Vec::new();
     for (row, diff) in materialized.into_iter().take(3) {
-        let decoded = decode_all_encoded_row_scalars(&row);
+        let decoded = decode_all_encoded_row_scalars_into(&row, &mut decode_scratch)
+            .map(|_| decode_scratch.clone());
         rows.push((decoded, diff));
     }
     tracing::debug!(
@@ -457,13 +459,14 @@ fn evaluate_aggregate_values(
     let mut filter_results = vec![false; filters.len()];
     let mut expression_values = vec![None; expressions.len()];
     let mut expression_valid = vec![false; expressions.len()];
+    let mut decode_scratch = Vec::new();
 
     for (encoded_row, weight) in encoded {
         if weight == 0 {
             continue;
         }
-        let row = match decode_all_encoded_row_scalars(&encoded_row) {
-            Ok(row) => row,
+        let row = match decode_all_encoded_row_scalars_into(&encoded_row, &mut decode_scratch) {
+            Ok(()) => &decode_scratch,
             Err(err) => {
                 tracing::warn!(
                     graph_id = %graph_id,
