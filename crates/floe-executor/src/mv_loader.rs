@@ -236,9 +236,7 @@ mod tests {
         let mut view = bridge
             .new_view(VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
             .await?;
-        for row in rows {
-            view.add_delta(row.clone(), 1);
-        }
+        view.add_deltas(rows.iter().cloned().map(|row| (row, 1)));
         view.flush().await?;
         if persist_schema {
             bridge

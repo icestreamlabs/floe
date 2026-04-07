@@ -545,9 +545,12 @@ mod tests {
         view: &mut crate::dbsp_bridge::DbspView,
         values: &[i64],
     ) -> PgResult<dbsp::handles::ZSetHandle> {
-        for value in values {
-            view.add_delta(encoded_i64_row(*value), 1);
-        }
+        view.add_deltas(
+            values
+                .iter()
+                .copied()
+                .map(|value| (encoded_i64_row(value), 1)),
+        );
         view.flush().await
     }
 
@@ -555,9 +558,12 @@ mod tests {
         view: &mut crate::dbsp_bridge::DbspView,
         deltas: &[(i64, i64)],
     ) -> PgResult<dbsp::handles::ZSetHandle> {
-        for (value, diff) in deltas {
-            view.add_delta(encoded_i64_row(*value), *diff);
-        }
+        view.add_deltas(
+            deltas
+                .iter()
+                .copied()
+                .map(|(value, diff)| (encoded_i64_row(value), diff)),
+        );
         view.flush().await
     }
 
