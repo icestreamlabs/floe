@@ -3,7 +3,6 @@ use std::sync::Arc;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::execution::context::SessionContext;
-use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use futures::StreamExt;
 use object_store::memory::InMemory;
@@ -11,7 +10,6 @@ use slatedb::Db;
 use tokio::runtime::Runtime;
 
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::DbspPersistedState;
 use floe_executor::mv::registry::MaterializedViewRegistry;
 use floe_executor::tail::{TailParams, execute_tail};
@@ -24,8 +22,12 @@ fn build_schema() -> Arc<Schema> {
     )]))
 }
 
-fn scalar_row(value: i64) -> Vec<ScalarValue> {
-    vec![ScalarValue::Int64(Some(value))]
+fn encode_i64_row(value: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 1 + 8);
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+    encoded
 }
 
 async fn append_values(
@@ -33,9 +35,7 @@ async fn append_values(
     values: &[i64],
 ) -> anyhow::Result<dbsp::handles::ZSetHandle> {
     for value in values {
-        let row = scalar_row(*value);
-        let encoded = encode_projected_row_key(&row)?;
-        view.add_delta(encoded, 1);
+        view.add_delta(encode_i64_row(*value), 1);
     }
     Ok(view.flush().await?)
 }

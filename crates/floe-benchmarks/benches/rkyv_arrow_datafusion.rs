@@ -18,7 +18,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::scalar::ScalarValue;
 use dbsp::storage::encoding::{decode, encode};
 use floe_executor::{ConsolidationMode, DeltaConsolidator};
 use parking_lot::RwLock;
@@ -87,6 +86,12 @@ impl fmt::Display for BenchBatchGenerator {
 impl LazyBatchGenerator for BenchBatchGenerator {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn reset_state(&self) -> Arc<RwLock<dyn LazyBatchGenerator>> {
+        Arc::new(RwLock::new(BenchBatchGenerator::new(Arc::clone(
+            &self.state,
+        ))))
     }
 
     fn generate_next_batch(&mut self) -> DataFusionResult<Option<RecordBatch>> {
@@ -240,18 +245,12 @@ fn decode_to_batch(schema: SchemaRef, encoded: &[Vec<u8>]) -> RecordBatch {
     RecordBatch::try_new(schema, arrays).expect("record batch")
 }
 
-type Row = Vec<ScalarValue>;
+type Row = BenchRow;
 
 fn decode_to_rows(encoded: &[Vec<u8>]) -> Vec<Row> {
     let mut rows = Vec::with_capacity(encoded.len());
     for bytes in encoded {
-        let row: BenchRow = decode(bytes).expect("decode row");
-        rows.push(vec![
-            ScalarValue::Int64(Some(row.id)),
-            ScalarValue::Int64(Some(row.value)),
-            ScalarValue::Boolean(Some(row.flag)),
-            ScalarValue::Utf8(Some(row.text)),
-        ]);
+        rows.push(decode(bytes).expect("decode row"));
     }
     rows
 }
@@ -259,21 +258,10 @@ fn decode_to_rows(encoded: &[Vec<u8>]) -> Vec<Row> {
 fn scalar_eval(rows: &[Row]) -> i64 {
     let mut sum = 0i64;
     for row in rows {
-        let flag = match row.get(2) {
-            Some(ScalarValue::Boolean(Some(value))) => *value,
-            Some(ScalarValue::Boolean(None) | ScalarValue::Null) => false,
-            other => panic!("unexpected flag value: {other:?}"),
-        };
-
-        if !flag {
+        if !row.flag {
             continue;
         }
-
-        match row.get(1) {
-            Some(ScalarValue::Int64(Some(value))) => sum += value,
-            Some(ScalarValue::Int64(None) | ScalarValue::Null) => {}
-            other => panic!("unexpected value column: {other:?}"),
-        }
+        sum += row.value;
     }
     sum
 }

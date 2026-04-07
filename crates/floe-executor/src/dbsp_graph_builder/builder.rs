@@ -4860,6 +4860,7 @@ mod tests {
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
     use dbsp::DbspJoin;
+    use dbsp::DbspPredicate;
     use dbsp::join::TransientJoinInputBatch;
     use dbsp::storage::{KeyValueTable, SlateTable};
     use dbsp::stream::StreamCursor;
