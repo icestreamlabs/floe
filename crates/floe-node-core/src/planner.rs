@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
@@ -10,7 +11,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
-use datafusion::scalar::ScalarValue;
 use floe_sql_parser::MaterializedViewDefinition;
 
 use crate::source::SourceRegistry;
@@ -112,12 +112,38 @@ fn passthrough_window_udf(
     ))
 }
 
+fn udf_batch_len(args: &[ColumnarValue]) -> usize {
+    args.iter()
+        .find_map(|arg| match arg {
+            ColumnarValue::Array(array) => Some(array.len()),
+            ColumnarValue::Scalar(_) => None,
+        })
+        .unwrap_or(1)
+}
+
+fn null_ts_value(len: usize) -> ColumnarValue {
+    let array: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![None::<i64>; len]));
+    ColumnarValue::Array(array)
+}
+
+fn null_utf8_value(len: usize) -> ColumnarValue {
+    let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
+    ColumnarValue::Array(array)
+}
+
+fn null_i64_value(len: usize) -> ColumnarValue {
+    let array: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; len]));
+    ColumnarValue::Array(array)
+}
+
 fn planner_udfs() -> Vec<ScalarUDF> {
+
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(args.first().cloned().unwrap_or(ColumnarValue::Scalar(
-                ScalarValue::TimestampMillisecond(None, None),
-            )))
+            Ok(args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_ts_value(udf_batch_len(args))))
         },
     );
     let scalar_utf8: ScalarFunctionImplementation = Arc::new(
@@ -125,7 +151,7 @@ fn planner_udfs() -> Vec<ScalarUDF> {
             Ok(args
                 .first()
                 .cloned()
-                .unwrap_or(ColumnarValue::Scalar(ScalarValue::Utf8(None))))
+                .unwrap_or_else(|| null_utf8_value(udf_batch_len(args))))
         },
     );
     let scalar_int: ScalarFunctionImplementation = Arc::new(
@@ -133,15 +159,14 @@ fn planner_udfs() -> Vec<ScalarUDF> {
             Ok(args
                 .first()
                 .cloned()
-                .unwrap_or(ColumnarValue::Scalar(ScalarValue::Int64(None))))
+                .unwrap_or_else(|| null_i64_value(udf_batch_len(args))))
         },
     );
-    let proctime: ScalarFunctionImplementation =
-        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                None, None,
-            )))
-        });
+    let proctime: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            Ok(null_ts_value(udf_batch_len(args)))
+        },
+    );
 
     let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
     vec![

@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::{Buf, Bytes};
-use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::encoding::encode_projected_row_key;
 use floe_executor::materialized_view::DbspPersistedState;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_storage::{MaterializedViewMetadata, SlateCatalog};
@@ -333,6 +331,14 @@ async fn streaming_execute_respects_mv_version_filter() {
 
 const STREAM_VIEW_NAME: &str = "mv_stream_filter";
 
+fn encode_i64_row(value: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(4 + 1 + 8);
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    encoded.push(0x01);
+    encoded.extend_from_slice(&value.to_le_bytes());
+    encoded
+}
+
 async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u64>) {
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
     let query = FloeQueryContext::new(Arc::clone(&catalog));
@@ -373,8 +379,7 @@ async fn seed_mv_state(
         .expect("create view");
     let mut versions = Vec::new();
     for value in rows {
-        let key =
-            encode_projected_row_key(&[ScalarValue::Int64(Some(*value))]).expect("encode row key");
+        let key = encode_i64_row(*value);
         view.add_delta(key, 1);
         let handle = view.flush().await.expect("flush view");
         versions.push(handle.version);
