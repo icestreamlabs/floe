@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::common::Column;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
@@ -13,7 +14,6 @@ use datafusion::logical_expr::{
     ColumnarValue, Expr, JoinType, ScalarFunctionImplementation, Volatility, col, lit, table_scan,
 };
 use datafusion::prelude::SessionContext;
-use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::SlateTable;
@@ -38,6 +38,15 @@ fn arrow_schema(fields: Vec<Field>) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
+fn udf_batch_len(args: &[ColumnarValue]) -> usize {
+    args.iter()
+        .find_map(|arg| match arg {
+            ColumnarValue::Array(array) => Some(array.len()),
+            ColumnarValue::Scalar(_) => None,
+        })
+        .unwrap_or(1)
+}
+
 async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let ctx = SessionContext::new();
     let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
@@ -51,20 +60,27 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
 }
 
 fn register_planner_test_udfs(ctx: &SessionContext) {
-    let passthrough_utf8: ScalarFunctionImplementation =
-        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))
-        });
-    let passthrough_int64: ScalarFunctionImplementation =
-        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))
-        });
-    let proctime: ScalarFunctionImplementation =
-        Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                None, None,
-            )))
-        });
+    let passthrough_utf8: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
+            Ok(ColumnarValue::Array(array))
+        },
+    );
+    let passthrough_int64: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let array: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; len]));
+            Ok(ColumnarValue::Array(array))
+        },
+    );
+    let proctime: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let array: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![None::<i64>; len]));
+            Ok(ColumnarValue::Array(array))
+        },
+    );
     let ts = DataType::Timestamp(TimeUnit::Millisecond, None);
     ctx.register_udf(create_udf(
         "proctime",

@@ -5,9 +5,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit};
 use datafusion::physical_plan::collect;
-use datafusion::scalar::ScalarValue;
 use dbsp::StreamRetention;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use object_store::{ObjectStore, memory::InMemory};
@@ -890,7 +889,7 @@ async fn source_provider_pushes_down_primary_key_filters() {
     let eq_filter = Expr::BinaryExpr(BinaryExpr::new(
         Box::new(Expr::Column(Column::from_name("id"))),
         Operator::Eq,
-        Box::new(Expr::Literal(ScalarValue::Int64(Some(2)), None)),
+        Box::new(lit(2_i64)),
     ));
     let statuses = provider
         .supports_filters_pushdown(&[&eq_filter])
@@ -919,10 +918,7 @@ async fn source_provider_pushes_down_primary_key_filters() {
 
     let in_filter = Expr::InList(datafusion::logical_expr::expr::InList {
         expr: Box::new(Expr::Column(Column::from_name("id"))),
-        list: vec![
-            Expr::Literal(ScalarValue::Int64(Some(1)), None),
-            Expr::Literal(ScalarValue::Int64(Some(3)), None),
-        ],
+        list: vec![lit(1_i64), lit(3_i64)],
         negated: false,
     });
     let in_plan = provider
@@ -950,12 +946,12 @@ fn mv_version_filter_is_extracted() {
     let mv_filter = Expr::BinaryExpr(BinaryExpr::new(
         Box::new(Expr::Column(Column::from_name(MV_VERSION_COLUMN))),
         Operator::Eq,
-        Box::new(Expr::Literal(ScalarValue::UInt64(Some(7)), None)),
+        Box::new(lit(7_u64)),
     ));
     let other_filter = Expr::BinaryExpr(BinaryExpr::new(
         Box::new(Expr::Column(Column::from_name("auction"))),
         Operator::Eq,
-        Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
+        Box::new(lit(42_i64)),
     ));
     let filters = vec![mv_filter.clone(), other_filter.clone()];
     let (version, retained) = extract_mv_version_filter(&filters);

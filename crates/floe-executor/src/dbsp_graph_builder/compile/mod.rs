@@ -7,8 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::common::Column;
 #[cfg(test)]
 use datafusion::logical_expr::Expr;
-#[cfg(test)]
-use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::{DbspAggregateExpr, DbspProjectExpr};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::semijoin::SemiJoinMode;
@@ -33,8 +31,6 @@ use crate::encoding::decode_all_encoded_row_scalars;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
 use super::builder::DbspGraphBuilder;
-#[cfg(test)]
-use dbsp::DbspPredicate;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TopNSortSpec {
     ascending: bool,
@@ -367,22 +363,7 @@ fn evaluate_aggregate_values(
             }
         };
         eval_schema = Arc::clone(project.output_schema());
-        let predicate = match DbspPredicate::try_new(
-            Expr::Literal(ScalarValue::Boolean(Some(true)), None),
-            Arc::clone(&input_schema),
-        ) {
-            Ok(predicate) => predicate,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to build {context} test aggregate predicate"
-                );
-                return vec![None; aggregates.len()];
-            }
-        };
-        let evaluator = match VectorizedFilterProjectEvaluator::for_filter_map(
-            &predicate,
+        let evaluator = match VectorizedFilterProjectEvaluator::for_map(
             project.expressions(),
             Arc::clone(&input_schema),
         ) {
