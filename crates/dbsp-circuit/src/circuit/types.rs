@@ -44,64 +44,6 @@ impl DbspScalarType {
     }
 }
 
-/// Typed scalar value used by circuit rows.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ScalarValue {
-    Int64(i64),
-    Utf8(String),
-    TimestampMillis(i64),
-    Bool(bool),
-    Null(DbspScalarType),
-}
-
-impl ScalarValue {
-    pub fn data_type(&self) -> DbspScalarType {
-        match self {
-            Self::Int64(_) => DbspScalarType::Int64,
-            Self::Utf8(_) => DbspScalarType::Utf8,
-            Self::TimestampMillis(_) => DbspScalarType::TimestampMillis,
-            Self::Bool(_) => DbspScalarType::Bool,
-            Self::Null(ty) => ty.clone(),
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self, Self::Null(_))
-    }
-
-    pub fn null(ty: DbspScalarType) -> Self {
-        Self::Null(ty)
-    }
-
-    pub fn timestamp_millis(value: i64) -> Self {
-        Self::TimestampMillis(value)
-    }
-}
-
-impl From<i64> for ScalarValue {
-    fn from(value: i64) -> ScalarValue {
-        ScalarValue::Int64(value)
-    }
-}
-
-impl From<String> for ScalarValue {
-    fn from(value: String) -> ScalarValue {
-        ScalarValue::Utf8(value)
-    }
-}
-
-impl From<&str> for ScalarValue {
-    fn from(value: &str) -> ScalarValue {
-        ScalarValue::Utf8(value.to_string())
-    }
-}
-
-impl From<bool> for ScalarValue {
-    fn from(value: bool) -> ScalarValue {
-        ScalarValue::Bool(value)
-    }
-}
-
 impl fmt::Display for DbspScalarType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
@@ -112,27 +54,6 @@ impl fmt::Display for DbspScalarType {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, TimeUnit};
-
-    #[test]
-    fn scalar_value_type_round_trip() {
-        let values = vec![
-            ScalarValue::Int64(42),
-            ScalarValue::Utf8("hello".to_string()),
-            ScalarValue::TimestampMillis(1_700_000_000_000),
-            ScalarValue::Bool(true),
-            ScalarValue::Null(DbspScalarType::Utf8),
-        ];
-
-        for value in values {
-            let ty = value.data_type();
-            assert!(!ty.name().is_empty());
-            if let ScalarValue::Null(_) = value {
-                assert!(value.is_null());
-            } else {
-                assert!(!value.is_null());
-            }
-        }
-    }
 
     #[test]
     fn arrow_conversion() {

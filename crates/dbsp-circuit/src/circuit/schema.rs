@@ -6,7 +6,7 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion_common::{DFSchema, DFSchemaRef};
 
 use crate::circuit::arrow_batch::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
-use crate::circuit::types::{DbspScalarType, ScalarValue};
+use crate::circuit::types::DbspScalarType;
 
 pub type FieldRef = usize;
 
@@ -72,36 +72,6 @@ impl RowSchema {
 
     pub fn field_index(&self, name: &str) -> Option<FieldRef> {
         self.index_by_name.get(name).copied()
-    }
-
-    pub fn validate_row(&self, values: &[ScalarValue]) -> Result<()> {
-        if values.len() != self.fields.len() {
-            return Err(anyhow!(
-                "row length mismatch: expected {}, found {}",
-                self.fields.len(),
-                values.len()
-            ));
-        }
-
-        for (field, value) in self.fields.iter().zip(values.iter()) {
-            if value.is_null() {
-                if !field.nullable {
-                    return Err(anyhow!("field {} is not nullable", field.name));
-                }
-                continue;
-            }
-
-            if value.data_type() != field.data_type {
-                return Err(anyhow!(
-                    "type mismatch for field {}: expected {}, found {}",
-                    field.name,
-                    field.data_type.name(),
-                    value.data_type().name()
-                ));
-            }
-        }
-
-        Ok(())
     }
 
     pub fn to_arrow_schema(&self) -> Arc<ArrowSchema> {
@@ -185,31 +155,6 @@ mod tests {
             Field::new("id", DbspScalarType::Utf8, false),
         ]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn validates_row_values() {
-        let schema = sample_schema();
-        let ok = vec![
-            ScalarValue::Int64(1),
-            ScalarValue::Utf8("alice".to_string()),
-            ScalarValue::Null(DbspScalarType::Bool),
-        ];
-        assert!(schema.validate_row(&ok).is_ok());
-
-        let wrong_type = vec![
-            ScalarValue::Utf8("oops".to_string()),
-            ScalarValue::Utf8("alice".to_string()),
-            ScalarValue::Null(DbspScalarType::Bool),
-        ];
-        assert!(schema.validate_row(&wrong_type).is_err());
-
-        let not_nullable = vec![
-            ScalarValue::Null(DbspScalarType::Int64),
-            ScalarValue::Utf8("alice".to_string()),
-            ScalarValue::Null(DbspScalarType::Bool),
-        ];
-        assert!(schema.validate_row(&not_nullable).is_err());
     }
 
     #[test]
