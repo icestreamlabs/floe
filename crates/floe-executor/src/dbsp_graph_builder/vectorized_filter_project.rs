@@ -15,7 +15,6 @@ use datafusion::common::{Column, DFSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
 
@@ -891,20 +890,61 @@ impl CompiledValue {
         }
     }
 
-    fn from_scalar(value: &ScalarValue, data_type: CompiledValueType) -> Result<Self> {
-        match (data_type, value) {
-            (CompiledValueType::Int64, ScalarValue::Int64(value)) => Ok(Self::Int64(*value)),
-            (CompiledValueType::Utf8, ScalarValue::Utf8(value)) => Ok(Self::Utf8(value.clone())),
-            (CompiledValueType::TimestampMillis, ScalarValue::TimestampMillisecond(value, _)) => {
-                Ok(Self::TimestampMillis(*value))
+    fn from_array(array: &dyn Array, data_type: CompiledValueType) -> Result<Self> {
+        match data_type {
+            CompiledValueType::Int64 => {
+                let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    anyhow!(
+                        "unsupported literal array {:?} for compiled type {:?}",
+                        array.data_type(),
+                        data_type
+                    )
+                })?;
+                Ok(Self::Int64((!values.is_null(0)).then(|| values.value(0))))
             }
-            (CompiledValueType::Bool, ScalarValue::Boolean(value)) => Ok(Self::Bool(*value)),
-            (data_type, ScalarValue::Null) => Ok(Self::null(data_type)),
-            _ => Err(anyhow!(
-                "unsupported literal {:?} for compiled type {:?}",
-                value,
-                data_type
-            )),
+            CompiledValueType::Utf8 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported literal array {:?} for compiled type {:?}",
+                            array.data_type(),
+                            data_type
+                        )
+                    })?;
+                Ok(Self::Utf8(
+                    (!values.is_null(0)).then(|| values.value(0).to_string()),
+                ))
+            }
+            CompiledValueType::TimestampMillis => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported literal array {:?} for compiled type {:?}",
+                            array.data_type(),
+                            data_type
+                        )
+                    })?;
+                Ok(Self::TimestampMillis(
+                    (!values.is_null(0)).then(|| values.value(0)),
+                ))
+            }
+            CompiledValueType::Bool => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported literal array {:?} for compiled type {:?}",
+                            array.data_type(),
+                            data_type
+                        )
+                    })?;
+                Ok(Self::Bool((!values.is_null(0)).then(|| values.value(0))))
+            }
         }
     }
 
@@ -1049,8 +1089,9 @@ impl CompiledExpr {
                 else {
                     return Ok(None);
                 };
+                let literal_array = value.to_array()?;
                 Ok(Some(Self::Literal {
-                    value: CompiledValue::from_scalar(value, data_type)?,
+                    value: CompiledValue::from_array(literal_array.as_ref(), data_type)?,
                 }))
             }
             Expr::BinaryExpr(binary) => {

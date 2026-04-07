@@ -1,6 +1,6 @@
 use anyhow::Result;
+use datafusion::arrow::array::{Array, BooleanArray, Int64Array, StringArray, UInt64Array};
 use datafusion::logical_expr::{Expr, Operator};
-use datafusion::scalar::ScalarValue;
 
 use crate::encoding::{EncodedRowScalar, extract_encoded_row_scalar};
 
@@ -118,30 +118,46 @@ fn is_named_column(expr: &Expr, column_name: &str) -> bool {
 }
 
 fn literal_to_u64(expr: &Expr) -> Option<u64> {
-    match expr {
-        Expr::Literal(ScalarValue::UInt64(Some(value)), _) => Some(*value),
-        Expr::Literal(ScalarValue::Int64(Some(value)), _) if *value >= 0 => Some(*value as u64),
-        _ => None,
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    let array = value.to_array().ok()?;
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return (!values.is_null(0)).then(|| values.value(0));
     }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return (!values.is_null(0))
+            .then(|| values.value(0))
+            .filter(|value| *value >= 0)
+            .map(|value| value as u64);
+    }
+    None
 }
 
 fn literal_to_encoded_scalar(expr: &Expr) -> Option<EncodedRowScalar> {
-    match expr {
-        Expr::Literal(value, _) => scalar_to_encoded(value),
-        _ => None,
-    }
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    scalar_to_encoded(value.to_array().ok()?.as_ref())
 }
 
-fn scalar_to_encoded(value: &ScalarValue) -> Option<EncodedRowScalar> {
-    match value {
-        ScalarValue::Int64(Some(value)) => Some(EncodedRowScalar::Int64(*value)),
-        ScalarValue::Utf8(Some(value)) => Some(EncodedRowScalar::Utf8(value.clone())),
-        ScalarValue::TimestampMillisecond(Some(value), _) => {
-            Some(EncodedRowScalar::TimestampMillis(*value))
-        }
-        ScalarValue::Boolean(Some(value)) => Some(EncodedRowScalar::Bool(*value)),
-        _ => None,
+fn scalar_to_encoded(array: &dyn Array) -> Option<EncodedRowScalar> {
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return (!values.is_null(0)).then(|| EncodedRowScalar::Int64(values.value(0)));
     }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return (!values.is_null(0)).then(|| EncodedRowScalar::Utf8(values.value(0).to_string()));
+    }
+    if let Some(values) = array
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
+    {
+        return (!values.is_null(0)).then(|| EncodedRowScalar::TimestampMillis(values.value(0)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+        return (!values.is_null(0)).then(|| EncodedRowScalar::Bool(values.value(0)));
+    }
+    None
 }
 
 #[cfg(test)]

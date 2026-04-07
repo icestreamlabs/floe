@@ -8,8 +8,8 @@ pub use dbsp::circuit::{
     DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType,
     DbspSelectNode, DbspSourceNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
     DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem, RowSchema,
-    ScalarValue, TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table,
-    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
+    TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
+    nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
 
 use crate::namespaces;
