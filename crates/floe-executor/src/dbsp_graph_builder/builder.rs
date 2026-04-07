@@ -7,7 +7,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
-use datafusion::scalar::ScalarValue;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
@@ -15,7 +14,7 @@ use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
-    DbspNodeKind, DbspPredicate, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
+    DbspNodeKind, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -2932,13 +2931,7 @@ fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNK
 
     let project_node = DbspProjectNode::try_new(Arc::clone(&input_schema), items)
         .context("build transient topn expression precompute projection")?;
-    let predicate = DbspPredicate::try_new(
-        Expr::Literal(ScalarValue::Boolean(Some(true)), None),
-        Arc::clone(&input_schema),
-    )
-    .context("build transient topn precompute predicate")?;
-    let evaluator = VectorizedFilterProjectEvaluator::for_filter_map(
-        &predicate,
+    let evaluator = VectorizedFilterProjectEvaluator::for_map(
         project_node.expressions(),
         Arc::clone(&input_schema),
     )
@@ -4234,13 +4227,7 @@ fn build_transient_aggregate_precompute(
 
     let project_node = DbspProjectNode::try_new(Arc::clone(&input_schema), items)
         .context("build transient aggregate expression precompute projection")?;
-    let predicate = DbspPredicate::try_new(
-        Expr::Literal(ScalarValue::Boolean(Some(true)), None),
-        Arc::clone(&input_schema),
-    )
-    .context("build transient aggregate precompute predicate")?;
-    let evaluator = VectorizedFilterProjectEvaluator::for_filter_map(
-        &predicate,
+    let evaluator = VectorizedFilterProjectEvaluator::for_map(
         project_node.expressions(),
         Arc::clone(&input_schema),
     )
@@ -4872,7 +4859,6 @@ mod tests {
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility};
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
-    use datafusion::scalar::ScalarValue;
     use dbsp::DbspJoin;
     use dbsp::join::TransientJoinInputBatch;
     use dbsp::storage::{KeyValueTable, SlateTable};
@@ -6302,12 +6288,23 @@ mod tests {
     }
 
     fn register_planner_test_udfs(ctx: &SessionContext) {
-        let proctime: ScalarFunctionImplementation =
-            Arc::new(|_: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                    None, None,
+        let proctime: ScalarFunctionImplementation = Arc::new(
+            |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                let len = args
+                    .iter()
+                    .find_map(|arg| match arg {
+                        ColumnarValue::Array(array) => Some(array.len()),
+                        ColumnarValue::Scalar(_) => None,
+                    })
+                    .unwrap_or(1);
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::TimestampMillisecondArray::from(vec![
+                        None::<i64>;
+                        len
+                    ]),
                 )))
-            });
+            },
+        );
         ctx.register_udf(create_udf(
             "proctime",
             vec![],

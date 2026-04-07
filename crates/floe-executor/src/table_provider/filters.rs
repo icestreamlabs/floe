@@ -148,13 +148,14 @@ fn scalar_to_encoded(value: &ScalarValue) -> Option<EncodedRowScalar> {
 mod tests {
     use super::*;
     use datafusion::common::Column;
+    use datafusion::logical_expr::lit;
 
     #[test]
     fn parses_primary_key_equality_filter() {
         let expr = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
             Box::new(Expr::Column(Column::from_name("id"))),
             Operator::Eq,
-            Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
+            Box::new(lit(42_i64)),
         ));
         let filter = parse_primary_key_expr(&expr, "id").expect("pk eq filter");
         assert!(filter.matches_encoded(Some(&EncodedRowScalar::Int64(42))));
@@ -165,10 +166,7 @@ mod tests {
     fn parses_primary_key_in_list_filter() {
         let expr = Expr::InList(datafusion::logical_expr::expr::InList {
             expr: Box::new(Expr::Column(Column::from_name("id"))),
-            list: vec![
-                Expr::Literal(ScalarValue::Int64(Some(1)), None),
-                Expr::Literal(ScalarValue::Int64(Some(2)), None),
-            ],
+            list: vec![lit(1_i64), lit(2_i64)],
             negated: false,
         });
         let filter = parse_primary_key_expr(&expr, "id").expect("pk in filter");
