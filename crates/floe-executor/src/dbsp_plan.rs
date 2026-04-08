@@ -1,13 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::common::Column;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 pub use dbsp::circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
     DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType,
-    DbspSelectNode, DbspSourceNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem, RowSchema,
+    DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem,
+    RowSchema,
     TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
     nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
@@ -27,8 +30,277 @@ impl DbspPlanBuilder {
     }
 
     pub fn build(&self, df_plan: &LogicalPlan) -> Result<CircuitPlan, PlannerError> {
-        self.planner.plan(df_plan)
+        let plan = self.planner.plan(df_plan)?;
+        normalize_optimizer_source_projections(plan)
     }
+}
+
+fn normalize_optimizer_source_projections(
+    mut plan: CircuitPlan,
+) -> Result<CircuitPlan, PlannerError> {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for idx in 0..plan.nodes.len() {
+            let (new_inputs, new_kind, new_output_schema) = match plan.nodes[idx].kind.clone() {
+                DbspNodeKind::Project(project) => {
+                    let Some((project_input_idx, rebased_input_schema)) =
+                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    else {
+                        continue;
+                    };
+                    let items = project
+                        .expressions()
+                        .iter()
+                        .map(|expr| ProjectItem {
+                            expr: expr.expression().expr().clone(),
+                            alias: Some(expr.alias().to_string()),
+                        })
+                        .collect();
+                    let rebased = DbspProjectNode::try_new(rebased_input_schema, items)
+                        .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    (
+                        vec![project_input_idx],
+                        DbspNodeKind::Project(rebased.clone()),
+                        Arc::clone(rebased.output_schema()),
+                    )
+                }
+                DbspNodeKind::Select(select) => {
+                    let Some((project_input_idx, rebased_input_schema)) =
+                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    else {
+                        continue;
+                    };
+                    let rebased = DbspSelectNode::try_new(
+                        rebased_input_schema.clone(),
+                        select.predicate().expression().expr().clone(),
+                    )
+                    .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    (
+                        vec![project_input_idx],
+                        DbspNodeKind::Select(rebased),
+                        rebased_input_schema,
+                    )
+                }
+                DbspNodeKind::Aggregate(aggregate) => {
+                    let Some((project_input_idx, rebased_input_schema)) =
+                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    else {
+                        continue;
+                    };
+                    let group_keys = aggregate
+                        .group_keys()
+                        .iter()
+                        .map(|key| {
+                            (
+                                key.expression().expr().clone(),
+                                Some(key.alias().to_string()),
+                            )
+                        })
+                        .collect();
+                    let aggregates = aggregate
+                        .aggregates()
+                        .iter()
+                        .map(|agg| {
+                            (
+                                agg.function().clone(),
+                                agg.expression().map(|expr| expr.expr().clone()),
+                                agg.filter().map(|expr| expr.expr().clone()),
+                                agg.distinct(),
+                                Some(agg.alias().to_string()),
+                            )
+                        })
+                        .collect();
+                    let rebased = DbspAggregateNode::try_new(rebased_input_schema, group_keys, aggregates)
+                        .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let output_schema = Arc::clone(rebased.output_schema());
+                    (
+                        vec![project_input_idx],
+                        DbspNodeKind::Aggregate(rebased),
+                        output_schema,
+                    )
+                }
+                DbspNodeKind::WindowAggregate(window) => {
+                    let Some((project_input_idx, rebased_input_schema)) =
+                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    else {
+                        continue;
+                    };
+                    let group_keys = window
+                        .aggregate
+                        .group_keys()
+                        .iter()
+                        .map(|key| {
+                            (
+                                key.expression().expr().clone(),
+                                Some(key.alias().to_string()),
+                            )
+                        })
+                        .collect();
+                    let aggregates = window
+                        .aggregate
+                        .aggregates()
+                        .iter()
+                        .map(|agg| {
+                            (
+                                agg.function().clone(),
+                                agg.expression().map(|expr| expr.expr().clone()),
+                                agg.filter().map(|expr| expr.expr().clone()),
+                                agg.distinct(),
+                                Some(agg.alias().to_string()),
+                            )
+                        })
+                        .collect();
+                    let aggregate =
+                        DbspAggregateNode::try_new(rebased_input_schema.clone(), group_keys, aggregates)
+                            .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let window_spec = DbspWindowSpec::try_new(
+                        window.window.policy.clone(),
+                        window.window.time_expression.expr().clone(),
+                        rebased_input_schema,
+                        window.window.allowed_lateness_ms,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    (
+                        vec![project_input_idx],
+                        DbspNodeKind::WindowAggregate(DbspWindowAggregateNode {
+                            aggregate,
+                            window: window_spec,
+                        }),
+                        plan.nodes[idx].output_schema.clone(),
+                    )
+                }
+                DbspNodeKind::TopN(topn) => {
+                    let Some((project_input_idx, rebased_input_schema)) =
+                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    else {
+                        continue;
+                    };
+                    let partition_by = topn
+                        .partition_by()
+                        .iter()
+                        .map(|expr| expr.expr().clone())
+                        .collect();
+                    let order_by = topn
+                        .order_by()
+                        .iter()
+                        .map(|expr| {
+                            OrderExpr::try_new(
+                                expr.expression().expr().clone(),
+                                rebased_input_schema.clone(),
+                                expr.ascending(),
+                                expr.nulls_first(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let rebased = DbspTopNNode::try_new(
+                        rebased_input_schema.clone(),
+                        partition_by,
+                        order_by,
+                        topn.limit(),
+                        topn.offset(),
+                    )
+                    .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    (
+                        vec![project_input_idx],
+                        DbspNodeKind::TopN(rebased),
+                        rebased_input_schema,
+                    )
+                }
+                _ => continue,
+            };
+            if plan.nodes[idx].inputs != new_inputs {
+                plan.nodes[idx].inputs = new_inputs;
+                plan.nodes[idx].kind = new_kind;
+                plan.nodes[idx].output_schema = new_output_schema;
+                changed = true;
+            }
+        }
+    }
+    prune_unreachable_nodes(&mut plan);
+    Ok(plan)
+}
+
+fn bypassable_source_projection_input(
+    plan: &CircuitPlan,
+    inputs: &[usize],
+) -> Option<(usize, Arc<RowSchema>)> {
+    let [input_idx] = inputs else {
+        return None;
+    };
+    let project_node = plan.node(*input_idx)?;
+    let DbspNodeKind::Project(project) = &project_node.kind else {
+        return None;
+    };
+    if !is_simple_source_column_projection(project) {
+        return None;
+    }
+    let project_input_idx = *project_node.inputs.first()?;
+    if !is_source_unary_chain(plan, project_input_idx) {
+        return None;
+    }
+    Some((project_input_idx, Arc::clone(project.input_schema())))
+}
+
+fn is_source_unary_chain(plan: &CircuitPlan, node_idx: usize) -> bool {
+    let Some(node) = plan.node(node_idx) else {
+        return false;
+    };
+    match &node.kind {
+        DbspNodeKind::Source(_) => true,
+        DbspNodeKind::Select(_) | DbspNodeKind::Passthrough => node
+            .inputs
+            .first()
+            .copied()
+            .is_some_and(|input| is_source_unary_chain(plan, input)),
+        DbspNodeKind::Project(project) if is_simple_source_column_projection(project) => node
+            .inputs
+            .first()
+            .copied()
+            .is_some_and(|input| is_source_unary_chain(plan, input)),
+        _ => false,
+    }
+}
+
+fn is_simple_source_column_projection(project: &DbspProjectNode) -> bool {
+    let mut seen = HashSet::new();
+    project.expressions().iter().all(|expr| {
+        let Some(column_idx) = direct_projection_column_index(expr.expression().expr(), project.input_schema()) else {
+            return false;
+        };
+        let Some(field) = project.input_schema().field(column_idx) else {
+            return false;
+        };
+        expr.alias() == field.name && seen.insert(column_idx)
+    })
+}
+
+fn direct_projection_column_index(expr: &Expr, schema: &RowSchema) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => resolve_schema_column_index(schema, column),
+        Expr::Alias(alias) => direct_projection_column_index(alias.expr.as_ref(), schema),
+        _ => None,
+    }
+}
+
+fn resolve_schema_column_index(schema: &RowSchema, column: &Column) -> Option<usize> {
+    let _ = &column.relation;
+    schema.field_index(column.name.as_str())
+}
+
+fn prune_unreachable_nodes(plan: &mut CircuitPlan) {
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![plan.root];
+    while let Some(node_id) = pending.pop() {
+        if !reachable.insert(node_id) {
+            continue;
+        }
+        if let Some(node) = plan.node(node_id) {
+            pending.extend(node.inputs.iter().copied());
+        }
+    }
+    plan.nodes.retain(|node| reachable.contains(&node.id));
 }
 
 /// Returns a [`PlannerConfig`] pre-populated with Nexmark table descriptors.

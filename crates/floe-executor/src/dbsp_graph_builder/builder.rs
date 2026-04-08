@@ -3304,6 +3304,54 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     pending.push_back(input_idx);
                 }
             }
+            DbspNodeKind::WindowAggregate(window) => {
+                let input_idx = first_input(node, "window aggregate")?;
+                let aggregate = &window.aggregate;
+                let mut input_columns = BTreeSet::new();
+                add_required_expression_columns(
+                    &window.window.time_expression,
+                    aggregate.input_schema().as_ref(),
+                    &mut input_columns,
+                )?;
+                for group_key in aggregate.group_keys() {
+                    add_required_expression_columns(
+                        group_key.expression(),
+                        aggregate.input_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                let group_key_count = aggregate.group_keys().len();
+                let aggregate_output_offset = 2 + group_key_count;
+                for column_idx in required_columns {
+                    let Some(aggregate_idx) = column_idx.checked_sub(aggregate_output_offset) else {
+                        continue;
+                    };
+                    let aggregate_expr =
+                        aggregate.aggregates().get(aggregate_idx).ok_or_else(|| {
+                            anyhow!(
+                                "required output column {column_idx} out of bounds for window aggregate node"
+                            )
+                        })?;
+                    if let Some(expr) = aggregate_expr.expression() {
+                        add_required_expression_columns(
+                            expr,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                    if let Some(filter) = aggregate_expr.filter() {
+                        add_required_expression_columns(
+                            filter,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
             DbspNodeKind::Passthrough | DbspNodeKind::Sink(_) => {
                 let operator = match &node.kind {
                     DbspNodeKind::Passthrough => "passthrough",
@@ -5158,6 +5206,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn q5_plan_source_requirements_prune_unused_source_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT auction, COUNT(*) AS num \
+             FROM nexmark_bid \
+             GROUP BY auction, HOP(date_time, 2000, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        assert_eq!(
+            requirements,
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![0, 5],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn q7_plan_source_requirements_prune_unused_source_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT MAX(price) AS maxprice \
+             FROM nexmark_bid \
+             GROUP BY TUMBLE(date_time, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        assert_eq!(
+            requirements,
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![2, 5],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn q12_plan_source_requirements_prune_unused_source_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT bidder, COUNT(*) AS bid_count \
+             FROM nexmark_bid \
+             GROUP BY bidder, TUMBLE(date_time, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        assert_eq!(
+            requirements,
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![1, 5],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_q5_window_aggregate_elides_redundant_scan_projection() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT auction, COUNT(*) AS num \
+             FROM nexmark_bid \
+             GROUP BY auction, HOP(date_time, 2000, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        validate_dbsp_plan(
+            &plan,
+            &std::collections::BTreeSet::from(["nexmark_bid".to_string()]),
+            "benchmark_result",
+        )
+        .expect("validated circuit plan");
+
+        let root = plan.node(plan.root).expect("root node");
+        let &window_idx = root.inputs.first().expect("window aggregate input");
+        let window = plan.node(window_idx).expect("window aggregate node");
+        assert!(
+            matches!(window.kind, DbspNodeKind::WindowAggregate(_)),
+            "expected root input to be window aggregate, found {:?}",
+            window.kind
+        );
+        let &window_input_idx = window.inputs.first().expect("window source input");
+        let window_input = plan.node(window_input_idx).expect("window input node");
+        assert!(
+            matches!(window_input.kind, DbspNodeKind::Source(_)),
+            "expected optimized q5 window aggregate to read directly from source, found {:?}",
+            window_input.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_q7_window_aggregate_elides_redundant_scan_projection() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT MAX(price) AS maxprice \
+             FROM nexmark_bid \
+             GROUP BY TUMBLE(date_time, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        validate_dbsp_plan(
+            &plan,
+            &std::collections::BTreeSet::from(["nexmark_bid".to_string()]),
+            "benchmark_result",
+        )
+        .expect("validated circuit plan");
+
+        let root = plan.node(plan.root).expect("root node");
+        let &window_idx = root.inputs.first().expect("window aggregate input");
+        let window = plan.node(window_idx).expect("window aggregate node");
+        assert!(
+            matches!(window.kind, DbspNodeKind::WindowAggregate(_)),
+            "expected root input to be window aggregate, found {:?}",
+            window.kind
+        );
+        let &window_input_idx = window.inputs.first().expect("window source input");
+        let window_input = plan.node(window_input_idx).expect("window input node");
+        assert!(
+            matches!(window_input.kind, DbspNodeKind::Source(_)),
+            "expected optimized q7 window aggregate to read directly from source, found {:?}",
+            window_input.kind
+        );
+    }
+
+    #[tokio::test]
     async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
@@ -6806,7 +6991,30 @@ mod tests {
                     Volatility::Immutable,
                 ),
                 DataType::Timestamp(TimeUnit::Millisecond, None),
-                passthrough_ts,
+                Arc::clone(&passthrough_ts),
+            ),
+        ));
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+            datafusion::logical_expr::expr_fn::SimpleScalarUDF::new_with_signature(
+                "hop",
+                Signature::one_of(
+                    vec![
+                        TypeSignature::Exact(vec![
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                            DataType::Int64,
+                            DataType::Int64,
+                        ]),
+                        TypeSignature::Exact(vec![
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                            DataType::Int64,
+                            DataType::Int64,
+                            DataType::Int64,
+                        ]),
+                    ],
+                    Volatility::Immutable,
+                ),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                Arc::clone(&passthrough_ts),
             ),
         ));
         ctx.register_udf(create_udf(
