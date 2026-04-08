@@ -27,7 +27,7 @@ type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
-static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+pub(crate) static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "floe_window_events_dropped_too_late_total",
         "Number of input rows dropped by window operators because they arrived beyond allowed lateness",
@@ -35,7 +35,7 @@ static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register floe_window_events_dropped_too_late_total")
 });
 
-static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+pub(crate) static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_window_state_entries",
         "Approximate number of active window aggregate entries currently retained",
@@ -43,7 +43,7 @@ static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register floe_window_state_entries")
 });
 
-static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+pub(crate) static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "floe_window_state_limit_exceeded_total",
         "Number of times window aggregate state exceeded configured FLOE_WINDOW_STATE_MAX_ENTRIES limit",
@@ -51,7 +51,7 @@ static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .expect("register floe_window_state_limit_exceeded_total")
 });
 
-static WINDOW_STATE_LIMIT: LazyLock<Option<usize>> = LazyLock::new(|| {
+pub(crate) static WINDOW_STATE_LIMIT: LazyLock<Option<usize>> = LazyLock::new(|| {
     std::env::var("FLOE_WINDOW_STATE_MAX_ENTRIES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

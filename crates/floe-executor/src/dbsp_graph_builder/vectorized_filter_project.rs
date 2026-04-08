@@ -265,6 +265,9 @@ impl VectorizedFilterProjectEvaluator {
             return Ok(Vec::new());
         }
         let selected = self.selected_indices(&prepared)?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
 
         match &self.projection_plan {
             ProjectionPlan::ColumnIndices { indices, .. } => {
@@ -872,7 +875,7 @@ impl CompiledValueType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CompiledValue {
     Int64(Option<i64>),
     Utf8(Option<String>),
@@ -1037,7 +1040,101 @@ impl CompiledInputBatch {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
+struct CompiledCaseArm {
+    when: Arc<CompiledExpr>,
+    then: Arc<CompiledExpr>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompiledScalarFunction {
+    Hour,
+    CountChar,
+}
+
+impl CompiledScalarFunction {
+    fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("hour") {
+            Some(Self::Hour)
+        } else if name.eq_ignore_ascii_case("count_char") {
+            Some(Self::CountChar)
+        } else {
+            None
+        }
+    }
+
+    fn arity(&self) -> usize {
+        match self {
+            Self::Hour => 1,
+            Self::CountChar => 2,
+        }
+    }
+
+    fn evaluate(&self, args: &[CompiledColumn], row_count: usize) -> Result<CompiledColumn> {
+        match self {
+            Self::Hour => {
+                let ts = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled hour expected one argument"))?;
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let value = ts
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled hour row {row_idx} was missing"))?;
+                    let hour = match value {
+                        CompiledValue::TimestampMillis(Some(millis)) => {
+                            Some(millis.div_euclid(3_600_000).rem_euclid(24))
+                        }
+                        CompiledValue::TimestampMillis(None) => None,
+                        other => {
+                            return Err(anyhow!(
+                                "compiled hour expects timestamp(ms), found {other:?}"
+                            ));
+                        }
+                    };
+                    output.push(CompiledValue::Int64(hour));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::CountChar => {
+                let text = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled count_char expected two arguments"))?;
+                let needle = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("compiled count_char expected two arguments"))?;
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let text = text
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled count_char row {row_idx} was missing"))?;
+                    let needle = needle.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled count_char row {row_idx} was missing from needle")
+                    })?;
+                    let count = match (text, needle) {
+                        (CompiledValue::Utf8(Some(text)), CompiledValue::Utf8(Some(needle))) => {
+                            Some(if needle.is_empty() {
+                                0
+                            } else {
+                                i64::try_from(text.matches(needle).count()).unwrap_or(i64::MAX)
+                            })
+                        }
+                        (CompiledValue::Utf8(None), _) | (_, CompiledValue::Utf8(None)) => None,
+                        _ => {
+                            return Err(anyhow!(
+                                "compiled count_char expects Utf8 operands: {text:?} vs {needle:?}"
+                            ));
+                        }
+                    };
+                    output.push(CompiledValue::Int64(count));
+                }
+                Ok(Arc::new(output))
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum CompiledExpr {
     Column {
         index: usize,
@@ -1071,6 +1168,23 @@ enum CompiledExpr {
         list: Arc<Vec<CompiledExpr>>,
         negated: bool,
     },
+    ConjunctiveRange {
+        expr: Arc<CompiledExpr>,
+        low: Arc<CompiledExpr>,
+        low_op: Operator,
+        high: Arc<CompiledExpr>,
+        high_op: Operator,
+    },
+    Case {
+        expr: Option<Arc<CompiledExpr>>,
+        when_then_expr: Arc<Vec<CompiledCaseArm>>,
+        else_expr: Option<Arc<CompiledExpr>>,
+        result_type: CompiledValueType,
+    },
+    ScalarFunction {
+        function: CompiledScalarFunction,
+        args: Arc<Vec<CompiledExpr>>,
+    },
 }
 
 impl CompiledExpr {
@@ -1095,6 +1209,12 @@ impl CompiledExpr {
                 }))
             }
             Expr::BinaryExpr(binary) => {
+                if binary.op == Operator::And
+                    && let Some(compiled) =
+                        Self::try_compile_conjunctive_range(binary, df_schema, input_schema)?
+                {
+                    return Ok(Some(compiled));
+                }
                 let supported = matches!(
                     binary.op,
                     Operator::Eq
@@ -1189,8 +1309,116 @@ impl CompiledExpr {
                     negated: in_list.negated,
                 }))
             }
+            Expr::Case(case) => {
+                let base_expr = match case.expr.as_ref() {
+                    Some(expr) => {
+                        let Some(compiled) =
+                            Self::try_compile(expr.as_ref(), df_schema, input_schema)?
+                        else {
+                            return Ok(None);
+                        };
+                        Some(Arc::new(compiled))
+                    }
+                    None => None,
+                };
+                let mut when_then_expr = Vec::with_capacity(case.when_then_expr.len());
+                for (when, then) in &case.when_then_expr {
+                    let Some(when) = Self::try_compile(when.as_ref(), df_schema, input_schema)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(then) = Self::try_compile(then.as_ref(), df_schema, input_schema)?
+                    else {
+                        return Ok(None);
+                    };
+                    when_then_expr.push(CompiledCaseArm {
+                        when: Arc::new(when),
+                        then: Arc::new(then),
+                    });
+                }
+                let else_expr = match case.else_expr.as_ref() {
+                    Some(expr) => {
+                        let Some(compiled) =
+                            Self::try_compile(expr.as_ref(), df_schema, input_schema)?
+                        else {
+                            return Ok(None);
+                        };
+                        Some(Arc::new(compiled))
+                    }
+                    None => None,
+                };
+                let Some(result_type) =
+                    CompiledValueType::try_from_arrow(&expr.get_type(df_schema)?)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::Case {
+                    expr: base_expr,
+                    when_then_expr: Arc::new(when_then_expr),
+                    else_expr,
+                    result_type,
+                }))
+            }
+            Expr::ScalarFunction(function) => {
+                let Some(function_name) = CompiledScalarFunction::from_name(function.name()) else {
+                    return Ok(None);
+                };
+                if function.args.len() != function_name.arity() {
+                    return Ok(None);
+                }
+                let Some(args) = function
+                    .args
+                    .iter()
+                    .map(|arg| Self::try_compile(arg, df_schema, input_schema))
+                    .collect::<Result<Option<Vec<_>>>>()?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::ScalarFunction {
+                    function: function_name,
+                    args: Arc::new(args),
+                }))
+            }
             _ => Ok(None),
         }
+    }
+
+    fn try_compile_conjunctive_range(
+        binary: &datafusion::logical_expr::BinaryExpr,
+        df_schema: &DFSchema,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Result<Option<Self>> {
+        let Some(left) = Self::try_compile(binary.left.as_ref(), df_schema, input_schema)? else {
+            return Ok(None);
+        };
+        let Some(right) = Self::try_compile(binary.right.as_ref(), df_schema, input_schema)? else {
+            return Ok(None);
+        };
+        let Some((left_expr, left_bound, left_op)) = extract_range_comparison(left) else {
+            return Ok(None);
+        };
+        let Some((right_expr, right_bound, right_op)) = extract_range_comparison(right) else {
+            return Ok(None);
+        };
+        if left_expr != right_expr {
+            return Ok(None);
+        }
+        let (low, low_op, high, high_op) = match (left_op, right_op) {
+            (Operator::Gt | Operator::GtEq, Operator::Lt | Operator::LtEq) => {
+                (left_bound, left_op, right_bound, right_op)
+            }
+            (Operator::Lt | Operator::LtEq, Operator::Gt | Operator::GtEq) => {
+                (right_bound, right_op, left_bound, left_op)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Self::ConjunctiveRange {
+            expr: Arc::new(left_expr),
+            low: Arc::new(low),
+            low_op,
+            high: Arc::new(high),
+            high_op,
+        }))
     }
 
     fn evaluate(&self, batch: &CompiledInputBatch) -> Result<CompiledColumn> {
@@ -1311,6 +1539,132 @@ impl CompiledExpr {
                     output.push(CompiledValue::Bool(result));
                 }
                 Ok(Arc::new(output))
+            }
+            Self::ConjunctiveRange {
+                expr,
+                low,
+                low_op,
+                high,
+                high_op,
+            } => {
+                let expr = expr.evaluate(batch)?;
+                let low = low.evaluate(batch)?;
+                let high = high.evaluate(batch)?;
+                let mut output = Vec::with_capacity(batch.row_count);
+                for row_idx in 0..batch.row_count {
+                    let value = expr.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled conjunctive range row {row_idx} was missing")
+                    })?;
+                    let low = low.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled conjunctive range row {row_idx} was missing from low")
+                    })?;
+                    let high = high.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled conjunctive range row {row_idx} was missing from high")
+                    })?;
+                    let lower = compare_compiled_values(value, low, *low_op)?;
+                    let upper = compare_compiled_values(value, high, *high_op)?;
+                    output.push(CompiledValue::Bool(and_bool_opt(lower, upper)));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::Case {
+                expr,
+                when_then_expr,
+                else_expr,
+                result_type,
+            } => {
+                let expr = expr.as_ref().map(|expr| expr.evaluate(batch)).transpose()?;
+                let when_then_expr = when_then_expr
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arm)| {
+                        Ok::<_, anyhow::Error>((
+                            arm.when.evaluate(batch).with_context(|| {
+                                format!("evaluate compiled case when arm {idx}")
+                            })?,
+                            arm.then.evaluate(batch).with_context(|| {
+                                format!("evaluate compiled case then arm {idx}")
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let else_expr = else_expr
+                    .as_ref()
+                    .map(|expr| expr.evaluate(batch))
+                    .transpose()?;
+                let mut output = Vec::with_capacity(batch.row_count);
+                for row_idx in 0..batch.row_count {
+                    let matched = if let Some(expr) = expr.as_ref() {
+                        let expr_value = expr.get(row_idx).ok_or_else(|| {
+                            anyhow!("compiled case row {row_idx} was missing from base expression")
+                        })?;
+                        let mut matched = None;
+                        for (when, then) in &when_then_expr {
+                            let when_value = when.get(row_idx).ok_or_else(|| {
+                                anyhow!("compiled case row {row_idx} was missing from when arm")
+                            })?;
+                            if expr_value.equals(when_value)? == Some(true) {
+                                matched = Some(
+                                    then.get(row_idx)
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "compiled case row {row_idx} was missing from then arm"
+                                            )
+                                        })?
+                                        .clone(),
+                                );
+                                break;
+                            }
+                        }
+                        matched
+                    } else {
+                        let mut matched = None;
+                        for (when, then) in &when_then_expr {
+                            let when_value = when.get(row_idx).ok_or_else(|| {
+                                anyhow!("compiled case row {row_idx} was missing from when arm")
+                            })?;
+                            if when_value.predicate_truth()? {
+                                matched = Some(
+                                    then.get(row_idx)
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "compiled case row {row_idx} was missing from then arm"
+                                            )
+                                        })?
+                                        .clone(),
+                                );
+                                break;
+                            }
+                        }
+                        matched
+                    };
+                    if let Some(value) = matched {
+                        output.push(value);
+                    } else if let Some(else_expr) = else_expr.as_ref() {
+                        output.push(
+                            else_expr
+                                .get(row_idx)
+                                .ok_or_else(|| {
+                                    anyhow!("compiled case row {row_idx} was missing from else arm")
+                                })?
+                                .clone(),
+                        );
+                    } else {
+                        output.push(CompiledValue::null(*result_type));
+                    }
+                }
+                Ok(Arc::new(output))
+            }
+            Self::ScalarFunction { function, args } => {
+                let args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arg)| {
+                        arg.evaluate(batch)
+                            .with_context(|| format!("evaluate compiled scalar argument {idx}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                function.evaluate(&args, batch.row_count)
             }
         }
     }
@@ -1453,6 +1807,19 @@ fn compare_compiled_values(
         _ => return Err(anyhow!("unsupported compiled comparison operator {op:?}")),
     };
     Ok(Some(result))
+}
+
+fn extract_range_comparison(expr: CompiledExpr) -> Option<(CompiledExpr, CompiledExpr, Operator)> {
+    let CompiledExpr::Binary { op, left, right } = expr else {
+        return None;
+    };
+    if !matches!(
+        op,
+        Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq
+    ) {
+        return None;
+    }
+    Some((left.as_ref().clone(), right.as_ref().clone(), op))
 }
 
 fn and_bool_opt(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -1972,4 +2339,172 @@ fn consolidate_encoded_delta_batch(
         output.push((values.value(idx).to_vec(), diff));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::common::{Column, ScalarValue};
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{
+        BinaryExpr, Case, ScalarFunctionImplementation, ScalarUDF, Volatility, create_udf,
+    };
+    use datafusion::physical_plan::ColumnarValue;
+
+    fn null_i64_value(len: usize) -> ColumnarValue {
+        ColumnarValue::Array(Arc::new(Int64Array::from(vec![None::<i64>; len])))
+    }
+
+    fn create_test_udf(
+        name: &str,
+        arg_types: Vec<DataType>,
+        return_type: DataType,
+    ) -> Arc<ScalarUDF> {
+        let return_type_for_impl = return_type.clone();
+        let implementation: ScalarFunctionImplementation = Arc::new(
+            move |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                let len = args
+                    .iter()
+                    .find_map(|arg| match arg {
+                        ColumnarValue::Array(array) => Some(array.len()),
+                        ColumnarValue::Scalar(_) => None,
+                    })
+                    .unwrap_or(1);
+                Ok(match return_type_for_impl {
+                    DataType::Int64 => null_i64_value(len),
+                    _ => unreachable!("test UDF only supports Int64 output"),
+                })
+            },
+        );
+        Arc::new(create_udf(
+            name,
+            arg_types,
+            return_type,
+            Volatility::Immutable,
+            implementation,
+        ))
+    }
+
+    #[test]
+    fn compiles_q14_case_count_char_and_range_predicate_expressions() {
+        let input_schema = Schema::new(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new(
+                "date_time",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("extra", DataType::Utf8, true),
+        ]);
+        let df_schema = DFSchema::try_from(input_schema.clone()).expect("df schema");
+        let hour_udf = create_test_udf(
+            "hour",
+            vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+            DataType::Int64,
+        );
+        let count_char_udf = create_test_udf(
+            "count_char",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Int64,
+        );
+
+        let hour_expr = |column_name: &str| {
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(&hour_udf),
+                vec![Expr::Column(Column::from_name(column_name))],
+            ))
+        };
+        let price_expr = || {
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(Expr::Column(Column::from_name("price"))),
+                    Operator::Multiply,
+                    Box::new(Expr::Literal(ScalarValue::Int64(Some(908)), None)),
+                ))),
+                Operator::Divide,
+                Box::new(Expr::Literal(ScalarValue::Int64(Some(1000)), None)),
+            ))
+        };
+        let int_lit = |value| Expr::Literal(ScalarValue::Int64(Some(value)), None);
+        let str_lit = |value: &str| Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None);
+
+        let q14_case = Expr::Case(Case::new(
+            None,
+            vec![
+                (
+                    Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(hour_expr("date_time")),
+                            Operator::GtEq,
+                            Box::new(int_lit(8)),
+                        ))),
+                        Operator::And,
+                        Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(hour_expr("date_time")),
+                            Operator::LtEq,
+                            Box::new(int_lit(18)),
+                        ))),
+                    ))),
+                    Box::new(str_lit("dayTime")),
+                ),
+                (
+                    Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(hour_expr("date_time")),
+                            Operator::LtEq,
+                            Box::new(int_lit(6)),
+                        ))),
+                        Operator::Or,
+                        Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(hour_expr("date_time")),
+                            Operator::GtEq,
+                            Box::new(int_lit(20)),
+                        ))),
+                    ))),
+                    Box::new(str_lit("nightTime")),
+                ),
+            ],
+            Some(Box::new(str_lit("otherTime"))),
+        ));
+        let count_char = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&count_char_udf),
+            vec![
+                Expr::Column(Column::from_name("extra")),
+                Expr::Literal(ScalarValue::Utf8(Some("c".to_string())), None),
+            ],
+        ));
+        let q14_predicate = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(price_expr()),
+                Operator::Gt,
+                Box::new(int_lit(1_000_000)),
+            ))),
+            Operator::And,
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(price_expr()),
+                Operator::Lt,
+                Box::new(int_lit(50_000_000)),
+            ))),
+        ));
+
+        assert!(
+            CompiledExpr::try_compile(&q14_case, &df_schema, &input_schema)
+                .expect("compile q14 case")
+                .is_some()
+        );
+        assert!(
+            CompiledExpr::try_compile(&count_char, &df_schema, &input_schema)
+                .expect("compile q14 count_char")
+                .is_some()
+        );
+        assert!(matches!(
+            CompiledExpr::try_compile(&q14_predicate, &df_schema, &input_schema)
+                .expect("compile q14 predicate"),
+            Some(CompiledExpr::ConjunctiveRange { .. })
+        ));
+    }
 }

@@ -2173,6 +2173,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "datafusion",
  "floe-core",
  "floe-executor",
@@ -2181,6 +2182,7 @@ dependencies = [
  "nexmark",
  "object_store",
  "rdkafka",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

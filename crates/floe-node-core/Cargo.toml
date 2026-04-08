@@ -9,6 +9,7 @@ floe-executor = { path = "../floe-executor" }
 floe-sql-parser = { path = "../floe-sql-parser" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 datafusion = { workspace = true }
 nexmark = { workspace = true }
 rdkafka = { workspace = true }
@@ -21,3 +22,4 @@ futures = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tokio-postgres = { workspace = true }
 url = { workspace = true }
+regex = "1.11"

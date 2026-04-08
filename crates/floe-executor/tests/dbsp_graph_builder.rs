@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
+use chrono::Utc;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, StringArray, TimestampMillisecondArray,
+};
 use datafusion::common::Column;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
@@ -29,6 +32,7 @@ use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::source_journal::SourceBatchJournal;
 use object_store::memory::InMemory;
+use regex::Regex;
 use slatedb::Db;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
@@ -47,6 +51,15 @@ fn udf_batch_len(args: &[ColumnarValue]) -> usize {
         .unwrap_or(1)
 }
 
+fn split_index_value(text: &str, delimiter: &str, index: i64) -> Option<String> {
+    if index < 0 || delimiter.is_empty() {
+        return None;
+    }
+    text.split(delimiter)
+        .nth(index as usize)
+        .map(str::to_string)
+}
+
 async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let ctx = SessionContext::new();
     let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
@@ -60,18 +73,164 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
 }
 
 fn register_planner_test_udfs(ctx: &SessionContext) {
-    let passthrough_utf8: ScalarFunctionImplementation = Arc::new(
-        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            let len = udf_batch_len(args);
-            let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
-            Ok(ColumnarValue::Array(array))
-        },
-    );
     let passthrough_int64: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
             let len = udf_batch_len(args);
             let array: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; len]));
             Ok(ColumnarValue::Array(array))
+        },
+    );
+    let date_format_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let ts = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(TimestampMillisecondArray::from(vec![
+                        None::<i64>;
+                        len
+                    ])))
+                })
+                .into_array(len)?;
+            let fmt = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; len])))
+                })
+                .into_array(len)?;
+            let (Some(ts), Some(fmt)) = (
+                ts.as_any().downcast_ref::<TimestampMillisecondArray>(),
+                fmt.as_any().downcast_ref::<StringArray>(),
+            ) else {
+                let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
+                return Ok(ColumnarValue::Array(array));
+            };
+
+            let values = (0..len)
+                .map(|row_idx| {
+                    if ts.is_null(row_idx) || fmt.is_null(row_idx) {
+                        return None;
+                    }
+                    let dt = chrono::DateTime::<Utc>::from_timestamp_millis(ts.value(row_idx))?;
+                    let pattern = fmt
+                        .value(row_idx)
+                        .replace("yyyy", "%Y")
+                        .replace("MM", "%m")
+                        .replace("dd", "%d")
+                        .replace("HH", "%H")
+                        .replace("mm", "%M")
+                        .replace("ss", "%S");
+                    Some(dt.format(&pattern).to_string())
+                })
+                .collect::<Vec<_>>();
+            Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
+        },
+    );
+    let regexp_extract_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let text = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; len])))
+                })
+                .into_array(len)?;
+            let pattern = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; len])))
+                })
+                .into_array(len)?;
+            let group = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(Int64Array::from(vec![None::<i64>; len])))
+                })
+                .into_array(len)?;
+            let (Some(text), Some(pattern), Some(group)) = (
+                text.as_any().downcast_ref::<StringArray>(),
+                pattern.as_any().downcast_ref::<StringArray>(),
+                group.as_any().downcast_ref::<Int64Array>(),
+            ) else {
+                let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
+                return Ok(ColumnarValue::Array(array));
+            };
+
+            let mut cache: HashMap<String, Option<Regex>> = HashMap::new();
+            let values = (0..len)
+                .map(|row_idx| {
+                    if text.is_null(row_idx) || pattern.is_null(row_idx) || group.is_null(row_idx) {
+                        return None;
+                    }
+                    let group_idx = group.value(row_idx);
+                    if group_idx < 0 {
+                        return None;
+                    }
+                    let pattern_text = pattern.value(row_idx);
+                    let regex = cache
+                        .entry(pattern_text.to_string())
+                        .or_insert_with(|| Regex::new(pattern_text).ok());
+                    let regex = regex.as_ref()?;
+                    let captures = regex.captures(text.value(row_idx))?;
+                    let matched = captures.get(group_idx as usize)?;
+                    Some(matched.as_str().to_string())
+                })
+                .collect::<Vec<_>>();
+            Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
+        },
+    );
+    let split_index_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let text = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; len])))
+                })
+                .into_array(len)?;
+            let delimiter = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; len])))
+                })
+                .into_array(len)?;
+            let index = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(Int64Array::from(vec![None::<i64>; len])))
+                })
+                .into_array(len)?;
+            let (Some(text), Some(delimiter), Some(index)) = (
+                text.as_any().downcast_ref::<StringArray>(),
+                delimiter.as_any().downcast_ref::<StringArray>(),
+                index.as_any().downcast_ref::<Int64Array>(),
+            ) else {
+                let array: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; len]));
+                return Ok(ColumnarValue::Array(array));
+            };
+
+            let values = (0..len)
+                .map(|row_idx| {
+                    if text.is_null(row_idx) || delimiter.is_null(row_idx) || index.is_null(row_idx)
+                    {
+                        return None;
+                    }
+                    split_index_value(
+                        text.value(row_idx),
+                        delimiter.value(row_idx),
+                        index.value(row_idx),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
         },
     );
     let proctime: ScalarFunctionImplementation = Arc::new(
@@ -104,21 +263,21 @@ fn register_planner_test_udfs(ctx: &SessionContext) {
         ],
         DataType::Utf8,
         Volatility::Immutable,
-        Arc::clone(&passthrough_utf8),
+        date_format_udf,
     ));
     ctx.register_udf(create_udf(
         "regexp_extract",
         vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
         DataType::Utf8,
         Volatility::Immutable,
-        Arc::clone(&passthrough_utf8),
+        regexp_extract_udf,
     ));
     ctx.register_udf(create_udf(
         "split_index",
         vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
         DataType::Utf8,
         Volatility::Immutable,
-        Arc::clone(&passthrough_utf8),
+        split_index_udf,
     ));
     ctx.register_udf(create_udf(
         "count_char",
@@ -2258,6 +2417,244 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
 }
 
 #[tokio::test]
+async fn source_projection_with_regexp_extract_materializes_from_transient_source_journal() {
+    let db = test_db("source-projection-regexp-extract").await;
+    let view_name = "mv_source_projection_regexp_extract";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT auction, bidder, price, channel, \
+             CASE \
+               WHEN lower(channel) = 'apple' THEN '0' \
+               WHEN lower(channel) = 'google' THEN '1' \
+               WHEN lower(channel) = 'facebook' THEN '2' \
+               WHEN lower(channel) = 'baidu' THEN '3' \
+               ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) \
+             END AS channel_id \
+             FROM nexmark_bid \
+             WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL \
+                OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new("channel", DataType::Utf8, true),
+            Field::new("channel_id", DataType::Utf8, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_channel_url(1, 42, 10, "APPLE", "https://example.com/no-channel"),
+            1,
+        )
+        .expect("append apple bid");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_channel_url(
+                2,
+                7,
+                20,
+                "web",
+                "https://example.com/x/item/1?q=1&channel_id=abc123&foo=1",
+            ),
+            1,
+        )
+        .expect("append regexp bid");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_channel_url(3, 8, 30, "web", "https://example.com/no-match"),
+            1,
+        )
+        .expect("append filtered bid");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick bid batch");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            channel_id_projection_row(1, 42, 10, "APPLE", "0"),
+            channel_id_projection_row(2, 7, 20, "web", "abc123"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn source_projection_with_split_index_materializes_from_transient_source_journal() {
+    let db = test_db("source-projection-split-index").await;
+    let view_name = "mv_source_projection_split_index";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT auction, bidder, price, channel, \
+             SPLIT_INDEX(url, '/', 3) AS dir1, \
+             SPLIT_INDEX(url, '/', 4) AS dir2, \
+             SPLIT_INDEX(url, '/', 5) AS dir3 \
+             FROM nexmark_bid",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new("channel", DataType::Utf8, true),
+            Field::new("dir1", DataType::Utf8, true),
+            Field::new("dir2", DataType::Utf8, true),
+            Field::new("dir3", DataType::Utf8, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_channel_url(
+                1,
+                42,
+                10,
+                "web",
+                "https://example.com/dirA/item/123?q=1",
+            ),
+            1,
+        )
+        .expect("append full split bid");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_channel_url(2, 7, 20, "web", "https://example.com/only"),
+            1,
+        )
+        .expect("append short split bid");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick bid batch");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![
+            split_index_projection_row(
+                1,
+                42,
+                10,
+                "web",
+                Some("dirA"),
+                Some("item"),
+                Some("123?q=1"),
+            ),
+            split_index_projection_row(2, 7, 20, "web", Some("only"), None, None),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn distinct_materializes_unique_rows() {
     let db = test_db("distinct-single").await;
     let view_name = "mv_distinct_bidder";
@@ -2535,6 +2932,181 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 3, 2])]);
+}
+
+#[tokio::test]
+async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
+    let db = test_db("q16-transient-aggregate-date-format").await;
+    let view_name = "mv_q16_transient";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let logical = sql_plan(
+        "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
+                MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, \
+                COUNT(*) AS total_bids, \
+                COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, \
+                COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, \
+                COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, \
+                COUNT(DISTINCT bidder) AS total_bidders, \
+                COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, \
+                COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, \
+                COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, \
+                COUNT(DISTINCT auction) AS total_auctions, \
+                COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, \
+                COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, \
+                COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions \
+         FROM nexmark_bid \
+         GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')",
+    )
+    .await;
+    let plan = DbspPlanBuilder::new(nexmark_config())
+        .build(&logical)
+        .expect("circuit plan");
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    let _view_handle = mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("channel", DataType::Utf8, true),
+            Field::new("day", DataType::Utf8, true),
+            Field::new("minute", DataType::Utf8, true),
+            Field::new("total_bids", DataType::Int64, true),
+            Field::new("rank1_bids", DataType::Int64, true),
+            Field::new("rank2_bids", DataType::Int64, true),
+            Field::new("rank3_bids", DataType::Int64, true),
+            Field::new("total_bidders", DataType::Int64, true),
+            Field::new("rank1_bidders", DataType::Int64, true),
+            Field::new("rank2_bidders", DataType::Int64, true),
+            Field::new("rank3_bidders", DataType::Int64, true),
+            Field::new("total_auctions", DataType::Int64, true),
+            Field::new("rank1_auctions", DataType::Int64, true),
+            Field::new("rank2_auctions", DataType::Int64, true),
+            Field::new("rank3_auctions", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx.clone(),
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build q16 transient aggregate graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 42, 9_999, 1_700_000_036_211), 1)
+        .expect("append tick 1");
+    bid_writer.flush().await.expect("flush tick 1");
+
+    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![
+            Some(EncodedRowScalar::Utf8("channel".to_string())),
+            Some(EncodedRowScalar::Utf8("2023-11-14".to_string())),
+            Some(EncodedRowScalar::Utf8("22:13".to_string())),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(0)),
+        ]]
+    );
+
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(2, 99, 15_000, 1_700_000_096_211), 1)
+        .expect("append tick 2");
+    bid_writer.flush().await.expect("flush tick 2");
+
+    wait_for_logical_version(&mv_registry, view_name, 2).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![
+            Some(EncodedRowScalar::Utf8("channel".to_string())),
+            Some(EncodedRowScalar::Utf8("2023-11-14".to_string())),
+            Some(EncodedRowScalar::Utf8("22:14".to_string())),
+            Some(EncodedRowScalar::Int64(2)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(2)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+            Some(EncodedRowScalar::Int64(2)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(0)),
+        ]]
+    );
+
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_ts(3, 7, 1_200_000, 1_700_000_156_211),
+            1,
+        )
+        .expect("append tick 3");
+    bid_writer.flush().await.expect("flush tick 3");
+
+    wait_for_logical_version(&mv_registry, view_name, 3).await;
+    assert_eq!(
+        visible_rows(&mv_registry, view_name).await,
+        vec![vec![
+            Some(EncodedRowScalar::Utf8("channel".to_string())),
+            Some(EncodedRowScalar::Utf8("2023-11-14".to_string())),
+            Some(EncodedRowScalar::Utf8("22:15".to_string())),
+            Some(EncodedRowScalar::Int64(3)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(3)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(3)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(1)),
+        ]]
+    );
 }
 
 #[tokio::test]
@@ -3301,6 +3873,42 @@ fn count_char_projection_row(
     ]
 }
 
+fn channel_id_projection_row(
+    auction: i64,
+    bidder: i64,
+    price: i64,
+    channel: &str,
+    channel_id: &str,
+) -> TestRow {
+    vec![
+        Some(EncodedRowScalar::Int64(auction)),
+        Some(EncodedRowScalar::Int64(bidder)),
+        Some(EncodedRowScalar::Int64(price)),
+        Some(EncodedRowScalar::Utf8(channel.to_string())),
+        Some(EncodedRowScalar::Utf8(channel_id.to_string())),
+    ]
+}
+
+fn split_index_projection_row(
+    auction: i64,
+    bidder: i64,
+    price: i64,
+    channel: &str,
+    dir1: Option<&str>,
+    dir2: Option<&str>,
+    dir3: Option<&str>,
+) -> TestRow {
+    vec![
+        Some(EncodedRowScalar::Int64(auction)),
+        Some(EncodedRowScalar::Int64(bidder)),
+        Some(EncodedRowScalar::Int64(price)),
+        Some(EncodedRowScalar::Utf8(channel.to_string())),
+        dir1.map(|value| EncodedRowScalar::Utf8(value.to_string())),
+        dir2.map(|value| EncodedRowScalar::Utf8(value.to_string())),
+        dir3.map(|value| EncodedRowScalar::Utf8(value.to_string())),
+    ]
+}
+
 fn scalar_i64(value: Option<&Option<EncodedRowScalar>>) -> i64 {
     match value {
         Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
@@ -3359,6 +3967,24 @@ fn encoded_bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: 
         EncodedTestField::Utf8("channel"),
         EncodedTestField::Utf8("url"),
         EncodedTestField::TimestampMillis(date_time_ms),
+        EncodedTestField::Utf8("extra"),
+    ])
+}
+
+fn encoded_bid_row_with_channel_url(
+    auction: i64,
+    bidder: i64,
+    price: i64,
+    channel: &str,
+    url: &str,
+) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(auction),
+        EncodedTestField::Int64(bidder),
+        EncodedTestField::Int64(price),
+        EncodedTestField::Utf8(channel),
+        EncodedTestField::Utf8(url),
+        EncodedTestField::TimestampMillis(1_700_000_000_000),
         EncodedTestField::Utf8("extra"),
     ])
 }

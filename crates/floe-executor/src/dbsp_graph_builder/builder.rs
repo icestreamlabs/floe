@@ -3260,6 +3260,47 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     pending.push_back(right_idx);
                 }
             }
+            DbspNodeKind::Aggregate(aggregate) => {
+                let input_idx = first_input(node, "aggregate")?;
+                let mut input_columns = BTreeSet::new();
+                for group_key in aggregate.group_keys() {
+                    add_required_expression_columns(
+                        group_key.expression(),
+                        aggregate.input_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                let group_key_count = aggregate.group_keys().len();
+                for column_idx in required_columns {
+                    let Some(aggregate_idx) = column_idx.checked_sub(group_key_count) else {
+                        continue;
+                    };
+                    let aggregate_expr =
+                        aggregate.aggregates().get(aggregate_idx).ok_or_else(|| {
+                            anyhow!(
+                                "required output column {column_idx} out of bounds for aggregate node"
+                            )
+                        })?;
+                    if let Some(expr) = aggregate_expr.expression() {
+                        add_required_expression_columns(
+                            expr,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                    if let Some(filter) = aggregate_expr.filter() {
+                        add_required_expression_columns(
+                            filter,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
             DbspNodeKind::Passthrough | DbspNodeKind::Sink(_) => {
                 let operator = match &node.kind {
                     DbspNodeKind::Passthrough => "passthrough",
@@ -3307,9 +3348,11 @@ fn add_required_expression_columns(
     columns: &mut BTreeSet<usize>,
 ) -> Result<()> {
     for column in expression.expr().column_refs() {
+        let qualified = column.flat_name();
         let column_idx = input_schema
-            .field_index(column.name.as_str())
-            .ok_or_else(|| anyhow!("column '{}' not found in input schema", column.name))?;
+            .field_index(&qualified)
+            .or_else(|| input_schema.field_index(column.name.as_str()))
+            .ok_or_else(|| anyhow!("column '{}' not found in input schema", qualified))?;
         columns.insert(column_idx);
     }
     Ok(())
@@ -4190,10 +4233,14 @@ fn build_transient_aggregate_precompute(
         }
     }
 
+    let mut direct_input_columns = BTreeSet::new();
     let mut seen = HashSet::new();
     let mut non_direct_expressions = Vec::new();
     for expr in &expressions {
-        if transient_aggregate_direct_column_index(expr, input_schema.as_ref()).is_some() {
+        if let Some(column_idx) =
+            transient_aggregate_direct_column_index(expr, input_schema.as_ref())
+        {
+            direct_input_columns.insert(column_idx);
             continue;
         }
         let key = transient_aggregate_expression_lookup_key(expr.expr());
@@ -4205,8 +4252,11 @@ fn build_transient_aggregate_precompute(
         return Ok((None, input_schema, Arc::new(HashMap::new())));
     }
 
-    let mut items = Vec::with_capacity(input_schema.len() + non_direct_expressions.len());
-    for field in input_schema.fields() {
+    let mut items = Vec::with_capacity(direct_input_columns.len() + non_direct_expressions.len());
+    for column_idx in direct_input_columns {
+        let field = input_schema
+            .field(column_idx)
+            .ok_or_else(|| anyhow!("transient aggregate input column {column_idx} missing"))?;
         items.push(dbsp::circuit::plan::ProjectItem {
             expr: Expr::Column(Column::new_unqualified(field.name.clone())),
             alias: Some(field.name.clone()),
@@ -4214,7 +4264,7 @@ fn build_transient_aggregate_precompute(
     }
 
     let mut expression_columns = HashMap::with_capacity(non_direct_expressions.len());
-    let mut next_index = input_schema.len();
+    let mut next_index = items.len();
     for (index, (key, expr)) in non_direct_expressions.into_iter().enumerate() {
         let alias = format!("__floe_transient_aggregate_expr_{index}");
         items.push(dbsp::circuit::plan::ProjectItem {
@@ -4852,11 +4902,16 @@ mod tests {
     use std::sync::atomic::AtomicI64;
     use std::time::Duration;
 
+    use chrono::Utc;
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
     use datafusion::common::Column;
     use datafusion::common::Result as DataFusionResult;
     use datafusion::datasource::{TableProvider, empty::EmptyTable};
     use datafusion::logical_expr::expr_fn::create_udf;
-    use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility};
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarFunctionImplementation, Signature, TypeSignature, Volatility,
+    };
     use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
     use dbsp::DbspJoin;
@@ -4961,6 +5016,247 @@ mod tests {
         assert_eq!(
             transient_sources,
             BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q4_plan_source_requirements_prune_unused_source_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT category, AVG(max) \
+             FROM (SELECT MAX(b.price) AS max, a.category \
+                   FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+                   WHERE b.date_time BETWEEN a.date_time AND a.expires \
+                   GROUP BY a.id, a.category) per_auction \
+             GROUP BY category",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        assert_eq!(
+            requirements,
+            vec![
+                PlanSourceRequirements {
+                    source_name: "nexmark_auction".to_string(),
+                    required_columns: vec![0, 6, 7, 8],
+                },
+                PlanSourceRequirements {
+                    source_name: "nexmark_bid".to_string(),
+                    required_columns: vec![0, 2],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn q16_plan_source_requirements_prune_unused_source_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
+                    MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, \
+                    COUNT(*) AS total_bids, \
+                    COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, \
+                    COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, \
+                    COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, \
+                    COUNT(DISTINCT bidder) AS total_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, \
+                    COUNT(DISTINCT auction) AS total_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions \
+             FROM nexmark_bid \
+             GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        assert_eq!(
+            requirements,
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![0, 1, 2, 3, 5],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
+                    MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, \
+                    COUNT(*) AS total_bids, \
+                    COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, \
+                    COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, \
+                    COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, \
+                    COUNT(DISTINCT bidder) AS total_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, \
+                    COUNT(DISTINCT auction) AS total_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions \
+             FROM nexmark_bid \
+             GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        let shape = try_build_transient_source_aggregate_root_shape(&plan, plan.root)
+            .expect("transient aggregate root shape")
+            .expect("transient aggregate root shape");
+        let (precompute_evaluator, aggregate_input_schema, expression_columns) =
+            build_transient_aggregate_precompute(&shape.aggregate)
+                .expect("build transient aggregate precompute");
+        let precompute_evaluator = precompute_evaluator.expect("precompute evaluator");
+
+        let field_names = aggregate_input_schema
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(field_names.contains(&"auction"));
+        assert!(field_names.contains(&"bidder"));
+        assert!(field_names.contains(&"channel"));
+        assert!(!field_names.contains(&"url"));
+        assert!(!field_names.contains(&"extra"));
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        let bid_definition = nexmark_bid_source_definition();
+        let bid_mask = required_mask(&requirements, &bid_definition, "nexmark_bid");
+        let bid_decoder = SourceRowDecoder::new_with_encoded_required_columns(
+            bid_definition,
+            Some(Arc::clone(&bid_mask)),
+        );
+        let encoded = encode_event(&bid_decoder, bid_event_payload(7, 42, 9_999), "nexmark_bid");
+        let source_deltas =
+            (shape.source_root.transform)(vec![(encoded, 1)]).expect("source transform");
+        let precomputed = precompute_evaluator
+            .transform_delta("benchmark_result", source_deltas)
+            .expect("precompute q16 pruned bid row");
+        assert_eq!(precomputed.len(), 1);
+
+        let row_evaluator = build_incremental_aggregate_row_evaluator(
+            Arc::clone(&aggregate_input_schema),
+            shape.aggregate.group_keys().to_vec(),
+            shape.aggregate.aggregates().to_vec(),
+            Arc::clone(&expression_columns),
+            "benchmark_result".to_string(),
+            "transient_aggregate",
+        );
+        let row = row_evaluator(&precomputed[0].0).expect("incremental aggregate row");
+        assert_eq!(row.slots.len(), shape.aggregate.aggregates().len());
+    }
+
+    #[tokio::test]
+    async fn q16_transient_incremental_aggregate_emits_utf8_group_keys() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
+                    MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, \
+                    COUNT(*) AS total_bids, \
+                    COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, \
+                    COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, \
+                    COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, \
+                    COUNT(DISTINCT bidder) AS total_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, \
+                    COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, \
+                    COUNT(DISTINCT auction) AS total_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, \
+                    COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions \
+             FROM nexmark_bid \
+             GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        let shape = try_build_transient_source_aggregate_root_shape(&plan, plan.root)
+            .expect("transient aggregate root shape")
+            .expect("transient aggregate root shape");
+        let (precompute_evaluator, aggregate_input_schema, expression_columns) =
+            build_transient_aggregate_precompute(&shape.aggregate)
+                .expect("build transient aggregate precompute");
+        let precompute_evaluator = precompute_evaluator.expect("precompute evaluator");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        let bid_definition = nexmark_bid_source_definition();
+        let bid_mask = required_mask(&requirements, &bid_definition, "nexmark_bid");
+        let bid_decoder = SourceRowDecoder::new_with_encoded_required_columns(
+            bid_definition,
+            Some(Arc::clone(&bid_mask)),
+        );
+
+        let encoded_one = encode_event(
+            &bid_decoder,
+            bid_event_payload_with_channel_and_ts(7, 42, 9_999, "web", 1_700_000_036_211),
+            "nexmark_bid",
+        );
+        let encoded_two = encode_event(
+            &bid_decoder,
+            bid_event_payload_with_channel_and_ts(8, 99, 15_000, "web", 1_700_000_096_211),
+            "nexmark_bid",
+        );
+
+        let source_deltas = (shape.source_root.transform)(vec![(encoded_one, 1), (encoded_two, 1)])
+            .expect("source transform");
+        let precomputed = precompute_evaluator
+            .transform_delta("benchmark_result", source_deltas)
+            .expect("precompute q16 rows");
+
+        let row_evaluator = build_incremental_aggregate_row_evaluator(
+            Arc::clone(&aggregate_input_schema),
+            shape.aggregate.group_keys().to_vec(),
+            shape.aggregate.aggregates().to_vec(),
+            Arc::clone(&expression_columns),
+            "benchmark_result".to_string(),
+            "transient_aggregate",
+        );
+        let aggregate = dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(
+            row_evaluator,
+            build_incremental_aggregate_slot_kinds(shape.aggregate.aggregates())
+                .expect("incremental aggregate slot kinds"),
+        )
+        .await
+        .expect("create transient incremental aggregate");
+
+        let output = aggregate
+            .apply_deltas(precomputed)
+            .await
+            .expect("apply q16 transient aggregate deltas");
+
+        assert_eq!(
+            output.len(),
+            1,
+            "expected q16 rows to group into one output row"
+        );
+        let ((row, values), diff) = &output[0];
+        assert_eq!(*diff, 1);
+        assert_eq!(
+            crate::encoding::extract_encoded_row_scalars(row, &[0, 1])
+                .expect("decode q16 group key"),
+            vec![
+                Some(crate::encoding::EncodedRowScalar::Utf8("web".to_string())),
+                Some(crate::encoding::EncodedRowScalar::Utf8(
+                    "2023-11-14".to_string()
+                )),
+            ]
+        );
+        assert_eq!(
+            values.first(),
+            Some(&dbsp::AggregateValue::Utf8("22:14".to_string()))
         );
     }
 
@@ -6306,15 +6602,120 @@ mod tests {
                 )))
             },
         );
+        let passthrough_ts: ScalarFunctionImplementation = Arc::new(
+            |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                Ok(args.first().cloned().unwrap_or_else(|| {
+                    ColumnarValue::Array(Arc::new(
+                        datafusion::arrow::array::TimestampMillisecondArray::from(vec![
+                            None::<i64>;
+                            1
+                        ]),
+                    ))
+                }))
+            },
+        );
+        let date_format_udf: ScalarFunctionImplementation = Arc::new(
+            |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                let len = args
+                    .iter()
+                    .find_map(|arg| match arg {
+                        ColumnarValue::Array(array) => Some(array.len()),
+                        ColumnarValue::Scalar(_) => None,
+                    })
+                    .unwrap_or(1);
+                let ts = args
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ColumnarValue::Array(Arc::new(
+                            datafusion::arrow::array::TimestampMillisecondArray::from(vec![
+                                None::<
+                                    i64,
+                                >;
+                                len
+                            ]),
+                        ))
+                    })
+                    .into_array(len)?;
+                let fmt = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ColumnarValue::Array(Arc::new(datafusion::arrow::array::StringArray::from(
+                            vec![None::<&str>; len],
+                        )))
+                    })
+                    .into_array(len)?;
+                let (Some(ts), Some(fmt)) = (
+                    ts.as_any()
+                        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>(),
+                    fmt.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>(),
+                ) else {
+                    return Ok(ColumnarValue::Array(Arc::new(
+                        datafusion::arrow::array::StringArray::from(vec![None::<&str>; len]),
+                    )));
+                };
+
+                let values = (0..len)
+                    .map(|row_idx| {
+                        if ts.is_null(row_idx) || fmt.is_null(row_idx) {
+                            return None;
+                        }
+                        let dt = chrono::DateTime::<Utc>::from_timestamp_millis(ts.value(row_idx))?;
+                        let pattern = fmt
+                            .value(row_idx)
+                            .replace("yyyy", "%Y")
+                            .replace("MM", "%m")
+                            .replace("dd", "%d")
+                            .replace("HH", "%H")
+                            .replace("mm", "%M")
+                            .replace("ss", "%S");
+                        Some(dt.format(&pattern).to_string())
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::StringArray::from(values),
+                )))
+            },
+        );
         ctx.register_udf(create_udf(
             "proctime",
             vec![],
-            datafusion::arrow::datatypes::DataType::Timestamp(
-                datafusion::arrow::datatypes::TimeUnit::Millisecond,
-                None,
-            ),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
             Volatility::Volatile,
             proctime,
+        ));
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+            datafusion::logical_expr::expr_fn::SimpleScalarUDF::new_with_signature(
+                "tumble",
+                Signature::one_of(
+                    vec![
+                        TypeSignature::Exact(vec![
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                            DataType::Int64,
+                        ]),
+                        TypeSignature::Exact(vec![
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                            DataType::Int64,
+                            DataType::Int64,
+                        ]),
+                    ],
+                    Volatility::Immutable,
+                ),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                passthrough_ts,
+            ),
+        ));
+        ctx.register_udf(create_udf(
+            "date_format",
+            vec![
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Utf8,
+            ],
+            DataType::Utf8,
+            Volatility::Immutable,
+            date_format_udf,
         ));
     }
 
@@ -6372,13 +6773,29 @@ mod tests {
     }
 
     fn bid_event_payload(auction: i64, bidder: i64, price: i64) -> Value {
+        bid_event_payload_with_channel_and_ts(
+            auction,
+            bidder,
+            price,
+            "channel",
+            1_700_000_000_000i64,
+        )
+    }
+
+    fn bid_event_payload_with_channel_and_ts(
+        auction: i64,
+        bidder: i64,
+        price: i64,
+        channel: &str,
+        date_time: i64,
+    ) -> Value {
         json!({
             "auction": auction,
             "bidder": bidder,
             "price": price,
-            "channel": "channel",
+            "channel": channel,
             "url": "https://example.invalid/bid",
-            "date_time": 1_700_000_000_000i64,
+            "date_time": date_time,
             "extra": "extra"
         })
     }

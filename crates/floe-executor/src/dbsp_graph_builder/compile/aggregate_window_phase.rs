@@ -1,7 +1,8 @@
 use super::*;
 use crate::encoding::{
     EncodedRowScalar, concat_encoded_rows, extract_encoded_row_columns,
-    extract_encoded_row_i64_like_column, extract_encoded_row_scalars,
+    extract_encoded_row_columns_and_i64_like_column, extract_encoded_row_i64_like_column,
+    extract_encoded_row_scalars,
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
@@ -246,6 +247,7 @@ impl DbspGraphBuilder {
         let input_schema = Arc::clone(aggregate.input_schema());
         let group_keys = aggregate.group_keys().to_vec();
         let aggregates = aggregate.aggregates().to_vec();
+        let simple_count_star = is_simple_count_star_aggregate(&aggregates);
         let time_expression = node.window.time_expression.clone();
         let mut precompute_expressions = Vec::new();
         precompute_expressions.extend(group_keys.iter().map(|key| key.expression().clone()));
@@ -254,7 +256,7 @@ impl DbspGraphBuilder {
             if let Some(filter) = agg.filter() {
                 precompute_expressions.push(filter.clone());
             }
-            if let Some(expr) = agg.expression() {
+            if !simple_count_star && let Some(expr) = agg.expression() {
                 precompute_expressions.push(expr.clone());
             }
         }
@@ -292,6 +294,133 @@ impl DbspGraphBuilder {
         let window_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
             report_graph_task_error(&window_events, &window_graph_id, window_label.clone(), err);
         });
+        let direct_time_column = resolved_expression_column_index(
+            &time_expression,
+            eval_schema.as_ref(),
+            expression_columns.as_ref(),
+        )
+        .ok_or_else(|| anyhow!("failed to resolve vectorized window aggregate time column"))?;
+        let watermark = Arc::clone(&self.watermark);
+
+        if simple_count_star {
+            tracing::info!(
+                graph_id = %graph_id,
+                "using window count-star fast path"
+            );
+            let key_columns = Arc::clone(&direct_group_key_columns);
+            let row_graph_id = graph_id.clone();
+            let row_extractor = move |bytes: &Vec<u8>| -> Option<(Vec<u8>, i64)> {
+                match extract_encoded_row_columns_and_i64_like_column(
+                    bytes,
+                    key_columns.as_ref(),
+                    direct_time_column,
+                    false,
+                ) {
+                    Ok(Some(extracted)) => Some(extracted),
+                    Ok(None) => None,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %row_graph_id,
+                            error = %err,
+                            "failed to extract window count-star row"
+                        );
+                        None
+                    }
+                }
+            };
+            let window_count_star_aggregate =
+                dbsp::DbspWindowCountStarAggregate::new::<Vec<u8>, Vec<u8>, _>(
+                    &upstream,
+                    row_extractor,
+                    window_size,
+                    window_slide,
+                    allowed_lateness_ms,
+                    watermark,
+                    Some(window_error_handler),
+                )
+                .await
+                .context("initialize DBSP window count-star aggregate")?;
+
+            let mapped = self
+                .map_window_count_star_aggregate_output(
+                    &graph_id,
+                    &window_count_star_aggregate.stream(),
+                    task_events,
+                    "window-aggregate-project",
+                )
+                .await?;
+            return Ok(mapped.stream());
+        }
+
+        if aggregates
+            .iter()
+            .all(|agg| agg.function() == &DbspAggregateFunction::Count)
+        {
+            let key_columns = Arc::clone(&direct_group_key_columns);
+            let key_graph_id = graph_id.clone();
+            let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
+                match extract_encoded_row_columns(bytes, key_columns.as_ref(), false) {
+                    Ok(selected) => selected,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %key_graph_id,
+                            error = %err,
+                            "failed to extract window aggregate group key columns"
+                        );
+                        None
+                    }
+                }
+            };
+
+            let time_graph_id = graph_id.clone();
+            let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
+                match extract_encoded_row_i64_like_column(bytes, direct_time_column) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %time_graph_id,
+                            error = %err,
+                            "failed to extract window aggregate time column"
+                        );
+                        None
+                    }
+                }
+            };
+
+            let slot_kinds = build_count_aggregate_slot_kinds(&aggregates);
+            let row_evaluator = build_window_count_row_evaluator(
+                Arc::clone(&eval_schema),
+                aggregates.clone(),
+                Arc::clone(&expression_columns),
+                graph_id.clone(),
+                "window aggregate",
+            );
+            let window_count_aggregate =
+                dbsp::DbspWindowCountAggregate::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _, _>(
+                    &upstream,
+                    key_extractor,
+                    row_evaluator,
+                    slot_kinds,
+                    time_extractor,
+                    window_size,
+                    window_slide,
+                    allowed_lateness_ms,
+                    watermark,
+                    Some(Arc::clone(&window_error_handler)),
+                )
+                .await
+                .context("initialize DBSP window count aggregate")?;
+
+            let mapped = self
+                .map_window_count_aggregate_output(
+                    &graph_id,
+                    &window_count_aggregate.stream(),
+                    task_events,
+                    "window-aggregate-project",
+                )
+                .await?;
+            return Ok(mapped.stream());
+        }
 
         let key_columns = Arc::clone(&direct_group_key_columns);
         let key_graph_id = graph_id.clone();
@@ -310,12 +439,6 @@ impl DbspGraphBuilder {
         };
 
         let time_graph_id = graph_id.clone();
-        let direct_time_column = resolved_expression_column_index(
-            &time_expression,
-            eval_schema.as_ref(),
-            expression_columns.as_ref(),
-        )
-        .ok_or_else(|| anyhow!("failed to resolve vectorized window aggregate time column"))?;
         let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
             match extract_encoded_row_i64_like_column(bytes, direct_time_column) {
                 Ok(value) => value,
@@ -360,7 +483,6 @@ impl DbspGraphBuilder {
             }
         };
 
-        let watermark = Arc::clone(&self.watermark);
         let window_aggregate = DbspWindowAggregate::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _, _>(
             &upstream,
             key_extractor,
@@ -585,6 +707,156 @@ impl DbspGraphBuilder {
         .context("initialize count aggregate output map")
     }
 
+    async fn map_window_count_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DbspMap> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(WindowKey<Vec<u8>>, Vec<i64>)| -> Vec<u8> {
+            let encoded_window_bounds = match encode_window_bounds(pair.0.start, pair.0.end) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode window aggregate bounds"
+                    );
+                    return Vec::new();
+                }
+            };
+            let with_key = match concat_encoded_rows(&encoded_window_bounds, &pair.0.key) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate bounds and key"
+                    );
+                    return Vec::new();
+                }
+            };
+            let encoded_count_values = match encode_count_values(&pair.1) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode count aggregate values"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&with_key, &encoded_count_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate output values"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        DbspMap::new::<(WindowKey<Vec<u8>>, Vec<i64>), Vec<u8>, _>(
+            aggregate_stream,
+            projector,
+            Some(project_error_handler),
+        )
+        .await
+        .context("initialize window count aggregate output map")
+    }
+
+    async fn map_window_count_star_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DbspMap> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(WindowKey<Vec<u8>>, i64)| -> Vec<u8> {
+            let encoded_window_bounds = match encode_window_bounds(pair.0.start, pair.0.end) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode window aggregate bounds"
+                    );
+                    return Vec::new();
+                }
+            };
+            let with_key = match concat_encoded_rows(&encoded_window_bounds, &pair.0.key) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate bounds and key"
+                    );
+                    return Vec::new();
+                }
+            };
+            let encoded_count_values = match encode_count_values(std::slice::from_ref(&pair.1)) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode count aggregate value"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&with_key, &encoded_count_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate output values"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        DbspMap::new::<(WindowKey<Vec<u8>>, i64), Vec<u8>, _>(
+            aggregate_stream,
+            projector,
+            Some(project_error_handler),
+        )
+        .await
+        .context("initialize window count-star aggregate output map")
+    }
+
     async fn map_incremental_aggregate_output(
         &self,
         graph_id: &str,
@@ -652,6 +924,54 @@ pub(crate) fn build_count_aggregate_slot_kinds(
             }
         })
         .collect()
+}
+
+fn is_simple_count_star_aggregate(aggregates: &[DbspAggregateExpr]) -> bool {
+    aggregates.len() == 1 && aggregates.iter().all(is_unconditional_count_aggregate)
+}
+
+fn is_unconditional_count_aggregate(agg: &DbspAggregateExpr) -> bool {
+    agg.function() == &DbspAggregateFunction::Count
+        && !agg.distinct()
+        && agg.filter().is_none()
+        && agg.expression().is_none_or(|expr| match expr.expr() {
+            Expr::Literal(value, _) => !value.is_null(),
+            _ => false,
+        })
+}
+
+pub(crate) fn build_window_count_row_evaluator(
+    input_schema: Arc<RowSchema>,
+    aggregates: Vec<DbspAggregateExpr>,
+    expression_columns: Arc<ExpressionColumnMap>,
+    graph_id: String,
+    context: &'static str,
+) -> impl Fn(
+    &WindowKey<Vec<u8>>,
+    &Vec<u8>,
+) -> Option<dbsp::CountAggregateRow<WindowKey<Vec<u8>>, Vec<u8>>>
++ Send
++ Sync
++ 'static {
+    let layout = Arc::new(build_count_eval_layout(
+        &aggregates,
+        input_schema.as_ref(),
+        expression_columns.as_ref(),
+    ));
+    move |window_key: &WindowKey<Vec<u8>>, bytes: &Vec<u8>| {
+        let counts = evaluate_count_row_values(
+            layout.as_ref(),
+            &aggregates,
+            bytes,
+            input_schema.as_ref(),
+            &graph_id,
+            context,
+        );
+        Some(dbsp::CountAggregateRow {
+            key: window_key.clone(),
+            slots: counts,
+        })
+    }
 }
 
 pub(crate) fn build_count_row_evaluator(

@@ -12,6 +12,46 @@ pub(crate) struct EncodedRowProjectionColumn {
     pub index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedJoinedEncodedRowProjection {
+    columns: Vec<EncodedRowProjectionColumn>,
+    left_requests: Vec<(usize, usize)>,
+    right_requests: Vec<(usize, usize)>,
+    projected_count_bytes: [u8; 4],
+}
+
+impl PreparedJoinedEncodedRowProjection {
+    pub(crate) fn try_new(columns: &[EncodedRowProjectionColumn]) -> Result<Self> {
+        let projected_count =
+            u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+        let mut left_requests = Vec::new();
+        let mut right_requests = Vec::new();
+        for (output_idx, column) in columns.iter().copied().enumerate() {
+            match column.source {
+                EncodedRowProjectionSource::Left => {
+                    left_requests.push((column.index, output_idx));
+                }
+                EncodedRowProjectionSource::Right => {
+                    right_requests.push((column.index, output_idx));
+                }
+            }
+        }
+        left_requests.sort_unstable_by_key(|(index, _)| *index);
+        right_requests.sort_unstable_by_key(|(index, _)| *index);
+
+        Ok(Self {
+            columns: columns.to_vec(),
+            left_requests,
+            right_requests,
+            projected_count_bytes: projected_count.to_le_bytes(),
+        })
+    }
+
+    fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EncodedRowScalar {
     Int64(i64),
@@ -171,6 +211,77 @@ pub fn extract_encoded_row_i64_like_column(
     }
 }
 
+pub fn extract_encoded_row_columns_and_i64_like_column(
+    bytes: &[u8],
+    indices: &[usize],
+    target_index: usize,
+    require_non_null: bool,
+) -> Result<Option<(Vec<u8>, i64)>> {
+    let count = encoded_row_column_count(bytes)?;
+    if indices.iter().any(|index| *index >= count) || target_index >= count {
+        return Err(anyhow!(
+            "encoded row has {count} columns but a requested index was out of bounds"
+        ));
+    }
+
+    let mut requested = indices
+        .iter()
+        .enumerate()
+        .map(|(slot, index)| (*index, slot))
+        .collect::<Vec<_>>();
+    requested.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut spans = vec![(0usize, 0usize); indices.len()];
+    let mut request_idx = 0usize;
+    let mut target_value = None;
+    let mut cursor = 4usize;
+
+    for column_idx in 0..count {
+        let start = cursor;
+        let tag = *bytes
+            .get(cursor)
+            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
+        cursor += 1;
+        let value_cursor = cursor;
+        cursor = encoded_field_end(bytes, cursor, tag)?;
+        let end = cursor;
+
+        while request_idx < requested.len() && requested[request_idx].0 == column_idx {
+            if require_non_null && is_null_field_tag(tag) {
+                return Ok(None);
+            }
+            let slot = requested[request_idx].1;
+            spans[slot] = (start, end);
+            request_idx += 1;
+        }
+
+        if column_idx == target_index {
+            target_value = match decode_encoded_scalar(bytes, value_cursor, tag)? {
+                Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value)) => {
+                    Some(value)
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected i64-like encoded field at index {target_index}, found {other:?}"
+                    ));
+                }
+                None => return Ok(None),
+            };
+        }
+    }
+
+    let total_payload_len = spans.iter().map(|(start, end)| end - start).sum::<usize>();
+    let selected_count =
+        u32::try_from(indices.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut out = Vec::with_capacity(4 + total_payload_len);
+    out.extend_from_slice(&selected_count.to_le_bytes());
+    for (start, end) in spans {
+        out.extend_from_slice(&bytes[start..end]);
+    }
+
+    Ok(target_value.map(|value| (out, value)))
+}
+
 pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
     let left_count = encoded_row_column_count(left)?;
     let right_count = encoded_row_column_count(right)?;
@@ -187,43 +298,14 @@ pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn project_joined_encoded_rows(
     left: &[u8],
     right: &[u8],
     columns: &[EncodedRowProjectionColumn],
 ) -> Result<Vec<u8>> {
-    let mut left_requests = Vec::new();
-    let mut right_requests = Vec::new();
-    for (output_idx, column) in columns.iter().enumerate() {
-        match column.source {
-            EncodedRowProjectionSource::Left => left_requests.push((column.index, output_idx)),
-            EncodedRowProjectionSource::Right => right_requests.push((column.index, output_idx)),
-        }
-    }
-
-    let mut spans_by_output = vec![(0usize, 0usize); columns.len()];
-    let mut total_payload_len = 0usize;
-    for (output_idx, start, end) in collect_encoded_field_spans(left, &left_requests)? {
-        spans_by_output[output_idx] = (start, end);
-        total_payload_len += end - start;
-    }
-    for (output_idx, start, end) in collect_encoded_field_spans(right, &right_requests)? {
-        spans_by_output[output_idx] = (start, end);
-        total_payload_len += end - start;
-    }
-
-    let projected_count =
-        u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
-    let mut out = Vec::with_capacity(4 + total_payload_len);
-    out.extend_from_slice(&projected_count.to_le_bytes());
-    for (output_idx, (start, end)) in spans_by_output.into_iter().enumerate() {
-        let source_bytes = match columns[output_idx].source {
-            EncodedRowProjectionSource::Left => left,
-            EncodedRowProjectionSource::Right => right,
-        };
-        out.extend_from_slice(&source_bytes[start..end]);
-    }
-    Ok(out)
+    let plan = PreparedJoinedEncodedRowProjection::try_new(columns)?;
+    project_joined_encoded_rows_prepared(left, right, &plan)
 }
 
 fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
@@ -320,10 +402,15 @@ fn is_null_field_tag(tag: u8) -> bool {
     matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08)
 }
 
-fn collect_encoded_field_spans(
+fn collect_encoded_field_spans_into(
     bytes: &[u8],
     requests: &[(usize, usize)],
-) -> Result<Vec<(usize, usize, usize)>> {
+    spans_by_output: &mut [(usize, usize)],
+) -> Result<usize> {
+    if requests.is_empty() {
+        return Ok(0);
+    }
+
     let count = encoded_row_column_count(bytes)?;
     if requests.iter().any(|(index, _)| *index >= count) {
         return Err(anyhow!(
@@ -331,12 +418,9 @@ fn collect_encoded_field_spans(
         ));
     }
 
-    let mut requested = requests.to_vec();
-    requested.sort_unstable_by_key(|(index, _)| *index);
-
-    let mut spans = Vec::with_capacity(requested.len());
     let mut request_idx = 0usize;
     let mut cursor = 4usize;
+    let mut total_payload_len = 0usize;
 
     for column_idx in 0..count {
         let start = cursor;
@@ -347,13 +431,58 @@ fn collect_encoded_field_spans(
         cursor = encoded_field_end(bytes, cursor, tag)?;
         let end = cursor;
 
-        while request_idx < requested.len() && requested[request_idx].0 == column_idx {
-            spans.push((requested[request_idx].1, start, end));
+        while request_idx < requests.len() && requests[request_idx].0 == column_idx {
+            let output_idx = requests[request_idx].1;
+            spans_by_output[output_idx] = (start, end);
+            total_payload_len += end - start;
             request_idx += 1;
         }
     }
 
-    Ok(spans)
+    Ok(total_payload_len)
+}
+
+pub(crate) fn project_joined_encoded_rows_prepared(
+    left: &[u8],
+    right: &[u8],
+    plan: &PreparedJoinedEncodedRowProjection,
+) -> Result<Vec<u8>> {
+    const INLINE_PROJECTED_COLUMNS: usize = 32;
+
+    if plan.column_count() <= INLINE_PROJECTED_COLUMNS {
+        let mut inline_spans = [(0usize, 0usize); INLINE_PROJECTED_COLUMNS];
+        project_joined_encoded_rows_with_spans(
+            left,
+            right,
+            plan,
+            &mut inline_spans[..plan.column_count()],
+        )
+    } else {
+        let mut spans = vec![(0usize, 0usize); plan.column_count()];
+        project_joined_encoded_rows_with_spans(left, right, plan, &mut spans)
+    }
+}
+
+fn project_joined_encoded_rows_with_spans(
+    left: &[u8],
+    right: &[u8],
+    plan: &PreparedJoinedEncodedRowProjection,
+    spans_by_output: &mut [(usize, usize)],
+) -> Result<Vec<u8>> {
+    let total_payload_len =
+        collect_encoded_field_spans_into(left, &plan.left_requests, spans_by_output)?
+            + collect_encoded_field_spans_into(right, &plan.right_requests, spans_by_output)?;
+
+    let mut out = Vec::with_capacity(4 + total_payload_len);
+    out.extend_from_slice(&plan.projected_count_bytes);
+    for (output_idx, (start, end)) in spans_by_output.iter().copied().enumerate() {
+        let source_bytes = match plan.columns[output_idx].source {
+            EncodedRowProjectionSource::Left => left,
+            EncodedRowProjectionSource::Right => right,
+        };
+        out.extend_from_slice(&source_bytes[start..end]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

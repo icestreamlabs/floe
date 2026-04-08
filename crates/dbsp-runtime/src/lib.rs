@@ -29,6 +29,8 @@ pub mod topk;
 pub mod topn;
 pub mod union;
 pub mod window;
+pub mod window_count_aggregate;
+pub mod window_count_star_aggregate;
 
 pub use dbsp_storage::storage;
 
@@ -80,3 +82,5 @@ pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
+pub use window_count_aggregate::DbspWindowCountAggregate;
+pub use window_count_star_aggregate::DbspWindowCountStarAggregate;

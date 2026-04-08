@@ -22,7 +22,7 @@ pub mod semantic {
 pub use dbsp_runtime::{
     aggregate, algebra, collections, count_aggregate, distinct, filter, filter_map, handles,
     incremental_aggregate, join, map, operators, relation_state, semijoin, stream, top1, topk,
-    topn, union, window,
+    topn, union, window, window_count_aggregate, window_count_star_aggregate,
 };
 pub use dbsp_storage::storage;
 
@@ -72,3 +72,5 @@ pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
+pub use window_count_aggregate::DbspWindowCountAggregate;
+pub use window_count_star_aggregate::DbspWindowCountStarAggregate;

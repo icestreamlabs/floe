@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int64Array, Int64Builder, StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, Int64Array, Int64Builder, StringArray, StringBuilder,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
@@ -14,6 +17,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 use floe_sql_parser::MaterializedViewDefinition;
+use regex::Regex;
 
 use crate::source::SourceRegistry;
 
@@ -138,6 +142,25 @@ fn null_i64_value(len: usize) -> ColumnarValue {
     ColumnarValue::Array(array)
 }
 
+fn translate_date_format_pattern(pattern: &str) -> String {
+    pattern
+        .replace("yyyy", "%Y")
+        .replace("MM", "%m")
+        .replace("dd", "%d")
+        .replace("HH", "%H")
+        .replace("mm", "%M")
+        .replace("ss", "%S")
+}
+
+fn split_index_value(text: &str, delimiter: &str, index: i64) -> Option<String> {
+    if index < 0 || delimiter.is_empty() {
+        return None;
+    }
+    text.split(delimiter)
+        .nth(index as usize)
+        .map(str::to_string)
+}
+
 fn planner_udfs() -> Vec<ScalarUDF> {
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
@@ -147,12 +170,148 @@ fn planner_udfs() -> Vec<ScalarUDF> {
                 .unwrap_or_else(|| null_ts_value(udf_batch_len(args))))
         },
     );
-    let scalar_utf8: ScalarFunctionImplementation = Arc::new(
+    let date_format_udf: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
-            Ok(args
+            let len = udf_batch_len(args);
+            let ts = args
                 .first()
                 .cloned()
-                .unwrap_or_else(|| null_utf8_value(udf_batch_len(args))))
+                .unwrap_or_else(|| null_ts_value(len))
+                .into_array(len)?;
+            let fmt = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let (Some(ts), Some(fmt)) = (
+                ts.as_any().downcast_ref::<TimestampMillisecondArray>(),
+                fmt.as_any().downcast_ref::<StringArray>(),
+            ) else {
+                return Ok(null_utf8_value(len));
+            };
+
+            let mut out = StringBuilder::new();
+            for row_idx in 0..len {
+                if ts.is_null(row_idx) || fmt.is_null(row_idx) {
+                    out.append_null();
+                    continue;
+                }
+
+                let Some(dt) = chrono::DateTime::<Utc>::from_timestamp_millis(ts.value(row_idx))
+                else {
+                    out.append_null();
+                    continue;
+                };
+                let pattern = translate_date_format_pattern(fmt.value(row_idx));
+                out.append_value(dt.format(&pattern).to_string());
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
+        },
+    );
+    let regexp_extract_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let text = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let pattern = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let group = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| null_i64_value(len))
+                .into_array(len)?;
+            let (Some(text), Some(pattern), Some(group)) = (
+                text.as_any().downcast_ref::<StringArray>(),
+                pattern.as_any().downcast_ref::<StringArray>(),
+                group.as_any().downcast_ref::<Int64Array>(),
+            ) else {
+                return Ok(null_utf8_value(len));
+            };
+
+            let mut cache: HashMap<String, Option<Regex>> = HashMap::new();
+            let mut out = StringBuilder::new();
+            for row_idx in 0..len {
+                if text.is_null(row_idx) || pattern.is_null(row_idx) || group.is_null(row_idx) {
+                    out.append_null();
+                    continue;
+                }
+
+                let group_idx = group.value(row_idx);
+                if group_idx < 0 {
+                    out.append_null();
+                    continue;
+                }
+
+                let pattern_text = pattern.value(row_idx);
+                let regex = cache
+                    .entry(pattern_text.to_string())
+                    .or_insert_with(|| Regex::new(pattern_text).ok());
+                let Some(regex) = regex.as_ref() else {
+                    out.append_null();
+                    continue;
+                };
+                let Some(captures) = regex.captures(text.value(row_idx)) else {
+                    out.append_null();
+                    continue;
+                };
+                let Some(matched) = captures.get(group_idx as usize) else {
+                    out.append_null();
+                    continue;
+                };
+                out.append_value(matched.as_str());
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
+        },
+    );
+    let split_index_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let text = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let delimiter = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| null_utf8_value(len))
+                .into_array(len)?;
+            let index = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| null_i64_value(len))
+                .into_array(len)?;
+            let (Some(text), Some(delimiter), Some(index)) = (
+                text.as_any().downcast_ref::<StringArray>(),
+                delimiter.as_any().downcast_ref::<StringArray>(),
+                index.as_any().downcast_ref::<Int64Array>(),
+            ) else {
+                return Ok(null_utf8_value(len));
+            };
+
+            let mut out = StringBuilder::new();
+            for row_idx in 0..len {
+                if text.is_null(row_idx) || delimiter.is_null(row_idx) || index.is_null(row_idx) {
+                    out.append_null();
+                    continue;
+                }
+
+                match split_index_value(
+                    text.value(row_idx),
+                    delimiter.value(row_idx),
+                    index.value(row_idx),
+                ) {
+                    Some(value) => out.append_value(value),
+                    None => out.append_null(),
+                }
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
         },
     );
     let hour_udf: ScalarFunctionImplementation = Arc::new(
@@ -325,21 +484,21 @@ fn planner_udfs() -> Vec<ScalarUDF> {
             vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
             DataType::Utf8,
             Volatility::Immutable,
-            Arc::clone(&scalar_utf8),
+            regexp_extract_udf,
         ),
         create_udf(
             "split_index",
             vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
             DataType::Utf8,
             Volatility::Immutable,
-            Arc::clone(&scalar_utf8),
+            split_index_udf,
         ),
         create_udf(
             "date_format",
             vec![ts.clone(), DataType::Utf8],
             DataType::Utf8,
             Volatility::Immutable,
-            Arc::clone(&scalar_utf8),
+            date_format_udf,
         ),
         create_udf(
             "hour",
@@ -399,6 +558,7 @@ pub(crate) fn to_camel_case(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use datafusion::arrow::array::{Array, StringArray};
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
     use floe_sql_parser::parse_materialized_view;
 
@@ -576,5 +736,106 @@ mod tests {
             logical_plan.contains("Aggregate"),
             "logical plan was: {logical_plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn regexp_extract_returns_capture_and_null_for_invalid_pattern() {
+        let ctx = SessionContext::new();
+        register_nexmark_udfs(&ctx);
+
+        let batches = ctx
+            .sql(
+                "SELECT \
+                 REGEXP_EXTRACT('x&channel_id=abc123&y=1', '(&|^)channel_id=([^&]*)', 2) AS capture, \
+                 REGEXP_EXTRACT('abc', '(', 1) AS invalid_pattern, \
+                 REGEXP_EXTRACT('abc', '(a)', 9) AS missing_group",
+            )
+            .await
+            .expect("build udf query")
+            .collect()
+            .await
+            .expect("collect udf query");
+
+        let batch = batches.first().expect("single batch");
+        let capture = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("capture string array");
+        let invalid_pattern = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("invalid_pattern string array");
+        let missing_group = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("missing_group string array");
+
+        assert_eq!(capture.value(0), "abc123");
+        assert!(invalid_pattern.is_null(0));
+        assert!(missing_group.is_null(0));
+    }
+
+    #[tokio::test]
+    async fn split_index_returns_segments_and_null_for_invalid_inputs() {
+        let ctx = SessionContext::new();
+        register_nexmark_udfs(&ctx);
+
+        let batches = ctx
+            .sql(
+                "SELECT \
+                 SPLIT_INDEX('https://example.com/dir/item/42', '/', 3) AS dir1, \
+                 SPLIT_INDEX('https://example.com/dir/item/42', '/', 4) AS dir2, \
+                 SPLIT_INDEX('https://example.com/dir/item/42', '/', 5) AS dir3, \
+                 SPLIT_INDEX('abc', '', 0) AS empty_delimiter, \
+                 SPLIT_INDEX('abc', '/', -1) AS negative_index, \
+                 SPLIT_INDEX('abc', '/', 5) AS out_of_range",
+            )
+            .await
+            .expect("build split_index query")
+            .collect()
+            .await
+            .expect("collect split_index query");
+
+        let batch = batches.first().expect("single batch");
+        let dir1 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dir1 string array");
+        let dir2 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dir2 string array");
+        let dir3 = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dir3 string array");
+        let empty_delimiter = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("empty_delimiter string array");
+        let negative_index = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("negative_index string array");
+        let out_of_range = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("out_of_range string array");
+
+        assert_eq!(dir1.value(0), "dir");
+        assert_eq!(dir2.value(0), "item");
+        assert_eq!(dir3.value(0), "42");
+        assert!(empty_delimiter.is_null(0));
+        assert!(negative_index.is_null(0));
+        assert!(out_of_range.is_null(0));
     }
 }

@@ -2,8 +2,8 @@ use super::*;
 use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
-    EncodedRowProjectionColumn, concat_encoded_rows, extract_encoded_row_columns,
-    project_joined_encoded_rows,
+    EncodedRowProjectionColumn, PreparedJoinedEncodedRowProjection, concat_encoded_rows,
+    extract_encoded_row_columns, project_joined_encoded_rows_prepared,
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
@@ -817,108 +817,96 @@ impl DbspGraphBuilder {
             .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
         let right_output_projection = (right_join_schema.len() != right_schema.len())
             .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
+        let prepared_output_projection = output_projection
+            .as_ref()
+            .map(|columns| PreparedJoinedEncodedRowProjection::try_new(columns.as_ref()))
+            .transpose()
+            .context("prepare transient join output projection")?
+            .map(Arc::new);
 
-        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %left_graph_id,
-                        error = %err,
-                        "failed to extract join left key columns"
-                    );
-                    None
-                }
-            }
-        };
-
-        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %right_graph_id,
-                        error = %err,
-                        "failed to extract join right key columns"
-                    );
-                    None
-                }
-            }
-        };
-
-        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
-
-        let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
-                match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
-                    Ok(Some(encoded)) => encoded,
-                    Ok(None) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            "transient join left output projection unexpectedly returned null"
-                        );
-                        return Vec::new();
+        let make_projector = {
+            let left_output_projection = left_output_projection.clone();
+            let right_output_projection = right_output_projection.clone();
+            let prepared_output_projection = prepared_output_projection.clone();
+            let projector_graph_id = projector_graph_id.clone();
+            move || {
+                let left_output_projection = left_output_projection.clone();
+                let right_output_projection = right_output_projection.clone();
+                let prepared_output_projection = prepared_output_projection.clone();
+                let projector_graph_id = projector_graph_id.clone();
+                move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+                    let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
+                        match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
+                            Ok(Some(encoded)) => encoded,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    "transient join left output projection unexpectedly returned null"
+                                );
+                                return Vec::new();
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    error = %err,
+                                    "failed to project transient join left output columns"
+                                );
+                                return Vec::new();
+                            }
+                        }
+                    } else {
+                        left_bytes.clone()
+                    };
+                    let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
+                        match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
+                            Ok(Some(encoded)) => encoded,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    "transient join right output projection unexpectedly returned null"
+                                );
+                                return Vec::new();
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    error = %err,
+                                    "failed to project transient join right output columns"
+                                );
+                                return Vec::new();
+                            }
+                        }
+                    } else {
+                        right_bytes.clone()
+                    };
+                    if let Some(plan) = prepared_output_projection.as_ref() {
+                        return match project_joined_encoded_rows_prepared(
+                            &left_encoded,
+                            &right_encoded,
+                            plan,
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(err) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    error = %err,
+                                    "failed to project join output columns directly"
+                                );
+                                Vec::new()
+                            }
+                        };
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            error = %err,
-                            "failed to project transient join left output columns"
-                        );
-                        return Vec::new();
+                    match concat_encoded_rows(&left_encoded, &right_encoded) {
+                        Ok(encoded) => encoded,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %projector_graph_id,
+                                error = %err,
+                                "failed to concatenate join projection rows"
+                            );
+                            Vec::new()
+                        }
                     }
-                }
-            } else {
-                left_bytes.clone()
-            };
-            let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
-                match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
-                    Ok(Some(encoded)) => encoded,
-                    Ok(None) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            "transient join right output projection unexpectedly returned null"
-                        );
-                        return Vec::new();
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            error = %err,
-                            "failed to project transient join right output columns"
-                        );
-                        return Vec::new();
-                    }
-                }
-            } else {
-                right_bytes.clone()
-            };
-            if let Some(columns) = output_projection.as_ref() {
-                return match project_joined_encoded_rows(
-                    &left_encoded,
-                    &right_encoded,
-                    columns.as_ref(),
-                ) {
-                    Ok(encoded) => encoded,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            error = %err,
-                            "failed to project join output columns directly"
-                        );
-                        Vec::new()
-                    }
-                };
-            }
-            match concat_encoded_rows(&left_encoded, &right_encoded) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %projector_graph_id,
-                        error = %err,
-                        "failed to concatenate join projection rows"
-                    );
-                    Vec::new()
                 }
             }
         };
@@ -949,6 +937,34 @@ impl DbspGraphBuilder {
             });
         });
 
+        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %left_graph_id,
+                        error = %err,
+                        "failed to extract join left key columns"
+                    );
+                    None
+                }
+            }
+        };
+
+        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
+            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
+                Ok(selected) => selected,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %right_graph_id,
+                        error = %err,
+                        "failed to extract join right key columns"
+                    );
+                    None
+                }
+            }
+        };
+
         DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
             &left,
             &right,
@@ -957,8 +973,8 @@ impl DbspGraphBuilder {
             true,
             left_key,
             right_key,
-            predicate,
-            projector,
+            |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true },
+            make_projector(),
             observer,
             Some(join_error_handler),
         )
