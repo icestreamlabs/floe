@@ -66,10 +66,44 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     ctx.register_table("nexmark_bid", provider)
         .expect("register nexmark_bid");
     register_planner_test_udfs(&ctx);
-    ctx.state()
+    let plan = ctx
+        .state()
         .create_logical_plan(sql)
         .await
-        .expect("build logical plan")
+        .expect("build logical plan");
+    let optimized = ctx.state().optimize(&plan).expect("optimize logical plan");
+    if logical_plan_uses_only_dbsp_supported_types(&optimized) {
+        optimized
+    } else {
+        plan
+    }
+}
+
+fn logical_plan_uses_only_dbsp_supported_types(
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> bool {
+    logical_plan_node_supported(plan)
+        && plan
+            .inputs()
+            .into_iter()
+            .all(logical_plan_uses_only_dbsp_supported_types)
+}
+
+fn logical_plan_node_supported(plan: &datafusion::logical_expr::LogicalPlan) -> bool {
+    plan.schema()
+        .fields()
+        .iter()
+        .all(|field| dbsp_supported_arrow_type(field.data_type()))
+}
+
+fn dbsp_supported_arrow_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int64
+            | DataType::Utf8
+            | DataType::Boolean
+            | DataType::Timestamp(TimeUnit::Millisecond, None)
+    )
 }
 
 fn register_planner_test_udfs(ctx: &SessionContext) {

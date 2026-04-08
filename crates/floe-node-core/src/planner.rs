@@ -62,6 +62,21 @@ pub async fn plan_materialized_views(
                     definition.name()
                 )
             })?;
+        let optimized = ctx.state().optimize(&plan).with_context(|| {
+            format!(
+                "failed to optimize logical plan for materialized view {}",
+                definition.name()
+            )
+        })?;
+        let plan = if logical_plan_uses_only_dbsp_supported_types(&optimized) {
+            optimized
+        } else {
+            tracing::debug!(
+                view = %definition.name(),
+                "falling back to unoptimized logical plan because optimized plan uses unsupported DBSP types"
+            );
+            plan
+        };
         plans.push(PlannedMaterializedView {
             definition: definition.clone(),
             logical_plan: plan,
@@ -98,6 +113,31 @@ fn register_nexmark_udfs(ctx: &SessionContext) {
     for udf in planner_udfs() {
         ctx.register_udf(udf);
     }
+}
+
+fn logical_plan_uses_only_dbsp_supported_types(plan: &LogicalPlan) -> bool {
+    logical_plan_node_supported(plan)
+        && plan
+            .inputs()
+            .into_iter()
+            .all(logical_plan_uses_only_dbsp_supported_types)
+}
+
+fn logical_plan_node_supported(plan: &LogicalPlan) -> bool {
+    plan.schema()
+        .fields()
+        .iter()
+        .all(|field| dbsp_supported_arrow_type(field.data_type()))
+}
+
+fn dbsp_supported_arrow_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int64
+            | DataType::Utf8
+            | DataType::Boolean
+            | DataType::Timestamp(TimeUnit::Millisecond, None)
+    )
 }
 
 fn passthrough_window_udf(

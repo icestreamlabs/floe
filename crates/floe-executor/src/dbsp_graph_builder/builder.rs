@@ -3047,8 +3047,11 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
     if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
     }
-    if let Some(shape) = find_transient_source_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_name().to_string()])));
+    // Keep orchestration durability decisions aligned with the builder by using the same
+    // recursive source-root matcher here. Optimizer-inserted wrapper projections can otherwise
+    // preserve the transient fast path in the builder while leaving durable outer streams enabled.
+    if let Some(shape) = try_build_transient_source_root_materialization(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_name])));
     }
     if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
         && shape
@@ -4931,8 +4934,8 @@ mod tests {
     use crate::GraphTaskError;
     use crate::dbsp_bridge::DbspBridge;
     use crate::dbsp_plan::{
-        DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
-        validate_dbsp_plan,
+        CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, DbspProjectNode, DbspSourceNode,
+        ProjectItem, nexmark_auction_table, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
     };
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::outer_stream::OuterStreamRegistry;
@@ -4993,6 +4996,73 @@ mod tests {
         assert!(
             try_build_direct_join_output_projection(join, &transient_opt.steps).is_some(),
             "expected benchmark join root to expose a direct output projection: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn nested_source_projection_root_stays_source_batch_journal_eligible() {
+        let source_table = nexmark_bid_table();
+        let source_schema = source_table.schema().clone();
+        let first_items = source_schema
+            .fields()
+            .iter()
+            .map(|field| ProjectItem {
+                expr: col(field.name.as_str()),
+                alias: Some(field.name.clone()),
+            })
+            .collect::<Vec<_>>();
+        let first_project =
+            DbspProjectNode::try_new(Arc::clone(&source_schema), first_items).expect("project");
+        let first_schema = first_project.output_schema().clone();
+        let second_items = first_schema
+            .fields()
+            .iter()
+            .map(|field| ProjectItem {
+                expr: col(field.name.as_str()),
+                alias: Some(field.name.clone()),
+            })
+            .collect::<Vec<_>>();
+        let second_project =
+            DbspProjectNode::try_new(Arc::clone(&first_schema), second_items).expect("project");
+        let second_schema = second_project.output_schema().clone();
+        let plan = CircuitPlan {
+            root: 2,
+            nodes: vec![
+                CircuitNode {
+                    id: 0,
+                    kind: DbspNodeKind::Source(DbspSourceNode {
+                        table: source_table,
+                    }),
+                    inputs: vec![],
+                    output_schema: source_schema,
+                },
+                CircuitNode {
+                    id: 1,
+                    kind: DbspNodeKind::Project(first_project),
+                    inputs: vec![0],
+                    output_schema: first_schema,
+                },
+                CircuitNode {
+                    id: 2,
+                    kind: DbspNodeKind::Project(second_project),
+                    inputs: vec![1],
+                    output_schema: second_schema,
+                },
+            ],
+        };
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
+        );
+        assert!(
+            try_build_transient_source_root_materialization(&plan, plan.root)
+                .expect("transient source root materialization")
+                .is_some(),
+            "expected nested source projections to remain transient-eligible: {plan:#?}"
         );
     }
 
@@ -6578,10 +6648,42 @@ mod tests {
         ctx.register_table("nexmark_auction", auction_provider)
             .expect("register nexmark_auction");
         register_planner_test_udfs(&ctx);
-        ctx.state()
+        let plan = ctx
+            .state()
             .create_logical_plan(sql)
             .await
-            .expect("build logical plan")
+            .expect("build logical plan");
+        let optimized = ctx.state().optimize(&plan).expect("optimize logical plan");
+        if logical_plan_uses_only_dbsp_supported_types(&optimized) {
+            optimized
+        } else {
+            plan
+        }
+    }
+
+    fn logical_plan_uses_only_dbsp_supported_types(plan: &LogicalPlan) -> bool {
+        logical_plan_node_supported(plan)
+            && plan
+                .inputs()
+                .into_iter()
+                .all(logical_plan_uses_only_dbsp_supported_types)
+    }
+
+    fn logical_plan_node_supported(plan: &LogicalPlan) -> bool {
+        plan.schema()
+            .fields()
+            .iter()
+            .all(|field| dbsp_supported_arrow_type(field.data_type()))
+    }
+
+    fn dbsp_supported_arrow_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Int64
+                | DataType::Utf8
+                | DataType::Boolean
+                | DataType::Timestamp(TimeUnit::Millisecond, None)
+        )
     }
 
     fn register_planner_test_udfs(ctx: &SessionContext) {

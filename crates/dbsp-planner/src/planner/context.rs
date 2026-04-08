@@ -168,26 +168,30 @@ impl<'cfg> PlannerContext<'cfg> {
                 if let Some(topn) = self.plan_row_number_filter(filter)? {
                     return Ok(topn);
                 }
+                let normalized_predicate = normalize_expr(filter.predicate.clone())?;
                 if let LogicalPlan::Projection(projection) = filter.input.as_ref() {
                     let base = self.plan_node(&projection.input)?;
-                    let select = DbspSelectNode::try_new(
-                        base.schema.clone(),
-                        normalize_expr(filter.predicate.clone())?,
-                    )?;
-                    let filter_id = self.add_node(
-                        vec![base.id],
-                        DbspNodeKind::Select(select),
-                        base.schema.clone(),
-                    );
-                    let filtered = PlannedNode {
-                        id: filter_id,
-                        schema: base.schema.clone(),
-                    };
-                    return self.build_projection_node(filtered, projection);
+                    let predicate_references_only_base_columns = normalized_predicate
+                        .column_refs()
+                        .iter()
+                        .all(|column| base.schema.field_index(column.name.as_str()).is_some());
+                    if predicate_references_only_base_columns {
+                        let select =
+                            DbspSelectNode::try_new(base.schema.clone(), normalized_predicate)?;
+                        let filter_id = self.add_node(
+                            vec![base.id],
+                            DbspNodeKind::Select(select),
+                            base.schema.clone(),
+                        );
+                        let filtered = PlannedNode {
+                            id: filter_id,
+                            schema: base.schema.clone(),
+                        };
+                        return self.build_projection_node(filtered, projection);
+                    }
                 }
 
                 let input = self.plan_node(&filter.input)?;
-                let normalized_predicate = normalize_expr(filter.predicate.clone())?;
                 if let Some(optimized) = self.optimize_join_subtree(
                     input.clone(),
                     Some(normalized_predicate.clone()),
@@ -199,6 +203,12 @@ impl<'cfg> PlannerContext<'cfg> {
                 if matches!(filter.input.as_ref(), LogicalPlan::Projection(_))
                     && let Some(node) = self.node_by_id(input.id)
                     && let DbspNodeKind::Project(project) = &node.kind
+                    && normalized_predicate.column_refs().iter().all(|column| {
+                        project
+                            .input_schema()
+                            .field_index(column.name.as_str())
+                            .is_some()
+                    })
                 {
                     predicate_schema = Arc::clone(project.input_schema());
                 }
