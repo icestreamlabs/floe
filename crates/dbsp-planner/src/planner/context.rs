@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -292,7 +292,9 @@ impl<'cfg> PlannerContext<'cfg> {
         input: PlannedNode,
         expressions: &[Expr],
     ) -> Result<PlannedNode, PlannerError> {
-        let items = expressions
+        let rewritten_expressions =
+            self.rewrite_projection_expressions_for_input(&input, expressions)?;
+        let items = rewritten_expressions
             .iter()
             .map(|expr| {
                 let (expression, alias) = extract_alias(expr.clone())?;
@@ -313,6 +315,38 @@ impl<'cfg> PlannerContext<'cfg> {
             id,
             schema: output_schema,
         })
+    }
+
+    fn rewrite_projection_expressions_for_input(
+        &self,
+        input: &PlannedNode,
+        expressions: &[Expr],
+    ) -> Result<Vec<Expr>, PlannerError> {
+        let join = self.join_node_for_projection_input(input.id);
+        let Some(join) = join else {
+            return Ok(expressions.to_vec());
+        };
+        let relation_sides = infer_join_relation_sides(Some(expressions), None, join);
+        expressions
+            .iter()
+            .map(|expr| rewrite_join_output_projection_expr(expr.clone(), join, &relation_sides))
+            .collect()
+    }
+
+    fn join_node_for_projection_input(&self, input_id: usize) -> Option<&DbspJoinNode> {
+        let node = self.node_by_id(input_id)?;
+        match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            DbspNodeKind::Select(_) => {
+                let join_input_id = *node.inputs.first()?;
+                let join_node = self.node_by_id(join_input_id)?;
+                match &join_node.kind {
+                    DbspNodeKind::Join(join) => Some(join),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn optimize_join_subtree(
@@ -352,11 +386,29 @@ impl<'cfg> PlannerContext<'cfg> {
             return Ok(None);
         }
 
-        let required_output_columns = if let Some(expressions) = projection_exprs {
-            required_columns_for_expressions(expressions, input.schema.as_ref())?
-        } else {
-            (0..input.schema.len()).collect::<BTreeSet<_>>()
-        };
+        let join_relation_sides =
+            infer_join_relation_sides(projection_exprs, current_top_filter.as_ref(), join);
+        let rewritten_projection_exprs = projection_exprs
+            .map(|expressions| {
+                expressions
+                    .iter()
+                    .map(|expr| {
+                        rewrite_join_output_projection_expr(
+                            expr.clone(),
+                            join,
+                            &join_relation_sides,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, PlannerError>>()
+            })
+            .transpose()?;
+
+        let required_output_columns =
+            if let Some(expressions) = rewritten_projection_exprs.as_deref() {
+                required_columns_for_expressions(expressions, input.schema.as_ref())?
+            } else {
+                (0..input.schema.len()).collect::<BTreeSet<_>>()
+            };
         let SplitJoinFilter {
             left_pushdown,
             right_pushdown,
@@ -475,7 +527,7 @@ impl<'cfg> PlannerContext<'cfg> {
         if let Some(remaining) = remaining {
             current = self.build_select(current, remaining)?;
         }
-        if let Some(expressions) = projection_exprs {
+        if let Some(expressions) = rewritten_projection_exprs.as_deref() {
             return self.build_projection_items(current, expressions).map(Some);
         }
         Ok(Some(current))
@@ -1139,6 +1191,120 @@ fn required_columns_for_expressions(
         add_required_expression_columns(&expression, input_schema, &mut columns)?;
     }
     Ok(columns)
+}
+
+fn infer_join_relation_sides(
+    projection_exprs: Option<&[Expr]>,
+    top_filter: Option<&Expr>,
+    join: &DbspJoinNode,
+) -> HashMap<String, JoinInputSide> {
+    let mut inferred = HashMap::new();
+    if let Some(expressions) = projection_exprs {
+        for expr in expressions {
+            accumulate_join_relation_sides(expr, join, &mut inferred);
+        }
+    }
+    if let Some(filter) = top_filter {
+        accumulate_join_relation_sides(filter, join, &mut inferred);
+    }
+    inferred
+}
+
+fn accumulate_join_relation_sides(
+    expression: &Expr,
+    join: &DbspJoinNode,
+    inferred: &mut HashMap<String, JoinInputSide>,
+) {
+    for column in expression.column_refs() {
+        let Some(relation) = column.relation.as_ref().map(ToString::to_string) else {
+            continue;
+        };
+        let left_has = join.left_schema.field_index(column.name.as_str()).is_some();
+        let right_has = join
+            .right_schema
+            .field_index(column.name.as_str())
+            .is_some();
+        let Some(side) = (match (left_has, right_has) {
+            (true, false) => Some(JoinInputSide::Left),
+            (false, true) => Some(JoinInputSide::Right),
+            _ => None,
+        }) else {
+            continue;
+        };
+        inferred.entry(relation).or_insert(side);
+    }
+}
+
+fn rewrite_join_output_projection_expr(
+    expression: Expr,
+    join: &DbspJoinNode,
+    relation_sides: &HashMap<String, JoinInputSide>,
+) -> Result<Expr, PlannerError> {
+    expression
+        .transform_up(|expr| match expr {
+            Expr::Column(column) => {
+                let output_idx = resolve_join_output_column_index(&column, join, relation_sides)?;
+                let field = join.output_schema.field(output_idx).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "join output column index {output_idx} out of bounds",
+                    ))
+                })?;
+                Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                    field.name.clone(),
+                ))))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .map(|result| result.data)
+        .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+fn resolve_join_output_column_index(
+    column: &Column,
+    join: &DbspJoinNode,
+    relation_sides: &HashMap<String, JoinInputSide>,
+) -> Result<usize, DataFusionError> {
+    if let Some(relation) = column.relation.as_ref().map(ToString::to_string) {
+        if let Some(side) = relation_sides.get(&relation) {
+            return match side {
+                JoinInputSide::Left => join
+                    .left_schema
+                    .field_index(column.name.as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "column '{}.{}' not found in left join input schema",
+                            relation, column.name
+                        ))
+                    }),
+                JoinInputSide::Right => join
+                    .right_schema
+                    .field_index(column.name.as_str())
+                    .map(|idx| join.left_schema.len() + idx)
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "column '{}.{}' not found in right join input schema",
+                            relation, column.name
+                        ))
+                    }),
+            };
+        }
+    }
+
+    if let Some(output_idx) = join.output_schema.field_index(column.name.as_str()) {
+        return Ok(output_idx);
+    }
+
+    match (
+        join.left_schema.field_index(column.name.as_str()),
+        join.right_schema.field_index(column.name.as_str()),
+    ) {
+        (Some(output_idx), None) => Ok(output_idx),
+        (None, Some(right_idx)) => Ok(join.left_schema.len() + right_idx),
+        _ => Err(DataFusionError::Plan(format!(
+            "column '{}' could not be resolved in join output schema",
+            column.flat_name()
+        ))),
+    }
 }
 
 fn split_join_filter(

@@ -3323,7 +3323,8 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                 let group_key_count = aggregate.group_keys().len();
                 let aggregate_output_offset = 2 + group_key_count;
                 for column_idx in required_columns {
-                    let Some(aggregate_idx) = column_idx.checked_sub(aggregate_output_offset) else {
+                    let Some(aggregate_idx) = column_idx.checked_sub(aggregate_output_offset)
+                    else {
                         continue;
                     };
                     let aggregate_expr =
@@ -4963,7 +4964,7 @@ mod tests {
     use datafusion::logical_expr::{
         ColumnarValue, ScalarFunctionImplementation, Signature, TypeSignature, Volatility,
     };
-    use datafusion::logical_expr::{JoinType, LogicalPlan, col, lit, table_scan};
+    use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, col, lit, table_scan};
     use datafusion::prelude::SessionContext;
     use dbsp::DbspJoin;
     use dbsp::DbspPredicate;
@@ -5339,6 +5340,126 @@ mod tests {
             matches!(window_input.kind, DbspNodeKind::Source(_)),
             "expected optimized q7 window aggregate to read directly from source, found {:?}",
             window_input.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_q14_collapses_common_expr_projection_chain() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT auction, bidder, price * 908 / 1000 AS price, \
+                    CASE WHEN HOUR(date_time) >= 8 AND HOUR(date_time) <= 18 THEN 'dayTime' \
+                         WHEN HOUR(date_time) <= 6 OR HOUR(date_time) >= 20 THEN 'nightTime' \
+                         ELSE 'otherTime' END AS bid_time_type, \
+                    date_time, extra, COUNT_CHAR(extra, 'c') AS c_counts \
+             FROM nexmark_bid \
+             WHERE price * 908 / 1000 > 1000000 AND price * 908 / 1000 < 50000000",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        validate_dbsp_plan(
+            &plan,
+            &std::collections::BTreeSet::from(["nexmark_bid".to_string()]),
+            "benchmark_result",
+        )
+        .expect("validated circuit plan");
+
+        let project = plan.node(plan.root).expect("root node");
+        assert!(
+            matches!(project.kind, DbspNodeKind::Project(_)),
+            "expected q14 root to be final project, found {:?}",
+            project.kind
+        );
+
+        let mut project_layers_before_select = 0usize;
+        let mut select_idx = *project.inputs.first().expect("project input");
+        loop {
+            let node = plan.node(select_idx).expect("plan node");
+            match &node.kind {
+                DbspNodeKind::Project(_) => {
+                    project_layers_before_select += 1;
+                    select_idx = *node.inputs.first().expect("project child");
+                }
+                DbspNodeKind::Select(_) => break,
+                other => panic!(
+                    "expected optimized q14 root path to reach a select, found {:?}",
+                    other
+                ),
+            }
+        }
+        assert!(
+            project_layers_before_select <= 2,
+            "expected q14 common-expression normalization to bound the projection chain before the select, found {project_layers_before_select} layers"
+        );
+
+        let select = plan.node(select_idx).expect("select node");
+        assert!(
+            matches!(select.kind, DbspNodeKind::Select(_)),
+            "expected optimized q14 root path to reach a select, found {:?}",
+            select.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_q20_preserves_right_side_duplicate_columns() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT b.auction, b.bidder, b.price, b.channel, b.url, \
+                    b.date_time AS \"dateTime\", b.extra, \
+                    a.item_name AS \"itemName\", a.description, \
+                    a.initial_bid AS \"initialBid\", a.reserve, \
+                    a.date_time AS auction_time, a.expires, a.seller, \
+                    a.category, a.extra AS auction_extra \
+             FROM nexmark_bid AS b \
+             JOIN nexmark_auction AS a ON b.auction = a.id \
+             WHERE a.category = 10",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        validate_dbsp_plan(
+            &plan,
+            &std::collections::BTreeSet::from([
+                "nexmark_auction".to_string(),
+                "nexmark_bid".to_string(),
+            ]),
+            "benchmark_result",
+        )
+        .expect("validated circuit plan");
+
+        let project_node = plan.node(plan.root).expect("root node");
+        let DbspNodeKind::Project(project) = &project_node.kind else {
+            panic!(
+                "expected q20 root to be project, found {:?}",
+                project_node.kind
+            );
+        };
+
+        let auction_time = project
+            .expressions()
+            .iter()
+            .find(|expr| expr.alias() == "auction_time")
+            .expect("auction_time expression");
+        assert_eq!(
+            auction_time.expression().expr(),
+            &Expr::Column(Column::from_name("date_time_1"))
+        );
+
+        let auction_extra = project
+            .expressions()
+            .iter()
+            .find(|expr| expr.alias() == "auction_extra")
+            .expect("auction_extra expression");
+        assert_eq!(
+            auction_extra.expression().expr(),
+            &Expr::Column(Column::from_name("extra_1"))
+        );
+
+        let &join_idx = project_node.inputs.first().expect("join input");
+        let join = plan.node(join_idx).expect("join node");
+        assert!(
+            matches!(join.kind, DbspNodeKind::Join(_)),
+            "expected q20 root project to read directly from join, found {:?}",
+            join.kind
         );
     }
 
@@ -6966,6 +7087,105 @@ mod tests {
                 )))
             },
         );
+        let hour_udf: ScalarFunctionImplementation =
+            Arc::new(
+                |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                    let len = args
+                        .iter()
+                        .find_map(|arg| match arg {
+                            ColumnarValue::Array(array) => Some(array.len()),
+                            ColumnarValue::Scalar(_) => None,
+                        })
+                        .unwrap_or(1);
+                    let ts =
+                        args.first()
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                ColumnarValue::Array(Arc::new(
+                                    datafusion::arrow::array::TimestampMillisecondArray::from(
+                                        vec![None::<i64>; len],
+                                    ),
+                                ))
+                            })
+                            .into_array(len)?;
+                    let Some(ts) = ts
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
+                    else {
+                        return Ok(ColumnarValue::Array(Arc::new(
+                            datafusion::arrow::array::Int64Array::from(vec![None::<i64>; len]),
+                        )));
+                    };
+
+                    let values = (0..len)
+                        .map(|row_idx| {
+                            (!ts.is_null(row_idx))
+                                .then(|| ts.value(row_idx).div_euclid(3_600_000).rem_euclid(24))
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(ColumnarValue::Array(Arc::new(
+                        datafusion::arrow::array::Int64Array::from(values),
+                    )))
+                },
+            );
+        let count_char_udf: ScalarFunctionImplementation = Arc::new(
+            |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+                let len = args
+                    .iter()
+                    .find_map(|arg| match arg {
+                        ColumnarValue::Array(array) => Some(array.len()),
+                        ColumnarValue::Scalar(_) => None,
+                    })
+                    .unwrap_or(1);
+                let text = args
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ColumnarValue::Array(Arc::new(datafusion::arrow::array::StringArray::from(
+                            vec![None::<&str>; len],
+                        )))
+                    })
+                    .into_array(len)?;
+                let needle = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ColumnarValue::Array(Arc::new(datafusion::arrow::array::StringArray::from(
+                            vec![None::<&str>; len],
+                        )))
+                    })
+                    .into_array(len)?;
+                let (Some(text), Some(needle)) = (
+                    text.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>(),
+                    needle
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>(),
+                ) else {
+                    return Ok(ColumnarValue::Array(Arc::new(
+                        datafusion::arrow::array::Int64Array::from(vec![None::<i64>; len]),
+                    )));
+                };
+
+                let values = (0..len)
+                    .map(|row_idx| {
+                        if text.is_null(row_idx) || needle.is_null(row_idx) {
+                            return None;
+                        }
+                        let haystack = text.value(row_idx);
+                        let token = needle.value(row_idx);
+                        Some(if token.is_empty() {
+                            0
+                        } else {
+                            i64::try_from(haystack.matches(token).count()).unwrap_or(i64::MAX)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ColumnarValue::Array(Arc::new(
+                    datafusion::arrow::array::Int64Array::from(values),
+                )))
+            },
+        );
         ctx.register_udf(create_udf(
             "proctime",
             vec![],
@@ -7026,6 +7246,20 @@ mod tests {
             DataType::Utf8,
             Volatility::Immutable,
             date_format_udf,
+        ));
+        ctx.register_udf(create_udf(
+            "hour",
+            vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+            DataType::Int64,
+            Volatility::Immutable,
+            hour_udf,
+        ));
+        ctx.register_udf(create_udf(
+            "count_char",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Int64,
+            Volatility::Immutable,
+            count_char_udf,
         ));
     }
 

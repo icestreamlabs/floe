@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::common::Column;
+use datafusion::common::{
+    Column,
+    tree_node::{Transformed, TreeNode},
+};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 
 pub use dbsp::circuit::{
@@ -10,9 +13,8 @@ pub use dbsp::circuit::{
     DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType,
     DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
     DbspWindowPolicy, DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem,
-    RowSchema,
-    TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
-    nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
+    RowSchema, TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table,
+    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
 
 use crate::namespaces;
@@ -44,19 +46,25 @@ fn normalize_optimizer_source_projections(
         for idx in 0..plan.nodes.len() {
             let (new_inputs, new_kind, new_output_schema) = match plan.nodes[idx].kind.clone() {
                 DbspNodeKind::Project(project) => {
-                    let Some((project_input_idx, rebased_input_schema)) =
-                        bypassable_source_projection_input(&plan, &plan.nodes[idx].inputs)
+                    let Some((project_input_idx, rebased_input_schema, alias_exprs)) =
+                        inlinable_source_project_input(&plan, &plan.nodes[idx].inputs)
                     else {
                         continue;
                     };
-                    let items = project
+                    let items: std::result::Result<Vec<_>, PlannerError> = project
                         .expressions()
                         .iter()
-                        .map(|expr| ProjectItem {
-                            expr: expr.expression().expr().clone(),
-                            alias: Some(expr.alias().to_string()),
+                        .map(|expr| {
+                            Ok(ProjectItem {
+                                expr: rewrite_project_aliases(
+                                    expr.expression().expr().clone(),
+                                    &alias_exprs,
+                                )?,
+                                alias: Some(expr.alias().to_string()),
+                            })
                         })
                         .collect();
+                    let items = items?;
                     let rebased = DbspProjectNode::try_new(rebased_input_schema, items)
                         .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
                     (
@@ -111,8 +119,9 @@ fn normalize_optimizer_source_projections(
                             )
                         })
                         .collect();
-                    let rebased = DbspAggregateNode::try_new(rebased_input_schema, group_keys, aggregates)
-                        .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let rebased =
+                        DbspAggregateNode::try_new(rebased_input_schema, group_keys, aggregates)
+                            .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
                     let output_schema = Arc::clone(rebased.output_schema());
                     (
                         vec![project_input_idx],
@@ -151,9 +160,12 @@ fn normalize_optimizer_source_projections(
                             )
                         })
                         .collect();
-                    let aggregate =
-                        DbspAggregateNode::try_new(rebased_input_schema.clone(), group_keys, aggregates)
-                            .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let aggregate = DbspAggregateNode::try_new(
+                        rebased_input_schema.clone(),
+                        group_keys,
+                        aggregates,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
                     let window_spec = DbspWindowSpec::try_new(
                         window.window.policy.clone(),
                         window.window.time_expression.expr().clone(),
@@ -208,6 +220,50 @@ fn normalize_optimizer_source_projections(
                         rebased_input_schema,
                     )
                 }
+                DbspNodeKind::Join(join) => {
+                    let mut new_inputs = plan.nodes[idx].inputs.clone();
+                    let mut left_schema = Arc::clone(&join.left_schema);
+                    let mut right_schema = Arc::clone(&join.right_schema);
+
+                    if let Some((left_input_idx, rebased_left_schema)) =
+                        bypassable_identity_source_projection_input(&plan, new_inputs[0])
+                    {
+                        new_inputs[0] = left_input_idx;
+                        left_schema = rebased_left_schema;
+                    }
+                    if let Some((right_input_idx, rebased_right_schema)) =
+                        bypassable_identity_source_projection_input(&plan, new_inputs[1])
+                    {
+                        new_inputs[1] = right_input_idx;
+                        right_schema = rebased_right_schema;
+                    }
+                    if new_inputs == plan.nodes[idx].inputs {
+                        continue;
+                    }
+
+                    let key_pairs = join
+                        .keys
+                        .iter()
+                        .map(|key| {
+                            (
+                                key.left_expression().expr().clone(),
+                                key.right_expression().expr().clone(),
+                            )
+                        })
+                        .collect();
+                    let rebased = DbspJoinNode::try_new(
+                        join.join_type.clone(),
+                        left_schema,
+                        right_schema,
+                        key_pairs,
+                        join.residual
+                            .as_ref()
+                            .map(|residual| residual.expr().clone()),
+                    )
+                    .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+                    let output_schema = Arc::clone(&rebased.output_schema);
+                    (new_inputs, DbspNodeKind::Join(rebased), output_schema)
+                }
                 _ => continue,
             };
             if plan.nodes[idx].inputs != new_inputs {
@@ -220,6 +276,28 @@ fn normalize_optimizer_source_projections(
     }
     prune_unreachable_nodes(&mut plan);
     Ok(plan)
+}
+
+fn inlinable_source_project_input(
+    plan: &CircuitPlan,
+    inputs: &[usize],
+) -> Option<(usize, Arc<RowSchema>, BTreeMap<String, Expr>)> {
+    let [input_idx] = inputs else {
+        return None;
+    };
+    let project_node = plan.node(*input_idx)?;
+    let DbspNodeKind::Project(project) = &project_node.kind else {
+        return None;
+    };
+    let project_input_idx = *project_node.inputs.first()?;
+    if !is_source_unary_chain(plan, project_input_idx) {
+        return None;
+    }
+    Some((
+        project_input_idx,
+        Arc::clone(project.input_schema()),
+        project_alias_exprs(project),
+    ))
 }
 
 fn bypassable_source_projection_input(
@@ -241,6 +319,59 @@ fn bypassable_source_projection_input(
         return None;
     }
     Some((project_input_idx, Arc::clone(project.input_schema())))
+}
+
+fn bypassable_identity_source_projection_input(
+    plan: &CircuitPlan,
+    input_idx: usize,
+) -> Option<(usize, Arc<RowSchema>)> {
+    let project_node = plan.node(input_idx)?;
+    let DbspNodeKind::Project(project) = &project_node.kind else {
+        return None;
+    };
+    if !is_identity_source_projection(project) {
+        return None;
+    }
+    let project_input_idx = *project_node.inputs.first()?;
+    if !is_source_unary_chain(plan, project_input_idx) {
+        return None;
+    }
+    Some((project_input_idx, Arc::clone(project.input_schema())))
+}
+
+fn project_alias_exprs(project: &DbspProjectNode) -> BTreeMap<String, Expr> {
+    project
+        .expressions()
+        .iter()
+        .map(|expr| (expr.alias().to_string(), expr.expression().expr().clone()))
+        .collect()
+}
+
+fn rewrite_project_aliases(
+    expr: Expr,
+    alias_exprs: &BTreeMap<String, Expr>,
+) -> Result<Expr, PlannerError> {
+    let mut rewritten = expr;
+    for _ in 0..=alias_exprs.len() {
+        let next = rewritten
+            .clone()
+            .transform_up(|node| match node {
+                Expr::Column(column) => match alias_exprs.get(column.name.as_str()) {
+                    Some(alias_expr) => Ok(Transformed::yes(alias_expr.clone())),
+                    None => Ok(Transformed::no(Expr::Column(column))),
+                },
+                other => Ok(Transformed::no(other)),
+            })
+            .map(|result| result.data)
+            .map_err(|err| PlannerError::AnalysisError(err.into()))?;
+        if next == rewritten {
+            return Ok(next);
+        }
+        rewritten = next;
+    }
+    Err(PlannerError::UnsupportedPlan(
+        "optimizer projection aliases formed a rewrite cycle".to_string(),
+    ))
 }
 
 fn is_source_unary_chain(plan: &CircuitPlan, node_idx: usize) -> bool {
@@ -266,7 +397,9 @@ fn is_source_unary_chain(plan: &CircuitPlan, node_idx: usize) -> bool {
 fn is_simple_source_column_projection(project: &DbspProjectNode) -> bool {
     let mut seen = HashSet::new();
     project.expressions().iter().all(|expr| {
-        let Some(column_idx) = direct_projection_column_index(expr.expression().expr(), project.input_schema()) else {
+        let Some(column_idx) =
+            direct_projection_column_index(expr.expression().expr(), project.input_schema())
+        else {
             return false;
         };
         let Some(field) = project.input_schema().field(column_idx) else {
@@ -274,6 +407,20 @@ fn is_simple_source_column_projection(project: &DbspProjectNode) -> bool {
         };
         expr.alias() == field.name && seen.insert(column_idx)
     })
+}
+
+fn is_identity_source_projection(project: &DbspProjectNode) -> bool {
+    project.expressions().len() == project.input_schema().len()
+        && project.expressions().iter().enumerate().all(|(idx, expr)| {
+            match project.input_schema().field(idx) {
+                Some(field) => {
+                    direct_projection_column_index(expr.expression().expr(), project.input_schema())
+                        == Some(idx)
+                        && expr.alias() == field.name
+                }
+                None => false,
+            }
+        })
 }
 
 fn direct_projection_column_index(expr: &Expr, schema: &RowSchema) -> Option<usize> {
