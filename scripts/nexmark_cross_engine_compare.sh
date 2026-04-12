@@ -62,6 +62,8 @@ FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
+STRICT_RESULT_CORRECTNESS="${STRICT_RESULT_CORRECTNESS:-1}"
+STRICT_RESULT_CONTENT_CHECK="${STRICT_RESULT_CONTENT_CHECK:-1}"
 
 RUN_DIR="${ARTIFACT_ROOT}/${RUN_ID}"
 RESULTS_FILE="${RUN_DIR}/summary.md"
@@ -132,35 +134,159 @@ input_rows_total_for_sources() {
   printf '%s\n' "${total}"
 }
 
-floe_result_row_target_for_query() {
+expected_result_rows_for_query() {
   case "$1" in
-    q18)
-      # The bid producer assigns a unique bidder per bid, so
-      # (auction, bidder) is unique for every bid row.
+    q0|q1|q18|q21|q22)
       printf '%s\n' "${BID_ROWS}"
       ;;
-    q19)
-      # The bid producer distributes bids round-robin across 10k auctions.
-      # Once BID_ROWS exceeds 100k, each auction has at least 10 bids and the
-      # ROW_NUMBER() <= 10 result cardinality saturates at 100k rows.
-      if (( BID_ROWS <= 100000 )); then
-        printf '%s\n' "${BID_ROWS}"
+    q2)
+      # Auction id cycles every 10k bids; ids divisible by 123 pass.
+      local full_cycles rem
+      full_cycles=$((BID_ROWS / 10000))
+      rem=$((BID_ROWS % 10000))
+      printf '%s\n' $((full_cycles * 81 + rem / 123))
+      ;;
+    q3)
+      # Seller ids map to person ids (50_000 + auction_id). Category=10 auctions
+      # are ids divisible by 10. States in {or,id,ca} correspond to id%6 in {0,1,2}.
+      local matches id rem
+      matches=0
+      for ((id = 10; id <= AUCTION_ROWS; id += 10)); do
+        if (( id > PERSON_ROWS )); then
+          break
+        fi
+        rem=$((id % 6))
+        if (( rem == 0 || rem == 1 || rem == 2 )); then
+          matches=$((matches + 1))
+        fi
+      done
+      printf '%s\n' "${matches}"
+      ;;
+    q4)
+      local auctions_with_bids joined_auctions
+      auctions_with_bids=$((BID_ROWS < 10000 ? BID_ROWS : 10000))
+      joined_auctions=$((AUCTION_ROWS < auctions_with_bids ? AUCTION_ROWS : auctions_with_bids))
+      if (( joined_auctions <= 0 )); then
+        printf '0\n'
+      elif (( joined_auctions < 10 )); then
+        printf '%s\n' "${joined_auctions}"
       else
-        printf '100000\n'
+        printf '10\n'
       fi
       ;;
-    q15) printf '1\n' ;;
-    q16) printf '5\n' ;;
-    q17) printf '10000\n' ;;
-    *) printf '\n' ;;
+    q5)
+      printf '%s\n' $((BID_ROWS * 5))
+      ;;
+    q6|q9)
+      local auctions_with_bids joined_auctions
+      auctions_with_bids=$((BID_ROWS < 10000 ? BID_ROWS : 10000))
+      joined_auctions=$((AUCTION_ROWS < auctions_with_bids ? AUCTION_ROWS : auctions_with_bids))
+      printf '%s\n' "${joined_auctions}"
+      ;;
+    q7)
+      if (( BID_ROWS == 0 )); then
+        printf '0\n'
+      else
+        # BASE_TS_MS is aligned to 10s boundaries and generated timestamps start at +1ms.
+        printf '%s\n' $((BID_ROWS / 10000 + 1))
+      fi
+      ;;
+    q8)
+      printf '%s\n' "${PERSON_ROWS}"
+      ;;
+    q12|q13|q14|q15|q16|q17|q19|q20)
+      case "$1" in
+        q12)
+          printf '%s\n' "${BID_ROWS}"
+          ;;
+        q13)
+          # For AUCTION_ROWS <= 10k, bids join at most one auction row.
+          local full_cycles rem
+          full_cycles=$((BID_ROWS / 10000))
+          rem=$((BID_ROWS % 10000))
+          if (( AUCTION_ROWS <= 0 )); then
+            printf '0\n'
+          elif (( AUCTION_ROWS >= 10000 )); then
+            printf '%s\n' "${BID_ROWS}"
+          else
+            printf '%s\n' $((full_cycles * AUCTION_ROWS + (rem < AUCTION_ROWS ? rem : AUCTION_ROWS)))
+          fi
+          ;;
+        q14)
+          # price * 908 / 1000 never reaches 1,000,000 for generated bids.
+          printf '0\n'
+          ;;
+        q15)
+          if (( BID_ROWS > 0 )); then
+            printf '1\n'
+          else
+            printf '0\n'
+          fi
+          ;;
+        q16)
+          if (( BID_ROWS <= 0 )); then
+            printf '0\n'
+          elif (( BID_ROWS < 5 )); then
+            printf '%s\n' "${BID_ROWS}"
+          else
+            printf '5\n'
+          fi
+          ;;
+        q17)
+          if (( BID_ROWS < 10000 )); then
+            printf '%s\n' "${BID_ROWS}"
+          else
+            printf '10000\n'
+          fi
+          ;;
+        q19)
+          # Top-10 per auction over round-robin auction ids.
+          local full_cycles rem
+          full_cycles=$((BID_ROWS / 10000))
+          rem=$((BID_ROWS % 10000))
+          local top_q top_q1
+          top_q=$((full_cycles < 10 ? full_cycles : 10))
+          top_q1=$(((full_cycles + 1) < 10 ? (full_cycles + 1) : 10))
+          printf '%s\n' $((rem * top_q1 + (10000 - rem) * top_q))
+          ;;
+        q20)
+          # Category-10 auctions are ids divisible by 10.
+          local full_cycles rem id total
+          full_cycles=$((BID_ROWS / 10000))
+          rem=$((BID_ROWS % 10000))
+          total=0
+          for ((id = 10; id <= AUCTION_ROWS && id <= 10000; id += 10)); do
+            total=$((total + full_cycles))
+            if (( id <= rem )); then
+              total=$((total + 1))
+            fi
+          done
+          printf '%s\n' "${total}"
+          ;;
+      esac
+      ;;
+    *)
+      printf '\n'
+      ;;
   esac
 }
 
-floe_result_visibility_mode_for_query() {
-  case "$1" in
-    q15|q16|q17|q18|q19) printf 'exact_target\n' ;;
-    *) printf '\n' ;;
-  esac
+validate_correctness_input_shape() {
+  if ! env_enabled "${STRICT_RESULT_CORRECTNESS}"; then
+    return 0
+  fi
+  if (( AUCTION_ROWS > 10000 )); then
+    die "STRICT_RESULT_CORRECTNESS requires AUCTION_ROWS <= 10000 (current: ${AUCTION_ROWS})"
+  fi
+}
+
+validate_content_check_config() {
+  if ! env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    return 0
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    die "STRICT_RESULT_CONTENT_CHECK=1 requires sha256sum"
+  fi
 }
 
 query_sql() {
@@ -721,6 +847,65 @@ poll_feldera_source_counts() {
   return 1
 }
 
+poll_pg_result_rows_equals() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local expected_rows="$4"
+  local relation="${5:-benchmark_result}"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local result_rows
+    result_rows="$(fetch_pg_scalar "${port}" "${user}" "${db}" "SELECT COUNT(*)::BIGINT FROM ${relation}")"
+    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ && ${result_rows} -eq ${expected_rows} ]]; then
+      return 0
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
+poll_feldera_result_rows_equals() {
+  local pipeline="$1"
+  local expected_rows="$2"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local response result_rows
+    response="$(curl -fsS --get \
+      "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/query" \
+      --data-urlencode "sql=SELECT COUNT(*) AS row_count FROM benchmark_result" \
+      --data-urlencode "format=json" 2>/dev/null || true)"
+    result_rows="$(printf '%s' "${response}" | jq -sr 'if length > 0 then (.[0].ROW_COUNT // .[0].row_count // empty) else empty end' 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ && ${result_rows} -eq ${expected_rows} ]]; then
+      return 0
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
 poll_floe_kafka_group_catchup() {
   local sources="$1"
   local bid_group_id="$2"
@@ -784,33 +969,8 @@ poll_floe_kafka_group_catchup() {
   return 1
 }
 
-poll_floe_result_rows_at_least() {
-  local expected_rows="$1"
-
-  local start_ms now_ms
-  start_ms="$(date +%s%3N)"
-
-  local _
-  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
-    now_ms="$(date +%s%3N)"
-    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
-      return 1
-    fi
-
-    local result_rows
-    result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
-    if [[ -n "${result_rows}" && "${result_rows}" =~ ^[0-9]+$ && ${result_rows} -ge ${expected_rows} ]]; then
-      return 0
-    fi
-
-    sleep_ms "${POLL_INTERVAL_MS}"
-  done
-
-  return 1
-}
-
 poll_floe_query_completion() {
-  local query_id="$1"
+  local _query_id="$1"
   local sources="$2"
   local bid_group_id="$3"
   local auction_group_id="$4"
@@ -832,18 +992,6 @@ poll_floe_query_completion() {
     "${person_topic}"; then
     return 1
   fi
-
-  local result_visibility_mode
-  result_visibility_mode="$(floe_result_visibility_mode_for_query "${query_id}")"
-  case "${result_visibility_mode}" in
-    exact_target)
-      local expected_result_rows
-      expected_result_rows="$(floe_result_row_target_for_query "${query_id}")"
-      if [[ -n "${expected_result_rows}" ]] && ! poll_floe_result_rows_at_least "${expected_result_rows}"; then
-        return 1
-      fi
-      ;;
-  esac
 
   now_ms="$(date +%s%3N)"
   POST_PRODUCE_WAIT_MS=$((now_ms - start_ms))
@@ -881,6 +1029,84 @@ wait_for_floe_pg() {
   return 1
 }
 
+summarize_floe_hotspots() {
+  local log_path="$1"
+  local report_path="$2"
+
+  : > "${report_path}"
+  if [[ ! -f "${log_path}" ]]; then
+    return 0
+  fi
+
+  local raw_path="${report_path}.raw"
+  awk '
+    /materialized view optimization hotspot/ {
+      path = ""
+      phase = ""
+      share = ""
+      total = ""
+      for (i = 1; i <= NF; i++) {
+        token = $i
+        if (index(token, "path=") == 1) {
+          path = substr(token, 6)
+        } else if (index(token, "hotspot_phase=") == 1) {
+          phase = substr(token, 15)
+        } else if (index(token, "hotspot_phase_share=") == 1) {
+          share = substr(token, 20)
+        } else if (index(token, "total_ms=") == 1) {
+          total = substr(token, 10)
+        }
+      }
+      gsub(/[^a-z_]/, "", path)
+      gsub(/[^a-z_]/, "", phase)
+      if (path == "" || phase == "") {
+        next
+      }
+      share_clean = share
+      gsub(/[^0-9.]/, "", share_clean)
+      if (share_clean == "") {
+        share_val = 0
+      } else {
+        share_val = share_clean + 0
+      }
+      total_clean = total
+      gsub(/[^0-9]/, "", total_clean)
+      if (total_clean == "") {
+        total_val = 0
+      } else {
+        total_val = total_clean + 0
+      }
+      key = path ":" phase
+      count[key] += 1
+      share_sum[key] += share_val
+      if (total_val > max_total[key]) {
+        max_total[key] = total_val
+      }
+    }
+    END {
+      for (key in count) {
+        avg_share = share_sum[key] / count[key]
+        printf "%d %.6f %s %d\n", count[key], avg_share, key, max_total[key] + 0
+      }
+    }
+  ' "${log_path}" | sort -k1,1nr -k2,2nr > "${raw_path}" || true
+
+  if [[ ! -s "${raw_path}" ]]; then
+    rm -f "${raw_path}"
+    return 0
+  fi
+
+  awk '{printf "%s count=%s avg_share=%.3f max_total_ms=%s\n", $3, $1, $2, $4}' "${raw_path}" > "${report_path}"
+  rm -f "${raw_path}"
+
+  local top_key top_share
+  top_key="$(awk 'NR == 1 {print $1}' "${report_path}")"
+  top_share="$(awk 'NR == 1 {for (i = 1; i <= NF; i++) if ($i ~ /^avg_share=/) {split($i, parts, "="); print parts[2]; exit}}' "${report_path}")"
+  if [[ -n "${top_key}" ]]; then
+    printf 'hotspot=%s(avg_share=%s)' "${top_key}" "${top_share:-0}"
+  fi
+}
+
 capture_run_context() {
   jq -n \
     --arg run_id "${RUN_ID}" \
@@ -898,6 +1124,8 @@ capture_run_context() {
     --arg git_commit "$(git rev-parse HEAD)" \
     --arg git_branch "$(git branch --show-current 2>/dev/null || true)" \
     --arg rustc_version "$(rustc -V)" \
+    --arg strict_result_correctness "${STRICT_RESULT_CORRECTNESS}" \
+    --arg strict_result_content_check "${STRICT_RESULT_CONTENT_CHECK}" \
     '{
       run_id: $run_id,
       engine: $engine,
@@ -922,6 +1150,11 @@ capture_run_context() {
         git_branch: $git_branch,
         rustc_version: $rustc_version,
         binary: "target/release/floe-node"
+      },
+      correctness: {
+        strict_result_correctness: $strict_result_correctness,
+        strict_result_content_check: $strict_result_content_check,
+        content_check_mode: "engine_local_expected_query"
       }
     }' > "${RUN_DIR}/run_context.json"
 }
@@ -1046,6 +1279,118 @@ fetch_pg_scalar() {
   local db="$3"
   local sql="$4"
   PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql -h 127.0.0.1 -p "${port}" -U "${user}" -d "${db}" -Atqc "${sql}" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+compute_pg_query_content_fingerprint() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local artifact_dir="$4"
+  local label="$5"
+  local query_sql="$6"
+  local rows_file="${artifact_dir}/${label}.rows.tsv"
+
+  if ! PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql \
+    -h 127.0.0.1 \
+    -p "${port}" \
+    -U "${user}" \
+    -d "${db}" \
+    -P "null=\\N" \
+    -At \
+    -F $'\t' \
+    -c "${query_sql}" > "${rows_file}" 2>/dev/null; then
+    return 1
+  fi
+
+  local row_count hash
+  row_count="$(wc -l < "${rows_file}" | tr -d '[:space:]')"
+  hash="$(LC_ALL=C sort "${rows_file}" | sha256sum | awk '{print $1}')"
+  printf '%s\t%s\n' "${row_count}" "${hash}"
+}
+
+compute_pg_result_content_hash() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local artifact_dir="$4"
+  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "SELECT * FROM benchmark_result"
+}
+
+compute_feldera_query_content_fingerprint() {
+  local pipeline="$1"
+  local artifact_dir="$2"
+  local label="$3"
+  local query_sql="$4"
+  local rows_json_file="${artifact_dir}/${label}.rows.json"
+  local rows_jsonl_file="${artifact_dir}/${label}.rows.jsonl"
+
+  if ! curl -fsS --get \
+    "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/query" \
+    --data-urlencode "sql=${query_sql}" \
+    --data-urlencode "format=json" > "${rows_json_file}" 2>/dev/null; then
+    return 1
+  fi
+
+  if ! jq -cS '.[]' "${rows_json_file}" > "${rows_jsonl_file}" 2>/dev/null; then
+    return 1
+  fi
+
+  local row_count hash
+  row_count="$(wc -l < "${rows_jsonl_file}" | tr -d '[:space:]')"
+  hash="$(LC_ALL=C sort "${rows_jsonl_file}" | sha256sum | awk '{print $1}')"
+  printf '%s\t%s\n' "${row_count}" "${hash}"
+}
+
+compute_feldera_result_content_hash() {
+  local pipeline="$1"
+  local artifact_dir="$2"
+  compute_feldera_query_content_fingerprint "${pipeline}" "${artifact_dir}" "benchmark_result" "SELECT * FROM benchmark_result"
+}
+
+split_content_fingerprint() {
+  local fingerprint="$1"
+  local row_count
+  local hash
+  IFS=$'\t' read -r row_count hash <<< "${fingerprint}"
+  printf '%s\t%s\n' "${row_count:-}" "${hash:-}"
+}
+
+verify_result_content_hash() {
+  local engine="$1"
+  local query_id="$2"
+  local observed_rows="$3"
+  local observed_hash="$4"
+  local expected_rows="$5"
+  local expected_hash="$6"
+  local artifact_dir="$7"
+
+  local content_report="${artifact_dir}/content_hash.txt"
+  {
+    printf 'engine=%s\n' "${engine}"
+    printf 'query_id=%s\n' "${query_id}"
+    printf 'observed_result_rows=%s\n' "${observed_rows}"
+    printf 'observed_content_sha256=%s\n' "${observed_hash}"
+    printf 'expected_result_rows=%s\n' "${expected_rows}"
+    printf 'expected_content_sha256=%s\n' "${expected_hash}"
+  } > "${content_report}"
+
+  if ! env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    return 0
+  fi
+
+  if [[ "${observed_rows}" != "${expected_rows}" || "${observed_hash}" != "${expected_hash}" ]]; then
+    {
+      printf 'expected_result_rows=%s\n' "${expected_rows}"
+      printf 'expected_content_sha256=%s\n' "${expected_hash}"
+      printf 'observed_result_rows=%s\n' "${observed_rows}"
+      printf 'observed_content_sha256=%s\n' "${observed_hash}"
+      printf 'query_id=%s\n' "${query_id}"
+      printf 'engine=%s\n' "${engine}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+
+  return 0
 }
 
 # Materialize
@@ -1257,6 +1602,12 @@ run_materialize_query() {
 
   local input_rows
   input_rows="$(input_rows_total_for_sources "${sources}")"
+  local expected_result_rows
+  expected_result_rows="$(expected_result_rows_for_query "${query_id}")"
+  if [[ -z "${expected_result_rows}" ]]; then
+    printf 'missing_expected_result_rows_for_query=%s\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  fi
   local notes="count_views_pgwire"
   if env_enabled "${MATERIALIZE_BEST_EFFORT_IN_MEMORY}"; then
     notes="count_views_pgwire_indexed_views"
@@ -1276,8 +1627,46 @@ run_materialize_query() {
     rows_per_sec=0
   fi
 
+  if ! poll_pg_result_rows_equals "${MATERIALIZE_SQL_PORT}" materialize materialize "${expected_result_rows}" benchmark_result; then
+    local observed
+    observed="$(fetch_pg_scalar "${MATERIALIZE_SQL_PORT}" materialize materialize "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${observed:-n/a}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+
   result_rows="$(fetch_pg_scalar "${MATERIALIZE_SQL_PORT}" materialize materialize "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
   [[ -z "${result_rows}" ]] && result_rows="n/a"
+  if [[ "${result_rows}" != "${expected_result_rows}" ]]; then
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${result_rows}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+  local observed_fingerprint expected_fingerprint
+  observed_fingerprint="$(compute_pg_result_content_hash "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}")" || {
+    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local expected_query_text
+  expected_query_text="$(query_sql_for_engine materialize "${query_id}")"
+  expected_fingerprint="$(compute_pg_query_content_fingerprint "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
+  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+  if ! verify_result_content_hash materialize "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+    return 1
+  fi
+  notes="${notes};correctness_exact_rows=${expected_result_rows}"
+  notes="${notes};content_sha256=${observed_hash:0:16}"
 
   append_summary_row materialize "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
@@ -1451,6 +1840,12 @@ run_risingwave_query() {
 
   local input_rows
   input_rows="$(input_rows_total_for_sources "${sources}")"
+  local expected_result_rows
+  expected_result_rows="$(expected_result_rows_for_query "${query_id}")"
+  if [[ -z "${expected_result_rows}" ]]; then
+    printf 'missing_expected_result_rows_for_query=%s\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  fi
 
   local start_ms end_ms total_ms rows_per_sec result_rows
   start_ms="$(date +%s%3N)"
@@ -1466,10 +1861,46 @@ run_risingwave_query() {
     rows_per_sec=0
   fi
 
+  if ! poll_pg_result_rows_equals "${RISINGWAVE_SQL_PORT}" root dev "${expected_result_rows}" benchmark_result; then
+    local observed
+    observed="$(fetch_pg_scalar "${RISINGWAVE_SQL_PORT}" root dev "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${observed:-n/a}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+
   result_rows="$(fetch_pg_scalar "${RISINGWAVE_SQL_PORT}" root dev "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
   [[ -z "${result_rows}" ]] && result_rows="n/a"
+  if [[ "${result_rows}" != "${expected_result_rows}" ]]; then
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${result_rows}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+  local observed_fingerprint expected_fingerprint
+  observed_fingerprint="$(compute_pg_result_content_hash "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}")" || {
+    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local expected_query_text
+  expected_query_text="$(query_sql_for_engine risingwave "${query_id}")"
+  expected_fingerprint="$(compute_pg_query_content_fingerprint "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
+  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+  if ! verify_result_content_hash risingwave "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+    return 1
+  fi
 
-  append_summary_row risingwave "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "count_views_pgwire"
+  append_summary_row risingwave "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "count_views_pgwire;correctness_exact_rows=${expected_result_rows};content_sha256=${observed_hash:0:16}"
   return 0
 }
 
@@ -1728,6 +2159,12 @@ run_feldera_query() {
 
   local input_rows
   input_rows="$(input_rows_total_for_sources "${sources}")"
+  local expected_result_rows
+  expected_result_rows="$(expected_result_rows_for_query "${query_id}")"
+  if [[ -z "${expected_result_rows}" ]]; then
+    printf 'missing_expected_result_rows_for_query=%s\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  fi
 
   local start_ms end_ms total_ms rows_per_sec result_rows
   start_ms="$(date +%s%3N)"
@@ -1743,6 +2180,22 @@ run_feldera_query() {
     rows_per_sec=0
   fi
 
+  if ! poll_feldera_result_rows_equals "${pipeline}" "${expected_result_rows}"; then
+    local observed
+    local observed_response
+    observed_response="$(curl -fsS --get \
+      "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/query" \
+      --data-urlencode "sql=SELECT COUNT(*) AS row_count FROM benchmark_result" \
+      --data-urlencode "format=json" 2>/dev/null || true)"
+    observed="$(printf '%s' "${observed_response}" | jq -sr 'if length > 0 then (.[0].ROW_COUNT // .[0].row_count // empty) else empty end' 2>/dev/null | tr -d '[:space:]' || true)"
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${observed:-n/a}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+
   local response
   response="$(curl -fsS --get \
     "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/query" \
@@ -1750,11 +2203,38 @@ run_feldera_query() {
     --data-urlencode "format=json" 2>/dev/null || true)"
   result_rows="$(printf '%s' "${response}" | jq -sr 'if length > 0 then (.[0].ROW_COUNT // .[0].row_count // empty) else empty end' 2>/dev/null | tr -d '[:space:]' || true)"
   [[ -z "${result_rows}" ]] && result_rows="n/a"
+  if [[ "${result_rows}" != "${expected_result_rows}" ]]; then
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${result_rows}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    return 1
+  fi
+  local observed_fingerprint expected_fingerprint
+  observed_fingerprint="$(compute_feldera_result_content_hash "${pipeline}" "${artifact_dir}")" || {
+    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local expected_query_text
+  expected_query_text="$(query_sql_for_engine feldera "${query_id}")"
+  expected_fingerprint="$(compute_feldera_query_content_fingerprint "${pipeline}" "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    return 1
+  }
+  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
+  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+  if ! verify_result_content_hash feldera "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+    return 1
+  fi
 
   local notes="count_views_adhoc_query"
   if env_enabled "${FELDERA_BEST_EFFORT_IN_MEMORY}"; then
     notes="count_views_adhoc_query_best_effort_in_memory"
   fi
+  notes="${notes};correctness_exact_rows=${expected_result_rows}"
+  notes="${notes};content_sha256=${observed_hash:0:16}"
   append_summary_row feldera "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
 
   curl -fsS -X POST "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/shutdown" >/dev/null 2>&1 || true
@@ -1843,13 +2323,10 @@ write_floe_config() {
     }' > "${path}"
 }
 
-write_floe_program_sql() {
-  local path="$1"
-  local query_id="$2"
-  local sources="$3"
+floe_query_text_for_sources() {
+  local query_id="$1"
+  local sources="$2"
   local query_text
-
-  : > "${path}"
 
   if floe_query_uses_alias_ctes "${query_id}"; then
     local base_query
@@ -1868,26 +2345,6 @@ write_floe_program_sql() {
       ctes+=('person AS (SELECT id, name, city, state, date_time AS "dateTime", extra FROM nexmark_person)')
     fi
 
-    if floe_query_uses_legacy_ingest_views "${query_id}"; then
-      if has_source "${sources}" bid; then
-        cat >> "${path}" <<'SQL'
-CREATE MATERIALIZED VIEW benchmark_ingest_bid AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_bid;
-SQL
-      fi
-
-      if has_source "${sources}" auction; then
-        cat >> "${path}" <<'SQL'
-CREATE MATERIALIZED VIEW benchmark_ingest_auction AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_auction;
-SQL
-      fi
-
-      if has_source "${sources}" person; then
-        cat >> "${path}" <<'SQL'
-CREATE MATERIALIZED VIEW benchmark_ingest_person AS SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_person;
-SQL
-      fi
-    fi
-
     query_text="WITH ${ctes[0]}"
     local idx
     for ((idx = 1; idx < ${#ctes[@]}; idx++)); do
@@ -1897,6 +2354,18 @@ SQL
   else
     query_text="$(query_sql_floe "${query_id}")"
   fi
+
+  printf '%s\n' "${query_text}"
+}
+
+write_floe_program_sql() {
+  local path="$1"
+  local query_id="$2"
+  local sources="$3"
+
+  : > "${path}"
+  local query_text
+  query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
 
   cat >> "${path}" <<SQL
 CREATE MATERIALIZED VIEW benchmark_result AS
@@ -1953,6 +2422,13 @@ run_floe_query() {
 
   local input_rows
   input_rows="$(input_rows_total_for_sources "${sources}")"
+  local expected_result_rows
+  expected_result_rows="$(expected_result_rows_for_query "${query_id}")"
+  if [[ -z "${expected_result_rows}" ]]; then
+    printf 'missing_expected_result_rows_for_query=%s\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    stop_floe_process
+    return 1
+  fi
 
   local start_ms end_ms total_ms rows_per_sec result_rows notes
   start_ms="$(date +%s%3N)"
@@ -1969,14 +2445,63 @@ run_floe_query() {
     rows_per_sec=0
   fi
 
-  result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
-  [[ -z "${result_rows}" ]] && result_rows="n/a"
-  notes="source_catchup_kafka_group_offsets"
-  if [[ -n "$(floe_result_visibility_mode_for_query "${query_id}")" ]]; then
-    notes="source_catchup_kafka_group_offsets_and_result_visibility"
+  if ! poll_pg_result_rows_equals "${FLOE_PG_PORT}" postgres postgres "${expected_result_rows}" benchmark_result; then
+    local observed
+    observed="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${observed:-n/a}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    stop_floe_process
+    return 1
   fi
 
+  result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
+  [[ -z "${result_rows}" ]] && result_rows="n/a"
+  if [[ "${result_rows}" != "${expected_result_rows}" ]]; then
+    {
+      printf 'expected_result_rows=%s\n' "${expected_result_rows}"
+      printf 'observed_result_rows=%s\n' "${result_rows}"
+      printf 'query_id=%s\n' "${query_id}"
+    } > "${artifact_dir}/correctness.error"
+    stop_floe_process
+    return 1
+  fi
+  local observed_fingerprint expected_fingerprint
+  observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}")" || {
+    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    stop_floe_process
+    return 1
+  }
+  local expected_query_text
+  expected_query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+  expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+    stop_floe_process
+    return 1
+  }
+  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
+  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+  if ! verify_result_content_hash floe "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+    stop_floe_process
+    return 1
+  fi
+  notes="source_catchup_kafka_group_offsets"
+  notes="${notes};correctness_exact_rows=${expected_result_rows}"
+  notes="${notes};content_sha256=${observed_hash:0:16}"
+
   stop_floe_process
+  local hotspot_input="${artifact_dir}/floe_hotspot_input.log"
+  cat "${artifact_dir}/floe-node.stdout.log" "${artifact_dir}/floe-node.stderr.log" > "${hotspot_input}" 2>/dev/null || true
+  local hotspot_report="${artifact_dir}/floe_optimization_hotspots.txt"
+  local hotspot_note
+  hotspot_note="$(summarize_floe_hotspots "${hotspot_input}" "${hotspot_report}")"
+  rm -f "${hotspot_input}"
+  if [[ -n "${hotspot_note}" ]]; then
+    notes="${notes};${hotspot_note}"
+  fi
   append_summary_row floe "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
 }
@@ -2095,6 +2620,8 @@ main() {
   command -v psql >/dev/null 2>&1 || die "psql is required"
   command -v docker >/dev/null 2>&1 || die "docker is required"
   command -v curl >/dev/null 2>&1 || die "curl is required"
+  validate_correctness_input_shape
+  validate_content_check_config
 
   local queries_file="${RUN_DIR}/queries.txt"
   selected_queries "${QUERY_SELECTOR}" > "${queries_file}"
@@ -2136,10 +2663,9 @@ EOF2
       run_engine_suite feldera "${queries_file}"
       ;;
     all)
-      run_engine_suite floe "${queries_file}"
-      run_engine_suite materialize "${queries_file}"
-      run_engine_suite risingwave "${queries_file}"
-      run_engine_suite feldera "${queries_file}"
+      for engine in floe materialize risingwave feldera; do
+        run_engine_suite "${engine}" "${queries_file}"
+      done
       ;;
     *)
       die "unknown engine '${ENGINE}' (expected floe|materialize|risingwave|feldera|all)"

@@ -1,6 +1,9 @@
 use std::sync::LazyLock;
 
-use prometheus::{Histogram, HistogramOpts, IntCounter, register_histogram, register_int_counter};
+use prometheus::{
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, register_histogram,
+    register_histogram_vec, register_int_counter, register_int_counter_vec,
+};
 
 use crate::delta_consolidation::ConsolidationStats;
 
@@ -92,6 +95,33 @@ static DELTA_CONSOLIDATION_ZERO_DROPPED_ROWS: LazyLock<IntCounter> = LazyLock::n
     .expect("register floe_delta_consolidation_zero_weight_dropped_rows_total")
 });
 
+static MV_OPTIMIZATION_HOTSPOTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_mv_optimization_hotspots_total",
+        "Dominant materialized-view apply phase observations by path",
+        &["path", "phase"]
+    )
+    .expect("register floe_mv_optimization_hotspots_total")
+});
+
+static MV_OPTIMIZATION_HOTSPOT_SHARE: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_mv_optimization_hotspot_share",
+        "Dominant materialized-view apply phase share of total latency",
+        &["path", "phase"]
+    )
+    .expect("register floe_mv_optimization_hotspot_share")
+});
+
+static MV_OPTIMIZATION_TOTAL_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_mv_optimization_total_ms",
+        "Observed materialized-view apply total latency in milliseconds by path",
+        &["path"]
+    )
+    .expect("register floe_mv_optimization_total_ms")
+});
+
 pub(crate) fn observe_delta_batch(rows: usize, bytes: usize) {
     if rows > 0 {
         DELTA_BATCH_ROWS.observe(rows as f64);
@@ -130,6 +160,23 @@ pub(crate) fn inc_tail_rows(count: usize) {
     }
 }
 
+pub(crate) fn observe_mv_optimization_hotspot(
+    path: &str,
+    phase: &str,
+    phase_share: f64,
+    total_ms: u64,
+) {
+    MV_OPTIMIZATION_HOTSPOTS
+        .with_label_values(&[path, phase])
+        .inc();
+    MV_OPTIMIZATION_HOTSPOT_SHARE
+        .with_label_values(&[path, phase])
+        .observe(phase_share.clamp(0.0, 1.0));
+    MV_OPTIMIZATION_TOTAL_MS
+        .with_label_values(&[path])
+        .observe(total_ms as f64);
+}
+
 pub(crate) fn init() {
     let _ = &*MV_UPDATE_LATENCY_MS;
     let _ = &*MV_UPDATES_TOTAL;
@@ -142,4 +189,7 @@ pub(crate) fn init() {
     let _ = &*DELTA_CONSOLIDATION_ROWS_OUT;
     let _ = &*DELTA_CONSOLIDATION_ZERO_DROP_RATE;
     let _ = &*DELTA_CONSOLIDATION_ZERO_DROPPED_ROWS;
+    let _ = &*MV_OPTIMIZATION_HOTSPOTS;
+    let _ = &*MV_OPTIMIZATION_HOTSPOT_SHARE;
+    let _ = &*MV_OPTIMIZATION_TOTAL_MS;
 }

@@ -34,6 +34,9 @@ static MV_OVERLAY_APPLY_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_OVERLAY_APPLY_LOG_SAMPLE_EVERY: u64 = 16;
 static MV_OVERLAY_SNAPSHOT_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_OVERLAY_SNAPSHOT_LOG_SAMPLE_EVERY: u64 = 8;
+static MV_OPTIMIZATION_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MV_OPTIMIZATION_LOG_SAMPLE_EVERY: u64 = 64;
+const MV_OPTIMIZATION_LOG_MIN_TOTAL_MS: u64 = 250;
 
 pub(super) type DeltaTransformFn =
     dyn Fn(Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
@@ -201,6 +204,37 @@ struct FlushedBatch {
     published_ts: i64,
     handle: ZSetHandle,
     latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HotspotSummary {
+    phase: &'static str,
+    phase_ms: u64,
+    phase_share: f64,
+}
+
+fn summarize_hotspot(phases: &[(&'static str, u64)], total_ms: u64) -> Option<HotspotSummary> {
+    if total_ms == 0 {
+        return None;
+    }
+    let (phase, phase_ms) = phases.iter().max_by_key(|(_, ms)| *ms).copied()?;
+    if phase_ms == 0 {
+        return None;
+    }
+    Some(HotspotSummary {
+        phase,
+        phase_ms,
+        phase_share: phase_ms as f64 / total_ms as f64,
+    })
+}
+
+fn should_log_optimization_hotspot(total_ms: u64) -> bool {
+    if total_ms >= MV_OPTIMIZATION_LOG_MIN_TOTAL_MS {
+        return true;
+    }
+    MV_OPTIMIZATION_LOG_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(MV_OPTIMIZATION_LOG_SAMPLE_EVERY)
 }
 
 #[derive(Debug, Default)]
@@ -1151,6 +1185,36 @@ impl DbspGraphBuilder {
         let latency_ms = apply_start.elapsed().as_millis() as u64;
         metrics::observe_mv_update_latency_ms(latency_ms);
         metrics::inc_mv_updates();
+        let hotspot = summarize_hotspot(
+            &[
+                ("transform", apply.transform_ms),
+                ("state_apply", apply_stats.apply_ms),
+            ],
+            latency_ms,
+        );
+        if let Some(hotspot) = hotspot {
+            metrics::observe_mv_optimization_hotspot(
+                "overlay_apply",
+                hotspot.phase,
+                hotspot.phase_share,
+                latency_ms,
+            );
+            if should_log_optimization_hotspot(latency_ms) {
+                tracing::info!(
+                    view = %view_label,
+                    namespace = "overlay",
+                    version = ts,
+                    path = "overlay_apply",
+                    delta_rows = apply.delta_rows,
+                    delta_bytes = apply.delta_bytes,
+                    total_ms = latency_ms,
+                    hotspot_phase = hotspot.phase,
+                    hotspot_phase_ms = hotspot.phase_ms,
+                    hotspot_phase_share = hotspot.phase_share,
+                    "materialized view optimization hotspot"
+                );
+            }
+        }
         if MV_OVERLAY_APPLY_LOG_COUNTER
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(MV_OVERLAY_APPLY_LOG_SAMPLE_EVERY)
@@ -1392,6 +1456,43 @@ impl DbspGraphBuilder {
             .first_enqueue_at
             .map(|started| started.elapsed().as_millis() as u64)
             .unwrap_or(total_ms);
+        let hotspot = summarize_hotspot(
+            &[
+                ("load", pending.total_load_ms),
+                ("transform", pending.total_transform_ms),
+                ("merge", pending.total_merge_ms),
+                ("flush", flush_ms),
+            ],
+            total_ms,
+        );
+        if let Some(hotspot) = hotspot {
+            metrics::observe_mv_optimization_hotspot(
+                "flush_apply",
+                hotspot.phase,
+                hotspot.phase_share,
+                total_ms,
+            );
+            if should_log_optimization_hotspot(total_ms) {
+                tracing::info!(
+                    graph_id = %graph_id,
+                    namespace = %view_namespace,
+                    trigger = trigger.as_str(),
+                    first_version = first_ts,
+                    last_version = last_ts,
+                    pending_versions = pending.pending_versions,
+                    pending_deltas = pending.pending_deltas,
+                    pending_rows = pending.pending_rows,
+                    pending_bytes = pending.pending_bytes,
+                    path = "flush_apply",
+                    total_ms,
+                    latency_ms,
+                    hotspot_phase = hotspot.phase,
+                    hotspot_phase_ms = hotspot.phase_ms,
+                    hotspot_phase_share = hotspot.phase_share,
+                    "materialized view optimization hotspot"
+                );
+            }
+        }
         if total_ms >= 1_000 {
             tracing::info!(
                 graph_id = %graph_id,

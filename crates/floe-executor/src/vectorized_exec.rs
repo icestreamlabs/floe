@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -9,6 +10,7 @@ use datafusion::physical_plan::collect;
 use crate::delta_consolidation::{
     ConsolidationMode, ConsolidationOutput, ConsolidationStats, DeltaConsolidator,
 };
+use crate::metrics;
 
 #[derive(Debug, Clone)]
 pub struct VectorizedTickOutput {
@@ -39,10 +41,12 @@ impl VectorizedPlanExecutor {
 
     pub async fn run_tick(&self) -> Result<VectorizedTickOutput> {
         let raw_batches = collect(Arc::clone(&self.plan), Arc::clone(&self.task_ctx)).await?;
+        let consolidate_start = Instant::now();
         let ConsolidationOutput { batches, stats } = self
             .consolidator
             .consolidate_with_stats(raw_batches)
             .await?;
+        metrics::observe_delta_consolidation(stats, consolidate_start.elapsed().as_millis() as u64);
         Ok(VectorizedTickOutput { batches, stats })
     }
 
