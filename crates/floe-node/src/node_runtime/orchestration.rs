@@ -1135,7 +1135,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         }
                     }
                 };
-                let event_ts = event.event_time_ms().or(event_ts);
+                // Prefer row-derived event time (from decoded timestamp columns) when available.
+                // Connector-level event_time_ms is a fallback for sources without row timestamps.
+                let event_ts = event_ts.or(event.event_time_ms());
                 if let Some(ts) = event_ts {
                     let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
                     let entry = tick_source_max_event_ts[source_id].get_or_insert(i64::MIN);
@@ -1226,45 +1228,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 metrics::record_source_watermark_ms(&source, *watermark_entry);
                 source_last_seen_at.insert(source, now_instant);
             }
-            if let Some(global_candidate) = compute_global_watermark(
+            let prev_watermark = watermark_for_task.load(Ordering::Relaxed);
+            let global_candidate = compute_global_watermark(
                 &source_watermarks,
                 &source_last_seen_at,
                 now_instant,
                 watermark_idle_timeout,
-            ) {
-                let prev = watermark_for_task.load(Ordering::Relaxed);
-                let next = advance_global_watermark(prev, Some(global_candidate));
-                if next != prev {
-                    watermark_for_task.store(next, Ordering::Relaxed);
-                }
-                if next >= 0 {
-                    metrics::record_global_watermark_ms(next);
-                    mv_for_task.update_watermark_all(next as u64);
-                    let now_ms = current_unix_time_ms();
-                    let watermark_ms = u64::try_from(next).unwrap_or(u64::MAX);
-                    metrics::record_watermark_lag_ms(now_ms.saturating_sub(watermark_ms));
-                }
-            }
-            {
-                let mut debug_state = watermark_debug_for_task.write().await;
-                debug_state.updated_at_unix_ms = current_unix_time_ms();
-                let global = watermark_for_task.load(Ordering::Relaxed);
-                debug_state.global_watermark_ms = (global >= 0).then_some(global);
-                let mut sources = Vec::with_capacity(source_watermarks.len());
-                for (source, watermark) in &source_watermarks {
-                    let idle = source_last_seen_at
-                        .get(source)
-                        .map(|last| now_instant.duration_since(*last) >= watermark_idle_timeout)
-                        .unwrap_or(true);
-                    sources.push(http_ingest::WatermarkDebugSourceState {
-                        source: source.clone(),
-                        watermark_ms: *watermark,
-                        idle,
-                    });
-                }
-                sources.sort_by(|left, right| left.source.cmp(&right.source));
-                debug_state.sources = sources;
-            }
+            );
+            let next_watermark = advance_global_watermark(prev_watermark, global_candidate);
             let tick_start = Instant::now();
             let tick_span = tracing::info_span!(
                 "connector_tick",
@@ -1342,11 +1313,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     checkpoint_manager.update_partition_offset(source, partition, offset);
                 }
             }
-            let frontier = watermark_for_task
-                .load(Ordering::Relaxed)
-                .max(0)
-                .try_into()
-                .unwrap_or(0_u64);
+            let frontier = next_watermark.max(0).try_into().unwrap_or(0_u64);
             let mv_versions = collect_mv_versions_for_commit(&mv_for_task, &mut last_mv_versions);
             let tick_commit = TickCommit::new(
                 epoch,
@@ -1437,6 +1404,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             metrics::record_last_committed_tick(epoch);
             metrics::record_checkpoint_age_seconds(0);
             last_checkpoint_commit_at = Instant::now();
+            if next_watermark != prev_watermark {
+                watermark_for_task.store(next_watermark, Ordering::Relaxed);
+            }
+            if next_watermark >= 0 {
+                metrics::record_global_watermark_ms(next_watermark);
+                mv_for_task.update_watermark_all(next_watermark as u64);
+                let now_ms = current_unix_time_ms();
+                let watermark_ms = u64::try_from(next_watermark).unwrap_or(u64::MAX);
+                metrics::record_watermark_lag_ms(now_ms.saturating_sub(watermark_ms));
+            }
+            {
+                let mut debug_state = watermark_debug_for_task.write().await;
+                debug_state.updated_at_unix_ms = current_unix_time_ms();
+                debug_state.global_watermark_ms = (next_watermark >= 0).then_some(next_watermark);
+                let mut sources = Vec::with_capacity(source_watermarks.len());
+                for (source, watermark) in &source_watermarks {
+                    let idle = source_last_seen_at
+                        .get(source)
+                        .map(|last| now_instant.duration_since(*last) >= watermark_idle_timeout)
+                        .unwrap_or(true);
+                    sources.push(http_ingest::WatermarkDebugSourceState {
+                        source: source.clone(),
+                        watermark_ms: *watermark,
+                        idle,
+                    });
+                }
+                sources.sort_by(|left, right| left.source.cmp(&right.source));
+                debug_state.sources = sources;
+            }
             if !tick_kafka_offsets.is_empty() && !kafka_commit_senders_for_task.is_empty() {
                 let kafka_commit_start = Instant::now();
                 let commit = build_kafka_offset_commit(epoch, &committed_kafka_offsets);

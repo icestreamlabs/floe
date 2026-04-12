@@ -619,6 +619,46 @@ async fn preserves_subquery_projection_aliases_after_row_number_lowering() {
     let topn = topn.expect("expected lowered TopN node");
     assert_eq!(topn.limit(), 1);
     assert_eq!(topn.partition_by().len(), 1);
+    assert_eq!(topn.order_by().len(), 2);
+    assert!(
+        !topn.order_by()[0].ascending(),
+        "first ORDER BY key should preserve DESC"
+    );
+    assert!(
+        topn.order_by()[1].ascending(),
+        "second ORDER BY key should preserve ASC"
+    );
+}
+
+#[tokio::test]
+async fn preserves_q9_row_number_ordering_after_lowering() {
+    let sql = "SELECT id, \"itemName\", description, \"initialBid\", reserve, \"dateTime\", expires, seller, category, extra, auction, bidder, price, \"bidTime\", \"bidExtra\" \
+        FROM (SELECT a.id, a.item_name AS \"itemName\", a.description, a.initial_bid AS \"initialBid\", a.reserve, a.date_time AS \"dateTime\", a.expires, a.seller, a.category, a.extra, \
+              b.auction, b.bidder, b.price, b.date_time AS \"bidTime\", b.extra AS \"bidExtra\", \
+              ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.date_time ASC) AS rownum \
+              FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+              WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
+        WHERE rownum <= 1";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let topn = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::TopN(topn) => Some(topn),
+        _ => None,
+    });
+    let topn = topn.expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 1);
+    assert_eq!(topn.partition_by().len(), 1);
+    assert_eq!(topn.order_by().len(), 2);
+    assert!(
+        !topn.order_by()[0].ascending(),
+        "q9 primary ORDER BY key should preserve DESC"
+    );
+    assert!(
+        topn.order_by()[1].ascending(),
+        "q9 secondary ORDER BY key should preserve ASC"
+    );
 }
 
 #[tokio::test]
@@ -635,6 +675,7 @@ async fn plans_hop_grouping_as_window_aggregate() {
     });
     let window = window.expect("expected WindowAggregate node");
     assert_eq!(window.aggregate.group_keys().len(), 1);
+    assert_eq!(window.window.allowed_lateness_ms, i64::MAX);
     match &window.window.policy {
         dbsp_circuit::circuit::plan::DbspWindowPolicy::Hopping { size_ms, slide_ms } => {
             assert_eq!(*size_ms, 10_000);
@@ -673,6 +714,7 @@ async fn plans_tumble_grouping_as_window_aggregate() {
     });
     let window = window.expect("expected WindowAggregate node");
     assert_eq!(window.aggregate.group_keys().len(), 1);
+    assert_eq!(window.window.allowed_lateness_ms, i64::MAX);
     match &window.window.policy {
         dbsp_circuit::circuit::plan::DbspWindowPolicy::Tumbling { size_ms } => {
             assert_eq!(*size_ms, 10_000);
@@ -709,6 +751,7 @@ async fn plans_session_grouping_as_window_aggregate() {
         _ => None,
     });
     let window = window.expect("expected WindowAggregate node");
+    assert_eq!(window.window.allowed_lateness_ms, i64::MAX);
     match &window.window.policy {
         dbsp_circuit::circuit::plan::DbspWindowPolicy::Session { gap_ms } => {
             assert_eq!(*gap_ms, 5_000);

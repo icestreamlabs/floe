@@ -352,20 +352,30 @@ impl DbspGraphBuilder {
                             &persistence_policy,
                         )
                         .await?;
-                    let left_transient_input = try_build_transient_join_input_optimization(
+                    let mut left_transient_input = try_build_transient_join_input_optimization(
                         self.graph_id(),
                         inputs.plan,
                         left_idx,
                         inputs.outer_transient_streams,
                         &inputs.cancel,
                     )?;
-                    let right_transient_input = try_build_transient_join_input_optimization(
+                    let mut right_transient_input = try_build_transient_join_input_optimization(
                         self.graph_id(),
                         inputs.plan,
                         right_idx,
                         inputs.outer_transient_streams,
                         &inputs.cancel,
                     )?;
+                    if left_transient_input.is_some() ^ right_transient_input.is_some() {
+                        tracing::info!(
+                            graph_id = %self.graph_id(),
+                            view = %inputs.view_name,
+                            root = inputs.plan.root,
+                            "disabling asymmetric transient join inputs for correctness fallback"
+                        );
+                        left_transient_input = None;
+                        right_transient_input = None;
+                    }
                     let left_transient_source = left_transient_input
                         .as_ref()
                         .map(|input| input.source_name.clone());

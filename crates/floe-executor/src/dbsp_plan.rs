@@ -372,7 +372,7 @@ fn bypassable_source_projection_input(
     let DbspNodeKind::Project(project) = &project_node.kind else {
         return None;
     };
-    if !is_simple_source_column_projection(project) {
+    if !is_identity_source_projection(project) {
         return None;
     }
     let project_input_idx = *project_node.inputs.first()?;

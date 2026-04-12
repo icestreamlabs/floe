@@ -1288,6 +1288,7 @@ compute_pg_query_content_fingerprint() {
   local artifact_dir="$4"
   local label="$5"
   local query_sql="$6"
+  local stderr_file="${7:-/dev/null}"
   local rows_file="${artifact_dir}/${label}.rows.tsv"
 
   if ! PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql \
@@ -1298,7 +1299,7 @@ compute_pg_query_content_fingerprint() {
     -P "null=\\N" \
     -At \
     -F $'\t' \
-    -c "${query_sql}" > "${rows_file}" 2>/dev/null; then
+    -c "${query_sql}" > "${rows_file}" 2>"${stderr_file}"; then
     return 1
   fi
 
@@ -1308,12 +1309,69 @@ compute_pg_query_content_fingerprint() {
   printf '%s\t%s\n' "${row_count}" "${hash}"
 }
 
+compute_pg_relation_projection() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local relation="$4"
+  local schema="${5:-public}"
+
+  if [[ ! "${relation}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    return 1
+  fi
+  if [[ ! "${schema}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    return 1
+  fi
+
+  local columns_output
+  columns_output="$(
+    PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql \
+      -h 127.0.0.1 \
+      -p "${port}" \
+      -U "${user}" \
+      -d "${db}" \
+      -Atqc "SELECT column_name FROM information_schema.columns WHERE table_schema = '${schema}' AND table_name = '${relation}' ORDER BY ordinal_position" \
+      2>/dev/null | tr -d '\r' || true
+  )"
+
+  local columns=()
+  local column
+  while IFS= read -r column; do
+    [[ -z "${column}" ]] && continue
+    columns+=("\"${column//\"/\"\"}\"")
+  done <<< "${columns_output}"
+
+  if (( ${#columns[@]} == 0 )); then
+    printf '%s' ""
+    return 0
+  fi
+
+  local projection=""
+  local idx
+  for ((idx = 0; idx < ${#columns[@]}; idx++)); do
+    if (( idx > 0 )); then
+      projection+=", "
+    fi
+    projection+="${columns[idx]}"
+  done
+  printf '%s' "${projection}"
+}
+
 compute_pg_result_content_hash() {
   local port="$1"
   local user="$2"
   local db="$3"
   local artifact_dir="$4"
-  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "SELECT * FROM benchmark_result"
+  local stderr_file="${5:-/dev/null}"
+  local projection
+  projection="$(compute_pg_relation_projection "${port}" "${user}" "${db}" "benchmark_result")"
+  local query_sql
+  if [[ -n "${projection}" ]]; then
+    query_sql="SELECT ${projection} FROM benchmark_result"
+  else
+    query_sql="SELECT * FROM benchmark_result"
+  fi
+  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "${query_sql}" "${stderr_file}"
 }
 
 compute_feldera_query_content_fingerprint() {
@@ -1651,13 +1709,13 @@ run_materialize_query() {
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
     local observed_fingerprint expected_fingerprint
-    observed_fingerprint="$(compute_pg_result_content_hash "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}")" || {
+    observed_fingerprint="$(compute_pg_result_content_hash "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
       printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
       return 1
     }
     local expected_query_text
     expected_query_text="$(query_sql_for_engine materialize "${query_id}")"
-    expected_fingerprint="$(compute_pg_query_content_fingerprint "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "expected_result" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
       printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
       return 1
     }
@@ -1890,13 +1948,13 @@ run_risingwave_query() {
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
     local observed_fingerprint expected_fingerprint
-    observed_fingerprint="$(compute_pg_result_content_hash "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}")" || {
+    observed_fingerprint="$(compute_pg_result_content_hash "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
       printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
       return 1
     }
     local expected_query_text
     expected_query_text="$(query_sql_for_engine risingwave "${query_id}")"
-    expected_fingerprint="$(compute_pg_query_content_fingerprint "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "expected_result" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
       printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
       return 1
     }
@@ -2375,6 +2433,25 @@ floe_query_text_for_sources() {
   printf '%s\n' "${query_text}"
 }
 
+floe_expected_query_text_for_sources() {
+  local query_id="$1"
+  local sources="$2"
+  local query_text
+  query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+
+  if has_source "${sources}" bid; then
+    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_bid\>/benchmark_input_bid/g')"
+  fi
+  if has_source "${sources}" auction; then
+    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_auction\>/benchmark_input_auction/g')"
+  fi
+  if has_source "${sources}" person; then
+    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_person\>/benchmark_input_person/g')"
+  fi
+
+  printf '%s\n' "${query_text}"
+}
+
 write_floe_program_sql() {
   local path="$1"
   local query_id="$2"
@@ -2383,6 +2460,27 @@ write_floe_program_sql() {
   : > "${path}"
   local query_text
   query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    if has_source "${sources}" bid; then
+      cat >> "${path}" <<SQL
+CREATE MATERIALIZED VIEW benchmark_input_bid AS
+SELECT auction, bidder, price, channel, url, date_time, extra FROM nexmark_bid;
+SQL
+    fi
+    if has_source "${sources}" auction; then
+      cat >> "${path}" <<SQL
+CREATE MATERIALIZED VIEW benchmark_input_auction AS
+SELECT id, item_name, description, initial_bid, reserve, date_time, expires, seller, category, extra FROM nexmark_auction;
+SQL
+    fi
+    if has_source "${sources}" person; then
+      cat >> "${path}" <<SQL
+CREATE MATERIALIZED VIEW benchmark_input_person AS
+SELECT id, name, email_address, credit_card, city, state, date_time, extra FROM nexmark_person;
+SQL
+    fi
+  fi
 
   cat >> "${path}" <<SQL
 CREATE MATERIALIZED VIEW benchmark_result AS
@@ -2488,14 +2586,14 @@ run_floe_query() {
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
     local observed_fingerprint expected_fingerprint
-    observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}")" || {
+    observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
       printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
       stop_floe_process
       return 1
     }
     local expected_query_text
-    expected_query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
-    expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+    expected_query_text="$(floe_expected_query_text_for_sources "${query_id}" "${sources}")"
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
       printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
       stop_floe_process
       return 1

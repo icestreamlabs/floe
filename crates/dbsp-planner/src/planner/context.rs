@@ -58,6 +58,7 @@ struct PlannedNode {
 }
 
 type RowNumberSpec = (String, Vec<Expr>, Vec<ExprSort>);
+const DEFAULT_WINDOW_ALLOWED_LATENESS_MS: i64 = i64::MAX;
 
 impl<'cfg> PlannerContext<'cfg> {
     fn new(config: &'cfg PlannerConfig) -> Self {
@@ -1020,7 +1021,7 @@ impl<'cfg> PlannerContext<'cfg> {
                 let allowed_lateness_ms = if func.args.len() == 3 {
                     self.parse_window_arg(&func.args[2])?
                 } else {
-                    0
+                    DEFAULT_WINDOW_ALLOWED_LATENESS_MS
                 };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Tumbling { size_ms },
@@ -1043,7 +1044,7 @@ impl<'cfg> PlannerContext<'cfg> {
                 let allowed_lateness_ms = if func.args.len() == 4 {
                     self.parse_window_arg(&func.args[3])?
                 } else {
-                    0
+                    DEFAULT_WINDOW_ALLOWED_LATENESS_MS
                 };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Hopping { size_ms, slide_ms },
@@ -1065,7 +1066,7 @@ impl<'cfg> PlannerContext<'cfg> {
                 let allowed_lateness_ms = if func.args.len() == 3 {
                     self.parse_window_arg(&func.args[2])?
                 } else {
-                    0
+                    DEFAULT_WINDOW_ALLOWED_LATENESS_MS
                 };
                 let spec = DbspWindowSpec::try_new(
                     DbspWindowPolicy::Session { gap_ms },

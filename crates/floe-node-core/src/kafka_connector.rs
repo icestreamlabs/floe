@@ -214,7 +214,9 @@ impl KafkaConnector {
                 partition: message.partition(),
                 offset: message.offset(),
             });
-            if let Some(event_time_ms) = kafka_message_timestamp_ms(message) {
+            if event.event_time_ms().is_none()
+                && let Some(event_time_ms) = kafka_message_timestamp_ms(message)
+            {
                 event = event.with_event_time_ms(event_time_ms);
             }
             staged.push(event);
