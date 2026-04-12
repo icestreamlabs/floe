@@ -110,7 +110,7 @@ impl DbspGraphBuilder {
     ) -> Result<DeltaHandleStream> {
         let predicate = select.predicate().clone();
         let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
-        let project_schema = Arc::clone(project.input_schema());
+        let project_schema = Arc::clone(select.output_schema());
 
         let graph_id = self.graph_id().to_string();
         let task_events = task_events.clone();

@@ -1013,6 +1013,7 @@ struct TransientSourceRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
     transform: Arc<DeltaTransformFn>,
+    requires_projected_input: bool,
 }
 
 struct TransientSourceTopNRootMaterialization {
@@ -3069,6 +3070,9 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
         else {
             return Ok(None);
         };
+        if left_root.requires_projected_input || right_root.requires_projected_input {
+            return Ok(None);
+        }
         return Ok(Some(BTreeSet::from([
             left_root.source_name,
             right_root.source_name,
@@ -3105,6 +3109,9 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
     let Some(right_root) = try_build_transient_source_root_materialization(plan, right_idx)? else {
         return Ok(None);
     };
+    if left_root.requires_projected_input || right_root.requires_projected_input {
+        return Ok(None);
+    }
     Ok(Some(BTreeSet::from([
         left_root.source_name,
         right_root.source_name,
@@ -3146,7 +3153,7 @@ pub fn transient_source_root_requirements(
         } => required_encoded_input_columns(
             Some(select.predicate()),
             Some(project.expressions()),
-            project.input_schema(),
+            select.output_schema(),
         )?,
     };
     Ok(Some(TransientSourceRootRequirements {
@@ -3701,6 +3708,9 @@ fn try_build_transient_join_input_optimization(
     else {
         return Ok(None);
     };
+    if source_root.requires_projected_input {
+        return Ok(None);
+    }
     let Some(upstream) = outer_transient_streams
         .get(&source_root.source_name)
         .cloned()
@@ -3778,6 +3788,7 @@ fn try_build_transient_source_root_materialization(
 ) -> Result<Option<TransientSourceRootMaterialization>> {
     if let Some(shape) = find_transient_source_root_shape(plan, root_idx)? {
         let source_name = shape.source_name().to_string();
+        let requires_projected_input = !matches!(shape, TransientSourceRootShape::Source { .. });
         let optimized_nodes = match &shape {
             TransientSourceRootShape::Source {
                 optimized_nodes, ..
@@ -3806,6 +3817,7 @@ fn try_build_transient_source_root_materialization(
             source_name,
             optimized_nodes,
             transform,
+            requires_projected_input,
         }));
     }
 
@@ -4931,7 +4943,7 @@ fn build_filter_map_transform(
 ) -> Result<Arc<DeltaTransformFn>> {
     let predicate = select.predicate().clone();
     let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(project.expressions().to_vec());
-    let project_schema = Arc::clone(project.input_schema());
+    let project_schema = Arc::clone(select.output_schema());
     let evaluator = Arc::new(
         VectorizedFilterProjectEvaluator::for_filter_map(
             &predicate,
@@ -4983,8 +4995,9 @@ mod tests {
     use crate::GraphTaskError;
     use crate::dbsp_bridge::DbspBridge;
     use crate::dbsp_plan::{
-        CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, DbspProjectNode, DbspSourceNode,
-        ProjectItem, nexmark_auction_table, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
+        CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, DbspProjectNode, DbspSelectNode,
+        DbspSourceNode, ProjectItem, nexmark_auction_table, nexmark_bid_table, nexmark_config,
+        validate_dbsp_plan,
     };
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::outer_stream::OuterStreamRegistry;
@@ -5340,6 +5353,77 @@ mod tests {
             matches!(window_input.kind, DbspNodeKind::Source(_)),
             "expected optimized q7 window aggregate to read directly from source, found {:?}",
             window_input.kind
+        );
+    }
+
+    #[test]
+    fn optimized_benchmark_join_has_consistent_project_input_schemas() {
+        let logical = benchmark_join_logical_plan();
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        for node in &plan.nodes {
+            let DbspNodeKind::Project(project) = &node.kind else {
+                continue;
+            };
+            let input_idx = *node.inputs.first().expect("project input");
+            let input_node = plan
+                .node(input_idx)
+                .unwrap_or_else(|| panic!("missing project input node {input_idx}"));
+            assert_eq!(
+                project.input_schema().to_arrow_schema(),
+                input_node.output_schema.to_arrow_schema(),
+                "project node {} input schema drifted from upstream node {} output schema",
+                node.id,
+                input_idx
+            );
+        }
+    }
+
+    #[test]
+    fn transient_filter_map_transform_accepts_rows_when_project_schema_is_stale() {
+        let full_schema = nexmark_bid_table().schema().clone();
+        let select =
+            DbspSelectNode::try_new(Arc::clone(&full_schema), col("auction").gt(lit(0i64)))
+                .expect("select");
+
+        let narrow_items = ["auction", "bidder", "price"]
+            .iter()
+            .map(|name| ProjectItem {
+                expr: col(*name),
+                alias: Some((*name).to_string()),
+            })
+            .collect::<Vec<_>>();
+        let narrow = DbspProjectNode::try_new(Arc::clone(&full_schema), narrow_items)
+            .expect("narrow source projection");
+        let narrow_schema = narrow.output_schema().clone();
+
+        let stale_items = narrow_schema
+            .fields()
+            .iter()
+            .map(|field| ProjectItem {
+                expr: col(field.name.as_str()),
+                alias: Some(field.name.clone()),
+            })
+            .collect::<Vec<_>>();
+        let stale_project =
+            DbspProjectNode::try_new(Arc::clone(&narrow_schema), stale_items).expect("project");
+
+        let transform =
+            build_filter_map_transform(&select, &stale_project).expect("filter_map transform");
+
+        let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+        let encoded = encode_event(&decoder, bid_event_payload(9, 101, 1000), "nexmark_bid");
+        let transformed = transform(vec![(encoded, 1)]).expect("transform rows");
+        assert_eq!(transformed.len(), 1);
+
+        let mut decoded = Vec::new();
+        crate::encoding::decode_all_encoded_row_scalars_into(&transformed[0].0, &mut decoded)
+            .expect("decode transformed row");
+        assert_eq!(
+            decoded.len(),
+            3,
+            "expected projected output width to remain narrow"
         );
     }
 

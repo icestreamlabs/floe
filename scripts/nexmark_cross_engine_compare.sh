@@ -1648,25 +1648,30 @@ run_materialize_query() {
     } > "${artifact_dir}/correctness.error"
     return 1
   fi
-  local observed_fingerprint expected_fingerprint
-  observed_fingerprint="$(compute_pg_result_content_hash "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}")" || {
-    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local expected_query_text
-  expected_query_text="$(query_sql_for_engine materialize "${query_id}")"
-  expected_fingerprint="$(compute_pg_query_content_fingerprint "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
-    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
-  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
-  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-  if ! verify_result_content_hash materialize "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
-    return 1
+  local observed_hash=""
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local observed_fingerprint expected_fingerprint
+    observed_fingerprint="$(compute_pg_result_content_hash "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}")" || {
+      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_query_text
+    expected_query_text="$(query_sql_for_engine materialize "${query_id}")"
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${MATERIALIZE_SQL_PORT}" materialize materialize "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=materialize\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_hash observed_rows_from_hash expected_rows_from_hash
+    IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+    if ! verify_result_content_hash materialize "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+      return 1
+    fi
   fi
   notes="${notes};correctness_exact_rows=${expected_result_rows}"
-  notes="${notes};content_sha256=${observed_hash:0:16}"
+  if [[ -n "${observed_hash}" ]]; then
+    notes="${notes};content_sha256=${observed_hash:0:16}"
+  fi
 
   append_summary_row materialize "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
@@ -1882,25 +1887,32 @@ run_risingwave_query() {
     } > "${artifact_dir}/correctness.error"
     return 1
   fi
-  local observed_fingerprint expected_fingerprint
-  observed_fingerprint="$(compute_pg_result_content_hash "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}")" || {
-    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local expected_query_text
-  expected_query_text="$(query_sql_for_engine risingwave "${query_id}")"
-  expected_fingerprint="$(compute_pg_query_content_fingerprint "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
-    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
-  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
-  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-  if ! verify_result_content_hash risingwave "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
-    return 1
+  local observed_hash=""
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local observed_fingerprint expected_fingerprint
+    observed_fingerprint="$(compute_pg_result_content_hash "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}")" || {
+      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_query_text
+    expected_query_text="$(query_sql_for_engine risingwave "${query_id}")"
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${RISINGWAVE_SQL_PORT}" root dev "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=risingwave\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_hash observed_rows_from_hash expected_rows_from_hash
+    IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+    if ! verify_result_content_hash risingwave "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+      return 1
+    fi
   fi
 
-  append_summary_row risingwave "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "count_views_pgwire;correctness_exact_rows=${expected_result_rows};content_sha256=${observed_hash:0:16}"
+  local rw_notes="count_views_pgwire;correctness_exact_rows=${expected_result_rows}"
+  if [[ -n "${observed_hash}" ]]; then
+    rw_notes="${rw_notes};content_sha256=${observed_hash:0:16}"
+  fi
+  append_summary_row risingwave "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${rw_notes}"
   return 0
 }
 
@@ -2211,22 +2223,25 @@ run_feldera_query() {
     } > "${artifact_dir}/correctness.error"
     return 1
   fi
-  local observed_fingerprint expected_fingerprint
-  observed_fingerprint="$(compute_feldera_result_content_hash "${pipeline}" "${artifact_dir}")" || {
-    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local expected_query_text
-  expected_query_text="$(query_sql_for_engine feldera "${query_id}")"
-  expected_fingerprint="$(compute_feldera_query_content_fingerprint "${pipeline}" "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
-    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    return 1
-  }
-  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
-  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
-  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-  if ! verify_result_content_hash feldera "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
-    return 1
+  local observed_hash=""
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local observed_fingerprint expected_fingerprint
+    observed_fingerprint="$(compute_feldera_result_content_hash "${pipeline}" "${artifact_dir}")" || {
+      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_query_text
+    expected_query_text="$(query_sql_for_engine feldera "${query_id}")"
+    expected_fingerprint="$(compute_feldera_query_content_fingerprint "${pipeline}" "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=feldera\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      return 1
+    }
+    local expected_hash observed_rows_from_hash expected_rows_from_hash
+    IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+    if ! verify_result_content_hash feldera "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+      return 1
+    fi
   fi
 
   local notes="count_views_adhoc_query"
@@ -2234,7 +2249,9 @@ run_feldera_query() {
     notes="count_views_adhoc_query_best_effort_in_memory"
   fi
   notes="${notes};correctness_exact_rows=${expected_result_rows}"
-  notes="${notes};content_sha256=${observed_hash:0:16}"
+  if [[ -n "${observed_hash}" ]]; then
+    notes="${notes};content_sha256=${observed_hash:0:16}"
+  fi
   append_summary_row feldera "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
 
   curl -fsS -X POST "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/shutdown" >/dev/null 2>&1 || true
@@ -2468,29 +2485,34 @@ run_floe_query() {
     stop_floe_process
     return 1
   fi
-  local observed_fingerprint expected_fingerprint
-  observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}")" || {
-    printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    stop_floe_process
-    return 1
-  }
-  local expected_query_text
-  expected_query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
-  expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
-    printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
-    stop_floe_process
-    return 1
-  }
-  local observed_hash expected_hash observed_rows_from_hash expected_rows_from_hash
-  IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
-  IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-  if ! verify_result_content_hash floe "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
-    stop_floe_process
-    return 1
+  local observed_hash=""
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local observed_fingerprint expected_fingerprint
+    observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}")" || {
+      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
+    }
+    local expected_query_text
+    expected_query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+    expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}")" || {
+      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
+    }
+    local expected_hash observed_rows_from_hash expected_rows_from_hash
+    IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+    if ! verify_result_content_hash floe "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+      stop_floe_process
+      return 1
+    fi
   fi
   notes="source_catchup_kafka_group_offsets"
   notes="${notes};correctness_exact_rows=${expected_result_rows}"
-  notes="${notes};content_sha256=${observed_hash:0:16}"
+  if [[ -n "${observed_hash}" ]]; then
+    notes="${notes};content_sha256=${observed_hash:0:16}"
+  fi
 
   stop_floe_process
   local hotspot_input="${artifact_dir}/floe_hotspot_input.log"

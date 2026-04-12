@@ -273,9 +273,70 @@ fn normalize_optimizer_source_projections(
                 changed = true;
             }
         }
+        changed |= normalize_project_input_schemas(&mut plan)?;
     }
     prune_unreachable_nodes(&mut plan);
     Ok(plan)
+}
+
+fn normalize_project_input_schemas(plan: &mut CircuitPlan) -> Result<bool, PlannerError> {
+    let output_schemas_by_node_id: BTreeMap<usize, Arc<RowSchema>> = plan
+        .nodes
+        .iter()
+        .map(|node| (node.id, Arc::clone(&node.output_schema)))
+        .collect();
+    let mut changed = false;
+
+    for idx in 0..plan.nodes.len() {
+        let DbspNodeKind::Project(project) = plan.nodes[idx].kind.clone() else {
+            continue;
+        };
+        let [input_idx] = plan.nodes[idx].inputs.as_slice() else {
+            continue;
+        };
+        let Some(actual_input_schema) = output_schemas_by_node_id.get(input_idx).cloned() else {
+            return Err(PlannerError::UnsupportedPlan(format!(
+                "project node {} references missing input node {input_idx}",
+                plan.nodes[idx].id
+            )));
+        };
+        if row_schema_eq(
+            project.input_schema().as_ref(),
+            actual_input_schema.as_ref(),
+        ) {
+            continue;
+        }
+
+        let items = project
+            .expressions()
+            .iter()
+            .map(|expr| ProjectItem {
+                expr: expr.expression().expr().clone(),
+                alias: Some(expr.alias().to_string()),
+            })
+            .collect::<Vec<_>>();
+        let rebased = DbspProjectNode::try_new(actual_input_schema, items)
+            .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
+        let output_schema = Arc::clone(rebased.output_schema());
+        plan.nodes[idx].kind = DbspNodeKind::Project(rebased);
+        plan.nodes[idx].output_schema = output_schema;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+fn row_schema_eq(left: &RowSchema, right: &RowSchema) -> bool {
+    left.len() == right.len()
+        && left
+            .fields()
+            .iter()
+            .zip(right.fields().iter())
+            .all(|(left_field, right_field)| {
+                left_field.name == right_field.name
+                    && left_field.data_type == right_field.data_type
+                    && left_field.nullable == right_field.nullable
+            })
 }
 
 fn inlinable_source_project_input(
