@@ -1869,15 +1869,15 @@ fn column_projection_indices(
     projections
         .iter()
         .map(|projection| {
-            let column_name = match projection.expression().expr() {
-                datafusion::logical_expr::Expr::Column(column) => column.name.as_str(),
+            let column = match projection.expression().expr() {
+                datafusion::logical_expr::Expr::Column(column) => column,
                 datafusion::logical_expr::Expr::Alias(alias) => match alias.expr.as_ref() {
-                    datafusion::logical_expr::Expr::Column(column) => column.name.as_str(),
+                    datafusion::logical_expr::Expr::Column(column) => column,
                     _ => return None,
                 },
                 _ => return None,
             };
-            input_schema.field_index(column_name)
+            resolve_input_schema_column_index(input_schema, column)
         })
         .collect::<Option<Vec<_>>>()
 }
@@ -1927,17 +1927,22 @@ fn add_expr_input_columns(
     columns: &mut BTreeSet<usize>,
 ) -> Result<()> {
     for column in expr.column_refs() {
-        let index = input_schema
-            .field_index(column.name.as_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "column '{}' was not found in vectorized input schema",
-                    column.name
-                )
-            })?;
+        let index = resolve_input_schema_column_index(input_schema, column).ok_or_else(|| {
+            anyhow!(
+                "column '{}' was not found in vectorized input schema",
+                column.flat_name()
+            )
+        })?;
         columns.insert(index);
     }
     Ok(())
+}
+
+fn resolve_input_schema_column_index(input_schema: &RowSchema, column: &Column) -> Option<usize> {
+    let qualified = column.flat_name();
+    input_schema
+        .field_index(&qualified)
+        .or_else(|| input_schema.field_index(column.name.as_str()))
 }
 
 fn build_decoded_input_slots(input_width: usize, required_columns: &[usize]) -> Vec<Option<usize>> {

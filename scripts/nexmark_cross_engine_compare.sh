@@ -876,6 +876,43 @@ poll_pg_result_rows_equals() {
   return 1
 }
 
+fetch_pg_relation_max_mv_version() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local relation="${4:-benchmark_result}"
+  fetch_pg_scalar "${port}" "${user}" "${db}" "SELECT COALESCE(MAX(__mv_version)::BIGINT, 0) FROM ${relation}"
+}
+
+poll_pg_relation_max_mv_version_at_least() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local expected_min_version="$4"
+  local relation="${5:-benchmark_result}"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local current_max_version
+    current_max_version="$(fetch_pg_relation_max_mv_version "${port}" "${user}" "${db}" "${relation}")"
+    if [[ -n "${current_max_version}" && "${current_max_version}" =~ ^[0-9]+$ && ${current_max_version} -ge ${expected_min_version} ]]; then
+      return 0
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
 poll_feldera_result_rows_equals() {
   local pipeline="$1"
   local expected_rows="$2"
@@ -1330,7 +1367,22 @@ compute_pg_relation_projection() {
       -p "${port}" \
       -U "${user}" \
       -d "${db}" \
-      -Atqc "SELECT column_name FROM information_schema.columns WHERE table_schema = '${schema}' AND table_name = '${relation}' ORDER BY ordinal_position" \
+      -Atqc "WITH chosen_schema AS (
+                SELECT table_schema
+                FROM information_schema.columns
+                WHERE table_name = '${relation}'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY
+                  CASE WHEN table_schema = '${schema}' THEN 1 ELSE 0 END DESC,
+                  table_schema
+                LIMIT 1
+              )
+              SELECT c.column_name
+              FROM information_schema.columns c
+              JOIN chosen_schema s
+                ON c.table_schema = s.table_schema
+              WHERE c.table_name = '${relation}'
+              ORDER BY c.ordinal_position" \
       2>/dev/null | tr -d '\r' || true
   )"
 
@@ -1338,6 +1390,9 @@ compute_pg_relation_projection() {
   local column
   while IFS= read -r column; do
     [[ -z "${column}" ]] && continue
+    if [[ "${column}" == "__mv_version" ]]; then
+      continue
+    fi
     columns+=("\"${column//\"/\"\"}\"")
   done <<< "${columns_output}"
 
@@ -1357,6 +1412,82 @@ compute_pg_relation_projection() {
   printf '%s' "${projection}"
 }
 
+compute_floe_normalized_projection_for_relation() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local relation="$4"
+  local schema="${5:-public}"
+  local relation_alias="${6:-}"
+
+  if [[ ! "${relation}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    return 1
+  fi
+  if [[ ! "${schema}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    return 1
+  fi
+
+  local columns_output
+  columns_output="$(
+    PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql \
+      -h 127.0.0.1 \
+      -p "${port}" \
+      -U "${user}" \
+      -d "${db}" \
+      -At \
+      -F $'\t' \
+      -c "WITH chosen_schema AS (
+            SELECT table_schema
+            FROM information_schema.columns
+            WHERE table_name = '${relation}'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY
+              CASE WHEN table_schema = '${schema}' THEN 1 ELSE 0 END DESC,
+              table_schema
+            LIMIT 1
+          )
+          SELECT c.column_name, c.data_type
+          FROM information_schema.columns c
+          JOIN chosen_schema s
+            ON c.table_schema = s.table_schema
+          WHERE c.table_name = '${relation}'
+          ORDER BY c.ordinal_position" \
+      2>/dev/null | tr -d '\r' || true
+  )"
+
+  local projection=""
+  local idx=0
+  local column_name data_type
+  while IFS=$'\t' read -r column_name data_type; do
+    [[ -z "${column_name}" ]] && continue
+    if [[ "${column_name}" == "__mv_version" ]]; then
+      continue
+    fi
+    local escaped_name="\"${column_name//\"/\"\"}\""
+    local column_ref="${escaped_name}"
+    if [[ -n "${relation_alias}" ]]; then
+      column_ref="${relation_alias}.${escaped_name}"
+    fi
+
+    local normalized_expr="${column_ref}"
+    case "${data_type}" in
+      int64|utf8|'timestamp(ms)'|bool|binary|uint64|null)
+        ;;
+      *)
+        normalized_expr="CAST(${column_ref} AS VARCHAR)"
+        ;;
+    esac
+
+    if (( idx > 0 )); then
+      projection+=", "
+    fi
+    projection+="${normalized_expr}"
+    idx=$((idx + 1))
+  done <<< "${columns_output}"
+
+  printf '%s' "${projection}"
+}
+
 compute_pg_result_content_hash() {
   local port="$1"
   local user="$2"
@@ -1372,6 +1503,41 @@ compute_pg_result_content_hash() {
     query_sql="SELECT * FROM benchmark_result"
   fi
   compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "${query_sql}" "${stderr_file}"
+}
+
+compute_floe_result_content_hash() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local artifact_dir="$4"
+  local stderr_file="${5:-/dev/null}"
+  local projection
+  projection="$(compute_floe_normalized_projection_for_relation "${port}" "${user}" "${db}" "benchmark_result" "public" "benchmark_result")"
+  local query_sql
+  if [[ -n "${projection}" ]]; then
+    query_sql="SELECT ${projection} FROM benchmark_result"
+  else
+    query_sql="SELECT * FROM benchmark_result"
+  fi
+  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "${query_sql}" "${stderr_file}"
+}
+
+compute_floe_expected_query_content_hash() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local artifact_dir="$4"
+  local expected_query_sql="$5"
+  local stderr_file="${6:-/dev/null}"
+  local projection
+  projection="$(compute_floe_normalized_projection_for_relation "${port}" "${user}" "${db}" "benchmark_result" "public" "expected_result")"
+  local query_sql
+  if [[ -n "${projection}" ]]; then
+    query_sql="SELECT ${projection} FROM (${expected_query_sql}) AS expected_result"
+  else
+    query_sql="${expected_query_sql}"
+  fi
+  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "expected_result" "${query_sql}" "${stderr_file}"
 }
 
 compute_feldera_query_content_fingerprint() {
@@ -2583,17 +2749,57 @@ run_floe_query() {
     stop_floe_process
     return 1
   fi
+
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local expected_min_result_version=0
+    local source_mv_version
+    if has_source "${sources}" bid; then
+      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_bid)"
+      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
+        expected_min_result_version="${source_mv_version}"
+      fi
+    fi
+    if has_source "${sources}" auction; then
+      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_auction)"
+      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
+        expected_min_result_version="${source_mv_version}"
+      fi
+    fi
+    if has_source "${sources}" person; then
+      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_person)"
+      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
+        expected_min_result_version="${source_mv_version}"
+      fi
+    fi
+
+    if (( expected_min_result_version > 0 )); then
+      if ! poll_pg_relation_max_mv_version_at_least "${FLOE_PG_PORT}" postgres postgres "${expected_min_result_version}" benchmark_result; then
+        local observed_max_result_version
+        observed_max_result_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_result)"
+        {
+          printf 'expected_min_result_version=%s\n' "${expected_min_result_version}"
+          printf 'observed_max_result_version=%s\n' "${observed_max_result_version:-n/a}"
+          printf 'query_id=%s\n' "${query_id}"
+          printf 'engine=floe\n'
+          printf 'reason=result_mv_version_did_not_catch_up_to_input_views\n'
+        } > "${artifact_dir}/correctness.error"
+        stop_floe_process
+        return 1
+      fi
+    fi
+  fi
+
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
     local observed_fingerprint expected_fingerprint
-    observed_fingerprint="$(compute_pg_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
+    observed_fingerprint="$(compute_floe_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
       printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
       stop_floe_process
       return 1
     }
     local expected_query_text
     expected_query_text="$(floe_expected_query_text_for_sources "${query_id}" "${sources}")"
-    expected_fingerprint="$(compute_pg_query_content_fingerprint "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "expected_result" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
+    expected_fingerprint="$(compute_floe_expected_query_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
       printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
       stop_floe_process
       return 1

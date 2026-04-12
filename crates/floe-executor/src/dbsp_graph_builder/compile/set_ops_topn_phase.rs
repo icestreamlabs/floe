@@ -174,6 +174,23 @@ impl DbspGraphBuilder {
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        let order_key_fields = order_key_columns
+            .iter()
+            .map(|column_idx| {
+                key_schema
+                    .field(*column_idx)
+                    .map(|field| field.name.clone())
+                    .unwrap_or_else(|| format!("__missing_{column_idx}"))
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            graph_id = %self.graph_id(),
+            partition_key_columns = ?partition_key_columns,
+            order_key_columns = ?order_key_columns,
+            order_key_fields = ?order_key_fields,
+            order_specs = ?order_specs,
+            "compiled topn node key layout"
+        );
         let needs_trim_projection = needs_precompute;
 
         let log_graph_id = graph_id.clone();
@@ -249,14 +266,66 @@ impl DbspGraphBuilder {
             >(&upstream, key_parts, Some(error_handler))
             .await
             .context("initialize DBSP partitioned top1")?;
+            let top1_stream = top1.stream();
+            let mut top1_cursor = StreamCursor::new(top1_stream.stream());
+            if let Ok((ts, handle)) = top1_cursor.snapshot().await {
+                tracing::debug!(
+                    graph_id = %graph_id,
+                    ts,
+                    handle_version = handle.version,
+                    "top1 output snapshot"
+                );
+                log_handle_rows("top1 output snapshot", &handle, &self.bridge).await?;
+            }
+            let top1_log_limit = Arc::new(AtomicUsize::new(3));
+            let top1_log_limit_clone = Arc::clone(&top1_log_limit);
+            let top1_task_events = task_events.clone();
+            let top1_task_graph_id = graph_id.clone();
+            let top1_task_label = "top1-output-logger".to_string();
+            let top1_bridge = Arc::clone(&self.bridge);
+            tokio::spawn(async move {
+                let mut cursor = top1_cursor;
+                loop {
+                    if top1_log_limit_clone.fetch_sub(1, Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                    let (ts, handle) = match cursor.next().await {
+                        Ok(next) => next,
+                        Err(err) => {
+                            report_graph_task_error(
+                                &top1_task_events,
+                                &top1_task_graph_id,
+                                top1_task_label.clone(),
+                                anyhow!("top1 output handle stream closed: {err}"),
+                            );
+                            break;
+                        }
+                    };
+                    tracing::debug!(
+                        graph_id = %top1_task_graph_id,
+                        ts,
+                        handle_version = handle.version,
+                        "top1 output handle"
+                    );
+                    if let Err(err) = log_handle_rows("top1 output handle", &handle, &top1_bridge).await {
+                        report_graph_task_error(
+                            &top1_task_events,
+                            &top1_task_graph_id,
+                            top1_task_label.clone(),
+                            anyhow!("failed to log top1 output handle rows: {err}"),
+                        );
+                        break;
+                    }
+                        }
+            });
             if !needs_trim_projection {
-                return Ok(top1.stream());
+                return Ok(top1_stream);
             }
             let trim =
                 build_trim_projection_node(Arc::clone(&key_schema), Arc::clone(&original_schema))
                     .context("build topn trim projection")?;
             return self
-                .compile_map(&trim, top1.stream(), &task_events)
+                .compile_map(&trim, top1_stream, &task_events)
                 .await
                 .context("initialize topn trim projection map");
         }

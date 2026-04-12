@@ -365,7 +365,7 @@ impl DbspGraphBuilder {
         )
         .await
         .context("initialize DBSP join")?;
-        // Log the first output handle, if any, to verify join activity.
+        // Log the first output handles, if any, to verify join activity.
         let mut join_cursor = StreamCursor::new(join.stream().stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {
             tracing::debug!(
@@ -377,6 +377,52 @@ impl DbspGraphBuilder {
             log_handle_rows("join output snapshot", &handle, &self.bridge).await?;
         }
         let join_stream = join.stream();
+        let join_log_limit = Arc::new(AtomicUsize::new(3));
+        let join_log_limit_clone = Arc::clone(&join_log_limit);
+        let join_task_events = task_events.clone();
+        let join_task_graph_id = graph_id.clone();
+        let join_task_label = "join-output-logger".to_string();
+        let join_bridge = Arc::clone(&self.bridge);
+        let cancel_join_output = cancel.clone();
+        tokio::spawn(async move {
+            let mut cursor = join_cursor;
+            loop {
+                tokio::select! {
+                    _ = cancel_join_output.cancelled() => break,
+                    result = cursor.next() => {
+                        let (ts, handle) = match result {
+                            Ok(next) => next,
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &join_task_events,
+                                    &join_task_graph_id,
+                                    join_task_label.clone(),
+                                    anyhow!("join output handle stream closed: {err}"),
+                                );
+                                break;
+                            }
+                        };
+                        if join_log_limit_clone.fetch_sub(1, Ordering::Relaxed) > 0 {
+                            tracing::debug!(
+                                graph_id = %join_task_graph_id,
+                                ts,
+                                handle_version = handle.version,
+                                "join output handle"
+                            );
+                            if let Err(err) = log_handle_rows("join output handle", &handle, &join_bridge).await {
+                                report_graph_task_error(
+                                    &join_task_events,
+                                    &join_task_graph_id,
+                                    join_task_label.clone(),
+                                    anyhow!("failed to log join output handle rows: {err}"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
         if matches!(join_type, DbspJoinType::Inner) {
             if defer_residual_to_post_filter {
                 let residual_expr = residual_for_post_filter

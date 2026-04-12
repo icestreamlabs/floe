@@ -662,6 +662,54 @@ async fn preserves_q9_row_number_ordering_after_lowering() {
 }
 
 #[tokio::test]
+async fn q9_post_projection_keeps_distinct_bid_alias_sources() {
+    let sql = "SELECT id, \"itemName\", description, \"initialBid\", reserve, \"dateTime\", expires, seller, category, extra, auction, bidder, price, \"bidTime\", \"bidExtra\" \
+        FROM (SELECT a.id, a.item_name AS \"itemName\", a.description, a.initial_bid AS \"initialBid\", a.reserve, a.date_time AS \"dateTime\", a.expires, a.seller, a.category, a.extra, \
+              b.auction, b.bidder, b.price, b.date_time AS \"bidTime\", b.extra AS \"bidExtra\", \
+              ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.date_time ASC) AS rownum \
+              FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+              WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
+        WHERE rownum <= 1";
+    let plan = sql_plan(sql).await;
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    let project = match &root.kind {
+        DbspNodeKind::Project(project) => project,
+        other => panic!("expected root project node, got {other:?}"),
+    };
+
+    let mut date_time_expr = None;
+    let mut bid_time_expr = None;
+    let mut extra_expr = None;
+    let mut bid_extra_expr = None;
+    for projection in project.expressions() {
+        match projection.alias() {
+            "dateTime" => date_time_expr = Some(format!("{:?}", projection.expression().expr())),
+            "bidTime" => bid_time_expr = Some(format!("{:?}", projection.expression().expr())),
+            "extra" => extra_expr = Some(format!("{:?}", projection.expression().expr())),
+            "bidExtra" => bid_extra_expr = Some(format!("{:?}", projection.expression().expr())),
+            _ => {}
+        }
+    }
+
+    let date_time_expr = date_time_expr.expect("missing dateTime projection");
+    let bid_time_expr = bid_time_expr.expect("missing bidTime projection");
+    let extra_expr = extra_expr.expect("missing extra projection");
+    let bid_extra_expr = bid_extra_expr.expect("missing bidExtra projection");
+
+    assert_ne!(
+        date_time_expr, bid_time_expr,
+        "dateTime and bidTime should come from distinct join columns"
+    );
+    assert_ne!(
+        extra_expr, bid_extra_expr,
+        "extra and bidExtra should come from distinct join columns"
+    );
+}
+
+#[tokio::test]
 async fn plans_hop_grouping_as_window_aggregate() {
     let sql =
         "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)";

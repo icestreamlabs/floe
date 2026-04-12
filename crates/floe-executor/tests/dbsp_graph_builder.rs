@@ -62,9 +62,22 @@ fn split_index_value(text: &str, delimiter: &str, index: i64) -> Option<String> 
 
 async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let ctx = SessionContext::new();
-    let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
-    ctx.register_table("nexmark_bid", provider)
+    let bid_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
+    let auction_provider: Arc<dyn TableProvider> =
+        Arc::new(EmptyTable::new(nexmark_auction_schema()));
+    let person_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_person_schema()));
+    ctx.register_table("nexmark_bid", Arc::clone(&bid_provider))
         .expect("register nexmark_bid");
+    ctx.register_table("bid", bid_provider)
+        .expect("register bid");
+    ctx.register_table("nexmark_auction", Arc::clone(&auction_provider))
+        .expect("register nexmark_auction");
+    ctx.register_table("auction", auction_provider)
+        .expect("register auction");
+    ctx.register_table("nexmark_person", Arc::clone(&person_provider))
+        .expect("register nexmark_person");
+    ctx.register_table("person", person_provider)
+        .expect("register person");
     register_planner_test_udfs(&ctx);
     let plan = ctx
         .state()
@@ -454,7 +467,7 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
-            enable_source_batch_journal: true,
+            enable_source_batch_journal: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2124,6 +2137,142 @@ async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
             bid_row_with_ts(1, 11, 200, 1_700_000_002_000),
             bid_row_with_ts(2, 22, 60, 1_700_000_002_000),
         ]
+    );
+}
+
+#[tokio::test]
+async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection() {
+    let db = test_db("row-number-top1-join-q9-shape").await;
+    let view_name = "mv_row_number_top1_join_q9_shape";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT id, bidder, price, \"bidExtra\" \
+             FROM ( \
+               SELECT a.id, b.bidder, b.price, b.extra AS \"bidExtra\", \
+                 ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.date_time ASC) AS rownum \
+               FROM nexmark_auction a \
+               JOIN nexmark_bid b ON a.id = b.auction \
+               WHERE b.date_time BETWEEN a.date_time AND a.expires \
+             ) ranked \
+             WHERE rownum <= 1",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_auction", "nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_auction", false);
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new("bidExtra", DataType::Utf8, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient row-number top1 join graph");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(
+            encoded_auction_row_with_ts_and_extra(
+                1,
+                500,
+                9,
+                1_700_000_100_000,
+                1_700_000_000_000,
+                "auction_extra",
+            ),
+            1,
+        )
+        .expect("append auction");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick auctions");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_ts_and_extra(1, 11, 10, 1_700_000_001_000, "bid_low"),
+            1,
+        )
+        .expect("append low bid");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_ts_and_extra(1, 22, 40, 1_700_000_002_000, "bid_high_late"),
+            1,
+        )
+        .expect("append high late bid");
+    bid_writer
+        .append_encoded(
+            encoded_bid_row_with_ts_and_extra(1, 33, 40, 1_700_000_001_500, "bid_high_early"),
+            1,
+        )
+        .expect("append high early bid");
+    registry
+        .tick_all_with_version(2)
+        .await
+        .expect("tick bids");
+
+    wait_for_logical_version(&mv_registry, view_name, 2).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(scalar_i64(row.first()), 1);
+    assert_eq!(scalar_i64(row.get(1)), 33);
+    assert_eq!(scalar_i64(row.get(2)), 40);
+    assert!(
+        matches!(
+            row.get(3),
+            Some(Some(EncodedRowScalar::Utf8(value))) if value == "bid_high_early"
+        ),
+        "expected bidExtra=bid_high_early, got {:?}",
+        row.get(3)
     );
 }
 
@@ -4118,6 +4267,24 @@ fn encoded_bid_row_with_ts(auction: i64, bidder: i64, price: i64, date_time_ms: 
     ])
 }
 
+fn encoded_bid_row_with_ts_and_extra(
+    auction: i64,
+    bidder: i64,
+    price: i64,
+    date_time_ms: i64,
+    extra: &str,
+) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(auction),
+        EncodedTestField::Int64(bidder),
+        EncodedTestField::Int64(price),
+        EncodedTestField::Utf8("channel"),
+        EncodedTestField::Utf8("url"),
+        EncodedTestField::TimestampMillis(date_time_ms),
+        EncodedTestField::Utf8(extra),
+    ])
+}
+
 fn encoded_bid_row_with_channel_url(
     auction: i64,
     bidder: i64,
@@ -4169,6 +4336,28 @@ fn encoded_auction_row_with_category(id: i64, seller: i64, category: i64) -> Vec
         EncodedTestField::TimestampMillis(1_700_000_000_000),
         EncodedTestField::TimestampMillis(1_700_000_100_000),
         EncodedTestField::Utf8("extra"),
+    ])
+}
+
+fn encoded_auction_row_with_ts_and_extra(
+    id: i64,
+    seller: i64,
+    category: i64,
+    expires_ms: i64,
+    date_time_ms: i64,
+    extra: &str,
+) -> Vec<u8> {
+    encode_test_row(&[
+        EncodedTestField::Int64(id),
+        EncodedTestField::Utf8("item"),
+        EncodedTestField::Utf8("desc"),
+        EncodedTestField::Int64(10),
+        EncodedTestField::Int64(20),
+        EncodedTestField::Int64(seller),
+        EncodedTestField::Int64(category),
+        EncodedTestField::TimestampMillis(expires_ms),
+        EncodedTestField::TimestampMillis(date_time_ms),
+        EncodedTestField::Utf8(extra),
     ])
 }
 
