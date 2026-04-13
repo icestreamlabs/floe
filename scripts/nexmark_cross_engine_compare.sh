@@ -64,6 +64,8 @@ FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 STRICT_RESULT_CORRECTNESS="${STRICT_RESULT_CORRECTNESS:-1}"
 STRICT_RESULT_CONTENT_CHECK="${STRICT_RESULT_CONTENT_CHECK:-1}"
+STRICT_CONTENT_RETRY_ATTEMPTS="${STRICT_CONTENT_RETRY_ATTEMPTS:-24}"
+STRICT_CONTENT_RETRY_DELAY_SECONDS="${STRICT_CONTENT_RETRY_DELAY_SECONDS:-5}"
 
 RUN_DIR="${ARTIFACT_ROOT}/${RUN_ID}"
 RESULTS_FILE="${RUN_DIR}/summary.md"
@@ -514,7 +516,7 @@ SQL
       ;;
     q4)
       cat <<'SQL'
-SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category
+SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price FROM (SELECT MAX(b.price) AS max, a.category FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category
 SQL
       ;;
     q5)
@@ -524,7 +526,7 @@ SQL
       ;;
     q6)
       cat <<'SQL'
-SELECT seller, AVG(price) AS moving_avg_price FROM (SELECT a.seller, b.price, b.date_time, ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked WHERE rownum <= 1 GROUP BY seller
+SELECT seller, CAST(AVG(price) AS BIGINT) AS moving_avg_price FROM (SELECT a.seller, b.price, b.date_time, ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked WHERE rownum <= 1 GROUP BY seller
 SQL
       ;;
     q7)
@@ -539,7 +541,7 @@ SQL
       ;;
     q9)
       cat <<'SQL'
-SELECT id, "itemName", description, "initialBid", reserve, "dateTime", expires, seller, category, extra, auction, bidder, price, "bidTime", "bidExtra" FROM (SELECT a.id, a.item_name AS "itemName", a.description, a.initial_bid AS "initialBid", a.reserve, a.date_time AS "dateTime", a.expires, a.seller, a.category, a.extra, b.auction, b.bidder, b.price, b.date_time AS "bidTime", b.extra AS "bidExtra", ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.date_time ASC) AS rownum FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked WHERE rownum <= 1
+SELECT id, "itemName", description, "initialBid", reserve, "dateTime", expires, seller, category, extra, auction, bidder, price, "bidTime", "bidExtra" FROM (SELECT a.id, a.item_name AS "itemName", a.description, a.initial_bid AS "initialBid", a.reserve, a.auction_time AS "dateTime", a.expires, a.seller, a.category, a.auction_extra AS extra, b.auction, b.bidder, b.price, b.bid_time AS "bidTime", b.bid_extra AS "bidExtra", ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.bid_time ASC) AS rownum FROM (SELECT id, item_name, description, initial_bid, reserve, date_time AS auction_time, expires, seller, category, extra AS auction_extra FROM nexmark_auction) a JOIN (SELECT auction, bidder, price, date_time AS bid_time, extra AS bid_extra FROM nexmark_bid) b ON a.id = b.auction WHERE b.bid_time BETWEEN a.auction_time AND a.expires) ranked WHERE rownum <= 1
 SQL
       ;;
     q12)
@@ -569,7 +571,7 @@ SQL
       ;;
     q17)
       cat <<'SQL'
-SELECT auction, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, AVG(price) AS avg_price, SUM(price) AS sum_price FROM nexmark_bid GROUP BY auction, DATE_FORMAT(date_time, 'yyyy-MM-dd')
+SELECT auction, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, CAST(AVG(price) AS BIGINT) AS avg_price, SUM(price) AS sum_price FROM nexmark_bid GROUP BY auction, DATE_FORMAT(date_time, 'yyyy-MM-dd')
 SQL
       ;;
     q18)
@@ -808,6 +810,46 @@ poll_pg_source_counts() {
   return 1
 }
 
+poll_pg_relation_counts_at_least() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  shift 3
+  local specs=("$@")
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local ready=1
+    local spec
+    for spec in "${specs[@]}"; do
+      local relation="${spec%%:*}"
+      local target="${spec##*:}"
+      local count
+      count="$(fetch_pg_scalar "${port}" "${user}" "${db}" "SELECT COUNT(*)::BIGINT FROM ${relation}")"
+      if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ || ${count} -lt ${target} ]]; then
+        ready=0
+        break
+      fi
+    done
+
+    if [[ "${ready}" == "1" ]]; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
 poll_feldera_source_counts() {
   local pipeline="$1"
   shift
@@ -904,6 +946,51 @@ poll_pg_relation_max_mv_version_at_least() {
     local current_max_version
     current_max_version="$(fetch_pg_relation_max_mv_version "${port}" "${user}" "${db}" "${relation}")"
     if [[ -n "${current_max_version}" && "${current_max_version}" =~ ^[0-9]+$ && ${current_max_version} -ge ${expected_min_version} ]]; then
+      return 0
+    fi
+
+    sleep_ms "${POLL_INTERVAL_MS}"
+  done
+
+  return 1
+}
+
+poll_pg_relation_max_mv_version_stable() {
+  local port="$1"
+  local user="$2"
+  local db="$3"
+  local relation="${4:-benchmark_result}"
+  local stable_polls_required="${5:-8}"
+
+  local start_ms now_ms
+  start_ms="$(date +%s%3N)"
+
+  local previous_max_version=""
+  local stable_polls=0
+  local _
+  for _ in $(seq 1 "${POLL_ATTEMPTS}"); do
+    now_ms="$(date +%s%3N)"
+    if (( now_ms - start_ms >= POLL_TIMEOUT_MS )); then
+      return 1
+    fi
+
+    local current_max_version
+    current_max_version="$(fetch_pg_relation_max_mv_version "${port}" "${user}" "${db}" "${relation}")"
+    if [[ -z "${current_max_version}" || ! "${current_max_version}" =~ ^[0-9]+$ ]]; then
+      stable_polls=0
+      previous_max_version=""
+      sleep_ms "${POLL_INTERVAL_MS}"
+      continue
+    fi
+
+    if [[ "${current_max_version}" == "${previous_max_version}" ]]; then
+      stable_polls=$((stable_polls + 1))
+    else
+      previous_max_version="${current_max_version}"
+      stable_polls=1
+    fi
+
+    if (( stable_polls >= stable_polls_required )); then
       return 0
     fi
 
@@ -1511,15 +1598,17 @@ compute_floe_result_content_hash() {
   local db="$3"
   local artifact_dir="$4"
   local stderr_file="${5:-/dev/null}"
+  local relation="${6:-benchmark_result}"
+  local label="${7:-${relation}}"
   local projection
-  projection="$(compute_floe_normalized_projection_for_relation "${port}" "${user}" "${db}" "benchmark_result" "public" "benchmark_result")"
+  projection="$(compute_floe_normalized_projection_for_relation "${port}" "${user}" "${db}" "${relation}" "public" "${relation}")"
   local query_sql
   if [[ -n "${projection}" ]]; then
-    query_sql="SELECT ${projection} FROM benchmark_result"
+    query_sql="SELECT ${projection} FROM ${relation}"
   else
-    query_sql="SELECT * FROM benchmark_result"
+    query_sql="SELECT * FROM ${relation}"
   fi
-  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "benchmark_result" "${query_sql}" "${stderr_file}"
+  compute_pg_query_content_fingerprint "${port}" "${user}" "${db}" "${artifact_dir}" "${label}" "${query_sql}" "${stderr_file}"
 }
 
 compute_floe_expected_query_content_hash() {
@@ -2603,17 +2692,81 @@ floe_expected_query_text_for_sources() {
   local query_id="$1"
   local sources="$2"
   local query_text
-  query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+  case "${query_id}" in
+    q5|q7|q8|q12)
+      query_text="$(query_sql_portable "${query_id}")"
 
-  if has_source "${sources}" bid; then
-    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_bid\>/benchmark_input_bid/g')"
-  fi
-  if has_source "${sources}" auction; then
-    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_auction\>/benchmark_input_auction/g')"
-  fi
-  if has_source "${sources}" person; then
-    query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_person\>/benchmark_input_person/g')"
-  fi
+      local portable_ctes=()
+      if has_source "${sources}" bid; then
+        portable_ctes+=('bid AS (SELECT auction, bidder, price, channel, url, CAST(date_time AS BIGINT) AS "dateTime", extra FROM benchmark_input_bid)')
+      fi
+      if has_source "${sources}" auction; then
+        portable_ctes+=('auction AS (SELECT id, item_name AS "itemName", description, initial_bid AS "initialBid", reserve, CAST(date_time AS BIGINT) AS "dateTime", expires, seller, category, extra FROM benchmark_input_auction)')
+      fi
+      if has_source "${sources}" person; then
+        portable_ctes+=('person AS (SELECT id, name, city, state, CAST(date_time AS BIGINT) AS "dateTime", extra FROM benchmark_input_person)')
+      fi
+
+      if (( ${#portable_ctes[@]} > 0 )); then
+        local wrapped_portable="WITH ${portable_ctes[0]}"
+        local portable_idx
+        for ((portable_idx = 1; portable_idx < ${#portable_ctes[@]}; portable_idx++)); do
+          wrapped_portable+=", ${portable_ctes[portable_idx]}"
+        done
+        wrapped_portable+=" ${query_text}"
+        query_text="${wrapped_portable}"
+      fi
+      ;;
+    q13|q21|q22)
+      query_text="$(query_sql_portable "${query_id}")"
+
+      local ctes=()
+      if has_source "${sources}" bid; then
+        ctes+=('bid AS (SELECT auction, bidder, price, channel, url, date_time AS "dateTime", extra FROM benchmark_input_bid)')
+      fi
+      if has_source "${sources}" auction; then
+        ctes+=('auction AS (SELECT id, item_name AS "itemName", description, initial_bid AS "initialBid", reserve, date_time AS "dateTime", expires, seller, category, extra FROM benchmark_input_auction)')
+      fi
+      if has_source "${sources}" person; then
+        ctes+=('person AS (SELECT id, name, city, state, date_time AS "dateTime", extra FROM benchmark_input_person)')
+      fi
+
+      if (( ${#ctes[@]} > 0 )); then
+        local wrapped="WITH ${ctes[0]}"
+        local idx
+        for ((idx = 1; idx < ${#ctes[@]}; idx++)); do
+          wrapped+=", ${ctes[idx]}"
+        done
+        wrapped+=" ${query_text}"
+        query_text="${wrapped}"
+      fi
+      ;;
+    q14)
+      query_text='SELECT auction, bidder, price * 908 / 1000 AS price, CASE WHEN CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) >= 8 AND CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) <= 18 THEN '\''dayTime'\'' WHEN CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) <= 6 OR CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) >= 20 THEN '\''nightTime'\'' ELSE '\''otherTime'\'' END AS bid_time_type, date_time AS "dateTime", extra, LENGTH(extra) - LENGTH(REPLACE(extra, '\''c'\'', '\'''\'')) AS c_counts FROM benchmark_input_bid WHERE price * 908 / 1000 > 1000000 AND price * 908 / 1000 < 50000000'
+      ;;
+    q15)
+      query_text='SELECT SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM benchmark_input_bid GROUP BY SUBSTR(CAST(date_time AS VARCHAR), 1, 10)'
+      ;;
+    q16)
+      query_text='SELECT channel, SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, MAX(SUBSTR(CAST(date_time AS VARCHAR), 12, 5)) AS minute, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM benchmark_input_bid GROUP BY channel, SUBSTR(CAST(date_time AS VARCHAR), 1, 10)'
+      ;;
+    q17)
+      query_text='SELECT auction, SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, CAST(AVG(price) AS BIGINT) AS avg_price, SUM(price) AS sum_price FROM benchmark_input_bid GROUP BY auction, SUBSTR(CAST(date_time AS VARCHAR), 1, 10)'
+      ;;
+    *)
+      query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
+
+      if has_source "${sources}" bid; then
+        query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_bid\>/benchmark_input_bid/g')"
+      fi
+      if has_source "${sources}" auction; then
+        query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_auction\>/benchmark_input_auction/g')"
+      fi
+      if has_source "${sources}" person; then
+        query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_person\>/benchmark_input_person/g')"
+      fi
+      ;;
+  esac
 
   printf '%s\n' "${query_text}"
 }
@@ -2718,6 +2871,21 @@ run_floe_query() {
     stop_floe_process
     return 1
   fi
+  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+    local strict_specs=()
+    while IFS= read -r strict_spec; do
+      [[ -n "${strict_spec}" ]] && strict_specs+=("${strict_spec}")
+    done < <(relation_specs_for_sources "${sources}" benchmark_input)
+    if ! poll_pg_relation_counts_at_least "${FLOE_PG_PORT}" postgres postgres "${strict_specs[@]}"; then
+      {
+        printf 'query_id=%s\n' "${query_id}"
+        printf 'engine=floe\n'
+        printf 'reason=benchmark_input_row_counts_not_reached_after_kafka_catchup\n'
+      } > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
+    fi
+  fi
   end_ms="$(date +%s%3N)"
   total_ms=$((end_ms - start_ms))
   if (( total_ms > 0 )); then
@@ -2751,52 +2919,23 @@ run_floe_query() {
   fi
 
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
-    local expected_min_result_version=0
-    local source_mv_version
-    if has_source "${sources}" bid; then
-      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_bid)"
-      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
-        expected_min_result_version="${source_mv_version}"
-      fi
-    fi
-    if has_source "${sources}" auction; then
-      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_auction)"
-      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
-        expected_min_result_version="${source_mv_version}"
-      fi
-    fi
-    if has_source "${sources}" person; then
-      source_mv_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_input_person)"
-      if [[ -n "${source_mv_version}" && "${source_mv_version}" =~ ^[0-9]+$ && ${source_mv_version} -gt ${expected_min_result_version} ]]; then
-        expected_min_result_version="${source_mv_version}"
-      fi
-    fi
-
-    if (( expected_min_result_version > 0 )); then
-      if ! poll_pg_relation_max_mv_version_at_least "${FLOE_PG_PORT}" postgres postgres "${expected_min_result_version}" benchmark_result; then
-        local observed_max_result_version
-        observed_max_result_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_result)"
-        {
-          printf 'expected_min_result_version=%s\n' "${expected_min_result_version}"
-          printf 'observed_max_result_version=%s\n' "${observed_max_result_version:-n/a}"
-          printf 'query_id=%s\n' "${query_id}"
-          printf 'engine=floe\n'
-          printf 'reason=result_mv_version_did_not_catch_up_to_input_views\n'
-        } > "${artifact_dir}/correctness.error"
-        stop_floe_process
-        return 1
-      fi
+    if ! poll_pg_relation_max_mv_version_stable "${FLOE_PG_PORT}" postgres postgres benchmark_result 8; then
+      local observed_max_result_version
+      observed_max_result_version="$(fetch_pg_relation_max_mv_version "${FLOE_PG_PORT}" postgres postgres benchmark_result)"
+      {
+        printf 'query_id=%s\n' "${query_id}"
+        printf 'engine=floe\n'
+        printf 'observed_max_result_version=%s\n' "${observed_max_result_version:-n/a}"
+        printf 'reason=result_mv_version_not_stable_before_content_hash\n'
+      } > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
     fi
   fi
 
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
-    local observed_fingerprint expected_fingerprint
-    observed_fingerprint="$(compute_floe_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
-      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
-      stop_floe_process
-      return 1
-    }
+    local expected_fingerprint
     local expected_query_text
     expected_query_text="$(floe_expected_query_text_for_sources "${query_id}" "${sources}")"
     expected_fingerprint="$(compute_floe_expected_query_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
@@ -2804,10 +2943,53 @@ run_floe_query() {
       stop_floe_process
       return 1
     }
-    local expected_hash observed_rows_from_hash expected_rows_from_hash
-    IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+    local expected_hash expected_rows_from_hash
     IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-    if ! verify_result_content_hash floe "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+
+    local retry_attempts="${STRICT_CONTENT_RETRY_ATTEMPTS}"
+    if [[ -z "${retry_attempts}" || ! "${retry_attempts}" =~ ^[0-9]+$ || ${retry_attempts} -lt 1 ]]; then
+      retry_attempts=1
+    fi
+    local retry_delay_seconds="${STRICT_CONTENT_RETRY_DELAY_SECONDS}"
+    if [[ -z "${retry_delay_seconds}" || ! "${retry_delay_seconds}" =~ ^[0-9]+$ || ${retry_delay_seconds} -lt 0 ]]; then
+      retry_delay_seconds=0
+    fi
+
+    local observed_fingerprint observed_rows_from_hash final_observed_rows final_observed_hash
+    local matched=0
+    local attempt
+    for attempt in $(seq 1 "${retry_attempts}"); do
+      observed_fingerprint="$(compute_floe_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
+        printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+        stop_floe_process
+        return 1
+      }
+      IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+      final_observed_rows="${observed_rows_from_hash}"
+      final_observed_hash="${observed_hash}"
+
+      if [[ "${observed_rows_from_hash}" == "${expected_rows_from_hash}" && "${observed_hash}" == "${expected_hash}" ]]; then
+        matched=1
+        break
+      fi
+
+      if (( attempt < retry_attempts && retry_delay_seconds > 0 )); then
+        sleep "${retry_delay_seconds}"
+      fi
+    done
+
+    if [[ "${matched}" != "1" ]]; then
+      if ! verify_result_content_hash floe "${query_id}" "${final_observed_rows}" "${final_observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+        stop_floe_process
+        return 1
+      fi
+    fi
+
+    if [[ -n "${final_observed_hash}" ]]; then
+      observed_hash="${final_observed_hash}"
+    fi
+
+    if [[ "${matched}" != "1" ]]; then
       stop_floe_process
       return 1
     fi
