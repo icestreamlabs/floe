@@ -9,9 +9,7 @@ use dbsp::RowSchema;
 use dbsp::StreamRetention;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
-use dbsp::storage::KeyValueTable;
-use dbsp::storage::dictionary::Dictionary;
-use dbsp::stream::util::delta_zset_handle;
+use dbsp::stream::util::DeltaZSetHandleReader;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -407,7 +405,7 @@ impl DbspGraphBuilder {
         let cursor = StreamCursor::new(upstream.stream());
         let upstream_frontier = cursor.observed();
         let mut upstream_stream = handle_stream.stream();
-        let mut dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>> = HashMap::new();
+        let mut delta_reader = DeltaZSetHandleReader::<Vec<u8>>::new(table.clone());
         let graph_id = self.graph_id().to_string();
         let view_namespace = crate::namespaces::materialized_view(view_name)
             .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
@@ -441,8 +439,7 @@ impl DbspGraphBuilder {
                     .with_context(|| format!("load delta handle for view '{view_name}' at {ts}"))?;
                 let apply = Self::queue_delta_handle_for_view(
                     &mut view,
-                    table.clone(),
-                    &mut dict_cache,
+                    &mut delta_reader,
                     Arc::clone(&arrow_schema),
                     consolidation_mode,
                     delta_transform.as_ref(),
@@ -516,7 +513,7 @@ impl DbspGraphBuilder {
         tokio::spawn(async move {
             let mut cursor = cursor;
             let mut view = view;
-            let mut dict_cache = dict_cache;
+            let mut delta_reader = delta_reader;
             let mut pending = pending;
             loop {
                 let delay_remaining = pending.delay_remaining(flush_cfg, Instant::now());
@@ -567,8 +564,7 @@ impl DbspGraphBuilder {
                             if let Err(err) = Self::process_materialize_delta(
                                 result,
                                 &mut view,
-                                table.clone(),
-                                &mut dict_cache,
+                                &mut delta_reader,
                                 Arc::clone(&arrow_schema),
                                 consolidation_mode,
                                 delta_transform.as_ref(),
@@ -617,8 +613,7 @@ impl DbspGraphBuilder {
                             if let Err(err) = Self::process_materialize_delta(
                                 result,
                                 &mut view,
-                                table.clone(),
-                                &mut dict_cache,
+                                &mut delta_reader,
                                 Arc::clone(&arrow_schema),
                                 consolidation_mode,
                                 delta_transform.as_ref(),
@@ -1088,8 +1083,7 @@ impl DbspGraphBuilder {
     async fn process_materialize_delta(
         result: Result<(i64, ZSetHandle)>,
         view: &mut DbspView,
-        table: Arc<dyn KeyValueTable>,
-        dict_cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+        delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
         row_schema: SchemaRef,
         consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
@@ -1114,8 +1108,7 @@ impl DbspGraphBuilder {
         let _enter = update_span.enter();
         let apply = Self::queue_delta_handle_for_view(
             view,
-            table,
-            dict_cache,
+            delta_reader,
             row_schema,
             consolidation_mode,
             delta_transform,
@@ -1344,8 +1337,7 @@ impl DbspGraphBuilder {
 
     async fn queue_delta_handle_for_view(
         view: &mut DbspView,
-        table: Arc<dyn KeyValueTable>,
-        dict_cache: &mut HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+        delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
         _row_schema: SchemaRef,
         _consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
@@ -1353,7 +1345,8 @@ impl DbspGraphBuilder {
         authoritative_state: Option<(&Arc<MaterializedViewHandle>, u64)>,
     ) -> Result<DeltaApplyStats> {
         let load_start = Instant::now();
-        let mut deltas = delta_zset_handle::<Vec<u8>>(table, dict_cache, delta_handle)
+        let mut deltas = delta_reader
+            .read(delta_handle)
             .await
             .context("materialize delta handle for materialized view")?;
         let load_ms = load_start.elapsed().as_millis() as u64;

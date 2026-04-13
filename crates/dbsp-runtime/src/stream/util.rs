@@ -12,6 +12,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::zset::VersionedZSet;
 use crate::handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -39,6 +40,103 @@ pub(crate) const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
 
 fn dictionary_namespace_for_handle(ns: &str) -> &str {
     ns.strip_suffix(DELTA_NAMESPACE_SUFFIX).unwrap_or(ns)
+}
+
+/// Reusable decoder for delta handle rows that avoids reopening the underlying
+/// versioned ZSet for every observed handle version.
+pub struct DeltaZSetHandleReader<K>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    table: Arc<dyn KeyValueTable>,
+    dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    zset_cache: HashMap<String, VersionedZSet<K>>,
+}
+
+impl<K> DeltaZSetHandleReader<K>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub fn new(table: Arc<dyn KeyValueTable>) -> Self {
+        Self {
+            table,
+            dict_cache: HashMap::new(),
+            zset_cache: HashMap::new(),
+        }
+    }
+
+    pub async fn read(&mut self, handle: &ZSetHandle) -> Result<Vec<(K, i64)>> {
+        let total_start = Instant::now();
+        let dict_ns = dictionary_namespace_for_handle(&handle.ns);
+
+        let dict_open_start = Instant::now();
+        let (dict, dict_cache_hit) = if let Some(existing) = self.dict_cache.get(dict_ns) {
+            (existing.clone(), true)
+        } else {
+            let dictionary = Arc::new(
+                Dictionary::with_table(self.table.clone(), dict_ns.to_string(), None)
+                    .await
+                    .context("open dictionary for ZSet handle")?,
+            );
+            self.dict_cache
+                .insert(dict_ns.to_string(), dictionary.clone());
+            (dictionary, false)
+        };
+        let dict_open_ms = dict_open_start.elapsed().as_millis() as u64;
+
+        let zset_open_start = Instant::now();
+        if !self.zset_cache.contains_key(&handle.ns) {
+            let versioned = VersionedZSet::new(dict, self.table.clone(), handle.ns.clone())
+                .await
+                .context("open versioned ZSet for delta handle reader")?;
+            self.zset_cache.insert(handle.ns.clone(), versioned);
+        }
+        let zset_open_ms = zset_open_start.elapsed().as_millis() as u64;
+
+        let delta_iter_start = Instant::now();
+        let zset = self
+            .zset_cache
+            .get(&handle.ns)
+            .ok_or_else(|| anyhow::anyhow!("missing cached versioned ZSet for {}", handle.ns))?;
+        let mut deltas = zset
+            .delta_iter_with_dict(handle.version)
+            .await
+            .context("delta iterate ZSet handle")?;
+        let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
+        let rows_before_retain = deltas.len();
+        deltas.retain(|(_, delta)| *delta != 0);
+
+        tracing::debug!(
+            namespace = %handle.ns,
+            version = handle.version,
+            dict_ns,
+            dict_cache_hit,
+            dict_open_ms,
+            zset_open_ms,
+            rows_before_retain,
+            rows_after_retain = deltas.len(),
+            delta_iter_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "zset handle delta reader breakdown"
+        );
+        Ok(deltas)
+    }
 }
 
 pub(crate) fn delta_handle_namespace(namespace: &str) -> String {
