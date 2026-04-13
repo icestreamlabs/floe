@@ -3119,9 +3119,6 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
     let Some(right_root) = try_build_transient_source_root_materialization(plan, right_idx)? else {
         return Ok(None);
     };
-    if left_root.requires_projected_input || right_root.requires_projected_input {
-        return Ok(None);
-    }
     Ok(Some(BTreeSet::from([
         left_root.source_name,
         right_root.source_name,
@@ -3718,9 +3715,6 @@ fn try_build_transient_join_input_optimization(
     else {
         return Ok(None);
     };
-    if source_root.requires_projected_input {
-        return Ok(None);
-    }
     let Some(upstream) = outer_transient_streams
         .get(&source_root.source_name)
         .cloned()
