@@ -379,7 +379,7 @@ fn evaluate_aggregate_values(
                 return vec![None; aggregates.len()];
             }
         };
-        encoded = match evaluator.transform_delta(graph_id, encoded) {
+        encoded = match evaluator.transform_delta(graph_id, &encoded) {
             Ok(delta) => delta,
             Err(err) => {
                 tracing::warn!(

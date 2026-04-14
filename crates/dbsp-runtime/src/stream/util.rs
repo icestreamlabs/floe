@@ -1,7 +1,9 @@
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -37,6 +39,80 @@ pub(crate) const ZSET_INTEGRAL_PREFIX: &str = "zset_integral/";
 pub(crate) const ZSET_INTEGRAL_STREAM_PREFIX: &str = "stream_zset_integral/";
 pub(crate) const DELTA_LIFTED_JOIN_STREAM_PREFIX: &str = "stream_delta_lifted_join/";
 pub(crate) const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
+const TRANSIENT_ZSET_BATCH_REGISTRY_MAX_ENTRIES: usize = 512;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TransientZSetBatchKey {
+    namespace: String,
+    version: u64,
+    type_id: TypeId,
+}
+
+#[derive(Default)]
+struct TransientZSetBatchRegistry {
+    entries: HashMap<TransientZSetBatchKey, Arc<dyn Any + Send + Sync>>,
+    order: VecDeque<TransientZSetBatchKey>,
+}
+
+static TRANSIENT_ZSET_BATCH_REGISTRY: LazyLock<Mutex<TransientZSetBatchRegistry>> =
+    LazyLock::new(|| Mutex::new(TransientZSetBatchRegistry::default()));
+
+fn transient_zset_batch_key<K>(handle: &ZSetHandle) -> TransientZSetBatchKey
+where
+    K: Send + Sync + 'static,
+{
+    TransientZSetBatchKey {
+        namespace: handle.ns.clone(),
+        version: handle.version,
+        type_id: TypeId::of::<K>(),
+    }
+}
+
+fn evict_excess_transient_zset_batches(registry: &mut TransientZSetBatchRegistry) {
+    while registry.entries.len() > TRANSIENT_ZSET_BATCH_REGISTRY_MAX_ENTRIES {
+        let Some(candidate) = registry.order.pop_front() else {
+            break;
+        };
+        registry.entries.remove(&candidate);
+    }
+}
+
+pub fn publish_transient_zset_batch<K>(handle: &ZSetHandle, batch: Arc<Vec<(K, i64)>>)
+where
+    K: Send + Sync + 'static,
+{
+    if handle.version == 0 || batch.is_empty() {
+        return;
+    }
+
+    let key = transient_zset_batch_key::<K>(handle);
+    let payload: Arc<dyn Any + Send + Sync> = Arc::new(batch) as Arc<dyn Any + Send + Sync>;
+    let mut registry = TRANSIENT_ZSET_BATCH_REGISTRY
+        .lock()
+        .expect("transient zset batch registry lock poisoned");
+    registry.entries.insert(key.clone(), payload);
+    registry.order.push_back(key);
+    evict_excess_transient_zset_batches(&mut registry);
+}
+
+pub fn transient_zset_batch<K>(handle: &ZSetHandle) -> Option<Arc<Vec<(K, i64)>>>
+where
+    K: Send + Sync + 'static,
+{
+    if handle.version == 0 {
+        return Some(Arc::new(Vec::new()));
+    }
+
+    let key = transient_zset_batch_key::<K>(handle);
+    let payload = {
+        let registry = TRANSIENT_ZSET_BATCH_REGISTRY
+            .lock()
+            .expect("transient zset batch registry lock poisoned");
+        registry.entries.get(&key).cloned()
+    }?;
+    let batch = Arc::downcast::<Arc<Vec<(K, i64)>>>(payload).ok()?;
+    Some(batch.as_ref().clone())
+}
 
 fn dictionary_namespace_for_handle(ns: &str) -> &str {
     ns.strip_suffix(DELTA_NAMESPACE_SUFFIX).unwrap_or(ns)
@@ -82,6 +158,19 @@ where
     }
 
     pub async fn read(&mut self, handle: &ZSetHandle) -> Result<Vec<(K, i64)>> {
+        if handle.version == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(batch) = transient_zset_batch::<K>(handle) {
+            tracing::debug!(
+                namespace = %handle.ns,
+                version = handle.version,
+                rows = batch.len(),
+                "zset handle reader transient delta hit"
+            );
+            return Ok(batch.as_ref().clone());
+        }
+
         let total_start = Instant::now();
         let dict_ns = dictionary_namespace_for_handle(&handle.ns);
 
@@ -121,6 +210,7 @@ where
         let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
         let rows_before_retain = deltas.len();
         deltas.retain(|(_, delta)| *delta != 0);
+        publish_transient_zset_batch(handle, Arc::new(deltas.clone()));
 
         tracing::debug!(
             namespace = %handle.ns,
@@ -434,6 +524,41 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    Ok(delta_zset_handle_batch(table, cache, handle)
+        .await?
+        .as_ref()
+        .clone())
+}
+
+pub async fn delta_zset_handle_batch<K>(
+    table: Arc<dyn KeyValueTable>,
+    cache: &mut HashMap<String, Arc<Dictionary<K>>>,
+    handle: &ZSetHandle,
+) -> Result<Arc<Vec<(K, i64)>>>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    if handle.version == 0 {
+        return Ok(Arc::new(Vec::new()));
+    }
+    if let Some(batch) = transient_zset_batch::<K>(handle) {
+        tracing::debug!(
+            namespace = %handle.ns,
+            version = handle.version,
+            rows = batch.len(),
+            "zset handle transient delta hit"
+        );
+        return Ok(batch);
+    }
+
     let total_start = Instant::now();
     let dict_ns = dictionary_namespace_for_handle(&handle.ns);
     let dict_open_start = Instant::now();
@@ -459,6 +584,8 @@ where
     let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
     let rows_before_retain = deltas.len();
     deltas.retain(|(_, delta)| *delta != 0);
+    let deltas = Arc::new(deltas);
+    publish_transient_zset_batch(handle, Arc::clone(&deltas));
     tracing::debug!(
         namespace = %handle.ns,
         version = handle.version,
@@ -537,6 +664,36 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     stream.push_value_in_place(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{delta_zset_handle_batch, publish_transient_zset_batch};
+    use crate::handles::ZSetHandle;
+    use crate::storage::{KeyValueTable, SlateTable};
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn delta_zset_handle_batch_uses_transient_registry_before_storage() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("transient_zset_registry", store).await.expect("open SlateDB"));
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+        let handle = ZSetHandle {
+            ns: "transient_only_delta".to_string(),
+            version: 7,
+        };
+        let expected = Arc::new(vec![("alpha".to_string(), 1), ("beta".to_string(), -1)]);
+        publish_transient_zset_batch(&handle, Arc::clone(&expected));
+
+        let actual = delta_zset_handle_batch::<String>(table, &mut HashMap::new(), &handle)
+            .await
+            .expect("load transient delta batch");
+
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
 }
 
 pub(crate) fn set_value_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)

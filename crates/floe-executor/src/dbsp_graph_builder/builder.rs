@@ -1010,7 +1010,7 @@ fn apply_transient_segment_vectorized(
         if deltas.is_empty() {
             break;
         }
-        deltas = evaluator.transform_delta(graph_id, deltas)?;
+        deltas = evaluator.transform_delta(graph_id, &deltas)?;
     }
     Ok(deltas)
 }
@@ -4148,7 +4148,7 @@ async fn build_transient_aggregate_receiver(
                             }
                         };
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                            match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4228,7 +4228,7 @@ async fn build_transient_aggregate_receiver(
                             }
                         };
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                            match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4679,7 +4679,7 @@ fn build_transient_topn_receiver(
                             }
                         };
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                            match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4770,7 +4770,7 @@ fn build_transient_topn_receiver(
                             }
                         };
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, input_deltas) {
+                            match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4819,7 +4819,7 @@ fn build_transient_topn_receiver(
                         }
                     };
                     let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                        match evaluator.transform_delta(&graph_id, input_deltas) {
+                        match evaluator.transform_delta(&graph_id, &input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4922,7 +4922,7 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
             .context("build vectorized transient source filter evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", delta_values)
+        evaluator.transform_delta("source_batch_journal", &delta_values)
     }))
 }
 
@@ -4934,7 +4934,7 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
             .context("build vectorized transient source map evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", delta_values)
+        evaluator.transform_delta("source_batch_journal", &delta_values)
     }))
 }
 
@@ -4954,7 +4954,7 @@ fn build_filter_map_transform(
         .context("build vectorized transient source filter_map evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", delta_values)
+        evaluator.transform_delta("source_batch_journal", &delta_values)
     }))
 }
 
@@ -5603,7 +5603,7 @@ mod tests {
         let source_deltas =
             (shape.source_root.transform)(vec![(encoded, 1)]).expect("source transform");
         let precomputed = precompute_evaluator
-            .transform_delta("benchmark_result", source_deltas)
+            .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 pruned bid row");
         assert_eq!(precomputed.len(), 1);
 
@@ -5674,7 +5674,7 @@ mod tests {
         let source_deltas = (shape.source_root.transform)(vec![(encoded_one, 1), (encoded_two, 1)])
             .expect("source transform");
         let precomputed = precompute_evaluator
-            .transform_delta("benchmark_result", source_deltas)
+            .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 rows");
 
         let row_evaluator = build_incremental_aggregate_row_evaluator(
@@ -6483,7 +6483,7 @@ mod tests {
                 evaluator
                     .transform_delta(
                         "benchmark_join_build_tick_residual",
-                        build_tick_delta.into_iter().collect(),
+                        &build_tick_delta.into_iter().collect::<Vec<_>>(),
                     )
                     .expect("apply benchmark join build tick residual filter"),
             )
@@ -6565,12 +6565,12 @@ mod tests {
             .expect("materialize canonical join delta");
             let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
                 consolidate_encoded_deltas(
-                    evaluator
-                        .transform_delta(
-                            "benchmark_join_tick_residual",
-                            actual.into_iter().collect(),
-                        )
-                        .expect("apply benchmark join residual filter"),
+                evaluator
+                    .transform_delta(
+                        "benchmark_join_tick_residual",
+                        &actual.into_iter().collect::<Vec<_>>(),
+                    )
+                    .expect("apply benchmark join residual filter"),
                 )
             } else {
                 actual
@@ -6594,7 +6594,7 @@ mod tests {
             };
             let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
                 evaluator
-                    .transform_delta("benchmark_join_tick_residual", transient_raw)
+                    .transform_delta("benchmark_join_tick_residual", &transient_raw)
                     .expect("apply benchmark transient join residual filter")
             } else {
                 transient_raw
@@ -6888,7 +6888,7 @@ mod tests {
                 evaluator
                     .transform_delta(
                         "benchmark_join_source_task_build_tick_residual",
-                        build_tick_delta.into_iter().collect(),
+                        &build_tick_delta.into_iter().collect::<Vec<_>>(),
                     )
                     .expect("apply benchmark source-task join build tick residual filter"),
             )
@@ -6954,12 +6954,12 @@ mod tests {
             .expect("materialize canonical join delta");
             let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
                 consolidate_encoded_deltas(
-                    evaluator
-                        .transform_delta(
-                            "benchmark_join_source_task_tick_residual",
-                            actual.into_iter().collect(),
-                        )
-                        .expect("apply benchmark source-task join residual filter"),
+                evaluator
+                    .transform_delta(
+                        "benchmark_join_source_task_tick_residual",
+                        &actual.into_iter().collect::<Vec<_>>(),
+                    )
+                    .expect("apply benchmark source-task join residual filter"),
                 )
             } else {
                 actual
@@ -6983,7 +6983,7 @@ mod tests {
             };
             let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
                 evaluator
-                    .transform_delta("benchmark_join_source_task_tick_residual", transient_raw)
+                    .transform_delta("benchmark_join_source_task_tick_residual", &transient_raw)
                     .expect("apply benchmark source-task transient join residual filter")
             } else {
                 transient_raw

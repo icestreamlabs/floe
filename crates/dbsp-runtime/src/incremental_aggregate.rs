@@ -321,7 +321,7 @@ where
         delta_values: Vec<(V, i64)>,
     ) -> anyhow::Result<Vec<((K, Vec<AggregateValue>), i64)>> {
         let mut op = self.op.lock().await;
-        let deltas = op.apply_delta_values(delta_values).await?;
+        let deltas = op.apply_delta_values(&delta_values).await?;
         Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
     }
 }

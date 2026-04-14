@@ -16,7 +16,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 /// Unions multiple delta inputs into a single delta with coalesced weights.
 pub struct UnionOp<K>
@@ -133,12 +133,13 @@ where
 
         let mut merged: HashMap<K, i64> = HashMap::new();
         for handle in inputs {
-            let deltas = delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, handle)
-                .await
-                .context("load delta for union")?;
-            for (key, delta) in deltas {
+            let deltas =
+                delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, handle)
+                    .await
+                    .context("load delta for union")?;
+            for (key, delta) in deltas.iter() {
                 let entry = merged.entry(key.clone()).or_insert(0);
-                *entry += delta;
+                *entry += *delta;
                 if *entry == 0 {
                     merged.remove(&key);
                 }
@@ -152,6 +153,7 @@ where
         let handle = Self::apply_deltas_to_versioned(&mut self.output, &merged)
             .await
             .context("persist union deltas")?;
+        publish_transient_zset_batch(&handle, Arc::new(merged.into_iter().collect::<Vec<_>>()));
         Ok(Some(handle))
     }
 }

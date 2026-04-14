@@ -12,7 +12,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -166,7 +166,7 @@ where
             .context("distinct operator requires one input delta handle")?;
 
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for distinct")?;
 
@@ -179,9 +179,9 @@ where
             .context("load distinct cache")?;
 
         let mut delta_map = HashMap::new();
-        for (key, diff_weight) in delta_values {
+        for (key, diff_weight) in delta_values.iter() {
             let entry = delta_map.entry(key.clone()).or_insert(0);
-            *entry += diff_weight;
+            *entry += *diff_weight;
             if *entry == 0 {
                 delta_map.remove(&key);
             }
@@ -238,6 +238,7 @@ where
         let h_handle = Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None)
             .await
             .context("persist distinct H output")?;
+        publish_transient_zset_batch(&h_handle, Arc::new(h_deltas.into_iter().collect::<Vec<_>>()));
         Ok(Some(h_handle))
     }
 }

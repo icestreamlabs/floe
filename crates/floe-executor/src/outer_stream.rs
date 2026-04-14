@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use dbsp::stream::util::publish_transient_zset_batch;
 use dbsp::stream::{DeltaHandleStream, SnapshotHandleStream};
 use dbsp::{StreamRetention, ZSetStream};
 use tokio::sync::mpsc;
@@ -235,7 +236,7 @@ impl OuterStreamWriter {
             let encode_us = self.pending_encode_us;
             self.pending_transient_bytes = 0;
             self.pending_encode_us = 0;
-            self.publish_batch(batch);
+            self.publish_batch(batch.clone());
             if TRANSIENT_SOURCE_BATCH_LOG_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(TRANSIENT_SOURCE_BATCH_LOG_SAMPLE_EVERY)
@@ -249,6 +250,15 @@ impl OuterStreamWriter {
                     durable_enabled = self.durable_enabled,
                     "outer stream transient batch published"
                 );
+            }
+            if self.durable_enabled {
+                let (snapshot_handle, delta_handle) = self
+                    .stream
+                    .flush_with_delta()
+                    .await
+                    .context("flush durable outer stream batch")?;
+                publish_transient_zset_batch(&delta_handle, Arc::clone(&batch.deltas));
+                return Ok(snapshot_handle.version);
             }
         } else if publish_empty_transient {
             self.transient_version = publish_version;

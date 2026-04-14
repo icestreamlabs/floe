@@ -34,7 +34,8 @@ async fn filter_map_emits_handle_for_empty_output_ticks() {
         &source.delta_handle_stream(),
         |delta_values| {
             Ok(delta_values
-                .into_iter()
+                .iter()
+                .cloned()
                 .filter(|(value, _)| value.starts_with('k'))
                 .collect())
         },

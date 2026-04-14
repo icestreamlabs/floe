@@ -204,7 +204,7 @@ where
             WINDOW_DROPPED_TOO_LATE_TOTAL.inc_by(dropped_too_late);
         }
 
-        let mut output_deltas = self.count_op.apply_delta_values(expanded).await?;
+        let mut output_deltas = self.count_op.apply_delta_values(&expanded).await?;
         if let Some(cutoff) = cutoff {
             merge_output_deltas(
                 &mut output_deltas,

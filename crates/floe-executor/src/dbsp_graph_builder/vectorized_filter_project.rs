@@ -245,7 +245,7 @@ impl VectorizedFilterProjectEvaluator {
     pub(crate) fn transform_delta(
         &self,
         graph_id: &str,
-        delta_values: Vec<(Vec<u8>, i64)>,
+        delta_values: &[(Vec<u8>, i64)],
     ) -> Result<Vec<(Vec<u8>, i64)>> {
         if delta_values.is_empty() {
             return Ok(Vec::new());
@@ -254,7 +254,7 @@ impl VectorizedFilterProjectEvaluator {
             .projection_plan
             .is_identity(self.input_schema.fields().len());
         if self.predicate.is_none() && identity_projection {
-            return consolidate_encoded_delta_batch(delta_values);
+            return consolidate_encoded_delta_batch(delta_values.to_vec());
         }
         if let Some(fast_path) = self.encoded_fast_path.as_ref() {
             return fast_path.transform_delta(delta_values);
@@ -360,11 +360,7 @@ impl VectorizedFilterProjectEvaluator {
         }
     }
 
-    fn prepare_input(
-        &self,
-        graph_id: &str,
-        delta_values: Vec<(Vec<u8>, i64)>,
-    ) -> Result<PreparedEncodedInput> {
+    fn prepare_input(&self, graph_id: &str, delta_values: &[(Vec<u8>, i64)]) -> Result<PreparedEncodedInput> {
         let needs_physical_batch = self.predicate_requires_physical_batch()
             || self.projection_plan.requires_physical_batch();
         let needs_compiled_batch = self.predicate_requires_compiled_batch()
@@ -380,12 +376,12 @@ impl VectorizedFilterProjectEvaluator {
         let mut weights = Vec::with_capacity(delta_values.len());
         let mut projected_ranges =
             capture_projection_ranges.then(|| Vec::with_capacity(delta_values.len()));
-        for (encoded, weight) in delta_values {
-            if weight == 0 {
+        for (encoded, weight) in delta_values.iter() {
+            if *weight == 0 {
                 continue;
             }
             match self.decode_row(
-                &encoded,
+                encoded,
                 capture_projection_ranges,
                 needs_physical_batch,
                 needs_compiled_batch,
@@ -410,8 +406,8 @@ impl VectorizedFilterProjectEvaluator {
                     {
                         all_ranges.push(ranges);
                     }
-                    encoded_rows.push(encoded);
-                    weights.push(weight);
+                    encoded_rows.push(encoded.clone());
+                    weights.push(*weight);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -679,17 +675,17 @@ fn build_encoded_fast_path(
 }
 
 impl EncodedFilterProjectFastPath {
-    fn transform_delta(&self, delta_values: Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> {
+    fn transform_delta(&self, delta_values: &[(Vec<u8>, i64)]) -> Result<Vec<(Vec<u8>, i64)>> {
         if delta_values.is_empty() {
             return Ok(Vec::new());
         }
         let mut staged = Vec::with_capacity(delta_values.len());
-        for (encoded, diff) in delta_values {
-            if diff == 0 {
+        for (encoded, diff) in delta_values.iter() {
+            if *diff == 0 {
                 continue;
             }
-            if let Some(projected) = self.transform_row(&encoded)? {
-                staged.push((projected, diff));
+            if let Some(projected) = self.transform_row(encoded)? {
+                staged.push((projected, *diff));
             }
         }
         consolidate_encoded_delta_batch(staged)

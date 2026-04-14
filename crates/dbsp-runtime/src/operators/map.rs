@@ -18,7 +18,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 pub struct MapOp<K, R>
 where
@@ -202,7 +202,7 @@ where
 
         let load_start = Instant::now();
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &input_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &input_handle)
                 .await
                 .context("load input delta for map")?;
         let input_delta_rows = delta_values.len();
@@ -210,10 +210,10 @@ where
 
         let project_start = Instant::now();
         let mut projected: HashMap<R, i64> = HashMap::new();
-        for (key, weight) in delta_values {
-            let projected_key = (self.projector)(&key);
+        for (key, weight) in delta_values.iter() {
+            let projected_key = (self.projector)(key);
             let entry = projected.entry(projected_key.clone()).or_insert(0);
-            *entry += weight;
+            *entry += *weight;
             if *entry == 0 {
                 projected.remove(&projected_key);
             }
@@ -262,6 +262,10 @@ where
         let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &projected, None)
             .await
             .context("persist map delta output")?;
+        publish_transient_zset_batch(
+            &output_handle,
+            Arc::new(projected.into_iter().collect::<Vec<_>>()),
+        );
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
         tracing::debug!(
             ts,
