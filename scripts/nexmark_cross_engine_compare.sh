@@ -58,6 +58,10 @@ FLOE_INGEST_BATCH_SIZE="${FLOE_INGEST_BATCH_SIZE:-16384}"
 FLOE_INGEST_BATCH_PER_SOURCE="${FLOE_INGEST_BATCH_PER_SOURCE:-16384}"
 FLOE_INGEST_BATCH_PER_CONNECTOR="${FLOE_INGEST_BATCH_PER_CONNECTOR:-16384}"
 FLOE_MV_RETAIN_LAST="${FLOE_MV_RETAIN_LAST:-256}"
+FLOE_MV_FLUSH_ENABLED="${FLOE_MV_FLUSH_ENABLED:-0}"
+FLOE_MV_FLUSH_MAX_PENDING_DELTAS="${FLOE_MV_FLUSH_MAX_PENDING_DELTAS:-0}"
+FLOE_MV_FLUSH_MAX_DELAY_MS="${FLOE_MV_FLUSH_MAX_DELAY_MS:-0}"
+FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY="${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY:-1}"
 FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 
@@ -2609,6 +2613,10 @@ write_floe_config() {
     --argjson ingest_batch_per_source "${FLOE_INGEST_BATCH_PER_SOURCE}" \
     --argjson ingest_batch_per_connector "${FLOE_INGEST_BATCH_PER_CONNECTOR}" \
     --argjson mv_retain_last "${FLOE_MV_RETAIN_LAST}" \
+    --argjson mv_flush_enabled "${FLOE_MV_FLUSH_ENABLED}" \
+    --argjson mv_flush_max_pending_deltas "${FLOE_MV_FLUSH_MAX_PENDING_DELTAS}" \
+    --argjson mv_flush_max_delay_ms "${FLOE_MV_FLUSH_MAX_DELAY_MS}" \
+    --argjson mv_flush_on_catchup_boundary "${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY}" \
     '{
       connectors: (
         []
@@ -2645,7 +2653,13 @@ write_floe_config() {
         ingest_batch_size: $ingest_batch_size,
         ingest_batch_per_source: $ingest_batch_per_source,
         ingest_batch_per_connector: $ingest_batch_per_connector,
-        mv_retain_last: $mv_retain_last
+        mv_retain_last: $mv_retain_last,
+        mv_flush: {
+          enabled: ($mv_flush_enabled == 1),
+          max_pending_deltas: (if $mv_flush_max_pending_deltas > 0 then $mv_flush_max_pending_deltas else null end),
+          max_delay_ms: (if $mv_flush_max_delay_ms > 0 then $mv_flush_max_delay_ms else null end),
+          flush_on_catchup_boundary: ($mv_flush_on_catchup_boundary == 1)
+        }
       },
       storage: {
         await_durable: false
