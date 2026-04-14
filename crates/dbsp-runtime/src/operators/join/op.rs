@@ -20,7 +20,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
@@ -469,14 +469,14 @@ where
         {
             batch.as_ref()
         } else {
-            left_loaded = delta_zset_handle::<L>(
+            left_loaded = delta_zset_handle_batch::<L>(
                 self.table.clone(),
                 &mut self.dict_cache_left,
                 &left_delta_handle,
             )
             .await
             .context("load left delta for join")?;
-            left_loaded.as_slice()
+            left_loaded.as_ref().as_slice()
         };
         let right_loaded;
         let right_delta_values: &[(R, i64)] = if let Some(batch) = transient_inputs
@@ -485,14 +485,14 @@ where
         {
             batch.as_ref()
         } else {
-            right_loaded = delta_zset_handle::<R>(
+            right_loaded = delta_zset_handle_batch::<R>(
                 self.table.clone(),
                 &mut self.dict_cache_right,
                 &right_delta_handle,
             )
             .await
             .context("load right delta for join")?;
-            right_loaded.as_slice()
+            right_loaded.as_ref().as_slice()
         };
         let left_keyed = self.stage_keyed_deltas(left_delta_values, &self.left_key);
         let right_keyed = self.stage_keyed_deltas(right_delta_values, &self.right_key);
@@ -643,11 +643,12 @@ where
                 .output
                 .as_mut()
                 .context("join output persistence requested without configured output zset")?;
-            Some(
+            let persisted_handle =
                 Self::apply_deltas_to_versioned(output, &delta_join, None, "output")
                     .await
-                    .context("persist join delta output")?,
-            )
+                    .context("persist join delta output")?;
+            publish_transient_zset_batch(&persisted_handle, Arc::clone(&delta_batch));
+            Some(persisted_handle)
         } else {
             None
         };

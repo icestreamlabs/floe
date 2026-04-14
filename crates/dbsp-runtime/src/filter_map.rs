@@ -20,8 +20,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::DeltaHandleStream;
 use crate::stream::runtime::{HandleOperatorRuntime, RuntimeErrorHandler, report_runtime_error};
 use crate::stream::util::{
-    build_exact_stream_from_values, collect_values, delta_zset_handle, publish_scheduled_value,
-    push_value_in_place,
+    build_exact_stream_from_values, collect_values, delta_zset_handle_batch,
+    publish_scheduled_value, publish_transient_zset_batch, push_value_in_place,
 };
 
 /// Filter+map wrapper that evaluates a fused row transform over handle streams.
@@ -177,7 +177,7 @@ impl DbspFilterMap {
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        F: Fn(Vec<(K, i64)>) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync + Clone + 'static,
+        F: Fn(&[(K, i64)]) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync + Clone + 'static,
     {
         let table = input.table();
         let frontier = input.current_time();
@@ -328,7 +328,7 @@ where
         let total_start = Instant::now();
         let load_start = Instant::now();
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, input_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, input_handle)
                 .await
                 .context("load input delta for filter_map")?;
         let input_delta_rows = delta_values.len();
@@ -336,12 +336,12 @@ where
 
         let transform_start = Instant::now();
         let mut projected: HashMap<R, i64> = HashMap::new();
-        for (key, weight) in delta_values {
-            let Some(out_key) = (self.transform)(&key) else {
+        for (key, weight) in delta_values.iter() {
+            let Some(out_key) = (self.transform)(key) else {
                 continue;
             };
             let entry = projected.entry(out_key.clone()).or_insert(0);
-            *entry += weight;
+            *entry += *weight;
             if *entry == 0 {
                 projected.remove(&out_key);
             }
@@ -366,9 +366,10 @@ where
 
         let output_apply_start = Instant::now();
         let projected = projected.into_iter().collect::<Vec<_>>();
-        let output_handle = apply_deltas_to_versioned(&mut self.output, projected)
+        let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
             .await
             .context("persist filter_map delta output")?;
+        publish_transient_zset_batch(&output_handle, Arc::new(projected));
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
         tracing::debug!(
             ts,
@@ -409,7 +410,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    transform: Arc<dyn Fn(Vec<(K, i64)>) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>,
+    transform: Arc<dyn Fn(&[(K, i64)]) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>,
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
@@ -440,14 +441,15 @@ where
         let total_start = Instant::now();
         let load_start = Instant::now();
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, input_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, input_handle)
                 .await
                 .context("load input delta for filter_map batch")?;
         let input_delta_rows = delta_values.len();
         let load_ms = load_start.elapsed().as_millis() as u64;
 
         let transform_start = Instant::now();
-        let projected = (self.transform)(delta_values).context("run filter_map batch transform")?;
+        let projected = (self.transform)(delta_values.as_ref())
+            .context("run filter_map batch transform")?;
         let transform_ms = transform_start.elapsed().as_millis() as u64;
         let output_delta_rows = projected.len();
 
@@ -467,9 +469,10 @@ where
         }
 
         let output_apply_start = Instant::now();
-        let output_handle = apply_deltas_to_versioned(&mut self.output, projected)
+        let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
             .await
             .context("persist filter_map batch delta output")?;
+        publish_transient_zset_batch(&output_handle, Arc::new(projected));
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
         tracing::debug!(
             ts,
@@ -491,7 +494,7 @@ where
 
 async fn apply_deltas_to_versioned<R>(
     versioned: &mut VersionedZSet<R>,
-    deltas: Vec<(R, i64)>,
+    deltas: &[(R, i64)],
 ) -> anyhow::Result<ZSetHandle>
 where
     R: Archive
@@ -508,8 +511,9 @@ where
     let input_rows = deltas.len();
     let stage_start = Instant::now();
     let staged: Vec<(R, i64)> = deltas
-        .into_iter()
+        .iter()
         .filter(|(_, delta)| *delta != 0)
+        .map(|(row, delta)| (row.clone(), *delta))
         .collect();
     let stage_ms = stage_start.elapsed().as_millis() as u64;
     if staged.is_empty() {

@@ -19,7 +19,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
@@ -276,7 +276,7 @@ where
             .context("group-by operator requires one input delta handle")?;
 
         let delta_values =
-            delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+            delta_zset_handle_batch::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for group-by")?;
 
@@ -284,7 +284,7 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let coalesced = self.coalesce_deltas(delta_values);
+        let coalesced = self.coalesce_deltas(delta_values.as_ref().clone());
         if coalesced.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
         }
@@ -390,6 +390,10 @@ where
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist group-by delta output")?;
+        publish_transient_zset_batch(
+            &delta_handle,
+            Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
+        );
         Ok(Some(delta_handle))
     }
 }

@@ -17,7 +17,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::{compute_delta, delta_zset_handle};
+use crate::stream::util::{compute_delta, delta_zset_handle_batch, publish_transient_zset_batch};
 
 type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
 
@@ -241,7 +241,7 @@ where
             .context("topk operator requires one input delta handle")?;
 
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for topk")?;
 
@@ -254,9 +254,9 @@ where
             .context("load topk input cache")?;
 
         let mut delta_map = HashMap::new();
-        for (key, diff_weight) in delta_values {
+        for (key, diff_weight) in delta_values.iter() {
             let entry = delta_map.entry(key.clone()).or_insert(0);
-            *entry += diff_weight;
+            *entry += *diff_weight;
             if *entry == 0 {
                 delta_map.remove(&key);
             }
@@ -360,6 +360,10 @@ where
         let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None)
             .await
             .context("persist topk output delta")?;
+        publish_transient_zset_batch(
+            &output_handle,
+            Arc::new(output_delta.into_iter().collect::<Vec<_>>()),
+        );
         Ok(Some(output_handle))
     }
 }

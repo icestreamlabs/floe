@@ -452,7 +452,7 @@ impl DbspGraphBuilder {
                         err,
                     );
                 });
-                let residual_transform = move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<
+                let residual_transform = move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<
                     Vec<(Vec<u8>, i64)>,
                 > { residual_evaluator.transform_delta(&residual_graph_id, delta_values) };
                 let residual_filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
@@ -962,7 +962,7 @@ impl DbspGraphBuilder {
         let observer_label = format!("transient-join-post-filter:{graph_id}");
         let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
             let filtered = if let Some(evaluator) = deferred_residual_evaluator.as_ref() {
-                match evaluator.transform_delta(&observer_graph_id, deltas.as_ref().clone()) {
+                match evaluator.transform_delta(&observer_graph_id, deltas.as_ref()) {
                     Ok(filtered) => filtered,
                     Err(err) => {
                         report_graph_task_error(

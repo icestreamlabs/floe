@@ -18,7 +18,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 pub struct FilterOp<K>
 where
@@ -174,7 +174,7 @@ where
             .context("filter operator requires one input delta handle")?;
         let load_start = Instant::now();
         let delta_values =
-            delta_zset_handle::<K>(self.table.clone(), &mut self.dict_cache, &input_handle)
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &input_handle)
                 .await
                 .context("load input delta for filter")?;
         let input_delta_rows = delta_values.len();
@@ -182,10 +182,10 @@ where
 
         let filter_start = Instant::now();
         let mut filtered: HashMap<K, i64> = HashMap::new();
-        for (key, weight) in delta_values {
-            if (self.predicate)(&key) {
+        for (key, weight) in delta_values.iter() {
+            if (self.predicate)(key) {
                 let entry = filtered.entry(key.clone()).or_insert(0);
-                *entry += weight;
+                *entry += *weight;
                 if *entry == 0 {
                     filtered.remove(&key);
                 }
@@ -235,6 +235,10 @@ where
         let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &filtered, None)
             .await
             .context("persist filter delta output")?;
+        publish_transient_zset_batch(
+            &output_handle,
+            Arc::new(filtered.into_iter().collect::<Vec<_>>()),
+        );
         let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
         tracing::debug!(
             ts,

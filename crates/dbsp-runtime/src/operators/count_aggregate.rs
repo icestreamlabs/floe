@@ -19,7 +19,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync>;
 
@@ -282,13 +282,13 @@ where
 
     pub async fn apply_delta_values(
         &mut self,
-        delta_values: Vec<(V, i64)>,
+        delta_values: &[(V, i64)],
     ) -> Result<HashMap<(K, Vec<i64>), i64>> {
         if delta_values.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let coalesced = self.coalesce_deltas(delta_values);
+        let coalesced = self.coalesce_deltas(delta_values.to_vec());
         if coalesced.is_empty() {
             return Ok(HashMap::new());
         }
@@ -661,11 +661,11 @@ where
             .context("count aggregate operator requires one input delta handle")?;
 
         let delta_values =
-            delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
+            delta_zset_handle_batch::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for count aggregate")?;
 
-        let output_deltas = self.apply_delta_values(delta_values).await?;
+        let output_deltas = self.apply_delta_values(delta_values.as_ref()).await?;
         if output_deltas.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
         }
@@ -674,6 +674,10 @@ where
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist grouped-count output delta")?;
+        publish_transient_zset_batch(
+            &delta_handle,
+            Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
+        );
         Ok(Some(delta_handle))
     }
 }

@@ -47,7 +47,7 @@ impl DbspGraphBuilder {
         );
         let vectorized_graph_id = graph_id.clone();
         let transform =
-            move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 evaluator.transform_delta(&vectorized_graph_id, delta_values)
             };
         let filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
@@ -88,7 +88,7 @@ impl DbspGraphBuilder {
         );
         let vectorized_graph_id = graph_id.clone();
         let transform =
-            move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 evaluator.transform_delta(&vectorized_graph_id, delta_values)
             };
         let map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
@@ -136,7 +136,7 @@ impl DbspGraphBuilder {
         );
         let vectorized_graph_id = graph_id.clone();
         let transform =
-            move |delta_values: Vec<(Vec<u8>, i64)>| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
                 evaluator.transform_delta(&vectorized_graph_id, delta_values)
             };
 

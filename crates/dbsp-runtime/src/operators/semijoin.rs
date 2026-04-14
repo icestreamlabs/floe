@@ -18,7 +18,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
-use crate::stream::util::delta_zset_handle;
+use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 
@@ -297,14 +297,14 @@ where
             .cloned()
             .context("semijoin operator requires right delta handle")?;
 
-        let left_delta_values = delta_zset_handle::<L>(
+        let left_delta_values = delta_zset_handle_batch::<L>(
             self.table.clone(),
             &mut self.dict_cache_left,
             &left_delta_handle,
         )
         .await
         .context("load left delta for semijoin")?;
-        let right_delta_values = delta_zset_handle::<R>(
+        let right_delta_values = delta_zset_handle_batch::<R>(
             self.table.clone(),
             &mut self.dict_cache_right,
             &right_delta_handle,
@@ -312,8 +312,8 @@ where
         .await
         .context("load right delta for semijoin")?;
 
-        let left_delta = self.coalesce_deltas(left_delta_values);
-        let right_delta = self.coalesce_deltas(right_delta_values);
+        let left_delta = self.coalesce_deltas(left_delta_values.as_ref().clone());
+        let right_delta = self.coalesce_deltas(right_delta_values.as_ref().clone());
 
         if left_delta.is_empty() && right_delta.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));
@@ -473,6 +473,10 @@ where
         let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None)
             .await
             .context("persist semijoin delta output")?;
+        publish_transient_zset_batch(
+            &delta_handle,
+            Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
+        );
         Ok(Some(delta_handle))
     }
 }
