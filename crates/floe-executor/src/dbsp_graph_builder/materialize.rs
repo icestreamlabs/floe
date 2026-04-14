@@ -1080,6 +1080,252 @@ impl DbspGraphBuilder {
         Ok(())
     }
 
+    pub(super) async fn materialize_view_from_delta_overlay(
+        &mut self,
+        view_name: &str,
+        schema: Arc<RowSchema>,
+        upstream: DeltaHandleStream,
+        delta_transform: Option<Arc<DeltaTransformFn>>,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
+        mv_registry: &Arc<MaterializedViewRegistry>,
+    ) -> Result<()> {
+        let registry_handle = mv_registry.register(view_name.to_string());
+        let arrow_schema = schema.to_arrow_schema();
+        mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
+        {
+            let bridge = self.bridge.lock().await;
+            bridge
+                .save_mv_schema(view_name, Arc::clone(&arrow_schema))
+                .await
+                .with_context(|| format!("persist schema metadata for '{view_name}'"))?;
+        }
+
+        let mut view = {
+            let mut bridge = self.bridge.lock().await;
+            bridge
+                .new_view(view_name, StreamRetention::KeepLast { keep_last: 1 })
+                .await
+                .with_context(|| format!("provision materialized view '{view_name}'"))?
+        };
+        view.set_compaction_policy(CompactionPolicy::disabled());
+        let replay_floor = {
+            let logical_version = {
+                let bridge = self.bridge.lock().await;
+                bridge
+                    .load_mv_logical_version(view_name)
+                    .await
+                    .with_context(|| {
+                        format!("load logical version metadata for materialized view '{view_name}'")
+                    })?
+            };
+            let mut view_handle_stream = view.handle_stream();
+            let view_frontier = view_handle_stream.committed_frontier();
+            if let Some(logical_version) = logical_version
+                && view_frontier >= 0
+            {
+                let handle = view_handle_stream.get(view_frontier).await?;
+                let mut state = self.state_from_handle(&handle).await?;
+                state = state.with_logical_version(logical_version);
+                registry_handle.set_dbsp_state(state);
+                registry_handle
+                    .publish_version(i64::try_from(logical_version).unwrap_or(i64::MAX), handle);
+                if Self::should_bootstrap_authoritative_zero(view_frontier, Some(logical_version)) {
+                    let _ = registry_handle.seed_authoritative_row_count_if_latest(0, 0);
+                } else {
+                    registry_handle.mark_state_non_authoritative();
+                }
+                Some(logical_version)
+            } else {
+                registry_handle.mark_state_authoritative();
+                None
+            }
+        };
+
+        let table = {
+            let bridge = self.bridge.lock().await;
+            bridge.table()
+        };
+        let mut cursor = StreamCursor::new(upstream.stream());
+        let upstream_frontier = cursor.observed();
+        let mut upstream_stream = upstream.stream();
+        let mut delta_reader = DeltaZSetHandleReader::<Vec<u8>>::new(table);
+        let graph_id = self.graph_id().to_string();
+        let view_label = view_name.to_string();
+        let view_namespace = crate::namespaces::materialized_view(view_name)
+            .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
+        let task_label = format!("materialize-view:{view_label}");
+        let task_events = task_events.clone();
+        let cancel = cancel.clone();
+        let bridge_clone = Arc::clone(&self.bridge);
+        let snapshot_cfg = self.mv_overlay_snapshot;
+        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<OverlaySnapshotFlushRequest>();
+        let flush_registry = Arc::clone(&registry_handle);
+        let flush_graph_id = graph_id.clone();
+        let flush_view_label = view_label.clone();
+        let flush_view_namespace = view_namespace.clone();
+        let flush_task_events = task_events.clone();
+        let flush_task_label = task_label.clone();
+        tokio::spawn(async move {
+            while let Some(request) = flush_rx.recv().await {
+                if let Err(err) = Self::flush_overlay_snapshot_request(
+                    &mut view,
+                    &bridge_clone,
+                    &flush_registry,
+                    &flush_graph_id,
+                    &flush_view_label,
+                    &flush_view_namespace,
+                    request,
+                )
+                .await
+                {
+                    report_graph_task_error(
+                        &flush_task_events,
+                        &flush_graph_id,
+                        flush_task_label.clone(),
+                        err,
+                    );
+                    break;
+                }
+            }
+        });
+
+        let mut pending_snapshot = PendingOverlaySnapshot::default();
+        let replay_floor_ts = replay_floor
+            .and_then(|version| i64::try_from(version).ok())
+            .unwrap_or(-1);
+        if replay_floor_ts < upstream_frontier {
+            for ts in (replay_floor_ts + 1)..=upstream_frontier {
+                let delta_handle = upstream_stream.get(ts).await.with_context(|| {
+                    format!("load delta handle for materialized view '{view_name}' at {ts}")
+                })?;
+                Self::process_delta_handle_overlay(
+                    Ok((ts, delta_handle)),
+                    &mut delta_reader,
+                    delta_transform.as_ref(),
+                    &registry_handle,
+                    replay_floor,
+                    &mut pending_snapshot,
+                    &graph_id,
+                    &view_label,
+                )
+                .await?;
+                if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
+                    if let Some(request) = pending_snapshot.take_request("background_threshold")
+                        && flush_tx.send(request).is_err()
+                    {
+                        return Err(anyhow::anyhow!(
+                            "overlay snapshot flush task unexpectedly stopped"
+                        ));
+                    }
+                }
+            }
+        }
+
+        tokio::spawn(async move {
+            let mut pending_snapshot = pending_snapshot;
+            loop {
+                if let Some(delay_remaining) =
+                    pending_snapshot.delay_remaining(snapshot_cfg, Instant::now())
+                {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            if let Some(request) = pending_snapshot.take_request("shutdown")
+                                && flush_tx.send(request).is_err()
+                            {
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    anyhow::anyhow!("overlay snapshot flush task unexpectedly stopped"),
+                                );
+                            }
+                            break;
+                        },
+                        _ = tokio::time::sleep(delay_remaining) => {
+                            if let Some(request) = pending_snapshot.take_request("max_delay")
+                                && flush_tx.send(request).is_err()
+                            {
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    anyhow::anyhow!("overlay snapshot flush task unexpectedly stopped"),
+                                );
+                                break;
+                            }
+                        },
+                        result = cursor.next() => {
+                            if let Err(err) = Self::process_delta_handle_overlay(
+                                result,
+                                &mut delta_reader,
+                                delta_transform.as_ref(),
+                                &registry_handle,
+                                replay_floor,
+                                &mut pending_snapshot,
+                                &graph_id,
+                                &view_label,
+                            )
+                            .await
+                            {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
+                                if let Some(request) = pending_snapshot.take_request("background_threshold")
+                                    && flush_tx.send(request).is_err()
+                                {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        anyhow::anyhow!("overlay snapshot flush task unexpectedly stopped"),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = cursor.next() => {
+                            if let Err(err) = Self::process_delta_handle_overlay(
+                                result,
+                                &mut delta_reader,
+                                delta_transform.as_ref(),
+                                &registry_handle,
+                                replay_floor,
+                                &mut pending_snapshot,
+                                &graph_id,
+                                &view_label,
+                            )
+                            .await
+                            {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
+                                if let Some(request) = pending_snapshot.take_request("background_threshold")
+                                    && flush_tx.send(request).is_err()
+                                {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        anyhow::anyhow!("overlay snapshot flush task unexpectedly stopped"),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn process_materialize_delta(
         result: Result<(i64, ZSetHandle)>,
         view: &mut DbspView,
@@ -1134,6 +1380,50 @@ impl DbspGraphBuilder {
         Ok(())
     }
 
+    async fn process_delta_handle_overlay(
+        result: Result<(i64, ZSetHandle)>,
+        delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
+        registry: &Arc<MaterializedViewHandle>,
+        replay_floor: Option<u64>,
+        pending_snapshot: &mut PendingOverlaySnapshot,
+        graph_id: &str,
+        view_label: &str,
+    ) -> Result<()> {
+        let (ts, delta_handle) = result.with_context(|| {
+            format!("stream for materialized view '{view_label}' closed unexpectedly")
+        })?;
+        let ts_u64 = u64::try_from(ts.max(0)).unwrap_or(u64::MAX);
+        if replay_floor.is_some_and(|floor| ts_u64 <= floor) {
+            return Ok(());
+        }
+        let update_span = tracing::info_span!(
+            "dbsp_write",
+            graph_id = %graph_id,
+            view = %view_label,
+            namespace = "overlay",
+            version = ts,
+        );
+        let _enter = update_span.enter();
+        let apply_start = Instant::now();
+        let (apply, deltas) =
+            Self::load_transformed_delta_handle(delta_reader, delta_transform, &delta_handle)
+                .await
+                .with_context(|| {
+                    format!("apply delta handle for materialized view '{view_label}' at {ts}")
+                })?;
+        Self::apply_encoded_overlay_batch(
+            apply_start,
+            ts,
+            apply,
+            deltas,
+            registry,
+            pending_snapshot,
+            view_label,
+        )
+        .context("apply encoded overlay batch for transformed delta handle")
+    }
+
     async fn process_transient_materialize_batch_overlay(
         batch: TransientMaterializeBatch,
         delta_transform: Arc<DeltaTransformFn>,
@@ -1162,6 +1452,28 @@ impl DbspGraphBuilder {
             .with_context(|| {
                 format!("apply transient source batch for materialized view '{view_label}' at {ts}")
             })?;
+        Self::apply_encoded_overlay_batch(
+            apply_start,
+            ts,
+            apply,
+            merged,
+            registry,
+            pending_snapshot,
+            view_label,
+        )
+        .context("apply encoded overlay batch for transient materialization")
+    }
+
+    fn apply_encoded_overlay_batch(
+        apply_start: Instant,
+        ts: i64,
+        apply: DeltaApplyStats,
+        merged: EncodedDeltaBatch,
+        registry: &Arc<MaterializedViewHandle>,
+        pending_snapshot: &mut PendingOverlaySnapshot,
+        view_label: &str,
+    ) -> Result<()> {
+        let ts_u64 = u64::try_from(ts.max(0)).unwrap_or(u64::MAX);
         if merged.is_empty() {
             registry.publish_logical_version(ts);
             registry.advance_authoritative_row_count_version(ts_u64);
@@ -1180,6 +1492,7 @@ impl DbspGraphBuilder {
         metrics::inc_mv_updates();
         let hotspot = summarize_hotspot(
             &[
+                ("load", apply.load_ms),
                 ("transform", apply.transform_ms),
                 ("state_apply", apply_stats.apply_ms),
             ],
@@ -1218,6 +1531,7 @@ impl DbspGraphBuilder {
                 version = ts,
                 delta_rows = apply.delta_rows,
                 delta_bytes = apply.delta_bytes,
+                load_ms = apply.load_ms,
                 transform_ms = apply.transform_ms,
                 merge_ms = apply.merge_ms,
                 overlay_rows = apply_stats.overlay_rows,
@@ -1335,15 +1649,11 @@ impl DbspGraphBuilder {
         Ok(())
     }
 
-    async fn queue_delta_handle_for_view(
-        view: &mut DbspView,
+    async fn load_transformed_delta_handle(
         delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
-        _row_schema: SchemaRef,
-        _consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
         delta_handle: &ZSetHandle,
-        authoritative_state: Option<(&Arc<MaterializedViewHandle>, u64)>,
-    ) -> Result<DeltaApplyStats> {
+    ) -> Result<(DeltaApplyStats, EncodedDeltaBatch)> {
         let load_start = Instant::now();
         let mut deltas = delta_reader
             .read(delta_handle)
@@ -1364,22 +1674,6 @@ impl DbspGraphBuilder {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let merge_start = Instant::now();
-        if let Some((registry, version)) = authoritative_state {
-            if deltas.is_empty() {
-                registry.stage_authoritative_row_count_version(version);
-            } else {
-                registry
-                    .apply_encoded_state_batch(version, &deltas)
-                    .context("update authoritative materialized view state cache")?;
-            }
-        }
-        if !deltas.is_empty() {
-            // Transient segment outputs are already batch-transformed; feed rows straight
-            // into MV overlay and let ZSetStream overlay consolidation handle duplicates.
-            view.add_deltas(deltas);
-        }
-        let merge_ms = merge_start.elapsed().as_millis() as u64;
         tracing::debug!(
             delta_handle_version = delta_handle.version,
             raw_delta_rows,
@@ -1387,16 +1681,58 @@ impl DbspGraphBuilder {
             delta_bytes,
             load_ms,
             transform_ms,
-            merge_ms,
+            "materialized view delta transformed"
+        );
+        Ok((
+            DeltaApplyStats {
+                delta_rows,
+                delta_bytes,
+                load_ms,
+                transform_ms,
+                merge_ms: 0,
+            },
+            Arc::new(deltas),
+        ))
+    }
+
+    async fn queue_delta_handle_for_view(
+        view: &mut DbspView,
+        delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
+        _row_schema: SchemaRef,
+        _consolidation_mode: ConsolidationMode,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
+        delta_handle: &ZSetHandle,
+        authoritative_state: Option<(&Arc<MaterializedViewHandle>, u64)>,
+    ) -> Result<DeltaApplyStats> {
+        let (mut apply, deltas) =
+            Self::load_transformed_delta_handle(delta_reader, delta_transform, delta_handle)
+                .await?;
+        let merge_start = Instant::now();
+        if let Some((registry, version)) = authoritative_state {
+            if deltas.is_empty() {
+                registry.stage_authoritative_row_count_version(version);
+            } else {
+                registry
+                    .apply_encoded_state_batch(version, deltas.as_ref())
+                    .context("update authoritative materialized view state cache")?;
+            }
+        }
+        if !deltas.is_empty() {
+            // Transient segment outputs are already batch-transformed; feed rows straight
+            // into MV overlay and let ZSetStream overlay consolidation handle duplicates.
+            view.add_deltas(into_owned_deltas(deltas));
+        }
+        apply.merge_ms = merge_start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            delta_handle_version = delta_handle.version,
+            delta_rows = apply.delta_rows,
+            delta_bytes = apply.delta_bytes,
+            load_ms = apply.load_ms,
+            transform_ms = apply.transform_ms,
+            merge_ms = apply.merge_ms,
             "materialized view delta queued"
         );
-        Ok(DeltaApplyStats {
-            delta_rows,
-            delta_bytes,
-            load_ms,
-            transform_ms,
-            merge_ms,
-        })
+        Ok(apply)
     }
 
     async fn transform_transient_batch(

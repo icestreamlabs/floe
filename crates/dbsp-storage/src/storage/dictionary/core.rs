@@ -11,6 +11,7 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use slatedb::config::ScanOptions;
 use slatedb::{Db, WriteBatch};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -26,6 +27,7 @@ const K2ID_PREFIX: &[u8] = b"k2id/";
 const ID2K_PREFIX: &[u8] = b"id2k/";
 const META_NEXT_ID: &[u8] = b"meta/next_id";
 const RESOLVE_MANY_FETCH_CHUNK: usize = 256;
+const RESOLVE_MANY_RANGE_SCAN_MIN_IDS: usize = 512;
 #[allow(dead_code)]
 pub struct Dictionary<K>
 where
@@ -149,6 +151,29 @@ where
         let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
         self.encode_id2k_key_into(&mut key, id);
         key
+    }
+
+    fn decode_id2k_key_id(&self, key: &[u8]) -> Result<u64> {
+        let suffix = key
+            .strip_prefix(self.id2k_prefix.as_slice())
+            .ok_or_else(|| anyhow!("dictionary reverse key missing id2k prefix"))?;
+        if suffix.len() != 8 {
+            return Err(anyhow!(
+                "dictionary reverse key has unexpected suffix length {}",
+                suffix.len()
+            ));
+        }
+        Ok(u64::from_be_bytes(suffix.try_into().unwrap()))
+    }
+
+    fn id2k_range_end_exclusive(&self, end_id_inclusive: u64) -> Vec<u8> {
+        if let Some(next_id) = end_id_inclusive.checked_add(1) {
+            self.id2k_key(next_id)
+        } else {
+            let mut upper = self.id2k_prefix.clone();
+            upper.push(0xFF);
+            upper
+        }
     }
 
     fn next_probe_slot(slot: u16) -> Option<u16> {
@@ -673,10 +698,51 @@ where
         let cache_scan_ms = cache_scan_start.elapsed().as_millis() as u64;
 
         let fetch_start = Instant::now();
-        let mut fetch_chunks = 0usize;
+        let mut range_scan_spans = 0usize;
+        let mut range_scan_ids = 0usize;
+        let mut point_fetch_chunks = 0usize;
         if !missing_ids.is_empty() {
-            for chunk in missing_ids.chunks(RESOLVE_MANY_FETCH_CHUNK) {
-                fetch_chunks += 1;
+            let mut sorted_missing_ids = missing_ids.clone();
+            sorted_missing_ids.sort_unstable();
+            let mut point_fetch_ids = Vec::with_capacity(sorted_missing_ids.len());
+
+            let mut span_start = 0usize;
+            while span_start < sorted_missing_ids.len() {
+                let mut span_end = span_start + 1;
+                while span_end < sorted_missing_ids.len()
+                    && sorted_missing_ids[span_end] == sorted_missing_ids[span_end - 1] + 1
+                {
+                    span_end += 1;
+                }
+
+                let span_ids = &sorted_missing_ids[span_start..span_end];
+                if span_ids.len() >= RESOLVE_MANY_RANGE_SCAN_MIN_IDS {
+                    range_scan_spans += 1;
+                    range_scan_ids += span_ids.len();
+                    let start_key = self.id2k_key(span_ids[0]);
+                    let end_key = self.id2k_range_end_exclusive(*span_ids.last().unwrap());
+                    let scanned = self
+                        .table
+                        .scan_range_bytes(start_key..end_key, &ScanOptions::default())
+                        .await?;
+                    for (key, bytes) in scanned {
+                        let id = self.decode_id2k_key_id(key.as_ref())?;
+                        let decoded = decompress_value(bytes.as_ref())?;
+                        let shared = {
+                            let mut cache = self.cache.lock().unwrap();
+                            cache.remember(decoded, id)
+                        };
+                        encoded_by_id.insert(id, shared);
+                    }
+                } else {
+                    point_fetch_ids.extend_from_slice(span_ids);
+                }
+
+                span_start = span_end;
+            }
+
+            for chunk in point_fetch_ids.chunks(RESOLVE_MANY_FETCH_CHUNK) {
+                point_fetch_chunks += 1;
                 let mut id2k_keys = Vec::with_capacity(chunk.len());
                 for &id in chunk {
                     let mut key = Vec::with_capacity(self.id2k_prefix.len() + 8);
@@ -734,7 +800,9 @@ where
             cache_hit_refs,
             cache_miss_unique = missing_ids.len(),
             cache_scan_ms,
-            fetch_chunks,
+            range_scan_spans,
+            range_scan_ids,
+            point_fetch_chunks,
             fetch_ms,
             decode_ms,
             output_ms,

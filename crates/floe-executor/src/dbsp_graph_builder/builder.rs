@@ -307,7 +307,6 @@ impl DbspGraphBuilder {
             }
         }
 
-        let mut root_materialized = false;
         let root_stream = if !matches!(root_node.kind, DbspNodeKind::Sink(_)) {
             if let Some(transient_opt) = try_build_transient_segment_optimization(
                 inputs.plan,
@@ -462,23 +461,21 @@ impl DbspGraphBuilder {
                     segment_score = transient_opt.score,
                     "using transient segment for root materialization"
                 );
-                let stream = self
-                    .materialize_view(
-                        inputs.view_name,
-                        Arc::clone(&root_node.output_schema),
-                        upstream,
-                        Some(transient_opt.transform),
-                        &inputs.cancel,
-                        &inputs.task_events,
-                        &inputs.mv_registry,
-                        &mut mv_latest,
-                        inputs.mv_retention,
-                        self.output_consolidation_mode,
-                    )
-                    .await?;
-                built.insert(inputs.plan.root, stream.clone());
-                root_materialized = true;
-                stream
+                self.materialize_view_from_delta_overlay(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    upstream,
+                    Some(transient_opt.transform),
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
             } else {
                 self.compile_node(
                     inputs.plan,
@@ -510,7 +507,7 @@ impl DbspGraphBuilder {
             .await?
         };
 
-        if !root_materialized && !mv_latest.contains_key(inputs.view_name) {
+        if !mv_latest.contains_key(inputs.view_name) {
             self.materialize_view(
                 inputs.view_name,
                 Arc::clone(&root_node.output_schema),

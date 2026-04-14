@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use lru::LruCache;
 
-const CACHE_CAPACITY: usize = 1024;
+const KEY_TO_ID_CACHE_CAPACITY: usize = 4_096;
+const ID_TO_KEY_CACHE_CAPACITY: usize = 32_768;
+const NEGATIVE_CACHE_CAPACITY: usize = 4_096;
 pub(super) type SharedKey = Arc<[u8]>;
 
 pub(super) struct Cache {
@@ -16,11 +18,16 @@ pub(super) struct Cache {
 impl Cache {
     #[allow(dead_code)]
     pub(super) fn new() -> Self {
-        let capacity = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero cache size");
+        let key_to_id_capacity =
+            NonZeroUsize::new(KEY_TO_ID_CACHE_CAPACITY).expect("non-zero cache size");
+        let id_to_key_capacity =
+            NonZeroUsize::new(ID_TO_KEY_CACHE_CAPACITY).expect("non-zero cache size");
+        let negative_capacity =
+            NonZeroUsize::new(NEGATIVE_CACHE_CAPACITY).expect("non-zero cache size");
         Self {
-            key_to_id: LruCache::new(capacity),
-            id_to_key: LruCache::new(capacity),
-            negatives: LruCache::new(capacity),
+            key_to_id: LruCache::new(key_to_id_capacity),
+            id_to_key: LruCache::new(id_to_key_capacity),
+            negatives: LruCache::new(negative_capacity),
         }
     }
 
