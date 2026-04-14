@@ -18,6 +18,7 @@ POLL_INTERVAL_MS="${POLL_INTERVAL_MS:-250}"
 POLL_TIMEOUT_MS="${POLL_TIMEOUT_MS:-240000}"
 POLL_ATTEMPTS=$(((POLL_TIMEOUT_MS + POLL_INTERVAL_MS - 1) / POLL_INTERVAL_MS))
 PG_QUERY_TIMEOUT_SECONDS="${PG_QUERY_TIMEOUT_SECONDS:-5}"
+PG_CONTENT_QUERY_TIMEOUT_SECONDS="${PG_CONTENT_QUERY_TIMEOUT_SECONDS:-120}"
 
 BROKER_PORT="${BROKER_PORT:-19092}"
 BROKER_ADDR="127.0.0.1:${BROKER_PORT}"
@@ -1419,7 +1420,7 @@ compute_pg_query_content_fingerprint() {
   local stderr_file="${7:-/dev/null}"
   local rows_file="${artifact_dir}/${label}.rows.tsv"
 
-  if ! PGPASSWORD="" timeout "${PG_QUERY_TIMEOUT_SECONDS}"s psql \
+  if ! PGPASSWORD="" timeout "${PG_CONTENT_QUERY_TIMEOUT_SECONDS}"s psql \
     -h 127.0.0.1 \
     -p "${port}" \
     -U "${user}" \
@@ -2769,7 +2770,6 @@ floe_expected_query_text_for_sources() {
       ;;
     *)
       query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
-
       if has_source "${sources}" bid; then
         query_text="$(printf '%s' "${query_text}" | sed -E 's/\<nexmark_bid\>/benchmark_input_bid/g')"
       fi
@@ -2789,12 +2789,13 @@ write_floe_program_sql() {
   local path="$1"
   local query_id="$2"
   local sources="$3"
+  local include_validation_inputs="${4:-0}"
 
   : > "${path}"
   local query_text
   query_text="$(floe_query_text_for_sources "${query_id}" "${sources}")"
 
-  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
+  if [[ "${include_validation_inputs}" == "1" ]]; then
     if has_source "${sources}" bid; then
       cat >> "${path}" <<SQL
 CREATE MATERIALIZED VIEW benchmark_input_bid AS
@@ -2885,21 +2886,6 @@ run_floe_query() {
     stop_floe_process
     return 1
   fi
-  if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
-    local strict_specs=()
-    while IFS= read -r strict_spec; do
-      [[ -n "${strict_spec}" ]] && strict_specs+=("${strict_spec}")
-    done < <(relation_specs_for_sources "${sources}" benchmark_input)
-    if ! poll_pg_relation_counts_at_least "${FLOE_PG_PORT}" postgres postgres "${strict_specs[@]}"; then
-      {
-        printf 'query_id=%s\n' "${query_id}"
-        printf 'engine=floe\n'
-        printf 'reason=benchmark_input_row_counts_not_reached_after_kafka_catchup\n'
-      } > "${artifact_dir}/correctness.error"
-      stop_floe_process
-      return 1
-    fi
-  fi
   end_ms="$(date +%s%3N)"
   total_ms=$((end_ms - start_ms))
   if (( total_ms > 0 )); then
@@ -2949,17 +2935,6 @@ run_floe_query() {
 
   local observed_hash=""
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
-    local expected_fingerprint
-    local expected_query_text
-    expected_query_text="$(floe_expected_query_text_for_sources "${query_id}" "${sources}")"
-    expected_fingerprint="$(compute_floe_expected_query_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${expected_query_text}" "${artifact_dir}/expected_result.stderr.log")" || {
-      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
-      stop_floe_process
-      return 1
-    }
-    local expected_hash expected_rows_from_hash
-    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
-
     local retry_attempts="${STRICT_CONTENT_RETRY_ATTEMPTS}"
     if [[ -z "${retry_attempts}" || ! "${retry_attempts}" =~ ^[0-9]+$ || ${retry_attempts} -lt 1 ]]; then
       retry_attempts=1
@@ -2969,22 +2944,17 @@ run_floe_query() {
       retry_delay_seconds=0
     fi
 
-    local observed_fingerprint observed_rows_from_hash final_observed_rows final_observed_hash
-    local matched=0
+    local observed_fingerprint observed_rows_from_hash
+    local observed_hash_ready=0
     local attempt
     for attempt in $(seq 1 "${retry_attempts}"); do
-      observed_fingerprint="$(compute_floe_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || {
-        printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
-        stop_floe_process
-        return 1
-      }
-      IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
-      final_observed_rows="${observed_rows_from_hash}"
-      final_observed_hash="${observed_hash}"
-
-      if [[ "${observed_rows_from_hash}" == "${expected_rows_from_hash}" && "${observed_hash}" == "${expected_hash}" ]]; then
-        matched=1
-        break
+      observed_fingerprint="$(compute_floe_result_content_hash "${FLOE_PG_PORT}" postgres postgres "${artifact_dir}" "${artifact_dir}/benchmark_result.stderr.log")" || true
+      if [[ -n "${observed_fingerprint}" ]]; then
+        IFS=$'\t' read -r observed_rows_from_hash observed_hash <<< "$(split_content_fingerprint "${observed_fingerprint}")"
+        if [[ -n "${observed_rows_from_hash}" && -n "${observed_hash}" ]]; then
+          observed_hash_ready=1
+          break
+        fi
       fi
 
       if (( attempt < retry_attempts && retry_delay_seconds > 0 )); then
@@ -2992,21 +2962,81 @@ run_floe_query() {
       fi
     done
 
-    if [[ "${matched}" != "1" ]]; then
-      if ! verify_result_content_hash floe "${query_id}" "${final_observed_rows}" "${final_observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
-        stop_floe_process
-        return 1
-      fi
-    fi
-
-    if [[ -n "${final_observed_hash}" ]]; then
-      observed_hash="${final_observed_hash}"
-    fi
-
-    if [[ "${matched}" != "1" ]]; then
+    if [[ "${observed_hash_ready}" != "1" ]]; then
+      printf 'failed_to_compute_observed_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
       stop_floe_process
       return 1
     fi
+
+    stop_floe_process
+
+    local validation_artifact_dir="${artifact_dir}/validation"
+    mkdir -p "${validation_artifact_dir}"
+    local validation_bid_group_id="${bid_group_id}_validation"
+    local validation_auction_group_id="${auction_group_id}_validation"
+    local validation_person_group_id="${person_group_id}_validation"
+    local validation_config_path="${validation_artifact_dir}/floe_config.json"
+    local validation_program_path="${validation_artifact_dir}/program.sql"
+    write_floe_config "${validation_config_path}" "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}" "${validation_bid_group_id}" "${validation_auction_group_id}" "${validation_person_group_id}"
+    write_floe_program_sql "${validation_program_path}" "${query_id}" "${sources}" 1
+
+    local validation_program_sql
+    validation_program_sql="$(tr '\n' ' ' < "${validation_program_path}")"
+
+    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+      FLOE_ADMIN_PORT=0 \
+      "${REPO_ROOT}/target/release/floe-node" run \
+      --slatedb-await-durable false \
+      --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
+      --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
+      --config "${validation_config_path}" \
+      --mv-query "${validation_program_sql}" \
+      > "${validation_artifact_dir}/floe-node.stdout.log" \
+      2> "${validation_artifact_dir}/floe-node.stderr.log" &
+    FLOE_NODE_PID=$!
+
+    if ! wait_for_floe_pg "${validation_artifact_dir}"; then
+      stop_floe_process
+      return 1
+    fi
+
+    if ! poll_floe_query_completion "${query_id}" "${sources}" "${validation_bid_group_id}" "${validation_auction_group_id}" "${validation_person_group_id}" "${bid_topic}" "${auction_topic}" "${person_topic}"; then
+      stop_floe_process
+      return 1
+    fi
+
+    local strict_specs=()
+    while IFS= read -r strict_spec; do
+      [[ -n "${strict_spec}" ]] && strict_specs+=("${strict_spec}")
+    done < <(relation_specs_for_sources "${sources}" benchmark_input)
+
+    if ! poll_pg_relation_counts_at_least "${FLOE_PG_PORT}" postgres postgres "${strict_specs[@]}"; then
+      {
+        printf 'query_id=%s\n' "${query_id}"
+        printf 'engine=floe\n'
+        printf 'reason=benchmark_input_row_counts_not_reached_in_validation_run\n'
+      } > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
+    fi
+
+    local expected_fingerprint
+    local expected_query_text
+    expected_query_text="$(floe_expected_query_text_for_sources "${query_id}" "${sources}")"
+    expected_fingerprint="$(compute_floe_expected_query_content_hash "${FLOE_PG_PORT}" postgres postgres "${validation_artifact_dir}" "${expected_query_text}" "${validation_artifact_dir}/expected_result.stderr.log")" || {
+      printf 'failed_to_compute_expected_content_fingerprint_for_query=%s\nengine=floe\n' "${query_id}" > "${artifact_dir}/correctness.error"
+      stop_floe_process
+      return 1
+    }
+    local expected_hash expected_rows_from_hash
+    IFS=$'\t' read -r expected_rows_from_hash expected_hash <<< "$(split_content_fingerprint "${expected_fingerprint}")"
+
+    if ! verify_result_content_hash floe "${query_id}" "${observed_rows_from_hash}" "${observed_hash}" "${expected_rows_from_hash}" "${expected_hash}" "${artifact_dir}"; then
+      stop_floe_process
+      return 1
+    fi
+
+    stop_floe_process
   fi
   notes="source_catchup_kafka_group_offsets"
   notes="${notes};correctness_exact_rows=${expected_result_rows}"

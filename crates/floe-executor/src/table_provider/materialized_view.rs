@@ -7,17 +7,10 @@ use std::time::Instant;
 #[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::stats::Precision;
-use datafusion::common::{Result as DFCommonResult, internal_err};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics,
+    ExecutionPlan,
 };
 use dbsp::handles::ZSetHandleView;
 
@@ -31,6 +24,7 @@ use super::helpers::{
     append_mv_version_field, build_batches_from_encoded_snapshot,
     build_constant_u64_projection_batches,
 };
+use super::SnapshotScanExec;
 
 #[derive(Clone)]
 pub struct MaterializedViewTableProvider {
@@ -135,6 +129,26 @@ impl MaterializedViewTableProvider {
                 self.view_name
             ))
         })?;
+        let latest_visible_version = view
+            .latest_version()
+            .and_then(|version| u64::try_from(version).ok());
+        let target_version = as_of_version.or(latest_visible_version).unwrap_or(0);
+
+        if latest_visible_version == Some(target_version)
+            && let Some(visible_row_count) = view.authoritative_row_count_for(target_version)
+            && view.authoritative_row_count() == Some(visible_row_count)
+        {
+            let snapshot = view.snapshot_encoded();
+            tracing::info!(
+                view = %self.view_name,
+                version = target_version,
+                rows = snapshot.len(),
+                storage = "authoritative_state",
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "materialized view loaded rows"
+            );
+            return Ok((snapshot, target_version));
+        }
 
         if let Some((base_version, target_version, overlay)) =
             view.encoded_overlay_batches(as_of_version)
@@ -180,13 +194,6 @@ impl MaterializedViewTableProvider {
                 "materialized view has no DBSP state when loading rows"
             );
             return Ok((HashMap::new(), 0));
-        };
-        let latest_visible_version = view
-            .latest_version()
-            .and_then(|version| u64::try_from(version).ok());
-        let target_version = match as_of_version.or(latest_visible_version) {
-            Some(version) => version,
-            None => return Ok((HashMap::new(), 0)),
         };
         let snapshot = if let Some(dbsp_version) =
             Self::resolve_dbsp_version(view.as_ref(), &state, target_version)
@@ -363,138 +370,8 @@ impl TableProvider for MaterializedViewTableProvider {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let (as_of_version, _passthrough_filters) = extract_mv_version_filter(filters);
-        let (projected_schema, _projected_indices) =
-            super::helpers::project_schema(&self.schema, projection)?;
-        Ok(Arc::new(MaterializedViewScanExec::new(
-            self.clone(),
-            projected_schema,
-            projection.cloned(),
-            as_of_version,
-            limit,
-        )))
-    }
-}
-
-#[derive(Debug)]
-struct MaterializedViewScanExec {
-    provider: MaterializedViewTableProvider,
-    schema: datafusion::arrow::datatypes::SchemaRef,
-    projection: Option<Vec<usize>>,
-    as_of_version: Option<u64>,
-    limit: Option<usize>,
-    cache: PlanProperties,
-}
-
-impl MaterializedViewScanExec {
-    fn new(
-        provider: MaterializedViewTableProvider,
-        schema: datafusion::arrow::datatypes::SchemaRef,
-        projection: Option<Vec<usize>>,
-        as_of_version: Option<u64>,
-        limit: Option<usize>,
-    ) -> Self {
-        let cache = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::RoundRobinBatch(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        )
-        .with_scheduling_type(SchedulingType::Cooperative);
-        Self {
-            provider,
-            schema,
-            projection,
-            as_of_version,
-            limit,
-            cache,
-        }
-    }
-}
-
-impl DisplayAs for MaterializedViewScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "MaterializedViewScanExec: view={}",
-                    self.provider.view_name
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, ""),
-        }
-    }
-}
-
-impl ExecutionPlan for MaterializedViewScanExec {
-    fn name(&self) -> &str {
-        "MaterializedViewScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.cache
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFCommonResult<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            internal_err!("MaterializedViewScanExec does not support children")
-        }
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFCommonResult<SendableRecordBatchStream> {
-        if partition > 0 {
-            return internal_err!("invalid partition {partition} for MaterializedViewScanExec");
-        }
-        let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&self.schema), 2);
-        let tx = builder.tx();
-        let provider = self.provider.clone();
-        let projection = self.projection.clone();
-        let as_of_version = self.as_of_version;
-        let limit = self.limit;
-        builder.spawn(async move {
-            let (_, batches) = provider
-                .build_batches(as_of_version, projection.as_ref(), limit)
-                .await?;
-            for batch in batches {
-                tx.send(Ok(batch))
-                    .await
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-            }
-            Ok(())
-        });
-        Ok(builder.build())
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> DFCommonResult<Statistics> {
-        if let Some(idx) = partition
-            && idx != 0
-        {
-            return internal_err!("invalid partition index {idx} for MaterializedViewScanExec");
-        }
-        if let Some((row_count, _version)) = self
-            .provider
-            .fast_count_batches(self.as_of_version, self.limit)?
-        {
-            return Ok(Statistics::new_unknown(self.schema.as_ref())
-                .with_num_rows(Precision::Exact(row_count)));
-        }
-        Ok(Statistics::new_unknown(self.schema.as_ref()))
+        let (projected_schema, batches) =
+            self.build_batches(as_of_version, projection, limit).await?;
+        Ok(Arc::new(SnapshotScanExec::new(projected_schema, batches)))
     }
 }
