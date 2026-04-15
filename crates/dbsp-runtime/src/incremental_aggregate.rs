@@ -308,16 +308,20 @@ where
                 )
             });
 
+        let mut op = IncrementalAggregateOp::new(
+            state,
+            table,
+            Arc::new(row_evaluator) as RowEvaluator<V, K>,
+            output,
+            slot_kinds,
+            distinct_index,
+            input_index,
+        );
+        op.state.enable_live_replayable();
+        op.enable_live_output_replayable();
+
         Ok(Self {
-            op: AsyncMutex::new(IncrementalAggregateOp::new(
-                state,
-                table,
-                Arc::new(row_evaluator) as RowEvaluator<V, K>,
-                output,
-                slot_kinds,
-                distinct_index,
-                input_index,
-            )),
+            op: AsyncMutex::new(op),
         })
     }
 

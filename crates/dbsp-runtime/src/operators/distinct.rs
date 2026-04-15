@@ -65,6 +65,10 @@ where
         }
     }
 
+    pub fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     async fn ensure_integrated_cache(&mut self) -> Result<()> {
         if self.integrated_cache.is_some() {
             return Ok(());
@@ -86,21 +90,46 @@ where
         base: Option<u64>,
         state_label: &'static str,
     ) -> Result<ZSetHandle> {
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
+        let mut keyed_deltas: Vec<(&K, i64)> = Vec::new();
         for (key, delta) in deltas {
             if *delta == 0 {
                 continue;
             }
+            keyed_deltas.push((key, *delta));
+        }
+
+        if keyed_deltas.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
+            }
+            return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            let batch = Arc::new(
+                keyed_deltas
+                    .iter()
+                    .map(|(key, delta)| ((*key).clone(), *delta))
+                    .collect(),
+            );
+            return Ok(versioned.publish_replayable_batch(batch));
+        }
+
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in keyed_deltas {
             let id = dict_batch
                 .intern(key)
                 .await
                 .context("intern key while staging distinct delta")?;
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
         }
         drop(dict_batch);
 
@@ -116,15 +145,6 @@ where
                 bucket,
                 deltas: bucket_deltas,
             });
-        }
-
-        if segments.is_empty() {
-            if base.is_some()
-                && let Some(handle) = versioned.current_handle()
-            {
-                return Ok(handle);
-            }
-            return Ok(versioned.handle_for_version(0));
         }
 
         let persist_start = std::time::Instant::now();

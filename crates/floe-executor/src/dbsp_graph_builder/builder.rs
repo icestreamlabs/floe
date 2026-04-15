@@ -2385,7 +2385,7 @@ impl TransientDirectInt64TopNProcessor {
         candidate_rows_considered: &mut usize,
         exact_rows_sorted: &mut usize,
     ) -> Vec<(Vec<u8>, i64)> {
-        if updates.iter().all(|update| update.diff > 0) {
+        if previous_output.is_empty() && updates.iter().all(|update| update.diff > 0) {
             self.apply_partition_updates_append_only(
                 state,
                 previous_output,
@@ -3731,6 +3731,7 @@ fn try_build_direct_partitioned_top1_config(
     })
 }
 
+#[allow(dead_code)]
 fn try_build_direct_int64_partitioned_topn_config(
     topn: &DbspTopNNode,
 ) -> Option<TransientDirectInt64TopNConfig> {
@@ -5010,6 +5011,49 @@ fn build_transient_topn_receiver_from_batches(
         return rx;
     }
 
+    let use_direct_int64_partitioned_topn = false;
+    if use_direct_int64_partitioned_topn {
+        if let Some(config) = try_build_direct_int64_partitioned_topn_config(topn) {
+            let mut processor =
+                TransientDirectInt64TopNProcessor::new(graph_id.clone(), config, topn);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        maybe_batch = upstream_rx.recv() => {
+                            let Some(batch) = maybe_batch else {
+                                break;
+                            };
+                            let input_deltas = batch.deltas.as_ref().clone();
+                            let output_deltas = match processor.apply_deltas(input_deltas) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            };
+                            if debug_transient_join {
+                                eprintln!(
+                                    "transient-topn-output graph_id={} version={} rows={}",
+                                    graph_id,
+                                    batch.version,
+                                    output_deltas.len()
+                                );
+                            }
+                            if tx.send(TransientMaterializeBatch {
+                                version: batch.version,
+                                deltas: Arc::new(output_deltas),
+                            }).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            return rx;
+        }
+    }
+
     let use_partitioned_top1 =
         topn.limit() == 1 && topn.offset() == 0 && !topn.partition_by().is_empty();
     let key_layout = match build_transient_topn_key_layout(topn) {
@@ -5071,46 +5115,8 @@ fn build_transient_topn_receiver_from_batches(
         return rx;
     }
 
-    if let Some(config) = try_build_direct_int64_partitioned_topn_config(topn) {
-        let mut processor = TransientDirectInt64TopNProcessor::new(graph_id.clone(), config, topn);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    maybe_batch = upstream_rx.recv() => {
-                        let Some(batch) = maybe_batch else {
-                            break;
-                        };
-                        let input_deltas = batch.deltas.as_ref().clone();
-                        let output_deltas = match processor.apply_deltas(input_deltas) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
-                        if debug_transient_join {
-                            eprintln!(
-                                "transient-topn-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                output_deltas.len()
-                            );
-                        }
-                        if tx.send(TransientMaterializeBatch {
-                            version: batch.version,
-                            deltas: Arc::new(output_deltas),
-                        }).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        return rx;
-    }
-
-    let use_vectorized_partitioned_topn = topn.offset() == 0
+    let use_vectorized_partitioned_topn = false
+        && topn.offset() == 0
         && topn.limit() > 1
         && topn.limit() <= 64
         && !topn.partition_by().is_empty();
@@ -6160,6 +6166,25 @@ mod tests {
             transient_sources,
             BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn q19_source_topn_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \
+             FROM (SELECT auction, bidder, price, channel, url, date_time AS \"dateTime\", extra, \
+                          ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC, date_time ASC, bidder ASC, channel ASC, url ASC, extra ASC) AS rank_number \
+                   FROM nexmark_bid) ranked \
+             WHERE rank_number <= 10",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(transient_sources, BTreeSet::from(["nexmark_bid".to_string()]));
     }
 
     #[tokio::test]

@@ -62,10 +62,30 @@ static DBSP_OPERATOR_PHASE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(||
 
 static DBSP_OPERATOR_PERSISTENCE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DBSP_OPERATOR_PHASE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
-const DBSP_OPERATOR_PERSISTENCE_LOG_SAMPLE_EVERY: u64 = 128;
-const DBSP_OPERATOR_PHASE_LOG_SAMPLE_EVERY: u64 = 128;
-const DBSP_OPERATOR_PERSISTENCE_LOG_MIN_MS: u64 = 10;
-const DBSP_OPERATOR_PHASE_LOG_MIN_MS: u64 = 10;
+static DBSP_OPERATOR_PERSISTENCE_LOG_SAMPLE_EVERY: LazyLock<u64> = LazyLock::new(|| {
+    env_u64("FLOE_DBSP_OPERATOR_PERSISTENCE_LOG_SAMPLE_EVERY", 128).max(1)
+});
+static DBSP_OPERATOR_PHASE_LOG_SAMPLE_EVERY: LazyLock<u64> =
+    LazyLock::new(|| env_u64("FLOE_DBSP_OPERATOR_PHASE_LOG_SAMPLE_EVERY", 128).max(1));
+static DBSP_OPERATOR_PERSISTENCE_LOG_MIN_MS: LazyLock<u64> = LazyLock::new(|| {
+    env_u64(
+        "FLOE_DBSP_OPERATOR_PERSISTENCE_LOG_MIN_MS",
+        env_u64("FLOE_DBSP_OPERATOR_LOG_MIN_MS", 10),
+    )
+});
+static DBSP_OPERATOR_PHASE_LOG_MIN_MS: LazyLock<u64> = LazyLock::new(|| {
+    env_u64(
+        "FLOE_DBSP_OPERATOR_PHASE_LOG_MIN_MS",
+        env_u64("FLOE_DBSP_OPERATOR_LOG_MIN_MS", 10),
+    )
+});
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 pub(crate) fn observe_flush_write_metrics(metrics: FlushWriteMetrics) {
     DBSP_FLUSH_WRITE_BATCH_CALLS.observe(metrics.write_batch_calls as f64);
@@ -85,10 +105,10 @@ pub(crate) fn observe_operator_persistence_latency_ms(
     DBSP_OPERATOR_PERSISTENCE_LATENCY_MS
         .with_label_values(&[operator, state])
         .observe(latency_ms as f64);
-    if latency_ms >= DBSP_OPERATOR_PERSISTENCE_LOG_MIN_MS
+    if latency_ms >= *DBSP_OPERATOR_PERSISTENCE_LOG_MIN_MS
         || DBSP_OPERATOR_PERSISTENCE_LOG_COUNTER
             .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(DBSP_OPERATOR_PERSISTENCE_LOG_SAMPLE_EVERY)
+            .is_multiple_of(*DBSP_OPERATOR_PERSISTENCE_LOG_SAMPLE_EVERY)
     {
         tracing::info!(
             operator,
@@ -108,10 +128,10 @@ pub(crate) fn observe_operator_phase_latency_ms(
     DBSP_OPERATOR_PHASE_LATENCY_MS
         .with_label_values(&[operator, state, phase])
         .observe(latency_ms as f64);
-    if latency_ms >= DBSP_OPERATOR_PHASE_LOG_MIN_MS
+    if latency_ms >= *DBSP_OPERATOR_PHASE_LOG_MIN_MS
         || DBSP_OPERATOR_PHASE_LOG_COUNTER
             .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(DBSP_OPERATOR_PHASE_LOG_SAMPLE_EVERY)
+            .is_multiple_of(*DBSP_OPERATOR_PHASE_LOG_SAMPLE_EVERY)
     {
         tracing::info!(
             operator,
