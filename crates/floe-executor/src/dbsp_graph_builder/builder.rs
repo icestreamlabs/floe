@@ -3228,28 +3228,10 @@ impl TransientDirectTop1Processor {
         &self,
         row_key: &Vec<u8>,
     ) -> Result<Option<(TransientDirectTop1PartitionKey, i64)>> {
-        let partition_key = match self.partition_layout {
-            TransientDirectTop1PartitionLayout::One(partition_idx) => {
-                let Some(partition_value) =
-                    extract_encoded_row_int64_column(row_key, partition_idx)?
-                else {
-                    return Ok(None);
-                };
-                TransientDirectTop1PartitionKey::One(partition_value)
-            }
-            TransientDirectTop1PartitionLayout::Two(partition_indices) => {
-                let Some(first_partition_value) =
-                    extract_encoded_row_int64_column(row_key, partition_indices[0])?
-                else {
-                    return Ok(None);
-                };
-                let Some(second_partition_value) =
-                    extract_encoded_row_int64_column(row_key, partition_indices[1])?
-                else {
-                    return Ok(None);
-                };
-                TransientDirectTop1PartitionKey::Two(first_partition_value, second_partition_value)
-            }
+        let Some(partition_key) =
+            extract_direct_top1_partition_key(row_key, self.partition_layout)?
+        else {
+            return Ok(None);
         };
         let Some(order_value) = extract_encoded_row_i64_like_column(row_key, self.order_idx)?
         else {
@@ -3283,6 +3265,24 @@ fn compute_transient_topn_key_parts(
         }
     };
 
+    let order_key = compute_transient_topn_order_key(
+        graph_id,
+        order_specs,
+        order_key_columns,
+        order_value_types,
+        row_key,
+    );
+
+    (partition_key, order_key)
+}
+
+fn compute_transient_topn_order_key(
+    graph_id: &str,
+    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    order_key_columns: &[usize],
+    order_value_types: &[DbspScalarType],
+    row_key: &Vec<u8>,
+) -> Option<TransientTopNKey> {
     let mut values = Vec::with_capacity(order_key_columns.len());
     for (column_idx, expected_type) in order_key_columns.iter().zip(order_value_types.iter()) {
         let scalar = match extract_encoded_row_scalar(row_key, *column_idx) {
@@ -3293,7 +3293,7 @@ fn compute_transient_topn_key_parts(
                     error = %err,
                     "failed to extract transient topn order key column"
                 );
-                return (partition_key, None);
+                return None;
             }
         };
         match TransientTopNValue::from_encoded_scalar(scalar, expected_type) {
@@ -3304,15 +3304,12 @@ fn compute_transient_topn_key_parts(
                     error = %err,
                     "failed to map transient topn order value"
                 );
-                return (partition_key, None);
+                return None;
             }
         }
     }
 
-    (
-        partition_key,
-        Some(TransientTopNKey::new(order_specs, values, row_key.clone())),
-    )
+    Some(TransientTopNKey::new(order_specs, values, row_key.clone()))
 }
 
 fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNKeyLayout> {
@@ -4132,6 +4129,35 @@ fn extract_encoded_row_int64_column(bytes: &[u8], target_index: usize) -> Result
     }
 
     bail!("encoded row missing int64 column at index {target_index}")
+}
+
+fn extract_direct_top1_partition_key(
+    row_key: &[u8],
+    partition_layout: TransientDirectTop1PartitionLayout,
+) -> Result<Option<TransientDirectTop1PartitionKey>> {
+    let partition_key = match partition_layout {
+        TransientDirectTop1PartitionLayout::One(partition_idx) => {
+            let Some(partition_value) = extract_encoded_row_int64_column(row_key, partition_idx)?
+            else {
+                return Ok(None);
+            };
+            TransientDirectTop1PartitionKey::One(partition_value)
+        }
+        TransientDirectTop1PartitionLayout::Two(partition_indices) => {
+            let Some(first_partition_value) =
+                extract_encoded_row_int64_column(row_key, partition_indices[0])?
+            else {
+                return Ok(None);
+            };
+            let Some(second_partition_value) =
+                extract_encoded_row_int64_column(row_key, partition_indices[1])?
+            else {
+                return Ok(None);
+            };
+            TransientDirectTop1PartitionKey::Two(first_partition_value, second_partition_value)
+        }
+    };
+    Ok(Some(partition_key))
 }
 fn extract_encoded_row_i64_like_column(bytes: &[u8], target_index: usize) -> Result<Option<i64>> {
     if bytes.len() < 4 {
@@ -5106,6 +5132,7 @@ async fn build_transient_aggregate_receiver_from_batches(
             .await
             .context("initialize transient incremental aggregate")?,
         );
+        aggregate_processor.enable_append_only_input().await;
         let precompute_evaluator = precompute_evaluator.clone();
 
         tokio::spawn(async move {
@@ -5454,6 +5481,7 @@ async fn build_transient_window_incremental_receiver_from_batches(
         .await
         .context("initialize transient window incremental aggregate")?,
     );
+    aggregate_processor.enable_append_only_input().await;
     let group_key_columns = Arc::new(group_key_columns);
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-window-aggregate:{graph_id}");
@@ -6440,7 +6468,6 @@ fn build_transient_topn_receiver_from_batches(
     }
 
     let use_vectorized_partitioned_topn = false
-        && append_only_input
         && topn.offset() == 0
         && topn.limit() > 1
         && topn.limit() <= 64

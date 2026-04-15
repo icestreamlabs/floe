@@ -333,6 +333,11 @@ where
         let deltas = op.apply_delta_values(&delta_values).await?;
         Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
     }
+
+    pub async fn enable_append_only_input(&self) {
+        let mut op = self.op.lock().await;
+        op.enable_append_only_input();
+    }
 }
 
 #[derive(Clone)]

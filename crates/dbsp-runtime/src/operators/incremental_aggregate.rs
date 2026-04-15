@@ -232,6 +232,7 @@ where
     slot_kinds: Vec<IncrementalAggregateSlotKind>,
     distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
     input_index: Option<IndexedBatchZSet<K, V>>,
+    append_only_input: bool,
 }
 
 impl<K, V> IncrementalAggregateOp<K, V>
@@ -274,11 +275,16 @@ where
             slot_kinds,
             distinct_index,
             input_index,
+            append_only_input: false,
         }
     }
 
     pub fn enable_live_output_replayable(&mut self) {
         self.output.enable_replayable_persistence();
+    }
+
+    pub fn enable_append_only_input(&mut self) {
+        self.append_only_input = true;
     }
 
     fn has_extrema(&self) -> bool {
@@ -477,23 +483,34 @@ where
             return Ok(HashMap::new());
         }
 
-        let coalesce_start = Instant::now();
-        let coalesced = self.coalesce_deltas(delta_values.to_vec());
-        metrics::observe_operator_phase_latency_ms(
-            "incremental_aggregate",
-            "step",
-            "coalesce_input",
-            coalesce_start.elapsed().as_millis() as u64,
-        );
-        if coalesced.is_empty() {
+        let coalesced = if self.append_only_input {
             metrics::observe_operator_phase_latency_ms(
                 "incremental_aggregate",
                 "step",
-                "apply_delta_values_total",
-                total_start.elapsed().as_millis() as u64,
+                "coalesce_input",
+                0,
             );
-            return Ok(HashMap::new());
-        }
+            None
+        } else {
+            let coalesce_start = Instant::now();
+            let coalesced = self.coalesce_deltas(delta_values.to_vec());
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "coalesce_input",
+                coalesce_start.elapsed().as_millis() as u64,
+            );
+            if coalesced.is_empty() {
+                metrics::observe_operator_phase_latency_ms(
+                    "incremental_aggregate",
+                    "step",
+                    "apply_delta_values_total",
+                    total_start.elapsed().as_millis() as u64,
+                );
+                return Ok(HashMap::new());
+            }
+            Some(coalesced)
+        };
 
         #[derive(Clone, Debug)]
         enum AggregatedSlotDelta {
@@ -519,13 +536,13 @@ where
         let slot_kinds = &self.slot_kinds;
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
-        let aggregate_updates_start = Instant::now();
-        for (value, weight) in coalesced {
+        let has_extrema = self.has_extrema();
+        let mut apply_value = |value: V, weight: i64| {
             if weight == 0 {
-                continue;
+                return;
             }
             let Some(row_update) = (self.row_evaluator)(&value) else {
-                continue;
+                return;
             };
             if row_update.slots.len() != self.slot_kinds.len() {
                 tracing::warn!(
@@ -533,11 +550,11 @@ where
                     actual = row_update.slots.len(),
                     "incremental aggregate row evaluator returned unexpected slot vector width"
                 );
-                continue;
+                return;
             }
             let key = row_update.key;
             let slots = row_update.slots;
-            if self.has_extrema() && weight < 0 {
+            if has_extrema && weight < 0 {
                 recompute_keys.insert(key.clone());
                 aggregated_updates_by_key.remove(&key);
             }
@@ -562,7 +579,7 @@ where
             }
             affected_keys.insert(key.clone());
             if recompute_keys.contains(&key) {
-                continue;
+                return;
             }
 
             let updates =
@@ -671,6 +688,17 @@ where
                         );
                     }
                 }
+            }
+        };
+
+        let aggregate_updates_start = Instant::now();
+        if let Some(coalesced) = coalesced {
+            for (value, weight) in coalesced {
+                apply_value(value, weight);
+            }
+        } else {
+            for (value, weight) in delta_values.iter() {
+                apply_value(value.clone(), *weight);
             }
         }
         metrics::observe_operator_phase_latency_ms(
