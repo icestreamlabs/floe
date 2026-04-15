@@ -801,7 +801,15 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     wait_for_logical_version(&mv_registry, view_name, 4).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
-    sort_rows_by_first_column(&mut rows);
+    rows.sort_by_key(|row| {
+        (
+            scalar_i64(row.first()),
+            scalar_i64(row.get(1)),
+            scalar_i64(row.get(2)),
+            scalar_timestamp_millis(row.get(3)),
+            scalar_i64(row.get(4)),
+        )
+    });
     rows.sort_by_key(|row| scalar_i64(row.get(1)));
     assert_eq!(
         rows,
@@ -2530,6 +2538,134 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     assert_eq!(rows, vec![int_row(&[7, 60]), int_row(&[9, 90])]);
+}
+
+#[tokio::test]
+async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal() {
+    let db = test_db("join-proctime-q13-transient-source").await;
+    let view_name = "mv_join_proctime_q13_transient_source";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT b.auction, b.bidder, b.price, b.date_time AS \"dateTime\", a.seller AS value \
+             FROM (SELECT *, PROCTIME() AS p_time FROM nexmark_bid) b \
+             JOIN nexmark_auction AS a ON b.auction = a.id \
+             WHERE b.auction % 10000 = a.id % 10000",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_auction", "nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_auction", false);
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("auction", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+            Field::new(
+                "dateTime",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("value", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient q13 graph");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(
+            encoded_auction_row_with_ts_and_extra(
+                1,
+                7,
+                1,
+                1_700_000_100_000,
+                1_700_000_000_000,
+                "a1",
+            ),
+            1,
+        )
+        .expect("append auction");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick auctions");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 42, 10, 1_700_000_001_000), 1)
+        .expect("append first bid");
+    registry.tick_all_with_version(2).await.expect("tick bids");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 84, 20, 1_700_000_002_000), 1)
+        .expect("append second bid");
+    registry.tick_all_with_version(3).await.expect("tick bids");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(42)),
+            Some(EncodedRowScalar::Int64(10)),
+            Some(EncodedRowScalar::TimestampMillis(1_700_000_001_000)),
+            Some(EncodedRowScalar::Int64(7)),
+        ], vec![
+            Some(EncodedRowScalar::Int64(1)),
+            Some(EncodedRowScalar::Int64(84)),
+            Some(EncodedRowScalar::Int64(20)),
+            Some(EncodedRowScalar::TimestampMillis(1_700_000_002_000)),
+            Some(EncodedRowScalar::Int64(7)),
+        ]]
+    );
 }
 
 #[tokio::test]

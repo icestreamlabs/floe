@@ -1,4 +1,5 @@
 use super::*;
+use crate::dbsp_graph_builder::materialize::DeltaTransformFn;
 use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
@@ -9,6 +10,54 @@ use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
 impl DbspGraphBuilder {
+    fn build_transient_join_precompute_transform(
+        node: &DbspProjectNode,
+    ) -> Result<Arc<DeltaTransformFn>> {
+        let expressions: Arc<Vec<DbspProjectExpr>> = Arc::new(node.expressions().to_vec());
+        let schema = Arc::clone(node.input_schema());
+        let evaluator = Arc::new(
+            VectorizedFilterProjectEvaluator::for_map(expressions.as_ref(), Arc::clone(&schema))
+                .context("build vectorized transient join precompute evaluator")?,
+        );
+        Ok(Arc::new(move |delta_values| {
+            evaluator.transform_delta("transient_join_precompute", delta_values)
+        }))
+    }
+
+    fn remap_transient_join_input_batches(
+        graph_id: &str,
+        side: &'static str,
+        mut input: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        transform: Arc<DeltaTransformFn>,
+        task_events: &GraphTaskSender,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let graph_id = graph_id.to_string();
+        let task_events = task_events.clone();
+        let task_label = format!("transient-join-{side}-precompute:{graph_id}");
+        tokio::spawn(async move {
+            while let Some(batch) = input.recv().await {
+                let transformed = match transform(batch.deltas.as_ref()) {
+                    Ok(transformed) => transformed,
+                    Err(err) => {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        break;
+                    }
+                };
+                if tx
+                    .send(dbsp::join::TransientJoinInputBatch {
+                        ts: batch.ts,
+                        deltas: Arc::new(transformed),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
     pub(crate) async fn compile_join(
         &mut self,
         node: &DbspJoinNode,
@@ -778,10 +827,21 @@ impl DbspGraphBuilder {
             let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&left_schema), items)
                 .context("build transient join left key precompute projection")?;
             left_join_schema = Arc::clone(precompute.output_schema());
+            let precompute_transform = Self::build_transient_join_precompute_transform(&precompute)
+                .context("build transient join left key precompute transform")?;
             left = self
                 .compile_map(&precompute, left, task_events)
                 .await
                 .context("initialize transient join left key precompute map")?;
+            left_transient = left_transient.map(|receiver| {
+                Self::remap_transient_join_input_batches(
+                    &graph_id,
+                    "left",
+                    receiver,
+                    Arc::clone(&precompute_transform),
+                    task_events,
+                )
+            });
             key_columns
         } else {
             left_key_column_options
@@ -816,10 +876,21 @@ impl DbspGraphBuilder {
             let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&right_schema), items)
                 .context("build transient join right key precompute projection")?;
             right_join_schema = Arc::clone(precompute.output_schema());
+            let precompute_transform = Self::build_transient_join_precompute_transform(&precompute)
+                .context("build transient join right key precompute transform")?;
             right = self
                 .compile_map(&precompute, right, task_events)
                 .await
                 .context("initialize transient join right key precompute map")?;
+            right_transient = right_transient.map(|receiver| {
+                Self::remap_transient_join_input_batches(
+                    &graph_id,
+                    "right",
+                    receiver,
+                    Arc::clone(&precompute_transform),
+                    task_events,
+                )
+            });
             key_columns
         } else {
             right_key_column_options
@@ -828,12 +899,6 @@ impl DbspGraphBuilder {
                 .collect::<Option<Vec<_>>>()
                 .expect("right key columns should be direct")
         };
-        if left_join_schema.len() != left_schema.len()
-            || right_join_schema.len() != right_schema.len()
-        {
-            left_transient = None;
-            right_transient = None;
-        }
 
         let left_key_columns = Arc::new(left_key_columns_resolved);
         let right_key_columns = Arc::new(right_key_columns_resolved);
