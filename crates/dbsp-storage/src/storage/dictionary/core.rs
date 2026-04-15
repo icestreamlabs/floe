@@ -40,7 +40,7 @@ where
     meta_key: Vec<u8>,
     next_id: AtomicU64,
     cache: Mutex<Cache>,
-    seen_hashes: Mutex<AHashSet<u64>>,
+    fresh_next_slot_by_hash: Mutex<AHashMap<u64, u16>>,
     fast_path_fresh: bool,
     hash_fn: HashFn,
     _marker: std::marker::PhantomData<K>,
@@ -91,7 +91,7 @@ where
             meta_key,
             next_id: AtomicU64::new(next_id),
             cache: Mutex::new(Cache::new()),
-            seen_hashes: Mutex::new(AHashSet::new()),
+            fresh_next_slot_by_hash: Mutex::new(AHashMap::new()),
             fast_path_fresh,
             hash_fn: hash_fn.unwrap_or_else(|| Arc::new(xxh3_64)),
             _marker: std::marker::PhantomData,
@@ -178,6 +178,15 @@ where
 
     fn next_probe_slot(slot: u16) -> Option<u16> {
         (slot != u16::MAX).then_some(slot + 1)
+    }
+
+    fn reserve_fresh_slot(&self, hash: u64) -> Result<u16> {
+        let mut next_slot_by_hash = self.fresh_next_slot_by_hash.lock().unwrap();
+        let next_slot = next_slot_by_hash.entry(hash).or_insert(0);
+        let slot = *next_slot;
+        *next_slot = Self::next_probe_slot(slot)
+            .ok_or_else(|| anyhow!("dictionary full: all probe slots occupied for hash"))?;
+        Ok(slot)
     }
 
     async fn first_free_slot(&self, hash: u64) -> Result<u16> {
@@ -317,12 +326,25 @@ where
         I: IntoIterator<Item = &'a K>,
         K: 'a,
     {
+        let total_start = Instant::now();
         let mut encoded_keys = Vec::new();
         for key in keys {
             encoded_keys
                 .push(encoding::encode(key).context("unable to encode dictionary key in batch")?);
         }
-        self.intern_many_encoded(encoded_keys).await
+        let encode_ms = total_start.elapsed().as_millis() as u64;
+        let output = self.intern_many_encoded(encoded_keys).await?;
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        if total_ms >= 10 {
+            tracing::info!(
+                keys = output.len(),
+                encode_ms,
+                intern_ms = total_ms.saturating_sub(encode_ms),
+                total_ms,
+                "dictionary intern_many_values latency"
+            );
+        }
+        Ok(output)
     }
 
     /// Intern a batch of keys that are already unique within the batch.
@@ -334,24 +356,50 @@ where
         I: IntoIterator<Item = &'a K>,
         K: 'a,
     {
+        let total_start = Instant::now();
         let mut encoded_keys = Vec::new();
         for key in keys {
             encoded_keys
                 .push(encoding::encode(key).context("unable to encode dictionary key in batch")?);
         }
-        self.intern_many_encoded_unique(encoded_keys).await
+        let encode_ms = total_start.elapsed().as_millis() as u64;
+        let output = self.intern_many_encoded_unique(encoded_keys).await?;
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        if total_ms >= 10 {
+            tracing::info!(
+                keys = output.len(),
+                encode_ms,
+                intern_ms = total_ms.saturating_sub(encode_ms),
+                total_ms,
+                "dictionary intern_many_values_unique latency"
+            );
+        }
+        Ok(output)
     }
 
     /// Intern a batch of owned keys that are already unique within the batch.
     ///
     /// This avoids cloning key payloads while staging batch inserts.
     pub async fn intern_many_values_unique_owned(&self, keys: Vec<K>) -> Result<Vec<u64>> {
+        let total_start = Instant::now();
         let mut encoded_keys = Vec::with_capacity(keys.len());
         for key in keys {
             encoded_keys
                 .push(encoding::encode(&key).context("unable to encode dictionary key in batch")?);
         }
-        self.intern_many_encoded_unique(encoded_keys).await
+        let encode_ms = total_start.elapsed().as_millis() as u64;
+        let output = self.intern_many_encoded_unique(encoded_keys).await?;
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        if total_ms >= 10 {
+            tracing::info!(
+                keys = output.len(),
+                encode_ms,
+                intern_ms = total_ms.saturating_sub(encode_ms),
+                total_ms,
+                "dictionary intern_many_values_unique_owned latency"
+            );
+        }
+        Ok(output)
     }
 
     async fn intern_many_encoded(&self, encoded_keys: Vec<Vec<u8>>) -> Result<Vec<u64>> {
@@ -600,19 +648,11 @@ where
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
         next_slot_by_hash: &mut AHashMap<u64, u16>,
     ) -> Result<u64> {
-        if self.fast_path_fresh
-            && let std::collections::hash_map::Entry::Vacant(entry) = next_slot_by_hash.entry(hash)
-        {
-            let can_use_slot_zero = {
-                let mut seen = self.seen_hashes.lock().unwrap();
-                seen.insert(hash)
-            };
-            if can_use_slot_zero {
-                let id = self.reserve_id();
-                entry.insert(1);
-                pending.push((encoded_key.to_vec(), id, hash, 0));
-                return Ok(id);
-            }
+        if self.fast_path_fresh {
+            let slot = self.reserve_fresh_slot(hash)?;
+            let id = self.reserve_id();
+            pending.push((encoded_key.to_vec(), id, hash, slot));
+            return Ok(id);
         }
 
         let next_slot = match next_slot_by_hash.entry(hash) {
@@ -638,19 +678,11 @@ where
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
         next_slot_by_hash: &mut AHashMap<u64, u16>,
     ) -> Result<u64> {
-        if self.fast_path_fresh
-            && let std::collections::hash_map::Entry::Vacant(entry) = next_slot_by_hash.entry(hash)
-        {
-            let can_use_slot_zero = {
-                let mut seen = self.seen_hashes.lock().unwrap();
-                seen.insert(hash)
-            };
-            if can_use_slot_zero {
-                let id = self.reserve_id();
-                entry.insert(1);
-                pending.push((encoded_key, id, hash, 0));
-                return Ok(id);
-            }
+        if self.fast_path_fresh {
+            let slot = self.reserve_fresh_slot(hash)?;
+            let id = self.reserve_id();
+            pending.push((encoded_key, id, hash, slot));
+            return Ok(id);
         }
 
         let next_slot = match next_slot_by_hash.entry(hash) {
@@ -819,28 +851,23 @@ where
         overlay: Option<&mut BatchOverlay>,
     ) -> Result<u64> {
         let hash = self.hash(&encoded_key);
-        let first_free_slot = self.first_free_slot(hash).await?;
-        if self.fast_path_fresh && first_free_slot == 0 {
-            let can_use_slot_zero = {
-                let mut seen = self.seen_hashes.lock().unwrap();
-                seen.insert(hash)
-            };
-            if can_use_slot_zero {
-                let id = self.reserve_id();
-                self.persist_mapping(encoded_key.clone(), id, hash, 0)
-                    .await?;
-                {
-                    let mut cache = self.cache.lock().unwrap();
-                    cache.clear_negative(&encoded_key);
-                }
-                if let Some(overlay) = overlay {
-                    overlay.clear_negative(&encoded_key);
-                    overlay.remember_positive(encoded_key.clone(), id);
-                }
-                return Ok(id);
+        if self.fast_path_fresh {
+            let slot = self.reserve_fresh_slot(hash)?;
+            let id = self.reserve_id();
+            self.persist_mapping(encoded_key.clone(), id, hash, slot)
+                .await?;
+            {
+                let mut cache = self.cache.lock().unwrap();
+                cache.clear_negative(&encoded_key);
             }
+            if let Some(overlay) = overlay {
+                overlay.clear_negative(&encoded_key);
+                overlay.remember_positive(encoded_key.clone(), id);
+            }
+            return Ok(id);
         }
 
+        let first_free_slot = self.first_free_slot(hash).await?;
         let id = self.reserve_id();
         self.persist_mapping(encoded_key.clone(), id, hash, first_free_slot)
             .await?;

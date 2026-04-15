@@ -191,39 +191,11 @@ where
         base: Option<u64>,
         state_label: &'static str,
     ) -> Result<ZSetHandle> {
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
-        for (key, delta) in deltas {
-            if *delta == 0 {
-                continue;
-            }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging top1 delta")?;
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
-        }
-        drop(dict_batch);
-
-        let mut segments = Vec::new();
-        for (bucket, mut bucket_deltas) in buckets {
-            bucket_deltas.retain(|(_, delta)| *delta != 0);
-            if bucket_deltas.is_empty() {
-                continue;
-            }
-            bucket_deltas.sort_by_key(|(id, _)| *id);
-            segments.push(SegmentRecord {
-                id: 0,
-                bucket,
-                deltas: bucket_deltas,
-            });
-        }
-
-        if segments.is_empty() {
+        let staged = deltas
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key.clone(), *delta)))
+            .collect::<Vec<_>>();
+        if staged.is_empty() {
             if base.is_some()
                 && let Some(handle) = versioned.current_handle()
             {
@@ -237,13 +209,29 @@ where
                 base.is_none(),
                 "replayable versioned ZSet does not support persisted base chaining"
             );
-            let batch = Arc::new(
-                deltas
-                    .iter()
-                    .filter_map(|(key, delta)| (*delta != 0).then_some((key.clone(), *delta)))
-                    .collect(),
-            );
-            return Ok(versioned.publish_replayable_batch(batch));
+            return Ok(versioned.publish_replayable_batch(Arc::new(staged)));
+        }
+
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in staged {
+            let id = dict_batch
+                .intern(&key)
+                .await
+                .context("intern key while staging top1 delta")?;
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
+        }
+        drop(dict_batch);
+
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
         }
 
         let persist_start = std::time::Instant::now();

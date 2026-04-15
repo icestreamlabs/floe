@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
@@ -85,6 +85,57 @@ async fn handles_hash_collisions() {
         let resolved = dict.resolve(id).await.expect("resolve id");
         assert_eq!(resolved.value, value);
     }
+}
+
+#[tokio::test]
+async fn fresh_collision_slots_are_reserved_across_batch_boundaries() {
+    let table = build_table().await;
+    let forced_hash: HashFn = Arc::new(|_| 7);
+    let dict = Dictionary::<TestKey>::with_table(table, "fresh_collision_batches", Some(forced_hash))
+        .await
+        .expect("build dictionary");
+
+    let id_a = dict
+        .intern(&TestKey {
+            value: "a".to_string(),
+        })
+        .await
+        .expect("intern key a");
+    let batch_ids = dict
+        .intern_many_values_unique_owned(vec![
+            TestKey {
+                value: "b".to_string(),
+            },
+            TestKey {
+                value: "c".to_string(),
+            },
+        ])
+        .await
+        .expect("intern batch");
+    let id_d = dict
+        .intern(&TestKey {
+            value: "d".to_string(),
+        })
+        .await
+        .expect("intern key d");
+
+    let ids = vec![id_a, batch_ids[0], batch_ids[1], id_d];
+    assert_eq!(ids.iter().copied().collect::<HashSet<_>>().len(), 4);
+
+    for (slot, id) in ids.iter().enumerate() {
+        let stored = dict
+            .table()
+            .get(&dict.k2id_key(7, slot as u16))
+            .await
+            .expect("fetch collision slot")
+            .map(|bytes| decode_id(&bytes).expect("decode id"))
+            .expect("collision slot present");
+        assert_eq!(stored, *id);
+    }
+
+    let resolved = dict.resolve_many(&ids).await.expect("resolve ids");
+    let values = resolved.into_iter().map(|entry| entry.value).collect::<Vec<_>>();
+    assert_eq!(values, vec!["a", "b", "c", "d"]);
 }
 
 #[tokio::test]

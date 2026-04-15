@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -339,8 +340,6 @@ where
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let dict = versioned.dictionary();
         let mut keyed_deltas: Vec<(&T, i64)> = Vec::new();
         for (key, delta) in deltas {
             if *delta == 0 {
@@ -348,32 +347,7 @@ where
             }
             keyed_deltas.push((key, *delta));
         }
-        let ids = dict
-            .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))
-            .await
-            .context("batch intern keys while staging incremental aggregate delta")?;
-        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
-        }
-
-        let mut segments = Vec::new();
-        for (bucket, mut bucket_deltas) in buckets {
-            bucket_deltas.retain(|(_, delta)| *delta != 0);
-            if bucket_deltas.is_empty() {
-                continue;
-            }
-            bucket_deltas.sort_by_key(|(id, _)| *id);
-            segments.push(SegmentRecord {
-                id: 0,
-                bucket,
-                deltas: bucket_deltas,
-            });
-        }
-
-        if segments.is_empty() {
+        if keyed_deltas.is_empty() {
             if base.is_some()
                 && let Some(handle) = versioned.current_handle()
             {
@@ -396,20 +370,90 @@ where
             return Ok(versioned.publish_replayable_batch(batch));
         }
 
-        let persist_start = std::time::Instant::now();
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
+        let intern_start = Instant::now();
+        let ids = dict
+            .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))
+            .await
+            .context("batch intern keys while staging incremental aggregate delta")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "intern_keys",
+            intern_start.elapsed().as_millis() as u64,
+        );
+
+        let bucketize_start = Instant::now();
+        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
+        }
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "bucketize_deltas",
+            bucketize_start.elapsed().as_millis() as u64,
+        );
+
+        let build_segments_start = Instant::now();
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.retain(|(_, delta)| *delta != 0);
+            if bucket_deltas.is_empty() {
+                continue;
+            }
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
+        }
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "build_segments",
+            build_segments_start.elapsed().as_millis() as u64,
+        );
+
+        let persist_start = Instant::now();
         let mut batch = WriteBatch::new();
+        let enqueue_start = Instant::now();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
             .await
             .context("schedule incremental aggregate version update")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "enqueue_version",
+            enqueue_start.elapsed().as_millis() as u64,
+        );
 
+        let write_start = Instant::now();
         versioned
             .table()
             .write_batch(batch)
             .await
             .context("write incremental aggregate version update")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "write_batch",
+            write_start.elapsed().as_millis() as u64,
+        );
 
+        let apply_plan_start = Instant::now();
         versioned.apply_version_plan(&plan);
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            state_label,
+            "apply_version_plan",
+            apply_plan_start.elapsed().as_millis() as u64,
+        );
         metrics::observe_operator_persistence_latency_ms(
             "incremental_aggregate",
             state_label,
@@ -422,12 +466,32 @@ where
         &mut self,
         delta_values: &[(V, i64)],
     ) -> Result<HashMap<(K, Vec<AggregateValue>), i64>> {
+        let total_start = Instant::now();
         if delta_values.is_empty() {
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "apply_delta_values_total",
+                total_start.elapsed().as_millis() as u64,
+            );
             return Ok(HashMap::new());
         }
 
+        let coalesce_start = Instant::now();
         let coalesced = self.coalesce_deltas(delta_values.to_vec());
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "coalesce_input",
+            coalesce_start.elapsed().as_millis() as u64,
+        );
         if coalesced.is_empty() {
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "apply_delta_values_total",
+                total_start.elapsed().as_millis() as u64,
+            );
             return Ok(HashMap::new());
         }
 
@@ -455,6 +519,7 @@ where
         let slot_kinds = &self.slot_kinds;
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
+        let aggregate_updates_start = Instant::now();
         for (value, weight) in coalesced {
             if weight == 0 {
                 continue;
@@ -608,22 +673,42 @@ where
                 }
             }
         }
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "aggregate_updates",
+            aggregate_updates_start.elapsed().as_millis() as u64,
+        );
 
         if affected_keys.is_empty() {
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "apply_delta_values_total",
+                total_start.elapsed().as_millis() as u64,
+            );
             return Ok(HashMap::new());
         }
 
         if let Some(input_index) = self.input_index.as_ref()
             && !index_updates.is_empty()
         {
+            let input_index_start = Instant::now();
             input_index
                 .apply_deltas(index_updates)
                 .await
                 .context("update incremental aggregate input index")?;
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "update_input_index",
+                input_index_start.elapsed().as_millis() as u64,
+            );
         }
 
         let mut distinct_count_adjustments: HashMap<K, Vec<i64>> = HashMap::new();
         if !distinct_deltas.is_empty() {
+            let distinct_index_start = Instant::now();
             let distinct_index = self
                 .distinct_index
                 .as_ref()
@@ -654,17 +739,31 @@ where
                     .await
                     .context("update incremental aggregate distinct index")?;
             }
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "update_distinct_index",
+                distinct_index_start.elapsed().as_millis() as u64,
+            );
         }
 
+        let ensure_cache_start = Instant::now();
         self.ensure_state_cache()
             .await
             .context("load incremental aggregate cache")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "ensure_state_cache",
+            ensure_cache_start.elapsed().as_millis() as u64,
+        );
 
         let zero_state = GroupedIncrementalAggregateState::zero(&self.slot_kinds);
         let mut state_deltas: HashMap<(K, GroupedIncrementalAggregateState), i64> = HashMap::new();
         let mut output_deltas: HashMap<(K, Vec<AggregateValue>), i64> = HashMap::new();
         let mut cache_updates = Vec::new();
 
+        let compute_group_states_start = Instant::now();
         {
             let state_cache = self
                 .state_cache
@@ -822,8 +921,20 @@ where
                 cache_updates.push((key, new_state));
             }
         }
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "compute_group_states",
+            compute_group_states_start.elapsed().as_millis() as u64,
+        );
 
         if state_deltas.is_empty() {
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "apply_delta_values_total",
+                total_start.elapsed().as_millis() as u64,
+            );
             return Ok(HashMap::new());
         }
 
@@ -832,6 +943,7 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
+        let persist_integrated_start = Instant::now();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
             &mut self.state.integrated,
             &state_deltas,
@@ -840,9 +952,16 @@ where
         )
         .await
         .context("update incremental aggregate integrated state")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "persist_integrated",
+            persist_integrated_start.elapsed().as_millis() as u64,
+        );
         self.state.update_handle(new_integrated_handle);
 
         if let Some(state_cache) = self.state_cache.as_mut() {
+            let cache_update_start = Instant::now();
             for (key, value) in cache_updates {
                 if let Some(value) = value {
                     state_cache.insert(key, value);
@@ -850,8 +969,20 @@ where
                     state_cache.remove(&key);
                 }
             }
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "apply_cache_updates",
+                cache_update_start.elapsed().as_millis() as u64,
+            );
         }
 
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "apply_delta_values_total",
+            total_start.elapsed().as_millis() as u64,
+        );
         Ok(output_deltas)
     }
 
@@ -1047,27 +1178,62 @@ where
         _ts: i64,
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
+        let step_start = Instant::now();
         let delta_handle = inputs
             .first()
             .cloned()
             .context("incremental aggregate operator requires one input delta handle")?;
 
+        let load_delta_start = Instant::now();
         let delta_values =
             delta_zset_handle_batch::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for incremental aggregate")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "load_delta",
+            load_delta_start.elapsed().as_millis() as u64,
+        );
+
+        let apply_values_start = Instant::now();
         let output_deltas = self.apply_delta_values(delta_values.as_ref()).await?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "apply_delta_values",
+            apply_values_start.elapsed().as_millis() as u64,
+        );
         if output_deltas.is_empty() {
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "on_step_total",
+                step_start.elapsed().as_millis() as u64,
+            );
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
+        let persist_output_start = Instant::now();
         let delta_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist incremental aggregate output delta")?;
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "persist_output",
+            persist_output_start.elapsed().as_millis() as u64,
+        );
         publish_transient_zset_batch(
             &delta_handle,
             Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
+        );
+        metrics::observe_operator_phase_latency_ms(
+            "incremental_aggregate",
+            "step",
+            "on_step_total",
+            step_start.elapsed().as_millis() as u64,
         );
         Ok(Some(delta_handle))
     }
