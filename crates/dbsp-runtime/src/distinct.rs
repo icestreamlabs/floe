@@ -98,6 +98,10 @@ impl DbspDistinct {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = distinct_op.lock().await;
+            op_guard.state.enable_live_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 

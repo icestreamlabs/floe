@@ -52,6 +52,18 @@ where
         self.latest_handle = handle;
     }
 
+    pub fn enable_live_replayable(&mut self) {
+        self.integrated.enable_replayable_persistence();
+    }
+
+    pub fn base_version_for_update(&self) -> Option<u64> {
+        if self.integrated.uses_replayable_persistence() {
+            None
+        } else {
+            self.integrated.current_handle().map(|handle| handle.version)
+        }
+    }
+
     pub fn dictionary(&self) -> Arc<Dictionary<K>> {
         self.integrated.dictionary()
     }
@@ -168,5 +180,37 @@ mod tests {
             !manifest_keys.is_empty(),
             "versioned stream state should stay on KV manifest prefixes"
         );
+    }
+
+    #[tokio::test]
+    async fn replayable_state_uses_no_base_version_for_updates() {
+        let table = build_table("relation-state-replayable-base").await;
+        let mut state = RelationState::<i64>::empty(
+            table,
+            "relation-state-replayable-base".to_string(),
+        )
+        .await
+        .expect("create relation state");
+        assert_eq!(state.base_version_for_update(), None);
+
+        let key_id = state
+            .dictionary()
+            .intern(&7)
+            .await
+            .expect("intern state key");
+        let version = state
+            .integrated
+            .create_version(vec![SegmentRecord {
+                id: 0,
+                bucket: 0,
+                deltas: vec![(key_id, 1)],
+            }])
+            .await
+            .expect("create version");
+        state.update_handle(state.integrated.handle_for_version(version));
+        assert_eq!(state.base_version_for_update(), Some(version));
+
+        state.enable_live_replayable();
+        assert_eq!(state.base_version_for_update(), None);
     }
 }

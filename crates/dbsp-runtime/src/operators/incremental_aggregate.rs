@@ -938,11 +938,7 @@ where
             return Ok(HashMap::new());
         }
 
-        let base_version = self
-            .state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
+        let base_version = self.state.base_version_for_update();
         let persist_integrated_start = Instant::now();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
             &mut self.state.integrated,

@@ -405,11 +405,7 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let base_version = self
-            .state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
+        let base_version = self.state.base_version_for_update();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
             &mut self.state.integrated,
             &updates,
@@ -539,6 +535,10 @@ impl DbspWindowCountStarAggregate {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = window_op.lock().await;
+            op_guard.state.enable_live_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {

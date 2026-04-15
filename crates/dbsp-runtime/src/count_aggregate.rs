@@ -187,6 +187,10 @@ impl DbspCountAggregate {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = count_aggregate_op.lock().await;
+            op_guard.state.enable_live_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
