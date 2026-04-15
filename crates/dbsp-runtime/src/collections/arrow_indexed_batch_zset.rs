@@ -30,6 +30,7 @@ const SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 128;
 
 type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 type ValueWeightMap = FastMap<Vec<u8>, i64>;
+type TypedValueWeightMap<T> = FastMap<T, i64>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexedStatePersistence {
@@ -84,8 +85,8 @@ where
     segment_sequence_lock: AsyncMutex<()>,
     lookup_cache_shards: Vec<Mutex<FastMap<Vec<u8>, ValueWeightMap>>>,
     segment_cache_shards: Vec<Mutex<FastMap<u64, Arc<CachedSegment>>>>,
-    overlay_by_key: Mutex<FastMap<Vec<u8>, ValueWeightMap>>,
-    overlay_by_value: Mutex<FastMap<Vec<u8>, FastMap<Vec<u8>, i64>>>,
+    overlay_by_key: Mutex<FastMap<K, TypedValueWeightMap<V>>>,
+    overlay_by_value: Mutex<FastMap<V, TypedValueWeightMap<K>>>,
     persistence: IndexedStatePersistence,
     _marker: PhantomData<(K, V)>,
 }
@@ -530,30 +531,48 @@ where
     }
 
     pub async fn values_for_key(&self, key: &K) -> Result<Vec<(V, i64)>> {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Ok(self
+                .overlay_by_key
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?
+                .get(key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, weight)| *weight != 0)
+                .collect());
+        }
+
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
         if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
             return self.decode_value_weights(cached);
         }
 
-        let mut aggregate = self
-            .load_persisted_value_weights_for_key(&key_bytes)
-            .await?;
-        self.apply_overlay_for_key(&key_bytes, &mut aggregate)?;
+        let aggregate = self.load_persisted_value_weights_for_key(&key_bytes).await?;
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         self.decode_value_weights(aggregate)
     }
 
     pub async fn value_weight_for_key_value(&self, key: &K, value: &V) -> Result<i64> {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Ok(self
+                .overlay_by_key
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?
+                .get(key)
+                .and_then(|values| values.get(value))
+                .copied()
+                .unwrap_or(0));
+        }
+
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
         let value_bytes = encode(value).context("encode Arrow-index lookup value")?;
         if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
             return Ok(cached.get(&value_bytes).copied().unwrap_or(0));
         }
 
-        let mut aggregate = self
-            .load_persisted_value_weights_for_key(&key_bytes)
-            .await?;
-        self.apply_overlay_for_key(&key_bytes, &mut aggregate)?;
+        let aggregate = self.load_persisted_value_weights_for_key(&key_bytes).await?;
         let weight = aggregate.get(&value_bytes).copied().unwrap_or(0);
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         Ok(weight)
@@ -564,9 +583,21 @@ where
             return Err(anyhow!("reverse index not enabled"));
         }
 
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Ok(self
+                .overlay_by_value
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?
+                .get(value)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, weight)| *weight != 0)
+                .collect());
+        }
+
         let value_bytes = encode(value).context("encode Arrow-index reverse lookup value")?;
-        let mut aggregate = self.load_persisted_keys_for_value(&value_bytes).await?;
-        self.apply_overlay_for_value(&value_bytes, &mut aggregate)?;
+        let aggregate = self.load_persisted_keys_for_value(&value_bytes).await?;
 
         let mut keys = Vec::with_capacity(aggregate.len());
         for (key_bytes, weight) in aggregate {
@@ -582,6 +613,28 @@ where
     {
         if !self.range_enabled {
             return Err(anyhow!("range index not enabled"));
+        }
+
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            let overlay_snapshot = self.overlay_snapshot_by_key()?;
+            let lower_bytes = lower.encode_range_key();
+            let upper_bytes = upper.encode_range_key();
+            if lower_bytes >= upper_bytes {
+                return Ok(Vec::new());
+            }
+            let mut output = Vec::new();
+            for (key, overlay_values) in overlay_snapshot {
+                let range_key = key.encode_range_key();
+                if range_key < lower_bytes || range_key >= upper_bytes {
+                    continue;
+                }
+                for (value, weight) in overlay_values {
+                    if weight != 0 {
+                        output.push((key.clone(), value, weight));
+                    }
+                }
+            }
+            return Ok(output);
         }
 
         let lower_bytes = lower.encode_range_key();
@@ -663,50 +716,23 @@ where
             }
         }
 
-        let overlay_snapshot = self.overlay_snapshot_by_key()?;
-        for (key_bytes, overlay_values) in overlay_snapshot {
-            if overlay_values.is_empty() {
-                continue;
-            }
-            let key = decode::<K>(&key_bytes)
-                .context("decode Arrow-index overlay key for range lookup")?;
-            let range_key = key.encode_range_key();
-            if range_key < lower_bytes || range_key >= upper_bytes {
-                continue;
-            }
-
-            let mut merged: ValueWeightMap = FastMap::default();
-            for (existing_key, existing_value, existing_weight) in output
-                .iter()
-                .filter(|(existing_key, _, _)| existing_key == &key)
-            {
-                let _ = existing_key;
-                merged.insert(
-                    encode(existing_value).context("encode persisted range lookup value")?,
-                    *existing_weight,
-                );
-            }
-            for (value_bytes, delta) in overlay_values {
-                let next = merged
-                    .get(&value_bytes)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(delta);
-                if next == 0 {
-                    merged.remove(&value_bytes);
-                } else {
-                    merged.insert(value_bytes, next);
-                }
-            }
-            output.retain(|(existing_key, _, _)| existing_key != &key);
-            for (value, weight) in self.decode_value_weights(merged)? {
-                output.push((key.clone(), value, weight));
-            }
-        }
         Ok(output)
     }
 
     pub async fn entries(&self) -> Result<Vec<(K, V, i64)>> {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            let overlay_snapshot = self.overlay_snapshot_by_key()?;
+            let mut out = Vec::new();
+            for (key, overlay_values) in overlay_snapshot {
+                for (value, weight) in overlay_values {
+                    if weight != 0 {
+                        out.push((key.clone(), value, weight));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         let segment_ids = self
             .segment_store
             .list_segment_ids()
@@ -760,21 +786,6 @@ where
         }
 
         let mut out = Vec::with_capacity(aggregate.len());
-        let overlay_snapshot = self.overlay_snapshot_by_key()?;
-        for (key_bytes, overlay_values) in overlay_snapshot {
-            for (value_bytes, delta) in overlay_values {
-                let next = aggregate
-                    .get(&(key_bytes.clone(), value_bytes.clone()))
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(delta);
-                if next == 0 {
-                    aggregate.remove(&(key_bytes.clone(), value_bytes));
-                } else {
-                    aggregate.insert((key_bytes.clone(), value_bytes), next);
-                }
-            }
-        }
         for ((key_bytes, value_bytes), weight) in aggregate {
             let key = decode::<K>(&key_bytes).context("decode key bytes while listing entries")?;
             let value =
@@ -1094,7 +1105,7 @@ where
         I: IntoIterator<Item = (K, V, i64)>,
     {
         let mut metrics = ApplyDeltaMetrics::default();
-        let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
+        let mut touched_updates: FastMap<K, TypedValueWeightMap<V>> = FastMap::default();
 
         for (key, value, delta) in deltas {
             metrics.input_records = metrics.input_records.saturating_add(1);
@@ -1103,10 +1114,8 @@ where
             }
             metrics.non_zero_input_records = metrics.non_zero_input_records.saturating_add(1);
 
-            let key_bytes = encode(&key).context("encode Arrow-index replayable key")?;
-            let value_bytes = encode(&value).context("encode Arrow-index replayable value")?;
-            let key_updates = touched_updates.entry(key_bytes).or_default();
-            *key_updates.entry(value_bytes).or_insert(0) += delta;
+            let key_updates = touched_updates.entry(key).or_default();
+            *key_updates.entry(value).or_insert(0) += delta;
         }
 
         for updates in touched_updates.values_mut() {
@@ -1118,33 +1127,32 @@ where
         }
 
         self.apply_overlay_updates(&touched_updates)?;
-        self.apply_lookup_cache_updates(&touched_updates)?;
         metrics.coalesced_records = metrics.non_zero_input_records;
         Ok(metrics)
     }
 
-    fn apply_overlay_updates(&self, updates: &FastMap<Vec<u8>, ValueWeightMap>) -> Result<()> {
+    fn apply_overlay_updates(&self, updates: &FastMap<K, TypedValueWeightMap<V>>) -> Result<()> {
         {
             let mut guard = self
                 .overlay_by_key
                 .lock()
                 .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?;
-            for (key_bytes, key_updates) in updates {
-                let state = guard.entry(key_bytes.clone()).or_default();
-                for (value_bytes, delta) in key_updates {
+            for (key, key_updates) in updates {
+                let state = guard.entry(key.clone()).or_default();
+                for (value, delta) in key_updates {
                     let next = state
-                        .get(value_bytes)
+                        .get(value)
                         .copied()
                         .unwrap_or(0)
                         .saturating_add(*delta);
                     if next == 0 {
-                        state.remove(value_bytes);
+                        state.remove(value);
                     } else {
-                        state.insert(value_bytes.clone(), next);
+                        state.insert(value.clone(), next);
                     }
                 }
                 if state.is_empty() {
-                    guard.remove(key_bytes);
+                    guard.remove(key);
                 }
             }
         }
@@ -1154,21 +1162,21 @@ where
                 .overlay_by_value
                 .lock()
                 .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?;
-            for (key_bytes, key_updates) in updates {
-                for (value_bytes, delta) in key_updates {
-                    let state = guard.entry(value_bytes.clone()).or_default();
+            for (key, key_updates) in updates {
+                for (value, delta) in key_updates {
+                    let state = guard.entry(value.clone()).or_default();
                     let next = state
-                        .get(key_bytes)
+                        .get(key)
                         .copied()
                         .unwrap_or(0)
                         .saturating_add(*delta);
                     if next == 0 {
-                        state.remove(key_bytes);
+                        state.remove(key);
                     } else {
-                        state.insert(key_bytes.clone(), next);
+                        state.insert(key.clone(), next);
                     }
                     if state.is_empty() {
-                        guard.remove(value_bytes);
+                        guard.remove(value);
                     }
                 }
             }
@@ -1177,61 +1185,7 @@ where
         Ok(())
     }
 
-    fn apply_overlay_for_key(
-        &self,
-        key_bytes: &[u8],
-        aggregate: &mut ValueWeightMap,
-    ) -> Result<()> {
-        let guard = self
-            .overlay_by_key
-            .lock()
-            .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?;
-        let Some(overlay) = guard.get(key_bytes) else {
-            return Ok(());
-        };
-        for (value_bytes, delta) in overlay {
-            let next = aggregate
-                .get(value_bytes)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(*delta);
-            if next == 0 {
-                aggregate.remove(value_bytes);
-            } else {
-                aggregate.insert(value_bytes.clone(), next);
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_overlay_for_value(
-        &self,
-        value_bytes: &[u8],
-        aggregate: &mut FastMap<Vec<u8>, i64>,
-    ) -> Result<()> {
-        let guard = self
-            .overlay_by_value
-            .lock()
-            .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?;
-        let Some(overlay) = guard.get(value_bytes) else {
-            return Ok(());
-        };
-        for (key_bytes, delta) in overlay {
-            let next = aggregate
-                .get(key_bytes)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(*delta);
-            if next == 0 {
-                aggregate.remove(key_bytes);
-            } else {
-                aggregate.insert(key_bytes.clone(), next);
-            }
-        }
-        Ok(())
-    }
-
-    fn overlay_snapshot_by_key(&self) -> Result<FastMap<Vec<u8>, ValueWeightMap>> {
+    fn overlay_snapshot_by_key(&self) -> Result<FastMap<K, TypedValueWeightMap<V>>> {
         self.overlay_by_key
             .lock()
             .map(|guard| guard.clone())
