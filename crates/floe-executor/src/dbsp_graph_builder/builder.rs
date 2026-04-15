@@ -683,6 +683,7 @@ impl DbspGraphBuilder {
                     self.graph_id(),
                     topn,
                     receiver,
+                    false,
                     cancel,
                     task_events,
                 ),
@@ -1407,9 +1408,8 @@ struct TransientTopNProcessor {
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
     offset: usize,
-    row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
-    input_weights: HashMap<Vec<u8>, i64>,
-    order_index: BTreeMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
+    row_key_cache: Option<HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>>,
+    order_index: BTreeMap<Vec<u8>, BTreeMap<TransientTopNKey, i64>>,
     partition_output_cache: BTreeMap<Vec<u8>, HashMap<Vec<u8>, i64>>,
     profile_enabled: bool,
     profiled_batches: usize,
@@ -1431,6 +1431,7 @@ impl TransientTopNProcessor {
         graph_id: impl Into<String>,
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
+        append_only_input: bool,
     ) -> Self {
         let order_specs = Arc::new(
             topn.order_by()
@@ -1449,8 +1450,7 @@ impl TransientTopNProcessor {
             order_specs,
             limit: topn.limit(),
             offset: topn.offset(),
-            row_key_cache: HashMap::new(),
-            input_weights: HashMap::new(),
+            row_key_cache: (!append_only_input).then(HashMap::new),
             order_index: BTreeMap::new(),
             partition_output_cache: BTreeMap::new(),
             profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
@@ -1481,22 +1481,16 @@ impl TransientTopNProcessor {
             affected_partitions.insert(partition_key.clone());
 
             let mutation_start = profile_this_batch.then(Instant::now);
-            let previous_weight = self.input_weights.get(&row_key).copied().unwrap_or(0);
+            let partition_index = self.order_index.entry(partition_key.clone()).or_default();
+            let previous_weight = partition_index.get(&order_key).copied().unwrap_or(0);
             let next_weight = previous_weight.saturating_add(diff);
             if next_weight <= 0 {
-                self.input_weights.remove(&row_key);
-            } else {
-                self.input_weights.insert(row_key.clone(), next_weight);
-            }
-
-            let partition_index = self.order_index.entry(partition_key.clone()).or_default();
-            if next_weight <= 0 {
-                partition_index.remove(&(order_key.clone(), row_key.clone()));
+                partition_index.remove(&order_key);
                 if partition_index.is_empty() {
                     self.order_index.remove(&partition_key);
                 }
             } else {
-                partition_index.insert((order_key, row_key), next_weight);
+                partition_index.insert(order_key, next_weight);
             }
             if let Some(mutation_start) = mutation_start {
                 mutation_us += mutation_start.elapsed().as_micros();
@@ -1565,7 +1559,7 @@ impl TransientTopNProcessor {
 
     fn compute_partition_topn(
         &self,
-        partition_index: &BTreeMap<(TransientTopNKey, Vec<u8>), i64>,
+        partition_index: &BTreeMap<TransientTopNKey, i64>,
     ) -> HashMap<Vec<u8>, i64> {
         if self.limit == 0 {
             return HashMap::new();
@@ -1575,7 +1569,7 @@ impl TransientTopNProcessor {
         let mut remaining_take = self.limit;
         let mut output = HashMap::new();
 
-        for ((_order_key, row_key), weight) in partition_index {
+        for (order_key, weight) in partition_index {
             if remaining_take == 0 {
                 break;
             }
@@ -1595,7 +1589,7 @@ impl TransientTopNProcessor {
             let available = usize::try_from(remaining_weight).unwrap_or(usize::MAX);
             let take = remaining_take.min(available);
             if take > 0 {
-                output.insert(row_key.clone(), take as i64);
+                output.insert(order_key.tie_breaker.clone(), take as i64);
                 remaining_take -= take;
             }
         }
@@ -1604,11 +1598,15 @@ impl TransientTopNProcessor {
     }
 
     fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        if let Some(cached) = self.row_key_cache.get(row_key) {
+        if let Some(cache) = self.row_key_cache.as_ref()
+            && let Some(cached) = cache.get(row_key)
+        {
             return cached.clone();
         }
         let computed = self.compute_key_parts(row_key);
-        self.row_key_cache.insert(row_key.clone(), computed.clone());
+        if let Some(cache) = self.row_key_cache.as_mut() {
+            cache.insert(row_key.clone(), computed.clone());
+        }
         computed
     }
 
@@ -4956,13 +4954,21 @@ fn build_transient_topn_receiver(
         cancel,
         task_events,
     );
-    build_transient_topn_receiver_from_batches(graph_id, topn, upstream_rx, cancel, task_events)
+    build_transient_topn_receiver_from_batches(
+        graph_id,
+        topn,
+        upstream_rx,
+        true,
+        cancel,
+        task_events,
+    )
 }
 
 fn build_transient_topn_receiver_from_batches(
     graph_id: &str,
     topn: &DbspTopNNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    append_only_input: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
@@ -5172,7 +5178,8 @@ fn build_transient_topn_receiver_from_batches(
         return rx;
     }
 
-    let mut processor = TransientTopNProcessor::new(graph_id.clone(), topn, &key_layout);
+    let mut processor =
+        TransientTopNProcessor::new(graph_id.clone(), topn, &key_layout, append_only_input);
     let precompute_evaluator = key_layout.precompute_evaluator.clone();
 
     tokio::spawn(async move {
