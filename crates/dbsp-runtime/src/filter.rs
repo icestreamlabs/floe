@@ -102,6 +102,10 @@ impl DbspFilter {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = filter_op.lock().await;
+            op_guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 

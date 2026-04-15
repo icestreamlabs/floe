@@ -110,6 +110,10 @@ impl DbspMap {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = map_op.lock().await;
+            op_guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 

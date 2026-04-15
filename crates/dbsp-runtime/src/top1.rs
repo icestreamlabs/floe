@@ -75,7 +75,8 @@ impl DbspPartitionedTop1 {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for top1")?;
-        let input_index = IndexedBatchZSet::new(table.clone(), format!("top1_input_{top1_id}"));
+        let input_index =
+            IndexedBatchZSet::new_replayable(table.clone(), format!("top1_input_{top1_id}"));
         let key_extractor = Arc::new(key_extractor);
         let top1_op = Arc::new(AsyncMutex::new(PartitionedTop1Op::new_with_key_extractor(
             input_index,
@@ -112,6 +113,10 @@ impl DbspPartitionedTop1 {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = top1_op.lock().await;
+            op_guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {

@@ -106,6 +106,10 @@ impl DbspFilterMap {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut guard = state.lock().await;
+            guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
@@ -228,6 +232,10 @@ impl DbspFilterMap {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut guard = state.lock().await;
+            guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
@@ -324,6 +332,10 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
@@ -437,6 +449,10 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
@@ -448,8 +464,8 @@ where
         let load_ms = load_start.elapsed().as_millis() as u64;
 
         let transform_start = Instant::now();
-        let projected = (self.transform)(delta_values.as_ref())
-            .context("run filter_map batch transform")?;
+        let projected =
+            (self.transform)(delta_values.as_ref()).context("run filter_map batch transform")?;
         let transform_ms = transform_start.elapsed().as_millis() as u64;
         let output_delta_rows = projected.len();
 
@@ -528,6 +544,20 @@ where
         return Ok(versioned
             .current_handle()
             .unwrap_or_else(|| versioned.handle_for_version(0)));
+    }
+
+    if versioned.uses_replayable_persistence() {
+        let batch = Arc::new(staged);
+        let handle = versioned.publish_replayable_batch(Arc::clone(&batch));
+        tracing::debug!(
+            namespace = %versioned.namespace(),
+            input_rows,
+            staged_rows = batch.len(),
+            stage_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "filter_map apply_deltas_to_versioned breakdown (replayable)"
+        );
+        return Ok(handle);
     }
 
     let split_start = Instant::now();

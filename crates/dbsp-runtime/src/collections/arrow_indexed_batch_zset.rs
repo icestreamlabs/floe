@@ -31,6 +31,12 @@ const SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 128;
 type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 type ValueWeightMap = FastMap<Vec<u8>, i64>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedStatePersistence {
+    Immediate,
+    Replayable,
+}
+
 struct CachedSegment {
     values: Vec<Vec<u8>>,
 }
@@ -78,6 +84,9 @@ where
     segment_sequence_lock: AsyncMutex<()>,
     lookup_cache_shards: Vec<Mutex<FastMap<Vec<u8>, ValueWeightMap>>>,
     segment_cache_shards: Vec<Mutex<FastMap<u64, Arc<CachedSegment>>>>,
+    overlay_by_key: Mutex<FastMap<Vec<u8>, ValueWeightMap>>,
+    overlay_by_value: Mutex<FastMap<Vec<u8>, FastMap<Vec<u8>, i64>>>,
+    persistence: IndexedStatePersistence,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -103,15 +112,69 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub fn new(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(table, namespace.into(), false, false)
+        Self::build(
+            table,
+            namespace.into(),
+            false,
+            false,
+            IndexedStatePersistence::Immediate,
+        )
+    }
+
+    pub fn new_replayable(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
+        Self::build(
+            table,
+            namespace.into(),
+            false,
+            false,
+            IndexedStatePersistence::Replayable,
+        )
     }
 
     pub fn with_reverse_index(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(table, namespace.into(), true, false)
+        Self::build(
+            table,
+            namespace.into(),
+            true,
+            false,
+            IndexedStatePersistence::Immediate,
+        )
+    }
+
+    pub fn with_reverse_index_replayable(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self::build(
+            table,
+            namespace.into(),
+            true,
+            false,
+            IndexedStatePersistence::Replayable,
+        )
     }
 
     pub fn with_range_index(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(table, namespace.into(), false, true)
+        Self::build(
+            table,
+            namespace.into(),
+            false,
+            true,
+            IndexedStatePersistence::Immediate,
+        )
+    }
+
+    pub fn with_range_index_replayable(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self::build(
+            table,
+            namespace.into(),
+            false,
+            true,
+            IndexedStatePersistence::Replayable,
+        )
     }
 
     pub fn with_hot_key_compaction_threshold(
@@ -131,6 +194,7 @@ where
         namespace: String,
         reverse_enabled: bool,
         range_enabled: bool,
+        persistence: IndexedStatePersistence,
     ) -> Self {
         let mut base = b"indexed_batch_arrow/".to_vec();
         base.extend_from_slice(namespace.as_bytes());
@@ -174,6 +238,9 @@ where
             segment_sequence_lock: AsyncMutex::new(()),
             lookup_cache_shards: make_mutex_shards(LOOKUP_CACHE_SHARDS),
             segment_cache_shards: make_mutex_shards(SEGMENT_CACHE_SHARDS),
+            overlay_by_key: Mutex::new(FastMap::default()),
+            overlay_by_value: Mutex::new(FastMap::default()),
+            persistence,
             _marker: PhantomData,
         }
     }
@@ -215,6 +282,10 @@ where
     where
         I: IntoIterator<Item = (K, V, i64)>,
     {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return self.apply_replayable_deltas(deltas);
+        }
+
         let mut metrics = ApplyDeltaMetrics::default();
         let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
@@ -330,6 +401,10 @@ where
         K: RangeKey,
         I: IntoIterator<Item = (K, V, i64)>,
     {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return self.apply_replayable_deltas(deltas);
+        }
+
         let mut metrics = ApplyDeltaMetrics::default();
         let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
@@ -460,34 +535,10 @@ where
             return self.decode_value_weights(cached);
         }
 
-        let refs = self.segment_refs_for_key(&key_bytes).await?;
-        let mut aggregate: ValueWeightMap = FastMap::default();
-
-        for (segment_id, postings) in refs {
-            let segment = self
-                .segment_for_id(segment_id)
-                .await
-                .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
-            for (row_index, delta) in postings {
-                let value_bytes = segment
-                    .value_bytes(row_index)
-                    .with_context(|| {
-                        format!("load row {row_index} from Arrow-index segment {segment_id}")
-                    })?
-                    .to_vec();
-                let next = aggregate
-                    .get(&value_bytes)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(delta);
-                if next == 0 {
-                    aggregate.remove(&value_bytes);
-                } else {
-                    aggregate.insert(value_bytes, next);
-                }
-            }
-        }
-
+        let mut aggregate = self
+            .load_persisted_value_weights_for_key(&key_bytes)
+            .await?;
+        self.apply_overlay_for_key(&key_bytes, &mut aggregate)?;
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         self.decode_value_weights(aggregate)
     }
@@ -499,34 +550,10 @@ where
             return Ok(cached.get(&value_bytes).copied().unwrap_or(0));
         }
 
-        let refs = self.segment_refs_for_key(&key_bytes).await?;
-        let mut aggregate: ValueWeightMap = FastMap::default();
-
-        for (segment_id, postings) in refs {
-            let segment = self
-                .segment_for_id(segment_id)
-                .await
-                .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
-            for (row_index, delta) in postings {
-                let value_bytes = segment
-                    .value_bytes(row_index)
-                    .with_context(|| {
-                        format!("load row {row_index} from Arrow-index segment {segment_id}")
-                    })?
-                    .to_vec();
-                let next = aggregate
-                    .get(&value_bytes)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(delta);
-                if next == 0 {
-                    aggregate.remove(&value_bytes);
-                } else {
-                    aggregate.insert(value_bytes, next);
-                }
-            }
-        }
-
+        let mut aggregate = self
+            .load_persisted_value_weights_for_key(&key_bytes)
+            .await?;
+        self.apply_overlay_for_key(&key_bytes, &mut aggregate)?;
         let weight = aggregate.get(&value_bytes).copied().unwrap_or(0);
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         Ok(weight)
@@ -538,23 +565,8 @@ where
         }
 
         let value_bytes = encode(value).context("encode Arrow-index reverse lookup value")?;
-        let refs = self.segment_refs_for_value(&value_bytes).await?;
-        let mut aggregate: FastMap<Vec<u8>, i64> = FastMap::default();
-
-        for key_deltas in refs.into_values() {
-            for (key_bytes, delta) in key_deltas {
-                let next = aggregate
-                    .get(&key_bytes)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(delta);
-                if next == 0 {
-                    aggregate.remove(&key_bytes);
-                } else {
-                    aggregate.insert(key_bytes, next);
-                }
-            }
-        }
+        let mut aggregate = self.load_persisted_keys_for_value(&value_bytes).await?;
+        self.apply_overlay_for_value(&value_bytes, &mut aggregate)?;
 
         let mut keys = Vec::with_capacity(aggregate.len());
         for (key_bytes, weight) in aggregate {
@@ -650,6 +662,47 @@ where
                 output.push((key.clone(), value, weight));
             }
         }
+
+        let overlay_snapshot = self.overlay_snapshot_by_key()?;
+        for (key_bytes, overlay_values) in overlay_snapshot {
+            if overlay_values.is_empty() {
+                continue;
+            }
+            let key = decode::<K>(&key_bytes)
+                .context("decode Arrow-index overlay key for range lookup")?;
+            let range_key = key.encode_range_key();
+            if range_key < lower_bytes || range_key >= upper_bytes {
+                continue;
+            }
+
+            let mut merged: ValueWeightMap = FastMap::default();
+            for (existing_key, existing_value, existing_weight) in output
+                .iter()
+                .filter(|(existing_key, _, _)| existing_key == &key)
+            {
+                let _ = existing_key;
+                merged.insert(
+                    encode(existing_value).context("encode persisted range lookup value")?,
+                    *existing_weight,
+                );
+            }
+            for (value_bytes, delta) in overlay_values {
+                let next = merged
+                    .get(&value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    merged.remove(&value_bytes);
+                } else {
+                    merged.insert(value_bytes, next);
+                }
+            }
+            output.retain(|(existing_key, _, _)| existing_key != &key);
+            for (value, weight) in self.decode_value_weights(merged)? {
+                output.push((key.clone(), value, weight));
+            }
+        }
         Ok(output)
     }
 
@@ -707,6 +760,21 @@ where
         }
 
         let mut out = Vec::with_capacity(aggregate.len());
+        let overlay_snapshot = self.overlay_snapshot_by_key()?;
+        for (key_bytes, overlay_values) in overlay_snapshot {
+            for (value_bytes, delta) in overlay_values {
+                let next = aggregate
+                    .get(&(key_bytes.clone(), value_bytes.clone()))
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&(key_bytes.clone(), value_bytes));
+                } else {
+                    aggregate.insert((key_bytes.clone(), value_bytes), next);
+                }
+            }
+        }
         for ((key_bytes, value_bytes), weight) in aggregate {
             let key = decode::<K>(&key_bytes).context("decode key bytes while listing entries")?;
             let value =
@@ -1019,6 +1087,215 @@ where
             }
         }
         Ok(())
+    }
+
+    fn apply_replayable_deltas<I>(&self, deltas: I) -> Result<ApplyDeltaMetrics>
+    where
+        I: IntoIterator<Item = (K, V, i64)>,
+    {
+        let mut metrics = ApplyDeltaMetrics::default();
+        let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
+
+        for (key, value, delta) in deltas {
+            metrics.input_records = metrics.input_records.saturating_add(1);
+            if delta == 0 {
+                continue;
+            }
+            metrics.non_zero_input_records = metrics.non_zero_input_records.saturating_add(1);
+
+            let key_bytes = encode(&key).context("encode Arrow-index replayable key")?;
+            let value_bytes = encode(&value).context("encode Arrow-index replayable value")?;
+            let key_updates = touched_updates.entry(key_bytes).or_default();
+            *key_updates.entry(value_bytes).or_insert(0) += delta;
+        }
+
+        for updates in touched_updates.values_mut() {
+            updates.retain(|_, weight| *weight != 0);
+        }
+        touched_updates.retain(|_, updates| !updates.is_empty());
+        if touched_updates.is_empty() {
+            return Ok(metrics);
+        }
+
+        self.apply_overlay_updates(&touched_updates)?;
+        self.apply_lookup_cache_updates(&touched_updates)?;
+        metrics.coalesced_records = metrics.non_zero_input_records;
+        Ok(metrics)
+    }
+
+    fn apply_overlay_updates(&self, updates: &FastMap<Vec<u8>, ValueWeightMap>) -> Result<()> {
+        {
+            let mut guard = self
+                .overlay_by_key
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?;
+            for (key_bytes, key_updates) in updates {
+                let state = guard.entry(key_bytes.clone()).or_default();
+                for (value_bytes, delta) in key_updates {
+                    let next = state
+                        .get(value_bytes)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*delta);
+                    if next == 0 {
+                        state.remove(value_bytes);
+                    } else {
+                        state.insert(value_bytes.clone(), next);
+                    }
+                }
+                if state.is_empty() {
+                    guard.remove(key_bytes);
+                }
+            }
+        }
+
+        if self.reverse_enabled {
+            let mut guard = self
+                .overlay_by_value
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?;
+            for (key_bytes, key_updates) in updates {
+                for (value_bytes, delta) in key_updates {
+                    let state = guard.entry(value_bytes.clone()).or_default();
+                    let next = state
+                        .get(key_bytes)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*delta);
+                    if next == 0 {
+                        state.remove(key_bytes);
+                    } else {
+                        state.insert(key_bytes.clone(), next);
+                    }
+                    if state.is_empty() {
+                        guard.remove(value_bytes);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_overlay_for_key(
+        &self,
+        key_bytes: &[u8],
+        aggregate: &mut ValueWeightMap,
+    ) -> Result<()> {
+        let guard = self
+            .overlay_by_key
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?;
+        let Some(overlay) = guard.get(key_bytes) else {
+            return Ok(());
+        };
+        for (value_bytes, delta) in overlay {
+            let next = aggregate
+                .get(value_bytes)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(*delta);
+            if next == 0 {
+                aggregate.remove(value_bytes);
+            } else {
+                aggregate.insert(value_bytes.clone(), next);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_overlay_for_value(
+        &self,
+        value_bytes: &[u8],
+        aggregate: &mut FastMap<Vec<u8>, i64>,
+    ) -> Result<()> {
+        let guard = self
+            .overlay_by_value
+            .lock()
+            .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?;
+        let Some(overlay) = guard.get(value_bytes) else {
+            return Ok(());
+        };
+        for (key_bytes, delta) in overlay {
+            let next = aggregate
+                .get(key_bytes)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(*delta);
+            if next == 0 {
+                aggregate.remove(key_bytes);
+            } else {
+                aggregate.insert(key_bytes.clone(), next);
+            }
+        }
+        Ok(())
+    }
+
+    fn overlay_snapshot_by_key(&self) -> Result<FastMap<Vec<u8>, ValueWeightMap>> {
+        self.overlay_by_key
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))
+    }
+
+    async fn load_persisted_value_weights_for_key(
+        &self,
+        key_bytes: &[u8],
+    ) -> Result<ValueWeightMap> {
+        let refs = self.segment_refs_for_key(key_bytes).await?;
+        let mut aggregate: ValueWeightMap = FastMap::default();
+
+        for (segment_id, postings) in refs {
+            let segment = self
+                .segment_for_id(segment_id)
+                .await
+                .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
+            for (row_index, delta) in postings {
+                let value_bytes = segment
+                    .value_bytes(row_index)
+                    .with_context(|| {
+                        format!("load row {row_index} from Arrow-index segment {segment_id}")
+                    })?
+                    .to_vec();
+                let next = aggregate
+                    .get(&value_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&value_bytes);
+                } else {
+                    aggregate.insert(value_bytes, next);
+                }
+            }
+        }
+
+        Ok(aggregate)
+    }
+
+    async fn load_persisted_keys_for_value(
+        &self,
+        value_bytes: &[u8],
+    ) -> Result<FastMap<Vec<u8>, i64>> {
+        let refs = self.segment_refs_for_value(value_bytes).await?;
+        let mut aggregate: FastMap<Vec<u8>, i64> = FastMap::default();
+
+        for key_deltas in refs.into_values() {
+            for (key_bytes, delta) in key_deltas {
+                let next = aggregate
+                    .get(&key_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(delta);
+                if next == 0 {
+                    aggregate.remove(&key_bytes);
+                } else {
+                    aggregate.insert(key_bytes, next);
+                }
+            }
+        }
+
+        Ok(aggregate)
     }
 
     async fn segment_for_id(&self, segment_id: u64) -> Result<Arc<CachedSegment>> {

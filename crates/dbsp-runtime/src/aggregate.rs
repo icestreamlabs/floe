@@ -87,7 +87,10 @@ impl DbspAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for aggregate")?;
-        let index = IndexedBatchZSet::new(table.clone(), format!("aggregate_index_{aggregate_id}"));
+        let index = IndexedBatchZSet::new_replayable(
+            table.clone(),
+            format!("aggregate_index_{aggregate_id}"),
+        );
 
         let aggregate_op = Arc::new(AsyncMutex::new(AggregateOp::new(
             state,

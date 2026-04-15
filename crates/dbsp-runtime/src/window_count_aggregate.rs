@@ -332,7 +332,7 @@ impl DbspWindowCountAggregate {
             .iter()
             .any(|kind| matches!(kind, CountAggregateSlotKind::Distinct))
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::new_replayable(
                     table.clone(),
                     format!("window_count_aggregate_distinct_{aggregate_id}"),
                 )

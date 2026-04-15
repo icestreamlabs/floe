@@ -12,6 +12,7 @@ use crate::collections::zset::VersionedZSet;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::util::transient_zset_batch;
 
 /// Lightweight reference to a materialized version of a versioned ZSet.
 ///
@@ -91,6 +92,27 @@ where
     }
 
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
+        let handle = ZSetHandle {
+            ns: self.namespace.clone(),
+            version: self.version,
+        };
+        if let Some(batch) = transient_zset_batch::<K>(&handle) {
+            let mut materialized: HashMap<K, i64> = HashMap::with_capacity(batch.len());
+            for (key, delta) in batch.as_ref() {
+                let next = materialized
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*delta);
+                if next == 0 {
+                    materialized.remove(key);
+                } else {
+                    materialized.insert(key.clone(), next);
+                }
+            }
+            return Ok(materialized);
+        }
+
         let span = tracing::debug_span!(
             "materialize",
             namespace = %self.namespace,
@@ -108,6 +130,14 @@ where
     }
 
     pub async fn delta_iter(&self) -> Result<Vec<(K, i64)>> {
+        let handle = ZSetHandle {
+            ns: self.namespace.clone(),
+            version: self.version,
+        };
+        if let Some(batch) = transient_zset_batch::<K>(&handle) {
+            return Ok(batch.as_ref().clone());
+        }
+
         let span = tracing::debug_span!(
             "delta_iter",
             namespace = %self.namespace,

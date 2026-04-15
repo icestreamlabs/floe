@@ -276,6 +276,10 @@ where
         }
     }
 
+    pub fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     fn has_extrema(&self) -> bool {
         self.slot_kinds.iter().any(|kind| {
             matches!(
@@ -376,6 +380,20 @@ where
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            let batch = Arc::new(
+                keyed_deltas
+                    .iter()
+                    .map(|(key, delta)| ((*key).clone(), *delta))
+                    .collect(),
+            );
+            return Ok(versioned.publish_replayable_batch(batch));
         }
 
         let persist_start = std::time::Instant::now();

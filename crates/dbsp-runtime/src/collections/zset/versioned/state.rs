@@ -12,7 +12,10 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::super::ZSET_PREFIX;
-use super::{CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, ZSetVersionManifest};
+use super::{
+    CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, VersionedZSetPersistence,
+    ZSetVersionManifest,
+};
 
 impl CompactionPolicy {
     pub const fn disabled() -> Self {
@@ -87,6 +90,16 @@ where
         table: Arc<dyn KeyValueTable>,
         namespace: impl Into<String>,
     ) -> Result<Self> {
+        Self::new_with_persistence(dict, table, namespace, VersionedZSetPersistence::Immediate)
+            .await
+    }
+
+    pub async fn new_with_persistence(
+        dict: Arc<Dictionary<K>>,
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        persistence: VersionedZSetPersistence,
+    ) -> Result<Self> {
         let namespace = namespace.into();
         let mut manifest_prefix = ZSET_PREFIX.as_bytes().to_vec();
         manifest_prefix.extend_from_slice(namespace.as_bytes());
@@ -106,9 +119,11 @@ where
             manifest_prefix,
             segment_prefix,
             current_version: 0,
+            persisted_version: 0,
             intent_key,
             manifest: None,
             next_segment_id: 1,
+            persistence,
         };
 
         versioned.refresh_state().await?;
@@ -168,6 +183,26 @@ where
         }
     }
 
+    pub fn persisted_handle(&self) -> Option<ZSetHandle> {
+        if self.persisted_version == 0 {
+            None
+        } else {
+            Some(self.handle_for_version(self.persisted_version))
+        }
+    }
+
+    pub fn persistence(&self) -> VersionedZSetPersistence {
+        self.persistence
+    }
+
+    pub fn enable_replayable_persistence(&mut self) {
+        self.persistence = VersionedZSetPersistence::Replayable;
+    }
+
+    pub fn uses_replayable_persistence(&self) -> bool {
+        matches!(self.persistence, VersionedZSetPersistence::Replayable)
+    }
+
     #[cfg(test)]
     pub(crate) fn manifest_prefix_bytes(&self) -> &[u8] {
         &self.manifest_prefix
@@ -191,6 +226,7 @@ where
     pub(crate) async fn adopt_persisted_version(&mut self, version: u64) -> Result<()> {
         if version == 0 {
             self.current_version = 0;
+            self.persisted_version = 0;
             self.manifest = None;
             return Ok(());
         }
@@ -204,6 +240,7 @@ where
             .map(|id| id.saturating_add(1))
             .unwrap_or(1);
         self.current_version = version;
+        self.persisted_version = version;
         self.next_segment_id = self.next_segment_id.max(next_segment_id);
         self.manifest = Some(manifest);
         Ok(())

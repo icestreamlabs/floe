@@ -50,6 +50,68 @@ async fn arrow_indexed_cache_stays_consistent_across_updates() {
 }
 
 #[tokio::test]
+async fn arrow_indexed_replayable_reads_overlay_without_persisting() {
+    let table = build_table("arrow-indexed-replayable").await;
+    let namespace = "arrow_indexed_replayable";
+    let index = IndexedBatchZSet::<i64, i64>::new_replayable(table.clone(), namespace);
+    index
+        .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (2, 20, 2)])
+        .await
+        .expect("apply replayable deltas");
+
+    let mut values = index.values_for_key(&1).await.expect("overlay lookup");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1), (11, 1)]);
+
+    let reopened = IndexedBatchZSet::<i64, i64>::new(table, namespace);
+    let persisted = reopened
+        .values_for_key(&1)
+        .await
+        .expect("persisted lookup should ignore replayable overlay");
+    assert!(persisted.is_empty());
+}
+
+#[tokio::test]
+async fn arrow_indexed_replayable_reverse_lookup_reads_overlay() {
+    let table = build_table("arrow-indexed-replayable-reverse").await;
+    let index = IndexedBatchZSet::<i64, i64>::with_reverse_index_replayable(
+        table,
+        "arrow_indexed_replayable_reverse",
+    );
+    index
+        .apply_deltas(vec![(1, 10, 1), (2, 10, 2), (1, 10, -1)])
+        .await
+        .expect("apply replayable reverse deltas");
+
+    let mut keys = index
+        .keys_for_value(&10)
+        .await
+        .expect("overlay reverse lookup");
+    keys.sort_unstable();
+    assert_eq!(keys, vec![(2, 2)]);
+}
+
+#[tokio::test]
+async fn arrow_indexed_replayable_range_lookup_reads_overlay() {
+    let table = build_table("arrow-indexed-replayable-range").await;
+    let index = IndexedBatchZSet::<i64, i64>::with_range_index_replayable(
+        table,
+        "arrow_indexed_replayable_range",
+    );
+    index
+        .apply_deltas_with_range(vec![(1, 10, 1), (2, 20, 2), (3, 30, 3)])
+        .await
+        .expect("apply replayable range deltas");
+
+    let mut rows = index
+        .values_for_key_range(&2, &4)
+        .await
+        .expect("overlay range lookup");
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(2, 20, 2), (3, 30, 3)]);
+}
+
+#[tokio::test]
 async fn arrow_indexed_reopen_preserves_persisted_state() {
     let table = build_table("arrow-indexed-reopen").await;
     let namespace = "arrow_indexed_reopen";

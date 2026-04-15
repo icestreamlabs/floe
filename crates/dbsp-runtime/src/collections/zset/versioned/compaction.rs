@@ -28,7 +28,7 @@ where
     where
         K: Clone,
     {
-        let previous_version = self.current_version;
+        let previous_version = self.persisted_version;
         let new_version = self
             .compact_current_detached()
             .await
@@ -47,14 +47,14 @@ where
     where
         K: Clone,
     {
-        if self.current_version == 0 {
+        if self.persisted_version == 0 {
             return Err(anyhow!("cannot compact empty version"));
         }
 
         let mut manifests = Vec::new();
-        let mut cursor = Some(self.current_version);
+        let mut cursor = Some(self.persisted_version);
         while let Some(version) = cursor {
-            let manifest = if version == self.current_version {
+            let manifest = if version == self.persisted_version {
                 self.manifest
                     .clone()
                     .ok_or_else(|| anyhow!("missing current manifest for compaction"))?

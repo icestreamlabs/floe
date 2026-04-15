@@ -87,6 +87,10 @@ where
         }
     }
 
+    pub fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     async fn apply_deltas_to_versioned(
         versioned: &mut VersionedZSet<K>,
         deltas: &HashMap<K, i64>,
@@ -103,6 +107,20 @@ where
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            let batch = Arc::new(
+                staged
+                    .iter()
+                    .map(|(key, delta)| ((*key).clone(), *delta))
+                    .collect(),
+            );
+            return Ok(versioned.publish_replayable_batch(batch));
         }
 
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();

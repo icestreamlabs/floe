@@ -102,6 +102,10 @@ where
         }
     }
 
+    pub fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     fn keys_for(&mut self, key: &K) -> (Option<P>, Option<O>) {
         if let Some(cached) = self.row_key_cache.get(key) {
             return cached.clone();
@@ -146,7 +150,8 @@ where
         } else {
             self.partition_output_cache.remove(partition_key);
         }
-        self.partition_order_index.insert(partition_key.clone(), index);
+        self.partition_order_index
+            .insert(partition_key.clone(), index);
         Ok(())
     }
 
@@ -225,6 +230,20 @@ where
                 return Ok(handle);
             }
             return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            let batch = Arc::new(
+                deltas
+                    .iter()
+                    .filter_map(|(key, delta)| (*delta != 0).then_some((key.clone(), *delta)))
+                    .collect(),
+            );
+            return Ok(versioned.publish_replayable_batch(batch));
         }
 
         let persist_start = std::time::Instant::now();

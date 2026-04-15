@@ -16,8 +16,10 @@ use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::handles::ZSetHandle;
 use crate::storage::dictionary::KeyIntern;
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::stream::util::{publish_transient_zset_batch, transient_zset_batch};
 
 use super::super::prefix_bounds;
 use super::{
@@ -39,7 +41,7 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub async fn create_version(&mut self, segments: Vec<SegmentRecord>) -> Result<u64> {
-        let base = self.manifest.as_ref().map(|_| self.current_version);
+        let base = self.manifest.as_ref().map(|_| self.persisted_version);
         self.create_version_with_base(segments, base).await
     }
 
@@ -137,11 +139,20 @@ where
 
     pub(crate) fn apply_version_plan(&mut self, plan: &VersionWritePlan) {
         self.current_version = plan.version;
+        self.persisted_version = plan.version;
         self.manifest = Some(plan.manifest.clone());
     }
 
+    pub fn publish_replayable_batch(&mut self, deltas: Arc<Vec<(K, i64)>>) -> ZSetHandle {
+        let version = self.current_version.saturating_add(1);
+        self.current_version = version;
+        let handle = self.handle_for_version(version);
+        publish_transient_zset_batch(&handle, deltas);
+        handle
+    }
+
     pub async fn chain_stats(&self) -> Result<VersionChainStats> {
-        if self.current_version == 0 {
+        if self.persisted_version == 0 {
             return Ok(VersionChainStats::default());
         }
 
@@ -173,6 +184,27 @@ where
     }
 
     pub async fn materialize(&self) -> Result<HashMap<K, i64>> {
+        if self.current_version != 0
+            && self.current_version != self.persisted_version
+            && let Some(batch) =
+                transient_zset_batch::<K>(&self.handle_for_version(self.current_version))
+        {
+            let mut aggregate: HashMap<K, i64> = HashMap::with_capacity(batch.len());
+            for (key, delta) in batch.as_ref() {
+                let next = aggregate
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*delta);
+                if next == 0 {
+                    aggregate.remove(key);
+                } else {
+                    aggregate.insert(key.clone(), next);
+                }
+            }
+            return Ok(aggregate);
+        }
+
         let span = tracing::debug_span!(
             "materialize",
             namespace = %self.namespace,
@@ -257,6 +289,13 @@ where
     pub async fn delta_iter_with_dict(&self, version: u64) -> Result<Vec<(K, i64)>> {
         if version == 0 {
             return Ok(Vec::new());
+        }
+
+        if version == self.current_version
+            && version != self.persisted_version
+            && let Some(batch) = transient_zset_batch::<K>(&self.handle_for_version(version))
+        {
+            return Ok(batch.as_ref().clone());
         }
 
         let total_start = Instant::now();
@@ -350,6 +389,25 @@ where
     pub async fn load_existing_version(&self, version: u64) -> Result<HashMap<K, i64>> {
         if version == 0 {
             return Ok(HashMap::new());
+        }
+        if version == self.current_version
+            && version != self.persisted_version
+            && let Some(batch) = transient_zset_batch::<K>(&self.handle_for_version(version))
+        {
+            let mut aggregate: HashMap<K, i64> = HashMap::with_capacity(batch.len());
+            for (key, delta) in batch.as_ref() {
+                let next = aggregate
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*delta);
+                if next == 0 {
+                    aggregate.remove(key);
+                } else {
+                    aggregate.insert(key.clone(), next);
+                }
+            }
+            return Ok(aggregate);
         }
         self.load_version_chain(version).await
     }
@@ -458,6 +516,7 @@ where
         }
 
         self.current_version = max_version;
+        self.persisted_version = max_version;
         self.manifest = current;
         self.next_segment_id = max_segment_id.saturating_add(1).max(1);
         Ok(())

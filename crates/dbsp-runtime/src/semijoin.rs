@@ -90,11 +90,11 @@ impl DbspSemiJoin {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for semijoin")?;
-        let left_index = crate::collections::IndexedBatchZSet::new(
+        let left_index = crate::collections::IndexedBatchZSet::new_replayable(
             table.clone(),
             format!("semijoin_left_index_{semijoin_id}"),
         );
-        let right_index = crate::collections::IndexedBatchZSet::new(
+        let right_index = crate::collections::IndexedBatchZSet::new_replayable(
             table.clone(),
             format!("semijoin_right_index_{semijoin_id}"),
         );

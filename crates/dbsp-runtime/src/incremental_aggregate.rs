@@ -118,7 +118,7 @@ impl DbspIncrementalAggregate {
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::new_replayable(
                     table.clone(),
                     format!("incremental_aggregate_distinct_{aggregate_id}"),
                 )
@@ -132,7 +132,7 @@ impl DbspIncrementalAggregate {
                 )
             })
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::new_replayable(
                     table.clone(),
                     format!("incremental_aggregate_index_{aggregate_id}"),
                 )
@@ -176,6 +176,10 @@ impl DbspIncrementalAggregate {
         )
         .await?;
         stream.flush().await?;
+        {
+            let mut op_guard = aggregate_op.lock().await;
+            op_guard.enable_live_output_replayable();
+        }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
@@ -283,7 +287,7 @@ where
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::new_replayable(
                     table.clone(),
                     format!("transient_incremental_aggregate_distinct_{aggregate_id}"),
                 )
@@ -297,7 +301,7 @@ where
                 )
             })
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::new_replayable(
                     table.clone(),
                     format!("transient_incremental_aggregate_index_{aggregate_id}"),
                 )
