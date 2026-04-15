@@ -54,6 +54,7 @@ where
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     partition_output_cache: BTreeMap<P, K>,
+    partition_order_index: BTreeMap<P, BTreeMap<(O, K), i64>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
     key_parts: KeyPartsFn<K, P, O>,
 }
@@ -94,6 +95,7 @@ where
             output,
             dict_cache: HashMap::new(),
             partition_output_cache: BTreeMap::new(),
+            partition_order_index: BTreeMap::new(),
             row_key_cache: HashMap::new(),
             key_parts,
         }
@@ -108,13 +110,16 @@ where
         computed
     }
 
-    async fn recompute_partition_top1(&mut self, partition_key: &P) -> Result<Option<K>> {
+    async fn ensure_partition_cache(&mut self, partition_key: &P) -> Result<()> {
+        if self.partition_order_index.contains_key(partition_key) {
+            return Ok(());
+        }
         let values = self
             .input_index
             .values_for_key(partition_key)
             .await
             .context("load top1 partition values")?;
-        let mut best: Option<(O, K)> = None;
+        let mut index: BTreeMap<(O, K), i64> = BTreeMap::new();
         for (row, weight) in values {
             if weight <= 0 {
                 continue;
@@ -122,14 +127,56 @@ where
             let (_, Some(order_key)) = self.keys_for(&row) else {
                 continue;
             };
-            match &best {
-                Some((best_order, best_row))
-                    if (order_key.clone(), row.clone())
-                        >= (best_order.clone(), best_row.clone()) => {}
-                _ => best = Some((order_key, row)),
+            let index_key = (order_key, row);
+            let next_weight = index
+                .get(&index_key)
+                .copied()
+                .unwrap_or(0_i64)
+                .saturating_add(weight);
+            if next_weight <= 0 {
+                index.remove(&index_key);
+            } else {
+                index.insert(index_key, next_weight);
             }
         }
-        Ok(best.map(|(_, row)| row))
+        if let Some((_, row)) = index.keys().next() {
+            self.partition_output_cache
+                .insert(partition_key.clone(), row.clone());
+        } else {
+            self.partition_output_cache.remove(partition_key);
+        }
+        self.partition_order_index.insert(partition_key.clone(), index);
+        Ok(())
+    }
+
+    fn apply_partition_delta(&mut self, partition_key: &P, row: &K, diff_weight: i64) {
+        if diff_weight == 0 {
+            return;
+        }
+        let (_, Some(order_key)) = self.keys_for(row) else {
+            return;
+        };
+        let partition_index = self
+            .partition_order_index
+            .entry(partition_key.clone())
+            .or_default();
+        let index_key = (order_key, row.clone());
+        let next_weight = partition_index
+            .get(&index_key)
+            .copied()
+            .unwrap_or(0_i64)
+            .saturating_add(diff_weight);
+        if next_weight <= 0 {
+            partition_index.remove(&index_key);
+        } else {
+            partition_index.insert(index_key, next_weight);
+        }
+    }
+
+    fn cached_partition_top1(&self, partition_key: &P) -> Option<K> {
+        self.partition_order_index
+            .get(partition_key)
+            .and_then(|index| index.keys().next().map(|(_, row)| row.clone()))
     }
 
     async fn apply_deltas_to_versioned(
@@ -261,15 +308,25 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
+        for partition_key in &affected_partitions {
+            self.ensure_partition_cache(partition_key)
+                .await
+                .context("seed top1 partition cache")?;
+        }
+
         self.input_index
-            .apply_deltas(index_updates)
+            .apply_deltas(index_updates.iter().cloned())
             .await
             .context("update top1 input index")?;
+
+        for (partition_key, key, diff_weight) in &index_updates {
+            self.apply_partition_delta(partition_key, key, *diff_weight);
+        }
 
         let mut output_delta = HashMap::new();
         for partition_key in affected_partitions {
             let old_top = self.partition_output_cache.get(&partition_key).cloned();
-            let new_top = self.recompute_partition_top1(&partition_key).await?;
+            let new_top = self.cached_partition_top1(&partition_key);
             if old_top == new_top {
                 continue;
             }

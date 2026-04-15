@@ -210,31 +210,6 @@ where
         self
     }
 
-    fn join_entries_with_right_map(
-        &self,
-        left: &[(L, i64)],
-        right: Option<&FastHashMap<R, i64>>,
-        acc: &mut FastHashMap<O, i64>,
-    ) {
-        let Some(right) = right else {
-            return;
-        };
-        for (lk, lw) in left {
-            if *lw == 0 {
-                continue;
-            }
-            for (rk, rw) in right {
-                if *rw == 0 {
-                    continue;
-                }
-                if (self.predicate)(lk, rk) {
-                    let out = (self.projector)(lk, rk);
-                    *acc.entry(out).or_insert(0) += lw * rw;
-                }
-            }
-        }
-    }
-
     fn join_entries_with_maps(
         &self,
         left: Option<&FastHashMap<L, i64>>,
@@ -242,31 +217,6 @@ where
         acc: &mut FastHashMap<O, i64>,
     ) {
         let (Some(left), Some(right)) = (left, right) else {
-            return;
-        };
-        for (lk, lw) in left {
-            if *lw == 0 {
-                continue;
-            }
-            for (rk, rw) in right {
-                if *rw == 0 {
-                    continue;
-                }
-                if (self.predicate)(lk, rk) {
-                    let out = (self.projector)(lk, rk);
-                    *acc.entry(out).or_insert(0) += lw * rw;
-                }
-            }
-        }
-    }
-
-    fn join_entries_with_left_map(
-        &self,
-        left: Option<&FastHashMap<L, i64>>,
-        right: &[(R, i64)],
-        acc: &mut FastHashMap<O, i64>,
-    ) {
-        let Some(left) = left else {
             return;
         };
         for (lk, lw) in left {
@@ -334,6 +284,59 @@ where
             }
         }
         updates
+    }
+
+    async fn seed_memory_index_for_keys<T>(
+        index_store: &IndexedBatchZSet<K, T>,
+        memory_index: &mut FastHashMap<K, FastHashMap<T, i64>>,
+        keys: impl Iterator<Item = &K>,
+    ) -> Result<()>
+    where
+        T: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    {
+        let mut missing_keys = Vec::new();
+        for key in keys {
+            if !memory_index.contains_key(key) {
+                missing_keys.push(key.clone());
+            }
+        }
+
+        for key in missing_keys {
+            let values = index_store
+                .values_for_key(&key)
+                .await
+                .context("load join index entries into memory cache")?;
+            let mut rows: FastHashMap<T, i64> = FastHashMap::new();
+            for (row, weight) in values {
+                if weight == 0 {
+                    continue;
+                }
+                match rows.entry(row) {
+                    Entry::Occupied(mut entry) => {
+                        let next = entry.get().saturating_add(weight);
+                        if next == 0 {
+                            entry.remove();
+                        } else {
+                            *entry.get_mut() = next;
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(weight);
+                    }
+                }
+            }
+            memory_index.insert(key, rows);
+        }
+
+        Ok(())
     }
 
     async fn apply_deltas_to_versioned<T>(
@@ -497,6 +500,23 @@ where
         let left_keyed = self.stage_keyed_deltas(left_delta_values, &self.left_key);
         let right_keyed = self.stage_keyed_deltas(right_delta_values, &self.right_key);
 
+        if self.persist_indexes {
+            Self::seed_memory_index_for_keys(
+                &self.right_index,
+                &mut self.right_memory_index,
+                left_keyed.keys(),
+            )
+            .await
+            .context("seed right join memory index")?;
+            Self::seed_memory_index_for_keys(
+                &self.left_index,
+                &mut self.left_memory_index,
+                right_keyed.keys(),
+            )
+            .await
+            .context("seed left join memory index")?;
+        }
+
         // Build output delta from pre-update state (A, B) and current deltas
         // (ΔA, ΔB). State/index updates happen after this block to keep
         // each tick atomic.
@@ -507,48 +527,22 @@ where
         // ΔA ⋈ B
         if has_left {
             for (key, left_entries) in &left_keyed {
-                if self.persist_indexes {
-                    let right_entries = self
-                        .right_index
-                        .values_for_key(key)
-                        .await
-                        .context("load right join index")?;
-                    self.join_entries_with_left_map(
-                        Some(left_entries),
-                        &right_entries,
-                        &mut delta_join,
-                    );
-                } else {
-                    self.join_entries_with_maps(
-                        Some(left_entries),
-                        self.right_memory_index.get(key),
-                        &mut delta_join,
-                    );
-                }
+                self.join_entries_with_maps(
+                    Some(left_entries),
+                    self.right_memory_index.get(key),
+                    &mut delta_join,
+                );
             }
         }
 
         // A ⋈ ΔB
         if has_right {
             for (key, right_entries) in &right_keyed {
-                if self.persist_indexes {
-                    let left_entries = self
-                        .left_index
-                        .values_for_key(key)
-                        .await
-                        .context("load left join index")?;
-                    self.join_entries_with_right_map(
-                        &left_entries,
-                        Some(right_entries),
-                        &mut delta_join,
-                    );
-                } else {
-                    self.join_entries_with_maps(
-                        self.left_memory_index.get(key),
-                        Some(right_entries),
-                        &mut delta_join,
-                    );
-                }
+                self.join_entries_with_maps(
+                    self.left_memory_index.get(key),
+                    Some(right_entries),
+                    &mut delta_join,
+                );
             }
         }
 
@@ -566,10 +560,8 @@ where
         }
         delta_join.retain(|_, w| *w != 0);
 
-        if !self.persist_indexes {
-            Self::apply_keyed_updates_to_memory_index(&mut self.left_memory_index, &left_keyed);
-            Self::apply_keyed_updates_to_memory_index(&mut self.right_memory_index, &right_keyed);
-        }
+        Self::apply_keyed_updates_to_memory_index(&mut self.left_memory_index, &left_keyed);
+        Self::apply_keyed_updates_to_memory_index(&mut self.right_memory_index, &right_keyed);
 
         if self.persist_indexes {
             let left_updates = Self::flatten_keyed_updates(&left_keyed);

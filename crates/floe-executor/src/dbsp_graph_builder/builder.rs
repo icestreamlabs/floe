@@ -225,7 +225,8 @@ impl DbspGraphBuilder {
                     optimized_nodes = ?transient_aggregate_root.optimized_nodes,
                     "using transient aggregate root materialization with source batch journal"
                 );
-                let identity_transform: Arc<DeltaTransformFn> = Arc::new(|deltas| Ok(deltas));
+                let identity_transform: Arc<DeltaTransformFn> =
+                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
                 self.materialize_view_from_transient_overlay_receiver(
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
@@ -391,7 +392,7 @@ impl DbspGraphBuilder {
                         try_build_direct_join_output_projection(join, &transient_opt.steps);
                     let direct_output_projection = output_projection.is_some();
                     let delta_transform: Arc<DeltaTransformFn> = if direct_output_projection {
-                        Arc::new(|deltas| Ok(deltas))
+                        Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()))
                     } else {
                         Arc::clone(&transient_opt.transform)
                     };
@@ -1004,9 +1005,13 @@ fn build_transient_segment_optimization_from_spec(
 fn apply_transient_segment_vectorized(
     graph_id: &str,
     evaluators: &[VectorizedFilterProjectEvaluator],
-    mut deltas: Vec<(Vec<u8>, i64)>,
+    deltas: &[(Vec<u8>, i64)],
 ) -> Result<Vec<(Vec<u8>, i64)>> {
-    for evaluator in evaluators {
+    if evaluators.is_empty() {
+        return Ok(deltas.to_vec());
+    }
+    let mut deltas = evaluators[0].transform_delta(graph_id, deltas)?;
+    for evaluator in &evaluators[1..] {
         if deltas.is_empty() {
             break;
         }
@@ -3736,7 +3741,7 @@ fn try_build_transient_join_input_optimization(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let transformed = match transform(batch.deltas.as_ref().clone()) {
+                    let transformed = match transform(batch.deltas.as_ref()) {
                         Ok(transformed) => transformed,
                         Err(err) => {
                             tracing::warn!(
@@ -3806,7 +3811,8 @@ fn try_build_transient_source_root_materialization(
         };
         let transform = match shape {
             TransientSourceRootShape::Source { .. } => {
-                Ok(Arc::new(|deltas| Ok(deltas)) as Arc<DeltaTransformFn>)
+                Ok(Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()))
+                    as Arc<DeltaTransformFn>)
             }
             TransientSourceRootShape::Select { select, .. } => build_filter_transform(&select),
             TransientSourceRootShape::Project { project, .. } => build_map_transform(&project),
@@ -3907,7 +3913,7 @@ fn try_build_transient_source_topn_root_shape(
                 source_root,
                 topn: topn.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas| Ok(deltas)),
+                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -3994,7 +4000,7 @@ fn try_build_transient_source_aggregate_root_shape(
                 source_root,
                 aggregate: aggregate.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas| Ok(deltas)),
+                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -4140,7 +4146,7 @@ async fn build_transient_aggregate_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4172,7 +4178,7 @@ async fn build_transient_aggregate_receiver(
                                 break;
                             }
                         };
-                        let final_deltas = match output_transform(encoded_output) {
+                        let final_deltas = match output_transform(&encoded_output) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4220,7 +4226,7 @@ async fn build_transient_aggregate_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4252,7 +4258,7 @@ async fn build_transient_aggregate_receiver(
                                 break;
                             }
                         };
-                        let final_deltas = match output_transform(encoded_output) {
+                        let final_deltas = match output_transform(&encoded_output) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4595,7 +4601,7 @@ fn compose_delta_transforms(
 ) -> Arc<DeltaTransformFn> {
     Arc::new(move |deltas| {
         let deltas = first(deltas)?;
-        second(deltas)
+        second(&deltas)
     })
 }
 
@@ -4623,7 +4629,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4671,7 +4677,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4719,7 +4725,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4762,7 +4768,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -4811,7 +4817,7 @@ fn build_transient_topn_receiver(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let input_deltas = match input_transform(batch.deltas.as_ref().clone()) {
+                    let input_deltas = match input_transform(batch.deltas.as_ref()) {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -5415,7 +5421,7 @@ mod tests {
 
         let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
         let encoded = encode_event(&decoder, bid_event_payload(9, 101, 1000), "nexmark_bid");
-        let transformed = transform(vec![(encoded, 1)]).expect("transform rows");
+        let transformed = transform(&vec![(encoded, 1)]).expect("transform rows");
         assert_eq!(transformed.len(), 1);
 
         let mut decoded = Vec::new();
@@ -7360,7 +7366,7 @@ mod tests {
         let actual = materialize_zset_handle::<Vec<u8>>(Arc::clone(table), &mut cache, &handle)
             .await
             .expect("materialize child handle");
-        let expected = consolidate_encoded_deltas(transform(source_batch).expect("transform"));
+        let expected = consolidate_encoded_deltas(transform(&source_batch).expect("transform"));
         assert_eq!(actual, expected, "{label}");
     }
 

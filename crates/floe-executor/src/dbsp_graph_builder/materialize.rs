@@ -37,7 +37,7 @@ const MV_OPTIMIZATION_LOG_SAMPLE_EVERY: u64 = 64;
 const MV_OPTIMIZATION_LOG_MIN_TOTAL_MS: u64 = 250;
 
 pub(super) type DeltaTransformFn =
-    dyn Fn(Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
+    dyn Fn(&[(Vec<u8>, i64)]) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransientMaterializeBatch {
@@ -1664,8 +1664,8 @@ impl DbspGraphBuilder {
         let raw_delta_rows = deltas.len();
         let transform_start = Instant::now();
         if let Some(transform) = delta_transform {
-            deltas =
-                transform(deltas).context("apply transient transform before materialized view")?;
+            deltas = transform(&deltas)
+                .context("apply transient transform before materialized view")?;
         }
         let transform_ms = transform_start.elapsed().as_millis() as u64;
 
@@ -1746,7 +1746,7 @@ impl DbspGraphBuilder {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let merged = delta_transform(into_owned_deltas(batch.deltas))
+        let merged = delta_transform(batch.deltas.as_ref())
             .context("apply transient transform before materialized view")?;
         let transform_ms = transform_start.elapsed().as_millis() as u64;
         Ok((
