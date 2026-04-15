@@ -306,6 +306,57 @@ impl DbspGraphBuilder {
                     });
                 }
             }
+            if let Some(transient_join_pipeline_root) =
+                try_build_transient_join_pipeline_root_materialization(
+                    inputs.plan,
+                    inputs.plan.root,
+                )?
+                && transient_join_pipeline_root
+                    .steps
+                    .iter()
+                    .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    left_source = %transient_join_pipeline_root.left_source_root.source_name,
+                    right_source = %transient_join_pipeline_root.right_source_root.source_name,
+                    optimized_nodes = ?transient_join_pipeline_root.optimized_nodes,
+                    "using transient join pipeline root materialization with source batch journal"
+                );
+                let identity_transform: Arc<DeltaTransformFn> =
+                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+                let receiver = self
+                    .build_transient_join_pipeline_root_receiver(
+                        inputs.plan,
+                        &transient_join_pipeline_root,
+                        inputs.outer_handle_streams,
+                        inputs.outer_transient_streams,
+                        &inputs.cancel,
+                        &inputs.task_events,
+                        &mut built,
+                        &inputs.mv_registry,
+                        &mut mv_latest,
+                        inputs.mv_retention,
+                        &persistence_policy,
+                    )
+                    .await?;
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    receiver,
+                    identity_transform,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
         }
 
         let root_stream = if !matches!(root_node.kind, DbspNodeKind::Sink(_)) {
@@ -529,6 +580,127 @@ impl DbspGraphBuilder {
             mv_latest,
             required_sources,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_transient_join_pipeline_root_receiver(
+        &mut self,
+        plan: &CircuitPlan,
+        root: &TransientJoinPipelineRootMaterialization,
+        outer_handle_streams: &HashMap<String, DeltaHandleStream>,
+        outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+        cancel: &CancellationToken,
+        task_events: &GraphTaskSender,
+        built: &mut HashMap<usize, DeltaHandleStream>,
+        mv_registry: &Arc<MaterializedViewRegistry>,
+        mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
+        mv_retention: StreamRetention,
+        persistence_policy: &PersistencePolicy,
+    ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+        let left = self
+            .compile_node(
+                plan,
+                root.left_input_idx,
+                outer_handle_streams,
+                cancel,
+                task_events,
+                built,
+                mv_registry,
+                mv_latest,
+                mv_retention,
+                persistence_policy,
+            )
+            .await?;
+        let right = self
+            .compile_node(
+                plan,
+                root.right_input_idx,
+                outer_handle_streams,
+                cancel,
+                task_events,
+                built,
+                mv_registry,
+                mv_latest,
+                mv_retention,
+                persistence_policy,
+            )
+            .await?;
+        let left_transient_input = try_build_transient_join_input_optimization(
+            self.graph_id(),
+            plan,
+            root.left_input_idx,
+            outer_transient_streams,
+            cancel,
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "missing transient join input for left source-journal input {}",
+                root.left_input_idx
+            )
+        })?;
+        let right_transient_input = try_build_transient_join_input_optimization(
+            self.graph_id(),
+            plan,
+            root.right_input_idx,
+            outer_transient_streams,
+            cancel,
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "missing transient join input for right source-journal input {}",
+                root.right_input_idx
+            )
+        })?;
+
+        let (tx, mut receiver) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+        self.compile_transient_join_root_materialization(
+            &root.join,
+            left,
+            right,
+            Some(left_transient_input.receiver),
+            Some(right_transient_input.receiver),
+            None,
+            tx,
+            task_events,
+        )
+        .await?;
+
+        let identity_transform: Arc<DeltaTransformFn> =
+            Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+        for (step_idx, step) in root.steps.iter().enumerate() {
+            receiver = match step {
+                TransientJoinPipelineStep::Transform(transform) => {
+                    build_transient_transform_receiver(
+                        self.graph_id(),
+                        format!("transient-join-pipeline-transform:{step_idx}"),
+                        receiver,
+                        Arc::clone(transform),
+                        cancel,
+                        task_events,
+                    )
+                }
+                TransientJoinPipelineStep::TopN(topn) => build_transient_topn_receiver_from_batches(
+                    self.graph_id(),
+                    topn,
+                    receiver,
+                    cancel,
+                    task_events,
+                ),
+                TransientJoinPipelineStep::Aggregate(aggregate) => {
+                    build_transient_aggregate_receiver_from_batches(
+                        self.graph_id(),
+                        aggregate,
+                        receiver,
+                        Arc::clone(&identity_transform),
+                        cancel,
+                        task_events,
+                    )
+                    .await?
+                }
+            };
+        }
+
+        Ok(receiver)
     }
 
     pub(super) fn graph_id(&self) -> &str {
@@ -1025,7 +1197,6 @@ struct TransientSourceRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
     transform: Arc<DeltaTransformFn>,
-    requires_projected_input: bool,
 }
 
 struct TransientSourceTopNRootMaterialization {
@@ -1047,10 +1218,15 @@ struct TransientJoinInputOptimization {
     receiver: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
 }
 
+#[derive(Clone)]
 struct TransientJoinPipelineRootMaterialization {
     left_input_idx: usize,
     right_input_idx: usize,
-    steps: Vec<TransientPipelineStepSpec>,
+    left_source_root: TransientSourceRootMaterialization,
+    right_source_root: TransientSourceRootMaterialization,
+    join: dbsp::DbspJoinNode,
+    optimized_nodes: Vec<usize>,
+    steps: Vec<TransientJoinPipelineStep>,
 }
 
 #[derive(Clone)]
@@ -1069,10 +1245,11 @@ struct TransientSourceAggregateRootShape {
     transform: Arc<DeltaTransformFn>,
 }
 
-enum TransientPipelineStepSpec {
-    Transform,
-    Aggregate,
-    TopN,
+#[derive(Clone)]
+enum TransientJoinPipelineStep {
+    Transform(Arc<DeltaTransformFn>),
+    Aggregate(DbspAggregateNode),
+    TopN(DbspTopNNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3070,24 +3247,11 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
         && shape
             .steps
             .iter()
-            .any(|step| !matches!(step, TransientPipelineStepSpec::Transform))
+            .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
     {
-        let Some(left_root) =
-            try_build_transient_source_root_materialization(plan, shape.left_input_idx)?
-        else {
-            return Ok(None);
-        };
-        let Some(right_root) =
-            try_build_transient_source_root_materialization(plan, shape.right_input_idx)?
-        else {
-            return Ok(None);
-        };
-        if left_root.requires_projected_input || right_root.requires_projected_input {
-            return Ok(None);
-        }
         return Ok(Some(BTreeSet::from([
-            left_root.source_name,
-            right_root.source_name,
+            shape.left_source_root.source_name,
+            shape.right_source_root.source_name,
         ])));
     }
 
@@ -3732,6 +3896,7 @@ fn try_build_transient_join_input_optimization(
     let optimized_nodes = source_root.optimized_nodes.clone();
     let transform = Arc::clone(&source_root.transform);
     let cancel = cancel.clone();
+    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
 
     tokio::spawn(async move {
         loop {
@@ -3755,11 +3920,22 @@ fn try_build_transient_join_input_optimization(
                             continue;
                         }
                     };
-                    let join_ts = batch.version.saturating_add(1);
-                    if tx.send(dbsp::join::TransientJoinInputBatch {
-                        ts: join_ts,
-                        deltas: Arc::new(transformed),
-                    }).is_err() {
+                        let join_ts = batch.version.saturating_add(1);
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-join-input graph_id={} input_idx={} source={} version={} join_ts={} rows={}",
+                                graph_id,
+                                input_idx,
+                                batch.source,
+                                batch.version,
+                                join_ts,
+                                transformed.len()
+                            );
+                        }
+                        if tx.send(dbsp::join::TransientJoinInputBatch {
+                            ts: join_ts,
+                            deltas: Arc::new(transformed),
+                        }).is_err() {
                         tracing::debug!(
                             graph_id = %graph_id,
                             input_idx,
@@ -3793,8 +3969,7 @@ fn try_build_transient_source_root_materialization(
     root_idx: usize,
 ) -> Result<Option<TransientSourceRootMaterialization>> {
     if let Some(shape) = find_transient_source_root_shape(plan, root_idx)? {
-        let source_name = shape.source_name().to_string();
-        let requires_projected_input = !matches!(shape, TransientSourceRootShape::Source { .. });
+        let source_name = canonical_source_name(shape.source_name());
         let optimized_nodes = match &shape {
             TransientSourceRootShape::Source {
                 optimized_nodes, ..
@@ -3824,7 +3999,6 @@ fn try_build_transient_source_root_materialization(
             source_name,
             optimized_nodes,
             transform,
-            requires_projected_input,
         }));
     }
 
@@ -3889,6 +4063,15 @@ fn try_build_transient_source_root_materialization(
             Ok(Some(shape))
         }
         _ => Ok(None),
+    }
+}
+
+fn canonical_source_name(source_name: &str) -> String {
+    match source_name {
+        "person" => "nexmark_person".to_string(),
+        "auction" => "nexmark_auction".to_string(),
+        "bid" => "nexmark_bid".to_string(),
+        _ => source_name.to_string(),
     }
 }
 
@@ -4097,6 +4280,99 @@ async fn try_build_transient_source_aggregate_root_materialization(
     }))
 }
 
+fn build_transient_source_receiver(
+    graph_id: &str,
+    task_label: impl Into<String>,
+    upstream: TransientSourceHandleStream,
+    input_transform: Arc<DeltaTransformFn>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+    let mut upstream_rx = upstream.subscribe();
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let graph_id = graph_id.to_string();
+    let task_label = task_label.into();
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let input_deltas = match input_transform(batch.deltas.as_ref()) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(input_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn build_transient_transform_receiver(
+    graph_id: &str,
+    task_label: impl Into<String>,
+    mut upstream: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    transform: Arc<DeltaTransformFn>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let graph_id = graph_id.to_string();
+    let task_label = task_label.into();
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let output_deltas = match transform(batch.deltas.as_ref()) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if debug_transient_join {
+                        eprintln!(
+                            "transient-transform-output graph_id={} task={} version={} rows={}",
+                            graph_id,
+                            task_label,
+                            batch.version,
+                            output_deltas.len()
+                        );
+                    }
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(output_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
 async fn build_transient_aggregate_receiver(
     graph_id: &str,
     aggregate: &DbspAggregateNode,
@@ -4106,7 +4382,33 @@ async fn build_transient_aggregate_receiver(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let mut upstream_rx = upstream.subscribe();
+    let upstream_rx = build_transient_source_receiver(
+        graph_id,
+        format!("transient-aggregate-source:{graph_id}"),
+        upstream,
+        input_transform,
+        cancel,
+        task_events,
+    );
+    build_transient_aggregate_receiver_from_batches(
+        graph_id,
+        aggregate,
+        upstream_rx,
+        output_transform,
+        cancel,
+        task_events,
+    )
+    .await
+}
+
+async fn build_transient_aggregate_receiver_from_batches(
+    graph_id: &str,
+    aggregate: &DbspAggregateNode,
+    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    output_transform: Arc<DeltaTransformFn>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let (precompute_evaluator, aggregate_input_schema, aggregate_expression_columns) =
         build_transient_aggregate_precompute(aggregate)?;
@@ -4114,6 +4416,7 @@ async fn build_transient_aggregate_receiver(
     let task_label = format!("transient-aggregate:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if aggregate
         .aggregates()
         .iter()
@@ -4146,13 +4449,7 @@ async fn build_transient_aggregate_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
                             match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
@@ -4185,6 +4482,14 @@ async fn build_transient_aggregate_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-aggregate-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                final_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
@@ -4226,13 +4531,7 @@ async fn build_transient_aggregate_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
                             match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
@@ -4265,6 +4564,14 @@ async fn build_transient_aggregate_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-aggregate-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                final_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
@@ -4480,9 +4787,23 @@ fn try_build_transient_join_pipeline_root_materialization(
                 return Ok(None);
             }
             let (left_input_idx, right_input_idx) = join_inputs(root)?;
+            let Some(left_source_root) =
+                try_build_transient_source_root_materialization(plan, left_input_idx)?
+            else {
+                return Ok(None);
+            };
+            let Some(right_source_root) =
+                try_build_transient_source_root_materialization(plan, right_input_idx)?
+            else {
+                return Ok(None);
+            };
             Ok(Some(TransientJoinPipelineRootMaterialization {
                 left_input_idx,
                 right_input_idx,
+                left_source_root,
+                right_source_root,
+                join: join.clone(),
+                optimized_nodes: vec![root_idx],
                 steps: Vec::new(),
             }))
         }
@@ -4496,7 +4817,9 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            shape.steps.push(TransientPipelineStepSpec::Aggregate);
+            shape.steps
+                .push(TransientJoinPipelineStep::Aggregate(aggregate.clone()));
+            shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
         DbspNodeKind::TopN(topn) => {
@@ -4506,17 +4829,18 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            let _ = topn;
-            shape.steps.push(TransientPipelineStepSpec::TopN);
+            shape.steps.push(TransientJoinPipelineStep::TopN(topn.clone()));
+            shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
         DbspNodeKind::Passthrough => {
             let input_idx = first_input(root, "passthrough")?;
-            let Some(shape) =
+            let Some(mut shape) =
                 try_build_transient_join_pipeline_root_materialization(plan, input_idx)?
             else {
                 return Ok(None);
             };
+            shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
         DbspNodeKind::Select(select) => {
@@ -4526,8 +4850,11 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            let _ = select;
-            shape.steps.push(TransientPipelineStepSpec::Transform);
+            shape.steps
+                .push(TransientJoinPipelineStep::Transform(build_filter_transform(
+                    select,
+                )?));
+            shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
         DbspNodeKind::Project(project) => {
@@ -4544,8 +4871,12 @@ fn try_build_transient_join_pipeline_root_materialization(
                 else {
                     return Ok(None);
                 };
-                let _ = (select, project);
-                shape.steps.push(TransientPipelineStepSpec::Transform);
+                shape.steps
+                    .push(TransientJoinPipelineStep::Transform(
+                        build_filter_map_transform(select, project)?,
+                    ));
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
                 return Ok(Some(shape));
             }
 
@@ -4554,8 +4885,11 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            let _ = project;
-            shape.steps.push(TransientPipelineStepSpec::Transform);
+            shape.steps
+                .push(TransientJoinPipelineStep::Transform(build_map_transform(
+                    project,
+                )?));
+            shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
         _ => Ok(None),
@@ -4613,12 +4947,30 @@ fn build_transient_topn_receiver(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let mut upstream_rx = upstream.subscribe();
+    let upstream_rx = build_transient_source_receiver(
+        graph_id,
+        format!("transient-topn-source:{graph_id}"),
+        upstream,
+        input_transform,
+        cancel,
+        task_events,
+    );
+    build_transient_topn_receiver_from_batches(graph_id, topn, upstream_rx, cancel, task_events)
+}
+
+fn build_transient_topn_receiver_from_batches(
+    graph_id: &str,
+    topn: &DbspTopNNode,
+    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-topn:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
         let mut processor = TransientDirectTop1Processor::new(graph_id.clone(), config);
         tokio::spawn(async move {
@@ -4629,13 +4981,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -4643,6 +4989,14 @@ fn build_transient_topn_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-topn-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                output_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
@@ -4677,13 +5031,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
                             match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
@@ -4702,6 +5050,14 @@ fn build_transient_topn_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-topn-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                output_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
@@ -4725,13 +5081,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -4739,6 +5089,14 @@ fn build_transient_topn_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-topn-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                output_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
@@ -4768,13 +5126,7 @@ fn build_transient_topn_receiver(
                         let Some(batch) = maybe_batch else {
                             break;
                         };
-                        let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                            Ok(deltas) => deltas,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
-                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
                             match evaluator.transform_delta(&graph_id, &input_deltas) {
                                 Ok(deltas) => deltas,
@@ -4793,6 +5145,14 @@ fn build_transient_topn_receiver(
                                 break;
                             }
                         };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-topn-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                output_deltas.len()
+                            );
+                        }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
@@ -4817,13 +5177,7 @@ fn build_transient_topn_receiver(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
+                    let input_deltas = batch.deltas.as_ref().clone();
                     let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
                         match evaluator.transform_delta(&graph_id, &input_deltas) {
                             Ok(deltas) => deltas,
@@ -4842,6 +5196,14 @@ fn build_transient_topn_receiver(
                             break;
                         }
                     };
+                    if debug_transient_join {
+                        eprintln!(
+                            "transient-topn-output graph_id={} version={} rows={}",
+                            graph_id,
+                            batch.version,
+                            output_deltas.len()
+                        );
+                    }
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(output_deltas),
@@ -5003,8 +5365,8 @@ mod tests {
     use crate::dbsp_bridge::DbspBridge;
     use crate::dbsp_plan::{
         CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, DbspProjectNode, DbspSelectNode,
-        DbspSourceNode, ProjectItem, nexmark_auction_table, nexmark_bid_table, nexmark_config,
-        validate_dbsp_plan,
+        DbspSourceNode, ProjectItem, nexmark_auction_alias_table, nexmark_auction_table,
+        nexmark_bid_alias_table, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
     };
     use crate::materialized_view::MaterializedViewRegistry;
     use crate::outer_stream::OuterStreamRegistry;
@@ -5606,8 +5968,8 @@ mod tests {
             Some(Arc::clone(&bid_mask)),
         );
         let encoded = encode_event(&bid_decoder, bid_event_payload(7, 42, 9_999), "nexmark_bid");
-        let source_deltas =
-            (shape.source_root.transform)(vec![(encoded, 1)]).expect("source transform");
+        let source_deltas = (shape.source_root.transform)(&[(encoded, 1)])
+            .expect("source transform");
         let precomputed = precompute_evaluator
             .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 pruned bid row");
@@ -5677,8 +6039,9 @@ mod tests {
             "nexmark_bid",
         );
 
-        let source_deltas = (shape.source_root.transform)(vec![(encoded_one, 1), (encoded_two, 1)])
-            .expect("source transform");
+        let source_deltas =
+            (shape.source_root.transform)(&[(encoded_one, 1), (encoded_two, 1)])
+                .expect("source transform");
         let precomputed = precompute_evaluator
             .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 rows");
@@ -5737,6 +6100,54 @@ mod tests {
                    WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
              WHERE rownum <= 1 \
              GROUP BY seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q6_alias_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid_aliases(
+            "SELECT seller, AVG(price) AS moving_avg_price \
+             FROM (SELECT a.seller, b.price, b.\"dateTime\", \
+                          ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum \
+                   FROM auction a JOIN bid b ON a.id = b.auction \
+                   WHERE b.\"dateTime\" BETWEEN a.\"dateTime\" AND a.expires) ranked \
+             WHERE rownum <= 1 \
+             GROUP BY seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q9_alias_join_topn_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid_aliases(
+            "SELECT id, \"itemName\", description, \"initialBid\", reserve, \"dateTime\", expires, seller, category, extra, auction, bidder, price, \"bidTime\", \"bidExtra\" \
+             FROM (SELECT a.id, a.\"itemName\", a.description, a.\"initialBid\", a.reserve, a.\"dateTime\", a.expires, a.seller, a.category, a.extra, \
+                          b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", b.extra AS \"bidExtra\", \
+                          ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.\"dateTime\" ASC) AS rownum \
+                   FROM auction a JOIN bid b ON a.id = b.auction \
+                   WHERE b.\"dateTime\" BETWEEN a.\"dateTime\" AND a.expires) ranked \
+             WHERE rownum <= 1",
         )
         .await;
         let planner = DbspPlanBuilder::new(nexmark_config());
@@ -6451,7 +6862,7 @@ mod tests {
             ),
         ];
         let transformed_right_tick1 =
-            (right_transient.transform)(auction_batch.clone()).expect("transform auction batch");
+            (right_transient.transform)(&auction_batch).expect("transform auction batch");
         right_transient_tx
             .send(TransientJoinInputBatch {
                 ts: 1,
@@ -6530,7 +6941,7 @@ mod tests {
                 ),
             ];
             let transformed_left =
-                (left_transient.transform)(bid_batch.clone()).expect("transform bid batch");
+                (left_transient.transform)(&bid_batch).expect("transform bid batch");
             if tick != 16 {
                 left_transient_tx
                     .send(TransientJoinInputBatch {
@@ -6571,12 +6982,12 @@ mod tests {
             .expect("materialize canonical join delta");
             let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
                 consolidate_encoded_deltas(
-                evaluator
-                    .transform_delta(
-                        "benchmark_join_tick_residual",
-                        &actual.into_iter().collect::<Vec<_>>(),
-                    )
-                    .expect("apply benchmark join residual filter"),
+                    evaluator
+                        .transform_delta(
+                            "benchmark_join_tick_residual",
+                            &actual.into_iter().collect::<Vec<_>>(),
+                        )
+                        .expect("apply benchmark join residual filter"),
                 )
             } else {
                 actual
@@ -6960,12 +7371,12 @@ mod tests {
             .expect("materialize canonical join delta");
             let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
                 consolidate_encoded_deltas(
-                evaluator
-                    .transform_delta(
-                        "benchmark_join_source_task_tick_residual",
-                        &actual.into_iter().collect::<Vec<_>>(),
-                    )
-                    .expect("apply benchmark source-task join residual filter"),
+                    evaluator
+                        .transform_delta(
+                            "benchmark_join_source_task_tick_residual",
+                            &actual.into_iter().collect::<Vec<_>>(),
+                        )
+                        .expect("apply benchmark source-task join residual filter"),
                 )
             } else {
                 actual
@@ -7044,6 +7455,42 @@ mod tests {
             .expect("register nexmark_bid");
         ctx.register_table("nexmark_auction", auction_provider)
             .expect("register nexmark_auction");
+        register_planner_test_udfs(&ctx);
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("build logical plan");
+        let optimized = ctx.state().optimize(&plan).expect("optimize logical plan");
+        if logical_plan_uses_only_dbsp_supported_types(&optimized) {
+            optimized
+        } else {
+            plan
+        }
+    }
+
+    async fn sql_plan_with_auction_and_bid_aliases(sql: &str) -> LogicalPlan {
+        let ctx = SessionContext::new();
+        let bid_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_bid_table().schema().to_arrow_schema(),
+        ));
+        let auction_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_auction_table().schema().to_arrow_schema(),
+        ));
+        let bid_alias_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_bid_alias_table().schema().to_arrow_schema(),
+        ));
+        let auction_alias_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(
+            nexmark_auction_alias_table().schema().to_arrow_schema(),
+        ));
+        ctx.register_table("nexmark_bid", bid_provider)
+            .expect("register nexmark_bid");
+        ctx.register_table("nexmark_auction", auction_provider)
+            .expect("register nexmark_auction");
+        ctx.register_table("bid", bid_alias_provider)
+            .expect("register bid alias");
+        ctx.register_table("auction", auction_alias_provider)
+            .expect("register auction alias");
         register_planner_test_udfs(&ctx);
         let plan = ctx
             .state()

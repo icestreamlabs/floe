@@ -1664,8 +1664,8 @@ impl DbspGraphBuilder {
         let raw_delta_rows = deltas.len();
         let transform_start = Instant::now();
         if let Some(transform) = delta_transform {
-            deltas = transform(&deltas)
-                .context("apply transient transform before materialized view")?;
+            deltas =
+                transform(&deltas).context("apply transient transform before materialized view")?;
         }
         let transform_ms = transform_start.elapsed().as_millis() as u64;
 

@@ -65,7 +65,8 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let bid_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_bid_schema()));
     let auction_provider: Arc<dyn TableProvider> =
         Arc::new(EmptyTable::new(nexmark_auction_schema()));
-    let person_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(nexmark_person_schema()));
+    let person_provider: Arc<dyn TableProvider> =
+        Arc::new(EmptyTable::new(nexmark_person_schema()));
     ctx.register_table("nexmark_bid", Arc::clone(&bid_provider))
         .expect("register nexmark_bid");
     ctx.register_table("bid", bid_provider)
@@ -2190,7 +2191,7 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2252,12 +2253,9 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
             1,
         )
         .expect("append high early bid");
-    registry
-        .tick_all_with_version(2)
-        .await
-        .expect("tick bids");
+    registry.tick_all_with_version(2).await.expect("tick bids");
 
-    wait_for_logical_version(&mv_registry, view_name, 2).await;
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
     wait_for_visible_row_count(&mv_registry, view_name, 1).await;
 
     let rows = visible_rows(&mv_registry, view_name).await;
@@ -2274,6 +2272,147 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
         "expected bidExtra=bid_high_early, got {:?}",
         row.get(3)
     );
+}
+
+#[tokio::test]
+async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal() {
+    let db = test_db("join-top1-aggregate-q6-transient-source").await;
+    let view_name = "mv_join_top1_aggregate_q6_transient_source";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT seller, CAST(AVG(price) AS BIGINT) AS moving_avg_price \
+             FROM (SELECT a.seller, b.price, \
+                          ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum \
+                   FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+                   WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
+             WHERE rownum <= 1 \
+             GROUP BY seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_auction", "nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_auction", false);
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("seller", DataType::Int64, true),
+            Field::new("moving_avg_price", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient q6 graph");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(
+            encoded_auction_row_with_ts_and_extra(
+                1,
+                7,
+                1,
+                1_700_000_100_000,
+                1_700_000_000_000,
+                "a1",
+            ),
+            1,
+        )
+        .expect("append auction 1");
+    auction_writer
+        .append_encoded(
+            encoded_auction_row_with_ts_and_extra(
+                2,
+                7,
+                1,
+                1_700_000_100_000,
+                1_700_000_000_000,
+                "a2",
+            ),
+            1,
+        )
+        .expect("append auction 2");
+    auction_writer
+        .append_encoded(
+            encoded_auction_row_with_ts_and_extra(
+                3,
+                9,
+                1,
+                1_700_000_100_000,
+                1_700_000_000_000,
+                "a3",
+            ),
+            1,
+        )
+        .expect("append auction 3");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick auctions");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 11, 30, 1_700_000_001_000), 1)
+        .expect("append bid 1");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 12, 50, 1_700_000_002_000), 1)
+        .expect("append bid 2");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(2, 21, 70, 1_700_000_001_500), 1)
+        .expect("append bid 3");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(2, 22, 10, 1_700_000_001_250), 1)
+        .expect("append bid 4");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(3, 31, 90, 1_700_000_001_750), 1)
+        .expect("append bid 5");
+    registry.tick_all_with_version(2).await.expect("tick bids");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(rows, vec![int_row(&[7, 60]), int_row(&[9, 90])]);
 }
 
 #[tokio::test]
@@ -4096,6 +4235,40 @@ async fn wait_for_logical_version(
     })
     .await
     .expect("wait for logical version");
+}
+
+async fn wait_for_logical_version_or_task_error(
+    registry: &MaterializedViewRegistry,
+    view_name: &str,
+    target_version: i64,
+    task_rx: &mut mpsc::UnboundedReceiver<GraphTaskError>,
+) {
+    let handle = registry.get(view_name).expect("view registered");
+    if handle.latest_version().unwrap_or(-1) >= target_version {
+        return;
+    }
+    let mut rx = handle.version_watch();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if rx.borrow().unwrap_or(-1) >= target_version {
+                break;
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    changed.expect("version watch update");
+                }
+                maybe_event = task_rx.recv() => {
+                    let event = maybe_event.expect("graph task error");
+                    panic!(
+                        "graph task error in {} [{}]: {}",
+                        event.graph_id, event.task, event.error
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("wait for logical version or task error");
 }
 
 async fn wait_for_visible_row_count(

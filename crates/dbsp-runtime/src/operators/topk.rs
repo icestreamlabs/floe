@@ -299,15 +299,14 @@ where
             .integrated
             .current_handle()
             .map(|handle| handle.version);
-        let new_integrated_handle =
-            Self::apply_deltas_to_versioned(
-                &mut self.state.integrated,
-                &delta_map,
-                base_version,
-                "integrated_input",
-            )
-            .await
-            .context("update topk input state")?;
+        let new_integrated_handle = Self::apply_deltas_to_versioned(
+            &mut self.state.integrated,
+            &delta_map,
+            base_version,
+            "integrated_input",
+        )
+        .await
+        .context("update topk input state")?;
         self.state.update_handle(new_integrated_handle);
 
         if let Some(input_cache) = self.input_cache.as_mut() {

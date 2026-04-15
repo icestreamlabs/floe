@@ -219,15 +219,14 @@ where
         }
 
         let base_version = self.state.base_version_for_update();
-        let new_integrated_handle =
-            Self::apply_deltas_to_versioned(
-                &mut self.state.integrated,
-                &delta_map,
-                base_version,
-                "integrated_input",
-            )
-            .await
-            .context("update integrated state for distinct")?;
+        let new_integrated_handle = Self::apply_deltas_to_versioned(
+            &mut self.state.integrated,
+            &delta_map,
+            base_version,
+            "integrated_input",
+        )
+        .await
+        .context("update integrated state for distinct")?;
         self.state.update_handle(new_integrated_handle);
 
         if let Some(integrated_map) = self.integrated_cache.as_mut() {
@@ -244,11 +243,13 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let h_handle =
-            Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None, "output")
-                .await
-                .context("persist distinct H output")?;
-        publish_transient_zset_batch(&h_handle, Arc::new(h_deltas.into_iter().collect::<Vec<_>>()));
+        let h_handle = Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None, "output")
+            .await
+            .context("persist distinct H output")?;
+        publish_transient_zset_batch(
+            &h_handle,
+            Arc::new(h_deltas.into_iter().collect::<Vec<_>>()),
+        );
         Ok(Some(h_handle))
     }
 }

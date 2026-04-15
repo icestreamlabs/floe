@@ -9,9 +9,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::{
-    ExecutionPlan,
-};
+use datafusion::physical_plan::ExecutionPlan;
 use dbsp::handles::ZSetHandleView;
 
 use crate::materialized_view::{
@@ -19,12 +17,12 @@ use crate::materialized_view::{
 };
 
 use super::MV_VERSION_COLUMN;
+use super::SnapshotScanExec;
 use super::filters::{extract_mv_version_filter, parse_mv_version_expr};
 use super::helpers::{
     append_mv_version_field, build_batches_from_encoded_snapshot,
     build_constant_u64_projection_batches,
 };
-use super::SnapshotScanExec;
 
 #[derive(Clone)]
 pub struct MaterializedViewTableProvider {

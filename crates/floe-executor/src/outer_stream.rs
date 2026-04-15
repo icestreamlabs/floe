@@ -338,6 +338,11 @@ impl OuterStreamRegistry {
 
     pub fn set_durable_enabled(&mut self, source: &str, enabled: bool) {
         if let Some(writer) = self.writers.get_mut(source) {
+            tracing::info!(
+                source,
+                durable_enabled = enabled,
+                "configured outer stream durability"
+            );
             writer.set_durable_enabled(enabled);
         }
     }

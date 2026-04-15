@@ -452,9 +452,10 @@ impl DbspGraphBuilder {
                         err,
                     );
                 });
-                let residual_transform = move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<
-                    Vec<(Vec<u8>, i64)>,
-                > { residual_evaluator.transform_delta(&residual_graph_id, delta_values) };
+                let residual_transform =
+                    move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                        residual_evaluator.transform_delta(&residual_graph_id, delta_values)
+                    };
                 let residual_filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
                     &join_stream,
                     residual_transform,
@@ -977,6 +978,14 @@ impl DbspGraphBuilder {
             } else {
                 deltas.as_ref().clone()
             };
+            if std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some() {
+                eprintln!(
+                    "transient-join-output graph_id={} version={} rows={}",
+                    observer_graph_id,
+                    version,
+                    filtered.len()
+                );
+            }
             let _ = output_tx.send(TransientMaterializeBatch {
                 version,
                 deltas: Arc::new(filtered),

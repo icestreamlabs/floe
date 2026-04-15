@@ -307,7 +307,9 @@ impl DbspGraphBuilder {
                         handle_version = handle.version,
                         "top1 output handle"
                     );
-                    if let Err(err) = log_handle_rows("top1 output handle", &handle, &top1_bridge).await {
+                    if let Err(err) =
+                        log_handle_rows("top1 output handle", &handle, &top1_bridge).await
+                    {
                         report_graph_task_error(
                             &top1_task_events,
                             &top1_task_graph_id,
@@ -316,7 +318,7 @@ impl DbspGraphBuilder {
                         );
                         break;
                     }
-                        }
+                }
             });
             if !needs_trim_projection {
                 return Ok(top1_stream);

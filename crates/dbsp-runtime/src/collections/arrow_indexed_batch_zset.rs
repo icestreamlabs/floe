@@ -549,7 +549,9 @@ where
             return self.decode_value_weights(cached);
         }
 
-        let aggregate = self.load_persisted_value_weights_for_key(&key_bytes).await?;
+        let aggregate = self
+            .load_persisted_value_weights_for_key(&key_bytes)
+            .await?;
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         self.decode_value_weights(aggregate)
     }
@@ -572,7 +574,9 @@ where
             return Ok(cached.get(&value_bytes).copied().unwrap_or(0));
         }
 
-        let aggregate = self.load_persisted_value_weights_for_key(&key_bytes).await?;
+        let aggregate = self
+            .load_persisted_value_weights_for_key(&key_bytes)
+            .await?;
         let weight = aggregate.get(&value_bytes).copied().unwrap_or(0);
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
         Ok(weight)
@@ -1165,11 +1169,7 @@ where
             for (key, key_updates) in updates {
                 for (value, delta) in key_updates {
                     let state = guard.entry(value.clone()).or_default();
-                    let next = state
-                        .get(key)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(*delta);
+                    let next = state.get(key).copied().unwrap_or(0).saturating_add(*delta);
                     if next == 0 {
                         state.remove(key);
                     } else {

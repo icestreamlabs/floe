@@ -1,9 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anyhow::Result;
+use async_trait::async_trait;
+use bytes::Bytes;
 use object_store::memory::InMemory;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use slatedb::config::ScanOptions;
 use slatedb::{Db, WriteBatch};
 
 use super::super::encoding;
@@ -14,6 +20,48 @@ use super::{Dictionary, HashFn, KeyIntern};
 #[derive(Debug, Clone, PartialEq, Archive, RkyvSerialize, RkyvDeserialize)]
 struct TestKey {
     value: String,
+}
+
+struct CountingTable {
+    inner: Arc<dyn KeyValueTable>,
+    get_bytes_calls: AtomicUsize,
+}
+
+impl CountingTable {
+    fn new(inner: Arc<dyn KeyValueTable>) -> Self {
+        Self {
+            inner,
+            get_bytes_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset_get_bytes_calls(&self) {
+        self.get_bytes_calls.store(0, Ordering::Relaxed);
+    }
+
+    fn get_bytes_calls(&self) -> usize {
+        self.get_bytes_calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl KeyValueTable for CountingTable {
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_bytes_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_bytes(key).await
+    }
+
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.inner.write_batch(batch).await
+    }
+
+    async fn scan_range_bytes(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.inner.scan_range_bytes(range, options).await
+    }
 }
 
 async fn build_table() -> Arc<dyn KeyValueTable> {
@@ -91,9 +139,10 @@ async fn handles_hash_collisions() {
 async fn fresh_collision_slots_are_reserved_across_batch_boundaries() {
     let table = build_table().await;
     let forced_hash: HashFn = Arc::new(|_| 7);
-    let dict = Dictionary::<TestKey>::with_table(table, "fresh_collision_batches", Some(forced_hash))
-        .await
-        .expect("build dictionary");
+    let dict =
+        Dictionary::<TestKey>::with_table(table, "fresh_collision_batches", Some(forced_hash))
+            .await
+            .expect("build dictionary");
 
     let id_a = dict
         .intern(&TestKey {
@@ -134,8 +183,54 @@ async fn fresh_collision_slots_are_reserved_across_batch_boundaries() {
     }
 
     let resolved = dict.resolve_many(&ids).await.expect("resolve ids");
-    let values = resolved.into_iter().map(|entry| entry.value).collect::<Vec<_>>();
+    let values = resolved
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>();
     assert_eq!(values, vec!["a", "b", "c", "d"]);
+}
+
+#[tokio::test]
+async fn batch_miss_reuses_discovered_collision_slot() {
+    let table = build_table().await;
+    let forced_hash: HashFn = Arc::new(|_| 11);
+    let seed = Dictionary::<TestKey>::with_table(
+        table.clone(),
+        "reuse_collision_slot",
+        Some(forced_hash.clone()),
+    )
+    .await
+    .expect("build seed dictionary");
+    seed.intern(&TestKey {
+        value: "existing".to_string(),
+    })
+    .await
+    .expect("seed existing key");
+    drop(seed);
+
+    let counting = Arc::new(CountingTable::new(table));
+    let dict = Dictionary::<TestKey>::with_table(
+        counting.clone() as Arc<dyn KeyValueTable>,
+        "reuse_collision_slot",
+        Some(forced_hash),
+    )
+    .await
+    .expect("reopen dictionary");
+
+    counting.reset_get_bytes_calls();
+    let assigned = dict
+        .intern(&TestKey {
+            value: "new".to_string(),
+        })
+        .await
+        .expect("intern colliding miss");
+
+    assert_ne!(assigned, 0);
+    assert_eq!(
+        counting.get_bytes_calls(),
+        3,
+        "lookup should reuse the first free slot discovered during the miss probe",
+    );
 }
 
 #[tokio::test]

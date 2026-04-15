@@ -360,7 +360,11 @@ impl VectorizedFilterProjectEvaluator {
         }
     }
 
-    fn prepare_input(&self, graph_id: &str, delta_values: &[(Vec<u8>, i64)]) -> Result<PreparedEncodedInput> {
+    fn prepare_input(
+        &self,
+        graph_id: &str,
+        delta_values: &[(Vec<u8>, i64)],
+    ) -> Result<PreparedEncodedInput> {
         let needs_physical_batch = self.predicate_requires_physical_batch()
             || self.projection_plan.requires_physical_batch();
         let needs_compiled_batch = self.predicate_requires_compiled_batch()

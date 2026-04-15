@@ -60,7 +60,9 @@ where
         if self.integrated.uses_replayable_persistence() {
             None
         } else {
-            self.integrated.current_handle().map(|handle| handle.version)
+            self.integrated
+                .current_handle()
+                .map(|handle| handle.version)
         }
     }
 
@@ -185,12 +187,10 @@ mod tests {
     #[tokio::test]
     async fn replayable_state_uses_no_base_version_for_updates() {
         let table = build_table("relation-state-replayable-base").await;
-        let mut state = RelationState::<i64>::empty(
-            table,
-            "relation-state-replayable-base".to_string(),
-        )
-        .await
-        .expect("create relation state");
+        let mut state =
+            RelationState::<i64>::empty(table, "relation-state-replayable-base".to_string())
+                .await
+                .expect("create relation state");
         assert_eq!(state.base_version_for_update(), None);
 
         let key_id = state

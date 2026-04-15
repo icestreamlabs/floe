@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -679,7 +679,11 @@ mod tests {
     #[tokio::test]
     async fn delta_zset_handle_batch_uses_transient_registry_before_storage() {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("transient_zset_registry", store).await.expect("open SlateDB"));
+        let db = Arc::new(
+            Db::open("transient_zset_registry", store)
+                .await
+                .expect("open SlateDB"),
+        );
         let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
         let handle = ZSetHandle {
             ns: "transient_only_delta".to_string(),

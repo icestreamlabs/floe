@@ -524,6 +524,7 @@ impl DbspJoin {
                 &observer,
                 &output_version,
                 None,
+                None,
                 ts as i64,
                 handles,
             )
@@ -593,6 +594,7 @@ impl DbspJoin {
                         &op,
                         &observer,
                         &output_version,
+                        None,
                         transient_inputs,
                         ts,
                         handles,
@@ -708,6 +710,7 @@ async fn drive_join_transient<L, R, O, K>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
     observer: &Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
     output_version: &Arc<AtomicU64>,
+    observer_version_override: Option<i64>,
     transient_inputs: Option<JoinTransientInputs<L, R>>,
     ts: i64,
     handles: Vec<ZSetHandle>,
@@ -776,10 +779,13 @@ where
         .on_step_transient_with_inputs(ts, &handles, transient_inputs)
         .await?
     {
-        let version = output_version
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        observer(i64::try_from(version).unwrap_or(i64::MAX), batch);
+        let version = observer_version_override.unwrap_or_else(|| {
+            let version = output_version
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            i64::try_from(version).unwrap_or(i64::MAX)
+        });
+        observer(version, batch);
     }
     Ok(())
 }
@@ -855,6 +861,7 @@ where
             &op,
             &observer,
             &output_version,
+            Some(next_ts.saturating_sub(1)),
             Some(JoinTransientInputs {
                 left: Some(left_batch),
                 right: Some(right_batch),

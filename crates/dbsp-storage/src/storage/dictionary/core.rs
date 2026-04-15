@@ -28,6 +28,12 @@ const ID2K_PREFIX: &[u8] = b"id2k/";
 const META_NEXT_ID: &[u8] = b"meta/next_id";
 const RESOLVE_MANY_FETCH_CHUNK: usize = 256;
 const RESOLVE_MANY_RANGE_SCAN_MIN_IDS: usize = 512;
+
+enum LookupExistingResult {
+    Existing(u64),
+    Missing { first_free_slot: u16 },
+}
+
 #[allow(dead_code)]
 pub struct Dictionary<K>
 where
@@ -204,6 +210,16 @@ where
     }
 
     async fn lookup_existing_id(&self, encoded_key: &[u8]) -> Result<Option<u64>> {
+        match self.lookup_existing_or_first_free_slot(encoded_key).await? {
+            LookupExistingResult::Existing(id) => Ok(Some(id)),
+            LookupExistingResult::Missing { .. } => Ok(None),
+        }
+    }
+
+    async fn lookup_existing_or_first_free_slot(
+        &self,
+        encoded_key: &[u8],
+    ) -> Result<LookupExistingResult> {
         let hash = self.hash(encoded_key);
         let mut slot = 0u16;
         let mut k2id_key_buf = Vec::with_capacity(self.k2id_prefix.len() + 10);
@@ -211,7 +227,9 @@ where
         loop {
             self.encode_k2id_key_into(&mut k2id_key_buf, hash, slot);
             let Some(id_bytes) = self.table.get_bytes(&k2id_key_buf).await? else {
-                return Ok(None);
+                return Ok(LookupExistingResult::Missing {
+                    first_free_slot: slot,
+                });
             };
             let id = decode_id(id_bytes.as_ref())?;
 
@@ -225,12 +243,14 @@ where
                 drop(cache);
 
                 if matches {
-                    return Ok(Some(id));
+                    return Ok(LookupExistingResult::Existing(id));
                 }
             } else {
                 // If the reverse mapping is missing, clear the stale forward pointer.
                 self.table.delete(&k2id_key_buf).await?;
-                return Ok(None);
+                return Ok(LookupExistingResult::Missing {
+                    first_free_slot: slot,
+                });
             }
 
             slot = match Self::next_probe_slot(slot) {
@@ -239,7 +259,9 @@ where
             };
         }
 
-        Ok(None)
+        Err(anyhow!(
+            "dictionary full: all probe slots occupied for hash"
+        ))
     }
 
     async fn persist_mapping(
@@ -277,7 +299,7 @@ where
                 return Ok(id);
             }
             if overlay_ref.is_negative(&encoded_key) {
-                return self.allocate_new(encoded_key, overlay).await;
+                return self.allocate_new(encoded_key, overlay, None).await;
             }
         }
 
@@ -293,27 +315,35 @@ where
             cache.is_negative(&encoded_key)
         };
         if should_allocate {
-            return self.allocate_new(encoded_key, overlay).await;
+            return self.allocate_new(encoded_key, overlay, None).await;
         }
 
-        if let Some(id) = self.lookup_existing_id(&encoded_key).await? {
-            if let Some(overlay_ref) = overlay.as_deref_mut() {
-                overlay_ref.remember_positive(encoded_key.clone(), id);
-            }
-            let mut cache = self.cache.lock().unwrap();
-            cache.remember(encoded_key, id);
-            return Ok(id);
-        }
-
+        match self
+            .lookup_existing_or_first_free_slot(&encoded_key)
+            .await?
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.remember_negative(&encoded_key);
-        }
-        if let Some(overlay_ref) = overlay.as_deref_mut() {
-            overlay_ref.remember_negative(encoded_key.clone());
-        }
+            LookupExistingResult::Existing(id) => {
+                if let Some(overlay_ref) = overlay.as_deref_mut() {
+                    overlay_ref.remember_positive(encoded_key.clone(), id);
+                }
+                let mut cache = self.cache.lock().unwrap();
+                cache.remember(encoded_key, id);
+                return Ok(id);
+            }
+            LookupExistingResult::Missing { first_free_slot } => {
+                {
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.remember_negative(&encoded_key);
+                }
+                if let Some(overlay_ref) = overlay.as_deref_mut() {
+                    overlay_ref.remember_negative(encoded_key.clone());
+                }
 
-        self.allocate_new(encoded_key, overlay).await
+                return self
+                    .allocate_new(encoded_key, overlay, Some(first_free_slot))
+                    .await;
+            }
+        }
     }
 
     fn lookup_existing_in_cache(&self, encoded_key: &[u8]) -> Option<u64> {
@@ -453,6 +483,7 @@ where
                             encoded,
                             &mut pending,
                             &mut next_slot_by_hash,
+                            None,
                         )
                         .await?;
                     reserve_ms += reserve_start.elapsed().as_millis() as u64;
@@ -460,30 +491,34 @@ where
                 } else {
                     lookup_existing_calls += 1;
                     let lookup_start = Instant::now();
-                    let existing = self.lookup_existing_id(encoded).await?;
+                    let existing = self.lookup_existing_or_first_free_slot(encoded).await?;
                     lookup_existing_ms += lookup_start.elapsed().as_millis() as u64;
-                    if let Some(existing) = existing {
-                        lookup_existing_hits += 1;
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.remember(encoded.clone(), existing);
-                        existing
-                    } else {
-                        {
+                    match existing {
+                        LookupExistingResult::Existing(existing) => {
+                            lookup_existing_hits += 1;
                             let mut cache = self.cache.lock().unwrap();
-                            cache.remember_negative(encoded);
+                            cache.remember(encoded.clone(), existing);
+                            existing
                         }
-                        reserve_calls += 1;
-                        let reserve_start = Instant::now();
-                        let id = self
-                            .reserve_in_batch(
-                                resolved_hash,
-                                encoded,
-                                &mut pending,
-                                &mut next_slot_by_hash,
-                            )
-                            .await?;
-                        reserve_ms += reserve_start.elapsed().as_millis() as u64;
-                        id
+                        LookupExistingResult::Missing { first_free_slot } => {
+                            {
+                                let mut cache = self.cache.lock().unwrap();
+                                cache.remember_negative(encoded);
+                            }
+                            reserve_calls += 1;
+                            let reserve_start = Instant::now();
+                            let id = self
+                                .reserve_in_batch(
+                                    resolved_hash,
+                                    encoded,
+                                    &mut pending,
+                                    &mut next_slot_by_hash,
+                                    Some(first_free_slot),
+                                )
+                                .await?;
+                            reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                            id
+                        }
                     }
                 }
             };
@@ -558,37 +593,49 @@ where
                     reserve_calls += 1;
                     let reserve_start = Instant::now();
                     let id = self
-                        .reserve_in_batch_owned(hash, encoded, &mut pending, &mut next_slot_by_hash)
+                        .reserve_in_batch_owned(
+                            hash,
+                            encoded,
+                            &mut pending,
+                            &mut next_slot_by_hash,
+                            None,
+                        )
                         .await?;
                     reserve_ms += reserve_start.elapsed().as_millis() as u64;
                     id
                 } else {
                     lookup_existing_calls += 1;
                     let lookup_start = Instant::now();
-                    let existing = self.lookup_existing_id(encoded.as_slice()).await?;
+                    let existing = self
+                        .lookup_existing_or_first_free_slot(encoded.as_slice())
+                        .await?;
                     lookup_existing_ms += lookup_start.elapsed().as_millis() as u64;
-                    if let Some(existing) = existing {
-                        lookup_existing_hits += 1;
-                        let mut cache = self.cache.lock().unwrap();
-                        cache.remember(encoded, existing);
-                        existing
-                    } else {
-                        {
+                    match existing {
+                        LookupExistingResult::Existing(existing) => {
+                            lookup_existing_hits += 1;
                             let mut cache = self.cache.lock().unwrap();
-                            cache.remember_negative(encoded.as_slice());
+                            cache.remember(encoded, existing);
+                            existing
                         }
-                        reserve_calls += 1;
-                        let reserve_start = Instant::now();
-                        let id = self
-                            .reserve_in_batch_owned(
-                                hash,
-                                encoded,
-                                &mut pending,
-                                &mut next_slot_by_hash,
-                            )
-                            .await?;
-                        reserve_ms += reserve_start.elapsed().as_millis() as u64;
-                        id
+                        LookupExistingResult::Missing { first_free_slot } => {
+                            {
+                                let mut cache = self.cache.lock().unwrap();
+                                cache.remember_negative(encoded.as_slice());
+                            }
+                            reserve_calls += 1;
+                            let reserve_start = Instant::now();
+                            let id = self
+                                .reserve_in_batch_owned(
+                                    hash,
+                                    encoded,
+                                    &mut pending,
+                                    &mut next_slot_by_hash,
+                                    Some(first_free_slot),
+                                )
+                                .await?;
+                            reserve_ms += reserve_start.elapsed().as_millis() as u64;
+                            id
+                        }
                     }
                 }
             };
@@ -620,22 +667,55 @@ where
 
     async fn flush_pending_batch(&self, pending: Vec<(Vec<u8>, u64, u64, u16)>) -> Result<()> {
         if !pending.is_empty() {
+            let total_start = Instant::now();
             let mut batch = WriteBatch::new();
+            let build_batch_start = Instant::now();
+            let mut raw_values = 0usize;
+            let mut compressed_values = 0usize;
+            let mut input_bytes = 0usize;
+            let mut stored_bytes = 0usize;
             for (encoded, id, hash, slot) in &pending {
                 batch.put(self.k2id_key(*hash, *slot), encode_id(*id));
-                batch.put(self.id2k_key(*id), compress_value(encoded.as_slice())?);
+                let compressed = compress_value(encoded.as_slice())?;
+                input_bytes += encoded.len();
+                stored_bytes += compressed.len();
+                if compressed.first().copied() == Some(0x00) {
+                    raw_values += 1;
+                } else {
+                    compressed_values += 1;
+                }
+                batch.put(self.id2k_key(*id), compressed);
             }
             batch.put(
                 self.meta_key.clone(),
                 encode_id(self.next_id.load(Ordering::SeqCst)),
             );
-            self.table.write_batch(batch).await?;
+            let build_batch_ms = build_batch_start.elapsed().as_millis() as u64;
 
+            let write_start = Instant::now();
+            self.table.write_batch(batch).await?;
+            let write_batch_ms = write_start.elapsed().as_millis() as u64;
+
+            let cache_update_start = Instant::now();
             let mut cache = self.cache.lock().unwrap();
             for (encoded, id, _, _) in pending {
                 cache.clear_negative(&encoded);
                 cache.remember(encoded, id);
             }
+            let cache_update_ms = cache_update_start.elapsed().as_millis() as u64;
+
+            tracing::debug!(
+                pending_writes = raw_values + compressed_values,
+                raw_values,
+                compressed_values,
+                input_bytes,
+                stored_bytes,
+                build_batch_ms,
+                write_batch_ms,
+                cache_update_ms,
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "dictionary flush_pending_batch breakdown"
+            );
         }
 
         Ok(())
@@ -647,6 +727,7 @@ where
         encoded_key: &[u8],
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
         next_slot_by_hash: &mut AHashMap<u64, u16>,
+        known_first_free_slot: Option<u16>,
     ) -> Result<u64> {
         if self.fast_path_fresh {
             let slot = self.reserve_fresh_slot(hash)?;
@@ -658,7 +739,10 @@ where
         let next_slot = match next_slot_by_hash.entry(hash) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let loaded = self.first_free_slot(hash).await?;
+                let loaded = match known_first_free_slot {
+                    Some(slot) => slot,
+                    None => self.first_free_slot(hash).await?,
+                };
                 entry.insert(loaded)
             }
         };
@@ -677,6 +761,7 @@ where
         encoded_key: Vec<u8>,
         pending: &mut Vec<(Vec<u8>, u64, u64, u16)>,
         next_slot_by_hash: &mut AHashMap<u64, u16>,
+        known_first_free_slot: Option<u16>,
     ) -> Result<u64> {
         if self.fast_path_fresh {
             let slot = self.reserve_fresh_slot(hash)?;
@@ -688,7 +773,10 @@ where
         let next_slot = match next_slot_by_hash.entry(hash) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let loaded = self.first_free_slot(hash).await?;
+                let loaded = match known_first_free_slot {
+                    Some(slot) => slot,
+                    None => self.first_free_slot(hash).await?,
+                };
                 entry.insert(loaded)
             }
         };
@@ -849,6 +937,7 @@ where
         &self,
         encoded_key: Vec<u8>,
         overlay: Option<&mut BatchOverlay>,
+        known_first_free_slot: Option<u16>,
     ) -> Result<u64> {
         let hash = self.hash(&encoded_key);
         if self.fast_path_fresh {
@@ -867,7 +956,10 @@ where
             return Ok(id);
         }
 
-        let first_free_slot = self.first_free_slot(hash).await?;
+        let first_free_slot = match known_first_free_slot {
+            Some(slot) => slot,
+            None => self.first_free_slot(hash).await?,
+        };
         let id = self.reserve_id();
         self.persist_mapping(encoded_key.clone(), id, hash, first_free_slot)
             .await?;

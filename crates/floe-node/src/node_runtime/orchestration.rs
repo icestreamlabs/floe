@@ -207,6 +207,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .difference(&durable_required_sources)
         .cloned()
         .collect();
+    tracing::info!(
+        transient_eligible_sources = ?transient_eligible_sources,
+        durable_required_sources = ?durable_required_sources,
+        transient_only_sources = ?transient_only_sources,
+        "resolved source durability sets"
+    );
     let transient_required_columns_by_source = {
         let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
             .definitions()
