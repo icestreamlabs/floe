@@ -679,14 +679,16 @@ impl DbspGraphBuilder {
                         task_events,
                     )
                 }
-                TransientJoinPipelineStep::TopN(topn) => build_transient_topn_receiver_from_batches(
-                    self.graph_id(),
-                    topn,
-                    receiver,
-                    false,
-                    cancel,
-                    task_events,
-                ),
+                TransientJoinPipelineStep::TopN(topn) => {
+                    build_transient_topn_receiver_from_batches(
+                        self.graph_id(),
+                        topn,
+                        receiver,
+                        false,
+                        cancel,
+                        task_events,
+                    )
+                }
                 TransientJoinPipelineStep::Aggregate(aggregate) => {
                     build_transient_aggregate_receiver_from_batches(
                         self.graph_id(),
@@ -1622,6 +1624,199 @@ impl TransientTopNProcessor {
     }
 }
 
+#[derive(Default)]
+struct TransientAppendOnlyTopNPartitionState {
+    visible_rows: BTreeMap<TransientTopNKey, i64>,
+    visible_count: usize,
+}
+
+struct TransientAppendOnlyTopNProcessor {
+    graph_id: String,
+    partition_key_columns: Arc<Vec<usize>>,
+    order_key_columns: Arc<Vec<usize>>,
+    order_value_types: Arc<Vec<DbspScalarType>>,
+    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    limit: usize,
+    profile_enabled: bool,
+    profiled_batches: usize,
+    partitions: HashMap<Vec<u8>, TransientAppendOnlyTopNPartitionState>,
+}
+
+impl TransientAppendOnlyTopNProcessor {
+    fn new(
+        graph_id: impl Into<String>,
+        topn: &DbspTopNNode,
+        key_layout: &TransientTopNKeyLayout,
+    ) -> Self {
+        let order_specs = Arc::new(
+            topn.order_by()
+                .iter()
+                .map(|expr| TransientTopNSortSpec {
+                    ascending: expr.ascending(),
+                    nulls_first: expr.nulls_first(),
+                })
+                .collect(),
+        );
+        Self {
+            graph_id: graph_id.into(),
+            partition_key_columns: Arc::clone(&key_layout.partition_columns),
+            order_key_columns: Arc::clone(&key_layout.order_columns),
+            order_value_types: Arc::clone(&key_layout.order_types),
+            order_specs,
+            limit: topn.limit(),
+            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profiled_batches: 0,
+            partitions: HashMap::new(),
+        }
+    }
+
+    fn apply_deltas(&mut self, deltas: Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> {
+        let input_delta_count = deltas.len();
+        let profile_this_batch = self.profile_enabled && self.profiled_batches < 16;
+        let total_start = profile_this_batch.then(Instant::now);
+        let mut key_eval_us = 0u128;
+        let mut partition_apply_us = 0u128;
+        let mut trimmed_rows = 0usize;
+        let mut skipped_rows = 0usize;
+        let mut affected_partitions = HashSet::new();
+        let mut output_deltas = HashMap::new();
+
+        for (row_key, diff) in deltas {
+            if diff == 0 {
+                continue;
+            }
+            if diff < 0 {
+                bail!(
+                    "append-only transient topn received negative diff for graph {}",
+                    self.graph_id
+                );
+            }
+
+            let key_start = profile_this_batch.then(Instant::now);
+            let (partition_key, order_key) = self.compute_key_parts(&row_key);
+            if let Some(key_start) = key_start {
+                key_eval_us += key_start.elapsed().as_micros();
+            }
+            let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
+                continue;
+            };
+
+            affected_partitions.insert(partition_key.clone());
+            let apply_start = profile_this_batch.then(Instant::now);
+            let state = self.partitions.entry(partition_key).or_default();
+            Self::apply_positive_delta(
+                state,
+                order_key,
+                diff,
+                self.limit,
+                &mut output_deltas,
+                &mut trimmed_rows,
+                &mut skipped_rows,
+            );
+            if let Some(apply_start) = apply_start {
+                partition_apply_us += apply_start.elapsed().as_micros();
+            }
+        }
+
+        let output_deltas = output_deltas
+            .into_iter()
+            .filter(|(_, diff)| *diff != 0)
+            .collect::<Vec<_>>();
+
+        if profile_this_batch {
+            self.profiled_batches += 1;
+            let total_us = total_start
+                .expect("total start present")
+                .elapsed()
+                .as_micros();
+            tracing::info!(
+                graph_id = %self.graph_id,
+                input_delta_count,
+                affected_partition_count = affected_partitions.len(),
+                retained_partitions = self.partitions.len(),
+                trimmed_rows,
+                skipped_rows,
+                output_delta_count = output_deltas.len(),
+                key_eval_us,
+                partition_apply_us,
+                total_us,
+                "transient append-only topn profile"
+            );
+        }
+
+        Ok(output_deltas)
+    }
+
+    fn apply_positive_delta(
+        state: &mut TransientAppendOnlyTopNPartitionState,
+        order_key: TransientTopNKey,
+        diff: i64,
+        limit: usize,
+        output_deltas: &mut HashMap<Vec<u8>, i64>,
+        trimmed_rows: &mut usize,
+        skipped_rows: &mut usize,
+    ) {
+        if limit == 0 {
+            return;
+        }
+
+        if state.visible_count >= limit
+            && let Some((worst_key, _)) = state.visible_rows.last_key_value()
+            && order_key > *worst_key
+        {
+            *skipped_rows = skipped_rows.saturating_add(diff as usize);
+            return;
+        }
+
+        let row_key = order_key.tie_breaker.clone();
+        let entry = state.visible_rows.entry(order_key).or_insert(0);
+        *entry = entry.saturating_add(diff);
+        state.visible_count = state.visible_count.saturating_add(diff as usize);
+        accumulate_single_weight_delta(output_deltas, row_key, diff);
+
+        while state.visible_count > limit {
+            let overflow = state.visible_count - limit;
+            let Some((worst_key, worst_weight)) = state
+                .visible_rows
+                .last_key_value()
+                .map(|(key, weight)| (key.clone(), *weight))
+            else {
+                break;
+            };
+            let removable = usize::try_from(worst_weight)
+                .unwrap_or(usize::MAX)
+                .min(overflow) as i64;
+            if removable <= 0 {
+                break;
+            }
+            if let Some(weight) = state.visible_rows.get_mut(&worst_key) {
+                *weight -= removable;
+                if *weight <= 0 {
+                    state.visible_rows.remove(&worst_key);
+                }
+            }
+            state.visible_count -= removable as usize;
+            *trimmed_rows = trimmed_rows.saturating_add(removable as usize);
+            accumulate_single_weight_delta(
+                output_deltas,
+                worst_key.tie_breaker.clone(),
+                -removable,
+            );
+        }
+    }
+
+    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
+        compute_transient_topn_key_parts(
+            &self.graph_id,
+            Arc::clone(&self.order_specs),
+            self.partition_key_columns.as_ref(),
+            self.order_key_columns.as_ref(),
+            self.order_value_types.as_ref(),
+            row_key,
+        )
+    }
+}
+
 impl TransientTop1Processor {
     fn new(
         graph_id: impl Into<String>,
@@ -1846,7 +2041,7 @@ struct TransientBatchTopNProcessor {
     order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
     limit: usize,
-    row_key_cache: HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>,
+    row_key_cache: Option<HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>>,
     partitions: HashMap<Vec<u8>, TransientBatchTopNPartitionState>,
     profile_enabled: bool,
     profiled_batches: usize,
@@ -1857,6 +2052,7 @@ impl TransientBatchTopNProcessor {
         graph_id: impl Into<String>,
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
+        append_only_input: bool,
     ) -> Self {
         let order_specs = Arc::new(
             topn.order_by()
@@ -1874,7 +2070,7 @@ impl TransientBatchTopNProcessor {
             order_value_types: Arc::clone(&key_layout.order_types),
             order_specs,
             limit: topn.limit(),
-            row_key_cache: HashMap::new(),
+            row_key_cache: (!append_only_input).then(HashMap::new),
             partitions: HashMap::new(),
             profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
             profiled_batches: 0,
@@ -2243,11 +2439,15 @@ impl TransientBatchTopNProcessor {
     }
 
     fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        if let Some(cached) = self.row_key_cache.get(row_key) {
+        if let Some(cache) = self.row_key_cache.as_ref()
+            && let Some(cached) = cache.get(row_key)
+        {
             return cached.clone();
         }
         let computed = self.compute_key_parts(row_key);
-        self.row_key_cache.insert(row_key.clone(), computed.clone());
+        if let Some(cache) = self.row_key_cache.as_mut() {
+            cache.insert(row_key.clone(), computed.clone());
+        }
         computed
     }
 
@@ -3179,6 +3379,21 @@ fn accumulate_weight_deltas(
                 output_deltas.remove(row_key);
             }
         }
+    }
+}
+
+fn accumulate_single_weight_delta(
+    output_deltas: &mut HashMap<Vec<u8>, i64>,
+    row_key: Vec<u8>,
+    diff: i64,
+) {
+    if diff == 0 {
+        return;
+    }
+    let entry = output_deltas.entry(row_key.clone()).or_insert(0);
+    *entry = entry.saturating_add(diff);
+    if *entry == 0 {
+        output_deltas.remove(&row_key);
     }
 }
 
@@ -4816,7 +5031,8 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            shape.steps
+            shape
+                .steps
                 .push(TransientJoinPipelineStep::Aggregate(aggregate.clone()));
             shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
@@ -4828,7 +5044,9 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            shape.steps.push(TransientJoinPipelineStep::TopN(topn.clone()));
+            shape
+                .steps
+                .push(TransientJoinPipelineStep::TopN(topn.clone()));
             shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
@@ -4849,10 +5067,9 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            shape.steps
-                .push(TransientJoinPipelineStep::Transform(build_filter_transform(
-                    select,
-                )?));
+            shape.steps.push(TransientJoinPipelineStep::Transform(
+                build_filter_transform(select)?,
+            ));
             shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
@@ -4870,10 +5087,9 @@ fn try_build_transient_join_pipeline_root_materialization(
                 else {
                     return Ok(None);
                 };
-                shape.steps
-                    .push(TransientJoinPipelineStep::Transform(
-                        build_filter_map_transform(select, project)?,
-                    ));
+                shape.steps.push(TransientJoinPipelineStep::Transform(
+                    build_filter_map_transform(select, project)?,
+                ));
                 shape.optimized_nodes.push(input_idx);
                 shape.optimized_nodes.push(root_idx);
                 return Ok(Some(shape));
@@ -4884,7 +5100,8 @@ fn try_build_transient_join_pipeline_root_materialization(
             else {
                 return Ok(None);
             };
-            shape.steps
+            shape
+                .steps
                 .push(TransientJoinPipelineStep::Transform(build_map_transform(
                     project,
                 )?));
@@ -5121,14 +5338,77 @@ fn build_transient_topn_receiver_from_batches(
         return rx;
     }
 
+    let use_append_only_partitioned_topn = append_only_input
+        && topn.offset() == 0
+        && topn.limit() > 1
+        && !topn.partition_by().is_empty();
+
+    if use_append_only_partitioned_topn {
+        let mut processor =
+            TransientAppendOnlyTopNProcessor::new(graph_id.clone(), topn, &key_layout);
+        let precompute_evaluator = key_layout.precompute_evaluator.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    maybe_batch = upstream_rx.recv() => {
+                        let Some(batch) = maybe_batch else {
+                            break;
+                        };
+                        let input_deltas = batch.deltas.as_ref().clone();
+                        let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
+                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            }
+                        } else {
+                            input_deltas
+                        };
+                        let output_deltas = match processor.apply_deltas(input_deltas) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if debug_transient_join {
+                            eprintln!(
+                                "transient-topn-output graph_id={} version={} rows={}",
+                                graph_id,
+                                batch.version,
+                                output_deltas.len()
+                            );
+                        }
+                        if tx.send(TransientMaterializeBatch {
+                            version: batch.version,
+                            deltas: Arc::new(output_deltas),
+                        }).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        return rx;
+    }
+
     let use_vectorized_partitioned_topn = false
+        && append_only_input
         && topn.offset() == 0
         && topn.limit() > 1
         && topn.limit() <= 64
         && !topn.partition_by().is_empty();
 
     if use_vectorized_partitioned_topn {
-        let mut processor = TransientBatchTopNProcessor::new(graph_id.clone(), topn, &key_layout);
+        let mut processor = TransientBatchTopNProcessor::new(
+            graph_id.clone(),
+            topn,
+            &key_layout,
+            append_only_input,
+        );
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         tokio::spawn(async move {
             loop {
@@ -5981,8 +6261,8 @@ mod tests {
             Some(Arc::clone(&bid_mask)),
         );
         let encoded = encode_event(&bid_decoder, bid_event_payload(7, 42, 9_999), "nexmark_bid");
-        let source_deltas = (shape.source_root.transform)(&[(encoded, 1)])
-            .expect("source transform");
+        let source_deltas =
+            (shape.source_root.transform)(&[(encoded, 1)]).expect("source transform");
         let precomputed = precompute_evaluator
             .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 pruned bid row");
@@ -6052,9 +6332,8 @@ mod tests {
             "nexmark_bid",
         );
 
-        let source_deltas =
-            (shape.source_root.transform)(&[(encoded_one, 1), (encoded_two, 1)])
-                .expect("source transform");
+        let source_deltas = (shape.source_root.transform)(&[(encoded_one, 1), (encoded_two, 1)])
+            .expect("source transform");
         let precomputed = precompute_evaluator
             .transform_delta("benchmark_result", &source_deltas)
             .expect("precompute q16 rows");
@@ -6191,7 +6470,10 @@ mod tests {
         let transient_sources = source_batch_journal_root_sources(&plan)
             .expect("source batch journal root sources")
             .expect("source batch journal root sources");
-        assert_eq!(transient_sources, BTreeSet::from(["nexmark_bid".to_string()]));
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
+        );
     }
 
     #[tokio::test]
