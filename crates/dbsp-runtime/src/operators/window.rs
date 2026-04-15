@@ -222,6 +222,10 @@ where
         }
     }
 
+    pub fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
+    }
+
     async fn ensure_aggregate_cache(&mut self) -> Result<()> {
         if self.aggregate_cache.is_some() {
             return Ok(());
@@ -326,21 +330,36 @@ where
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
+        let staged = deltas
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key.clone(), *delta)))
+            .collect::<Vec<_>>();
+        if staged.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
+            }
+            return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            return Ok(versioned.publish_replayable_batch(Arc::new(staged)));
+        }
+
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
         let mut dict_batch = dict.batch();
-        for (key, delta) in deltas {
-            if *delta == 0 {
-                continue;
-            }
+        for (key, delta) in staged {
             let id = dict_batch
-                .intern(key)
+                .intern(&key)
                 .await
                 .context("intern key while staging window aggregate delta")?;
-            buckets
-                .entry(bucket_for(id))
-                .or_default()
-                .push((id, *delta));
+            buckets.entry(bucket_for(id)).or_default().push((id, delta));
         }
         drop(dict_batch);
 
@@ -356,15 +375,6 @@ where
                 bucket,
                 deltas: bucket_deltas,
             });
-        }
-
-        if segments.is_empty() {
-            if base.is_some()
-                && let Some(handle) = versioned.current_handle()
-            {
-                return Ok(handle);
-            }
-            return Ok(versioned.handle_for_version(0));
         }
 
         let mut batch = WriteBatch::new();

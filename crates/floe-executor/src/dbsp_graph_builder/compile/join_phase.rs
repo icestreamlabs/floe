@@ -27,7 +27,9 @@ impl DbspGraphBuilder {
     fn remap_transient_join_input_batches(
         graph_id: &str,
         side: &'static str,
-        mut input: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        mut input: tokio::sync::mpsc::UnboundedReceiver<
+            dbsp::join::TransientJoinInputBatch<Vec<u8>>,
+        >,
         transform: Arc<DeltaTransformFn>,
         task_events: &GraphTaskSender,
     ) -> tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>> {

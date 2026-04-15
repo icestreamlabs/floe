@@ -626,57 +626,52 @@ impl<'cfg> PlannerContext<'cfg> {
         }
 
         let input = self.plan_node(&window_plan.input)?;
-        let (partition_by, order_by, post_projection) =
-            if let Some(join) = join_for_row_number_rewrite(self, input.id) {
-                let mut join_relation_exprs = partition_by.clone();
-                join_relation_exprs.extend(order_by.iter().map(|sort| sort.expr.clone()));
-                if let Some(expressions) = post_projection.as_ref() {
-                    join_relation_exprs.extend(expressions.iter().cloned());
-                }
-                let join_relation_sides =
-                    infer_join_relation_sides(Some(join_relation_exprs.as_slice()), None, join);
-                let rewritten_partition_by = partition_by
-                    .into_iter()
-                    .map(|expr| {
-                        rewrite_join_output_projection_expr(expr, join, &join_relation_sides)
+        let (partition_by, order_by, post_projection) = if let Some(join) =
+            join_for_row_number_rewrite(self, input.id)
+        {
+            let mut join_relation_exprs = partition_by.clone();
+            join_relation_exprs.extend(order_by.iter().map(|sort| sort.expr.clone()));
+            if let Some(expressions) = post_projection.as_ref() {
+                join_relation_exprs.extend(expressions.iter().cloned());
+            }
+            let join_relation_sides =
+                infer_join_relation_sides(Some(join_relation_exprs.as_slice()), None, join);
+            let rewritten_partition_by = partition_by
+                .into_iter()
+                .map(|expr| rewrite_join_output_projection_expr(expr, join, &join_relation_sides))
+                .collect::<Result<Vec<_>, PlannerError>>()?;
+            let rewritten_order_by = order_by
+                .into_iter()
+                .map(|sort| {
+                    Ok(ExprSort {
+                        expr: rewrite_join_output_projection_expr(
+                            sort.expr,
+                            join,
+                            &join_relation_sides,
+                        )?,
+                        asc: sort.asc,
+                        nulls_first: sort.nulls_first,
                     })
-                    .collect::<Result<Vec<_>, PlannerError>>()?;
-                let rewritten_order_by = order_by
-                    .into_iter()
-                    .map(|sort| {
-                        Ok(ExprSort {
-                            expr: rewrite_join_output_projection_expr(
-                                sort.expr,
-                                join,
-                                &join_relation_sides,
-                            )?,
-                            asc: sort.asc,
-                            nulls_first: sort.nulls_first,
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()?;
+            let rewritten_post_projection = post_projection
+                .map(|expressions| {
+                    expressions
+                        .into_iter()
+                        .map(|expr| {
+                            rewrite_join_output_projection_expr(expr, join, &join_relation_sides)
                         })
-                    })
-                    .collect::<Result<Vec<_>, PlannerError>>()?;
-                let rewritten_post_projection = post_projection
-                    .map(|expressions| {
-                        expressions
-                            .into_iter()
-                            .map(|expr| {
-                                rewrite_join_output_projection_expr(
-                                    expr,
-                                    join,
-                                    &join_relation_sides,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, PlannerError>>()
-                    })
-                    .transpose()?;
-                (
-                    rewritten_partition_by,
-                    rewritten_order_by,
-                    rewritten_post_projection,
-                )
-            } else {
-                (partition_by, order_by, post_projection)
-            };
+                        .collect::<Result<Vec<_>, PlannerError>>()
+                })
+                .transpose()?;
+            (
+                rewritten_partition_by,
+                rewritten_order_by,
+                rewritten_post_projection,
+            )
+        } else {
+            (partition_by, order_by, post_projection)
+        };
         let order_by = self.map_sort_expressions(&order_by, input.schema.clone())?;
         let topn = DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, 0)?;
         let output_schema = topn.output_schema().clone();

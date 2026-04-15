@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,7 +27,8 @@ use crate::dbsp_plan::{
 use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, EncodedRowScalar, concat_encoded_rows,
-    extract_encoded_row_columns, extract_encoded_row_scalar,
+    extract_encoded_row_columns, extract_encoded_row_columns_and_i64_like_column,
+    extract_encoded_row_scalar,
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
@@ -207,6 +209,79 @@ impl DbspGraphBuilder {
             .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
 
         if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
+            if let Some(transient_window_root) =
+                try_build_transient_source_window_aggregate_root_materialization(
+                    inputs.plan,
+                    inputs.plan.root,
+                    inputs.outer_transient_streams,
+                    Arc::clone(&self.watermark),
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    self.graph_id(),
+                )
+                .await?
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_window_root.source_name,
+                    optimized_nodes = ?transient_window_root.optimized_nodes,
+                    "using transient window aggregate root materialization with source batch journal"
+                );
+                let identity_transform: Arc<DeltaTransformFn> =
+                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    transient_window_root.receiver,
+                    identity_transform,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
+            if let Some(transient_window_root) =
+                try_build_transient_source_window_count_star_root_materialization(
+                    inputs.plan,
+                    inputs.plan.root,
+                    inputs.outer_transient_streams,
+                    Arc::clone(&self.watermark),
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    self.graph_id(),
+                )?
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_window_root.source_name,
+                    optimized_nodes = ?transient_window_root.optimized_nodes,
+                    "using transient window count-star root materialization with source batch journal"
+                );
+                let identity_transform: Arc<DeltaTransformFn> =
+                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    transient_window_root.receiver,
+                    identity_transform,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
             if let Some(transient_aggregate_root) =
                 try_build_transient_source_aggregate_root_materialization(
                     inputs.plan,
@@ -1215,6 +1290,18 @@ struct TransientSourceAggregateRootMaterialization {
     receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
 }
 
+struct TransientSourceWindowCountStarRootMaterialization {
+    source_name: String,
+    optimized_nodes: Vec<usize>,
+    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+}
+
+struct TransientSourceWindowAggregateRootMaterialization {
+    source_name: String,
+    optimized_nodes: Vec<usize>,
+    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+}
+
 struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
@@ -1246,6 +1333,29 @@ struct TransientSourceAggregateRootShape {
     aggregate: DbspAggregateNode,
     optimized_nodes: Vec<usize>,
     transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone)]
+struct TransientSourceWindowCountStarRootShape {
+    source_root: TransientSourceRootMaterialization,
+    window: dbsp::DbspWindowAggregateNode,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone)]
+struct TransientSourceWindowAggregateRootShape {
+    source_root: TransientSourceRootMaterialization,
+    window: dbsp::DbspWindowAggregateNode,
+    optimized_nodes: Vec<usize>,
+    transform: Arc<DeltaTransformFn>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TransientWindowCountKey {
+    start: i64,
+    end: i64,
+    key: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -3444,6 +3554,12 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
     if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
     }
@@ -4460,6 +4576,261 @@ fn try_build_transient_source_aggregate_root_shape(
     }
 }
 
+fn try_build_transient_source_window_count_star_root_shape(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceWindowCountStarRootShape>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::WindowAggregate(window) => {
+            if !is_transient_window_count_star_root(window) {
+                return Ok(None);
+            }
+            let input_idx = first_input(root, "window aggregate")?;
+            let Some(source_root) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let mut optimized_nodes = source_root.optimized_nodes.clone();
+            optimized_nodes.push(root_idx);
+            Ok(Some(TransientSourceWindowCountStarRootShape {
+                source_root,
+                window: window.clone(),
+                optimized_nodes,
+                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+            }))
+        }
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(mut shape) =
+                try_build_transient_source_window_count_star_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) =
+                try_build_transient_source_window_count_star_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_filter_transform(select)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) = try_build_transient_source_window_count_star_root_shape(
+                    plan,
+                    select_input_idx,
+                )?
+                else {
+                    return Ok(None);
+                };
+                shape.transform = compose_delta_transforms(
+                    Arc::clone(&shape.transform),
+                    build_filter_map_transform(select, project)?,
+                );
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) =
+                try_build_transient_source_window_count_star_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_map_transform(project)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_build_transient_source_window_count_star_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+    outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+    graph_id: &str,
+) -> Result<Option<TransientSourceWindowCountStarRootMaterialization>> {
+    let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, root_idx)?
+    else {
+        return Ok(None);
+    };
+    let Some(upstream) = outer_transient_streams
+        .get(&shape.source_root.source_name)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let receiver = build_transient_window_count_star_receiver(
+        graph_id,
+        &shape.window,
+        upstream,
+        Arc::clone(&shape.source_root.transform),
+        Arc::clone(&shape.transform),
+        watermark,
+        cancel,
+        task_events,
+    )?;
+    Ok(Some(TransientSourceWindowCountStarRootMaterialization {
+        source_name: shape.source_root.source_name,
+        optimized_nodes: shape.optimized_nodes,
+        receiver,
+    }))
+}
+
+fn try_build_transient_source_window_aggregate_root_shape(
+    plan: &CircuitPlan,
+    root_idx: usize,
+) -> Result<Option<TransientSourceWindowAggregateRootShape>> {
+    let Some(root) = plan.node(root_idx) else {
+        return Ok(None);
+    };
+    match &root.kind {
+        DbspNodeKind::WindowAggregate(window) => {
+            if !is_transient_window_incremental_root(window) {
+                return Ok(None);
+            }
+            let input_idx = first_input(root, "window aggregate")?;
+            let Some(source_root) =
+                try_build_transient_source_root_materialization(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            let mut optimized_nodes = source_root.optimized_nodes.clone();
+            optimized_nodes.push(root_idx);
+            Ok(Some(TransientSourceWindowAggregateRootShape {
+                source_root,
+                window: window.clone(),
+                optimized_nodes,
+                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+            }))
+        }
+        DbspNodeKind::Passthrough => {
+            let input_idx = first_input(root, "passthrough")?;
+            let Some(mut shape) =
+                try_build_transient_source_window_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Select(select) => {
+            let input_idx = first_input(root, "select")?;
+            let Some(mut shape) =
+                try_build_transient_source_window_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_filter_transform(select)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        DbspNodeKind::Project(project) => {
+            let input_idx = first_input(root, "project")?;
+            if let Some(select_input_idx) = fuseable_select_input(plan, root_idx, input_idx)? {
+                let Some(select_node) = plan.node(input_idx) else {
+                    return Ok(None);
+                };
+                let DbspNodeKind::Select(select) = &select_node.kind else {
+                    return Ok(None);
+                };
+                let Some(mut shape) =
+                    try_build_transient_source_window_aggregate_root_shape(plan, select_input_idx)?
+                else {
+                    return Ok(None);
+                };
+                shape.transform = compose_delta_transforms(
+                    Arc::clone(&shape.transform),
+                    build_filter_map_transform(select, project)?,
+                );
+                shape.optimized_nodes.push(input_idx);
+                shape.optimized_nodes.push(root_idx);
+                return Ok(Some(shape));
+            }
+
+            let Some(mut shape) =
+                try_build_transient_source_window_aggregate_root_shape(plan, input_idx)?
+            else {
+                return Ok(None);
+            };
+            shape.transform = compose_delta_transforms(
+                Arc::clone(&shape.transform),
+                build_map_transform(project)?,
+            );
+            shape.optimized_nodes.push(root_idx);
+            Ok(Some(shape))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn try_build_transient_source_window_aggregate_root_materialization(
+    plan: &CircuitPlan,
+    root_idx: usize,
+    outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+    graph_id: &str,
+) -> Result<Option<TransientSourceWindowAggregateRootMaterialization>> {
+    let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, root_idx)?
+    else {
+        return Ok(None);
+    };
+    let Some(upstream) = outer_transient_streams
+        .get(&shape.source_root.source_name)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let receiver = build_transient_window_incremental_receiver(
+        graph_id,
+        &shape.window,
+        upstream,
+        Arc::clone(&shape.source_root.transform),
+        Arc::clone(&shape.transform),
+        watermark,
+        cancel,
+        task_events,
+    )
+    .await?;
+    Ok(Some(TransientSourceWindowAggregateRootMaterialization {
+        source_name: shape.source_root.source_name,
+        optimized_nodes: shape.optimized_nodes,
+        receiver,
+    }))
+}
+
 async fn try_build_transient_source_aggregate_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,
@@ -4801,6 +5172,403 @@ async fn build_transient_aggregate_receiver_from_batches(
     Ok(rx)
 }
 
+fn build_transient_window_count_star_receiver(
+    graph_id: &str,
+    window: &dbsp::DbspWindowAggregateNode,
+    upstream: TransientSourceHandleStream,
+    input_transform: Arc<DeltaTransformFn>,
+    output_transform: Arc<DeltaTransformFn>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let upstream_rx = build_transient_source_receiver(
+        graph_id,
+        format!("transient-window-count-star-source:{graph_id}"),
+        upstream,
+        input_transform,
+        cancel,
+        task_events,
+    );
+    build_transient_window_count_star_receiver_from_batches(
+        graph_id,
+        window,
+        upstream_rx,
+        output_transform,
+        watermark,
+        cancel,
+        task_events,
+    )
+}
+
+fn build_transient_window_count_star_receiver_from_batches(
+    graph_id: &str,
+    window: &dbsp::DbspWindowAggregateNode,
+    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    output_transform: Arc<DeltaTransformFn>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let (precompute_evaluator, eval_schema, expression_columns) =
+        build_transient_window_count_star_precompute(window)?;
+    let group_key_columns = transient_window_direct_group_key_columns(
+        window.aggregate.group_keys(),
+        eval_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .ok_or_else(|| anyhow!("failed to resolve transient window count-star group key columns"))?;
+    let time_column = transient_window_resolved_expression_column_index(
+        &window.window.time_expression,
+        eval_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .ok_or_else(|| anyhow!("failed to resolve transient window count-star time column"))?;
+    let (window_size, window_slide) = match &window.window.policy {
+        dbsp::DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
+        dbsp::DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
+        dbsp::DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
+    };
+    let allowed_lateness_ms = window.window.allowed_lateness_ms;
+    let group_key_columns = Arc::new(group_key_columns);
+    let graph_id = graph_id.to_string();
+    let task_label = format!("transient-window-count-star:{graph_id}");
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut counts: HashMap<TransientWindowCountKey, i64> = HashMap::new();
+        let mut eviction_schedule: BTreeMap<i64, Vec<TransientWindowCountKey>> = BTreeMap::new();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let input_deltas = batch.deltas.as_ref().clone();
+                    let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
+                        match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
+                    } else {
+                        input_deltas
+                    };
+                    let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
+                    let mut grouped_deltas: HashMap<TransientWindowCountKey, i64> = HashMap::new();
+                    for (row, weight) in input_deltas {
+                        if weight == 0 {
+                            continue;
+                        }
+                        let extracted = match extract_encoded_row_columns_and_i64_like_column(
+                            &row,
+                            group_key_columns.as_ref(),
+                            time_column,
+                            false,
+                        ) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    err.context("extract transient window count-star row"),
+                                );
+                                return;
+                            }
+                        };
+                        let Some((key, event_ts)) = extracted else {
+                            continue;
+                        };
+                        if event_ts < 0 {
+                            continue;
+                        }
+                        if let Some(cutoff) = cutoff
+                            && event_ts < cutoff
+                        {
+                            continue;
+                        }
+                        transient_window_for_each_window(
+                            event_ts,
+                            window_size,
+                            window_slide,
+                            |window_start, window_end| {
+                                let window_key = TransientWindowCountKey {
+                                    start: window_start,
+                                    end: window_end,
+                                    key: key.clone(),
+                                };
+                                merge_i64_delta(&mut grouped_deltas, window_key, weight);
+                            },
+                        );
+                    }
+
+                    let mut updates: HashMap<(TransientWindowCountKey, i64), i64> = HashMap::new();
+                    for (key, delta) in grouped_deltas {
+                        if delta == 0 {
+                            continue;
+                        }
+                        let old_count = counts.get(&key).copied().unwrap_or(0);
+                        let new_count = old_count.saturating_add(delta);
+                        if old_count == new_count {
+                            continue;
+                        }
+                        if old_count != 0 {
+                            merge_count_delta(&mut updates, key.clone(), old_count, -1);
+                        }
+                        if new_count != 0 {
+                            merge_count_delta(&mut updates, key.clone(), new_count, 1);
+                            if old_count == 0 {
+                                eviction_schedule.entry(key.end).or_default().push(key.clone());
+                            }
+                            counts.insert(key, new_count);
+                        } else {
+                            counts.remove(&key);
+                        }
+                    }
+
+                    transient_window_evict_expired_counts(
+                        cutoff,
+                        &mut counts,
+                        &mut eviction_schedule,
+                        &mut updates,
+                    );
+
+                    let encoded_output = match encode_transient_window_count_output_deltas(updates) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let final_deltas = match output_transform(&encoded_output) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(final_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
+async fn build_transient_window_incremental_receiver(
+    graph_id: &str,
+    window: &dbsp::DbspWindowAggregateNode,
+    upstream: TransientSourceHandleStream,
+    input_transform: Arc<DeltaTransformFn>,
+    output_transform: Arc<DeltaTransformFn>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let upstream_rx = build_transient_source_receiver(
+        graph_id,
+        format!("transient-window-aggregate-source:{graph_id}"),
+        upstream,
+        input_transform,
+        cancel,
+        task_events,
+    );
+    build_transient_window_incremental_receiver_from_batches(
+        graph_id,
+        window,
+        upstream_rx,
+        output_transform,
+        watermark,
+        cancel,
+        task_events,
+    )
+    .await
+}
+
+async fn build_transient_window_incremental_receiver_from_batches(
+    graph_id: &str,
+    window: &dbsp::DbspWindowAggregateNode,
+    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    output_transform: Arc<DeltaTransformFn>,
+    watermark: Arc<AtomicI64>,
+    cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
+) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let (precompute_evaluator, eval_schema, expression_columns) =
+        build_transient_window_aggregate_precompute(window)?;
+    let group_key_columns = transient_window_direct_group_key_columns(
+        window.aggregate.group_keys(),
+        eval_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .ok_or_else(|| anyhow!("failed to resolve transient window aggregate group key columns"))?;
+    let time_column = transient_window_resolved_expression_column_index(
+        &window.window.time_expression,
+        eval_schema.as_ref(),
+        expression_columns.as_ref(),
+    )
+    .ok_or_else(|| anyhow!("failed to resolve transient window aggregate time column"))?;
+    let (window_size, window_slide) = match &window.window.policy {
+        dbsp::DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
+        dbsp::DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
+        dbsp::DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
+    };
+    let allowed_lateness_ms = window.window.allowed_lateness_ms;
+    let slot_kinds = build_incremental_aggregate_slot_kinds(window.aggregate.aggregates())
+        .ok_or_else(|| {
+            anyhow!("window aggregate is not eligible for transient incremental aggregation")
+        })?;
+    let row_evaluator = build_incremental_aggregate_row_evaluator(
+        Arc::clone(&eval_schema),
+        window.aggregate.group_keys().to_vec(),
+        window.aggregate.aggregates().to_vec(),
+        Arc::clone(&expression_columns),
+        graph_id.to_string(),
+        "transient_window_aggregate",
+    );
+    let row_evaluator = Arc::new(row_evaluator);
+    let aggregate_processor = Arc::new(
+        dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, (Vec<u8>, Vec<u8>)>::new(
+            {
+                let row_evaluator = Arc::clone(&row_evaluator);
+                move |pair: &(Vec<u8>, Vec<u8>)| {
+                    row_evaluator(&pair.1).map(|mut row| {
+                        row.key = pair.0.clone();
+                        row
+                    })
+                }
+            },
+            slot_kinds,
+        )
+        .await
+        .context("initialize transient window incremental aggregate")?,
+    );
+    let group_key_columns = Arc::new(group_key_columns);
+    let graph_id = graph_id.to_string();
+    let task_label = format!("transient-window-aggregate:{graph_id}");
+    let task_events = task_events.clone();
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                maybe_batch = upstream_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    let input_deltas = batch.deltas.as_ref().clone();
+                    let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
+                        match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
+                    } else {
+                        input_deltas
+                    };
+                    let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
+                    let mut windowed_deltas = Vec::new();
+                    for (row, weight) in input_deltas {
+                        if weight == 0 {
+                            continue;
+                        }
+                        match extract_encoded_row_columns_and_i64_like_column(
+                            &row,
+                            group_key_columns.as_ref(),
+                            time_column,
+                            false,
+                        ) {
+                            Ok(Some((group_key, event_ts))) => {
+                                if event_ts < 0 {
+                                    continue;
+                                }
+                                if let Some(cutoff) = cutoff
+                                    && event_ts < cutoff
+                                {
+                                    continue;
+                                }
+                                transient_window_for_each_window(event_ts, window_size, window_slide, |window_start, window_end| {
+                                    let encoded_window = match encode_transient_window_bounds(window_start, window_end) {
+                                        Ok(encoded) => encoded,
+                                        Err(err) => {
+                                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                            return;
+                                        }
+                                    };
+                                    let encoded_key = if group_key_columns.is_empty() {
+                                        encoded_window
+                                    } else {
+                                        match concat_encoded_rows(&encoded_window, &group_key) {
+                                            Ok(encoded) => encoded,
+                                            Err(err) => {
+                                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                                return;
+                                            }
+                                        }
+                                    };
+                                    windowed_deltas.push(((encoded_key, row.clone()), weight));
+                                });
+                                continue;
+                            }
+                            Ok(None) => continue,
+                            Err(err) => {
+                                report_graph_task_error(
+                                    &task_events,
+                                    &graph_id,
+                                    task_label.clone(),
+                                    err.context("extract transient window aggregate row"),
+                                );
+                                return;
+                            }
+                        };
+                    }
+                    let aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    let final_deltas = match output_transform(&encoded_output) {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if tx.send(TransientMaterializeBatch {
+                        version: batch.version,
+                        deltas: Arc::new(final_deltas),
+                    }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
 fn build_transient_aggregate_precompute(
     aggregate: &DbspAggregateNode,
 ) -> Result<(
@@ -4881,6 +5649,123 @@ fn build_transient_aggregate_precompute(
     ))
 }
 
+fn build_transient_window_count_star_precompute(
+    window: &dbsp::DbspWindowAggregateNode,
+) -> Result<(
+    Option<Arc<VectorizedFilterProjectEvaluator>>,
+    Arc<RowSchema>,
+    Arc<HashMap<String, usize>>,
+)> {
+    let input_schema = Arc::clone(window.aggregate.input_schema());
+    let mut expressions = Vec::new();
+    expressions.extend(
+        window
+            .aggregate
+            .group_keys()
+            .iter()
+            .map(|group_key| group_key.expression().clone()),
+    );
+    expressions.push(window.window.time_expression.clone());
+    build_transient_expression_precompute(input_schema, expressions, "__floe_transient_window_expr")
+}
+
+fn build_transient_window_aggregate_precompute(
+    window: &dbsp::DbspWindowAggregateNode,
+) -> Result<(
+    Option<Arc<VectorizedFilterProjectEvaluator>>,
+    Arc<RowSchema>,
+    Arc<HashMap<String, usize>>,
+)> {
+    let input_schema = Arc::clone(window.aggregate.input_schema());
+    let mut expressions = Vec::new();
+    expressions.extend(
+        window
+            .aggregate
+            .group_keys()
+            .iter()
+            .map(|group_key| group_key.expression().clone()),
+    );
+    expressions.push(window.window.time_expression.clone());
+    for agg in window.aggregate.aggregates() {
+        if let Some(filter) = agg.filter() {
+            expressions.push(filter.clone());
+        }
+        if let Some(expr) = agg.expression() {
+            expressions.push(expr.clone());
+        }
+    }
+    build_transient_expression_precompute(
+        input_schema,
+        expressions,
+        "__floe_transient_window_aggregate_expr",
+    )
+}
+
+fn build_transient_expression_precompute(
+    input_schema: Arc<RowSchema>,
+    expressions: Vec<DbspExpression>,
+    alias_prefix: &str,
+) -> Result<(
+    Option<Arc<VectorizedFilterProjectEvaluator>>,
+    Arc<RowSchema>,
+    Arc<HashMap<String, usize>>,
+)> {
+    let mut direct_input_columns = BTreeSet::new();
+    let mut seen = HashSet::new();
+    let mut non_direct_expressions = Vec::new();
+    for expr in &expressions {
+        if let Some(column_idx) =
+            transient_aggregate_direct_column_index(expr, input_schema.as_ref())
+        {
+            direct_input_columns.insert(column_idx);
+            continue;
+        }
+        let key = transient_aggregate_expression_lookup_key(expr.expr());
+        if seen.insert(key.clone()) {
+            non_direct_expressions.push((key, expr.expr().clone()));
+        }
+    }
+    if non_direct_expressions.is_empty() {
+        return Ok((None, input_schema, Arc::new(HashMap::new())));
+    }
+
+    let mut items = Vec::with_capacity(direct_input_columns.len() + non_direct_expressions.len());
+    for column_idx in direct_input_columns {
+        let field = input_schema
+            .field(column_idx)
+            .ok_or_else(|| anyhow!("transient expression input column {column_idx} missing"))?;
+        items.push(dbsp::circuit::plan::ProjectItem {
+            expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+            alias: Some(field.name.clone()),
+        });
+    }
+
+    let mut expression_columns = HashMap::with_capacity(non_direct_expressions.len());
+    let mut next_index = items.len();
+    for (index, (key, expr)) in non_direct_expressions.into_iter().enumerate() {
+        let alias = format!("{alias_prefix}_{index}");
+        items.push(dbsp::circuit::plan::ProjectItem {
+            expr,
+            alias: Some(alias),
+        });
+        expression_columns.insert(key, next_index);
+        next_index += 1;
+    }
+
+    let project_node = DbspProjectNode::try_new(Arc::clone(&input_schema), items)
+        .context("build transient expression precompute projection")?;
+    let evaluator = VectorizedFilterProjectEvaluator::for_map(
+        project_node.expressions(),
+        Arc::clone(&input_schema),
+    )
+    .context("initialize transient expression precompute evaluator")?;
+    Ok((
+        Some(Arc::new(evaluator)),
+        Arc::clone(project_node.output_schema()),
+        Arc::new(expression_columns),
+    ))
+}
+
 fn transient_aggregate_direct_column_index(
     expression: &DbspExpression,
     schema: &RowSchema,
@@ -4911,6 +5796,165 @@ fn transient_aggregate_expression_lookup_key(expr: &Expr) -> String {
         Expr::Alias(alias) => transient_aggregate_expression_lookup_key(alias.expr.as_ref()),
         other => other.to_string(),
     }
+}
+
+fn transient_window_direct_group_key_columns(
+    group_keys: &[dbsp::circuit::plan::GroupKeyExpr],
+    schema: &RowSchema,
+    expression_columns: &HashMap<String, usize>,
+) -> Option<Vec<usize>> {
+    group_keys
+        .iter()
+        .map(|key_expr| {
+            transient_window_resolved_expression_column_index(
+                key_expr.expression(),
+                schema,
+                expression_columns,
+            )
+        })
+        .collect()
+}
+
+fn transient_window_resolved_expression_column_index(
+    expression: &DbspExpression,
+    schema: &RowSchema,
+    expression_columns: &HashMap<String, usize>,
+) -> Option<usize> {
+    transient_aggregate_direct_column_index(expression, schema).or_else(|| {
+        expression_columns
+            .get(&transient_aggregate_expression_lookup_key(
+                expression.expr(),
+            ))
+            .copied()
+    })
+}
+
+fn is_transient_window_count_star_root(window: &dbsp::DbspWindowAggregateNode) -> bool {
+    let aggregates = window.aggregate.aggregates();
+    aggregates.len() == 1
+        && aggregates.iter().all(|agg| {
+            agg.function() == &dbsp::DbspAggregateFunction::Count
+                && !agg.distinct()
+                && agg.filter().is_none()
+                && agg.expression().is_none_or(|expr| match expr.expr() {
+                    Expr::Literal(value, _) => !value.is_null(),
+                    _ => false,
+                })
+        })
+}
+
+fn is_transient_window_incremental_root(window: &dbsp::DbspWindowAggregateNode) -> bool {
+    build_incremental_aggregate_slot_kinds(window.aggregate.aggregates()).is_some()
+}
+
+fn transient_window_for_each_window<F>(ts: i64, window_size: i64, window_slide: i64, mut visit: F)
+where
+    F: FnMut(i64, i64),
+{
+    if window_size == window_slide {
+        let start = ts.div_euclid(window_slide) * window_slide;
+        visit(start, start + window_size);
+        return;
+    }
+
+    let latest_start = ts.div_euclid(window_slide) * window_slide;
+    let count = (window_size / window_slide).max(1);
+    let first_start = latest_start - (count - 1) * window_slide;
+    for i in 0..count {
+        let start = first_start + i * window_slide;
+        visit(start, start + window_size);
+    }
+}
+
+fn transient_window_watermark_cutoff(
+    watermark: &AtomicI64,
+    allowed_lateness_ms: i64,
+) -> Option<i64> {
+    let watermark = watermark.load(Ordering::Relaxed);
+    if watermark < 0 {
+        return None;
+    }
+    Some(watermark.saturating_sub(allowed_lateness_ms.max(0)))
+}
+
+fn merge_i64_delta(
+    map: &mut HashMap<TransientWindowCountKey, i64>,
+    key: TransientWindowCountKey,
+    delta: i64,
+) {
+    if delta == 0 {
+        return;
+    }
+    let entry = map.entry(key.clone()).or_insert(0);
+    *entry += delta;
+    if *entry == 0 {
+        map.remove(&key);
+    }
+}
+
+fn merge_count_delta(
+    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
+    key: TransientWindowCountKey,
+    count: i64,
+    diff: i64,
+) {
+    if diff == 0 {
+        return;
+    }
+    let pair = (key, count);
+    let entry = updates.entry(pair.clone()).or_insert(0);
+    *entry += diff;
+    if *entry == 0 {
+        updates.remove(&pair);
+    }
+}
+
+fn transient_window_evict_expired_counts(
+    cutoff: Option<i64>,
+    counts: &mut HashMap<TransientWindowCountKey, i64>,
+    eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
+) {
+    let Some(cutoff) = cutoff else {
+        return;
+    };
+    let retained = eviction_schedule.split_off(&(cutoff + 1));
+    let expired = std::mem::replace(eviction_schedule, retained);
+    for (_, keys) in expired {
+        for key in keys {
+            let Some(old_count) = counts.remove(&key) else {
+                continue;
+            };
+            merge_count_delta(updates, key, old_count, -1);
+        }
+    }
+}
+
+fn encode_transient_window_count_output_deltas(
+    deltas: HashMap<(TransientWindowCountKey, i64), i64>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut encoded = Vec::with_capacity(deltas.len());
+    for ((key, count), diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let encoded_window = encode_transient_window_bounds(key.start, key.end)?;
+        let with_key = concat_encoded_rows(&encoded_window, &key.key)?;
+        let encoded_count = encode_i64_values(std::slice::from_ref(&count))?;
+        let row = concat_encoded_rows(&with_key, &encoded_count)?;
+        encoded.push((row, diff));
+    }
+    Ok(encoded)
+}
+
+fn encode_transient_window_bounds(start: i64, end: i64) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(4 + 18);
+    encoded.extend_from_slice(&2_u32.to_le_bytes());
+    encoded.push(0x03);
+    encoded.extend_from_slice(&start.to_le_bytes());
+    encoded.push(0x03);
+    encoded.extend_from_slice(&end.to_le_bytes());
+    Ok(encoded)
 }
 
 fn encode_count_aggregate_output_deltas(
@@ -5947,6 +6991,66 @@ mod tests {
                 source_name: "nexmark_bid".to_string(),
                 required_columns: vec![1, 5],
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn q12_window_count_star_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT bidder, COUNT(*) AS bid_count \
+             FROM nexmark_bid \
+             GROUP BY bidder, TUMBLE(date_time, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q5_window_count_star_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT auction, COUNT(*) AS num \
+             FROM nexmark_bid \
+             GROUP BY auction, HOP(date_time, 2000, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn q7_window_incremental_shape_is_source_batch_journal_eligible() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT MAX(price) AS maxprice \
+             FROM nexmark_bid \
+             GROUP BY TUMBLE(date_time, 10000)",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
         );
     }
 

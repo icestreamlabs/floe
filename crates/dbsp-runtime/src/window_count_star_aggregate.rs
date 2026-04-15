@@ -178,15 +178,37 @@ where
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let dict = versioned.dictionary();
         let mut keyed_deltas = Vec::new();
         for (key, delta) in deltas {
-            if *delta == 0 {
-                continue;
+            if *delta != 0 {
+                keyed_deltas.push((key, *delta));
             }
-            keyed_deltas.push((key, *delta));
         }
+        if keyed_deltas.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
+            }
+            return Ok(versioned.handle_for_version(0));
+        }
+
+        if versioned.uses_replayable_persistence() {
+            anyhow::ensure!(
+                base.is_none(),
+                "replayable versioned ZSet does not support persisted base chaining"
+            );
+            let batch = Arc::new(
+                keyed_deltas
+                    .iter()
+                    .map(|(key, delta)| ((*key).clone(), *delta))
+                    .collect(),
+            );
+            return Ok(versioned.publish_replayable_batch(batch));
+        }
+
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let dict = versioned.dictionary();
         let ids = dict
             .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))
             .await
@@ -212,15 +234,6 @@ where
             });
         }
 
-        if segments.is_empty() {
-            if base.is_some()
-                && let Some(handle) = versioned.current_handle()
-            {
-                return Ok(handle);
-            }
-            return Ok(versioned.handle_for_version(0));
-        }
-
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -235,6 +248,10 @@ where
 
         versioned.apply_version_plan(&plan);
         Ok(versioned.handle_for_version(plan.version))
+    }
+
+    fn enable_live_output_replayable(&mut self) {
+        self.output.enable_replayable_persistence();
     }
 
     async fn evict_expired_windows(
@@ -538,6 +555,7 @@ impl DbspWindowCountStarAggregate {
         {
             let mut op_guard = window_op.lock().await;
             op_guard.state.enable_live_replayable();
+            op_guard.enable_live_output_replayable();
         }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));

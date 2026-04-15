@@ -389,6 +389,7 @@ impl DbspWindowCountAggregate {
         {
             let mut op_guard = window_op.lock().await;
             op_guard.count_op.state.enable_live_replayable();
+            op_guard.count_op.enable_live_output_replayable();
         }
 
         let writer = Arc::new(AsyncMutex::new(stream.clone()));

@@ -10,7 +10,7 @@ ARTIFACT_ROOT="${ARTIFACT_ROOT:-${REPO_ROOT}/target/third_party_engine_benchmark
 RUN_ID="$(date +%s%3N)"
 NETWORK_NAME="${NETWORK_NAME:-floe-stream-bench-net}"
 
-BID_ROWS="${BID_ROWS:-100000}"
+BID_ROWS="${BID_ROWS:-1000000}"
 AUCTION_ROWS="${AUCTION_ROWS:-10000}"
 PERSON_ROWS="${PERSON_ROWS:-10000}"
 

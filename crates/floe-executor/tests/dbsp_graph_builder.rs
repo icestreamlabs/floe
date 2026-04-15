@@ -2652,19 +2652,22 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
     sort_rows_by_first_column(&mut rows);
     assert_eq!(
         rows,
-        vec![vec![
-            Some(EncodedRowScalar::Int64(1)),
-            Some(EncodedRowScalar::Int64(42)),
-            Some(EncodedRowScalar::Int64(10)),
-            Some(EncodedRowScalar::TimestampMillis(1_700_000_001_000)),
-            Some(EncodedRowScalar::Int64(7)),
-        ], vec![
-            Some(EncodedRowScalar::Int64(1)),
-            Some(EncodedRowScalar::Int64(84)),
-            Some(EncodedRowScalar::Int64(20)),
-            Some(EncodedRowScalar::TimestampMillis(1_700_000_002_000)),
-            Some(EncodedRowScalar::Int64(7)),
-        ]]
+        vec![
+            vec![
+                Some(EncodedRowScalar::Int64(1)),
+                Some(EncodedRowScalar::Int64(42)),
+                Some(EncodedRowScalar::Int64(10)),
+                Some(EncodedRowScalar::TimestampMillis(1_700_000_001_000)),
+                Some(EncodedRowScalar::Int64(7)),
+            ],
+            vec![
+                Some(EncodedRowScalar::Int64(1)),
+                Some(EncodedRowScalar::Int64(84)),
+                Some(EncodedRowScalar::Int64(20)),
+                Some(EncodedRowScalar::TimestampMillis(1_700_000_002_000)),
+                Some(EncodedRowScalar::Int64(7)),
+            ]
+        ]
     );
 }
 
