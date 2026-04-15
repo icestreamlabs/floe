@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -83,6 +84,7 @@ where
         versioned: &mut VersionedZSet<K>,
         deltas: &HashMap<K, i64>,
         base: Option<u64>,
+        state_label: &'static str,
     ) -> Result<ZSetHandle> {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
@@ -125,6 +127,7 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
+        let persist_start = std::time::Instant::now();
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -138,6 +141,11 @@ where
             .context("write distinct version update")?;
 
         versioned.apply_version_plan(&plan);
+        metrics::observe_operator_persistence_latency_ms(
+            "distinct",
+            state_label,
+            persist_start.elapsed().as_millis() as u64,
+        );
         Ok(versioned.handle_for_version(plan.version))
     }
 }
@@ -216,9 +224,14 @@ where
             .current_handle()
             .map(|handle| handle.version);
         let new_integrated_handle =
-            Self::apply_deltas_to_versioned(&mut self.state.integrated, &delta_map, base_version)
-                .await
-                .context("update integrated state for distinct")?;
+            Self::apply_deltas_to_versioned(
+                &mut self.state.integrated,
+                &delta_map,
+                base_version,
+                "integrated_input",
+            )
+            .await
+            .context("update integrated state for distinct")?;
         self.state.update_handle(new_integrated_handle);
 
         if let Some(integrated_map) = self.integrated_cache.as_mut() {
@@ -235,9 +248,10 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let h_handle = Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None)
-            .await
-            .context("persist distinct H output")?;
+        let h_handle =
+            Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None, "output")
+                .await
+                .context("persist distinct H output")?;
         publish_transient_zset_batch(&h_handle, Arc::new(h_deltas.into_iter().collect::<Vec<_>>()));
         Ok(Some(h_handle))
     }

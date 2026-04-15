@@ -12,6 +12,7 @@ use slatedb::WriteBatch;
 
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -156,6 +157,7 @@ where
         versioned: &mut VersionedZSet<K>,
         deltas: &HashMap<K, i64>,
         base: Option<u64>,
+        state_label: &'static str,
     ) -> Result<ZSetHandle> {
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
@@ -198,6 +200,7 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
+        let persist_start = std::time::Instant::now();
         let mut batch = WriteBatch::new();
         let plan = versioned
             .enqueue_version_with_base(segments, base, 0, &mut batch)
@@ -211,6 +214,11 @@ where
             .context("write topk version update")?;
 
         versioned.apply_version_plan(&plan);
+        metrics::observe_operator_persistence_latency_ms(
+            "topk",
+            state_label,
+            persist_start.elapsed().as_millis() as u64,
+        );
         Ok(versioned.handle_for_version(plan.version))
     }
 }
@@ -292,9 +300,14 @@ where
             .current_handle()
             .map(|handle| handle.version);
         let new_integrated_handle =
-            Self::apply_deltas_to_versioned(&mut self.state.integrated, &delta_map, base_version)
-                .await
-                .context("update topk input state")?;
+            Self::apply_deltas_to_versioned(
+                &mut self.state.integrated,
+                &delta_map,
+                base_version,
+                "integrated_input",
+            )
+            .await
+            .context("update topk input state")?;
         self.state.update_handle(new_integrated_handle);
 
         if let Some(input_cache) = self.input_cache.as_mut() {
@@ -357,9 +370,10 @@ where
         }
 
         let output_delta: HashMap<K, i64> = output_delta_vec.into_iter().collect();
-        let output_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None)
-            .await
-            .context("persist topk output delta")?;
+        let output_handle =
+            Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None, "output")
+                .await
+                .context("persist topk output delta")?;
         publish_transient_zset_batch(
             &output_handle,
             Arc::new(output_delta.into_iter().collect::<Vec<_>>()),
