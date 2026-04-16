@@ -7332,11 +7332,37 @@ mod tests {
         );
         let &window_input_idx = window.inputs.first().expect("window source input");
         let window_input = plan.node(window_input_idx).expect("window input node");
-        assert!(
-            matches!(window_input.kind, DbspNodeKind::Source(_)),
-            "expected optimized q5 window aggregate to read directly from source, found {:?}",
-            window_input.kind
-        );
+        match &window_input.kind {
+            DbspNodeKind::Source(_) => {}
+            DbspNodeKind::Project(project) => {
+                let &project_input_idx = window_input
+                    .inputs
+                    .first()
+                    .expect("project source input");
+                let project_input = plan
+                    .node(project_input_idx)
+                    .expect("project source input node");
+                assert!(
+                    matches!(project_input.kind, DbspNodeKind::Source(_)),
+                    "expected optimized q5 window aggregate projection input to be source, found {:?}",
+                    project_input.kind
+                );
+                let projected_fields = project
+                    .output_schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    projected_fields,
+                    vec!["auction", "date_time"],
+                    "optimized q5 window aggregate projection should only keep required columns"
+                );
+            }
+            other => panic!(
+                "expected optimized q5 window aggregate input to be source or source projection, found {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -7366,11 +7392,37 @@ mod tests {
         );
         let &window_input_idx = window.inputs.first().expect("window source input");
         let window_input = plan.node(window_input_idx).expect("window input node");
-        assert!(
-            matches!(window_input.kind, DbspNodeKind::Source(_)),
-            "expected optimized q7 window aggregate to read directly from source, found {:?}",
-            window_input.kind
-        );
+        match &window_input.kind {
+            DbspNodeKind::Source(_) => {}
+            DbspNodeKind::Project(project) => {
+                let &project_input_idx = window_input
+                    .inputs
+                    .first()
+                    .expect("project source input");
+                let project_input = plan
+                    .node(project_input_idx)
+                    .expect("project source input node");
+                assert!(
+                    matches!(project_input.kind, DbspNodeKind::Source(_)),
+                    "expected optimized q7 window aggregate projection input to be source, found {:?}",
+                    project_input.kind
+                );
+                let projected_fields = project
+                    .output_schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    projected_fields,
+                    vec!["price", "date_time"],
+                    "optimized q7 window aggregate projection should only keep required columns"
+                );
+            }
+            other => panic!(
+                "expected optimized q7 window aggregate input to be source or source projection, found {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8993,7 +9045,6 @@ mod tests {
         );
 
         let mut cache = HashMap::new();
-        let mut expected_transient_version = 1_i64;
         for tick in 0..64usize {
             let ts = i64::try_from(tick + 2).expect("tick version");
             let bid_batch = vec![
@@ -9059,10 +9110,9 @@ mod tests {
             let transient_raw = match timeout(recv_timeout, observer_rx.recv()).await {
                 Ok(Some((version, transient_batch))) => {
                     assert_eq!(
-                        version, expected_transient_version,
+                        version, ts,
                         "unexpected transient join output version at bid tick {tick}"
                     );
-                    expected_transient_version = expected_transient_version.saturating_add(1);
                     transient_batch.as_ref().clone()
                 }
                 Ok(None) | Err(_) => Vec::new(),

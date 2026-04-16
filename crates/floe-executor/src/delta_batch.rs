@@ -73,10 +73,11 @@ impl DeltaBatchBuffer {
         }
         fields.push(Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false));
         let delta_schema = Arc::new(Schema::new(fields));
+        let initial_capacity = initial_column_capacity(&config);
         let columns = base_schema
             .fields()
             .iter()
-            .map(|field| ScalarColumnBuilder::new(field.data_type(), config.max_rows))
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), initial_capacity))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -193,6 +194,14 @@ impl DeltaBatchBuffer {
         tracing::debug!(rows, bytes, ?reason, "delta batch flushed");
 
         Ok(Some(batch))
+    }
+}
+
+fn initial_column_capacity(config: &DeltaBatchConfig) -> usize {
+    match config.max_rows {
+        0 => 0,
+        usize::MAX => DeltaBatchConfig::default().max_rows,
+        rows => rows,
     }
 }
 
