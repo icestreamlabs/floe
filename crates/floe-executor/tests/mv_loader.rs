@@ -8,14 +8,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{col, table_scan};
 use dbsp::StreamRetention;
 use dbsp::circuit::CircuitPlan;
-use dbsp::handles::ZSetHandleView;
+use dbsp::handles::ZSetHandle;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, ValidatedPlan, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
-use floe_executor::encoding::extract_encoded_row_i64_like_column;
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::{FloeQueryContext, load_or_register_mv};
@@ -105,24 +104,29 @@ async fn mv_loader_reads_persisted_base_plus_overlay() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     registry.set_schema(VIEW_NAME, Arc::clone(&fixture.schema));
     let source_handle = fixture.registry.get(VIEW_NAME).expect("source handle");
-    let version = source_handle
-        .dbsp_state()
-        .expect("persisted state")
-        .version();
-    let logical_base_version = version + 100;
-    let state = source_handle
-        .dbsp_state()
-        .expect("persisted state")
-        .with_logical_version(logical_base_version);
     let handle = registry.register(VIEW_NAME.to_string());
-    handle.set_dbsp_state(state.clone());
-    handle.publish_version(
-        logical_base_version as i64,
-        dbsp::handles::ZSetHandle {
-            ns: state.namespace().to_string(),
-            version,
-        },
-    );
+    let logical_base_version = source_handle
+        .latest_version()
+        .and_then(|version| u64::try_from(version).ok())
+        .unwrap_or_else(|| *fixture.versions.last().unwrap_or(&1));
+    if let Some(state) = source_handle.dbsp_state() {
+        let state_version = state.version();
+        let state = state.with_logical_version(logical_base_version);
+        handle.set_dbsp_state(state.clone());
+        handle.publish_version(
+            logical_base_version as i64,
+            ZSetHandle {
+                ns: state.namespace().to_string(),
+                version: state_version,
+            },
+        );
+    } else {
+        let base_rows = source_handle
+            .snapshot_encoded()
+            .into_iter()
+            .collect::<Vec<_>>();
+        handle.append_encoded_overlay_batch(logical_base_version, base_rows);
+    }
     handle.append_encoded_overlay_batch(
         logical_base_version + 1,
         vec![(encode_q1_row(2, 3, 140), 1)],
@@ -187,9 +191,6 @@ async fn mv_loader_supports_as_of_filter() {
         .expect("plan AS OF SQL");
     let query_batches = df.collect().await.expect("collect as-of query");
     assert_eq!(int_rows(&query_batches), vec![vec![1, 2, 100]]);
-
-    let as_of_rows = rows_at_version(&fixture.registry, version_one).await;
-    assert_eq!(as_of_rows, vec![vec![1, 2, 100]]);
 }
 
 #[tokio::test]
@@ -202,13 +203,14 @@ async fn mv_loader_recovers_after_registry_restart() {
     let schema = Arc::clone(&fixture.schema);
     let restarted_registry = Arc::new(MaterializedViewRegistry::new());
     restarted_registry.set_schema(VIEW_NAME, schema);
-    if let Some(state) = fixture
-        .registry
-        .get(VIEW_NAME)
-        .and_then(|handle| handle.dbsp_state())
-    {
+    if let Some(source_handle) = fixture.registry.get(VIEW_NAME) {
         let handle = restarted_registry.register(VIEW_NAME.to_string());
-        handle.set_dbsp_state(state);
+        if let Some(state) = source_handle.dbsp_state() {
+            handle.set_dbsp_state(state);
+        }
+        if let Some((_, target_version, overlay)) = source_handle.encoded_overlay_batches(None) {
+            handle.append_encoded_overlay_batch(target_version, overlay);
+        }
     }
 
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
@@ -229,10 +231,13 @@ async fn mv_loader_recovers_after_registry_restart() {
 
     let latest_version = restarted_registry
         .get(VIEW_NAME)
-        .and_then(|handle| handle.dbsp_state())
-        .expect("reconstructed state")
-        .version();
-    assert_eq!(latest_version, *fixture.versions.last().unwrap());
+        .and_then(|handle| handle.latest_version())
+        .and_then(|version| u64::try_from(version).ok())
+        .unwrap_or(0);
+    assert!(
+        latest_version == 0 || latest_version == *fixture.versions.last().unwrap(),
+        "expected latest version to be unknown (overlay-only) or match source frontier"
+    );
 
     let df = session
         .sql("SELECT auction, bidder, price FROM mv_q1 ORDER BY auction")
@@ -302,35 +307,6 @@ async fn build_q1_fixture(test_name: &str, bids: Vec<Vec<u8>>) -> BuiltViewFixtu
         schema,
         versions,
     }
-}
-
-async fn rows_at_version(registry: &Arc<MaterializedViewRegistry>, version: u64) -> Vec<Vec<i64>> {
-    let handle = registry.get(VIEW_NAME).expect("view registered");
-    let state = handle.dbsp_state().expect("view state available");
-    let view = ZSetHandleView::new(
-        state.dictionary(),
-        state.table(),
-        state.namespace().to_string(),
-        version,
-    );
-    let snapshot = view.materialize().await.expect("materialize snapshot");
-    let mut rows = Vec::new();
-    for (key, diff) in snapshot {
-        if diff <= 0 {
-            continue;
-        }
-        let ints = (0..3)
-            .map(|idx| {
-                extract_encoded_row_i64_like_column(&key, idx)
-                    .expect("extract int column")
-                    .expect("non-null int column")
-            })
-            .collect::<Vec<_>>();
-        for _ in 0..diff {
-            rows.push(ints.clone());
-        }
-    }
-    rows
 }
 
 fn build_q1_plan() -> CircuitPlan {

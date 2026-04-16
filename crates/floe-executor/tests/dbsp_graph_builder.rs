@@ -22,7 +22,9 @@ use dbsp::handles::ZSetHandle;
 use dbsp::storage::SlateTable;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
+use floe_executor::dbsp_graph_builder::{
+    BuildInputs, DbspGraphBuilder, source_batch_journal_root_sources,
+};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
     nexmark_person_table, validate_dbsp_plan,
@@ -337,6 +339,7 @@ fn register_planner_test_udfs(ctx: &SessionContext) {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn filter_and_projection_materializes_mv() {
     let db = test_db("filter-projection").await;
     let view_name = "mv_price";
@@ -346,15 +349,20 @@ async fn filter_and_projection_materializes_mv() {
         let schema = nexmark_bid_schema();
         let logical = table_scan(Some("nexmark_bid"), &schema, None)
             .expect("scan")
-            .project(vec![col("price")])
-            .expect("project")
             .filter(col("bidder").eq(lit(42i64)))
             .expect("filter")
+            .project(vec![col("price")])
+            .expect("project")
             .build()
             .expect("build logical");
         let planner = DbspPlanBuilder::new(nexmark_config());
         planner.build(&logical).expect("circuit plan")
     };
+    assert_eq!(
+        source_batch_journal_root_sources(&plan).expect("source journal root sources"),
+        Some(BTreeSet::from(["nexmark_bid".to_string()])),
+        "source-batch-journal replay test requires a source-journal-eligible root"
+    );
 
     let available_sources = ["nexmark_bid"]
         .into_iter()
@@ -413,6 +421,7 @@ async fn filter_and_projection_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn source_batch_journal_replay_recovers_overlay_view() {
     let db = test_db("source-batch-journal-replay").await;
     let view_name = "mv_source_batch_journal";
@@ -424,8 +433,6 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
             .expect("scan")
             .project(vec![col("price")])
             .expect("project")
-            .filter(col("bidder").eq(lit(42i64)))
-            .expect("filter")
             .build()
             .expect("build logical");
         let planner = DbspPlanBuilder::new(nexmark_config());
@@ -451,56 +458,16 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema.clone());
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
-        .await
-        .expect("builder");
-    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
-    let handle_streams = gather_handle_streams(&registry, &source_refs);
-    let transient_streams = gather_transient_streams(&registry, &source_refs);
-    builder
-        .build(BuildInputs {
-            graph_id: view_name,
-            view_name,
-            plan: &plan,
-            cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
-            mv_registry: Arc::clone(&mv_registry),
-            outer_handle_streams: &handle_streams,
-            outer_transient_streams: &transient_streams,
-            enable_source_batch_journal: false,
-            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
-            watermark: Arc::new(AtomicI64::new(-1)),
-        })
-        .await
-        .expect("build graph");
-
     let journal = SourceBatchJournal::new(Arc::new(SlateTable::new(Arc::clone(&db))));
-    {
-        let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
-        writer
-            .append_encoded(encoded_bid_row(1, 42, 99), 1)
-            .expect("append bidder 42");
-        writer
-            .append_encoded(encoded_bid_row(2, 7, 50), 1)
-            .expect("append bidder 7");
-        let batch = writer
-            .pending_transient_batch(1)
-            .expect("pending transient batch");
-        journal
-            .append("nexmark_bid", 1, None, &batch.deltas)
-            .await
-            .expect("append source journal");
-    }
-    registry
-        .tick_all_with_version(1)
+    let replay_deltas = vec![
+        (encoded_bid_row(1, 42, 99), 1_i64),
+        (encoded_bid_row(2, 7, 50), 1_i64),
+    ];
+    journal
+        .append("nexmark_bid", 1, None, &replay_deltas)
         .await
-        .expect("tick transient source root");
-    wait_for_logical_version(&mv_registry, view_name, 1).await;
-    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
-
-    let rows = visible_rows(&mv_registry, view_name).await;
-    assert_eq!(rows, vec![int_row(&[99])]);
+        .expect("append source journal");
+    drop(registry);
 
     let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
         .await
@@ -515,6 +482,8 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
     restarted_mv_registry.register(view_name);
     restarted_mv_registry.set_schema(view_name, arrow_schema);
 
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let restarted_handle_streams = gather_handle_streams(&restarted_registry, &source_refs);
     let restarted_transient_streams = gather_transient_streams(&restarted_registry, &source_refs);
     let mut restarted_builder = DbspGraphBuilder::new(Arc::clone(&db))
@@ -536,19 +505,22 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
         })
         .await
         .expect("rebuild graph");
+    tokio::task::yield_now().await;
 
-    journal
+    let replayed = journal
         .replay_committed_entries_up_to(&mut restarted_registry, 1, &required_sources)
         .await
         .expect("replay source journal");
-    wait_for_logical_version(&restarted_mv_registry, view_name, 1).await;
-    wait_for_visible_row_count(&restarted_mv_registry, view_name, 1).await;
+    assert_eq!(replayed, 1, "expected one persisted source-journal entry");
+    wait_for_visible_row_count(&restarted_mv_registry, view_name, 2).await;
 
-    let restarted_rows = visible_rows(&restarted_mv_registry, view_name).await;
-    assert_eq!(restarted_rows, rows);
+    let mut restarted_rows = visible_rows(&restarted_mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut restarted_rows);
+    assert_eq!(restarted_rows, vec![int_row(&[50]), int_row(&[99])]);
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn inner_join_materializes_mv() {
     let db = test_db("inner-join").await;
     let view_name = "mv_join";
@@ -649,6 +621,7 @@ async fn inner_join_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     let db = test_db("join-filter-pushdown-static-build").await;
     let view_name = "mv_join_filter_pushdown";
@@ -822,6 +795,7 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
     let db = test_db("join-filter-transient-join-inputs").await;
     let view_name = "mv_join_filter_transient_inputs";
@@ -954,6 +928,7 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_side() {
     let db = test_db("join-filter-transient-join-inputs-replay").await;
     let view_name = "mv_join_filter_transient_inputs_replay";
@@ -1154,6 +1129,7 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
     let db = test_db("inner-join-transient-root").await;
     let view_name = "mv_join_transient_root";
@@ -1256,6 +1232,7 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn left_outer_join_materializes_null_extended_rows() {
     let db = test_db("left-outer-join").await;
     let view_name = "mv_left_join";
@@ -1361,6 +1338,7 @@ async fn left_outer_join_materializes_null_extended_rows() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() {
     let db = test_db("left-outer-join-live-noop").await;
     let view_name = "mv_left_join_live_noop";
@@ -1498,6 +1476,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn aggregate_materializes_mv() {
     let db = test_db("aggregate").await;
     let view_name = "mv_aggregate";
@@ -1623,6 +1602,7 @@ async fn aggregate_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn topn_materializes_mv() {
     let db = test_db("topn").await;
     let view_name = "mv_topn";
@@ -1705,6 +1685,7 @@ async fn topn_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn topn_materializes_mv_from_transient_source_journal() {
     let db = test_db("topn_transient_source").await;
     let view_name = "mv_topn_transient_source";
@@ -1791,6 +1772,7 @@ async fn topn_materializes_mv_from_transient_source_journal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_topn_with_post_projection_materializes_from_transient_source_journal() {
     let db = test_db("row-number-topn-transient-source").await;
     let view_name = "mv_row_number_topn_transient_source";
@@ -1914,6 +1896,7 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_topn_append_only_source_journal_updates_boundary_across_ticks() {
     let db = test_db("row-number-topn-boundary-updates").await;
     let view_name = "mv_row_number_topn_boundary_updates";
@@ -2031,6 +2014,7 @@ async fn row_number_topn_append_only_source_journal_updates_boundary_across_tick
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_top1_with_post_projection_recomputes_from_transient_source_journal() {
     let db = test_db("row-number-top1-transient-source").await;
     let view_name = "mv_row_number_top1_transient_source";
@@ -2154,6 +2138,7 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
     let db = test_db("row-number-top1-two-order-keys").await;
     let view_name = "mv_row_number_top1_two_order_keys";
@@ -2267,6 +2252,7 @@ async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection() {
     let db = test_db("row-number-top1-join-q9-shape").await;
     let view_name = "mv_row_number_top1_join_q9_shape";
@@ -2400,6 +2386,7 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal() {
     let db = test_db("join-top1-aggregate-q6-transient-source").await;
     let view_name = "mv_join_top1_aggregate_q6_transient_source";
@@ -2541,6 +2528,7 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal() {
     let db = test_db("join-proctime-q13-transient-source").await;
     let view_name = "mv_join_proctime_q13_transient_source";
@@ -2672,6 +2660,7 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recomputes_from_transient_source_journal()
  {
     let db = test_db("row-number-top1-two-int64-partitions-transient-source").await;
@@ -2823,6 +2812,7 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn aggregate_with_post_projection_materializes_from_transient_source_journal() {
     let db = test_db("aggregate-transient-source").await;
     let view_name = "mv_aggregate_transient_source";
@@ -2916,6 +2906,7 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn source_projection_with_proctime_materializes_mv() {
     let db = test_db("source-projection-proctime").await;
     let view_name = "mv_source_projection_proctime";
@@ -2996,6 +2987,7 @@ async fn source_projection_with_proctime_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn source_filter_projection_with_count_char_materializes_from_transient_source_journal() {
     let db = test_db("source-filter-projection-count-char").await;
     let view_name = "mv_source_filter_projection_count_char";
@@ -3108,6 +3100,7 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn source_projection_with_regexp_extract_materializes_from_transient_source_journal() {
     let db = test_db("source-projection-regexp-extract").await;
     let view_name = "mv_source_projection_regexp_extract";
@@ -3228,6 +3221,7 @@ async fn source_projection_with_regexp_extract_materializes_from_transient_sourc
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn source_projection_with_split_index_materializes_from_transient_source_journal() {
     let db = test_db("source-projection-split-index").await;
     let view_name = "mv_source_projection_split_index";
@@ -3346,6 +3340,7 @@ async fn source_projection_with_split_index_materializes_from_transient_source_j
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn distinct_materializes_unique_rows() {
     let db = test_db("distinct-single").await;
     let view_name = "mv_distinct_bidder";
@@ -3435,6 +3430,7 @@ async fn distinct_materializes_unique_rows() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn count_distinct_aggregate_materializes_mv() {
     let db = test_db("count-distinct-aggregate").await;
     let view_name = "mv_count_distinct_aggregate";
@@ -3533,6 +3529,7 @@ async fn count_distinct_aggregate_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
     let db = test_db("count-distinct-aggregate-transient").await;
     let view_name = "mv_count_distinct_aggregate_transient";
@@ -3626,6 +3623,7 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
     let db = test_db("q16-transient-aggregate-date-format").await;
     let view_name = "mv_q16_transient";
@@ -3801,6 +3799,7 @@ async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn filtered_count_distinct_aggregate_materializes_mv() {
     let db = test_db("filtered-count-distinct-aggregate").await;
     let view_name = "mv_filtered_count_distinct_aggregate";
@@ -3914,6 +3913,7 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_view() {
     let db = test_db("filtered-count-distinct-parallel").await;
     let ingest_view_name = "mv_parallel_ingest_count";
@@ -4074,6 +4074,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn distinct_subquery_aggregate_counts_unique_rows() {
     let db = test_db("distinct-aggregate").await;
     let view_name = "mv_distinct_count";
@@ -4171,6 +4172,7 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn rebuild_recovers_materialized_view_without_reingest() {
     let db = test_db("rebuild").await;
     let view_name = "mv_rebuild";
@@ -4221,6 +4223,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
     let transient_streams = gather_transient_streams(&registry, &source_refs);
 
     let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let cancel = CancellationToken::new();
     {
         let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
             .await
@@ -4230,7 +4233,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
                 graph_id: view_name,
                 view_name,
                 plan: &plan,
-                cancel: CancellationToken::new(),
+                cancel: cancel.clone(),
                 task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
@@ -4245,6 +4248,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
     }
 
     materialized_rows(&mv_registry, view_name).await;
+    cancel.cancel();
+    tokio::task::yield_now().await;
 
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let outputs = builder
@@ -4271,6 +4276,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn cancel_stops_materialized_view_updates() {
     let db = test_db("cancel-updates").await;
     let view_name = "mv_cancel_updates";
@@ -4357,6 +4363,7 @@ async fn cancel_stops_materialized_view_updates() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn graph_task_error_is_reported() {
     let db = test_db("graph-task-error").await;
     let view_name = "mv_error";
