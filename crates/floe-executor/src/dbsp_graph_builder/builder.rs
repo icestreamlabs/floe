@@ -228,13 +228,11 @@ impl DbspGraphBuilder {
                     optimized_nodes = ?transient_window_root.optimized_nodes,
                     "using transient window aggregate root materialization with source batch journal"
                 );
-                let identity_transform: Arc<DeltaTransformFn> =
-                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
                 self.materialize_view_from_transient_overlay_receiver(
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
                     transient_window_root.receiver,
-                    identity_transform,
+                    None,
                     &inputs.cancel,
                     &inputs.task_events,
                     &inputs.mv_registry,
@@ -264,13 +262,11 @@ impl DbspGraphBuilder {
                     optimized_nodes = ?transient_window_root.optimized_nodes,
                     "using transient window count-star root materialization with source batch journal"
                 );
-                let identity_transform: Arc<DeltaTransformFn> =
-                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
                 self.materialize_view_from_transient_overlay_receiver(
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
                     transient_window_root.receiver,
-                    identity_transform,
+                    None,
                     &inputs.cancel,
                     &inputs.task_events,
                     &inputs.mv_registry,
@@ -300,13 +296,11 @@ impl DbspGraphBuilder {
                     optimized_nodes = ?transient_aggregate_root.optimized_nodes,
                     "using transient aggregate root materialization with source batch journal"
                 );
-                let identity_transform: Arc<DeltaTransformFn> =
-                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
                 self.materialize_view_from_transient_overlay_receiver(
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
                     transient_aggregate_root.receiver,
-                    identity_transform,
+                    None,
                     &inputs.cancel,
                     &inputs.task_events,
                     &inputs.mv_registry,
@@ -337,7 +331,7 @@ impl DbspGraphBuilder {
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
                     transient_topn_root.receiver,
-                    Arc::clone(&transient_topn_root.transform),
+                    transient_topn_root.transform.clone(),
                     &inputs.cancel,
                     &inputs.task_events,
                     &inputs.mv_registry,
@@ -399,8 +393,6 @@ impl DbspGraphBuilder {
                     optimized_nodes = ?transient_join_pipeline_root.optimized_nodes,
                     "using transient join pipeline root materialization with source batch journal"
                 );
-                let identity_transform: Arc<DeltaTransformFn> =
-                    Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
                 let receiver = self
                     .build_transient_join_pipeline_root_receiver(
                         inputs.plan,
@@ -420,7 +412,7 @@ impl DbspGraphBuilder {
                     inputs.view_name,
                     Arc::clone(&root_node.output_schema),
                     receiver,
-                    identity_transform,
+                    None,
                     &inputs.cancel,
                     &inputs.task_events,
                     &inputs.mv_registry,
@@ -517,10 +509,10 @@ impl DbspGraphBuilder {
                     let output_projection =
                         try_build_direct_join_output_projection(join, &transient_opt.steps);
                     let direct_output_projection = output_projection.is_some();
-                    let delta_transform: Arc<DeltaTransformFn> = if direct_output_projection {
-                        Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()))
+                    let delta_transform = if direct_output_projection {
+                        None
                     } else {
-                        Arc::clone(&transient_opt.transform)
+                        Some(Arc::clone(&transient_opt.transform))
                     };
                     let (tx, rx) =
                         tokio::sync::mpsc::unbounded_channel::<TransientMaterializeBatch>();
@@ -760,6 +752,7 @@ impl DbspGraphBuilder {
                         topn,
                         receiver,
                         false,
+                        None,
                         cancel,
                         task_events,
                     )
@@ -1281,7 +1274,7 @@ struct TransientSourceTopNRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
     receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
-    transform: Arc<DeltaTransformFn>,
+    transform: Option<Arc<DeltaTransformFn>>,
 }
 
 struct TransientSourceAggregateRootMaterialization {
@@ -1324,7 +1317,8 @@ struct TransientSourceTopNRootShape {
     source_root: TransientSourceRootMaterialization,
     topn: DbspTopNNode,
     optimized_nodes: Vec<usize>,
-    transform: Arc<DeltaTransformFn>,
+    transform: Option<Arc<DeltaTransformFn>>,
+    output_projection: Option<Arc<Vec<usize>>>,
 }
 
 #[derive(Clone)]
@@ -4452,7 +4446,8 @@ fn try_build_transient_source_topn_root_shape(
                 source_root,
                 topn: topn.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+                transform: None,
+                output_projection: None,
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -4470,8 +4465,9 @@ fn try_build_transient_source_topn_root_shape(
             else {
                 return Ok(None);
             };
-            shape.transform = compose_delta_transforms(
-                Arc::clone(&shape.transform),
+            fold_topn_root_output_projection(&mut shape);
+            shape.transform = compose_optional_delta_transform(
+                shape.transform.take(),
                 build_filter_transform(select)?,
             );
             shape.optimized_nodes.push(root_idx);
@@ -4491,8 +4487,9 @@ fn try_build_transient_source_topn_root_shape(
                 else {
                     return Ok(None);
                 };
-                shape.transform = compose_delta_transforms(
-                    Arc::clone(&shape.transform),
+                fold_topn_root_output_projection(&mut shape);
+                shape.transform = compose_optional_delta_transform(
+                    shape.transform.take(),
                     build_filter_map_transform(select, project)?,
                 );
                 shape.optimized_nodes.push(input_idx);
@@ -4504,10 +4501,25 @@ fn try_build_transient_source_topn_root_shape(
             else {
                 return Ok(None);
             };
-            shape.transform = compose_delta_transforms(
-                Arc::clone(&shape.transform),
-                build_map_transform(project)?,
-            );
+            if let Some(columns) = try_build_direct_row_projection(project) {
+                if shape.transform.is_none() {
+                    shape.output_projection = Some(compose_direct_row_projection(
+                        shape.output_projection.take(),
+                        columns,
+                    )?);
+                } else {
+                    shape.transform = compose_optional_delta_transform(
+                        shape.transform.take(),
+                        build_direct_projection_transform(columns),
+                    );
+                }
+            } else {
+                fold_topn_root_output_projection(&mut shape);
+                shape.transform = compose_optional_delta_transform(
+                    shape.transform.take(),
+                    build_map_transform(project)?,
+                );
+            }
             shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
@@ -6206,6 +6218,7 @@ fn try_build_transient_source_topn_root_materialization(
         &shape.topn,
         upstream,
         Arc::clone(&shape.source_root.transform),
+        shape.output_projection.clone(),
         cancel,
         task_events,
     );
@@ -6227,11 +6240,78 @@ fn compose_delta_transforms(
     })
 }
 
+fn compose_optional_delta_transform(
+    first: Option<Arc<DeltaTransformFn>>,
+    second: Arc<DeltaTransformFn>,
+) -> Option<Arc<DeltaTransformFn>> {
+    Some(match first {
+        Some(first) => compose_delta_transforms(first, second),
+        None => second,
+    })
+}
+
+fn try_build_direct_row_projection(project: &DbspProjectNode) -> Option<Arc<Vec<usize>>> {
+    let columns = project
+        .expressions()
+        .iter()
+        .map(|expr| projection_direct_column_index(expr, project.input_schema().as_ref()))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Arc::new(columns))
+}
+
+fn compose_direct_row_projection(
+    first: Option<Arc<Vec<usize>>>,
+    second: Arc<Vec<usize>>,
+) -> Result<Arc<Vec<usize>>> {
+    let Some(first) = first else {
+        return Ok(second);
+    };
+    let mut composed = Vec::with_capacity(second.len());
+    for projected_idx in second.iter().copied() {
+        let Some(&source_idx) = first.get(projected_idx) else {
+            bail!(
+                "direct projection index {projected_idx} out of bounds for prior width {}",
+                first.len()
+            );
+        };
+        composed.push(source_idx);
+    }
+    Ok(Arc::new(composed))
+}
+
+fn build_direct_projection_transform(columns: Arc<Vec<usize>>) -> Arc<DeltaTransformFn> {
+    Arc::new(move |deltas: &[(Vec<u8>, i64)]| project_encoded_deltas(deltas, columns.as_ref()))
+}
+
+fn fold_topn_root_output_projection(shape: &mut TransientSourceTopNRootShape) {
+    if let Some(output_projection) = shape.output_projection.take() {
+        shape.transform = compose_optional_delta_transform(
+            shape.transform.take(),
+            build_direct_projection_transform(output_projection),
+        );
+    }
+}
+
+fn project_encoded_deltas(
+    deltas: &[(Vec<u8>, i64)],
+    columns: &[usize],
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    deltas
+        .iter()
+        .map(|(encoded, weight)| {
+            let projected = extract_encoded_row_columns(encoded, columns, false)?
+                .ok_or_else(|| anyhow!("direct encoded projection unexpectedly returned null"))?;
+            Ok((projected, *weight))
+        })
+        .collect()
+}
+
 fn build_transient_topn_receiver(
     graph_id: &str,
     topn: &DbspTopNNode,
     upstream: TransientSourceHandleStream,
     input_transform: Arc<DeltaTransformFn>,
+    output_projection: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
@@ -6248,6 +6328,7 @@ fn build_transient_topn_receiver(
         topn,
         upstream_rx,
         true,
+        output_projection,
         cancel,
         task_events,
     )
@@ -6258,6 +6339,7 @@ fn build_transient_topn_receiver_from_batches(
     topn: &DbspTopNNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     append_only_input: bool,
+    output_projection: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
@@ -6269,6 +6351,7 @@ fn build_transient_topn_receiver_from_batches(
     let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
         let mut processor = TransientDirectTop1Processor::new(graph_id.clone(), config);
+        let output_projection = output_projection.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6284,6 +6367,16 @@ fn build_transient_topn_receiver_from_batches(
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
+                        };
+                        let output_deltas = match output_projection.as_ref() {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            },
+                            None => output_deltas,
                         };
                         if debug_transient_join {
                             eprintln!(
@@ -6311,6 +6404,7 @@ fn build_transient_topn_receiver_from_batches(
         if let Some(config) = try_build_direct_int64_partitioned_topn_config(topn) {
             let mut processor =
                 TransientDirectInt64TopNProcessor::new(graph_id.clone(), config, topn);
+            let output_projection = output_projection.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -6326,6 +6420,16 @@ fn build_transient_topn_receiver_from_batches(
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                     break;
                                 }
+                            };
+                            let output_deltas = match output_projection.as_ref() {
+                                Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                    Ok(deltas) => deltas,
+                                    Err(err) => {
+                                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                        break;
+                                    }
+                                },
+                                None => output_deltas,
                             };
                             if debug_transient_join {
                                 eprintln!(
@@ -6362,6 +6466,7 @@ fn build_transient_topn_receiver_from_batches(
     if use_partitioned_top1 {
         let mut processor = TransientTop1Processor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
+        let output_projection = output_projection.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6388,6 +6493,16 @@ fn build_transient_topn_receiver_from_batches(
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
+                        };
+                        let output_deltas = match output_projection.as_ref() {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            },
+                            None => output_deltas,
                         };
                         if debug_transient_join {
                             eprintln!(
@@ -6419,6 +6534,7 @@ fn build_transient_topn_receiver_from_batches(
         let mut processor =
             TransientAppendOnlyTopNProcessor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
+        let output_projection = output_projection.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6445,6 +6561,16 @@ fn build_transient_topn_receiver_from_batches(
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
+                        };
+                        let output_deltas = match output_projection.as_ref() {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            },
+                            None => output_deltas,
                         };
                         if debug_transient_join {
                             eprintln!(
@@ -6481,6 +6607,7 @@ fn build_transient_topn_receiver_from_batches(
             append_only_input,
         );
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
+        let output_projection = output_projection.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6508,6 +6635,16 @@ fn build_transient_topn_receiver_from_batches(
                                 break;
                             }
                         };
+                        let output_deltas = match output_projection.as_ref() {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                Ok(deltas) => deltas,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            },
+                            None => output_deltas,
+                        };
                         if debug_transient_join {
                             eprintln!(
                                 "transient-topn-output graph_id={} version={} rows={}",
@@ -6532,6 +6669,7 @@ fn build_transient_topn_receiver_from_batches(
     let mut processor =
         TransientTopNProcessor::new(graph_id.clone(), topn, &key_layout, append_only_input);
     let precompute_evaluator = key_layout.precompute_evaluator.clone();
+    let output_projection = output_projection.clone();
 
     tokio::spawn(async move {
         loop {
@@ -6559,6 +6697,16 @@ fn build_transient_topn_receiver_from_batches(
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
+                    };
+                    let output_deltas = match output_projection.as_ref() {
+                        Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        },
+                        None => output_deltas,
                     };
                     if debug_transient_join {
                         eprintln!(

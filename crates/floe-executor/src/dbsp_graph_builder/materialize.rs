@@ -792,7 +792,7 @@ impl DbspGraphBuilder {
                             };
                             if let Err(err) = Self::process_transient_materialize_batch_overlay(
                                 batch.into(),
-                                Arc::clone(&delta_transform),
+                                Some(&delta_transform),
                                 &registry_handle,
                                 replay_floor,
                                 &mut pending_snapshot,
@@ -828,7 +828,7 @@ impl DbspGraphBuilder {
                             };
                             if let Err(err) = Self::process_transient_materialize_batch_overlay(
                                 batch.into(),
-                                Arc::clone(&delta_transform),
+                                Some(&delta_transform),
                                 &registry_handle,
                                 replay_floor,
                                 &mut pending_snapshot,
@@ -866,7 +866,7 @@ impl DbspGraphBuilder {
         view_name: &str,
         schema: Arc<RowSchema>,
         mut upstream: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
-        delta_transform: Arc<DeltaTransformFn>,
+        delta_transform: Option<Arc<DeltaTransformFn>>,
         cancel: &CancellationToken,
         task_events: &GraphTaskSender,
         mv_registry: &Arc<MaterializedViewRegistry>,
@@ -1011,7 +1011,7 @@ impl DbspGraphBuilder {
                             };
                             if let Err(err) = Self::process_transient_materialize_batch_overlay(
                                 batch,
-                                Arc::clone(&delta_transform),
+                                delta_transform.as_ref(),
                                 &registry_handle,
                                 replay_floor,
                                 &mut pending_snapshot,
@@ -1047,7 +1047,7 @@ impl DbspGraphBuilder {
                             };
                             if let Err(err) = Self::process_transient_materialize_batch_overlay(
                                 batch,
-                                Arc::clone(&delta_transform),
+                                delta_transform.as_ref(),
                                 &registry_handle,
                                 replay_floor,
                                 &mut pending_snapshot,
@@ -1426,7 +1426,7 @@ impl DbspGraphBuilder {
 
     async fn process_transient_materialize_batch_overlay(
         batch: TransientMaterializeBatch,
-        delta_transform: Arc<DeltaTransformFn>,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
         registry: &Arc<MaterializedViewHandle>,
         replay_floor: Option<u64>,
         pending_snapshot: &mut PendingOverlaySnapshot,
@@ -1736,19 +1736,26 @@ impl DbspGraphBuilder {
     }
 
     async fn transform_transient_batch(
-        delta_transform: Arc<DeltaTransformFn>,
+        delta_transform: Option<&Arc<DeltaTransformFn>>,
         batch: TransientMaterializeBatch,
     ) -> Result<(DeltaApplyStats, EncodedDeltaBatch)> {
-        let transform_start = Instant::now();
         let input_rows = batch.deltas.len();
         let input_bytes = batch
             .deltas
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let merged = delta_transform(batch.deltas.as_ref())
-            .context("apply transient transform before materialized view")?;
-        let transform_ms = transform_start.elapsed().as_millis() as u64;
+        let (merged, transform_ms) = if let Some(transform) = delta_transform {
+            let transform_start = Instant::now();
+            let merged = transform(batch.deltas.as_ref())
+                .context("apply transient transform before materialized view")?;
+            (
+                Arc::new(merged),
+                transform_start.elapsed().as_millis() as u64,
+            )
+        } else {
+            (batch.deltas, 0)
+        };
         Ok((
             DeltaApplyStats {
                 delta_rows: input_rows,
@@ -1757,7 +1764,7 @@ impl DbspGraphBuilder {
                 transform_ms,
                 merge_ms: 0,
             },
-            Arc::new(merged),
+            merged,
         ))
     }
 
