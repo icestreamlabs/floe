@@ -537,11 +537,11 @@ where
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
         let has_extrema = self.has_extrema();
-        let mut apply_value = |value: V, weight: i64| {
+        let mut apply_value = |value: &V, weight: i64| {
             if weight == 0 {
                 return;
             }
-            let Some(row_update) = (self.row_evaluator)(&value) else {
+            let Some(row_update) = (self.row_evaluator)(value) else {
                 return;
             };
             if row_update.slots.len() != self.slot_kinds.len() {
@@ -694,11 +694,11 @@ where
         let aggregate_updates_start = Instant::now();
         if let Some(coalesced) = coalesced {
             for (value, weight) in coalesced {
-                apply_value(value, weight);
+                apply_value(&value, weight);
             }
         } else {
             for (value, weight) in delta_values.iter() {
-                apply_value(value.clone(), *weight);
+                apply_value(value, *weight);
             }
         }
         metrics::observe_operator_phase_latency_ms(

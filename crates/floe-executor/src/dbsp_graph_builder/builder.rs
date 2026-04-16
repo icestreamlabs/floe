@@ -5521,59 +5521,135 @@ async fn build_transient_window_incremental_receiver_from_batches(
                     };
                     let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
                     let mut windowed_deltas = Vec::new();
+                    let mut encoded_window_cache: HashMap<(i64, i64), Vec<u8>> = HashMap::new();
                     for (row, weight) in input_deltas {
                         if weight == 0 {
                             continue;
                         }
-                        match extract_encoded_row_columns_and_i64_like_column(
-                            &row,
-                            group_key_columns.as_ref(),
-                            time_column,
-                            false,
-                        ) {
-                            Ok(Some((group_key, event_ts))) => {
-                                if event_ts < 0 {
-                                    continue;
+                        let (group_key, event_ts) = if group_key_columns.is_empty() {
+                            match extract_encoded_row_i64_like_column(&row, time_column) {
+                                Ok(Some(event_ts)) => (None, event_ts),
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        err.context("extract transient window aggregate timestamp"),
+                                    );
+                                    return;
                                 }
-                                if let Some(cutoff) = cutoff
-                                    && event_ts < cutoff
-                                {
-                                    continue;
-                                }
-                                transient_window_for_each_window(event_ts, window_size, window_slide, |window_start, window_end| {
-                                    let encoded_window = match encode_transient_window_bounds(window_start, window_end) {
-                                        Ok(encoded) => encoded,
-                                        Err(err) => {
-                                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                            return;
-                                        }
-                                    };
-                                    let encoded_key = if group_key_columns.is_empty() {
-                                        encoded_window
-                                    } else {
-                                        match concat_encoded_rows(&encoded_window, &group_key) {
-                                            Ok(encoded) => encoded,
-                                            Err(err) => {
-                                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                                return;
-                                            }
-                                        }
-                                    };
-                                    windowed_deltas.push(((encoded_key, row.clone()), weight));
-                                });
-                                continue;
                             }
-                            Ok(None) => continue,
-                            Err(err) => {
-                                report_graph_task_error(
-                                    &task_events,
-                                    &graph_id,
-                                    task_label.clone(),
-                                    err.context("extract transient window aggregate row"),
-                                );
-                                return;
+                        } else {
+                            match extract_encoded_row_columns_and_i64_like_column(
+                                &row,
+                                group_key_columns.as_ref(),
+                                time_column,
+                                false,
+                            ) {
+                                Ok(Some((group_key, event_ts))) => (Some(group_key), event_ts),
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        err.context("extract transient window aggregate row"),
+                                    );
+                                    return;
+                                }
                             }
                         };
+                        if event_ts < 0 {
+                            continue;
+                        }
+                        if let Some(cutoff) = cutoff
+                            && event_ts < cutoff
+                        {
+                            continue;
+                        }
+                        let mut build_window_key = |window_start: i64, window_end: i64| {
+                            let encoded_window = if let Some(encoded) =
+                                encoded_window_cache.get(&(window_start, window_end)).cloned()
+                            {
+                                encoded
+                            } else {
+                                match encode_transient_window_bounds(window_start, window_end) {
+                                    Ok(encoded) => {
+                                        encoded_window_cache
+                                            .insert((window_start, window_end), encoded.clone());
+                                        encoded
+                                    }
+                                    Err(err) => {
+                                        report_graph_task_error(
+                                            &task_events,
+                                            &graph_id,
+                                            task_label.clone(),
+                                            err,
+                                        );
+                                        return None;
+                                    }
+                                }
+                            };
+                            if let Some(group_key) = group_key.as_ref() {
+                                match concat_encoded_rows(&encoded_window, group_key) {
+                                    Ok(encoded) => Some(encoded),
+                                    Err(err) => {
+                                        report_graph_task_error(
+                                            &task_events,
+                                            &graph_id,
+                                            task_label.clone(),
+                                            err,
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(encoded_window)
+                            }
+                        };
+                        if window_size == window_slide {
+                            let mut encoded_key = None;
+                            transient_window_for_each_window(
+                                event_ts,
+                                window_size,
+                                window_slide,
+                                |window_start, window_end| {
+                                    encoded_key = build_window_key(window_start, window_end);
+                                },
+                            );
+                            if let Some(encoded_key) = encoded_key {
+                                windowed_deltas.push(((encoded_key, row), weight));
+                            }
+                            continue;
+                        }
+                        let mut encoded_keys = Vec::new();
+                        transient_window_for_each_window(
+                            event_ts,
+                            window_size,
+                            window_slide,
+                            |window_start, window_end| {
+                                if let Some(encoded_key) = build_window_key(window_start, window_end)
+                                {
+                                    encoded_keys.push(encoded_key);
+                                }
+                            },
+                        );
+                        if encoded_keys.is_empty() {
+                            continue;
+                        }
+                        let last_idx = encoded_keys.len() - 1;
+                        let mut row = Some(row);
+                        for (idx, encoded_key) in encoded_keys.into_iter().enumerate() {
+                            let row_value = if idx == last_idx {
+                                row.take().expect("transient window row already moved")
+                            } else {
+                                row.as_ref()
+                                    .expect("transient window row missing")
+                                    .clone()
+                            };
+                            windowed_deltas.push(((encoded_key, row_value), weight));
+                        }
                     }
                     let aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
                         Ok(deltas) => deltas,
