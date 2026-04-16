@@ -1767,7 +1767,21 @@ async fn topn_materializes_mv_from_transient_source_journal() {
     wait_for_visible_row_count(&mv_registry, view_name, 2).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
-    sort_rows_by_first_column(&mut rows);
+    rows.sort_by_key(|row| {
+        let first = match row.first() {
+            Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
+                *value
+            }
+            _ => 0,
+        };
+        let second = match row.get(1) {
+            Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
+                *value
+            }
+            _ => 0,
+        };
+        (first, second)
+    });
     assert_eq!(rows, vec![int_row(&[30]), int_row(&[30])]);
 }
 
