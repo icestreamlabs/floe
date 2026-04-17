@@ -2939,3 +2939,399 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field as ArrowField, Schema};
+    use dbsp::circuit::schema::Field as DbspField;
+    use dbsp::circuit::types::DbspScalarType;
+
+    fn dbsp_schema() -> Arc<RowSchema> {
+        RowSchema::try_new(vec![
+            DbspField::new("a", DbspScalarType::Int64, true),
+            DbspField::new("b", DbspScalarType::Utf8, true),
+            DbspField::new("c", DbspScalarType::TimestampMillis, true),
+            DbspField::new("d", DbspScalarType::Bool, true),
+        ])
+        .expect("schema")
+    }
+
+    fn encode_row(columns: &[Option<EncodedRowScalar>]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+        for column in columns {
+            match column {
+                None => encoded.push(0x00),
+                Some(EncodedRowScalar::Int64(value)) => {
+                    encoded.push(0x01);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                Some(EncodedRowScalar::Utf8(value)) => {
+                    let bytes = value.as_bytes();
+                    encoded.push(0x02);
+                    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    encoded.extend_from_slice(bytes);
+                }
+                Some(EncodedRowScalar::TimestampMillis(value)) => {
+                    encoded.push(0x03);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                Some(EncodedRowScalar::Bool(value)) => {
+                    encoded.push(0x04);
+                    encoded.push(if *value { 1 } else { 0 });
+                }
+            }
+        }
+        encoded
+    }
+
+    #[test]
+    fn comparison_and_boolean_helpers_cover_edges() {
+        assert_eq!(invert_comparison_operator(Operator::Eq), Some(Operator::Eq));
+        assert_eq!(invert_comparison_operator(Operator::Lt), Some(Operator::Gt));
+        assert_eq!(
+            invert_comparison_operator(Operator::GtEq),
+            Some(Operator::LtEq)
+        );
+        assert_eq!(invert_comparison_operator(Operator::And), None);
+
+        assert_eq!(compare_i64(10, 10, Operator::Eq).expect("eq"), true);
+        assert_eq!(compare_i64(10, 11, Operator::Lt).expect("lt"), true);
+        assert_eq!(compare_i64(11, 10, Operator::Gt).expect("gt"), true);
+        assert!(compare_i64(1, 2, Operator::And).is_err());
+
+        assert_eq!(and_bool_opt(Some(true), Some(false)), Some(false));
+        assert_eq!(and_bool_opt(Some(true), None), None);
+        assert_eq!(and_bool_opt(None, Some(false)), Some(false));
+
+        assert_eq!(or_bool_opt(Some(false), Some(true)), Some(true));
+        assert_eq!(or_bool_opt(Some(false), None), None);
+        assert_eq!(or_bool_opt(None, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn eval_compiled_binary_covers_arithmetic_and_concat_paths() {
+        let left = vec![CompiledValue::Int64(Some(7)), CompiledValue::Int64(None)];
+        let right = vec![CompiledValue::Int64(Some(2)), CompiledValue::Int64(Some(3))];
+
+        let plus = eval_compiled_binary(Operator::Plus, &left, &right).expect("plus");
+        assert_eq!(
+            plus.as_ref(),
+            &vec![CompiledValue::Int64(Some(9)), CompiledValue::Int64(None)]
+        );
+
+        assert!(eval_compiled_binary(Operator::Eq, &left[..1], &right).is_err());
+        assert!(
+            eval_compiled_binary_value(
+                Operator::Divide,
+                &CompiledValue::Int64(Some(9)),
+                &CompiledValue::Int64(Some(0))
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            eval_compiled_binary_value(
+                Operator::StringConcat,
+                &CompiledValue::Utf8(Some("a".to_string())),
+                &CompiledValue::Utf8(Some("b".to_string()))
+            )
+            .expect("concat"),
+            CompiledValue::Utf8(Some("ab".to_string()))
+        );
+
+        assert_eq!(
+            eval_compiled_binary_value(
+                Operator::StringConcat,
+                &CompiledValue::Utf8(None),
+                &CompiledValue::Utf8(Some("x".to_string()))
+            )
+            .expect("concat null"),
+            CompiledValue::Utf8(None)
+        );
+    }
+
+    #[test]
+    fn encoded_field_decode_and_projection_helpers_round_trip() {
+        let encoded = encode_row(&[
+            Some(EncodedRowScalar::Int64(10)),
+            Some(EncodedRowScalar::Utf8("x".to_string())),
+            Some(EncodedRowScalar::Bool(true)),
+            Some(EncodedRowScalar::TimestampMillis(50)),
+        ]);
+
+        let mut cursor = 4usize;
+        let mut ranges = Vec::new();
+        for _ in 0..4 {
+            let end = encoded_field_end(&encoded, cursor).expect("field end");
+            ranges.push(cursor..end);
+            cursor = end;
+        }
+        assert_eq!(cursor, encoded.len());
+
+        assert_eq!(
+            decode_encoded_field_as_encoded_scalar(
+                &encoded[ranges[0].clone()],
+                CompiledValueType::Int64
+            )
+            .expect("decode int"),
+            Some(EncodedRowScalar::Int64(10))
+        );
+        assert_eq!(
+            decode_encoded_field_as_encoded_scalar(
+                &encoded[ranges[1].clone()],
+                CompiledValueType::Utf8
+            )
+            .expect("decode utf8"),
+            Some(EncodedRowScalar::Utf8("x".to_string()))
+        );
+
+        let projected = project_encoded_row(
+            &encoded,
+            &[ranges[2].clone(), ranges[0].clone(), ranges[3].clone()],
+            3,
+        )
+        .expect("project");
+        assert_eq!(
+            crate::encoding::extract_encoded_row_scalars(&projected, &[0, 1, 2])
+                .expect("decode projected"),
+            vec![
+                Some(EncodedRowScalar::Bool(true)),
+                Some(EncodedRowScalar::Int64(10)),
+                Some(EncodedRowScalar::TimestampMillis(50)),
+            ]
+        );
+
+        assert!(encoded_field_end(&[0x09], 0).is_err());
+        assert!(project_encoded_row(&encoded, &[999..1000], 1).is_err());
+    }
+
+    #[test]
+    fn layout_and_sparse_batch_helpers_cover_sparse_decode() {
+        let schema = dbsp_schema();
+        let required = vec![3usize, 0usize];
+        let slots = build_decoded_input_slots(schema.len(), &required);
+        assert_eq!(slots, vec![Some(1), None, None, Some(0)]);
+
+        let layout = build_decoded_input_layout(schema.as_ref(), &required).expect("layout");
+        assert_eq!(layout.count, 2);
+        assert_eq!(
+            layout.value_types.as_ref(),
+            &[CompiledValueType::Bool, CompiledValueType::Int64]
+        );
+
+        let batch = build_sparse_input_batch(
+            &schema.to_arrow_schema(),
+            &slots,
+            vec![
+                vec![Some(EncodedRowScalar::Bool(true)), None],
+                vec![
+                    Some(EncodedRowScalar::Int64(10)),
+                    Some(EncodedRowScalar::Int64(20)),
+                ],
+            ],
+            2,
+        )
+        .expect("build sparse batch");
+
+        let col_a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("a int64");
+        assert_eq!(col_a.value(0), 10);
+        assert_eq!(col_a.value(1), 20);
+
+        let col_b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("b utf8 nulls");
+        assert!(col_b.is_null(0));
+        assert!(col_b.is_null(1));
+
+        let col_d = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("d bool");
+        assert_eq!(col_d.value(0), true);
+        assert!(col_d.is_null(1));
+
+        assert!(build_decoded_input_value_types(schema.as_ref(), &[99]).is_err());
+    }
+
+    #[test]
+    fn compiled_and_physical_projection_encoders_round_trip() {
+        assert_eq!(
+            compiled_value_from_encoded_scalar(
+                Some(&EncodedRowScalar::Int64(3)),
+                CompiledValueType::Int64
+            )
+            .expect("compiled int"),
+            CompiledValue::Int64(Some(3))
+        );
+        assert!(
+            compiled_value_from_encoded_scalar(
+                Some(&EncodedRowScalar::Utf8("x".to_string())),
+                CompiledValueType::Int64,
+            )
+            .is_err()
+        );
+
+        let compiled_columns: Vec<CompiledColumn> = vec![
+            Arc::new(vec![
+                CompiledValue::Int64(Some(11)),
+                CompiledValue::Int64(None),
+            ]),
+            Arc::new(vec![
+                CompiledValue::Utf8(Some("z".to_string())),
+                CompiledValue::Utf8(None),
+            ]),
+            Arc::new(vec![
+                CompiledValue::TimestampMillis(Some(77)),
+                CompiledValue::TimestampMillis(None),
+            ]),
+            Arc::new(vec![
+                CompiledValue::Bool(Some(true)),
+                CompiledValue::Bool(None),
+            ]),
+        ];
+        let encoded0 = encode_compiled_projection_row(&compiled_columns, 0).expect("row 0");
+        let encoded1 = encode_compiled_projection_row(&compiled_columns, 1).expect("row 1");
+
+        assert_eq!(
+            crate::encoding::extract_encoded_row_scalars(&encoded0, &[0, 1, 2, 3])
+                .expect("decode compiled row 0"),
+            vec![
+                Some(EncodedRowScalar::Int64(11)),
+                Some(EncodedRowScalar::Utf8("z".to_string())),
+                Some(EncodedRowScalar::TimestampMillis(77)),
+                Some(EncodedRowScalar::Bool(true)),
+            ]
+        );
+        assert_eq!(
+            crate::encoding::extract_encoded_row_scalars(&encoded1, &[0, 1, 2, 3])
+                .expect("decode compiled row 1"),
+            vec![None, None, None, None]
+        );
+
+        let physical_columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(5_i64)])),
+            Arc::new(StringArray::from(vec![Some("p")])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(123_i64)])),
+            Arc::new(BooleanArray::from(vec![Some(false)])),
+        ];
+        let physical_row =
+            encode_physical_projection_row(&physical_columns, 0).expect("physical row");
+        assert_eq!(
+            crate::encoding::extract_encoded_row_scalars(&physical_row, &[0, 1, 2, 3])
+                .expect("decode physical row"),
+            vec![
+                Some(EncodedRowScalar::Int64(5)),
+                Some(EncodedRowScalar::Utf8("p".to_string())),
+                Some(EncodedRowScalar::TimestampMillis(123)),
+                Some(EncodedRowScalar::Bool(false)),
+            ]
+        );
+
+        let mut encoded = Vec::new();
+        let unsupported: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0_f64)]));
+        assert!(encode_array_scalar_value(&unsupported, 0, &mut encoded).is_err());
+    }
+
+    #[test]
+    fn selection_and_consolidation_helpers_skip_zero_weights() {
+        let row_a = encode_row(&[Some(EncodedRowScalar::Int64(1))]);
+        let row_b = encode_row(&[Some(EncodedRowScalar::Int64(2))]);
+
+        let prepared = PreparedEncodedInput {
+            batch: None,
+            compiled_batch: None,
+            encoded_rows: vec![row_a.clone(), row_b.clone()],
+            weights: vec![0, 3],
+            projected_ranges: None,
+        };
+        assert_eq!(
+            build_selected_delta_values(&prepared, &[0, 1, 2]),
+            vec![(row_b.clone(), 3)]
+        );
+
+        let consolidated = consolidate_encoded_delta_batch(vec![
+            (row_a.clone(), 1),
+            (row_a, -1),
+            (row_b.clone(), 2),
+            (row_b.clone(), 3),
+            (row_b.clone(), -1),
+            (row_b.clone(), 0),
+        ])
+        .expect("consolidate");
+        assert_eq!(consolidated, vec![(row_b, 4)]);
+    }
+
+    #[test]
+    fn column_resolution_helpers_match_name_and_qualified_name() {
+        let arrow_schema = Schema::new(vec![
+            ArrowField::new("a", DataType::Int64, true),
+            ArrowField::new("t.b", DataType::Int64, true),
+        ]);
+        assert_eq!(
+            resolve_compiled_column_index(&arrow_schema, &Column::from_name("a")).expect("a"),
+            0
+        );
+        assert_eq!(
+            resolve_compiled_column_index(&arrow_schema, &Column::from_qualified_name("t.b"))
+                .expect("qualified b"),
+            1
+        );
+        assert!(
+            resolve_compiled_column_index(&arrow_schema, &Column::from_name("missing")).is_err()
+        );
+
+        let schema = dbsp_schema();
+        assert_eq!(
+            resolve_input_schema_column_index(schema.as_ref(), &Column::from_name("a")),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_input_schema_column_index(schema.as_ref(), &Column::from_name("missing")),
+            None
+        );
+    }
+
+    #[test]
+    fn compiled_input_batch_builder_places_columns_by_input_slot() {
+        let batch = build_compiled_input_batch(
+            4,
+            &[Some(1), None, Some(0), None],
+            vec![
+                vec![CompiledValue::Bool(Some(true)), CompiledValue::Bool(None)],
+                vec![
+                    CompiledValue::Int64(Some(9)),
+                    CompiledValue::Int64(Some(10)),
+                ],
+            ],
+            2,
+        );
+
+        assert_eq!(batch.row_count, 2);
+        assert!(batch.columns[1].is_none());
+        assert!(batch.columns[3].is_none());
+
+        assert_eq!(
+            batch.columns[0].as_ref().expect("col0").as_ref(),
+            &vec![
+                CompiledValue::Int64(Some(9)),
+                CompiledValue::Int64(Some(10))
+            ]
+        );
+        assert_eq!(
+            batch.columns[2].as_ref().expect("col2").as_ref(),
+            &vec![CompiledValue::Bool(Some(true)), CompiledValue::Bool(None)]
+        );
+    }
+}
