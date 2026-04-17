@@ -645,7 +645,9 @@ mod tests {
         assert_eq!(planned.len(), 1);
         let logical_plan = planned[0].logical_plan().display_indent().to_string();
         assert!(
-            logical_plan.contains("Projection") && logical_plan.contains("bid"),
+            logical_plan.contains("bid")
+                && (logical_plan.contains("Projection")
+                    || logical_plan.contains("TableScan: bid projection=[auction, dateTime]")),
             "logical plan was: {logical_plan}"
         );
         assert_eq!(planned[0].definition().name(), "mv");

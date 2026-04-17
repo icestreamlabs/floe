@@ -56,6 +56,7 @@ fn fixture_files_cover_all_canonical_queries() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn builds_and_queries_all_canonical_nexmark_views() -> Result<()> {
     for query in canonical_nexmark_queries() {
         let view_name = format!("mv_{}", query.id);

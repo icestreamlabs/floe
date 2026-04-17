@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dbsp::handles::ZSetHandleView;
-use floe_executor::encoding::extract_encoded_row_i64_like_column;
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
@@ -136,20 +134,7 @@ pub(crate) async fn wait_for_materialized_row_count(
             let handle = registry
                 .get(view)
                 .with_context(|| format!("materialized view handle for '{view}'"))?;
-            let Some(state) = handle.dbsp_state() else {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            };
-            let handle_view = ZSetHandleView::new(
-                state.dictionary(),
-                state.table(),
-                state.namespace().to_string(),
-                state.version(),
-            );
-            let snapshot = handle_view
-                .materialize()
-                .await
-                .with_context(|| format!("materialize view '{view}'"))?;
+            let snapshot = handle.snapshot_encoded();
             let row_count: usize = snapshot
                 .values()
                 .filter(|diff| **diff > 0)
@@ -165,48 +150,4 @@ pub(crate) async fn wait_for_materialized_row_count(
     .await
     .context("timeout waiting for materialized rows")??;
     Ok(())
-}
-
-pub(crate) async fn rows_at_version(
-    registry: &MaterializedViewRegistry,
-    view: &str,
-    version: u64,
-) -> Result<Vec<Vec<i64>>> {
-    let handle = registry
-        .get(view)
-        .with_context(|| format!("materialized view handle for '{view}'"))?;
-    let state = handle
-        .dbsp_state()
-        .with_context(|| format!("materialized view '{view}' missing DBSP state"))?;
-    let handle_view = ZSetHandleView::new(
-        state.dictionary(),
-        state.table(),
-        state.namespace().to_string(),
-        version,
-    );
-    let snapshot = handle_view
-        .materialize()
-        .await
-        .with_context(|| format!("materialize view '{view}' at version {version}"))?;
-    let mut rows = Vec::new();
-    for (key, diff) in snapshot {
-        if diff <= 0 {
-            continue;
-        }
-        let ints = (0..3)
-            .map(|idx| {
-                extract_encoded_row_i64_like_column(&key, idx)
-                    .with_context(|| format!("extract int column {idx} for view '{view}'"))
-                    .and_then(|value| {
-                        value.with_context(|| {
-                            format!("unexpected NULL int column {idx} for view '{view}'")
-                        })
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for _ in 0..diff {
-            rows.push(ints.clone());
-        }
-    }
-    Ok(rows)
 }

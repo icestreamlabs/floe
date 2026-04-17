@@ -5,6 +5,7 @@ use crate::helpers::{append_bid, wait_for_version};
 use crate::rows::int_rows2;
 
 #[tokio::test]
+#[serial_test::serial]
 async fn sql_projection_applies_expressions() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_projection_expr",

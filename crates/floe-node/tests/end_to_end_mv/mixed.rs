@@ -1,10 +1,14 @@
 use anyhow::Result;
 
 use crate::harness::MvTestHarness;
-use crate::helpers::{append_auction, append_bid, assert_manifest_exists, wait_for_version};
+use crate::helpers::{
+    append_auction, append_bid, assert_manifest_exists, wait_for_materialized_row_count,
+    wait_for_version,
+};
 use crate::rows::int_rows;
 
 #[tokio::test]
+#[serial_test::serial]
 async fn mixed_workload_join_regression_handles_retractions() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_mixed",
@@ -77,6 +81,7 @@ async fn mixed_workload_join_regression_handles_retractions() -> Result<()> {
         .max()
         .unwrap_or(0);
     wait_for_version(&harness.mv_registry, &harness.view_name, target_version).await?;
+    wait_for_materialized_row_count(&harness.mv_registry, &harness.view_name, 3).await?;
     let (session, _bridge) = harness.session_with_view().await?;
 
     let df = session

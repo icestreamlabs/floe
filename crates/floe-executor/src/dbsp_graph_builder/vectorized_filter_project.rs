@@ -66,7 +66,10 @@ enum EncodedPredicatePlan {
 
 #[derive(Clone)]
 enum EncodedI64Expr {
-    Column { index: usize, field_type: EncodedFieldType },
+    Column {
+        index: usize,
+        field_type: EncodedFieldType,
+    },
     Literal(i64),
     Negative(Arc<EncodedI64Expr>),
     Binary {
@@ -293,36 +296,36 @@ impl VectorizedFilterProjectEvaluator {
                 }
                 selected
             } else {
-            let prepared = self.prepare_input_with_layout(
-                graph_id,
-                delta_values,
-                &self.predicate_input_layout,
-                self.predicate_requires_physical_batch(),
-                self.predicate_requires_compiled_batch(),
-                false,
-            )?;
-            if prepared.encoded_rows.is_empty() {
-                return Ok(Vec::new());
-            }
-            let selected = self.selected_indices(&prepared)?;
-            if selected.is_empty() {
-                return Ok(Vec::new());
-            }
-            if identity_projection {
-                let mut staged = Vec::with_capacity(selected.len());
-                for idx in selected {
-                    let diff = prepared.weights.get(idx).copied().unwrap_or(0);
-                    if diff == 0 {
-                        continue;
-                    }
-                    let Some(encoded) = prepared.encoded_rows.get(idx).cloned() else {
-                        continue;
-                    };
-                    staged.push((encoded, diff));
+                let prepared = self.prepare_input_with_layout(
+                    graph_id,
+                    delta_values,
+                    &self.predicate_input_layout,
+                    self.predicate_requires_physical_batch(),
+                    self.predicate_requires_compiled_batch(),
+                    false,
+                )?;
+                if prepared.encoded_rows.is_empty() {
+                    return Ok(Vec::new());
                 }
-                return consolidate_encoded_delta_batch(staged);
-            }
-            build_selected_delta_values(&prepared, &selected)
+                let selected = self.selected_indices(&prepared)?;
+                if selected.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if identity_projection {
+                    let mut staged = Vec::with_capacity(selected.len());
+                    for idx in selected {
+                        let diff = prepared.weights.get(idx).copied().unwrap_or(0);
+                        if diff == 0 {
+                            continue;
+                        }
+                        let Some(encoded) = prepared.encoded_rows.get(idx).cloned() else {
+                            continue;
+                        };
+                        staged.push((encoded, diff));
+                    }
+                    return consolidate_encoded_delta_batch(staged);
+                }
+                build_selected_delta_values(&prepared, &selected)
             }
         } else {
             delta_values
@@ -432,10 +435,10 @@ impl VectorizedFilterProjectEvaluator {
         needs_compiled_batch: bool,
         capture_projection_ranges: bool,
     ) -> Result<PreparedEncodedInput> {
-        let mut decoded_columns =
-            needs_physical_batch.then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
-        let mut compiled_columns =
-            needs_compiled_batch.then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
+        let mut decoded_columns = needs_physical_batch
+            .then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
+        let mut compiled_columns = needs_compiled_batch
+            .then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
         let mut encoded_rows = Vec::with_capacity(delta_values.len());
         let mut weights = Vec::with_capacity(delta_values.len());
         let mut projected_ranges =
@@ -972,9 +975,8 @@ impl EncodedI64Expr {
             Self::Column { index, field_type } => {
                 let value = extract_encoded_row_i64_like_column(encoded, *index)?;
                 match (field_type, value) {
-                    (EncodedFieldType::Int64, value) | (EncodedFieldType::TimestampMillis, value) => {
-                        Ok(value)
-                    }
+                    (EncodedFieldType::Int64, value)
+                    | (EncodedFieldType::TimestampMillis, value) => Ok(value),
                 }
             }
             Self::Literal(value) => Ok(Some(*value)),
@@ -2246,7 +2248,10 @@ fn build_decoded_input_layout(
     required_columns: &[usize],
 ) -> Result<DecodedInputLayout> {
     Ok(DecodedInputLayout {
-        slots: Arc::new(build_decoded_input_slots(input_schema.len(), required_columns)),
+        slots: Arc::new(build_decoded_input_slots(
+            input_schema.len(),
+            required_columns,
+        )),
         value_types: Arc::new(build_decoded_input_value_types(
             input_schema,
             required_columns,
@@ -2922,11 +2927,15 @@ mod tests {
             Some(EncodedRowScalar::Utf8("ccc".to_string())),
         ]);
 
-        assert!(encoded_predicate
-            .matches_row(passing.as_slice())
-            .expect("evaluate passing row"));
-        assert!(!encoded_predicate
-            .matches_row(failing.as_slice())
-            .expect("evaluate failing row"));
+        assert!(
+            encoded_predicate
+                .matches_row(passing.as_slice())
+                .expect("evaluate passing row")
+        );
+        assert!(
+            !encoded_predicate
+                .matches_row(failing.as_slice())
+                .expect("evaluate failing row")
+        );
     }
 }

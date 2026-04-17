@@ -9,6 +9,7 @@ use crate::helpers::{
 use crate::rows::{bid_row_nullable, int_rows, int_rows2};
 
 #[tokio::test]
+#[serial_test::serial]
 async fn sql_filter_excludes_nulls() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_null_filter",
@@ -51,6 +52,7 @@ async fn sql_filter_excludes_nulls() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn sql_join_skips_null_keys() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_null_join",

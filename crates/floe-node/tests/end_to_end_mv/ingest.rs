@@ -1,11 +1,13 @@
 use anyhow::Result;
-use dbsp::handles::ZSetHandleView;
 
 use crate::harness::MvTestHarness;
-use crate::helpers::{append_bid, assert_manifest_exists, wait_for_version};
+use crate::helpers::{
+    append_bid, assert_manifest_exists, wait_for_materialized_row_count, wait_for_version,
+};
 use crate::rows::int_rows;
 
 #[tokio::test]
+#[serial_test::serial]
 async fn materialized_view_ingests_and_queries() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_q1",
@@ -37,23 +39,16 @@ async fn materialized_view_ingests_and_queries() -> Result<()> {
     }
     let target_version = handles.last().expect("latest handle").version as i64;
     wait_for_version(&harness.mv_registry, &harness.view_name, target_version).await?;
+    wait_for_materialized_row_count(&harness.mv_registry, &harness.view_name, 2).await?;
 
     let (session, _bridge) = harness.session_with_view().await?;
 
-    // Inspect the persisted state directly to ensure weights are correct.
-    let persisted = harness
+    // Inspect the in-memory encoded state to ensure weights are correct.
+    let materialized = harness
         .mv_registry
         .get(&harness.view_name)
         .expect("mv handle")
-        .dbsp_state()
-        .expect("persisted state");
-    let handle_view = ZSetHandleView::new(
-        persisted.dictionary(),
-        persisted.table(),
-        persisted.namespace().to_string(),
-        persisted.version(),
-    );
-    let materialized = handle_view.materialize().await.unwrap();
+        .snapshot_encoded();
     let total_weight: i64 = materialized.values().copied().sum();
     assert_eq!(total_weight, 2, "expected total weight of 2 rows");
     assert!(

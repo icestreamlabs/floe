@@ -1,10 +1,14 @@
 use anyhow::Result;
 
 use crate::harness::MvTestHarness;
-use crate::helpers::{append_auction, append_bid, assert_manifest_exists, wait_for_version};
+use crate::helpers::{
+    append_auction, append_bid, assert_manifest_exists, wait_for_materialized_row_count,
+    wait_for_version,
+};
 use crate::rows::{BidAuctionRow, bid_auction_rows};
 
 #[tokio::test]
+#[serial_test::serial]
 async fn materialized_view_joins_auctions() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_nexmark_bid_auctions",
@@ -144,6 +148,12 @@ async fn materialized_view_joins_auctions() -> Result<()> {
     ];
     let target_version = handles.last().expect("latest handle").version as i64;
     wait_for_version(&harness.mv_registry, &harness.view_name, target_version).await?;
+    wait_for_materialized_row_count(
+        &harness.mv_registry,
+        &harness.view_name,
+        expected_rows.len(),
+    )
+    .await?;
 
     let (session, _bridge) = harness.session_with_view().await?;
     let df = session

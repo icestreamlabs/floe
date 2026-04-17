@@ -24,6 +24,7 @@ use crate::helpers::{
 use crate::rows::int_rows_n;
 
 #[tokio::test]
+#[serial_test::serial]
 async fn wrapped_q15_style_aggregate_materializes_mv() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_q15_wrapped",
@@ -81,12 +82,13 @@ async fn wrapped_q15_style_aggregate_materializes_mv() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() -> Result<()> {
     let catalog = Arc::new(SlateCatalog::in_memory().await?);
     let db = catalog.db();
 
     let ingest_sql = "CREATE MATERIALIZED VIEW mv_parallel_ingest_bid AS \
-        SELECT COUNT(*)::BIGINT AS row_count FROM nexmark_bid";
+        SELECT auction FROM nexmark_bid";
     let result_sql = "CREATE MATERIALIZED VIEW mv_parallel_q15_wrapped AS \
         WITH bid AS (SELECT auction, bidder, price, channel, url, date_time AS \"dateTime\", extra FROM nexmark_bid) \
         SELECT DATE_FORMAT(\"dateTime\", 'yyyy-MM-dd') AS day, \

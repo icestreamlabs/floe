@@ -16,6 +16,7 @@ use crate::helpers::wait_for_version;
 use crate::rows::int_rows;
 
 #[tokio::test]
+#[serial_test::serial]
 async fn file_connector_ingests_and_queries() -> Result<()> {
     let mut harness = MvTestHarness::new(
         "mv_file",

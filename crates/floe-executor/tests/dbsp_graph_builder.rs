@@ -1769,15 +1769,15 @@ async fn topn_materializes_mv_from_transient_source_journal() {
     let mut rows = visible_rows(&mv_registry, view_name).await;
     rows.sort_by_key(|row| {
         let first = match row.first() {
-            Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
-                *value
-            }
+            Some(Some(
+                EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value),
+            )) => *value,
             _ => 0,
         };
         let second = match row.get(1) {
-            Some(Some(EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value))) => {
-                *value
-            }
+            Some(Some(
+                EncodedRowScalar::Int64(value) | EncodedRowScalar::TimestampMillis(value),
+            )) => *value,
             _ => 0,
         };
         (first, second)

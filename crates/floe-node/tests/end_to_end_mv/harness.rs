@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::Result;
 use dbsp::StreamRetention;
@@ -15,8 +15,12 @@ use floe_node::planner::plan_materialized_views;
 use floe_node::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;
 use floe_storage::SlateCatalog;
+use slatedb::object_store::ObjectStore;
+use slatedb::object_store::memory::InMemory;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+static NEXT_TEST_CATALOG_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct MvTestHarness {
     pub(crate) catalog: Arc<SlateCatalog>,
@@ -25,11 +29,17 @@ pub(crate) struct MvTestHarness {
     pub(crate) outer: OuterStreamRegistry,
     pub(crate) ingestion_bridge: DbspBridge,
     pub(crate) view_name: String,
+    cancel: CancellationToken,
 }
 
 impl MvTestHarness {
     pub(crate) async fn new(view_name: &str, view_sql: &str) -> Result<Self> {
-        let catalog = Arc::new(SlateCatalog::in_memory().await?);
+        let catalog_id = NEXT_TEST_CATALOG_ID.fetch_add(1, Ordering::Relaxed);
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateCatalog::with_object_store(format!("in-memory-test-{catalog_id}"), object_store)
+                .await?,
+        );
         Self::new_with_catalog(catalog, view_name, view_sql).await
     }
 
@@ -72,12 +82,13 @@ impl MvTestHarness {
         let handle_streams = gather_handle_streams(&outer, &source_refs);
         let transient_streams = gather_transient_streams(&outer, &source_refs);
         let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+        let cancel = CancellationToken::new();
         graph_builder
             .build(BuildInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &circuit_plans[0],
-                cancel: CancellationToken::new(),
+                cancel: cancel.clone(),
                 task_events: task_tx.clone(),
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
@@ -95,6 +106,7 @@ impl MvTestHarness {
             outer,
             ingestion_bridge,
             view_name: view_name.to_string(),
+            cancel,
         })
     }
 
@@ -112,6 +124,12 @@ impl MvTestHarness {
         )
         .await?;
         Ok((session, bridge))
+    }
+}
+
+impl Drop for MvTestHarness {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 

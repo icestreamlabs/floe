@@ -7335,10 +7335,7 @@ mod tests {
         match &window_input.kind {
             DbspNodeKind::Source(_) => {}
             DbspNodeKind::Project(project) => {
-                let &project_input_idx = window_input
-                    .inputs
-                    .first()
-                    .expect("project source input");
+                let &project_input_idx = window_input.inputs.first().expect("project source input");
                 let project_input = plan
                     .node(project_input_idx)
                     .expect("project source input node");
@@ -7395,10 +7392,7 @@ mod tests {
         match &window_input.kind {
             DbspNodeKind::Source(_) => {}
             DbspNodeKind::Project(project) => {
-                let &project_input_idx = window_input
-                    .inputs
-                    .first()
-                    .expect("project source input");
+                let &project_input_idx = window_input.inputs.first().expect("project source input");
                 let project_input = plan
                     .node(project_input_idx)
                     .expect("project source input node");

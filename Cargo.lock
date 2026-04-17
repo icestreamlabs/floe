@@ -2156,6 +2156,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "slatedb",
  "tempfile",
  "tikv-jemallocator",
