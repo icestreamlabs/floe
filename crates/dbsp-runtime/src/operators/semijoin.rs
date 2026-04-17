@@ -493,12 +493,23 @@ mod tests {
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     type Row = (i64, i64);
 
-    async fn build_db() -> Arc<Db> {
+    static TEST_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn next_test_suffix() -> u64 {
+        TEST_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn build_db(suffix: u64) -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        Arc::new(Db::open("semijoinop", store).await.expect("open SlateDB"))
+        Arc::new(
+            Db::open(format!("semijoinop_{suffix}"), store)
+                .await
+                .expect("open SlateDB"),
+        )
     }
 
     async fn stage_version<K>(
@@ -585,43 +596,53 @@ mod tests {
             }
             let present = right_keys.contains(&row.0);
             if mode.active(present) {
-                out.insert(row.clone(), *weight);
+                out.insert(*row, *weight);
             }
         }
         out
     }
 
     async fn run_semijoin_case(mode: SemiJoinMode) {
-        let db = build_db().await;
+        let suffix = next_test_suffix();
+        let db = build_db(suffix).await;
         let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
 
+        let prefix = format!("semijoin_{mode:?}_{suffix}");
+        let left_stream_ns = format!("{prefix}_left_stream");
+        let right_stream_ns = format!("{prefix}_right_stream");
+        let output_ns = format!("{prefix}_output");
+        let left_state_ns = format!("{prefix}_left_state");
+        let right_state_ns = format!("{prefix}_right_state");
+        let left_index_ns = format!("{prefix}_left_index");
+        let right_index_ns = format!("{prefix}_right_index");
+
         let left_dict = Arc::new(
-            Dictionary::<Row>::with_table(table.clone(), "semijoin_left_stream", None)
+            Dictionary::<Row>::with_table(table.clone(), left_stream_ns.clone(), None)
                 .await
                 .expect("left dict"),
         );
         let right_dict = Arc::new(
-            Dictionary::<Row>::with_table(table.clone(), "semijoin_right_stream", None)
+            Dictionary::<Row>::with_table(table.clone(), right_stream_ns.clone(), None)
                 .await
                 .expect("right dict"),
         );
         let output_dict = Arc::new(
-            Dictionary::<Row>::with_table(table.clone(), "semijoin_output", None)
+            Dictionary::<Row>::with_table(table.clone(), output_ns.clone(), None)
                 .await
                 .expect("output dict"),
         );
 
-        let left_state = RelationState::empty(table.clone(), "semijoin_left_state".to_string())
+        let left_state = RelationState::empty(table.clone(), left_state_ns)
             .await
             .expect("left state");
-        let right_state = RelationState::empty(table.clone(), "semijoin_right_state".to_string())
+        let right_state = RelationState::empty(table.clone(), right_state_ns)
             .await
             .expect("right state");
-        let output = VersionedZSet::new(output_dict.clone(), table.clone(), "semijoin_output")
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
             .await
             .expect("output zset");
-        let left_index = IndexedBatchZSet::new(table.clone(), "semijoin_left_index");
-        let right_index = IndexedBatchZSet::new(table.clone(), "semijoin_right_index");
+        let left_index = IndexedBatchZSet::new(table.clone(), left_index_ns);
+        let right_index = IndexedBatchZSet::new(table.clone(), right_index_ns);
 
         let left_key = Arc::new(|row: &Row| Some(row.0));
         let right_key = Arc::new(|row: &Row| Some(row.0));
@@ -659,7 +680,7 @@ mod tests {
         let mut prev_output: HashMap<Row, i64> = HashMap::new();
 
         let mut cache_out = HashMap::new();
-        cache_out.insert("semijoin_output".to_string(), output_dict.clone());
+        cache_out.insert(output_ns.clone(), output_dict.clone());
 
         for (step, (left_delta, right_delta)) in
             left_deltas.iter().zip(right_deltas.iter()).enumerate()
@@ -674,28 +695,28 @@ mod tests {
 
             let left_handle = if left_delta.is_empty() {
                 ZSetHandle {
-                    ns: "semijoin_left_stream".to_string(),
+                    ns: left_stream_ns.clone(),
                     version: 0,
                 }
             } else {
                 stage_version(
                     left_dict.clone(),
                     table.clone(),
-                    "semijoin_left_stream",
+                    left_stream_ns.as_str(),
                     left_delta,
                 )
                 .await
             };
             let right_handle = if right_delta.is_empty() {
                 ZSetHandle {
-                    ns: "semijoin_right_stream".to_string(),
+                    ns: right_stream_ns.clone(),
                     version: 0,
                 }
             } else {
                 stage_version(
                     right_dict.clone(),
                     table.clone(),
-                    "semijoin_right_stream",
+                    right_stream_ns.as_str(),
                     right_delta,
                 )
                 .await
