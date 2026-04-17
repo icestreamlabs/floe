@@ -246,3 +246,159 @@ fn encode_utf8_field(encoded: &mut Vec<u8>, value: &str) -> Result<()> {
     encoded.extend_from_slice(bytes);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
+    use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DB_ID: AtomicUsize = AtomicUsize::new(0);
+
+    async fn test_db() -> Arc<Db> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+        Arc::new(
+            Db::open(format!("dbsp-table-env-test-{id}"), store)
+                .await
+                .expect("open db"),
+        )
+    }
+
+    fn sample_person() -> Person {
+        Person {
+            id: 1,
+            name: "alice".to_string(),
+            email_address: "alice@example.com".to_string(),
+            credit_card: "1234".to_string(),
+            city: "seattle".to_string(),
+            state: "wa".to_string(),
+            date_time: 1_700_000_000_000,
+            extra: "extra".to_string(),
+        }
+    }
+
+    fn sample_auction() -> Auction {
+        Auction {
+            id: 10,
+            item_name: "item".to_string(),
+            description: "desc".to_string(),
+            initial_bid: 100,
+            reserve: 200,
+            date_time: 1_700_000_000_000,
+            expires: 1_700_000_100_000,
+            seller: 1,
+            category: 5,
+            extra: "auction-extra".to_string(),
+        }
+    }
+
+    fn sample_bid() -> Bid {
+        Bid {
+            auction: 10,
+            bidder: 2,
+            price: 150,
+            channel: "web".to_string(),
+            url: "https://example".to_string(),
+            date_time: 1_700_000_000_500,
+            extra: "bid-extra".to_string(),
+        }
+    }
+
+    #[test]
+    fn table_kind_maps_nexmark_tables_and_aliases() {
+        assert!(matches!(
+            table_kind(nexmark_person_table()),
+            Some(TableKind::Person)
+        ));
+        assert!(matches!(
+            table_kind(nexmark_person_alias_table()),
+            Some(TableKind::Person)
+        ));
+        assert!(matches!(
+            table_kind(nexmark_auction_table()),
+            Some(TableKind::Auction)
+        ));
+        assert!(matches!(
+            table_kind(nexmark_auction_alias_table()),
+            Some(TableKind::Auction)
+        ));
+        assert!(matches!(
+            table_kind(nexmark_bid_table()),
+            Some(TableKind::Bid)
+        ));
+        assert!(matches!(
+            table_kind(nexmark_bid_alias_table()),
+            Some(TableKind::Bid)
+        ));
+    }
+
+    #[test]
+    fn row_encoders_produce_expected_values() {
+        let person_row = encode_person_row(&sample_person()).expect("encode person");
+        let person_values = decode_all_encoded_row_scalars(&person_row).expect("decode person");
+        assert_eq!(person_values.len(), 8);
+        assert_eq!(person_values[0], Some(EncodedRowScalar::Int64(1)));
+
+        let auction_row = encode_auction_row(&sample_auction()).expect("encode auction");
+        let auction_values = decode_all_encoded_row_scalars(&auction_row).expect("decode auction");
+        assert_eq!(auction_values.len(), 10);
+        assert_eq!(auction_values[0], Some(EncodedRowScalar::Int64(10)));
+
+        let bid_row = encode_bid_row(&sample_bid()).expect("encode bid");
+        let bid_values = decode_all_encoded_row_scalars(&bid_row).expect("decode bid");
+        assert_eq!(bid_values.len(), 7);
+        assert_eq!(bid_values[0], Some(EncodedRowScalar::Int64(10)));
+        assert_eq!(bid_values[1], Some(EncodedRowScalar::Int64(2)));
+    }
+
+    #[tokio::test]
+    async fn environment_ingests_and_flushes_all_streams() {
+        let db = test_db().await;
+        let mut env = DbspTableEnvironment::new(db)
+            .await
+            .expect("build environment");
+
+        env.ingest_event(&Event::Person(sample_person()))
+            .expect("ingest person");
+        env.ingest_event(&Event::Auction(sample_auction()))
+            .expect("ingest auction");
+        env.ingest_event(&Event::Bid(sample_bid()))
+            .expect("ingest bid");
+        env.flush_all().await.expect("flush all");
+
+        let person_rows = env
+            .person
+            .latest_view()
+            .materialize()
+            .await
+            .expect("person rows");
+        let auction_rows = env
+            .auction
+            .latest_view()
+            .materialize()
+            .await
+            .expect("auction rows");
+        let bid_rows = env.bid.latest_view().materialize().await.expect("bid rows");
+
+        assert_eq!(person_rows.len(), 1);
+        assert_eq!(auction_rows.len(), 1);
+        assert_eq!(bid_rows.len(), 1);
+        assert!(env.handle_stream_for(nexmark_bid_table()).is_some());
+        assert!(
+            env.delta_handle_stream_for(nexmark_bid_alias_table())
+                .is_some()
+        );
+        assert!(env.zset_mut_for(nexmark_person_alias_table()).is_some());
+    }
+
+    #[test]
+    fn range_conversions_reject_overflow() {
+        let i64_overflow = as_i64(usize::MAX, "value").unwrap_err();
+        assert!(format!("{i64_overflow:#}").contains("exceeds i64 range"));
+
+        let ts_overflow = ts_to_i64(u64::MAX).unwrap_err();
+        assert!(format!("{ts_overflow:#}").contains("exceeds i64 range"));
+    }
+}

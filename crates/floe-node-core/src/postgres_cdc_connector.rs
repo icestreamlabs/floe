@@ -286,3 +286,128 @@ fn parse_wal2json_payload(
 
     Ok(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> PostgresCdcConnectorConfig {
+        PostgresCdcConnectorConfig {
+            connection_string: "postgres://localhost/postgres".to_string(),
+            slot: "floe_slot".to_string(),
+            poll_interval: Duration::from_millis(10),
+            max_changes: 128,
+            default_schema: "public".to_string(),
+            include_tables: None,
+            include_schema_in_source: false,
+            commit_lsn_rx: None,
+        }
+    }
+
+    #[test]
+    fn constructor_validates_required_fields() {
+        let mut config = base_config();
+        config.connection_string = " ".to_string();
+        assert!(PostgresCdcConnector::new(config.clone(), Vec::new()).is_err());
+
+        config = base_config();
+        config.slot = " ".to_string();
+        assert!(PostgresCdcConnector::new(config.clone(), Vec::new()).is_err());
+
+        config = base_config();
+        config.max_changes = 0;
+        assert!(PostgresCdcConnector::new(config, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn parse_wal2json_payload_emits_insert_and_update_rows() {
+        let payload = r#"{
+            "change": [
+                {
+                    "kind": "insert",
+                    "schema": "public",
+                    "table": "bid",
+                    "columnnames": ["auction", "price"],
+                    "columnvalues": [1, 99]
+                },
+                {
+                    "kind": "update",
+                    "schema": "public",
+                    "table": "bid",
+                    "columnnames": ["auction", "price"],
+                    "columnvalues": [1, 100]
+                },
+                {
+                    "kind": "delete",
+                    "schema": "public",
+                    "table": "bid",
+                    "columnnames": ["auction"],
+                    "columnvalues": [1]
+                }
+            ]
+        }"#;
+
+        let events = parse_wal2json_payload(payload, &base_config(), None).expect("parse payload");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source(), "bid");
+        assert_eq!(
+            events[0].payload().and_then(|v| v.get("auction")),
+            Some(&Value::from(1))
+        );
+        assert_eq!(
+            events[1].payload().and_then(|v| v.get("price")),
+            Some(&Value::from(100))
+        );
+    }
+
+    #[test]
+    fn parse_wal2json_payload_honors_schema_and_include_tables_filter() {
+        let mut config = base_config();
+        config.include_schema_in_source = true;
+
+        let payload = r#"{
+            "change": [
+                {
+                    "kind": "insert",
+                    "schema": "public",
+                    "table": "bid",
+                    "columnnames": ["auction"],
+                    "columnvalues": [1]
+                },
+                {
+                    "kind": "insert",
+                    "schema": "private",
+                    "table": "auction",
+                    "columnnames": ["id"],
+                    "columnvalues": [2]
+                }
+            ]
+        }"#;
+
+        let mut include = HashSet::new();
+        include.insert("public.bid".to_string());
+        let events =
+            parse_wal2json_payload(payload, &config, Some(&include)).expect("parse payload");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "public.bid");
+    }
+
+    #[test]
+    fn parse_wal2json_payload_rejects_mismatched_columns() {
+        let payload = r#"{
+            "change": [
+                {
+                    "kind": "insert",
+                    "schema": "public",
+                    "table": "bid",
+                    "columnnames": ["auction", "price"],
+                    "columnvalues": [1]
+                }
+            ]
+        }"#;
+
+        let err = parse_wal2json_payload(payload, &base_config(), None).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("length mismatch"));
+    }
+}

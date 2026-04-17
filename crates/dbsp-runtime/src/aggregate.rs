@@ -206,3 +206,67 @@ impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
 }
 
 static NEXT_AGGREGATE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StreamRetention;
+    use crate::operators::aggregate::count_all;
+    use crate::storage::SlateTable;
+    use crate::stream::util::materialize_zset_handle;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn aggregate_wrapper_counts_by_extracted_key() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("aggregate-wrapper-test", store)
+                .await
+                .expect("open db"),
+        );
+        let table: Arc<dyn crate::storage::KeyValueTable> = Arc::new(SlateTable::new(db));
+
+        let dict = Arc::new(
+            Dictionary::with_table(table.clone(), "aggregate_wrapper_source", None)
+                .await
+                .expect("source dictionary"),
+        );
+        let mut source = crate::ZSetStream::new(
+            dict,
+            table.clone(),
+            "aggregate_wrapper_source",
+            StreamRetention::None,
+        )
+        .await
+        .expect("source stream");
+
+        source.add_delta("a".to_string(), 1);
+        source.flush().await.expect("flush t1");
+        source.add_delta("a".to_string(), 1);
+        source.add_delta("cc".to_string(), 1);
+        source.flush().await.expect("flush t2");
+
+        let aggregate = DbspAggregate::new::<String, String, i64, _>(
+            &source.delta_handle_stream(),
+            |value: &String| Some(value.clone()),
+            count_all::<String, String>(),
+            None,
+        )
+        .await
+        .expect("build aggregate wrapper");
+
+        let mut output = aggregate.stream();
+        let ts = output.current_time();
+        let handle = output.get(ts).await.expect("output handle");
+        let mut cache = HashMap::new();
+        let materialized =
+            materialize_zset_handle::<(String, i64)>(table.clone(), &mut cache, &handle)
+                .await
+                .expect("materialize aggregate output");
+
+        assert_eq!(materialized.get(&("a".to_string(), 2)), Some(&1));
+        assert_eq!(materialized.get(&("cc".to_string(), 1)), Some(&1));
+    }
+}

@@ -178,3 +178,61 @@ impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
 }
 
 static NEXT_TOPK_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StreamRetention;
+    use crate::storage::SlateTable;
+    use crate::stream::util::materialize_zset_handle;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn topk_wrapper_keeps_smallest_order_keys() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("topk-wrapper-test", store).await.expect("open db"));
+        let table: Arc<dyn crate::storage::KeyValueTable> = Arc::new(SlateTable::new(db));
+
+        let dict = Arc::new(
+            Dictionary::with_table(table.clone(), "topk_wrapper_source", None)
+                .await
+                .expect("source dictionary"),
+        );
+        let mut source = crate::ZSetStream::new(
+            dict,
+            table.clone(),
+            "topk_wrapper_source",
+            StreamRetention::None,
+        )
+        .await
+        .expect("source stream");
+
+        source.add_delta("bbb".to_string(), 1);
+        source.add_delta("a".to_string(), 1);
+        source.add_delta("cc".to_string(), 1);
+        source.flush().await.expect("flush source");
+
+        let topk = DbspTopK::new::<String, usize, _>(
+            &source.delta_handle_stream(),
+            |value: &String| Some(value.len()),
+            2,
+            None,
+        )
+        .await
+        .expect("build topk wrapper");
+
+        let mut output = topk.stream();
+        let ts = output.current_time();
+        let handle = output.get(ts).await.expect("output handle");
+        let mut cache = HashMap::new();
+        let materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &handle)
+            .await
+            .expect("materialize topk output");
+
+        assert_eq!(materialized.get("a"), Some(&1));
+        assert_eq!(materialized.get("cc"), Some(&1));
+        assert!(materialized.get("bbb").is_none());
+    }
+}

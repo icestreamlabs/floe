@@ -135,3 +135,85 @@ async fn read_object(
     }
     Ok(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::Connector;
+    use crate::source::channel;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("floe-object-store-{test_name}-{nanos}"))
+    }
+
+    #[tokio::test]
+    async fn load_events_reads_single_file_when_prefix_is_object() {
+        let root = temp_path("single-file");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("events.jsonl");
+        fs::write(
+            &file,
+            "{\"source\":\"nexmark_bid\",\"data\":{\"auction\":1}}\n",
+        )
+        .expect("write events");
+
+        let config = ObjectStoreConnectorConfig {
+            url: format!("file://{}", file.display()),
+            default_source: None,
+        };
+        let events = load_events(&config).await.expect("load events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source(), "nexmark_bid");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn connector_tick_emits_default_source_with_resume_tokens() {
+        let root = temp_path("tick");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("events.jsonl");
+        fs::write(&file, "{\"auction\":1}\n{\"auction\":2}\n").expect("write events");
+
+        let config = ObjectStoreConnectorConfig {
+            url: format!("file://{}", root.display()),
+            default_source: Some("nexmark_bid".to_string()),
+        };
+        let mut connector = ObjectStoreConnector::new(config, Vec::new());
+        let (sender, mut rx) = channel(8);
+        let ctx = ConnectorContext::new(sender);
+
+        connector.init(&ctx).await.expect("init connector");
+
+        let first = connector.tick(&ctx).await.expect("first tick");
+        assert_eq!(first, ConnectorTick::Emitted(1));
+        let first_batch = rx.recv().await.expect("first batch");
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].source(), "nexmark_bid");
+        assert_eq!(
+            first_batch[0].resume_token(),
+            Some(&SourceResumeToken::ObjectStore { cursor: 0 })
+        );
+
+        let second = connector.tick(&ctx).await.expect("second tick");
+        assert_eq!(second, ConnectorTick::Emitted(1));
+        let second_batch = rx.recv().await.expect("second batch");
+        assert_eq!(
+            second_batch[0].resume_token(),
+            Some(&SourceResumeToken::ObjectStore { cursor: 1 })
+        );
+
+        let done = connector.tick(&ctx).await.expect("finished tick");
+        assert_eq!(done, ConnectorTick::Finished);
+
+        connector.shutdown().await.expect("shutdown connector");
+        fs::remove_dir_all(root).ok();
+    }
+}

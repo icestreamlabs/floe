@@ -232,3 +232,152 @@ fn read_cstring(payload: &[u8], start: usize) -> anyhow::Result<(String, usize)>
     let value = String::from_utf8_lossy(&payload[start..idx]).to_string();
     Ok((value, idx + 1))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn write_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) {
+        stream.write_all(&[msg_type]).expect("write type");
+        let len = (payload.len() + 4) as u32;
+        stream
+            .write_all(&len.to_be_bytes())
+            .expect("write message length");
+        stream.write_all(payload).expect("write payload");
+        stream.flush().expect("flush message");
+    }
+
+    fn row_description_payload(columns: &[&str]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+        for column in columns {
+            payload.extend_from_slice(column.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&0u32.to_be_bytes()); // table oid
+            payload.extend_from_slice(&0u16.to_be_bytes()); // attr num
+            payload.extend_from_slice(&25u32.to_be_bytes()); // text type oid
+            payload.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+            payload.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+            payload.extend_from_slice(&0u16.to_be_bytes()); // text format
+        }
+        payload
+    }
+
+    fn data_row_payload(values: &[Option<&str>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for value in values {
+            match value {
+                Some(text) => {
+                    payload.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                    payload.extend_from_slice(text.as_bytes());
+                }
+                None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn build_tail_sql_formats_options() {
+        assert_eq!(build_tail_sql("mv_q1", false, None), "TAIL mv_q1");
+        assert_eq!(
+            build_tail_sql("mv_q1", true, Some(42)),
+            "TAIL mv_q1 WITH SNAPSHOT AS OF 42"
+        );
+    }
+
+    #[test]
+    fn parse_row_description_and_data_row() {
+        let description = row_description_payload(&["auction", "price"]);
+        let columns = parse_row_description(&description).expect("parse row description");
+        assert_eq!(columns, vec!["auction", "price"]);
+
+        let row = parse_data_row(&data_row_payload(&[Some("10"), None, Some("alice")]))
+            .expect("parse data row");
+        assert_eq!(row, vec!["10", "NULL", "alice"]);
+    }
+
+    #[test]
+    fn parse_error_message_prefers_message_field() {
+        let mut payload = Vec::new();
+        payload.push(b'S');
+        payload.extend_from_slice(b"ERROR\0");
+        payload.push(b'M');
+        payload.extend_from_slice(b"boom\0");
+        payload.push(0);
+        assert_eq!(parse_error_message(&payload), "boom");
+    }
+
+    #[test]
+    fn run_executes_simple_tail_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+
+            // Startup packet: [len][payload].
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).expect("startup len");
+            let startup_len = u32::from_be_bytes(len) as usize;
+            let mut startup = vec![0u8; startup_len.saturating_sub(4)];
+            stream.read_exact(&mut startup).expect("startup payload");
+            assert!(
+                startup.windows(b"user\0".len()).any(|w| w == b"user\0"),
+                "startup packet should include user key"
+            );
+
+            write_message(&mut stream, b'R', &0u32.to_be_bytes());
+            write_message(&mut stream, b'Z', b"I");
+
+            // Query packet: [Q][len][sql\0].
+            let mut typ = [0u8; 1];
+            stream.read_exact(&mut typ).expect("query type");
+            assert_eq!(typ[0], b'Q');
+            let mut q_len = [0u8; 4];
+            stream.read_exact(&mut q_len).expect("query len");
+            let q_len = u32::from_be_bytes(q_len) as usize;
+            let mut query = vec![0u8; q_len.saturating_sub(4)];
+            stream.read_exact(&mut query).expect("query payload");
+            assert!(
+                query.starts_with(b"TAIL mv_q1"),
+                "expected tail query in startup exchange"
+            );
+
+            write_message(&mut stream, b'T', &row_description_payload(&["k", "v"]));
+            write_message(
+                &mut stream,
+                b'D',
+                &data_row_payload(&[Some("1"), Some("ok")]),
+            );
+            write_message(&mut stream, b'C', b"TAIL 1\0");
+            write_message(&mut stream, b'Z', b"I");
+
+            let mut terminate_type = [0u8; 1];
+            stream
+                .read_exact(&mut terminate_type)
+                .expect("terminate type");
+            assert_eq!(terminate_type[0], b'X');
+            let mut terminate_len = [0u8; 4];
+            stream
+                .read_exact(&mut terminate_len)
+                .expect("terminate len");
+            assert_eq!(u32::from_be_bytes(terminate_len), 4);
+        });
+
+        let result = run(TailConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            user: "postgres".to_string(),
+            database: "postgres".to_string(),
+            sql: build_tail_sql("mv_q1", false, None),
+            max_rows: Some(1),
+            no_header: true,
+        });
+        assert!(result.is_ok(), "tail client should complete successfully");
+        server.join().expect("server thread");
+    }
+}
