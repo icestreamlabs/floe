@@ -2652,6 +2652,10 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
+    rows.sort_by_key(|row| match row.get(1) {
+        Some(Some(EncodedRowScalar::Int64(value))) => *value,
+        _ => i64::MIN,
+    });
     assert_eq!(
         rows,
         vec![
