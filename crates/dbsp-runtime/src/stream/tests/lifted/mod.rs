@@ -6,4 +6,5 @@ mod join;
 mod nested_select;
 mod project;
 mod runtime_wrappers;
+mod scalar_wrappers;
 mod select;

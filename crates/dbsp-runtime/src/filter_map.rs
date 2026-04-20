@@ -667,3 +667,364 @@ fn bucket_for(id: u64) -> u16 {
 }
 
 static NEXT_FILTER_MAP_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::util::{delta_zset_handle_batch, materialize_zset_handle};
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FILTER_MAP_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn next_suffix() -> u64 {
+        FILTER_MAP_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn build_db(suffix: u64) -> Arc<Db> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        Arc::new(
+            Db::open(format!("filter_map_test_{suffix}"), store)
+                .await
+                .expect("open SlateDB"),
+        )
+    }
+
+    async fn stage_version<K>(
+        dict: Arc<Dictionary<K>>,
+        table: Arc<dyn KeyValueTable>,
+        namespace: &str,
+        deltas: &[(K, i64)],
+    ) -> ZSetHandle
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    {
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        let mut dict_batch = dict.batch();
+        for (key, delta) in deltas {
+            let id = dict_batch
+                .intern(key)
+                .await
+                .expect("intern key for filter_map test");
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
+        }
+        drop(dict_batch);
+
+        let mut segments = Vec::new();
+        for (bucket, mut bucket_deltas) in buckets {
+            bucket_deltas.retain(|(_, delta)| *delta != 0);
+            if bucket_deltas.is_empty() {
+                continue;
+            }
+            bucket_deltas.sort_by_key(|(id, _)| *id);
+            segments.push(SegmentRecord {
+                id: 0,
+                bucket,
+                deltas: bucket_deltas,
+            });
+        }
+
+        let mut versioned = VersionedZSet::new(dict, table, namespace.to_string())
+            .await
+            .expect("build versioned zset");
+        let version = versioned
+            .create_version_with_base(segments, None)
+            .await
+            .expect("create version");
+        versioned.handle_for_version(version)
+    }
+
+    fn coalesce_rows(rows: &[(i64, i64)]) -> HashMap<i64, i64> {
+        let mut out = HashMap::new();
+        for (key, weight) in rows {
+            let entry = out.entry(*key).or_insert(0);
+            *entry += *weight;
+            if *entry == 0 {
+                out.remove(key);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn zset_handle_group_and_bucket_helpers_work() {
+        let default = ZSetHandle {
+            ns: "group-default".to_string(),
+            version: 7,
+        };
+        let group = ZSetHandleGroup {
+            default: default.clone(),
+        };
+
+        let a = ZSetHandle {
+            ns: "a".to_string(),
+            version: 1,
+        };
+        let b = ZSetHandle {
+            ns: "b".to_string(),
+            version: 2,
+        };
+
+        assert_eq!(group.add(&a, &b).await, a);
+        assert_eq!(group.neg(&b).await, b);
+        assert_eq!(group.identity().await, default);
+
+        assert_eq!(bucket_for(0), 0);
+        assert_eq!(bucket_for(1 << 48), 1);
+        assert_eq!(bucket_for(u64::MAX), u16::MAX);
+    }
+
+    #[tokio::test]
+    async fn apply_deltas_to_versioned_covers_persistent_replayable_and_empty_paths() {
+        let suffix = next_suffix();
+        let db = build_db(suffix).await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
+
+        let ns = format!("apply_versioned_{suffix}");
+        let dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), ns.clone(), None)
+                .await
+                .expect("dict"),
+        );
+        let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), ns.clone())
+            .await
+            .expect("zset");
+
+        let handle1 = apply_deltas_to_versioned(&mut versioned, &[(1, 1), (2, 2), (1, -1), (3, 0)])
+            .await
+            .expect("apply persistent deltas");
+        let mut cache = HashMap::new();
+        let materialized1 = materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle1)
+            .await
+            .expect("materialize handle1");
+        assert_eq!(materialized1, HashMap::from([(2_i64, 2_i64)]));
+
+        let handle2 = apply_deltas_to_versioned(&mut versioned, &[(2, -2), (5, 0)])
+            .await
+            .expect("apply second persistent deltas");
+        let materialized2 = materialize_zset_handle::<i64>(table.clone(), &mut cache, &handle2)
+            .await
+            .expect("materialize handle2");
+        assert_eq!(materialized2, HashMap::from([(2_i64, -2_i64)]));
+
+        let handle3 = apply_deltas_to_versioned(&mut versioned, &[(9, 0)])
+            .await
+            .expect("apply empty staged deltas");
+        assert_eq!(handle3.version, handle2.version);
+
+        let replay_ns = format!("apply_versioned_replay_{suffix}");
+        let replay_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), replay_ns.clone(), None)
+                .await
+                .expect("replay dict"),
+        );
+        let mut replay = VersionedZSet::new(replay_dict, table.clone(), replay_ns)
+            .await
+            .expect("replay zset");
+        replay.enable_replayable_persistence();
+        let replay_handle = apply_deltas_to_versioned(&mut replay, &[(11, 3), (12, -1)])
+            .await
+            .expect("apply replayable deltas");
+        let replay_rows =
+            delta_zset_handle_batch::<i64>(table, &mut HashMap::new(), &replay_handle)
+                .await
+                .expect("delta replay rows");
+        assert_eq!(
+            coalesce_rows(replay_rows.as_ref()),
+            HashMap::from([(11_i64, 3_i64), (12_i64, -1_i64)])
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_map_state_on_step_projects_filters_and_replayable_output() {
+        let suffix = next_suffix();
+        let db = build_db(suffix).await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
+
+        let input_ns = format!("filter_map_state_input_{suffix}");
+        let output_ns = format!("filter_map_state_output_{suffix}");
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .expect("output dict"),
+        );
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+            .await
+            .expect("output zset");
+
+        let mut state = FilterMapState {
+            transform: Arc::new(|value: &i64| (value % 2 == 0).then_some(value * 10)),
+            table: table.clone(),
+            output,
+            dict_cache: HashMap::new(),
+        };
+
+        let input_h1 = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            input_ns.as_str(),
+            &[(1, 1), (2, 3), (4, -1)],
+        )
+        .await;
+        let out_h1 = state.on_step(1, &input_h1).await.expect("state step 1");
+        let out_rows_1 =
+            delta_zset_handle_batch::<i64>(table.clone(), &mut HashMap::new(), &out_h1)
+                .await
+                .expect("output rows 1");
+        assert_eq!(
+            coalesce_rows(out_rows_1.as_ref()),
+            HashMap::from([(20_i64, 3_i64), (40_i64, -1_i64)])
+        );
+
+        let input_h2 = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            input_ns.as_str(),
+            &[(1, 1), (3, -2)],
+        )
+        .await;
+        let out_h2 = state.on_step(2, &input_h2).await.expect("state step 2");
+        assert_eq!(out_h2.version, 0);
+
+        state.enable_live_output_replayable();
+        let input_h3 = stage_version(input_dict, table.clone(), input_ns.as_str(), &[(6, 2)]).await;
+        let out_h3 = state.on_step(3, &input_h3).await.expect("state step 3");
+        assert!(out_h3.version > 0);
+        let out_rows_3 = delta_zset_handle_batch::<i64>(table, &mut HashMap::new(), &out_h3)
+            .await
+            .expect("output rows 3");
+        assert_eq!(
+            coalesce_rows(out_rows_3.as_ref()),
+            HashMap::from([(60_i64, 2_i64)])
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_map_batch_state_on_step_handles_success_empty_and_error_paths() {
+        let suffix = next_suffix();
+        let db = build_db(suffix).await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
+
+        let input_ns = format!("filter_map_batch_input_{suffix}");
+        let output_ns = format!("filter_map_batch_output_{suffix}");
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .expect("output dict"),
+        );
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+            .await
+            .expect("output zset");
+
+        let mut state = FilterMapBatchState {
+            transform: Arc::new(|rows: &[(i64, i64)]| {
+                Ok(rows
+                    .iter()
+                    .filter_map(|(value, weight)| {
+                        (value % 2 != 0).then_some((value * 100, *weight))
+                    })
+                    .collect::<Vec<_>>())
+            }),
+            table: table.clone(),
+            output,
+            dict_cache: HashMap::new(),
+        };
+
+        let input_h1 = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            input_ns.as_str(),
+            &[(1, 2), (2, 1), (3, -1)],
+        )
+        .await;
+        let out_h1 = state
+            .on_step(1, &input_h1)
+            .await
+            .expect("batch state step 1");
+        let out_rows_1 =
+            delta_zset_handle_batch::<i64>(table.clone(), &mut HashMap::new(), &out_h1)
+                .await
+                .expect("batch output rows 1");
+        assert_eq!(
+            coalesce_rows(out_rows_1.as_ref()),
+            HashMap::from([(100_i64, 2_i64), (300_i64, -1_i64)])
+        );
+
+        let input_h2 = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            input_ns.as_str(),
+            &[(2, 5), (4, 1)],
+        )
+        .await;
+        let out_h2 = state
+            .on_step(2, &input_h2)
+            .await
+            .expect("batch state step 2");
+        assert_eq!(out_h2.version, 0);
+
+        state.enable_live_output_replayable();
+        let input_h3 = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            input_ns.as_str(),
+            &[(5, 3)],
+        )
+        .await;
+        let out_h3 = state
+            .on_step(3, &input_h3)
+            .await
+            .expect("batch state step 3");
+        assert!(out_h3.version > 0);
+
+        let output_err_ns = format!("filter_map_batch_output_err_{suffix}");
+        let output_err_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), output_err_ns.clone(), None)
+                .await
+                .expect("output err dict"),
+        );
+        let output_err = VersionedZSet::new(output_err_dict, table.clone(), output_err_ns)
+            .await
+            .expect("output err zset");
+        let mut err_state = FilterMapBatchState {
+            transform: Arc::new(|rows: &[(i64, i64)]| {
+                if rows.iter().any(|(value, _)| *value < 0) {
+                    anyhow::bail!("negative keys not allowed")
+                }
+                Ok(Vec::new())
+            }),
+            table: table.clone(),
+            output: output_err,
+            dict_cache: HashMap::new(),
+        };
+
+        let input_h_err = stage_version(input_dict, table, input_ns.as_str(), &[(-1, 1)]).await;
+        let err = err_state
+            .on_step(4, &input_h_err)
+            .await
+            .expect_err("batch transform should fail");
+        assert!(err.to_string().contains("run filter_map batch transform"));
+    }
+}
