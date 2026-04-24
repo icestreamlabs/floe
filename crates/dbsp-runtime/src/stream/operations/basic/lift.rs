@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -8,8 +9,8 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
-use crate::stream::util::{build_exact_stream_from_values, collect_values};
+use crate::stream::core::stream::{Stream, StreamEvaluator};
+use crate::stream::util::build_evaluated_stream;
 
 use super::time::{delay, integrate};
 use crate::stream::addition::StreamAddition;
@@ -36,25 +37,20 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(&I) -> O + Send + Sync,
+    F: Fn(&I) -> O + Send + Sync + 'static,
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon();
-    let values = collect_values(input, horizon).await?;
-    let mut mapped = Vec::with_capacity((horizon + 1) as usize);
-    for value in &values {
-        mapped.push(function(value));
-    }
-    let tail_default = function(&input.default_value());
-
-    build_exact_stream_from_values(
+    build_evaluated_stream(
         input.table(),
         output_group,
+        Arc::new(Lift1Evaluator {
+            input: input.clone(),
+            function: Arc::new(function),
+        }),
         "stream_lift1/",
         frontier,
         horizon,
-        &mapped,
-        tail_default,
     )
     .await
 }
@@ -90,29 +86,21 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(&L, &R) -> O + Send + Sync,
+    F: Fn(&L, &R) -> O + Send + Sync + 'static,
 {
     let frontier = left.current_time().max(right.current_time());
     let horizon = left.semantic_horizon().max(right.semantic_horizon());
-    let left_values = collect_values(left, horizon).await?;
-    let right_values = collect_values(right, horizon).await?;
-    let mut combined = Vec::with_capacity((horizon + 1) as usize);
-    for t in 0..=horizon {
-        combined.push(function(
-            &left_values[t as usize],
-            &right_values[t as usize],
-        ));
-    }
-    let tail_default = function(&left.default_value(), &right.default_value());
-
-    build_exact_stream_from_values(
+    build_evaluated_stream(
         left.table(),
         output_group,
+        Arc::new(Lift2Evaluator {
+            left: left.clone(),
+            right: right.clone(),
+            function: Arc::new(function),
+        }),
         "stream_lift2/",
         frontier,
         horizon,
-        &combined,
-        tail_default,
     )
     .await
 }
@@ -178,4 +166,111 @@ where
     let partial = addition.add(&f_ab, &f_a_delayed_b).await;
     let summed = addition.add(&partial, &f_delayed_a_b).await;
     Ok(summed)
+}
+
+struct Lift1Evaluator<I, O, F>
+where
+    I: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    I::Archived: RkyvDeserialize<I, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&I) -> O + Send + Sync + 'static,
+{
+    input: Stream<I>,
+    function: Arc<F>,
+}
+
+#[async_trait]
+impl<I, O, F> StreamEvaluator<O> for Lift1Evaluator<I, O, F>
+where
+    I: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    I::Archived: RkyvDeserialize<I, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&I) -> O + Send + Sync + 'static,
+{
+    async fn value_at(&self, timestamp: i64, _group: Arc<dyn AbelianGroup<O>>) -> Result<O> {
+        let mut input = self.input.clone();
+        let value = input.get(timestamp).await?;
+        Ok((self.function)(&value))
+    }
+}
+
+struct Lift2Evaluator<L, R, O, F>
+where
+    L: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&L, &R) -> O + Send + Sync + 'static,
+{
+    left: Stream<L>,
+    right: Stream<R>,
+    function: Arc<F>,
+}
+
+#[async_trait]
+impl<L, R, O, F> StreamEvaluator<O> for Lift2Evaluator<L, R, O, F>
+where
+    L: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(&L, &R) -> O + Send + Sync + 'static,
+{
+    async fn value_at(&self, timestamp: i64, _group: Arc<dyn AbelianGroup<O>>) -> Result<O> {
+        let mut left = self.left.clone();
+        let mut right = self.right.clone();
+        let left_value = left.get(timestamp).await?;
+        let right_value = right.get(timestamp).await?;
+        Ok((self.function)(&left_value, &right_value))
+    }
 }

@@ -38,7 +38,7 @@ async fn stream_addition_and_negation() {
 
     let mut neg = addition.neg(&left).await;
     assert_eq!(neg.current_time(), 2);
-    assert_eq!(neg.semantic_horizon(), 3);
+    assert_eq!(neg.semantic_horizon(), 4);
     assert_eq!(neg.get(0).await.expect("neg t0"), 0);
     assert_eq!(neg.get(1).await.expect("neg t1"), 0);
     assert_eq!(neg.get(2).await.expect("neg t2"), -1);
@@ -65,6 +65,23 @@ async fn delay_shifts_stream_values() {
     assert_eq!(delayed.get(3).await.expect("t3"), 10);
     assert_eq!(delayed.get(4).await.expect("t4"), 15);
     assert_eq!(delayed.get(5).await.expect("t5"), 0);
+}
+
+#[tokio::test]
+async fn delay_emits_identity_at_t0_for_non_identity_initial_value() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "delay_non_identity_t0", group.clone())
+        .await
+        .expect("create stream");
+    source.set_default(7).await.expect("set non-identity t0");
+    source.send(9).await.expect("send t1");
+
+    let mut delayed = delay(&source).await.expect("apply delay");
+    assert_eq!(delayed.get(0).await.expect("t0"), 0);
+    assert_eq!(delayed.get(1).await.expect("t1"), 7);
+    assert_eq!(delayed.get(2).await.expect("t2"), 9);
 }
 
 #[tokio::test]
@@ -110,7 +127,7 @@ async fn integrate_accumulates_stream() {
 }
 
 #[tokio::test]
-async fn integrate_rejects_non_identity_tail() {
+async fn integrate_advances_non_identity_tail_exactly() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
 
@@ -122,14 +139,71 @@ async fn integrate_rejects_non_identity_tail() {
         .await
         .expect("set non-identity default");
 
-    let err = match integrate(&source).await {
-        Ok(_) => panic!("non-identity tail should fail"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("eventually-identity input stream"),
-        "unexpected error: {err}"
-    );
+    let mut integrated = integrate(&source).await.expect("integrate stream");
+    assert_eq!(integrated.get(0).await.expect("t0"), 1);
+    assert_eq!(integrated.get(1).await.expect("t1"), 2);
+    assert_eq!(integrated.get(2).await.expect("t2"), 3);
+
+    integrated.advance_to(5).await.expect("advance derived");
+    assert_eq!(integrated.get(5).await.expect("t5"), 6);
+}
+
+#[tokio::test]
+async fn differentiate_integrate_roundtrip_with_non_identity_tail() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "diff_integrate_roundtrip", group.clone())
+        .await
+        .expect("create stream");
+    source
+        .set_default(2)
+        .await
+        .expect("set non-identity t0 and tail");
+    source.send(3).await.expect("send t1");
+    source.send(5).await.expect("send t2");
+
+    let integrated = integrate(&source).await.expect("integrate source");
+    let mut roundtrip = differentiate(&integrated)
+        .await
+        .expect("differentiate integrated source");
+
+    for t in 0..=6 {
+        assert_eq!(
+            roundtrip.get(t).await.expect("roundtrip value"),
+            source.get(t).await.expect("source value"),
+            "roundtrip mismatch at t={t}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn differentiate_is_input_minus_delay() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "differentiate_minus_delay", group.clone())
+        .await
+        .expect("create stream");
+    source
+        .set_default(4)
+        .await
+        .expect("set non-identity t0 and tail");
+    source.send(7).await.expect("send t1");
+    source.send(1).await.expect("send t2");
+
+    let mut diff = differentiate(&source).await.expect("differentiate source");
+    let mut delayed = delay(&source).await.expect("delay source");
+
+    for t in 0..=5 {
+        let current = source.get(t).await.expect("source value");
+        let previous = delayed.get(t).await.expect("delayed value");
+        assert_eq!(
+            diff.get(t).await.expect("diff value"),
+            current - previous,
+            "differentiate mismatch at t={t}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -210,7 +284,7 @@ async fn incrementalize2_preserves_tail_cancellation() {
         .expect("incrementalize product");
 
     assert_eq!(delta_product.current_time(), 2);
-    assert_eq!(delta_product.semantic_horizon(), 4);
+    assert_eq!(delta_product.semantic_horizon(), 3);
     assert_eq!(delta_product.get(0).await.expect("t0"), 0);
     assert_eq!(delta_product.get(1).await.expect("t1"), 10);
     assert_eq!(delta_product.get(2).await.expect("t2"), 80);

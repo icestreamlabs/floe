@@ -80,6 +80,9 @@ where
                         state.data_cache.insert(timestamp, value.clone());
                     }
                     return Ok(value);
+                } else if let Some(value) = self.derived_value_at(timestamp).await? {
+                    self.set_value_at_in_place(timestamp, value.clone());
+                    return Ok(value);
                 } else if let Some(default_value) = fallback_value {
                     return Ok(default_value);
                 }
@@ -111,6 +114,10 @@ where
             let current = self.current_time();
             if current >= timestamp {
                 break;
+            }
+            if let Some(value) = self.derived_value_at(current + 1).await? {
+                self.push_value_in_place(value);
+                continue;
             }
             let default = {
                 let state = self.read_state();

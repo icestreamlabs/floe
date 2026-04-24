@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
+use anyhow::Result;
+use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -29,16 +33,22 @@ mod values;
 /// - `Stream<ZSetHandle>` represents the delta (Delta R_t) of a relation `R` at time `t`.
 pub type DeltaStream = Stream<ZSetHandle>;
 
-/// Logical-time stream keyed by a logical transaction index.
+/// DBSP logical-time stream keyed by a logical transaction index.
 ///
-/// This is an operational prefix-plus-tail abstraction:
+/// Semantically, a stream is a total function from logical time to values in an
+/// Abelian group.
+///
+/// Persisted streams store materialized observations and compact unchanged
+/// suffixes internally, but that storage detail is not the semantic contract:
 /// - `current_time()` is the committed logical frontier,
-/// - `semantic_horizon()` is the last timestamp with explicitly scheduled
-///   semantics,
-/// - `default_value()` describes the eventual tail after that horizon.
+/// - `semantic_horizon()` is the last timestamp with an explicitly materialized
+///   value,
+/// - `default_value()` is the storage compaction value for materialized base
+///   streams.
 ///
-/// This type is intentionally not the paper DBSP denotational stream object.
-/// The paper-facing semantic stream API lives in `dbsp-semantic`.
+/// Derived streams attach an evaluator and compute their value at every logical
+/// timestamp from their input streams. Operators must preserve this total-stream
+/// semantics instead of using the storage tail as an approximation.
 ///
 /// For each relation `R` in the SQL runtime:
 /// - `Stream<ZSetHandle>` represents `Delta R_t`,
@@ -75,8 +85,24 @@ where
     default_prefix: Vec<u8>,
     state_key: Vec<u8>,
     group: Arc<dyn AbelianGroup<T>>,
+    evaluator: Option<Arc<dyn StreamEvaluator<T>>>,
     state: RwLock<StreamState<T>>,
     frontier_tx: watch::Sender<i64>,
+}
+
+#[async_trait]
+pub(crate) trait StreamEvaluator<T>: Send + Sync
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T>;
 }
 
 struct StreamState<T>
@@ -142,5 +168,17 @@ where
 
     fn notify_committed_frontier(&self, ts: i64) {
         let _ = self.core.frontier_tx.send(ts);
+    }
+
+    pub(crate) fn derived_value_at(
+        &self,
+        timestamp: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<T>>> + Send + '_>> {
+        Box::pin(async move {
+            let Some(evaluator) = self.core.evaluator.clone() else {
+                return Ok(None);
+            };
+            evaluator.value_at(timestamp, self.group()).await.map(Some)
+        })
     }
 }

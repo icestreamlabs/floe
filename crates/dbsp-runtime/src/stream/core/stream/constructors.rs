@@ -14,7 +14,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::keyspace::{self, namespace_prefix};
 use crate::storage::{KeyValueTable, SlateTable};
 
-use super::{Stream, StreamCore, StreamState};
+use super::{Stream, StreamCore, StreamEvaluator, StreamState};
 
 impl<T> Stream<T>
 where
@@ -63,6 +63,7 @@ where
             default_prefix,
             state_key,
             group,
+            evaluator: None,
             state: std::sync::RwLock::new(state),
             frontier_tx,
         });
@@ -135,6 +136,19 @@ where
             stream.flush().await?;
         }
 
+        Ok(stream)
+    }
+
+    pub(crate) async fn evaluated_with_table(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        group: Arc<dyn AbelianGroup<T>>,
+        evaluator: Arc<dyn StreamEvaluator<T>>,
+    ) -> Result<Self> {
+        let mut stream = Self::with_table(table, namespace, group).await?;
+        Arc::get_mut(&mut stream.core)
+            .expect("new evaluated stream should have unique core")
+            .evaluator = Some(evaluator);
         Ok(stream)
     }
 

@@ -41,8 +41,10 @@ where
         self.read_state().logical_timestamp
     }
 
-    /// Conservative upper bound on the last timestamp downstream operators must
-    /// inspect before the stream settles to its eventual tail.
+    /// Last timestamp with a materialized value or scheduled storage change.
+    ///
+    /// Derived streams remain semantically defined for all logical times; this
+    /// value is a cache/materialization boundary, not a semantic tail boundary.
     pub fn semantic_horizon(&self) -> i64 {
         self.read_state().max_known_timestamp
     }

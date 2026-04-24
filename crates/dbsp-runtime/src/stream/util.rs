@@ -20,7 +20,7 @@ use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::core::stream::Stream;
+use super::core::stream::{Stream, StreamEvaluator};
 use super::groups::HandleGroup;
 
 pub(crate) static DERIVED_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -334,6 +334,44 @@ where
             for t in (frontier + 1)..=horizon {
                 set_value_at_in_place(&result, t, values[t as usize].clone());
             }
+        }
+    }
+
+    Ok(result)
+}
+
+pub(crate) async fn build_evaluated_stream<T>(
+    table: Arc<dyn KeyValueTable>,
+    group: Arc<dyn AbelianGroup<T>>,
+    evaluator: Arc<dyn StreamEvaluator<T>>,
+    namespace_prefix: &str,
+    frontier: i64,
+    horizon: i64,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let namespace = next_derived_namespace(namespace_prefix);
+    let mut result = Stream::evaluated_with_table(table, namespace, group, evaluator).await?;
+
+    for t in 0..=horizon {
+        let value = result
+            .derived_value_at(t)
+            .await?
+            .expect("evaluated stream missing evaluator");
+        if t == 0 {
+            set_default_in_place(&mut result, value);
+        } else if t <= frontier {
+            push_value_in_place(&mut result, value);
+        } else {
+            set_value_at_in_place(&result, t, value);
         }
     }
 

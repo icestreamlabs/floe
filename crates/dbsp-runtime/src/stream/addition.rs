@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
@@ -10,8 +11,8 @@ use crate::algebra::AbelianGroup;
 use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::core::stream::Stream;
-use super::util::{build_derived_stream, build_exact_stream_from_values, collect_values};
+use super::core::stream::{Stream, StreamEvaluator};
+use super::util::{build_derived_stream, build_evaluated_stream};
 
 pub struct StreamAddition<T>
 where
@@ -72,31 +73,16 @@ where
     async fn add(&self, a: &Stream<T>, b: &Stream<T>) -> Stream<T> {
         let frontier = a.current_time().max(b.current_time());
         let horizon = a.semantic_horizon().max(b.semantic_horizon());
-        let values_a = collect_values(a, horizon)
-            .await
-            .expect("collect stream values for left operand");
-        let values_b = collect_values(b, horizon)
-            .await
-            .expect("collect stream values for right operand");
-
-        let mut sums = Vec::with_capacity((horizon + 1) as usize);
-        for t in 0..=horizon {
-            sums.push(
-                self.group
-                    .add(&values_a[t as usize], &values_b[t as usize])
-                    .await,
-            );
-        }
-        let tail_default = self.group.add(&a.default_value(), &b.default_value()).await;
-
-        build_exact_stream_from_values(
+        build_evaluated_stream(
             self.table.clone(),
             self.group.clone(),
+            Arc::new(AddEvaluator {
+                left: a.clone(),
+                right: b.clone(),
+            }),
             &self.namespace_prefix,
             frontier,
             horizon,
-            &sums,
-            tail_default,
         )
         .await
         .expect("failed to construct stream for addition")
@@ -105,23 +91,13 @@ where
     async fn neg(&self, a: &Stream<T>) -> Stream<T> {
         let frontier = a.current_time();
         let horizon = a.semantic_horizon();
-        let values = collect_values(a, horizon)
-            .await
-            .expect("collect stream values for negation");
-        let mut negated = Vec::with_capacity((horizon + 1) as usize);
-        for t in 0..=horizon {
-            negated.push(self.group.neg(&values[t as usize]).await);
-        }
-        let tail_default = self.group.neg(&a.default_value()).await;
-
-        build_exact_stream_from_values(
+        build_evaluated_stream(
             self.table.clone(),
             self.group.clone(),
+            Arc::new(NegEvaluator { input: a.clone() }),
             &self.namespace_prefix,
             frontier,
             horizon,
-            &negated,
-            tail_default,
         )
         .await
         .expect("failed to construct stream for negation")
@@ -135,5 +111,74 @@ where
         )
         .await
         .expect("failed to construct stream for identity")
+    }
+}
+
+struct AddEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    left: Stream<T>,
+    right: Stream<T>,
+}
+
+#[async_trait]
+impl<T> StreamEvaluator<T> for AddEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
+        let mut left = self.left.clone();
+        let mut right = self.right.clone();
+        let left_value = left.get(timestamp).await?;
+        let right_value = right.get(timestamp).await?;
+        Ok(group.add(&left_value, &right_value).await)
+    }
+}
+
+struct NegEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    input: Stream<T>,
+}
+
+#[async_trait]
+impl<T> StreamEvaluator<T> for NegEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
+        let mut input = self.input.clone();
+        let value = input.get(timestamp).await?;
+        Ok(group.neg(&value).await)
     }
 }

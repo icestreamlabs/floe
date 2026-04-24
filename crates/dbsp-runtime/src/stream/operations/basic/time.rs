@@ -1,18 +1,20 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use std::sync::Arc;
 
 use crate::algebra::AbelianGroup;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::Stream;
-use crate::stream::util::{build_exact_stream_from_values, collect_values};
+use crate::stream::core::stream::{Stream, StreamEvaluator};
+use crate::stream::util::build_evaluated_stream;
 
 /// Exact one-tick delay over the represented total stream.
 ///
-/// The result preserves scheduled values through `semantic_horizon()` and then
-/// settles to the input stream's eventual tail.
+/// The result is evaluated as `z^-1(input)` for every logical timestamp; the
+/// materialized prefix below is only a cache of already-observed values.
 pub async fn delay<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
     T: Archive
@@ -25,21 +27,16 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let frontier = input.current_time();
-    let horizon = input.semantic_horizon();
-    let input_values = collect_values(input, horizon).await?;
-    let mut delayed_values = Vec::with_capacity((horizon + 2) as usize);
-    delayed_values.push(input_values[0].clone());
-    for t in 1..=horizon + 1 {
-        delayed_values.push(input_values[(t - 1) as usize].clone());
-    }
-    build_exact_stream_from_values(
+    let horizon = input.semantic_horizon() + 1;
+    build_evaluated_stream(
         input.table(),
         input.group(),
+        Arc::new(DelayEvaluator {
+            input: input.clone(),
+        }),
         "stream_delay/",
         frontier,
-        horizon + 1,
-        &delayed_values,
-        input.default_value(),
+        horizon,
     )
     .await
 }
@@ -60,37 +57,24 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let frontier = input.current_time();
-    let horizon = input.semantic_horizon();
-    let values = collect_values(input, horizon).await?;
-    let group = input.group();
-    let tail_value = input.default_value();
-    let mut diff_values = Vec::with_capacity((horizon + 2) as usize);
-    diff_values.push(values[0].clone());
-    for t in 1..=horizon {
-        let current = &values[t as usize];
-        let previous = &values[(t - 1) as usize];
-        let neg_prev = group.neg(previous).await;
-        diff_values.push(group.add(current, &neg_prev).await);
-    }
-    let neg_last = group.neg(values.last().expect("values non-empty")).await;
-    diff_values.push(group.add(&tail_value, &neg_last).await);
-
-    build_exact_stream_from_values(
+    let horizon = input.semantic_horizon() + 1;
+    build_evaluated_stream(
         input.table(),
-        group.clone(),
+        input.group(),
+        Arc::new(DifferentiateEvaluator {
+            input: input.clone(),
+        }),
         "stream_diff/",
         frontier,
-        horizon + 1,
-        &diff_values,
-        group.identity().await,
+        horizon,
     )
     .await
 }
 
-/// Exact prefix integration for eventually-identity input streams.
+/// Stateful prefix integration.
 ///
-/// Non-identity tails are rejected because the current `Stream<T>` model cannot
-/// encode their integrated future exactly.
+/// The derived stream computes additional timestamps on demand, so non-identity
+/// input tails remain exact as logical time advances.
 pub async fn integrate<T>(input: &Stream<T>) -> Result<Stream<T>>
 where
     T: Archive
@@ -104,32 +88,127 @@ where
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon();
-    let values = collect_values(input, horizon).await?;
-    let group = input.group();
-    let identity = group.identity().await;
-    let tail_value = input.default_value();
-    if tail_value != identity {
-        return Err(anyhow!(
-            "integrate requires an eventually-identity input stream for exact semantics"
-        ));
-    }
-    let mut integrated_values = Vec::with_capacity((horizon + 1) as usize);
-    let mut acc = values[0].clone();
-    integrated_values.push(acc.clone());
-    for t in 1..=horizon {
-        let current = &values[t as usize];
-        acc = group.add(&acc, current).await;
-        integrated_values.push(acc.clone());
-    }
-
-    build_exact_stream_from_values(
+    build_evaluated_stream(
         input.table(),
-        group,
+        input.group(),
+        Arc::new(IntegrateEvaluator {
+            input: input.clone(),
+        }),
         "stream_integrate/",
         frontier,
         horizon,
-        &integrated_values,
-        acc,
     )
     .await
+}
+
+struct DelayEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    input: Stream<T>,
+}
+
+#[async_trait]
+impl<T> StreamEvaluator<T> for DelayEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
+        if timestamp == 0 {
+            Ok(group.identity().await)
+        } else {
+            let mut input = self.input.clone();
+            input.get(timestamp - 1).await
+        }
+    }
+}
+
+struct DifferentiateEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    input: Stream<T>,
+}
+
+#[async_trait]
+impl<T> StreamEvaluator<T> for DifferentiateEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
+        let mut input = self.input.clone();
+        let current = input.get(timestamp).await?;
+        if timestamp == 0 {
+            Ok(current)
+        } else {
+            let previous = input.get(timestamp - 1).await?;
+            let neg_previous = group.neg(&previous).await;
+            Ok(group.add(&current, &neg_previous).await)
+        }
+    }
+}
+
+struct IntegrateEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    input: Stream<T>,
+}
+
+#[async_trait]
+impl<T> StreamEvaluator<T> for IntegrateEvaluator<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
+        let mut input = self.input.clone();
+        let mut acc = group.identity().await;
+        for t in 0..=timestamp {
+            let value = input.get(t).await?;
+            acc = group.add(&acc, &value).await;
+        }
+        Ok(acc)
+    }
 }
