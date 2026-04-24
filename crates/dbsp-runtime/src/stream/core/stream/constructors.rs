@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -14,7 +14,10 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::keyspace::{self, namespace_prefix};
 use crate::storage::{KeyValueTable, SlateTable};
 
-use super::{Stream, StreamCore, StreamEvaluator, StreamState};
+use super::{
+    Stream, StreamCore, StreamEvaluator, StreamState, register_stream_evaluator,
+    registered_stream_evaluator,
+};
 
 impl<T> Stream<T>
 where
@@ -53,6 +56,9 @@ where
         let mut state_key = base.clone();
         state_key.extend_from_slice(b"meta/state");
 
+        let mut evaluator_key = base.clone();
+        evaluator_key.extend_from_slice(b"meta/evaluator");
+
         let initial_default = group.identity().await;
         let state = StreamState::new(initial_default.clone());
         let (frontier_tx, frontier_rx) = watch::channel(state.logical_timestamp);
@@ -62,6 +68,7 @@ where
             data_prefix,
             default_prefix,
             state_key,
+            evaluator_key,
             group,
             evaluator: None,
             state: std::sync::RwLock::new(state),
@@ -72,6 +79,21 @@ where
         let mut needs_initial_flush = false;
 
         stream.core.clear_intent().await?;
+        if stream
+            .table()
+            .get_bytes(&stream.core.evaluator_key)
+            .await?
+            .is_some()
+        {
+            let Some(evaluator) = registered_stream_evaluator::<T>(&namespace) else {
+                bail!(
+                    "cannot reopen evaluator-derived stream `{namespace}` without its in-memory DBSP evaluator graph"
+                );
+            };
+            Arc::get_mut(&mut stream.core)
+                .expect("new stream should have unique core")
+                .evaluator = Some(evaluator);
+        }
 
         if let Some(bytes) = stream.table().get_bytes(&stream.core.state_key).await? {
             let (timestamp, max_known_timestamp, identity, default, last_default_ts) =
@@ -145,10 +167,16 @@ where
         group: Arc<dyn AbelianGroup<T>>,
         evaluator: Arc<dyn StreamEvaluator<T>>,
     ) -> Result<Self> {
+        let namespace = namespace.into();
+        register_stream_evaluator(&namespace, evaluator.clone());
         let mut stream = Self::with_table(table, namespace, group).await?;
         Arc::get_mut(&mut stream.core)
             .expect("new evaluated stream should have unique core")
             .evaluator = Some(evaluator);
+        stream
+            .table()
+            .put(&stream.core.evaluator_key, b"ephemeral")
+            .await?;
         Ok(stream)
     }
 

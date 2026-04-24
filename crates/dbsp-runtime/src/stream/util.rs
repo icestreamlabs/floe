@@ -398,11 +398,61 @@ where
     Ok(())
 }
 
-pub(crate) async fn apply_on_resolved_handles<T, Fut>(
+struct HandleOpEvaluator<T, F, Fut>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
+{
+    input: Stream<StreamHandle>,
+    inner_group: Arc<dyn AbelianGroup<T>>,
+    op: Arc<F>,
+}
+
+#[async_trait::async_trait]
+impl<T, F, Fut> StreamEvaluator<StreamHandle> for HandleOpEvaluator<T, F, Fut>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
+{
+    async fn value_at(
+        &self,
+        timestamp: i64,
+        _group: Arc<dyn AbelianGroup<StreamHandle>>,
+    ) -> Result<StreamHandle> {
+        let mut input = self.input.clone();
+        let handle = input.get(timestamp).await?;
+        let inner = self
+            .input
+            .resolve_handle(&handle, self.inner_group.clone())
+            .await
+            .context("resolve handle for lifted evaluator")?;
+        let mut derived = (self.op)(inner).await?;
+        derived.flush().await?;
+        Ok(derived.handle())
+    }
+}
+
+pub(crate) async fn apply_on_resolved_handles<T, F, Fut>(
     input: &Stream<StreamHandle>,
     inner_group: Arc<dyn AbelianGroup<T>>,
     namespace_prefix: &str,
-    mut op: impl FnMut(Stream<T>) -> Fut,
+    op: F,
 ) -> Result<Stream<StreamHandle>>
 where
     T: Archive
@@ -413,54 +463,34 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    Fut: Future<Output = Result<Stream<T>>>,
+    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon();
-    let handles = collect_values(input, horizon).await?;
-    let mut derived_handles = Vec::with_capacity(handles.len());
-
-    for handle in &handles {
-        let inner = input
-            .resolve_handle(handle, inner_group.clone())
-            .await
-            .context("resolve handle for lifted operator")?;
-        let mut derived = op(inner).await?;
-        derived.flush().await?;
-        derived_handles.push(derived.handle());
-    }
-
-    let input_default_handle = input.default_value();
-    let default_handle = if let Some(existing) = handles
-        .iter()
-        .zip(derived_handles.iter())
-        .find_map(|(handle, derived)| {
-            if *handle == input_default_handle {
-                Some(derived.clone())
-            } else {
-                None
-            }
-        }) {
-        existing
-    } else {
-        let default_inner = input
-            .resolve_handle(&input_default_handle, inner_group)
-            .await
-            .context("resolve default handle for lifted operator")?;
-        let mut default_derived = op(default_inner).await?;
-        default_derived.flush().await?;
-        default_derived.handle()
-    };
+    let mut input_for_identity = input.clone();
+    let first_handle = input_for_identity.get(0).await?;
+    let first_inner = input
+        .resolve_handle(&first_handle, inner_group.clone())
+        .await
+        .context("resolve first handle for lifted operator identity")?;
+    let mut first_derived = op(first_inner).await?;
+    first_derived.flush().await?;
+    let default_handle = first_derived.handle();
     let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
         Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result = build_exact_stream_from_values(
+
+    let mut result = build_evaluated_stream(
         input.table(),
         handle_group,
+        Arc::new(HandleOpEvaluator {
+            input: input.clone(),
+            inner_group,
+            op: Arc::new(op),
+        }),
         namespace_prefix,
         frontier,
         horizon,
-        &derived_handles,
-        default_handle,
     )
     .await?;
 
@@ -468,10 +498,10 @@ where
     Ok(result)
 }
 
-pub(crate) async fn resolve_apply_handle_op<T, Fut>(
+pub(crate) async fn resolve_apply_handle_op<T, F, Fut>(
     outer: &Stream<StreamHandle>,
     inner_group: Arc<dyn AbelianGroup<T>>,
-    op: impl FnMut(Stream<T>) -> Fut,
+    op: F,
     out_prefix: &str,
 ) -> Result<Stream<StreamHandle>>
 where
@@ -483,7 +513,8 @@ where
         + 'static
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    Fut: Future<Output = Result<Stream<T>>>,
+    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
 {
     apply_on_resolved_handles(outer, inner_group, out_prefix, op).await
 }

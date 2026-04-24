@@ -4,7 +4,9 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::algebra::AbelianGroup;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -93,6 +95,7 @@ where
         input.group(),
         Arc::new(IntegrateEvaluator {
             input: input.clone(),
+            cache: Mutex::new(BTreeMap::new()),
         }),
         "stream_integrate/",
         frontier,
@@ -188,6 +191,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     input: Stream<T>,
+    cache: Mutex<BTreeMap<i64, T>>,
 }
 
 #[async_trait]
@@ -204,10 +208,30 @@ where
 {
     async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
         let mut input = self.input.clone();
-        let mut acc = group.identity().await;
-        for t in 0..=timestamp {
+        let cached = {
+            let cache = self
+                .cache
+                .lock()
+                .expect("integrate evaluator cache lock poisoned");
+            cache
+                .range(..=timestamp)
+                .next_back()
+                .map(|(&cached_ts, cached_value)| (cached_ts, cached_value.clone()))
+        };
+
+        let (start, mut acc) = if let Some((cached_ts, cached_value)) = cached {
+            (cached_ts + 1, cached_value)
+        } else {
+            (0, group.identity().await)
+        };
+
+        for t in start..=timestamp {
             let value = input.get(t).await?;
             acc = group.add(&acc, &value).await;
+            self.cache
+                .lock()
+                .expect("integrate evaluator cache lock poisoned")
+                .insert(t, acc.clone());
         }
         Ok(acc)
     }

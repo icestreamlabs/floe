@@ -1,7 +1,8 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -84,6 +85,7 @@ where
     data_prefix: Vec<u8>,
     default_prefix: Vec<u8>,
     state_key: Vec<u8>,
+    evaluator_key: Vec<u8>,
     group: Arc<dyn AbelianGroup<T>>,
     evaluator: Option<Arc<dyn StreamEvaluator<T>>>,
     state: RwLock<StreamState<T>>,
@@ -103,6 +105,55 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T>;
+}
+
+static STREAM_EVALUATOR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_stream_evaluator<T>(namespace: &str, evaluator: Arc<dyn StreamEvaluator<T>>)
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let erased: Arc<dyn Any + Send + Sync> = Arc::new(evaluator);
+    STREAM_EVALUATOR_REGISTRY
+        .lock()
+        .expect("stream evaluator registry lock poisoned")
+        .insert(namespace.to_string(), erased);
+}
+
+fn registered_stream_evaluator<T>(namespace: &str) -> Option<Arc<dyn StreamEvaluator<T>>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let erased = STREAM_EVALUATOR_REGISTRY
+        .lock()
+        .expect("stream evaluator registry lock poisoned")
+        .get(namespace)
+        .cloned()?;
+    let typed = Arc::downcast::<Arc<dyn StreamEvaluator<T>>>(erased).ok()?;
+    Some(typed.as_ref().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn unregister_stream_evaluator_for_test(namespace: &str) {
+    STREAM_EVALUATOR_REGISTRY
+        .lock()
+        .expect("stream evaluator registry lock poisoned")
+        .remove(namespace);
 }
 
 struct StreamState<T>

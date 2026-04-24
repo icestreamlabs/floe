@@ -1,7 +1,7 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -12,9 +12,7 @@ use crate::handles::{StreamHandle, ZSetHandle};
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::core::stream::Stream;
 use crate::stream::groups::HandleGroup;
-use crate::stream::util::{
-    LIFTED_PROJECT_STREAM_PREFIX, build_exact_stream_from_values, collect_values,
-};
+use crate::stream::util::{LIFTED_PROJECT_STREAM_PREFIX, apply_on_resolved_handles};
 
 use super::super::zset::lifted_project_zset_stream;
 
@@ -43,73 +41,20 @@ where
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     F: Fn(&K) -> R + Send + Sync + Clone + 'static,
 {
-    let frontier = input.current_time();
-    let horizon = input.semantic_horizon();
-    let handles = collect_values(input, horizon).await?;
-    let mut output_handles = Vec::with_capacity(handles.len());
-
-    for handle in &handles {
-        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-            Arc::new(HandleGroup::new(ZSetHandle {
-                ns: handle.ns.clone(),
-                version: 0,
-            }));
-        let inner_stream = input
-            .resolve_handle(handle, inner_group.clone())
-            .await
-            .context("resolve inner stream for lifted-lifted project")?;
-        let mut result_stream =
-            lifted_project_zset_stream::<K, R, _>(&inner_stream, projector.clone()).await?;
-        result_stream.flush().await?;
-        output_handles.push(result_stream.handle());
-    }
-
-    if output_handles.is_empty() {
-        return Err(anyhow!(
-            "lifted_lifted_project_zset_stream produced no output"
-        ));
-    }
-    let input_default_handle = input.default_value();
-    let default_handle = if let Some(existing) =
-        handles
-            .iter()
-            .zip(output_handles.iter())
-            .find_map(|(handle, derived)| {
-                if *handle == input_default_handle {
-                    Some(derived.clone())
-                } else {
-                    None
-                }
-            }) {
-        existing
-    } else {
-        let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> =
-            Arc::new(HandleGroup::new(ZSetHandle {
-                ns: input_default_handle.ns.clone(),
-                version: 0,
-            }));
-        let inner_stream = input
-            .resolve_handle(&input_default_handle, inner_group.clone())
-            .await
-            .context("resolve default inner stream for lifted-lifted project")?;
-        let mut result_stream =
-            lifted_project_zset_stream::<K, R, _>(&inner_stream, projector.clone()).await?;
-        result_stream.flush().await?;
-        result_stream.handle()
-    };
-    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
-    let mut result_stream = build_exact_stream_from_values(
-        input.table(),
-        handle_group,
+    let mut input_for_identity = input.clone();
+    let first_handle = input_for_identity.get(0).await?;
+    let inner_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(ZSetHandle {
+        ns: first_handle.ns,
+        version: 0,
+    }));
+    apply_on_resolved_handles(
+        input,
+        inner_group,
         LIFTED_PROJECT_STREAM_PREFIX,
-        frontier,
-        horizon,
-        &output_handles,
-        default_handle,
+        move |inner| {
+            let projector = projector.clone();
+            async move { lifted_project_zset_stream::<K, R, _>(&inner, projector).await }
+        },
     )
-    .await?;
-
-    result_stream.flush().await?;
-    Ok(result_stream)
+    .await
 }

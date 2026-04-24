@@ -541,6 +541,14 @@ struct DirectSourceDataVisitor<'a> {
     required_columns: Option<&'a [bool]>,
 }
 
+enum DirectColumnValue<'de> {
+    Int64(i64),
+    TimestampMillis(i64),
+    Utf8(Cow<'de, str>),
+    Bool(bool),
+    Null,
+}
+
 impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
     type Value = (Vec<u8>, Option<u64>);
 
@@ -552,7 +560,8 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let mut encoded_columns = vec![None; self.definition.columns().len()];
+        let mut encoded_columns: Vec<Option<DirectColumnValue<'de>>> =
+            self.definition.columns().iter().map(|_| None).collect();
         let mut event_ts = None;
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
             if let Some((idx, column)) =
@@ -576,7 +585,7 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
             }
         }
 
-        let mut row = Vec::with_capacity(64);
+        let mut row = Vec::with_capacity(4 + self.definition.columns().len() * 9);
         let count = u32::try_from(self.definition.columns().len())
             .map_err(|_| de::Error::custom("too many source columns to encode"))?;
         row.extend_from_slice(&count.to_le_bytes());
@@ -586,7 +595,7 @@ impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
                 continue;
             }
             if let Some(encoded) = encoded_columns[idx].take() {
-                row.extend_from_slice(&encoded);
+                encode_direct_column_value(&mut row, encoded, column.data_type())?;
             } else if column.nullable() {
                 encode_typed_null(&mut row, column.data_type());
             } else {
@@ -607,7 +616,7 @@ struct DirectSourceColumnSeed<'a> {
 }
 
 impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
-    type Value = (Vec<u8>, Option<u64>);
+    type Value = (DirectColumnValue<'de>, Option<u64>);
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
@@ -616,29 +625,34 @@ impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
         match self.data_type {
             SourceDataType::Int64 => {
                 let value = Option::<i64>::deserialize(deserializer)?;
-                encode_i64_column(value, self.nullable, self.field_name, false)
-                    .map(|encoded| (encoded, None))
+                match value {
+                    Some(value) => Ok((DirectColumnValue::Int64(value), None)),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.field_name
+                    ))),
+                }
             }
             SourceDataType::TimestampMillis => {
                 let value = Option::<i64>::deserialize(deserializer)?;
-                let encoded = encode_i64_column(value, self.nullable, self.field_name, true)?;
-                let event_ts = value.filter(|value| *value >= 0).map(|value| value as u64);
-                Ok((encoded, event_ts))
+                match value {
+                    Some(value) => {
+                        let event_ts = (value >= 0).then_some(value as u64);
+                        Ok((DirectColumnValue::TimestampMillis(value), event_ts))
+                    }
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.field_name
+                    ))),
+                }
             }
             SourceDataType::Utf8 => {
                 let value = Option::<Cow<'de, str>>::deserialize(deserializer)?;
                 match value {
-                    Some(value) => {
-                        let bytes = value.as_bytes();
-                        let len = u32::try_from(bytes.len())
-                            .map_err(|_| de::Error::custom("utf8 value too large for MV key"))?;
-                        let mut encoded = Vec::with_capacity(1 + 4 + bytes.len());
-                        encoded.push(0x02);
-                        encoded.extend_from_slice(&len.to_le_bytes());
-                        encoded.extend_from_slice(bytes);
-                        Ok((encoded, None))
-                    }
-                    None if self.nullable => Ok((vec![0x06], None)),
+                    Some(value) => Ok((DirectColumnValue::Utf8(value), None)),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
                     None => Err(de::Error::custom(format!(
                         "null value violates non-nullable column '{}'",
                         self.field_name
@@ -648,8 +662,8 @@ impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
             SourceDataType::Bool => {
                 let value = Option::<bool>::deserialize(deserializer)?;
                 match value {
-                    Some(value) => Ok((vec![0x04, if value { 1 } else { 0 }], None)),
-                    None if self.nullable => Ok((vec![0x08], None)),
+                    Some(value) => Ok((DirectColumnValue::Bool(value), None)),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
                     None => Err(de::Error::custom(format!(
                         "null value violates non-nullable column '{}'",
                         self.field_name
@@ -660,28 +674,38 @@ impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
     }
 }
 
-fn encode_i64_column<E>(
-    value: Option<i64>,
-    nullable: bool,
-    field_name: &str,
-    timestamp: bool,
-) -> std::result::Result<Vec<u8>, E>
+fn encode_direct_column_value<E>(
+    row: &mut Vec<u8>,
+    value: DirectColumnValue<'_>,
+    data_type: &SourceDataType,
+) -> std::result::Result<(), E>
 where
     E: de::Error,
 {
     match value {
-        Some(value) => {
-            let mut encoded = Vec::with_capacity(9);
-            encoded.push(if timestamp { 0x03 } else { 0x01 });
-            encoded.extend_from_slice(&value.to_le_bytes());
-            Ok(encoded)
+        DirectColumnValue::Int64(value) => {
+            row.push(0x01);
+            row.extend_from_slice(&value.to_le_bytes());
         }
-        None if nullable => Ok(vec![if timestamp { 0x07 } else { 0x05 }]),
-        None => Err(E::custom(format!(
-            "null value violates non-nullable column '{}'",
-            field_name
-        ))),
+        DirectColumnValue::TimestampMillis(value) => {
+            row.push(0x03);
+            row.extend_from_slice(&value.to_le_bytes());
+        }
+        DirectColumnValue::Utf8(value) => {
+            let bytes = value.as_bytes();
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| E::custom("utf8 value too large for MV key"))?;
+            row.push(0x02);
+            row.extend_from_slice(&len.to_le_bytes());
+            row.extend_from_slice(bytes);
+        }
+        DirectColumnValue::Bool(value) => {
+            row.push(0x04);
+            row.push(if value { 1 } else { 0 });
+        }
+        DirectColumnValue::Null => encode_typed_null(row, data_type),
     }
+    Ok(())
 }
 
 fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {

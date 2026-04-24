@@ -146,18 +146,29 @@ impl MaterializedViewHandle {
         }
 
         let mut guard = self.state.write().expect("mutex poisoned");
-        let previous = guard.get(key).copied().unwrap_or(0);
+        let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+        Self::apply_encoded_locked(&mut guard, &mut row_count, key, diff);
+    }
+
+    fn apply_encoded_locked(
+        state: &mut HashMap<EncodedRow, Diff>,
+        row_count: &mut i64,
+        key: &[u8],
+        diff: Diff,
+    ) {
+        if diff == 0 {
+            return;
+        }
+
+        let previous = state.get(key).copied().unwrap_or(0);
         let next = previous.saturating_add(diff);
         if next == 0 {
-            guard.remove(key);
+            state.remove(key);
+        } else if let Some(current) = state.get_mut(key) {
+            *current = next;
         } else {
-            if let Some(current) = guard.get_mut(key) {
-                *current = next;
-            } else {
-                guard.insert(key.to_vec(), next);
-            }
+            state.insert(key.to_vec(), next);
         }
-        let mut row_count = self.state_row_count.write().expect("mutex poisoned");
         let previous_rows = previous.max(0);
         let next_rows = next.max(0);
         *row_count = row_count
@@ -265,8 +276,12 @@ impl MaterializedViewHandle {
         if !*self.state_authoritative.read().expect("mutex poisoned") {
             return Ok(());
         }
-        for (key, diff) in deltas {
-            self.apply_encoded(key, *diff);
+        {
+            let mut state = self.state.write().expect("mutex poisoned");
+            let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+            for (key, diff) in deltas {
+                Self::apply_encoded_locked(&mut state, &mut row_count, key, *diff);
+            }
         }
         self.stage_authoritative_row_count_version(version);
         Ok(())

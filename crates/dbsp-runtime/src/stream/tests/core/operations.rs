@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::algebra::AbelianGroup;
 use crate::stream::addition::StreamAddition;
-use crate::stream::core::stream::Stream;
+use crate::stream::core::stream::{Stream, unregister_stream_evaluator_for_test};
 use crate::stream::operations::basic::{
     delay, differentiate, incrementalize2, integrate, lift1, lift2, stream_elimination,
 };
@@ -293,7 +293,7 @@ async fn incrementalize2_preserves_tail_cancellation() {
 }
 
 #[tokio::test]
-async fn derived_stream_persists_future_semantic_horizon() {
+async fn derived_stream_reopens_with_registered_evaluator() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
 
@@ -315,6 +315,36 @@ async fn derived_stream_persists_future_semantic_horizon() {
     assert_eq!(reopened.semantic_horizon(), 4);
     assert_eq!(reopened.get(4).await.expect("t4"), 15);
     assert_eq!(reopened.get(5).await.expect("t5"), 0);
+}
+
+#[tokio::test]
+async fn derived_stream_rejects_reopen_without_evaluator_graph() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(
+        db.clone(),
+        "persist_delay_missing_evaluator_input",
+        group.clone(),
+    )
+    .await
+    .expect("create stream");
+    source.send(5).await.expect("send t1");
+
+    let mut delayed = delay(&source).await.expect("apply delay");
+    let namespace = delayed.namespace().to_string();
+    delayed.flush().await.expect("flush delayed stream");
+    unregister_stream_evaluator_for_test(&namespace);
+
+    let err = match Stream::new(db, namespace, group).await {
+        Ok(_) => panic!("derived stream should not reopen without evaluator graph"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("without its in-memory DBSP evaluator graph"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
