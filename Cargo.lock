@@ -2111,6 +2111,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "dbsp",
+ "dbsp-semantic",
  "floe-core",
  "floe-sql-parser",
  "floe-storage",

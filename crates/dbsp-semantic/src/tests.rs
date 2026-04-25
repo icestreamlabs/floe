@@ -308,6 +308,30 @@ fn incremental_composition_matches_paper_equation() {
 }
 
 #[test]
+fn incremental_composition_covers_non_zero_preserving_queries() {
+    let q1 = pointwise("plus-one", |value: &i64| value + 1);
+    let q2 = pointwise("square", |value: &i64| value * value);
+    let composed = q1.compose(q2.clone());
+    let deltas = Stream::from_prefix(vec![0_i64, 2, -1, 3, -2, 0], 0);
+
+    let direct_incremental = observe(&incrementalize(composed.clone()).apply(deltas.clone()), 7);
+    let definition = observe(&differentiate(&composed.apply(integrate(&deltas))), 7);
+    assert_eq!(
+        direct_incremental, definition,
+        "incrementalization still denotes D o up-arrow(Q) o I"
+    );
+
+    let composed_incrementals = observe(
+        &incrementalize(q1).compose(incrementalize(q2)).apply(deltas),
+        7,
+    );
+    assert_eq!(
+        direct_incremental, composed_incrementals,
+        "DBSP composition must also hold for non-zero-preserving queries"
+    );
+}
+
+#[test]
 fn semantic_queries_cover_sets_bags_and_indexes() {
     let bag = Stream::constant(zset([(1_i64, 2), (2, 1), (3, 1)]));
     let mapped = map_zset(&bag, |value| value * 10);
@@ -468,6 +492,49 @@ fn aggregation_semantics_cover_additive_and_non_additive_behaviors() {
     assert_eq!(
         maxima.at(0),
         zset([((0_i64, 4_i64), 1), ((1_i64, 1_i64), 1)])
+    );
+}
+
+#[test]
+fn aggregation_semantics_cover_duplicates_retractions_and_empty_groups() {
+    let snapshots = Stream::from_prefix(
+        vec![
+            zset([(1_i64, 2), (3_i64, 1)]),
+            zset([(1_i64, 1), (2_i64, 1), (3_i64, 1)]),
+            zset([(1_i64, -1), (2_i64, 1), (4_i64, 2)]),
+            zset([(1_i64, -1), (2_i64, -1)]),
+        ],
+        zset([(1_i64, -1), (2_i64, -1)]),
+    );
+    let counts = count_by_zset(&snapshots, |value| Some(value % 2));
+    let positive_max = aggregate_zset(
+        &snapshots,
+        |value| Some(value % 2),
+        |_key, rows| {
+            rows.iter()
+                .filter(|(_, weight)| *weight > 0)
+                .map(|(value, _)| *value)
+                .max()
+        },
+    );
+
+    assert_eq!(
+        observe(&counts, 4),
+        vec![
+            zset([((1_i64, 3_i64), 1)]),
+            zset([((0_i64, 1_i64), 1), ((1_i64, 2_i64), 1)]),
+            zset([((0_i64, 3_i64), 1), ((1_i64, 0_i64), 1)]),
+            zset([((0_i64, 0_i64), 1), ((1_i64, 0_i64), 1)]),
+        ]
+    );
+    assert_eq!(
+        observe(&positive_max, 4),
+        vec![
+            zset([((1_i64, 3_i64), 1)]),
+            zset([((0_i64, 2_i64), 1), ((1_i64, 3_i64), 1)]),
+            zset([((0_i64, 4_i64), 1)]),
+            zset::<(i64, i64)>([]),
+        ]
     );
 }
 
@@ -924,6 +991,85 @@ fn semantic_windows_cover_overlaps_empty_windows_and_changing_prefixes() {
                         key: 1_i64,
                         start: 10,
                         end: 20,
+                    },
+                    1,
+                ),
+            ]),
+        ]
+    );
+}
+
+#[test]
+fn semantic_windows_cover_duplicates_and_retractions() {
+    let snapshots = Stream::from_prefix(
+        vec![
+            zset([(event(1, 1, 5), 2), (event(1, 6, 7), 1)]),
+            zset([(event(1, 1, 5), 1), (event(1, 6, 7), 1)]),
+            zset([(event(1, 1, 5), -1), (event(1, 6, 7), 1)]),
+        ],
+        zset([(event(1, 1, 5), -1), (event(1, 6, 7), 1)]),
+    );
+    let tumbling = tumbling_window_aggregate(
+        &snapshots,
+        |event| Some(event.user),
+        |event| Some(event.ts),
+        |_window, rows| Some(rows.iter().map(|(_, weight)| *weight).sum::<i64>()),
+        5,
+    );
+
+    assert_eq!(
+        observe(&tumbling, 3),
+        vec![
+            zset([
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 0,
+                        end: 5,
+                    },
+                    2,
+                ),
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 5,
+                        end: 10,
+                    },
+                    1,
+                ),
+            ]),
+            zset([
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 0,
+                        end: 5,
+                    },
+                    1,
+                ),
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 5,
+                        end: 10,
+                    },
+                    1,
+                ),
+            ]),
+            zset([
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 0,
+                        end: 5,
+                    },
+                    -1,
+                ),
+                window_count(
+                    Window {
+                        key: 1_i64,
+                        start: 5,
+                        end: 10,
                     },
                     1,
                 ),
