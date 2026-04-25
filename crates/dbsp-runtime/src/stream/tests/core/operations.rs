@@ -179,6 +179,32 @@ async fn differentiate_integrate_roundtrip_with_non_identity_tail() {
 }
 
 #[tokio::test]
+async fn integrate_differentiate_roundtrip_for_zero_initial_stream() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "integrate_diff_zero_initial", group.clone())
+        .await
+        .expect("create stream");
+    source.send(4).await.expect("send t1");
+    source.send(-2).await.expect("send t2");
+    source.send(6).await.expect("send t3");
+
+    let diff = differentiate(&source).await.expect("differentiate source");
+    let mut roundtrip = integrate(&diff)
+        .await
+        .expect("integrate differentiated source");
+
+    for t in 0..=6 {
+        assert_eq!(
+            roundtrip.get(t).await.expect("roundtrip value"),
+            source.get(t).await.expect("source value"),
+            "I(D(x)) must equal zero-initial x at t={t}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn differentiate_is_input_minus_delay() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
@@ -261,6 +287,59 @@ async fn lift2_combines_two_streams() {
     assert_eq!(combined.get(2).await.expect("t2"), 8);
     assert_eq!(combined.get(3).await.expect("t3"), 8);
     assert_eq!(combined.get(4).await.expect("t4"), 5);
+}
+
+#[tokio::test]
+async fn runtime_incrementalize2_matches_d_lift_i_definition() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut left_delta = Stream::new(db.clone(), "incrementalize2_law_left", group.clone())
+        .await
+        .expect("create left delta");
+    left_delta.send(1).await.expect("left t1");
+    left_delta.send(2).await.expect("left t2");
+    left_delta.send(-1).await.expect("left t3");
+
+    let mut right_delta = Stream::new(db.clone(), "incrementalize2_law_right", group.clone())
+        .await
+        .expect("create right delta");
+    right_delta.send(10).await.expect("right t1");
+    right_delta.send(-5).await.expect("right t2");
+    right_delta.send(20).await.expect("right t3");
+
+    let mut optimized = incrementalize2(
+        &left_delta,
+        &right_delta,
+        group.clone(),
+        |l: &i64, r: &i64| l * r,
+    )
+    .await
+    .expect("incrementalized product");
+
+    let integrated_left = integrate(&left_delta).await.expect("integrate left deltas");
+    let integrated_right = integrate(&right_delta)
+        .await
+        .expect("integrate right deltas");
+    let lifted_query = lift2(
+        &integrated_left,
+        &integrated_right,
+        group.clone(),
+        |l: &i64, r: &i64| l * r,
+    )
+    .await
+    .expect("lift product query");
+    let mut reference = differentiate(&lifted_query)
+        .await
+        .expect("differentiate lifted query");
+
+    for t in 0..=6 {
+        assert_eq!(
+            optimized.get(t).await.expect("optimized value"),
+            reference.get(t).await.expect("reference value"),
+            "incrementalize2 must match D(up-arrow(Q)(I(input))) at t={t}"
+        );
+    }
 }
 
 #[tokio::test]

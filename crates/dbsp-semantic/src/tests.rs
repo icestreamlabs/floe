@@ -284,6 +284,30 @@ fn circuit_transforms_match_paper_equations() {
 }
 
 #[test]
+fn incremental_composition_matches_paper_equation() {
+    let q1 = pointwise("double", |value: &i64| value * 2);
+    let q2 = pointwise("square", |value: &i64| value * value);
+    let composed = q1.compose(q2.clone());
+    let deltas = Stream::from_prefix(vec![0_i64, 2, -1, 3, -2, 0], 0);
+
+    assert_eq!(
+        observe(&incrementalize(composed.clone()).apply(deltas.clone()), 7),
+        observe(
+            &incrementalize(q1)
+                .compose(incrementalize(q2))
+                .apply(deltas.clone()),
+            7,
+        ),
+        "DBSP requires (Q2 o Q1)Delta = Q2Delta o Q1Delta"
+    );
+    assert_eq!(
+        observe(&incrementalize(composed.clone()).apply(deltas.clone()), 7),
+        observe(&differentiate(&composed.apply(integrate(&deltas))), 7,),
+        "incrementalization must denote D o up-arrow(Q) o I"
+    );
+}
+
+#[test]
 fn semantic_queries_cover_sets_bags_and_indexes() {
     let bag = Stream::constant(zset([(1_i64, 2), (2, 1), (3, 1)]));
     let mapped = map_zset(&bag, |value| value * 10);
