@@ -5,6 +5,7 @@ use crate::stream::addition::StreamAddition;
 use crate::stream::core::stream::{Stream, unregister_stream_evaluator_for_test};
 use crate::stream::operations::basic::{
     delay, differentiate, incrementalize2, integrate, lift1, lift2, stream_elimination,
+    stream_elimination_prefix, stream_elimination_range,
 };
 use crate::stream::tests::common::{IntegerGroup, build_db};
 
@@ -384,6 +385,62 @@ async fn stream_elimination_rejects_non_identity_tail() {
     };
     assert!(
         err.to_string().contains("eventually-identity input stream"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bounded_stream_elimination_sums_non_identity_tail_range() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(
+        db.clone(),
+        "bounded_stream_elimination_non_identity_tail",
+        group,
+    )
+    .await
+    .expect("create stream");
+    source.send(2).await.expect("send t1");
+    source.send(4).await.expect("send t2");
+    source
+        .set_default(7)
+        .await
+        .expect("set non-identity default");
+
+    let prefix = stream_elimination_prefix(&source, 4)
+        .await
+        .expect("bounded prefix elimination");
+    assert_eq!(prefix, 20);
+
+    let range = stream_elimination_range(&source, 2, 5)
+        .await
+        .expect("bounded range elimination");
+    assert_eq!(range, 25);
+}
+
+#[tokio::test]
+async fn bounded_stream_elimination_rejects_invalid_bounds() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+    let source = Stream::new(db, "bounded_stream_elimination_invalid_bounds", group)
+        .await
+        .expect("create stream");
+
+    let err = stream_elimination_range(&source, -1, 2)
+        .await
+        .expect_err("negative start should fail");
+    assert!(
+        err.to_string().contains("start cannot be negative"),
+        "unexpected error: {err}"
+    );
+
+    let err = stream_elimination_range(&source, 2, 1)
+        .await
+        .expect_err("inverted bounds should fail");
+    assert!(
+        err.to_string()
+            .contains("end must be greater than or equal to start"),
         "unexpected error: {err}"
     );
 }

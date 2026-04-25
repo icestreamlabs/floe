@@ -8,7 +8,7 @@ pub mod zset_strategies;
 
 pub use basic::{
     delay, differentiate, incrementalize2, integrate, lift1, lift2, stream_elimination,
-    stream_introduction,
+    stream_elimination_prefix, stream_elimination_range, stream_introduction,
 };
 pub use delta::delta_lifted_delta_lifted_join;
 pub use lifted::{

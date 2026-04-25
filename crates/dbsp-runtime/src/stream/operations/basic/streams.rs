@@ -58,3 +58,51 @@ where
     }
     Ok(acc)
 }
+
+pub async fn stream_elimination_range<T>(
+    stream: &Stream<T>,
+    start: i64,
+    end_inclusive: i64,
+) -> Result<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    if start < 0 {
+        return Err(anyhow!("stream_elimination_range start cannot be negative"));
+    }
+    if end_inclusive < start {
+        return Err(anyhow!(
+            "stream_elimination_range end must be greater than or equal to start"
+        ));
+    }
+
+    let group = stream.group();
+    let mut acc = group.identity().await;
+    let mut stream = stream.clone();
+    for timestamp in start..=end_inclusive {
+        let value = stream.get(timestamp).await?;
+        acc = group.add(&acc, &value).await;
+    }
+    Ok(acc)
+}
+
+pub async fn stream_elimination_prefix<T>(stream: &Stream<T>, end_inclusive: i64) -> Result<T>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    stream_elimination_range(stream, 0, end_inclusive).await
+}
