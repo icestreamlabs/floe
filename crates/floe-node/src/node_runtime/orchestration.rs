@@ -726,6 +726,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let poll_timeout = Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms));
                 let max_messages_per_tick =
                     max_messages_per_tick.unwrap_or(run_args.kafka_max_messages);
+                let default_source_id = default_source
+                    .as_deref()
+                    .and_then(|source| source_id_by_name.get(source).copied());
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
@@ -738,6 +741,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         topics,
                         group_id,
                         default_source,
+                        default_source_id,
                         poll_timeout,
                         max_messages_per_tick,
                         message_format: format,
@@ -942,7 +946,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         let mut last_mv_versions: HashMap<String, u64> = HashMap::new();
         let mut committed_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
         let mut latest_source_offsets: HashMap<(String, u32), u64> = HashMap::new();
-        let mut committed_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
+        let mut committed_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
         let mut committed_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
         let mut mv_last_update_at_ms: HashMap<String, u64> = tracked_mv_names
             .iter()
@@ -1060,7 +1064,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let mut encoded_rows = Vec::with_capacity(batch_len);
             let mut decoded_counts = vec![0usize; source_count];
             let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
-            let mut tick_kafka_offsets: HashMap<(String, i32), i64> = HashMap::new();
+            let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
             let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
             let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
             let decode_span = tracing::debug_span!(
@@ -1069,7 +1073,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 raw_batch_size = batch_len
             );
             let _decode_guard = decode_span.enter();
-            for SelectedSourceEvent { source_id, event } in batch {
+            for SelectedSourceEvent {
+                source_id,
+                mut event,
+            } in batch
+            {
                 let Some(source_id) = source_id else {
                     let source_name = event.source().to_string();
                     tracing::debug!(
@@ -1079,14 +1087,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     continue;
                 };
                 let source_name = source_names_by_id_for_task[source_id].as_str();
-                if let Some((partition, offset)) = event_resume_offset(event.resume_token()) {
+                if let Some((partition, offset)) = event_fast_resume_offset(&event)
+                    .or_else(|| event_resume_offset(event.resume_token()))
+                {
                     let entry = tick_source_offsets[source_id]
                         .get_or_insert_with(HashMap::new)
                         .entry(partition)
                         .or_insert(0);
                     *entry = (*entry).max(offset);
                 }
-                if let Some((topic, partition, offset)) = event_kafka_offset(event.resume_token()) {
+                if let Some((topic, partition, offset)) = event_fast_kafka_offset(&event)
+                    .or_else(|| event_kafka_offset(event.resume_token()))
+                {
                     let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
                     *entry = (*entry).max(offset);
                 }
@@ -1120,9 +1132,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     executor_cancel.cancel();
                     break 'executor;
                 };
-                let event_ts = if let Some(preencoded_row_key) =
-                    event.preencoded_row_key().map(|key| key.to_vec())
-                {
+                let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
                     encoded_rows.push((source_id, preencoded_row_key));
                     None
                 } else {

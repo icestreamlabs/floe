@@ -101,15 +101,29 @@ pub(super) fn event_resume_offset(
     }
 }
 
+pub(super) fn event_fast_resume_offset(event: &core_source::SourceEvent) -> Option<(u32, u64)> {
+    let (_, partition, offset) = event.kafka_position()?;
+    let partition = u32::try_from(partition).ok()?;
+    let offset = u64::try_from(offset).ok()?;
+    Some((partition, offset))
+}
+
+pub(super) fn event_fast_kafka_offset(
+    event: &core_source::SourceEvent,
+) -> Option<(Arc<str>, i32, i64)> {
+    let (topic, partition, offset) = event.kafka_position()?;
+    Some((Arc::clone(topic), partition, offset))
+}
+
 pub(super) fn event_kafka_offset(
     token: Option<&core_source::SourceResumeToken>,
-) -> Option<(String, i32, i64)> {
+) -> Option<(Arc<str>, i32, i64)> {
     match token? {
         core_source::SourceResumeToken::Kafka {
             topic,
             partition,
             offset,
-        } => Some((topic.clone(), *partition, *offset)),
+        } => Some((Arc::<str>::from(topic.as_str()), *partition, *offset)),
         _ => None,
     }
 }
@@ -128,8 +142,8 @@ pub(super) fn event_postgres_lsn(
 }
 
 pub(super) fn advance_kafka_offset_commit_state(
-    committed_offsets: &mut HashMap<(String, i32), i64>,
-    tick_offsets: &HashMap<(String, i32), i64>,
+    committed_offsets: &mut HashMap<(Arc<str>, i32), i64>,
+    tick_offsets: &HashMap<(Arc<str>, i32), i64>,
 ) {
     for (key, &offset) in tick_offsets {
         let entry = committed_offsets.entry(key.clone()).or_insert(offset);
@@ -139,12 +153,12 @@ pub(super) fn advance_kafka_offset_commit_state(
 
 pub(super) fn build_kafka_offset_commit(
     tick_id: u64,
-    offsets: &HashMap<(String, i32), i64>,
+    offsets: &HashMap<(Arc<str>, i32), i64>,
 ) -> KafkaOffsetCommit {
     let mut entries: Vec<KafkaTopicPartitionOffset> = offsets
         .iter()
         .map(|((topic, partition), offset)| KafkaTopicPartitionOffset {
-            topic: topic.clone(),
+            topic: topic.to_string(),
             partition: *partition,
             offset: *offset,
         })
@@ -267,12 +281,15 @@ pub(super) fn build_batch(
             let Some(event) = queue.pending.pop_front() else {
                 break;
             };
-            let source = event.source();
-            let source_id = source_id_by_name.get(source).copied();
+            let source_id = event
+                .source_id()
+                .or_else(|| source_id_by_name.get(event.source()).copied());
             let count = if let Some(source_id) = source_id {
                 &mut per_source_counts[source_id]
             } else {
-                unknown_source_counts.entry(source.to_string()).or_insert(0)
+                unknown_source_counts
+                    .entry(event.source().to_string())
+                    .or_insert(0)
             };
             if *count >= max_per_source {
                 deferred_queue.push_back(event);

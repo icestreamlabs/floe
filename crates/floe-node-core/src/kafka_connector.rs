@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
-use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent, SourceResumeToken};
+use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 
 static KAFKA_CONNECTOR_TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 256;
@@ -47,6 +47,7 @@ pub struct KafkaConnectorConfig {
     pub topics: Vec<String>,
     pub group_id: String,
     pub default_source: Option<String>,
+    pub default_source_id: Option<usize>,
     pub poll_timeout: Duration,
     pub max_messages_per_tick: usize,
     pub message_format: Option<String>,
@@ -71,6 +72,7 @@ pub struct KafkaConnector {
     message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
     direct_decode_lookup: DirectDecodeLookup,
+    topic_arcs: HashMap<String, Arc<str>>,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
     started_at: Option<Instant>,
@@ -102,11 +104,17 @@ impl KafkaConnector {
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
         let direct_decode_lookup =
             build_direct_decode_lookup(&definitions, &required_columns_by_source);
+        let topic_arcs = config
+            .topics
+            .iter()
+            .map(|topic| (topic.clone(), Arc::<str>::from(topic.as_str())))
+            .collect();
         Ok(Self {
             config,
             message_format,
             definitions,
             direct_decode_lookup,
+            topic_arcs,
             consumer: None,
             last_committed_tick_id: 0,
             started_at: None,
@@ -142,13 +150,23 @@ impl KafkaConnector {
             }
         };
         let events = match self.message_format {
-            KafkaMessageFormat::FloeJson => match parse_direct_floe_json_event(
+            KafkaMessageFormat::FloeJson => match parse_direct_default_source_payload_event(
                 payload,
                 self.config.default_source.as_deref(),
-                message.topic(),
                 &self.definitions,
                 &self.direct_decode_lookup,
-            ) {
+                self.config.default_source_id,
+            )
+            .or_else(|_| {
+                parse_direct_floe_json_event(
+                    payload,
+                    self.config.default_source.as_deref(),
+                    message.topic(),
+                    &self.definitions,
+                    &self.direct_decode_lookup,
+                    self.config.default_source_id,
+                )
+            }) {
                 Ok(Some(event)) => Ok(vec![event]),
                 Ok(None) => parse_floe_json_events(
                     payload,
@@ -208,12 +226,17 @@ impl KafkaConnector {
         };
 
         let mut staged = Vec::with_capacity(events.len());
+        let topic = self
+            .topic_arcs
+            .get(message.topic())
+            .cloned()
+            .unwrap_or_else(|| Arc::<str>::from(message.topic()));
         for event in events {
-            let mut event = event.with_resume_token(SourceResumeToken::Kafka {
-                topic: message.topic().to_string(),
-                partition: message.partition(),
-                offset: message.offset(),
-            });
+            let mut event = event.with_kafka_position(
+                Arc::clone(&topic),
+                message.partition(),
+                message.offset(),
+            );
             if event.event_time_ms().is_none()
                 && let Some(event_time_ms) = kafka_message_timestamp_ms(message)
             {
@@ -392,12 +415,47 @@ fn parse_floe_json_event(
     }
 }
 
+fn parse_direct_default_source_payload_event(
+    payload: &[u8],
+    default_source: Option<&str>,
+    definitions: &[SourceDefinition],
+    lookup: &DirectDecodeLookup,
+    default_source_id: Option<usize>,
+) -> Result<Option<SourceEvent>> {
+    let Some(source_name) = default_source else {
+        return Ok(None);
+    };
+    let Some((definition_idx, definition)) =
+        lookup_source_definition(definitions, &lookup.definition_index_by_name, source_name)
+    else {
+        return Ok(None);
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let (encoded_row, event_ts) = DirectSourceDataSeed {
+        definition,
+        column_indexes: &lookup.column_indexes_by_definition[definition_idx],
+        required_columns: lookup.required_columns_by_definition[definition_idx].as_deref(),
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|err| anyhow::anyhow!("direct default-source floe_json decode failed: {err}"))?;
+    let mut event = if let Some(source_id) = default_source_id {
+        SourceEvent::preencoded_for_source_id(source_id, encoded_row)
+    } else {
+        SourceEvent::preencoded(source_name, encoded_row)
+    };
+    if let Some(event_time_ms) = event_ts {
+        event = event.with_event_time_ms(event_time_ms);
+    }
+    Ok(Some(event))
+}
+
 fn parse_direct_floe_json_event(
     payload: &[u8],
     default_source: Option<&str>,
     topic: &str,
     definitions: &[SourceDefinition],
     lookup: &DirectDecodeLookup,
+    default_source_id: Option<usize>,
 ) -> Result<Option<SourceEvent>> {
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     DirectFloeJsonEventSeed {
@@ -405,6 +463,7 @@ fn parse_direct_floe_json_event(
         topic,
         definitions,
         lookup,
+        default_source_id,
     }
     .deserialize(&mut deserializer)
     .map_err(|err| anyhow::anyhow!("direct floe_json decode failed: {err}"))
@@ -415,6 +474,7 @@ struct DirectFloeJsonEventSeed<'a> {
     topic: &'a str,
     definitions: &'a [SourceDefinition],
     lookup: &'a DirectDecodeLookup,
+    default_source_id: Option<usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for DirectFloeJsonEventSeed<'_> {
@@ -478,7 +538,11 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
                             [definition_idx]
                             .as_deref(),
                     })?;
-                    encoded_row = Some(encoded);
+                    let source_id = self
+                        .seed
+                        .default_source_id
+                        .filter(|_| Some(source_name) == self.seed.default_source);
+                    encoded_row = Some((encoded, source_id));
                     if event_ts.is_none() {
                         event_ts = parsed_event_ts;
                     }
@@ -488,7 +552,7 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
                 }
             }
         }
-        let Some(encoded_row) = encoded_row else {
+        let Some((encoded_row, source_id)) = encoded_row else {
             return Ok(None);
         };
         let Some(source_name) = source
@@ -497,8 +561,11 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
         else {
             return Ok(None);
         };
-        let mut event =
-            SourceEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row);
+        let mut event = if let Some(source_id) = source_id {
+            SourceEvent::preencoded_for_source_id(source_id, encoded_row)
+        } else {
+            SourceEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row)
+        };
         if let Some(event_time_ms) = event_ts {
             event = event.with_event_time_ms(event_time_ms);
         }
@@ -991,10 +1058,16 @@ mod tests {
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
         let lookup = build_direct_decode_lookup(&[definition.clone()], &HashMap::new());
 
-        let direct =
-            parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()], &lookup)
-                .expect("direct parse")
-                .expect("direct event");
+        let direct = parse_direct_floe_json_event(
+            payload,
+            None,
+            "topic",
+            &[definition.clone()],
+            &lookup,
+            None,
+        )
+        .expect("direct parse")
+        .expect("direct event");
         let expected_event = SourceEvent::new(
             "nexmark_bid",
             json!({
@@ -1021,6 +1094,59 @@ mod tests {
     }
 
     #[test]
+    fn direct_default_source_json_parse_matches_source_decoder_encoding() {
+        let definition = SourceDefinition::new(
+            "nexmark_bid",
+            vec![
+                SourceColumn::new("auction", SourceDataType::Int64),
+                SourceColumn::new("bidder", SourceDataType::Int64),
+                SourceColumn::new("price", SourceDataType::Int64),
+                SourceColumn::new("channel", SourceDataType::Utf8),
+                SourceColumn::new("url", SourceDataType::Utf8),
+                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
+                SourceColumn::new("extra", SourceDataType::Utf8),
+            ],
+        )
+        .expect("definition");
+        let payload = br#"{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}"#;
+        let lookup = build_direct_decode_lookup(&[definition.clone()], &HashMap::new());
+
+        let direct = parse_direct_default_source_payload_event(
+            payload,
+            Some("nexmark_bid"),
+            &[definition.clone()],
+            &lookup,
+            Some(7),
+        )
+        .expect("direct parse")
+        .expect("direct event");
+        let expected_event = SourceEvent::new(
+            "nexmark_bid",
+            json!({
+                "auction": 100,
+                "bidder": 42,
+                "price": 99,
+                "channel": "web",
+                "url": "http://example.com",
+                "date_time": 1700000000000_i64,
+                "extra": "bid_extra"
+            }),
+        );
+        let decoder = SourceRowDecoder::new(definition);
+        let (expected_encoded, expected_ts) = decoder
+            .encode_row_key(&expected_event)
+            .expect("expected encoding");
+
+        assert_eq!(
+            direct.preencoded_row_key(),
+            Some(expected_encoded.as_slice())
+        );
+        assert_eq!(direct.event_time_ms(), expected_ts);
+        assert_eq!(direct.source_id(), Some(7));
+        assert_eq!(direct.source(), "");
+    }
+
+    #[test]
     fn direct_floe_json_parse_skips_unneeded_columns() {
         let definition = SourceDefinition::new(
             "nexmark_bid",
@@ -1041,10 +1167,16 @@ mod tests {
             )]),
         );
 
-        let direct =
-            parse_direct_floe_json_event(payload, None, "topic", &[definition.clone()], &lookup)
-                .expect("direct parse")
-                .expect("direct event");
+        let direct = parse_direct_floe_json_event(
+            payload,
+            None,
+            "topic",
+            &[definition.clone()],
+            &lookup,
+            None,
+        )
+        .expect("direct parse")
+        .expect("direct event");
         let decoder = SourceRowDecoder::new_with_encoded_required_columns(
             definition,
             Some(Arc::from([true, true, true, false])),

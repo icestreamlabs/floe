@@ -231,14 +231,14 @@ fn kafka_offset_commit_state_preserves_idle_topic_offsets() {
     advance_kafka_offset_commit_state(
         &mut committed,
         &HashMap::from([
-            (("auction".to_string(), 0_i32), 41_i64),
-            (("person".to_string(), 0_i32), 17_i64),
+            ((Arc::<str>::from("auction"), 0_i32), 41_i64),
+            ((Arc::<str>::from("person"), 0_i32), 17_i64),
         ]),
     );
 
     advance_kafka_offset_commit_state(
         &mut committed,
-        &HashMap::from([(("person".to_string(), 0_i32), 22_i64)]),
+        &HashMap::from([((Arc::<str>::from("person"), 0_i32), 22_i64)]),
     );
 
     assert_eq!(

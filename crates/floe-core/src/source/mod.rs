@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, ensure};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -192,6 +194,14 @@ pub struct SourceEvent {
     event_time_ms: Option<u64>,
     #[serde(skip)]
     preencoded_row_key: Option<Vec<u8>>,
+    #[serde(skip)]
+    source_id: Option<usize>,
+    #[serde(skip)]
+    kafka_topic: Option<Arc<str>>,
+    #[serde(skip)]
+    kafka_partition: Option<i32>,
+    #[serde(skip)]
+    kafka_offset: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,6 +237,10 @@ impl SourceEvent {
             resume_token: None,
             event_time_ms: None,
             preencoded_row_key: None,
+            source_id: None,
+            kafka_topic: None,
+            kafka_partition: None,
+            kafka_offset: None,
         }
     }
 
@@ -237,11 +251,33 @@ impl SourceEvent {
             resume_token: None,
             event_time_ms: None,
             preencoded_row_key: Some(preencoded_row_key),
+            source_id: None,
+            kafka_topic: None,
+            kafka_partition: None,
+            kafka_offset: None,
+        }
+    }
+
+    pub fn preencoded_for_source_id(source_id: usize, preencoded_row_key: Vec<u8>) -> Self {
+        Self {
+            source: String::new(),
+            payload: None,
+            resume_token: None,
+            event_time_ms: None,
+            preencoded_row_key: Some(preencoded_row_key),
+            source_id: Some(source_id),
+            kafka_topic: None,
+            kafka_partition: None,
+            kafka_offset: None,
         }
     }
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub fn source_id(&self) -> Option<usize> {
+        self.source_id
     }
 
     pub fn payload(&self) -> Option<&Value> {
@@ -255,6 +291,21 @@ impl SourceEvent {
     pub fn with_resume_token(mut self, resume_token: SourceResumeToken) -> Self {
         self.resume_token = Some(resume_token);
         self
+    }
+
+    pub fn with_kafka_position(mut self, topic: Arc<str>, partition: i32, offset: i64) -> Self {
+        self.kafka_topic = Some(topic);
+        self.kafka_partition = Some(partition);
+        self.kafka_offset = Some(offset);
+        self
+    }
+
+    pub fn kafka_position(&self) -> Option<(&Arc<str>, i32, i64)> {
+        Some((
+            self.kafka_topic.as_ref()?,
+            self.kafka_partition?,
+            self.kafka_offset?,
+        ))
     }
 
     pub fn event_time_ms(&self) -> Option<u64> {
