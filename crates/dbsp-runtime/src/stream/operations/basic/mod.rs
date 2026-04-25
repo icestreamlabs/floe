@@ -1,6 +1,6 @@
 mod lift;
 mod streams;
-mod time;
+pub(crate) mod time;
 mod zset;
 
 pub use lift::{incrementalize2, lift1, lift2};

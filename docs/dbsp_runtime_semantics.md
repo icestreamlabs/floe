@@ -19,17 +19,26 @@ deriving future values from storage defaults.
 
 ## Evaluator Persistence
 
-Evaluator-backed streams currently persist an `meta/evaluator` marker and
-register their evaluator graph in-process by namespace.
+Evaluator-backed streams persist an `meta/evaluator` marker. Reconstructible
+operators persist a serializable descriptor; the runtime currently supports
+descriptors for the built-in time operators `delay`, `differentiate`, and
+`integrate`, plus built-in stream `add` and `neg`.
 
-Reopening such a stream in the same process restores the evaluator from the
-registry. Reopening it without the evaluator graph fails explicitly. This avoids
-silently interpreting a derived stream as a finite prefix plus compacted default
-tail.
+For descriptor-backed streams, reopening rebuilds the evaluator from the
+descriptor and recursively reopens the input stream. This applies to scalar
+streams and handle-valued streams alike, so built-in time operators over derived
+ZSet handles remain semantically evaluable after process restart.
 
-This is intentionally a non-persistent evaluator graph model. Full durable DBSP
-graph recovery requires a serializable operator graph descriptor and a
-reconstruction path for evaluator nodes.
+Closure-backed evaluator streams still register their evaluator graph in-process
+by namespace. Reopening them in the same process restores the evaluator from the
+registry. Reopening them without the evaluator graph fails explicitly. This
+avoids silently interpreting a derived stream as a finite prefix plus compacted
+default tail.
+
+The remaining durable graph recovery work is to replace closure-backed runtime
+evaluators with typed operator descriptors wherever the operator is part of the
+production DBSP surface. Until then, non-descriptor evaluator streams are
+intentionally restart-bounded.
 
 ## Lifted Handle Streams
 
@@ -50,6 +59,12 @@ ZSet runtime machinery. They materialize an initial prefix and then publish
 future handles through live cursor tasks. Those operators should be validated by
 future-tick tests and against the semantic reference model when their behavior
 changes.
+
+Reference recompute tests currently cover the stateful operator cores for
+filter, map, distinct, consolidate, aggregate, group-by, top-N, joins,
+semijoins, antijoins, range joins, and as-of joins. `dbsp-semantic` lowering
+tests cover reference execution and reopen behavior for scalar, ZSet, set,
+indexed, nested, recursive, and windowed streams.
 
 ## Partial Operators
 

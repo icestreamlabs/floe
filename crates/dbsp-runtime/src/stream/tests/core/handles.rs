@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
+use crate::stream::core::stream::{Stream, unregister_stream_evaluator_for_test};
+use crate::stream::groups::HandleGroup;
+use crate::stream::operations::basic::delay;
 use crate::stream::tests::common::build_db;
 use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
 
@@ -142,6 +145,50 @@ async fn stream_reopens_at_persisted_frontier() {
         .expect("latest after reopen");
     assert_eq!(ts, 2);
     assert_eq!(handle.version, 2);
+}
+
+#[tokio::test]
+async fn delayed_handle_stream_reopens_from_builtin_descriptor() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let namespace = "derived_handle_restart";
+    let dict = Arc::new(
+        Dictionary::<Vec<u8>>::with_table(table.clone(), namespace, None)
+            .await
+            .expect("dictionary"),
+    );
+    let mut zset = ZSetStream::new(
+        dict,
+        table.clone(),
+        namespace.to_string(),
+        StreamRetention::KeepLast { keep_last: 2 },
+    )
+    .await
+    .expect("create zset stream");
+    zset.add_delta(vec![1], 1);
+    zset.flush().await.expect("flush v1");
+    zset.add_delta(vec![2], 1);
+    zset.flush().await.expect("flush v2");
+
+    let mut delayed = delay(&zset.handle_stream())
+        .await
+        .expect("delay handle stream");
+    let delayed_namespace = delayed.namespace().to_string();
+    delayed.flush().await.expect("flush delayed handle stream");
+    unregister_stream_evaluator_for_test(&delayed_namespace);
+
+    let default_hint = delayed.default_value();
+    let group = Arc::new(HandleGroup::new(default_hint));
+    let mut reopened = Stream::with_table(table, delayed_namespace, group)
+        .await
+        .expect("reopen delayed handle stream");
+
+    assert_eq!(
+        reopened.get(2).await.expect("delayed t2").version,
+        1,
+        "reopened delayed handle stream should evaluate from the durable time descriptor"
+    );
+    assert_eq!(reopened.get(3).await.expect("delayed t3").version, 2);
 }
 
 #[tokio::test]

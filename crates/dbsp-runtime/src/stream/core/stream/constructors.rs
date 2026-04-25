@@ -15,8 +15,8 @@ use crate::storage::keyspace::{self, namespace_prefix};
 use crate::storage::{KeyValueTable, SlateTable};
 
 use super::{
-    Stream, StreamCore, StreamEvaluator, StreamState, register_stream_evaluator,
-    registered_stream_evaluator,
+    Stream, StreamCore, StreamEvaluator, StreamEvaluatorDescriptor, StreamState,
+    register_stream_evaluator, registered_stream_evaluator,
 };
 
 impl<T> Stream<T>
@@ -79,13 +79,16 @@ where
         let mut needs_initial_flush = false;
 
         stream.core.clear_intent().await?;
-        if stream
-            .table()
-            .get_bytes(&stream.core.evaluator_key)
-            .await?
-            .is_some()
-        {
-            let Some(evaluator) = registered_stream_evaluator::<T>(&namespace) else {
+        if let Some(evaluator_bytes) = stream.table().get_bytes(&stream.core.evaluator_key).await? {
+            let evaluator = if let Some(evaluator) = stream
+                .rebuild_builtin_evaluator(evaluator_bytes.as_ref())
+                .await?
+            {
+                Some(evaluator)
+            } else {
+                registered_stream_evaluator::<T>(&namespace)
+            };
+            let Some(evaluator) = evaluator else {
                 bail!(
                     "cannot reopen evaluator-derived stream `{namespace}` without its in-memory DBSP evaluator graph"
                 );
@@ -178,6 +181,136 @@ where
             .put(&stream.core.evaluator_key, b"ephemeral")
             .await?;
         Ok(stream)
+    }
+
+    pub(crate) async fn evaluated_with_table_and_descriptor(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        group: Arc<dyn AbelianGroup<T>>,
+        evaluator: Arc<dyn StreamEvaluator<T>>,
+        descriptor: StreamEvaluatorDescriptor,
+    ) -> Result<Self> {
+        let stream = Self::evaluated_with_table(table, namespace, group, evaluator).await?;
+        match descriptor {
+            StreamEvaluatorDescriptor::BuiltinTime {
+                kind,
+                input_namespace,
+            } => {
+                let encoded = encoding::encode(&(
+                    "builtin-time".to_string(),
+                    kind.to_string(),
+                    input_namespace,
+                ))
+                .context("encode stream evaluator descriptor")?;
+                stream
+                    .table()
+                    .put(&stream.core.evaluator_key, &encoded)
+                    .await?;
+            }
+            StreamEvaluatorDescriptor::BuiltinUnary {
+                kind,
+                input_namespace,
+            } => {
+                let encoded = encoding::encode(&(
+                    "builtin-unary".to_string(),
+                    kind.to_string(),
+                    input_namespace,
+                ))
+                .context("encode stream evaluator descriptor")?;
+                stream
+                    .table()
+                    .put(&stream.core.evaluator_key, &encoded)
+                    .await?;
+            }
+            StreamEvaluatorDescriptor::BuiltinBinary {
+                kind,
+                left_namespace,
+                right_namespace,
+            } => {
+                let encoded = encoding::encode(&(
+                    "builtin-binary".to_string(),
+                    kind.to_string(),
+                    left_namespace,
+                    right_namespace,
+                ))
+                .context("encode stream evaluator descriptor")?;
+                stream
+                    .table()
+                    .put(&stream.core.evaluator_key, &encoded)
+                    .await?;
+            }
+        }
+        Ok(stream)
+    }
+
+    async fn rebuild_builtin_evaluator(
+        &self,
+        evaluator_bytes: &[u8],
+    ) -> Result<Option<Arc<dyn StreamEvaluator<T>>>> {
+        if let Ok((family, kind, input_namespace)) =
+            encoding::decode::<(String, String, String)>(evaluator_bytes)
+        {
+            if family == "builtin-time" {
+                let input = Box::pin(Stream::with_table(
+                    self.table(),
+                    input_namespace.clone(),
+                    self.group(),
+                ))
+                .await
+                .with_context(|| {
+                    format!("rebuild {kind} evaluator input stream `{input_namespace}`")
+                })?;
+                return Ok(Some(
+                    crate::stream::operations::basic::time::builtin_time_evaluator(kind, input)?,
+                ));
+            }
+
+            if family == "builtin-unary" {
+                let input = Box::pin(Stream::with_table(
+                    self.table(),
+                    input_namespace.clone(),
+                    self.group(),
+                ))
+                .await
+                .with_context(|| {
+                    format!("rebuild {kind} evaluator input stream `{input_namespace}`")
+                })?;
+                return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
+                    kind,
+                    Some(input),
+                    None,
+                )?));
+            }
+        }
+
+        if let Ok((family, kind, left_namespace, right_namespace)) =
+            encoding::decode::<(String, String, String, String)>(evaluator_bytes)
+            && family == "builtin-binary"
+        {
+            let left = Box::pin(Stream::with_table(
+                self.table(),
+                left_namespace.clone(),
+                self.group(),
+            ))
+            .await
+            .with_context(|| format!("rebuild {kind} evaluator left stream `{left_namespace}`"))?;
+            let right = Box::pin(Stream::with_table(
+                self.table(),
+                right_namespace.clone(),
+                self.group(),
+            ))
+            .await
+            .with_context(|| {
+                format!("rebuild {kind} evaluator right stream `{right_namespace}`")
+            })?;
+            return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
+                kind,
+                Some(left),
+                Some(right),
+            )?));
+        }
+
+        Ok(None)
     }
 
     pub async fn open_at(

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
@@ -10,8 +10,7 @@ use std::sync::Mutex;
 
 use crate::algebra::AbelianGroup;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::core::stream::{Stream, StreamEvaluator};
-use crate::stream::util::build_evaluated_stream;
+use crate::stream::core::stream::{Stream, StreamEvaluator, StreamEvaluatorDescriptor};
 
 /// Exact one-tick delay over the represented total stream.
 ///
@@ -30,12 +29,14 @@ where
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon() + 1;
-    build_evaluated_stream(
+    build_builtin_time_stream(
         input.table(),
         input.group(),
         Arc::new(DelayEvaluator {
             input: input.clone(),
         }),
+        "delay",
+        input.namespace().to_string(),
         "stream_delay/",
         frontier,
         horizon,
@@ -60,12 +61,14 @@ where
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon() + 1;
-    build_evaluated_stream(
+    build_builtin_time_stream(
         input.table(),
         input.group(),
         Arc::new(DifferentiateEvaluator {
             input: input.clone(),
         }),
+        "differentiate",
+        input.namespace().to_string(),
         "stream_diff/",
         frontier,
         horizon,
@@ -90,18 +93,95 @@ where
 {
     let frontier = input.current_time();
     let horizon = input.semantic_horizon();
-    build_evaluated_stream(
+    build_builtin_time_stream(
         input.table(),
         input.group(),
         Arc::new(IntegrateEvaluator {
             input: input.clone(),
             cache: Mutex::new(BTreeMap::new()),
         }),
+        "integrate",
+        input.namespace().to_string(),
         "stream_integrate/",
         frontier,
         horizon,
     )
     .await
+}
+
+pub(crate) fn builtin_time_evaluator<T>(
+    kind: impl AsRef<str>,
+    input: Stream<T>,
+) -> Result<Arc<dyn StreamEvaluator<T>>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    match kind.as_ref() {
+        "delay" => Ok(Arc::new(DelayEvaluator { input })),
+        "differentiate" => Ok(Arc::new(DifferentiateEvaluator { input })),
+        "integrate" => Ok(Arc::new(IntegrateEvaluator {
+            input,
+            cache: Mutex::new(BTreeMap::new()),
+        })),
+        other => bail!("unknown built-in time evaluator kind `{other}`"),
+    }
+}
+
+async fn build_builtin_time_stream<T>(
+    table: Arc<dyn crate::storage::KeyValueTable>,
+    group: Arc<dyn AbelianGroup<T>>,
+    evaluator: Arc<dyn StreamEvaluator<T>>,
+    kind: &'static str,
+    input_namespace: String,
+    prefix: &str,
+    frontier: i64,
+    horizon: i64,
+) -> Result<Stream<T>>
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    let namespace = crate::stream::util::next_derived_namespace(prefix);
+    let mut result = Stream::evaluated_with_table_and_descriptor(
+        table,
+        namespace,
+        group,
+        evaluator,
+        StreamEvaluatorDescriptor::BuiltinTime {
+            kind,
+            input_namespace,
+        },
+    )
+    .await?;
+
+    for t in 0..=horizon {
+        let value = result
+            .derived_value_at(t)
+            .await?
+            .expect("built-in time stream missing evaluator");
+        if t == 0 {
+            crate::stream::util::set_default_in_place(&mut result, value);
+        } else if t <= frontier {
+            crate::stream::util::push_value_in_place(&mut result, value);
+        } else {
+            crate::stream::util::set_value_at_in_place(&result, t, value);
+        }
+    }
+
+    Ok(result)
 }
 
 struct DelayEvaluator<T>

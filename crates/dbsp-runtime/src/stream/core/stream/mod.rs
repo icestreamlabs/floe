@@ -107,6 +107,22 @@ where
     async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T>;
 }
 
+pub(crate) enum StreamEvaluatorDescriptor {
+    BuiltinTime {
+        kind: &'static str,
+        input_namespace: String,
+    },
+    BuiltinUnary {
+        kind: &'static str,
+        input_namespace: String,
+    },
+    BuiltinBinary {
+        kind: &'static str,
+        left_namespace: String,
+        right_namespace: String,
+    },
+}
+
 static STREAM_EVALUATOR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

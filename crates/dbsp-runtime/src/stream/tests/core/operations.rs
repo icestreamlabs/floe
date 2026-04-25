@@ -319,22 +319,100 @@ async fn derived_stream_reopens_with_registered_evaluator() {
 }
 
 #[tokio::test]
-async fn derived_stream_rejects_reopen_without_evaluator_graph() {
+async fn builtin_time_stream_reopens_without_registered_evaluator() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut source = Stream::new(db.clone(), "persist_builtin_time_input", group.clone())
+        .await
+        .expect("create stream");
+    source.send(2).await.expect("send t1");
+    source.send(3).await.expect("send t2");
+
+    let mut delayed = delay(&source).await.expect("apply delay");
+    let delayed_namespace = delayed.namespace().to_string();
+    delayed.flush().await.expect("flush delayed stream");
+    unregister_stream_evaluator_for_test(&delayed_namespace);
+    let mut reopened_delay = Stream::new(db.clone(), delayed_namespace, group.clone())
+        .await
+        .expect("reopen delay from descriptor");
+    assert_eq!(reopened_delay.get(3).await.expect("delay t3"), 3);
+
+    let mut diff = differentiate(&source).await.expect("differentiate source");
+    let diff_namespace = diff.namespace().to_string();
+    diff.flush().await.expect("flush diff stream");
+    unregister_stream_evaluator_for_test(&diff_namespace);
+    let mut reopened_diff = Stream::new(db.clone(), diff_namespace, group.clone())
+        .await
+        .expect("reopen differentiate from descriptor");
+    assert_eq!(reopened_diff.get(2).await.expect("diff t2"), 1);
+
+    let mut integrated = integrate(&source).await.expect("integrate source");
+    let integrate_namespace = integrated.namespace().to_string();
+    integrated.flush().await.expect("flush integrate stream");
+    unregister_stream_evaluator_for_test(&integrate_namespace);
+    let mut reopened_integrate = Stream::new(db, integrate_namespace, group)
+        .await
+        .expect("reopen integrate from descriptor");
+    assert_eq!(reopened_integrate.get(2).await.expect("integrate t2"), 5);
+}
+
+#[tokio::test]
+async fn builtin_addition_stream_reopens_without_registered_evaluator() {
+    let db = build_db().await;
+    let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
+
+    let mut left = Stream::new(db.clone(), "persist_builtin_add_left", group.clone())
+        .await
+        .expect("create left stream");
+    left.send(2).await.expect("send left t1");
+    left.send(3).await.expect("send left t2");
+
+    let mut right = Stream::new(db.clone(), "persist_builtin_add_right", group.clone())
+        .await
+        .expect("create right stream");
+    right.send(5).await.expect("send right t1");
+    right.send(7).await.expect("send right t2");
+
+    let addition = StreamAddition::from_stream(&left);
+    let mut sum = addition.add(&left, &right).await;
+    let sum_namespace = sum.namespace().to_string();
+    sum.flush().await.expect("flush sum stream");
+    unregister_stream_evaluator_for_test(&sum_namespace);
+    let mut reopened_sum = Stream::new(db.clone(), sum_namespace, group.clone())
+        .await
+        .expect("reopen sum from descriptor");
+    assert_eq!(reopened_sum.get(2).await.expect("sum t2"), 10);
+
+    let mut neg = addition.neg(&left).await;
+    let neg_namespace = neg.namespace().to_string();
+    neg.flush().await.expect("flush neg stream");
+    unregister_stream_evaluator_for_test(&neg_namespace);
+    let mut reopened_neg = Stream::new(db, neg_namespace, group)
+        .await
+        .expect("reopen neg from descriptor");
+    assert_eq!(reopened_neg.get(2).await.expect("neg t2"), -3);
+}
+
+#[tokio::test]
+async fn closure_derived_stream_rejects_reopen_without_evaluator_graph() {
     let db = build_db().await;
     let group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
 
     let mut source = Stream::new(
         db.clone(),
-        "persist_delay_missing_evaluator_input",
+        "persist_closure_missing_evaluator_input",
         group.clone(),
     )
     .await
     .expect("create stream");
     source.send(5).await.expect("send t1");
 
-    let mut delayed = delay(&source).await.expect("apply delay");
-    let namespace = delayed.namespace().to_string();
-    delayed.flush().await.expect("flush delayed stream");
+    let mut lifted = lift1(&source, group.clone(), |value| value * 2)
+        .await
+        .expect("apply lift");
+    let namespace = lifted.namespace().to_string();
+    lifted.flush().await.expect("flush lifted stream");
     unregister_stream_evaluator_for_test(&namespace);
 
     let err = match Stream::new(db, namespace, group).await {
