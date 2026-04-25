@@ -1,7 +1,7 @@
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use datafusion::common::Column;
-use datafusion::logical_expr::{JoinType, col, lit, table_scan};
+use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, RowSchema,
@@ -335,6 +335,30 @@ fn missing_table_raises_planner_error() {
         }
         other => panic!("expected table not found error, got {other:?}"),
     }
+}
+
+#[test]
+fn recursive_plans_are_rejected_until_guarded_feedback_is_supported() -> Result<()> {
+    let schema = schema_for(nexmark_person_table());
+    let static_term = table_scan(Some(nexmark_person_table().name), &schema, None)?
+        .project(vec![col("id")])?
+        .build()?;
+    let recursive_term = static_term.clone();
+    let recursive_plan = LogicalPlanBuilder::from(static_term)
+        .to_recursive_query("recursive_ids".to_string(), recursive_term, false)?
+        .build()?;
+
+    let err = planner().build(&recursive_plan).unwrap_err();
+    match err {
+        PlannerError::UnsupportedPlan(desc) => {
+            assert!(
+                desc.contains("RecursiveQuery") || desc.contains("not supported"),
+                "expected recursive query rejection, got {desc}"
+            );
+        }
+        other => panic!("expected unsupported recursive query error, got {other:?}"),
+    }
+    Ok(())
 }
 
 fn planner() -> DbspPlanBuilder {

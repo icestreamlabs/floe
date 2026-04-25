@@ -20,6 +20,7 @@ use datafusion::prelude::SessionContext;
 use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::SlateTable;
+use dbsp_semantic::ZSet;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{
@@ -379,8 +380,11 @@ async fn filter_and_projection_materializes_mv() {
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
-        .append_encoded(encoded_bid_row(1, 42, 99), 1)
-        .expect("append bidder 42");
+        .append_encoded(encoded_bid_row(1, 42, 99), 2)
+        .expect("append duplicate bidder 42");
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 42, 99), -1)
+        .expect("append bidder 42 retraction");
     bid_writer.flush().await.expect("flush first step");
     bid_writer
         .append_encoded(encoded_bid_row(2, 7, 50), 1)
@@ -418,6 +422,11 @@ async fn filter_and_projection_materializes_mv() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![int_row(&[99])]);
+    assert_eq!(
+        zset_from_rows(&rows),
+        ZSet::from_weights([(row_key(&int_row(&[99])), 1)]),
+        "full filter/project MV graph should match ZSet reference semantics"
+    );
 }
 
 #[tokio::test]
@@ -618,6 +627,11 @@ async fn inner_join_materializes_mv() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![int_utf8_row(10, Some("alice"))]);
+    assert_eq!(
+        zset_from_rows(&rows),
+        ZSet::from_weights([(row_key(&int_utf8_row(10, Some("alice"))), 1)]),
+        "full join MV graph should match ZSet reference semantics"
+    );
 }
 
 #[tokio::test]
@@ -1580,6 +1594,11 @@ async fn aggregate_materializes_mv() {
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
+    assert_eq!(
+        zset_from_rows(&rows),
+        zset_from_rows(&expected),
+        "full aggregate MV graph should match ZSet reference semantics after insertions"
+    );
 
     bid_writer
         .append_encoded(encoded_bid_row(2, 42, 30), -1)
@@ -1599,6 +1618,11 @@ async fn aggregate_materializes_mv() {
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
+    assert_eq!(
+        zset_from_rows(&rows),
+        zset_from_rows(&expected),
+        "full aggregate MV graph should match ZSet reference semantics after retraction"
+    );
 }
 
 #[tokio::test]
@@ -3444,7 +3468,13 @@ async fn distinct_materializes_unique_rows() {
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
-    assert_eq!(rows, vec![int_row(&[7]), int_row(&[42])]);
+    let expected = vec![int_row(&[7]), int_row(&[42])];
+    assert_eq!(rows, expected);
+    assert_eq!(
+        zset_from_rows(&rows),
+        zset_from_rows(&expected),
+        "full distinct MV graph should match ZSet reference semantics"
+    );
 }
 
 #[tokio::test]
@@ -4516,6 +4546,18 @@ async fn tumbling_window_max_materializes_from_transient_source_journal() {
         rows.iter().any(|row| row_contains_i64(row, 99)),
         "expected tumbling window output to include max price 99"
     );
+    assert_eq!(
+        zset_from_rows(&rows),
+        ZSet::from_weights([(
+            row_key(&timestamp_int_row(
+                1_700_000_000_000,
+                1_700_000_010_000,
+                &[99]
+            )),
+            1,
+        )]),
+        "full tumbling max window MV graph should match ZSet reference semantics"
+    );
 }
 
 #[tokio::test]
@@ -4538,6 +4580,16 @@ async fn tumbling_window_count_by_bidder_materializes_from_transient_source_jour
         rows.iter()
             .any(|row| row_contains_i64(row, 42) && row_contains_i64(row, 2)),
         "expected bidder 42 aggregate count of 2"
+    );
+    let mut expected = vec![
+        timestamp_int_row(1_700_000_000_000, 1_700_000_010_000, &[7, 1]),
+        timestamp_int_row(1_700_000_000_000, 1_700_000_010_000, &[42, 2]),
+    ];
+    sort_rows_by_first_column(&mut expected);
+    assert_eq!(
+        zset_from_rows(&rows),
+        zset_from_rows(&expected),
+        "full tumbling count window MV graph should match ZSet reference semantics"
     );
 }
 
@@ -4877,6 +4929,21 @@ fn int_row(values: &[i64]) -> TestRow {
         .collect()
 }
 
+fn timestamp_int_row(start: i64, end: i64, values: &[i64]) -> TestRow {
+    let mut row = vec![
+        Some(EncodedRowScalar::TimestampMillis(start)),
+        Some(EncodedRowScalar::TimestampMillis(end)),
+    ];
+    row.extend(
+        values
+            .iter()
+            .copied()
+            .map(EncodedRowScalar::Int64)
+            .map(Some),
+    );
+    row
+}
+
 fn int_utf8_row(id: i64, label: Option<&str>) -> TestRow {
     vec![
         Some(EncodedRowScalar::Int64(id)),
@@ -4885,6 +4952,14 @@ fn int_utf8_row(id: i64, label: Option<&str>) -> TestRow {
             None => None,
         },
     ]
+}
+
+fn row_key(row: &TestRow) -> String {
+    format!("{row:?}")
+}
+
+fn zset_from_rows(rows: &[TestRow]) -> ZSet<String> {
+    ZSet::from_weights(rows.iter().map(|row| (row_key(row), 1)))
 }
 
 fn int_and_null_timestamp_row(id: i64) -> TestRow {
