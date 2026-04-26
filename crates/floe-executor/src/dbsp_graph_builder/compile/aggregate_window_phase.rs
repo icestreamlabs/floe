@@ -332,27 +332,32 @@ impl DbspGraphBuilder {
             );
             let key_columns = Arc::clone(&direct_group_key_columns);
             let row_graph_id = graph_id.clone();
-            let row_extractor = move |bytes: &Vec<u8>| -> Option<(Vec<u8>, i64)> {
-                match extract_encoded_row_columns_and_i64_like_column(
-                    bytes,
-                    key_columns.as_ref(),
-                    direct_time_column,
-                    false,
-                ) {
-                    Ok(Some(extracted)) => Some(extracted),
-                    Ok(None) => None,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %row_graph_id,
-                            error = %err,
-                            "failed to extract window count-star row"
-                        );
-                        None
+            let row_extractor = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut extracted = Vec::with_capacity(delta_values.len());
+                for (bytes, weight) in delta_values {
+                    match extract_encoded_row_columns_and_i64_like_column(
+                        bytes,
+                        key_columns.as_ref(),
+                        direct_time_column,
+                        false,
+                    ) {
+                        Ok(Some((key, event_ts))) => {
+                            extracted.push((bytes.clone(), *weight, key, event_ts));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %row_graph_id,
+                                error = %err,
+                                "failed to extract window count-star row"
+                            );
+                        }
                     }
                 }
+                extracted
             };
             let window_count_star_aggregate =
-                dbsp::DbspWindowCountStarAggregate::new::<Vec<u8>, Vec<u8>, _>(
+                dbsp::DbspWindowCountStarAggregate::new_batch::<Vec<u8>, Vec<u8>, _>(
                     &upstream,
                     row_extractor,
                     window_size,
@@ -380,34 +385,33 @@ impl DbspGraphBuilder {
             .all(|agg| agg.function() == &DbspAggregateFunction::Count)
         {
             let key_columns = Arc::clone(&direct_group_key_columns);
-            let key_graph_id = graph_id.clone();
-            let key_extractor = move |bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                match extract_encoded_row_columns(bytes, key_columns.as_ref(), false) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %key_graph_id,
-                            error = %err,
-                            "failed to extract window aggregate group key columns"
-                        );
-                        None
+            let window_graph_id = graph_id.clone();
+            let window_extractor = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut extracted = Vec::with_capacity(delta_values.len());
+                for (bytes, weight) in delta_values {
+                    if *weight == 0 {
+                        continue;
+                    }
+                    match extract_encoded_row_columns_and_i64_like_column(
+                        bytes,
+                        key_columns.as_ref(),
+                        direct_time_column,
+                        false,
+                    ) {
+                        Ok(Some((key, event_ts))) => {
+                            extracted.push((bytes.clone(), *weight, key, event_ts));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %window_graph_id,
+                                error = %err,
+                                "failed to extract window count aggregate row"
+                            );
+                        }
                     }
                 }
-            };
-
-            let time_graph_id = graph_id.clone();
-            let time_extractor = move |bytes: &Vec<u8>| -> Option<i64> {
-                match extract_encoded_row_i64_like_column(bytes, direct_time_column) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %time_graph_id,
-                            error = %err,
-                            "failed to extract window aggregate time column"
-                        );
-                        None
-                    }
-                }
+                extracted
             };
 
             let slot_kinds = build_count_aggregate_slot_kinds(&aggregates);
@@ -418,13 +422,21 @@ impl DbspGraphBuilder {
                 graph_id.clone(),
                 "window aggregate",
             );
+            let row_evaluator =
+                move |delta_values: &[(dbsp::WindowCountInput<Vec<u8>, Vec<u8>>, i64)]| {
+                    delta_values
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            row_evaluator(&row.window_key, &row.value).map(|row| (row, *weight))
+                        })
+                        .collect::<Vec<_>>()
+                };
             let window_count_aggregate =
-                dbsp::DbspWindowCountAggregate::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _, _>(
+                dbsp::DbspWindowCountAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
                     &upstream,
-                    key_extractor,
+                    window_extractor,
                     row_evaluator,
                     slot_kinds,
-                    time_extractor,
                     window_size,
                     window_slide,
                     allowed_lateness_ms,

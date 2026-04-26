@@ -21,6 +21,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
+#[cfg(test)]
 type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync>;
 type BatchRowEvaluator<V, K, D> =
     Arc<dyn Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync>;
@@ -147,6 +148,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub(crate) fn new(
         state: RelationState<(K, GroupedCountState)>,
         table: Arc<dyn KeyValueTable>,

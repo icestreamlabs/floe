@@ -33,13 +33,17 @@ use crate::stream::util::{
 };
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
-struct WindowCountInput<K, V> {
-    window_key: WindowKey<K>,
-    value: V,
+pub struct WindowCountInput<K, V> {
+    pub window_key: WindowKey<K>,
+    pub value: V,
 }
 
-type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
-type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
+type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
+type BatchWindowRowEvaluator<K, V, D> = Arc<
+    dyn Fn(&[(WindowCountInput<K, V>, i64)]) -> Vec<(CountAggregateRow<WindowKey<K>, D>, i64)>
+        + Send
+        + Sync,
+>;
 
 pub struct DbspWindowCountAggregate {
     stream: DeltaHandleStream,
@@ -77,8 +81,7 @@ where
 {
     table: Arc<dyn KeyValueTable>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
-    key_extractor: KeyExtractor<V, K>,
-    time_extractor: TimeExtractor<V>,
+    window_extractor: BatchWindowExtractor<V, K>,
     count_op: CountAggregateOp<WindowKey<K>, WindowCountInput<K, V>, D>,
     watermark: Arc<AtomicI64>,
     window_size: i64,
@@ -169,23 +172,20 @@ where
 
         let mut expanded = Vec::new();
         let mut dropped_too_late = 0_u64;
-        for (row, weight) in coalesced {
+        let delta_rows = coalesced.into_iter().collect::<Vec<_>>();
+        for (row, weight, key, event_ts) in (self.window_extractor)(&delta_rows) {
             if weight == 0 {
                 continue;
             }
-            let event_ts = match (self.time_extractor)(&row) {
-                Some(ts) if ts >= 0 => ts,
-                _ => continue,
-            };
+            if event_ts < 0 {
+                continue;
+            }
             if let Some(cutoff) = cutoff
                 && event_ts < cutoff
             {
                 dropped_too_late = dropped_too_late.saturating_add(weight.unsigned_abs());
                 continue;
             }
-            let Some(key) = (self.key_extractor)(&row) else {
-                continue;
-            };
             self.for_each_window(event_ts, |window_start, window_end| {
                 expanded.push((
                     WindowCountInput {
@@ -290,6 +290,84 @@ impl DbspWindowCountAggregate {
             + 'static,
         FTime: Fn(&V) -> Option<i64> + Send + Sync + 'static,
     {
+        let window_extractor = move |delta_values: &[(V, i64)]| {
+            delta_values
+                .iter()
+                .filter_map(|(row, weight)| {
+                    let event_ts = time_extractor(row)?;
+                    let key = key_extractor(row)?;
+                    Some((row.clone(), *weight, key, event_ts))
+                })
+                .collect()
+        };
+        let row_evaluator = move |delta_values: &[(WindowCountInput<K, V>, i64)]| {
+            delta_values
+                .iter()
+                .filter_map(|(row, weight)| {
+                    row_evaluator(&row.window_key, &row.value).map(|row| (row, *weight))
+                })
+                .collect()
+        };
+        Self::new_batch(
+            input,
+            window_extractor,
+            row_evaluator,
+            slot_kinds,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch<K, V, D, FWindow, FRow>(
+        input: &DeltaHandleStream,
+        window_extractor: FWindow,
+        row_evaluator: FRow,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        D: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
+        FRow: Fn(&[(WindowCountInput<K, V>, i64)]) -> Vec<(CountAggregateRow<WindowKey<K>, D>, i64)>
+            + Send
+            + Sync
+            + 'static,
+    {
         ensure!(window_size > 0, "window size must be positive");
         ensure!(window_slide > 0, "window slide must be positive");
         ensure!(
@@ -338,12 +416,10 @@ impl DbspWindowCountAggregate {
                 )
             });
 
-        let count_op = CountAggregateOp::new(
+        let count_op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(move |row: &WindowCountInput<K, V>| {
-                row_evaluator(&row.window_key, &row.value)
-            }),
+            Arc::new(row_evaluator) as BatchWindowRowEvaluator<K, V, D>,
             output,
             slot_kinds,
             distinct_index,
@@ -351,8 +427,7 @@ impl DbspWindowCountAggregate {
         let window_op = Arc::new(AsyncMutex::new(WindowCountAggregateOp {
             table: table.clone(),
             dict_cache: HashMap::new(),
-            key_extractor: Arc::new(key_extractor),
-            time_extractor: Arc::new(time_extractor),
+            window_extractor: Arc::new(window_extractor),
             count_op,
             watermark,
             window_size,
@@ -594,24 +669,35 @@ mod tests {
         .expect("output zset");
 
         let watermark = Arc::new(AtomicI64::new(-1));
-        let count_op = CountAggregateOp::<WindowKey<i64>, WindowCountInput<i64, i64>, i64>::new(
-            state,
-            table.clone(),
-            Arc::new(|row: &WindowCountInput<i64, i64>| {
-                Some(CountAggregateRow {
-                    key: row.window_key.clone(),
-                    slots: vec![CountAggregateSlotUpdate::<i64>::Linear(1)],
-                })
-            }),
-            output,
-            vec![CountAggregateSlotKind::Linear],
-            None,
-        );
+        let count_op =
+            CountAggregateOp::<WindowKey<i64>, WindowCountInput<i64, i64>, i64>::new_batch(
+                state,
+                table.clone(),
+                Arc::new(|rows: &[(WindowCountInput<i64, i64>, i64)]| {
+                    rows.iter()
+                        .map(|(row, weight)| {
+                            (
+                                CountAggregateRow {
+                                    key: row.window_key.clone(),
+                                    slots: vec![CountAggregateSlotUpdate::<i64>::Linear(1)],
+                                },
+                                *weight,
+                            )
+                        })
+                        .collect()
+                }),
+                output,
+                vec![CountAggregateSlotKind::Linear],
+                None,
+            );
         let mut op = WindowCountAggregateOp {
             table: table.clone(),
             dict_cache: HashMap::new(),
-            key_extractor: Arc::new(|_row: &i64| Some(0_i64)),
-            time_extractor: Arc::new(|row: &i64| Some(*row)),
+            window_extractor: Arc::new(|rows: &[(i64, i64)]| {
+                rows.iter()
+                    .map(|(row, weight)| (*row, *weight, 0_i64, *row))
+                    .collect()
+            }),
             count_op,
             watermark: Arc::clone(&watermark),
             window_size: 1_000,

@@ -21,6 +21,7 @@ use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemiJoinMode {
@@ -71,8 +72,8 @@ where
     pub right_state: RelationState<R>,
     pub left_index: IndexedBatchZSet<K, L>,
     pub right_index: IndexedBatchZSet<K, R>,
-    pub left_key: JoinKeyExtractor<L, K>,
-    pub right_key: JoinKeyExtractor<R, K>,
+    pub left_key: BatchJoinKeyExtractor<L, K>,
+    pub right_key: BatchJoinKeyExtractor<R, K>,
     pub mode: SemiJoinMode,
     pub table: Arc<dyn KeyValueTable>,
     pub integrated: Option<RelationState<L>>,
@@ -124,6 +125,45 @@ where
         output: VersionedZSet<L>,
         integrated: Option<RelationState<L>>,
     ) -> Self {
+        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        Self::new_batch(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            left_key,
+            right_key,
+            mode,
+            table,
+            output,
+            integrated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_key: BatchJoinKeyExtractor<L, K>,
+        right_key: BatchJoinKeyExtractor<R, K>,
+        mode: SemiJoinMode,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<L>,
+        integrated: Option<RelationState<L>>,
+    ) -> Self {
         Self {
             left_state,
             right_state,
@@ -143,22 +183,24 @@ where
     fn keyed_deltas<T>(
         &self,
         deltas: &HashMap<T, i64>,
-        extractor: &JoinKeyExtractor<T, K>,
+        extractor: &BatchJoinKeyExtractor<T, K>,
     ) -> HashMap<K, Vec<(T, i64)>>
     where
-        T: Clone,
+        T: Clone + Eq + Hash,
     {
         let mut keyed = HashMap::new();
-        for (row, weight) in deltas {
-            if *weight == 0 {
+        let rows = deltas
+            .iter()
+            .map(|(row, weight)| (row.clone(), *weight))
+            .collect::<Vec<_>>();
+        for (key, row, weight) in extractor(&rows) {
+            if weight == 0 {
                 continue;
             }
-            if let Some(key) = extractor(row) {
-                keyed
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push((row.clone(), *weight));
-            }
+            keyed
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push((row, weight));
         }
         keyed
     }

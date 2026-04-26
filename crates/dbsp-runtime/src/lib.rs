@@ -82,5 +82,5 @@ pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
-pub use window_count_aggregate::DbspWindowCountAggregate;
+pub use window_count_aggregate::{DbspWindowCountAggregate, WindowCountInput};
 pub use window_count_star_aggregate::DbspWindowCountStarAggregate;

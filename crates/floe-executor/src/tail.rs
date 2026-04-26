@@ -460,6 +460,7 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<
         builders,
         ops: Vec::new(),
     };
+    let deltas = coalesce_tail_deltas(deltas);
     let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
     for (key, diff) in deltas {
         if diff == 0 {
@@ -481,6 +482,21 @@ fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<
         decoded_rows.ops.resize(decoded_rows.ops.len() + count, op);
     }
     Ok(decoded_rows)
+}
+
+fn coalesce_tail_deltas(deltas: Vec<(Vec<u8>, i64)>) -> HashMap<Vec<u8>, i64> {
+    let mut merged = HashMap::with_capacity(deltas.len());
+    for (key, diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let entry = merged.entry(key.clone()).or_insert(0);
+        *entry += diff;
+        if *entry == 0 {
+            merged.remove(&key);
+        }
+    }
+    merged
 }
 
 fn build_tail_batches(

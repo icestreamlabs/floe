@@ -36,7 +36,7 @@ pub struct DbspWindowCountStarAggregate {
     stream: DeltaHandleStream,
 }
 
-type RowExtractor<V, K> = Arc<dyn Fn(&V) -> Option<(K, i64)> + Send + Sync>;
+type BatchRowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
 
 struct WindowCountStarAggregateOp<K, V>
 where
@@ -61,7 +61,7 @@ where
 {
     table: Arc<dyn KeyValueTable>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
-    row_extractor: RowExtractor<V, K>,
+    row_extractor: BatchRowExtractor<V, K>,
     state: RelationState<(WindowKey<K>, i64)>,
     output: VersionedZSet<(WindowKey<K>, i64)>,
     state_cache: Option<HashMap<WindowKey<K>, i64>>,
@@ -323,13 +323,10 @@ where
 
         let mut grouped_deltas = HashMap::with_capacity(delta_values.len());
         let mut dropped_too_late = 0_u64;
-        for (row, weight) in delta_values {
+        for (_row, weight, key, event_ts) in (self.row_extractor)(&delta_values) {
             if weight == 0 {
                 continue;
             }
-            let Some((key, event_ts)) = (self.row_extractor)(&row) else {
-                continue;
-            };
             if event_ts < 0 {
                 continue;
             }
@@ -476,6 +473,56 @@ impl DbspWindowCountStarAggregate {
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&V) -> Option<(K, i64)> + Send + Sync + 'static,
+    {
+        Self::new_batch(
+            input,
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(row, weight)| {
+                        let (key, event_ts) = row_extractor(row)?;
+                        Some((row.clone(), *weight, key, event_ts))
+                    })
+                    .collect()
+            },
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch<K, V, FRow>(
+        input: &DeltaHandleStream,
+        row_extractor: FRow,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
     {
         ensure!(window_size > 0, "window size must be positive");
         ensure!(window_slide > 0, "window slide must be positive");
@@ -742,7 +789,11 @@ mod tests {
         let mut op = WindowCountStarAggregateOp {
             table: table.clone(),
             dict_cache: HashMap::new(),
-            row_extractor: Arc::new(|row: &i64| Some((7_i64, *row))),
+            row_extractor: Arc::new(|rows: &[(i64, i64)]| {
+                rows.iter()
+                    .map(|(row, weight)| (*row, *weight, 7_i64, *row))
+                    .collect()
+            }),
             state,
             output,
             state_cache: None,

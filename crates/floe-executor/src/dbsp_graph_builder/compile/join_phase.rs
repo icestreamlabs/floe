@@ -550,40 +550,48 @@ impl DbspGraphBuilder {
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
-            let antijoin_left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                match extract_encoded_row_columns(
-                    left_bytes,
-                    antijoin_left_key_columns.as_ref(),
-                    true,
-                ) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %antijoin_left_graph_id,
-                            error = %err,
-                            "failed to extract left outer join anti left key columns"
-                        );
-                        None
+            let antijoin_left_key = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut keyed = Vec::with_capacity(delta_values.len());
+                for (left_bytes, weight) in delta_values {
+                    match extract_encoded_row_columns(
+                        left_bytes,
+                        antijoin_left_key_columns.as_ref(),
+                        true,
+                    ) {
+                        Ok(Some(key)) => keyed.push((key, left_bytes.clone(), *weight)),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_left_graph_id,
+                                error = %err,
+                                "failed to extract left outer join anti left key columns"
+                            );
+                        }
                     }
                 }
+                keyed
             };
 
-            let antijoin_right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                match extract_encoded_row_columns(
-                    right_bytes,
-                    antijoin_right_key_columns.as_ref(),
-                    true,
-                ) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %antijoin_right_graph_id,
-                            error = %err,
-                            "failed to extract left outer join anti right key columns"
-                        );
-                        None
+            let antijoin_right_key = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut keyed = Vec::with_capacity(delta_values.len());
+                for (right_bytes, weight) in delta_values {
+                    match extract_encoded_row_columns(
+                        right_bytes,
+                        antijoin_right_key_columns.as_ref(),
+                        true,
+                    ) {
+                        Ok(Some(key)) => keyed.push((key, right_bytes.clone(), *weight)),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_right_graph_id,
+                                error = %err,
+                                "failed to extract left outer join anti right key columns"
+                            );
+                        }
                     }
                 }
+                keyed
             };
 
             let antijoin_events = task_events.clone();
@@ -598,7 +606,7 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let antijoin = DbspSemiJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+            let antijoin = DbspSemiJoin::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
                 &left_join_input,
                 &right_join_input,
                 antijoin_left_key,
@@ -663,40 +671,48 @@ impl DbspGraphBuilder {
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
 
-            let antijoin_left_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                match extract_encoded_row_columns(
-                    right_bytes,
-                    antijoin_left_key_columns.as_ref(),
-                    true,
-                ) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %antijoin_left_graph_id,
-                            error = %err,
-                            "failed to extract right outer join anti right key columns"
-                        );
-                        None
+            let antijoin_left_key = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut keyed = Vec::with_capacity(delta_values.len());
+                for (right_bytes, weight) in delta_values {
+                    match extract_encoded_row_columns(
+                        right_bytes,
+                        antijoin_left_key_columns.as_ref(),
+                        true,
+                    ) {
+                        Ok(Some(key)) => keyed.push((key, right_bytes.clone(), *weight)),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_left_graph_id,
+                                error = %err,
+                                "failed to extract right outer join anti right key columns"
+                            );
+                        }
                     }
                 }
+                keyed
             };
 
-            let antijoin_right_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-                match extract_encoded_row_columns(
-                    left_bytes,
-                    antijoin_right_key_columns.as_ref(),
-                    true,
-                ) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %antijoin_right_graph_id,
-                            error = %err,
-                            "failed to extract right outer join anti left key columns"
-                        );
-                        None
+            let antijoin_right_key = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut keyed = Vec::with_capacity(delta_values.len());
+                for (left_bytes, weight) in delta_values {
+                    match extract_encoded_row_columns(
+                        left_bytes,
+                        antijoin_right_key_columns.as_ref(),
+                        true,
+                    ) {
+                        Ok(Some(key)) => keyed.push((key, left_bytes.clone(), *weight)),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %antijoin_right_graph_id,
+                                error = %err,
+                                "failed to extract right outer join anti left key columns"
+                            );
+                        }
                     }
                 }
+                keyed
             };
 
             let antijoin_events = task_events.clone();
@@ -711,7 +727,7 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let antijoin = DbspSemiJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+            let antijoin = DbspSemiJoin::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
                 &right_join_input,
                 &left_join_input,
                 antijoin_left_key,
