@@ -23,6 +23,8 @@ use crate::stream::util::{compute_delta, delta_zset_handle_batch, publish_transi
 type PartitionKeyFn<K, P> = Arc<dyn Fn(&K) -> Option<P> + Send + Sync>;
 type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
 type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
+type BatchKeyPartsFn<K, P, O> =
+    Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
 
 /// Top-N operator that applies row-number semantics: it counts multiplicity and
 /// supports OFFSET, matching ORDER BY/LIMIT/OFFSET behavior.
@@ -51,7 +53,7 @@ where
     // In-memory ordering index for top-N row semantics; rebuilt from storage on restart.
     order_index: Option<BTreeMap<P, BTreeMap<(O, K), i64>>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
-    key_parts: KeyPartsFn<K, P, O>,
+    key_parts: BatchKeyPartsFn<K, P, O>,
     limit: usize,
     offset: usize,
 }
@@ -89,6 +91,26 @@ where
         table: Arc<dyn KeyValueTable>,
         output: VersionedZSet<K>,
         key_parts: KeyPartsFn<K, P, O>,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
+        let key_parts = Arc::new(move |delta_values: &[(K, i64)]| {
+            delta_values
+                .iter()
+                .map(|(key, weight)| {
+                    let (partition, order) = key_parts(key);
+                    (key.clone(), *weight, partition, order)
+                })
+                .collect()
+        });
+        Self::new_with_batch_key_extractor(state, table, output, key_parts, limit, offset)
+    }
+
+    pub fn new_with_batch_key_extractor(
+        state: RelationState<K>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: BatchKeyPartsFn<K, P, O>,
         limit: usize,
         offset: usize,
     ) -> Self {
@@ -203,9 +225,31 @@ where
         if let Some(cached) = self.row_key_cache.get(key) {
             return cached.clone();
         }
-        let computed = (self.key_parts)(key);
+        let computed = (self.key_parts)(&[(key.clone(), 1)])
+            .into_iter()
+            .next()
+            .map(|(_, _, partition, order)| (partition, order))
+            .unwrap_or((None, None));
         self.row_key_cache.insert(key.clone(), computed.clone());
         computed
+    }
+
+    fn keys_for_batch(&mut self, rows: &[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> {
+        let mut missing = Vec::new();
+        let mut keyed = Vec::with_capacity(rows.len());
+        for (key, weight) in rows {
+            if let Some((partition, order)) = self.row_key_cache.get(key) {
+                keyed.push((key.clone(), *weight, partition.clone(), order.clone()));
+            } else {
+                missing.push((key.clone(), *weight));
+            }
+        }
+        for (key, weight, partition, order) in (self.key_parts)(&missing) {
+            self.row_key_cache
+                .insert(key.clone(), (partition.clone(), order.clone()));
+            keyed.push((key, weight, partition, order));
+        }
+        keyed
     }
 
     async fn apply_deltas_to_versioned(
@@ -351,19 +395,23 @@ where
             .context("build topn order index")?;
 
         let mut cache_updates = Vec::new();
-        for (key, diff_weight) in &delta_map {
+        let keyed_delta_rows = delta_map
+            .iter()
+            .map(|(key, weight)| (key.clone(), *weight))
+            .collect::<Vec<_>>();
+        for (key, diff_weight, partition_key, order_key) in self.keys_for_batch(&keyed_delta_rows) {
             let existing = self
                 .input_cache
                 .as_ref()
-                .and_then(|cache| cache.get(key).copied())
+                .and_then(|cache| cache.get(&key).copied())
                 .unwrap_or(0);
             let new_weight = existing + diff_weight;
             let (partition_key, order_key) = if existing > 0 || new_weight > 0 {
-                self.keys_for(key)
+                (partition_key, order_key)
             } else {
                 (None, None)
             };
-            cache_updates.push((key.clone(), existing, new_weight, partition_key, order_key));
+            cache_updates.push((key, existing, new_weight, partition_key, order_key));
         }
 
         let base_version = self.state.base_version_for_update();

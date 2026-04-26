@@ -279,8 +279,14 @@ impl MaterializedViewHandle {
         {
             let mut state = self.state.write().expect("mutex poisoned");
             let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+            let mut merged = HashMap::<&[u8], i64>::with_capacity(deltas.len());
             for (key, diff) in deltas {
-                Self::apply_encoded_locked(&mut state, &mut row_count, key, *diff);
+                if *diff != 0 {
+                    *merged.entry(key.as_slice()).or_insert(0) += *diff;
+                }
+            }
+            for (key, diff) in merged {
+                Self::apply_encoded_locked(&mut state, &mut row_count, key, diff);
             }
         }
         self.stage_authoritative_row_count_version(version);
@@ -390,6 +396,35 @@ impl MaterializedViewHandle {
                 break;
             }
             overlay.extend(deltas.iter().cloned());
+        }
+        Some((state.base_version, target_version, overlay))
+    }
+
+    pub fn encoded_overlay_merged_delta(
+        &self,
+        as_of_version: Option<u64>,
+    ) -> Option<(u64, u64, HashMap<Vec<u8>, i64>)> {
+        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+        let state = guard.as_ref()?;
+        let target_version = as_of_version.unwrap_or(state.latest_version);
+        if target_version < state.base_version {
+            return None;
+        }
+        let mut overlay = HashMap::new();
+        for (version, deltas) in &state.batches {
+            if *version > target_version {
+                break;
+            }
+            for (key, diff) in deltas.iter() {
+                if *diff == 0 {
+                    continue;
+                }
+                let entry = overlay.entry(key.clone()).or_insert(0);
+                *entry += *diff;
+                if *entry == 0 {
+                    overlay.remove(key);
+                }
+            }
         }
         Some((state.base_version, target_version, overlay))
     }

@@ -25,6 +25,7 @@ use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch}
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
 type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
 
@@ -81,8 +82,8 @@ where
     pub right_state: RelationState<R>,
     pub left_index: IndexedBatchZSet<K, L>,
     pub right_index: IndexedBatchZSet<K, R>,
-    pub left_key: JoinKeyExtractor<L, K>,
-    pub right_key: JoinKeyExtractor<R, K>,
+    pub left_key: BatchJoinKeyExtractor<L, K>,
+    pub right_key: BatchJoinKeyExtractor<R, K>,
     pub predicate: JoinPredicate<L, R>,
     pub projector: JoinProjector<L, R, O>,
     pub table: Arc<dyn KeyValueTable>,
@@ -148,6 +149,47 @@ where
         output: VersionedZSet<O>,
         integrated: Option<RelationState<O>>,
     ) -> Self {
+        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        Self::new_batch(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            table,
+            output,
+            integrated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_key: BatchJoinKeyExtractor<L, K>,
+        right_key: BatchJoinKeyExtractor<R, K>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<O>,
+        integrated: Option<RelationState<O>>,
+    ) -> Self {
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
@@ -184,6 +226,45 @@ where
         right_index: IndexedBatchZSet<K, R>,
         left_key: JoinKeyExtractor<L, K>,
         right_key: JoinKeyExtractor<R, K>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        integrated: Option<RelationState<O>>,
+    ) -> Self {
+        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        });
+        Self::new_without_output_batch(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            table,
+            integrated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_without_output_batch(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_key: BatchJoinKeyExtractor<L, K>,
+        right_key: BatchJoinKeyExtractor<R, K>,
         predicate: JoinPredicate<L, R>,
         projector: JoinProjector<L, R, O>,
         table: Arc<dyn KeyValueTable>,
@@ -244,30 +325,28 @@ where
     fn stage_keyed_deltas<T>(
         &self,
         deltas: &[(T, i64)],
-        extractor: &JoinKeyExtractor<T, K>,
+        extractor: &BatchJoinKeyExtractor<T, K>,
     ) -> KeyedRowDeltas<K, T>
     where
         T: Clone + Eq + Hash,
     {
         let mut keyed: KeyedRowDeltas<K, T> = FastHashMap::new();
-        for (row, weight) in deltas {
-            if *weight == 0 {
+        for (key, row, weight) in extractor(deltas) {
+            if weight == 0 {
                 continue;
             }
-            if let Some(key) = extractor(row) {
-                let rows = keyed.entry(key).or_default();
-                match rows.entry(row.clone()) {
-                    Entry::Occupied(mut entry) => {
-                        let next = entry.get().saturating_add(*weight);
-                        if next == 0 {
-                            entry.remove();
-                        } else {
-                            *entry.get_mut() = next;
-                        }
+            let rows = keyed.entry(key).or_default();
+            match rows.entry(row) {
+                Entry::Occupied(mut entry) => {
+                    let next = entry.get().saturating_add(weight);
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
                     }
-                    Entry::Vacant(entry) => {
-                        entry.insert(*weight);
-                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(weight);
                 }
             }
         }

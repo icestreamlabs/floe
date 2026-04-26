@@ -22,6 +22,8 @@ use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync>;
+type BatchRowEvaluator<V, K, D> =
+    Arc<dyn Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CountAggregateSlotKind {
@@ -107,7 +109,7 @@ where
 {
     pub state: RelationState<(K, GroupedCountState)>,
     pub table: Arc<dyn KeyValueTable>,
-    pub row_evaluator: RowEvaluator<V, K, D>,
+    pub row_evaluator: BatchRowEvaluator<V, K, D>,
     output: VersionedZSet<(K, Vec<i64>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     state_cache: Option<HashMap<K, GroupedCountState>>,
@@ -149,6 +151,32 @@ where
         state: RelationState<(K, GroupedCountState)>,
         table: Arc<dyn KeyValueTable>,
         row_evaluator: RowEvaluator<V, K, D>,
+        output: VersionedZSet<(K, Vec<i64>)>,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+        distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, D>>,
+    ) -> Self {
+        let batch_row_evaluator = Arc::new(move |delta_values: &[(V, i64)]| {
+            delta_values
+                .iter()
+                .filter_map(|(value, weight)| {
+                    (row_evaluator)(value).map(|row_update| (row_update, *weight))
+                })
+                .collect()
+        });
+        Self::new_batch(
+            state,
+            table,
+            batch_row_evaluator,
+            output,
+            slot_kinds,
+            distinct_index,
+        )
+    }
+
+    pub(crate) fn new_batch(
+        state: RelationState<(K, GroupedCountState)>,
+        table: Arc<dyn KeyValueTable>,
+        row_evaluator: BatchRowEvaluator<V, K, D>,
         output: VersionedZSet<(K, Vec<i64>)>,
         slot_kinds: Vec<CountAggregateSlotKind>,
         distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, D>>,
@@ -313,13 +341,16 @@ where
         let arity = self.slot_kinds.len();
         let mut grouped_deltas: HashMap<K, GroupedCountState> = HashMap::new();
         let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, D), i64> = HashMap::new();
-        for (value, weight) in coalesced {
+        let row_updates = (self.row_evaluator)(
+            &coalesced
+                .into_iter()
+                .filter(|(_, weight)| *weight != 0)
+                .collect::<Vec<_>>(),
+        );
+        for (row_update, weight) in row_updates {
             if weight == 0 {
                 continue;
             }
-            let Some(row_update) = (self.row_evaluator)(&value) else {
-                continue;
-            };
             if row_update.slots.len() != arity {
                 tracing::warn!(
                     expected = arity,

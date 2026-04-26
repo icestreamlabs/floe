@@ -135,6 +135,33 @@ impl OuterStreamWriter {
         Ok(())
     }
 
+    pub fn append_encoded_batch<I>(&mut self, deltas: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (Vec<u8>, Diff)>,
+    {
+        let mut staged = Vec::new();
+        let mut bytes = 0usize;
+        for (key, diff) in deltas {
+            if diff == 0 {
+                continue;
+            }
+            bytes = bytes.saturating_add(key.len() + std::mem::size_of::<i64>());
+            staged.push((key, diff));
+        }
+        if staged.is_empty() {
+            return Ok(0);
+        }
+
+        self.pending_transient_bytes = self.pending_transient_bytes.saturating_add(bytes);
+        if self.durable_enabled {
+            Arc::make_mut(&mut self.pending_transient_deltas).extend(staged.iter().cloned());
+            self.stream.add_deltas(staged);
+        } else {
+            Arc::make_mut(&mut self.pending_transient_deltas).extend(staged);
+        }
+        Ok(bytes)
+    }
+
     pub fn pending_transient_batch(&self, version: i64) -> Option<TransientSourceBatch> {
         if self.pending_transient_deltas.is_empty() && !self.has_transient_subscribers() {
             return None;

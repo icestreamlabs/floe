@@ -29,7 +29,8 @@ use crate::stream::util::{
     build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
-type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync>;
+type BatchRowEvaluator<V, K, D> =
+    Arc<dyn Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync>;
 
 pub struct DbspCountAggregate {
     stream: DeltaHandleStream,
@@ -41,7 +42,7 @@ where
     V: Clone + Eq + Hash,
     D: Clone + Eq + Hash,
 {
-    row_evaluator: RowEvaluator<V, K, D>,
+    row_evaluator: BatchRowEvaluator<V, K, D>,
     slot_kinds: Vec<CountAggregateSlotKind>,
     grouped_state: HashMap<K, GroupedCountState>,
     distinct_weights: HashMap<(DistinctGroupKey<K>, D), i64>,
@@ -117,6 +118,56 @@ impl DbspCountAggregate {
         D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
     {
+        Self::new_batch(
+            input,
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(value, weight)| row_evaluator(value).map(|row| (row, *weight)))
+                    .collect()
+            },
+            slot_kinds,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch<K, V, D, FRow>(
+        input: &DeltaHandleStream,
+        row_evaluator: FRow,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        D: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -150,10 +201,10 @@ impl DbspCountAggregate {
                 )
             });
 
-        let count_aggregate_op = Arc::new(AsyncMutex::new(CountAggregateOp::new(
+        let count_aggregate_op = Arc::new(AsyncMutex::new(CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(row_evaluator) as RowEvaluator<V, K, D>,
+            Arc::new(row_evaluator) as BatchRowEvaluator<V, K, D>,
             output,
             slot_kinds,
             distinct_index,
@@ -281,9 +332,28 @@ where
     where
         FRow: Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
     {
+        Self::new_batch(
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(value, weight)| row_evaluator(value).map(|row| (row, *weight)))
+                    .collect()
+            },
+            slot_kinds,
+        )
+        .await
+    }
+
+    pub async fn new_batch<FRow>(
+        row_evaluator: FRow,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+    ) -> anyhow::Result<Self>
+    where
+        FRow: Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync + 'static,
+    {
         Ok(Self {
             state: AsyncMutex::new(TransientCountAggregateState {
-                row_evaluator: Arc::new(row_evaluator) as RowEvaluator<V, K, D>,
+                row_evaluator: Arc::new(row_evaluator) as BatchRowEvaluator<V, K, D>,
                 slot_kinds,
                 grouped_state: HashMap::new(),
                 distinct_weights: HashMap::new(),
@@ -332,13 +402,16 @@ where
         let arity = self.slot_kinds.len();
         let mut grouped_deltas: HashMap<K, GroupedCountState> = HashMap::new();
         let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, D), i64> = HashMap::new();
-        for (value, weight) in coalesced {
+        let row_updates = (self.row_evaluator)(
+            &coalesced
+                .into_iter()
+                .filter(|(_, weight)| *weight != 0)
+                .collect::<Vec<_>>(),
+        );
+        for (row_update, weight) in row_updates {
             if weight == 0 {
                 continue;
             }
-            let Some(row_update) = (self.row_evaluator)(&value) else {
-                continue;
-            };
             if row_update.slots.len() != arity {
                 tracing::warn!(
                     expected = arity,

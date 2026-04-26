@@ -1187,22 +1187,30 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
 
             let decoded_rows_len = encoded_rows.len();
+            let mut encoded_batches_by_source = vec![Vec::new(); source_count];
+            for (source_id, encoded) in encoded_rows {
+                encoded_batches_by_source[source_id].push((encoded, 1));
+            }
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
-            for (source_id, encoded) in encoded_rows {
+            for (source_id, encoded_batch) in encoded_batches_by_source.into_iter().enumerate() {
+                if encoded_batch.is_empty() {
+                    continue;
+                }
                 let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(&source_name) else {
                     tracing::warn!(
                         source = %source_name,
-                        "no writer for source, skipping encoded row"
+                        rows = encoded_batch.len(),
+                        "no writer for source, skipping encoded row batch"
                     );
                     continue;
                 };
-                if let Err(err) = writer.append_encoded(encoded, 1) {
+                if let Err(err) = writer.append_encoded_batch(encoded_batch) {
                     tracing::error!(
                         source = %source_name,
                         error = %err,
-                        "failed to append encoded row"
+                        "failed to append encoded row batch"
                     );
                     continue;
                 }

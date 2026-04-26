@@ -25,6 +25,7 @@ use crate::stream::util::delta_zset_handle;
 
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
+type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
 pub(crate) static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -98,8 +99,7 @@ where
     pub state: RelationState<(WindowKey<K>, A)>,
     pub index: IndexedBatchZSet<WindowKey<K>, V>,
     pub table: Arc<dyn KeyValueTable>,
-    pub key_extractor: KeyExtractor<V, K>,
-    pub time_extractor: TimeExtractor<V>,
+    pub window_extractor: BatchWindowExtractor<V, K>,
     pub aggregator: Aggregator<K, V, A>,
     pub watermark: Arc<AtomicI64>,
     output: VersionedZSet<(WindowKey<K>, A)>,
@@ -154,6 +154,43 @@ where
         allowed_lateness_ms: i64,
         watermark: Arc<AtomicI64>,
     ) -> Result<Self> {
+        let window_extractor = Arc::new(move |delta_values: &[(V, i64)]| {
+            delta_values
+                .iter()
+                .filter_map(|(row, weight)| {
+                    let event_ts = time_extractor(row)?;
+                    let key = key_extractor(row)?;
+                    Some((row.clone(), *weight, key, event_ts))
+                })
+                .collect()
+        });
+        Self::new_with_batch_extractor(
+            state,
+            index,
+            table,
+            window_extractor,
+            aggregator,
+            output,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_batch_extractor(
+        state: RelationState<(WindowKey<K>, A)>,
+        index: IndexedBatchZSet<WindowKey<K>, V>,
+        table: Arc<dyn KeyValueTable>,
+        window_extractor: BatchWindowExtractor<V, K>,
+        aggregator: Aggregator<K, V, A>,
+        output: VersionedZSet<(WindowKey<K>, A)>,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+    ) -> Result<Self> {
         ensure!(window_size > 0, "window size must be positive");
         ensure!(window_slide > 0, "window slide must be positive");
         ensure!(
@@ -169,8 +206,7 @@ where
             state,
             index,
             table,
-            key_extractor,
-            time_extractor,
+            window_extractor,
             aggregator,
             watermark,
             output,
@@ -444,14 +480,14 @@ where
 
         let mut keyed_deltas: HashMap<WindowKey<K>, Vec<(V, i64)>> = HashMap::new();
         let mut dropped_too_late = 0_u64;
-        for (row, weight) in &delta_map {
-            if *weight == 0 {
+        let delta_rows = delta_map
+            .iter()
+            .map(|(row, weight)| (row.clone(), *weight))
+            .collect::<Vec<_>>();
+        for (row, weight, key, event_ts) in (self.window_extractor)(&delta_rows) {
+            if weight == 0 {
                 continue;
             }
-            let event_ts = match (self.time_extractor)(row) {
-                Some(ts) => ts,
-                None => continue,
-            };
             if event_ts < 0 {
                 continue;
             }
@@ -461,18 +497,16 @@ where
                 dropped_too_late = dropped_too_late.saturating_add(weight.unsigned_abs());
                 continue;
             }
-            if let Some(key) = (self.key_extractor)(row) {
-                for (window_start, window_end) in self.windows_for(event_ts) {
-                    let window_key = WindowKey {
-                        start: window_start,
-                        end: window_end,
-                        key: key.clone(),
-                    };
-                    keyed_deltas
-                        .entry(window_key)
-                        .or_default()
-                        .push((row.clone(), *weight));
-                }
+            for (window_start, window_end) in self.windows_for(event_ts) {
+                let window_key = WindowKey {
+                    start: window_start,
+                    end: window_end,
+                    key: key.clone(),
+                };
+                keyed_deltas
+                    .entry(window_key)
+                    .or_default()
+                    .push((row.clone(), weight));
             }
         }
         if dropped_too_late > 0 {

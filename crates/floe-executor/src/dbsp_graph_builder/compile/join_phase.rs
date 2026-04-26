@@ -8,6 +8,29 @@ use crate::encoding::{
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
+use std::collections::HashMap;
+
+fn project_encoded_delta_batch<K>(
+    delta_values: &[(K, i64)],
+    projector: impl Fn(&K) -> Vec<u8>,
+) -> Vec<(Vec<u8>, i64)> {
+    let mut projected = HashMap::<Vec<u8>, i64>::new();
+    for (key, weight) in delta_values {
+        if *weight == 0 {
+            continue;
+        }
+        let encoded = projector(key);
+        if encoded.is_empty() {
+            continue;
+        }
+        let entry = projected.entry(encoded.clone()).or_insert(0);
+        *entry += *weight;
+        if *entry == 0 {
+            projected.remove(&encoded);
+        }
+    }
+    projected.into_iter().collect()
+}
 
 impl DbspGraphBuilder {
     fn build_transient_join_precompute_transform(
@@ -615,9 +638,14 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let null_extended_left = DbspMap::new::<Vec<u8>, Vec<u8>, _>(
+            let null_extend_transform =
+                move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                    Ok(project_encoded_delta_batch(delta_values, &null_extend))
+                };
+
+            let null_extended_left = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
                 &antijoin.stream(),
-                null_extend,
+                null_extend_transform,
                 Some(null_extend_error_handler),
             )
             .await
@@ -723,9 +751,14 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let null_extended_right = DbspMap::new::<Vec<u8>, Vec<u8>, _>(
+            let null_extend_transform =
+                move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                    Ok(project_encoded_delta_batch(delta_values, &null_extend))
+                };
+
+            let null_extended_right = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
                 &antijoin.stream(),
-                null_extend,
+                null_extend_transform,
                 Some(null_extend_error_handler),
             )
             .await

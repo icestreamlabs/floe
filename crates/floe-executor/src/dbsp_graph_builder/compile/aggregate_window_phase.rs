@@ -10,6 +10,28 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 type ExpressionColumnMap = HashMap<String, usize>;
 
+fn project_encoded_delta_batch<K>(
+    delta_values: &[(K, i64)],
+    projector: impl Fn(&K) -> Vec<u8>,
+) -> Vec<(Vec<u8>, i64)> {
+    let mut projected = HashMap::<Vec<u8>, i64>::new();
+    for (key, weight) in delta_values {
+        if *weight == 0 {
+            continue;
+        }
+        let encoded = projector(key);
+        if encoded.is_empty() {
+            continue;
+        }
+        let entry = projected.entry(encoded.clone()).or_insert(0);
+        *entry += *weight;
+        if *entry == 0 {
+            projected.remove(&encoded);
+        }
+    }
+    projected.into_iter().collect()
+}
+
 #[derive(Clone)]
 struct CountEvalLayout {
     filters: Vec<dbsp::DbspExpression>,
@@ -106,7 +128,7 @@ impl DbspGraphBuilder {
             .all(|agg| agg.function() == &DbspAggregateFunction::Count)
         {
             let slot_kinds = build_count_aggregate_slot_kinds(&aggregates);
-            let row_evaluator = build_count_row_evaluator(
+            let row_evaluator = build_count_batch_row_evaluator(
                 Arc::clone(&eval_schema),
                 group_keys.clone(),
                 aggregates.clone(),
@@ -115,7 +137,7 @@ impl DbspGraphBuilder {
                 "aggregate",
             );
 
-            let count_aggregate = DbspCountAggregate::new::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
+            let count_aggregate = DbspCountAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
                 &upstream,
                 row_evaluator,
                 slot_kinds,
@@ -132,11 +154,11 @@ impl DbspGraphBuilder {
                     "aggregate-project",
                 )
                 .await?;
-            return Ok(mapped.stream());
+            return Ok(mapped);
         }
 
         if let Some(slot_kinds) = build_incremental_aggregate_slot_kinds(&aggregates) {
-            let row_evaluator = build_incremental_aggregate_row_evaluator(
+            let row_evaluator = build_incremental_aggregate_batch_row_evaluator(
                 Arc::clone(&eval_schema),
                 group_keys.clone(),
                 aggregates.clone(),
@@ -145,14 +167,15 @@ impl DbspGraphBuilder {
                 "aggregate",
             );
 
-            let incremental_aggregate = dbsp::DbspIncrementalAggregate::new::<Vec<u8>, Vec<u8>, _>(
-                &upstream,
-                row_evaluator,
-                slot_kinds,
-                Some(aggregate_error_handler),
-            )
-            .await
-            .context("initialize DBSP incremental aggregate")?;
+            let incremental_aggregate =
+                dbsp::DbspIncrementalAggregate::new_batch::<Vec<u8>, Vec<u8>, _>(
+                    &upstream,
+                    row_evaluator,
+                    slot_kinds,
+                    Some(aggregate_error_handler),
+                )
+                .await
+                .context("initialize DBSP incremental aggregate")?;
 
             let mapped = self
                 .map_incremental_aggregate_output(
@@ -162,7 +185,7 @@ impl DbspGraphBuilder {
                     "aggregate-project",
                 )
                 .await?;
-            return Ok(mapped.stream());
+            return Ok(mapped);
         }
 
         let key_columns = Arc::clone(&direct_group_key_columns);
@@ -234,7 +257,7 @@ impl DbspGraphBuilder {
             )
             .await?;
 
-        Ok(mapped.stream())
+        Ok(mapped)
     }
 
     pub(crate) async fn compile_window_aggregate(
@@ -349,7 +372,7 @@ impl DbspGraphBuilder {
                     "window-aggregate-project",
                 )
                 .await?;
-            return Ok(mapped.stream());
+            return Ok(mapped);
         }
 
         if aggregates
@@ -419,7 +442,7 @@ impl DbspGraphBuilder {
                     "window-aggregate-project",
                 )
                 .await?;
-            return Ok(mapped.stream());
+            return Ok(mapped);
         }
 
         let key_columns = Arc::clone(&direct_group_key_columns);
@@ -545,9 +568,14 @@ impl DbspGraphBuilder {
             }
         };
 
-        let mapped = DbspMap::new::<(WindowKey<Vec<u8>>, Vec<u8>), Vec<u8>, _>(
+        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, Vec<u8>), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, Vec<u8>), Vec<u8>, _>(
             &window_aggregate.stream(),
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
@@ -618,7 +646,7 @@ impl DbspGraphBuilder {
         aggregate_stream: &DeltaHandleStream,
         task_events: &GraphTaskSender,
         label_prefix: &str,
-    ) -> Result<DbspMap> {
+    ) -> Result<DeltaHandleStream> {
         let project_events = task_events.clone();
         let project_label = format!("{label_prefix}:{graph_id}");
         let project_graph_id = graph_id.to_string();
@@ -645,13 +673,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        DbspMap::new::<(Vec<u8>, Vec<u8>), Vec<u8>, _>(
+        let transform = move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<u8>), Vec<u8>, _>(
             aggregate_stream,
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
-        .context("initialize aggregate output map")
+        .context("initialize aggregate output map")?;
+        Ok(mapped.stream())
     }
 
     async fn map_count_aggregate_output(
@@ -660,7 +694,7 @@ impl DbspGraphBuilder {
         aggregate_stream: &DeltaHandleStream,
         task_events: &GraphTaskSender,
         label_prefix: &str,
-    ) -> Result<DbspMap> {
+    ) -> Result<DeltaHandleStream> {
         let project_events = task_events.clone();
         let project_label = format!("{label_prefix}:{graph_id}");
         let project_graph_id = graph_id.to_string();
@@ -698,13 +732,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        DbspMap::new::<(Vec<u8>, Vec<i64>), Vec<u8>, _>(
+        let transform = move |delta_values: &[((Vec<u8>, Vec<i64>), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<i64>), Vec<u8>, _>(
             aggregate_stream,
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
-        .context("initialize count aggregate output map")
+        .context("initialize count aggregate output map")?;
+        Ok(mapped.stream())
     }
 
     async fn map_window_count_aggregate_output(
@@ -713,7 +753,7 @@ impl DbspGraphBuilder {
         aggregate_stream: &DeltaHandleStream,
         task_events: &GraphTaskSender,
         label_prefix: &str,
-    ) -> Result<DbspMap> {
+    ) -> Result<DeltaHandleStream> {
         let project_events = task_events.clone();
         let project_label = format!("{label_prefix}:{graph_id}");
         let project_graph_id = graph_id.to_string();
@@ -773,13 +813,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        DbspMap::new::<(WindowKey<Vec<u8>>, Vec<i64>), Vec<u8>, _>(
+        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, Vec<i64>), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, Vec<i64>), Vec<u8>, _>(
             aggregate_stream,
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
-        .context("initialize window count aggregate output map")
+        .context("initialize window count aggregate output map")?;
+        Ok(mapped.stream())
     }
 
     async fn map_window_count_star_aggregate_output(
@@ -788,7 +834,7 @@ impl DbspGraphBuilder {
         aggregate_stream: &DeltaHandleStream,
         task_events: &GraphTaskSender,
         label_prefix: &str,
-    ) -> Result<DbspMap> {
+    ) -> Result<DeltaHandleStream> {
         let project_events = task_events.clone();
         let project_label = format!("{label_prefix}:{graph_id}");
         let project_graph_id = graph_id.to_string();
@@ -848,13 +894,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        DbspMap::new::<(WindowKey<Vec<u8>>, i64), Vec<u8>, _>(
+        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, i64), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, i64), Vec<u8>, _>(
             aggregate_stream,
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
-        .context("initialize window count-star aggregate output map")
+        .context("initialize window count-star aggregate output map")?;
+        Ok(mapped.stream())
     }
 
     async fn map_incremental_aggregate_output(
@@ -863,7 +915,7 @@ impl DbspGraphBuilder {
         aggregate_stream: &DeltaHandleStream,
         task_events: &GraphTaskSender,
         label_prefix: &str,
-    ) -> Result<DbspMap> {
+    ) -> Result<DeltaHandleStream> {
         let project_events = task_events.clone();
         let project_label = format!("{label_prefix}:{graph_id}");
         let project_graph_id = graph_id.to_string();
@@ -901,13 +953,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        DbspMap::new::<(Vec<u8>, Vec<dbsp::AggregateValue>), Vec<u8>, _>(
+        let transform = move |delta_values: &[((Vec<u8>, Vec<dbsp::AggregateValue>), i64)]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<dbsp::AggregateValue>), Vec<u8>, _>(
             aggregate_stream,
-            projector,
+            transform,
             Some(project_error_handler),
         )
         .await
-        .context("initialize incremental aggregate output map")
+        .context("initialize incremental aggregate output map")?;
+        Ok(mapped.stream())
     }
 }
 
@@ -1027,6 +1085,33 @@ pub(crate) fn build_count_row_evaluator(
             key: encoded_key,
             slots: counts,
         })
+    }
+}
+
+pub(crate) fn build_count_batch_row_evaluator(
+    input_schema: Arc<RowSchema>,
+    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
+    aggregates: Vec<DbspAggregateExpr>,
+    expression_columns: Arc<ExpressionColumnMap>,
+    graph_id: String,
+    context: &'static str,
+) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<(dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>, i64)>
++ Send
++ Sync
++ 'static {
+    let row_evaluator = build_count_row_evaluator(
+        input_schema,
+        group_keys,
+        aggregates,
+        expression_columns,
+        graph_id,
+        context,
+    );
+    move |delta_values: &[(Vec<u8>, i64)]| {
+        delta_values
+            .iter()
+            .filter_map(|(bytes, weight)| row_evaluator(bytes).map(|row| (row, *weight)))
+            .collect()
     }
 }
 
@@ -1550,6 +1635,35 @@ pub(crate) fn build_incremental_aggregate_row_evaluator(
             key: encoded_key,
             slots,
         })
+    }
+}
+
+pub(crate) fn build_incremental_aggregate_batch_row_evaluator(
+    input_schema: Arc<RowSchema>,
+    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
+    aggregates: Vec<DbspAggregateExpr>,
+    expression_columns: Arc<ExpressionColumnMap>,
+    graph_id: String,
+    context: &'static str,
+) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<(Vec<u8>, dbsp::IncrementalAggregateRow<Vec<u8>>, i64)>
++ Send
++ Sync
++ 'static {
+    let row_evaluator = build_incremental_aggregate_row_evaluator(
+        input_schema,
+        group_keys,
+        aggregates,
+        expression_columns,
+        graph_id,
+        context,
+    );
+    move |delta_values: &[(Vec<u8>, i64)]| {
+        delta_values
+            .iter()
+            .filter_map(|(bytes, weight)| {
+                row_evaluator(bytes).map(|row| (bytes.clone(), row, *weight))
+            })
+            .collect()
     }
 }
 

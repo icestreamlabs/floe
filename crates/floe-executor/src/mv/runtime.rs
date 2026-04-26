@@ -68,7 +68,7 @@ impl MaterializedView for MaterializedViewHandle {
             )
         })?;
         if let Some((base_version, _target_version, overlay)) =
-            self.encoded_overlay_batches(Some(version_u64))
+            self.encoded_overlay_merged_delta(Some(version_u64))
         {
             let mut snapshot = if let Some(state) = self.dbsp_state() {
                 if let Some(base_dbsp_version) = resolve_dbsp_version(self, &state, base_version) {
@@ -80,9 +80,6 @@ impl MaterializedView for MaterializedViewHandle {
                 HashMap::new()
             };
             for (key, diff) in overlay {
-                if diff == 0 {
-                    continue;
-                }
                 let previous = snapshot.get(&key).copied().unwrap_or(0);
                 let next = previous.saturating_add(diff);
                 if next <= 0 {

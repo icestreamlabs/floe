@@ -6,20 +6,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
-    new_null_array,
+    Array, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Column, DFSchema};
-use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
-use datafusion::physical_expr::PhysicalExpr;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
 
 use crate::encoding::{EncodedRowScalar, extract_encoded_row_i64_like_column};
-use crate::scalar_array_builder::ScalarColumnBuilder;
 
 #[derive(Clone)]
 pub(crate) struct VectorizedFilterProjectEvaluator {
@@ -35,7 +30,6 @@ pub(crate) struct VectorizedFilterProjectEvaluator {
 #[derive(Clone)]
 enum PredicatePlan {
     Compiled(Arc<CompiledExpr>),
-    Physical(Arc<dyn PhysicalExpr>),
 }
 
 #[derive(Clone)]
@@ -122,7 +116,6 @@ impl VectorizedFilterProjectEvaluator {
         let input_schema = input_schema.to_arrow_schema();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized filter_map")?;
-        let ctx = SessionContext::new();
         let predicate = if let Some(compiled) = CompiledExpr::try_compile(
             predicate.expression().expr(),
             &df_schema,
@@ -130,10 +123,10 @@ impl VectorizedFilterProjectEvaluator {
         )? {
             PredicatePlan::Compiled(Arc::new(compiled))
         } else {
-            PredicatePlan::Physical(
-                ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-                    .context("compile vectorized predicate expression")?,
-            )
+            return Err(anyhow!(
+                "unsupported vectorized filter_map predicate expression: {:?}",
+                predicate.expression().expr()
+            ));
         };
         let projection_plan = if let Some(indices) = column_projection {
             ProjectionPlan::column_indices(indices, input_schema.fields().len())
@@ -150,14 +143,13 @@ impl VectorizedFilterProjectEvaluator {
         {
             ProjectionPlan::Compiled(Arc::new(compiled))
         } else {
-            let projections = projections
-                .iter()
-                .map(|expr| {
-                    ctx.create_physical_expr(expr.expression().expr().clone(), &df_schema)
-                        .context("compile vectorized projection expression")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            ProjectionPlan::Physical(Arc::new(projections))
+            return Err(anyhow!(
+                "unsupported vectorized filter_map projection expression(s): {:?}",
+                projections
+                    .iter()
+                    .map(|expr| expr.expression().expr())
+                    .collect::<Vec<_>>()
+            ));
         };
         let encoded_predicate = build_encoded_predicate(Some(&predicate), input_schema.as_ref());
         let encoded_fast_path =
@@ -187,7 +179,6 @@ impl VectorizedFilterProjectEvaluator {
         let input_width = input_schema.fields().len();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized filter")?;
-        let ctx = SessionContext::new();
         let predicate = if let Some(compiled) = CompiledExpr::try_compile(
             predicate.expression().expr(),
             &df_schema,
@@ -195,10 +186,10 @@ impl VectorizedFilterProjectEvaluator {
         )? {
             PredicatePlan::Compiled(Arc::new(compiled))
         } else {
-            PredicatePlan::Physical(
-                ctx.create_physical_expr(predicate.expression().expr().clone(), &df_schema)
-                    .context("compile vectorized filter predicate expression")?,
-            )
+            return Err(anyhow!(
+                "unsupported vectorized filter predicate expression: {:?}",
+                predicate.expression().expr()
+            ));
         };
         let projection_plan = ProjectionPlan::column_indices(projections, input_width);
         let encoded_predicate = build_encoded_predicate(Some(&predicate), input_schema.as_ref());
@@ -232,7 +223,6 @@ impl VectorizedFilterProjectEvaluator {
         let input_schema = input_schema.to_arrow_schema();
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone())
             .context("build DataFusion schema for vectorized map")?;
-        let ctx = SessionContext::new();
         let projection_plan = if let Some(indices) = column_projection {
             ProjectionPlan::column_indices(indices, input_schema.fields().len())
         } else if let Some(compiled) = projections
@@ -248,14 +238,13 @@ impl VectorizedFilterProjectEvaluator {
         {
             ProjectionPlan::Compiled(Arc::new(compiled))
         } else {
-            let projections = projections
-                .iter()
-                .map(|expr| {
-                    ctx.create_physical_expr(expr.expression().expr().clone(), &df_schema)
-                        .context("compile vectorized map projection expression")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            ProjectionPlan::Physical(Arc::new(projections))
+            return Err(anyhow!(
+                "unsupported vectorized map projection expression(s): {:?}",
+                projections
+                    .iter()
+                    .map(|expr| expr.expression().expr())
+                    .collect::<Vec<_>>()
+            ));
         };
         Ok(Self {
             input_schema,
@@ -300,7 +289,6 @@ impl VectorizedFilterProjectEvaluator {
                     graph_id,
                     delta_values,
                     &self.predicate_input_layout,
-                    self.predicate_requires_physical_batch(),
                     self.predicate_requires_compiled_batch(),
                     false,
                 )?;
@@ -338,11 +326,10 @@ impl VectorizedFilterProjectEvaluator {
             return Ok(Vec::new());
         }
 
-        let mut prepared = self.prepare_input_with_layout(
+        let prepared = self.prepare_input_with_layout(
             graph_id,
             selected_input.as_slice(),
             &self.projection_input_layout,
-            self.projection_plan.requires_physical_batch(),
             self.projection_plan.requires_compiled_batch(),
             self.projection_plan
                 .needs_projection_ranges(self.input_schema.fields().len()),
@@ -394,35 +381,6 @@ impl VectorizedFilterProjectEvaluator {
                 }
                 consolidate_encoded_delta_batch(staged)
             }
-            ProjectionPlan::Physical(projections) => {
-                let batch = prepared.batch.take().ok_or_else(|| {
-                    anyhow!("vectorized projection batch was unexpectedly missing")
-                })?;
-                let projection_arrays = projections
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, expr)| {
-                        expr.evaluate(&batch)
-                            .with_context(|| {
-                                format!("evaluate vectorized projection column {idx}")
-                            })?
-                            .into_array(batch.num_rows())
-                            .with_context(|| {
-                                format!("materialize vectorized projection column {idx}")
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let mut staged = Vec::with_capacity(prepared.encoded_rows.len());
-                for idx in 0..prepared.encoded_rows.len() {
-                    let diff = prepared.weights.get(idx).copied().unwrap_or(0);
-                    if diff == 0 {
-                        continue;
-                    }
-                    let encoded = encode_physical_projection_row(&projection_arrays, idx)?;
-                    staged.push((encoded, diff));
-                }
-                consolidate_encoded_delta_batch(staged)
-            }
         }
     }
 
@@ -431,12 +389,9 @@ impl VectorizedFilterProjectEvaluator {
         graph_id: &str,
         delta_values: &[(Vec<u8>, i64)],
         layout: &DecodedInputLayout,
-        needs_physical_batch: bool,
         needs_compiled_batch: bool,
         capture_projection_ranges: bool,
     ) -> Result<PreparedEncodedInput> {
-        let mut decoded_columns = needs_physical_batch
-            .then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
         let mut compiled_columns = needs_compiled_batch
             .then(|| vec![Vec::with_capacity(delta_values.len()); layout.count]);
         let mut encoded_rows = Vec::with_capacity(delta_values.len());
@@ -451,17 +406,9 @@ impl VectorizedFilterProjectEvaluator {
                 encoded,
                 layout,
                 capture_projection_ranges,
-                needs_physical_batch,
                 needs_compiled_batch,
             ) {
                 Ok(decoded) => {
-                    if let (Some(all_columns), Some(row_values)) =
-                        (decoded_columns.as_mut(), decoded.decoded_values)
-                    {
-                        for (slot, value) in row_values.into_iter().enumerate() {
-                            all_columns[slot].push(value);
-                        }
-                    }
                     if let (Some(all_columns), Some(row_values)) =
                         (compiled_columns.as_mut(), decoded.compiled_values)
                     {
@@ -486,16 +433,6 @@ impl VectorizedFilterProjectEvaluator {
                 }
             }
         }
-        let batch = if needs_physical_batch && !encoded_rows.is_empty() {
-            Some(build_sparse_input_batch(
-                &self.input_schema,
-                layout.slots.as_ref(),
-                decoded_columns.unwrap_or_default(),
-                encoded_rows.len(),
-            )?)
-        } else {
-            None
-        };
         let compiled_batch = if needs_compiled_batch && !encoded_rows.is_empty() {
             Some(build_compiled_input_batch(
                 self.input_schema.fields().len(),
@@ -507,7 +444,6 @@ impl VectorizedFilterProjectEvaluator {
             None
         };
         Ok(PreparedEncodedInput {
-            batch,
             compiled_batch,
             encoded_rows,
             weights,
@@ -520,7 +456,6 @@ impl VectorizedFilterProjectEvaluator {
         encoded: &[u8],
         layout: &DecodedInputLayout,
         capture_projection_ranges: bool,
-        decode_scalar_values: bool,
         decode_compiled_values: bool,
     ) -> Result<DecodedEncodedRow> {
         if encoded.len() < 4 {
@@ -534,7 +469,6 @@ impl VectorizedFilterProjectEvaluator {
             ));
         }
         let mut cursor = 4usize;
-        let mut decoded_values = decode_scalar_values.then(|| vec![None; layout.count]);
         let mut compiled_values = decode_compiled_values.then(|| {
             layout
                 .value_types
@@ -553,7 +487,7 @@ impl VectorizedFilterProjectEvaluator {
             let start = cursor;
             let end = encoded_field_end(encoded, start)?;
             if let Some(slot) = layout.slots[input_idx] {
-                let decoded_scalar = if decoded_values.is_some() || compiled_values.is_some() {
+                let decoded_scalar = if compiled_values.is_some() {
                     Some(decode_encoded_field_as_encoded_scalar(
                         &encoded[start..end],
                         layout.value_types[slot],
@@ -561,9 +495,6 @@ impl VectorizedFilterProjectEvaluator {
                 } else {
                     None
                 };
-                if let Some(values) = decoded_values.as_mut() {
-                    values[slot] = decoded_scalar.clone().flatten();
-                }
                 if let Some(values) = compiled_values.as_mut() {
                     values[slot] = compiled_value_from_encoded_scalar(
                         decoded_scalar.as_ref().and_then(Option::as_ref),
@@ -591,7 +522,6 @@ impl VectorizedFilterProjectEvaluator {
             ));
         }
         Ok(DecodedEncodedRow {
-            decoded_values,
             compiled_values,
             projected_ranges,
         })
@@ -599,12 +529,8 @@ impl VectorizedFilterProjectEvaluator {
 
     fn selected_indices(&self, prepared: &PreparedEncodedInput) -> Result<Vec<usize>> {
         let mut selected = Vec::with_capacity(prepared.encoded_rows.len());
-        match (
-            &self.predicate,
-            prepared.compiled_batch.as_ref(),
-            prepared.batch.as_ref(),
-        ) {
-            (Some(PredicatePlan::Compiled(predicate)), Some(batch), _) => {
+        match (&self.predicate, prepared.compiled_batch.as_ref()) {
+            (Some(PredicatePlan::Compiled(predicate)), Some(batch)) => {
                 let predicate = predicate
                     .evaluate(batch)
                     .context("evaluate compiled filter_map predicate")?;
@@ -614,39 +540,16 @@ impl VectorizedFilterProjectEvaluator {
                     }
                 }
             }
-            (Some(PredicatePlan::Physical(predicate)), _, Some(batch)) => {
-                let predicate = predicate
-                    .evaluate(batch)
-                    .context("evaluate vectorized filter_map predicate")?
-                    .into_array(batch.num_rows())
-                    .context("materialize vectorized predicate result")?;
-                let bool_array = predicate
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| anyhow!("vectorized predicate did not evaluate to boolean"))?;
-                for idx in 0..bool_array.len() {
-                    if bool_array.is_valid(idx) && bool_array.value(idx) {
-                        selected.push(idx);
-                    }
-                }
-            }
-            (None, _, _) => {
+            (None, _) => {
                 for idx in 0..prepared.encoded_rows.len() {
                     selected.push(idx);
                 }
             }
-            (Some(PredicatePlan::Compiled(_)), None, _) => {
+            (Some(PredicatePlan::Compiled(_)), None) => {
                 return Err(anyhow!("compiled predicate batch was unexpectedly missing"));
-            }
-            (Some(PredicatePlan::Physical(_)), _, None) => {
-                return Err(anyhow!("physical predicate batch was unexpectedly missing"));
             }
         }
         Ok(selected)
-    }
-
-    fn predicate_requires_physical_batch(&self) -> bool {
-        matches!(self.predicate, Some(PredicatePlan::Physical(_)))
     }
 
     fn predicate_requires_compiled_batch(&self) -> bool {
@@ -661,7 +564,6 @@ enum ProjectionPlan {
         output_positions_by_input: Arc<Vec<Vec<usize>>>,
     },
     Compiled(Arc<Vec<CompiledExpr>>),
-    Physical(Arc<Vec<Arc<dyn PhysicalExpr>>>),
 }
 
 impl ProjectionPlan {
@@ -683,7 +585,6 @@ impl ProjectionPlan {
                     && indices.iter().enumerate().all(|(idx, col)| idx == *col)
             }
             Self::Compiled(_) => false,
-            Self::Physical(_) => false,
         }
     }
 
@@ -691,7 +592,6 @@ impl ProjectionPlan {
         match self {
             Self::ColumnIndices { indices, .. } => indices.len(),
             Self::Compiled(projections) => projections.len(),
-            Self::Physical(projections) => projections.len(),
         }
     }
 
@@ -701,16 +601,12 @@ impl ProjectionPlan {
                 output_positions_by_input,
                 ..
             } => Some(output_positions_by_input.as_ref()),
-            Self::Compiled(_) | Self::Physical(_) => None,
+            Self::Compiled(_) => None,
         }
     }
 
     fn needs_projection_ranges(&self, input_width: usize) -> bool {
         matches!(self, Self::ColumnIndices { .. }) && !self.is_identity(input_width)
-    }
-
-    fn requires_physical_batch(&self) -> bool {
-        matches!(self, Self::Physical(_))
     }
 
     fn requires_compiled_batch(&self) -> bool {
@@ -723,9 +619,7 @@ fn build_encoded_fast_path(
     projection_plan: &ProjectionPlan,
     input_schema: &datafusion::arrow::datatypes::Schema,
 ) -> Option<EncodedFilterProjectFastPath> {
-    let PredicatePlan::Compiled(predicate) = predicate? else {
-        return None;
-    };
+    let PredicatePlan::Compiled(predicate) = predicate?;
     let ProjectionPlan::ColumnIndices {
         indices,
         output_positions_by_input,
@@ -748,9 +642,7 @@ fn build_encoded_predicate(
     predicate: Option<&PredicatePlan>,
     input_schema: &datafusion::arrow::datatypes::Schema,
 ) -> Option<EncodedPredicatePlan> {
-    let PredicatePlan::Compiled(predicate) = predicate? else {
-        return None;
-    };
+    let PredicatePlan::Compiled(predicate) = predicate?;
     EncodedPredicatePlan::try_from_compiled(predicate.as_ref(), input_schema)
 }
 
@@ -2300,49 +2192,6 @@ fn build_selected_delta_values(
     rows
 }
 
-fn build_sparse_input_batch(
-    schema: &datafusion::arrow::datatypes::SchemaRef,
-    decoded_input_slots: &[Option<usize>],
-    mut decoded_columns: Vec<Vec<Option<EncodedRowScalar>>>,
-    row_count: usize,
-) -> Result<RecordBatch> {
-    let batch_schema = if decoded_input_slots.iter().any(Option::is_none) {
-        Arc::new(datafusion::arrow::datatypes::Schema::new(
-            schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone().with_nullable(true))
-                .collect::<Vec<_>>(),
-        ))
-    } else {
-        Arc::clone(schema)
-    };
-
-    let arrays: Vec<ArrayRef> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| {
-            if let Some(slot) = decoded_input_slots[idx] {
-                let mut builder = ScalarColumnBuilder::new(field.data_type(), row_count)
-                    .with_context(|| format!("initialize vectorized input column builder {idx}"))?;
-                for value in std::mem::take(&mut decoded_columns[slot]) {
-                    builder
-                        .append_encoded_scalar(value.as_ref())
-                        .with_context(|| {
-                            format!("append value into vectorized input column {idx}")
-                        })?;
-                }
-                Ok::<ArrayRef, anyhow::Error>(builder.finish_array())
-                    .with_context(|| format!("build vectorized input column {idx}"))
-            } else {
-                Ok::<ArrayRef, anyhow::Error>(new_null_array(field.data_type(), row_count))
-            }
-        })
-        .collect::<Result<_>>()?;
-    RecordBatch::try_new(batch_schema, arrays).context("build vectorized input batch")
-}
-
 fn build_compiled_input_batch(
     input_width: usize,
     decoded_input_slots: &[Option<usize>],
@@ -2485,7 +2334,6 @@ fn project_encoded_row(encoded: &[u8], ranges: &[Range<usize>], width: usize) ->
 }
 
 struct PreparedEncodedInput {
-    batch: Option<RecordBatch>,
     compiled_batch: Option<CompiledInputBatch>,
     encoded_rows: Vec<Vec<u8>>,
     weights: Vec<i64>,
@@ -2493,7 +2341,6 @@ struct PreparedEncodedInput {
 }
 
 struct DecodedEncodedRow {
-    decoded_values: Option<Vec<Option<EncodedRowScalar>>>,
     compiled_values: Option<Vec<CompiledValue>>,
     projected_ranges: Option<Vec<Range<usize>>>,
 }
@@ -2537,90 +2384,6 @@ fn encode_compiled_value(value: &CompiledValue, encoded: &mut Vec<u8>) -> Result
             encoded.push(if *flag { 1 } else { 0 });
         }
         CompiledValue::Bool(None) => encoded.push(0x08),
-    }
-    Ok(())
-}
-
-fn encode_physical_projection_row(columns: &[ArrayRef], row_idx: usize) -> Result<Vec<u8>> {
-    let count = u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
-    let mut encoded = Vec::with_capacity(4 + (columns.len() * 9));
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for column in columns {
-        encode_array_scalar_value(column, row_idx, &mut encoded)?;
-    }
-    Ok(encoded)
-}
-
-fn encode_array_scalar_value(
-    column: &ArrayRef,
-    row_idx: usize,
-    encoded: &mut Vec<u8>,
-) -> Result<()> {
-    if row_idx >= column.len() {
-        return Err(anyhow!("projection row index {row_idx} was out of bounds"));
-    }
-    if column.is_null(row_idx) {
-        match column.data_type() {
-            DataType::Int64 => encoded.push(0x05),
-            DataType::Utf8 => encoded.push(0x06),
-            DataType::Timestamp(TimeUnit::Millisecond, _) => encoded.push(0x07),
-            DataType::Boolean => encoded.push(0x08),
-            DataType::Null => encoded.push(0x00),
-            other => {
-                return Err(anyhow!(
-                    "unsupported projection type in vectorized physical encoder: {other:?}"
-                ));
-            }
-        }
-        return Ok(());
-    }
-
-    match column.data_type() {
-        DataType::Int64 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow!("expected Int64 projection array"))?;
-            encoded.push(0x01);
-            encoded.extend_from_slice(&array.value(row_idx).to_le_bytes());
-        }
-        DataType::Utf8 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("expected Utf8 projection array"))?;
-            let text = array.value(row_idx);
-            let bytes = text.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
-            encoded.push(0x02);
-            encoded.extend_from_slice(&len.to_le_bytes());
-            encoded.extend_from_slice(bytes);
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let array = column
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| anyhow!("expected timestamp(ms) projection array"))?;
-            encoded.push(0x03);
-            encoded.extend_from_slice(&array.value(row_idx).to_le_bytes());
-        }
-        DataType::Boolean => {
-            let array = column
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| anyhow!("expected boolean projection array"))?;
-            encoded.push(0x04);
-            encoded.push(if array.value(row_idx) { 1 } else { 0 });
-        }
-        DataType::Null => {
-            encoded.push(0x00);
-        }
-        other => {
-            return Err(anyhow!(
-                "unsupported projection type in vectorized physical encoder: {other:?}"
-            ));
-        }
     }
     Ok(())
 }
@@ -2943,9 +2706,6 @@ mod tests {
 #[cfg(test)]
 mod helper_tests {
     use super::*;
-    use datafusion::arrow::array::{
-        BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
-    };
     use datafusion::arrow::datatypes::{DataType, Field as ArrowField, Schema};
     use dbsp::circuit::schema::Field as DbspField;
     use dbsp::circuit::types::DbspScalarType;
@@ -3111,7 +2871,7 @@ mod helper_tests {
     }
 
     #[test]
-    fn layout_and_sparse_batch_helpers_cover_sparse_decode() {
+    fn layout_and_compiled_batch_helpers_cover_sparse_decode() {
         let schema = dbsp_schema();
         let required = vec![3usize, 0usize];
         let slots = build_decoded_input_slots(schema.len(), &required);
@@ -3124,49 +2884,37 @@ mod helper_tests {
             &[CompiledValueType::Bool, CompiledValueType::Int64]
         );
 
-        let batch = build_sparse_input_batch(
-            &schema.to_arrow_schema(),
+        let batch = build_compiled_input_batch(
+            schema.len(),
             &slots,
             vec![
-                vec![Some(EncodedRowScalar::Bool(true)), None],
+                vec![CompiledValue::Bool(Some(true)), CompiledValue::Bool(None)],
                 vec![
-                    Some(EncodedRowScalar::Int64(10)),
-                    Some(EncodedRowScalar::Int64(20)),
+                    CompiledValue::Int64(Some(10)),
+                    CompiledValue::Int64(Some(20)),
                 ],
             ],
             2,
-        )
-        .expect("build sparse batch");
+        );
 
-        let col_a = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("a int64");
-        assert_eq!(col_a.value(0), 10);
-        assert_eq!(col_a.value(1), 20);
-
-        let col_b = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("b utf8 nulls");
-        assert!(col_b.is_null(0));
-        assert!(col_b.is_null(1));
-
-        let col_d = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("d bool");
-        assert_eq!(col_d.value(0), true);
-        assert!(col_d.is_null(1));
+        assert_eq!(
+            batch.column(0).expect("a column").as_ref(),
+            &[
+                CompiledValue::Int64(Some(10)),
+                CompiledValue::Int64(Some(20)),
+            ]
+        );
+        assert!(batch.column(1).is_err());
+        assert_eq!(
+            batch.column(3).expect("d column").as_ref(),
+            &[CompiledValue::Bool(Some(true)), CompiledValue::Bool(None)]
+        );
 
         assert!(build_decoded_input_value_types(schema.as_ref(), &[99]).is_err());
     }
 
     #[test]
-    fn compiled_and_physical_projection_encoders_round_trip() {
+    fn compiled_projection_encoder_round_trip() {
         assert_eq!(
             compiled_value_from_encoded_scalar(
                 Some(&EncodedRowScalar::Int64(3)),
@@ -3219,29 +2967,6 @@ mod helper_tests {
                 .expect("decode compiled row 1"),
             vec![None, None, None, None]
         );
-
-        let physical_columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(vec![Some(5_i64)])),
-            Arc::new(StringArray::from(vec![Some("p")])),
-            Arc::new(TimestampMillisecondArray::from(vec![Some(123_i64)])),
-            Arc::new(BooleanArray::from(vec![Some(false)])),
-        ];
-        let physical_row =
-            encode_physical_projection_row(&physical_columns, 0).expect("physical row");
-        assert_eq!(
-            crate::encoding::extract_encoded_row_scalars(&physical_row, &[0, 1, 2, 3])
-                .expect("decode physical row"),
-            vec![
-                Some(EncodedRowScalar::Int64(5)),
-                Some(EncodedRowScalar::Utf8("p".to_string())),
-                Some(EncodedRowScalar::TimestampMillis(123)),
-                Some(EncodedRowScalar::Bool(false)),
-            ]
-        );
-
-        let mut encoded = Vec::new();
-        let unsupported: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0_f64)]));
-        assert!(encode_array_scalar_value(&unsupported, 0, &mut encoded).is_err());
     }
 
     #[test]
@@ -3250,7 +2975,6 @@ mod helper_tests {
         let row_b = encode_row(&[Some(EncodedRowScalar::Int64(2))]);
 
         let prepared = PreparedEncodedInput {
-            batch: None,
             compiled_batch: None,
             encoded_rows: vec![row_a.clone(), row_b.clone()],
             weights: vec![0, 3],

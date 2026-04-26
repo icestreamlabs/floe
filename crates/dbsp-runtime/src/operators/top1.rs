@@ -21,6 +21,8 @@ use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
 type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
+type BatchKeyPartsFn<K, P, O> =
+    Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
 
 /// Partition-local top-1 operator used for ROW_NUMBER() <= 1 style queries.
 ///
@@ -57,7 +59,7 @@ where
     partition_output_cache: BTreeMap<P, K>,
     partition_order_index: BTreeMap<P, BTreeMap<(O, K), i64>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
-    key_parts: KeyPartsFn<K, P, O>,
+    key_parts: BatchKeyPartsFn<K, P, O>,
 }
 
 impl<K, P, O> PartitionedTop1Op<K, P, O>
@@ -90,6 +92,24 @@ where
         output: VersionedZSet<K>,
         key_parts: KeyPartsFn<K, P, O>,
     ) -> Self {
+        let key_parts = Arc::new(move |delta_values: &[(K, i64)]| {
+            delta_values
+                .iter()
+                .map(|(key, weight)| {
+                    let (partition, order) = key_parts(key);
+                    (key.clone(), *weight, partition, order)
+                })
+                .collect()
+        });
+        Self::new_with_batch_key_extractor(input_index, table, output, key_parts)
+    }
+
+    pub fn new_with_batch_key_extractor(
+        input_index: IndexedBatchZSet<P, K>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: BatchKeyPartsFn<K, P, O>,
+    ) -> Self {
         Self {
             input_index,
             table,
@@ -110,9 +130,31 @@ where
         if let Some(cached) = self.row_key_cache.get(key) {
             return cached.clone();
         }
-        let computed = (self.key_parts)(key);
+        let computed = (self.key_parts)(&[(key.clone(), 1)])
+            .into_iter()
+            .next()
+            .map(|(_, _, partition, order)| (partition, order))
+            .unwrap_or((None, None));
         self.row_key_cache.insert(key.clone(), computed.clone());
         computed
+    }
+
+    fn keys_for_batch(&mut self, rows: &[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> {
+        let mut missing = Vec::new();
+        let mut keyed = Vec::with_capacity(rows.len());
+        for (key, weight) in rows {
+            if let Some((partition, order)) = self.row_key_cache.get(key) {
+                keyed.push((key.clone(), *weight, partition.clone(), order.clone()));
+            } else {
+                missing.push((key.clone(), *weight));
+            }
+        }
+        for (key, weight, partition, order) in (self.key_parts)(&missing) {
+            self.row_key_cache
+                .insert(key.clone(), (partition.clone(), order.clone()));
+            keyed.push((key, weight, partition, order));
+        }
+        keyed
     }
 
     async fn ensure_partition_cache(&mut self, partition_key: &P) -> Result<()> {
@@ -312,12 +354,16 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        for (key, diff_weight) in &delta_map {
-            let (Some(partition_key), _) = self.keys_for(key) else {
+        let keyed_delta_rows = delta_map
+            .iter()
+            .map(|(key, weight)| (key.clone(), *weight))
+            .collect::<Vec<_>>();
+        for (key, diff_weight, partition_key, _) in self.keys_for_batch(&keyed_delta_rows) {
+            let Some(partition_key) = partition_key else {
                 continue;
             };
             affected_partitions.insert(partition_key.clone());
-            index_updates.push((partition_key, key.clone(), *diff_weight));
+            index_updates.push((partition_key, key, diff_weight));
         }
         if affected_partitions.is_empty() {
             return Ok(Some(self.output.handle_for_version(0)));

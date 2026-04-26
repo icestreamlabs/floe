@@ -29,7 +29,8 @@ use crate::stream::util::{
     build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
-type RowEvaluator<V, K> = Arc<dyn Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync>;
+type BatchRowEvaluator<V, K> =
+    Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync>;
 
 pub struct DbspIncrementalAggregate {
     stream: DeltaHandleStream,
@@ -87,6 +88,49 @@ impl DbspIncrementalAggregate {
         V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
     {
+        Self::new_batch(
+            input,
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(value, weight)| {
+                        row_evaluator(value).map(|row| (value.clone(), row, *weight))
+                    })
+                    .collect()
+            },
+            slot_kinds,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch<K, V, FRow>(
+        input: &DeltaHandleStream,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -138,10 +182,10 @@ impl DbspIncrementalAggregate {
                 )
             });
 
-        let aggregate_op = Arc::new(AsyncMutex::new(IncrementalAggregateOp::new(
+        let aggregate_op = Arc::new(AsyncMutex::new(IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(row_evaluator) as RowEvaluator<V, K>,
+            Arc::new(row_evaluator) as BatchRowEvaluator<V, K>,
             output,
             slot_kinds,
             distinct_index,
@@ -261,6 +305,27 @@ where
     where
         FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
     {
+        Self::new_batch(
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(value, weight)| {
+                        row_evaluator(value).map(|row| (value.clone(), row, *weight))
+                    })
+                    .collect()
+            },
+            slot_kinds,
+        )
+        .await
+    }
+
+    pub async fn new_batch<FRow>(
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+    ) -> anyhow::Result<Self>
+    where
+        FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
+    {
         let aggregate_id = NEXT_INCREMENTAL_AGGREGATE_ID.fetch_add(1, Ordering::Relaxed);
         let table = build_ephemeral_state_table(&format!(
             "transient_incremental_aggregate_state_{aggregate_id}"
@@ -308,10 +373,10 @@ where
                 )
             });
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table,
-            Arc::new(row_evaluator) as RowEvaluator<V, K>,
+            Arc::new(row_evaluator) as BatchRowEvaluator<V, K>,
             output,
             slot_kinds,
             distinct_index,

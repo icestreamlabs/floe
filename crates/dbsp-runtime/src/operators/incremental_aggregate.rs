@@ -200,7 +200,10 @@ impl GroupedIncrementalAggregateState {
     }
 }
 
+#[cfg(test)]
 type RowEvaluator<V, K> = Arc<dyn Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync>;
+type BatchRowEvaluator<V, K> =
+    Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync>;
 
 pub struct IncrementalAggregateOp<K, V>
 where
@@ -225,7 +228,7 @@ where
 {
     pub state: RelationState<(K, GroupedIncrementalAggregateState)>,
     pub table: Arc<dyn KeyValueTable>,
-    pub row_evaluator: RowEvaluator<V, K>,
+    pub row_evaluator: BatchRowEvaluator<V, K>,
     output: VersionedZSet<(K, Vec<AggregateValue>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     state_cache: Option<HashMap<K, GroupedIncrementalAggregateState>>,
@@ -256,10 +259,39 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub(crate) fn new(
         state: RelationState<(K, GroupedIncrementalAggregateState)>,
         table: Arc<dyn KeyValueTable>,
         row_evaluator: RowEvaluator<V, K>,
+        output: VersionedZSet<(K, Vec<AggregateValue>)>,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
+        input_index: Option<IndexedBatchZSet<K, V>>,
+    ) -> Self {
+        let batch_row_evaluator = Arc::new(move |delta_values: &[(V, i64)]| {
+            delta_values
+                .iter()
+                .filter_map(|(value, weight)| {
+                    (row_evaluator)(value).map(|row_update| (value.clone(), row_update, *weight))
+                })
+                .collect()
+        });
+        Self::new_batch(
+            state,
+            table,
+            batch_row_evaluator,
+            output,
+            slot_kinds,
+            distinct_index,
+            input_index,
+        )
+    }
+
+    pub(crate) fn new_batch(
+        state: RelationState<(K, GroupedIncrementalAggregateState)>,
+        table: Arc<dyn KeyValueTable>,
+        row_evaluator: BatchRowEvaluator<V, K>,
         output: VersionedZSet<(K, Vec<AggregateValue>)>,
         slot_kinds: Vec<IncrementalAggregateSlotKind>,
         distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
@@ -537,13 +569,10 @@ where
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
         let has_extrema = self.has_extrema();
-        let mut apply_value = |value: &V, weight: i64| {
+        let mut apply_value = |value: V, row_update: IncrementalAggregateRow<K>, weight: i64| {
             if weight == 0 {
                 return;
             }
-            let Some(row_update) = (self.row_evaluator)(value) else {
-                return;
-            };
             if row_update.slots.len() != self.slot_kinds.len() {
                 tracing::warn!(
                     expected = self.slot_kinds.len(),
@@ -559,7 +588,7 @@ where
                 aggregated_updates_by_key.remove(&key);
             }
             if self.input_index.is_some() {
-                index_updates.push((key.clone(), value.clone(), weight));
+                index_updates.push((key.clone(), value, weight));
             }
             for (slot_idx, slot) in slots.iter().enumerate() {
                 if matches!(
@@ -692,14 +721,18 @@ where
         };
 
         let aggregate_updates_start = Instant::now();
-        if let Some(coalesced) = coalesced {
-            for (value, weight) in coalesced {
-                apply_value(&value, weight);
-            }
+        let row_updates = if let Some(coalesced) = coalesced {
+            (self.row_evaluator)(
+                &coalesced
+                    .into_iter()
+                    .filter(|(_, weight)| *weight != 0)
+                    .collect::<Vec<_>>(),
+            )
         } else {
-            for (value, weight) in delta_values.iter() {
-                apply_value(value, *weight);
-            }
+            (self.row_evaluator)(delta_values)
+        };
+        for (value, row_update, weight) in row_updates {
+            apply_value(value, row_update, weight);
         }
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
@@ -1131,13 +1164,11 @@ where
             })
             .collect();
 
-        for (value, weight) in values {
+        let row_updates = (self.row_evaluator)(&values);
+        for (_value, row_update, weight) in row_updates {
             if weight == 0 {
                 continue;
             }
-            let Some(row_update) = (self.row_evaluator)(&value) else {
-                continue;
-            };
             state.total_rows += weight;
             for (slot_idx, slot) in row_update.slots.iter().enumerate() {
                 match (&self.slot_kinds[slot_idx], slot) {
