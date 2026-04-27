@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
 use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
 use datafusion::arrow::array::{
     Array, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
@@ -13,6 +14,7 @@ use datafusion::common::{Column, DFSchema};
 use datafusion::logical_expr::{Expr, ExprSchemable, Operator};
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::{DbspPredicate, RowSchema};
+use regex::Regex;
 
 use crate::encoding::{EncodedRowScalar, extract_encoded_row_i64_like_column};
 
@@ -1232,6 +1234,10 @@ struct CompiledCaseArm {
 enum CompiledScalarFunction {
     Hour,
     CountChar,
+    DateFormat,
+    Lower,
+    RegexpExtract,
+    SplitIndex,
 }
 
 impl CompiledScalarFunction {
@@ -1240,6 +1246,14 @@ impl CompiledScalarFunction {
             Some(Self::Hour)
         } else if name.eq_ignore_ascii_case("count_char") {
             Some(Self::CountChar)
+        } else if name.eq_ignore_ascii_case("date_format") {
+            Some(Self::DateFormat)
+        } else if name.eq_ignore_ascii_case("lower") {
+            Some(Self::Lower)
+        } else if name.eq_ignore_ascii_case("regexp_extract") {
+            Some(Self::RegexpExtract)
+        } else if name.eq_ignore_ascii_case("split_index") {
+            Some(Self::SplitIndex)
         } else {
             None
         }
@@ -1249,6 +1263,10 @@ impl CompiledScalarFunction {
         match self {
             Self::Hour => 1,
             Self::CountChar => 2,
+            Self::DateFormat => 2,
+            Self::Lower => 1,
+            Self::RegexpExtract => 3,
+            Self::SplitIndex => 3,
         }
     }
 
@@ -1312,6 +1330,156 @@ impl CompiledScalarFunction {
                 }
                 Ok(Arc::new(output))
             }
+            Self::DateFormat => {
+                let ts = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled date_format expected two arguments"))?;
+                let fmt = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("compiled date_format expected two arguments"))?;
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let ts = ts
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled date_format row {row_idx} was missing"))?;
+                    let fmt = fmt.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled date_format row {row_idx} was missing from format")
+                    })?;
+                    let value = match (ts, fmt) {
+                        (
+                            CompiledValue::TimestampMillis(Some(millis)),
+                            CompiledValue::Utf8(Some(pattern)),
+                        ) => chrono::DateTime::<Utc>::from_timestamp_millis(*millis).map(|dt| {
+                            dt.format(&translate_date_format_pattern(pattern))
+                                .to_string()
+                        }),
+                        (CompiledValue::TimestampMillis(None), _)
+                        | (_, CompiledValue::Utf8(None)) => None,
+                        _ => {
+                            return Err(anyhow!(
+                                "compiled date_format expects TimestampMillis and Utf8 operands: {ts:?} vs {fmt:?}"
+                            ));
+                        }
+                    };
+                    output.push(CompiledValue::Utf8(value));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::Lower => {
+                let text = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled lower expected one argument"))?;
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let text = text
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled lower row {row_idx} was missing"))?;
+                    let value = match text {
+                        CompiledValue::Utf8(Some(text)) => Some(text.to_lowercase()),
+                        CompiledValue::Utf8(None) => None,
+                        other => {
+                            return Err(anyhow!("compiled lower expects Utf8, found {other:?}"));
+                        }
+                    };
+                    output.push(CompiledValue::Utf8(value));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::RegexpExtract => {
+                let text = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled regexp_extract expected three arguments"))?;
+                let pattern = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("compiled regexp_extract expected three arguments"))?;
+                let group = args
+                    .get(2)
+                    .ok_or_else(|| anyhow!("compiled regexp_extract expected three arguments"))?;
+                let mut cache: HashMap<String, Option<Regex>> = HashMap::new();
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let text = text.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled regexp_extract row {row_idx} was missing")
+                    })?;
+                    let pattern = pattern.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled regexp_extract row {row_idx} was missing from pattern")
+                    })?;
+                    let group = group.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled regexp_extract row {row_idx} was missing from group")
+                    })?;
+                    let value = match (text, pattern, group) {
+                        (
+                            CompiledValue::Utf8(Some(text)),
+                            CompiledValue::Utf8(Some(pattern)),
+                            CompiledValue::Int64(Some(group)),
+                        ) if *group >= 0 => {
+                            let regex = cache
+                                .entry(pattern.clone())
+                                .or_insert_with(|| Regex::new(pattern).ok());
+                            regex
+                                .as_ref()
+                                .and_then(|regex| regex.captures(text))
+                                .and_then(|captures| captures.get(*group as usize))
+                                .map(|matched| matched.as_str().to_string())
+                        }
+                        (
+                            CompiledValue::Utf8(Some(_)),
+                            CompiledValue::Utf8(Some(_)),
+                            CompiledValue::Int64(Some(_)),
+                        ) => None,
+                        (CompiledValue::Utf8(None), _, _)
+                        | (_, CompiledValue::Utf8(None), _)
+                        | (_, _, CompiledValue::Int64(None)) => None,
+                        _ => {
+                            return Err(anyhow!(
+                                "compiled regexp_extract expects Utf8, Utf8, Int64 operands: {text:?}, {pattern:?}, {group:?}"
+                            ));
+                        }
+                    };
+                    output.push(CompiledValue::Utf8(value));
+                }
+                Ok(Arc::new(output))
+            }
+            Self::SplitIndex => {
+                let text = args
+                    .first()
+                    .ok_or_else(|| anyhow!("compiled split_index expected three arguments"))?;
+                let delimiter = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("compiled split_index expected three arguments"))?;
+                let index = args
+                    .get(2)
+                    .ok_or_else(|| anyhow!("compiled split_index expected three arguments"))?;
+                let mut output = Vec::with_capacity(row_count);
+                for row_idx in 0..row_count {
+                    let text = text
+                        .get(row_idx)
+                        .ok_or_else(|| anyhow!("compiled split_index row {row_idx} was missing"))?;
+                    let delimiter = delimiter.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled split_index row {row_idx} was missing from delimiter")
+                    })?;
+                    let index = index.get(row_idx).ok_or_else(|| {
+                        anyhow!("compiled split_index row {row_idx} was missing from index")
+                    })?;
+                    let value = match (text, delimiter, index) {
+                        (
+                            CompiledValue::Utf8(Some(text)),
+                            CompiledValue::Utf8(Some(delimiter)),
+                            CompiledValue::Int64(Some(index)),
+                        ) => split_index_value(text, delimiter, *index),
+                        (CompiledValue::Utf8(None), _, _)
+                        | (_, CompiledValue::Utf8(None), _)
+                        | (_, _, CompiledValue::Int64(None)) => None,
+                        _ => {
+                            return Err(anyhow!(
+                                "compiled split_index expects Utf8, Utf8, Int64 operands: {text:?}, {delimiter:?}, {index:?}"
+                            ));
+                        }
+                    };
+                    output.push(CompiledValue::Utf8(value));
+                }
+                Ok(Arc::new(output))
+            }
         }
     }
 }
@@ -1363,6 +1531,10 @@ enum CompiledExpr {
         else_expr: Option<Arc<CompiledExpr>>,
         result_type: CompiledValueType,
     },
+    Cast {
+        expr: Arc<CompiledExpr>,
+        target_type: CompiledValueType,
+    },
     ScalarFunction {
         function: CompiledScalarFunction,
         args: Arc<Vec<CompiledExpr>>,
@@ -1377,6 +1549,19 @@ impl CompiledExpr {
     ) -> Result<Option<Self>> {
         match expr {
             Expr::Alias(alias) => Self::try_compile(alias.expr.as_ref(), df_schema, input_schema),
+            Expr::Cast(cast) => {
+                let Some(target_type) = CompiledValueType::try_from_arrow(&cast.data_type) else {
+                    return Ok(None);
+                };
+                let Some(expr) = Self::try_compile(cast.expr.as_ref(), df_schema, input_schema)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::Cast {
+                    expr: Arc::new(expr),
+                    target_type,
+                }))
+            }
             Expr::Column(column) => Ok(Some(Self::Column {
                 index: resolve_compiled_column_index(input_schema, column)?,
             })),
@@ -1837,6 +2022,15 @@ impl CompiledExpr {
                 }
                 Ok(Arc::new(output))
             }
+            Self::Cast { expr, target_type } => {
+                let values = expr.evaluate(batch)?;
+                Ok(Arc::new(
+                    values
+                        .iter()
+                        .map(|value| cast_compiled_value(value, *target_type))
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
             Self::ScalarFunction { function, args } => {
                 let args = args
                     .iter()
@@ -1904,6 +2098,51 @@ fn eval_compiled_binary(
             .map(|(left, right)| eval_compiled_binary_value(op, left, right))
             .collect::<Result<Vec<_>>>()?,
     ))
+}
+
+fn cast_compiled_value(
+    value: &CompiledValue,
+    target_type: CompiledValueType,
+) -> Result<CompiledValue> {
+    if value.is_null() {
+        return Ok(CompiledValue::null(target_type));
+    }
+    match (value, target_type) {
+        (CompiledValue::Int64(Some(value)), CompiledValueType::Int64) => {
+            Ok(CompiledValue::Int64(Some(*value)))
+        }
+        (CompiledValue::Int64(Some(value)), CompiledValueType::TimestampMillis) => {
+            Ok(CompiledValue::TimestampMillis(Some(*value)))
+        }
+        (CompiledValue::Int64(Some(value)), CompiledValueType::Utf8) => {
+            Ok(CompiledValue::Utf8(Some(value.to_string())))
+        }
+        (CompiledValue::TimestampMillis(Some(value)), CompiledValueType::TimestampMillis) => {
+            Ok(CompiledValue::TimestampMillis(Some(*value)))
+        }
+        (CompiledValue::TimestampMillis(Some(value)), CompiledValueType::Int64) => {
+            Ok(CompiledValue::Int64(Some(*value)))
+        }
+        (CompiledValue::TimestampMillis(Some(value)), CompiledValueType::Utf8) => {
+            Ok(CompiledValue::Utf8(Some(value.to_string())))
+        }
+        (CompiledValue::Utf8(Some(value)), CompiledValueType::Utf8) => {
+            Ok(CompiledValue::Utf8(Some(value.clone())))
+        }
+        (CompiledValue::Utf8(Some(value)), CompiledValueType::Int64) => value
+            .parse::<i64>()
+            .map(|value| CompiledValue::Int64(Some(value)))
+            .map_err(|err| anyhow!("failed to cast Utf8 to Int64: {err}")),
+        (CompiledValue::Bool(Some(value)), CompiledValueType::Bool) => {
+            Ok(CompiledValue::Bool(Some(*value)))
+        }
+        (CompiledValue::Bool(Some(value)), CompiledValueType::Utf8) => {
+            Ok(CompiledValue::Utf8(Some(value.to_string())))
+        }
+        (other, target_type) => Err(anyhow!(
+            "unsupported compiled cast from {other:?} to {target_type:?}"
+        )),
+    }
 }
 
 fn eval_compiled_binary_value(
@@ -2022,6 +2261,25 @@ fn or_bool_opt(left: Option<bool>, right: Option<bool>) -> Option<bool> {
         (None, Some(false)) => None,
         (None, None) => None,
     }
+}
+
+fn translate_date_format_pattern(pattern: &str) -> String {
+    pattern
+        .replace("yyyy", "%Y")
+        .replace("MM", "%m")
+        .replace("dd", "%d")
+        .replace("HH", "%H")
+        .replace("mm", "%M")
+        .replace("ss", "%S")
+}
+
+fn split_index_value(text: &str, delimiter: &str, index: i64) -> Option<String> {
+    if index < 0 || delimiter.is_empty() {
+        return None;
+    }
+    text.split(delimiter)
+        .nth(index as usize)
+        .map(str::to_string)
 }
 
 fn resolve_compiled_column_index(

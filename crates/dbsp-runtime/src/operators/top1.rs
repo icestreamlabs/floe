@@ -139,7 +139,10 @@ where
         computed
     }
 
-    fn keys_for_batch(&mut self, rows: &[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> {
+    fn keys_for_delta_map(
+        &mut self,
+        rows: &HashMap<K, i64>,
+    ) -> Vec<(K, i64, Option<P>, Option<O>)> {
         let mut missing = Vec::new();
         let mut keyed = Vec::with_capacity(rows.len());
         for (key, weight) in rows {
@@ -354,11 +357,7 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        let keyed_delta_rows = delta_map
-            .iter()
-            .map(|(key, weight)| (key.clone(), *weight))
-            .collect::<Vec<_>>();
-        for (key, diff_weight, partition_key, _) in self.keys_for_batch(&keyed_delta_rows) {
+        for (key, diff_weight, partition_key, _) in self.keys_for_delta_map(&delta_map) {
             let Some(partition_key) = partition_key else {
                 continue;
             };

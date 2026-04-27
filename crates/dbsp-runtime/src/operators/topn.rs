@@ -234,7 +234,10 @@ where
         computed
     }
 
-    fn keys_for_batch(&mut self, rows: &[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> {
+    fn keys_for_delta_map(
+        &mut self,
+        rows: &HashMap<K, i64>,
+    ) -> Vec<(K, i64, Option<P>, Option<O>)> {
         let mut missing = Vec::new();
         let mut keyed = Vec::with_capacity(rows.len());
         for (key, weight) in rows {
@@ -395,11 +398,7 @@ where
             .context("build topn order index")?;
 
         let mut cache_updates = Vec::new();
-        let keyed_delta_rows = delta_map
-            .iter()
-            .map(|(key, weight)| (key.clone(), *weight))
-            .collect::<Vec<_>>();
-        for (key, diff_weight, partition_key, order_key) in self.keys_for_batch(&keyed_delta_rows) {
+        for (key, diff_weight, partition_key, order_key) in self.keys_for_delta_map(&delta_map) {
             let existing = self
                 .input_cache
                 .as_ref()
