@@ -792,7 +792,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         .as_ref()
                         .is_some_and(|source| source_journal_skipped_sources.contains(source))
                         || default_source.is_none() && !source_journal_skipped_sources.is_empty());
-                let replay_from_beginning_offsets = if should_replay_from_kafka {
+                let resume_from_offsets = if should_replay_from_kafka {
                     recovered_kafka_offsets
                         .iter()
                         .filter(|offset| topics.iter().any(|topic| topic == &offset.topic))
@@ -822,7 +822,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         max_messages_per_tick,
                         message_format: format,
                         commit_offsets_rx: Some(commit_rx),
-                        replay_from_beginning_offsets,
+                        resume_from_offsets,
                     };
                     let mut connector = match KafkaConnector::new(
                         config,

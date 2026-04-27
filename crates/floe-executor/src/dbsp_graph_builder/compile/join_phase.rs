@@ -1142,6 +1142,7 @@ impl DbspGraphBuilder {
             left_transient,
             right_transient,
             true,
+            Some(format!("{}_transient_join_root", graph_id)),
             left_key,
             right_key,
             |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true },

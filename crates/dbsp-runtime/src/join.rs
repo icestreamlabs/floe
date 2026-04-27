@@ -395,6 +395,7 @@ impl DbspJoin {
             None,
             None,
             false,
+            None,
             left_key,
             right_key,
             predicate,
@@ -412,6 +413,7 @@ impl DbspJoin {
         left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>>,
         right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
         prefer_source_driven_runtime: bool,
+        state_namespace: Option<String>,
         left_key: KL,
         right_key: KR,
         predicate: P,
@@ -462,7 +464,8 @@ impl DbspJoin {
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
         let table = left.table();
-        let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
+        let join_id = state_namespace
+            .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
         let left_state =
             RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
@@ -477,21 +480,18 @@ impl DbspJoin {
             format!("join_right_index_{join_id}"),
         );
 
-        let join_op = Arc::new(AsyncMutex::new(
-            JoinOp::new_without_output(
-                left_state,
-                right_state,
-                left_index,
-                right_index,
-                Arc::new(left_key),
-                Arc::new(right_key),
-                Arc::new(predicate),
-                Arc::new(projector),
-                table.clone(),
-                None,
-            )
-            .with_persist_indexes(false),
-        ));
+        let join_op = Arc::new(AsyncMutex::new(JoinOp::new_without_output(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            Arc::new(left_key),
+            Arc::new(right_key),
+            Arc::new(predicate),
+            Arc::new(projector),
+            table.clone(),
+            None,
+        )));
 
         let output_version = Arc::new(AtomicU64::new(0));
 

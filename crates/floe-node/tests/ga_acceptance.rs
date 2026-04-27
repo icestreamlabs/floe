@@ -201,7 +201,14 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
                 "poll_ms": 25,
                 "max_messages_per_tick": 64
             }
-        ]
+        ],
+        "runtime": {
+            "mv_snapshot": {
+                "max_pending_rows": 1,
+                "max_pending_batches": 1,
+                "max_delay_ms": 100
+            }
+        }
     });
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write kafka restart config")?;
@@ -224,7 +231,17 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
     test_result?;
 
     let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(JOIN_MV_SQL)).await?;
-    let restart_result = wait_for_join_count_at_least(pg_port, 501, 1).await;
+    let restart_result = async {
+        wait_for_join_count_at_least(pg_port, 501, 1).await?;
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &brokers)
+            .create()
+            .context("create kafka producer")?;
+        produce_bid(&producer, &topic, 501, 8002, 4321).await?;
+        wait_for_join_count_at_least(pg_port, 501, 2).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     stop_child(&mut restarted, "INT").await;
     restart_result?;
 

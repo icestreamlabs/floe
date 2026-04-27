@@ -52,7 +52,7 @@ pub struct KafkaConnectorConfig {
     pub max_messages_per_tick: usize,
     pub message_format: Option<String>,
     pub commit_offsets_rx: Option<watch::Receiver<KafkaOffsetCommit>>,
-    pub replay_from_beginning_offsets: Vec<KafkaTopicPartitionOffset>,
+    pub resume_from_offsets: Vec<KafkaTopicPartitionOffset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +273,7 @@ impl Connector for KafkaConnector {
         Self::apply_latency_fetch_config(&mut client_config);
         tracing::info!("kafka latency fetch config enabled by default");
         let consumer: BaseConsumer = client_config.create().context("create kafka consumer")?;
-        if self.config.replay_from_beginning_offsets.is_empty() {
+        if self.config.resume_from_offsets.is_empty() {
             let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
             consumer
                 .subscribe(&topics)
@@ -281,7 +281,7 @@ impl Connector for KafkaConnector {
         } else {
             let mut assignment = TopicPartitionList::new();
             let mut assigned_partitions = 0usize;
-            for offset in &self.config.replay_from_beginning_offsets {
+            for offset in &self.config.resume_from_offsets {
                 if !self
                     .config
                     .topics
@@ -290,11 +290,16 @@ impl Connector for KafkaConnector {
                 {
                     continue;
                 }
+                let resume_offset = offset.offset.saturating_add(1);
                 assignment
-                    .add_partition_offset(&offset.topic, offset.partition, Offset::Beginning)
+                    .add_partition_offset(
+                        &offset.topic,
+                        offset.partition,
+                        Offset::Offset(resume_offset),
+                    )
                     .with_context(|| {
                         format!(
-                            "assign kafka replay start for {}[{}]",
+                            "assign kafka resume offset for {}[{}]",
                             offset.topic, offset.partition
                         )
                     })?;
@@ -308,10 +313,10 @@ impl Connector for KafkaConnector {
             } else {
                 consumer
                     .assign(&assignment)
-                    .context("assign kafka replay partitions")?;
+                    .context("assign kafka resume partitions")?;
                 tracing::info!(
-                    replay_offsets = ?self.config.replay_from_beginning_offsets,
-                    "kafka connector replaying assigned partitions from beginning after recovery"
+                    resume_offsets = ?self.config.resume_from_offsets,
+                    "kafka connector resuming assigned partitions after recovered offsets"
                 );
             }
         }
