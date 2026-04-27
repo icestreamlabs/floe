@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_runtime::orchestration::source_journal_required_sources;
 use floe_sql_parser::parse_floe_statement;
 use serde_json::json;
 
@@ -384,6 +385,7 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             zset_compaction_backoff_ticks: Some(8),
             zset_compaction_max_concurrent_jobs: Some(4),
             zset_gc_grace_period_ms: Some(1_000),
+            source_journal: None,
         },
         maintenance: config::MaintenanceConfig {
             paused: Some(true),
@@ -429,6 +431,39 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
         vec!["ns.compact".to_string()]
     );
     assert_eq!(args.maintenance_gc_namespace, vec!["ns.gc".to_string()]);
+}
+
+#[test]
+fn source_journal_auto_skips_replayable_connector_sources() {
+    let kafka = SourceDefinition::new(
+        "kafka_source",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("source")
+    .with_property("connector.kafka.type", "kafka");
+    let http = SourceDefinition::new(
+        "http_source",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("source")
+    .with_property("connector.http.type", "http");
+    let mut registry = SourceRegistry::new();
+    registry.register(kafka);
+    registry.register(http);
+    let transient = BTreeSet::from(["kafka_source".to_string(), "http_source".to_string()]);
+
+    assert_eq!(
+        source_journal_required_sources(&registry, &transient, SourceJournalConfig::Auto),
+        BTreeSet::from(["http_source".to_string()])
+    );
+    assert_eq!(
+        source_journal_required_sources(&registry, &transient, SourceJournalConfig::Full),
+        transient
+    );
+    assert!(
+        source_journal_required_sources(&registry, &transient, SourceJournalConfig::None)
+            .is_empty()
+    );
 }
 
 #[test]

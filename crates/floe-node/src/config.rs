@@ -134,6 +134,16 @@ pub struct StorageConfig {
     pub zset_compaction_max_concurrent_jobs: Option<usize>,
     #[serde(default)]
     pub zset_gc_grace_period_ms: Option<u64>,
+    #[serde(default)]
+    pub source_journal: Option<SourceJournalConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceJournalConfig {
+    Auto,
+    Full,
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -579,6 +589,7 @@ mod tests {
 
             [storage]
             await_durable = true
+            source_journal = "auto"
             zset_compaction_max_chain_len = 64
 
             [maintenance]
@@ -592,6 +603,10 @@ mod tests {
         assert_eq!(config.runtime.mv_snapshot.max_pending_rows, Some(500000));
         assert_eq!(config.runtime.mv_snapshot.max_delay_ms, Some(2000));
         assert_eq!(config.storage.await_durable, Some(true));
+        assert_eq!(
+            config.storage.source_journal,
+            Some(SourceJournalConfig::Auto)
+        );
         assert_eq!(config.maintenance.paused, Some(true));
     }
 

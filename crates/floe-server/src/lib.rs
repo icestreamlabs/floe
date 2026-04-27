@@ -26,8 +26,23 @@ use protocol::FloeServerFactory;
 
 const LISTEN_ENV: &str = "FLOE_PG_ADDR";
 const DATA_ENV: &str = "FLOE_DATA_DIR";
+const OBJECT_STORE_PROVIDER_ENV: &str = "CLOUD_PROVIDER";
+const OBJECT_STORE_ENV_FILE_ENV: &str = "FLOE_OBJECT_STORE_ENV_FILE";
+const SLATEDB_NAME_ENV: &str = "FLOE_SLATEDB_NAME";
 
 pub async fn init_storage(settings: Option<Settings>) -> Result<Arc<SlateCatalog>> {
+    if std::env::var(OBJECT_STORE_PROVIDER_ENV).is_ok() {
+        let env_file = std::env::var(OBJECT_STORE_ENV_FILE_ENV).ok();
+        let object_store = slatedb::admin::load_object_store_from_env(env_file)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("failed to initialise SlateDB object store from environment")?;
+        let db_name = std::env::var(SLATEDB_NAME_ENV).unwrap_or_else(|_| "floe".to_string());
+        return SlateCatalog::with_object_store_with_settings(db_name, object_store, settings)
+            .await
+            .map(Arc::new)
+            .context("failed to initialise SlateDB object-store catalog");
+    }
+
     match std::env::var(DATA_ENV) {
         Ok(dir) => {
             let path = PathBuf::from(dir);

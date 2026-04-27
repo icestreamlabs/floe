@@ -19,7 +19,7 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-slatedb = { workspace = true }
+slatedb = { workspace = true, features = ["aws"] }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }

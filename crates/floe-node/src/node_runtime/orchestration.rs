@@ -1,5 +1,36 @@
 use super::*;
 
+pub(super) fn source_journal_required_sources(
+    registry: &SourceRegistry,
+    transient_only_sources: &BTreeSet<String>,
+    mode: SourceJournalConfig,
+) -> BTreeSet<String> {
+    match mode {
+        SourceJournalConfig::Full => transient_only_sources.clone(),
+        SourceJournalConfig::None => BTreeSet::new(),
+        SourceJournalConfig::Auto => transient_only_sources
+            .iter()
+            .filter(|source| {
+                registry
+                    .get(source.as_str())
+                    .is_none_or(|definition| !source_is_replayable_from_connector(definition))
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
+fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
+    definition.properties().iter().any(|(key, value)| {
+        key.starts_with("connector.") && key.ends_with(".type") && {
+            matches!(
+                value.as_str(),
+                "kafka" | "postgres_cdc" | "file" | "object_store"
+            )
+        }
+    })
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
     init_tracing();
     metrics::init();
@@ -212,6 +243,25 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         durable_required_sources = ?durable_required_sources,
         transient_only_sources = ?transient_only_sources,
         "resolved source durability sets"
+    );
+    let source_journal_mode = config
+        .as_ref()
+        .and_then(|config| config.storage.source_journal)
+        .unwrap_or(SourceJournalConfig::Auto);
+    let source_journal_required_sources = source_journal_required_sources(
+        &source_registry,
+        &transient_only_sources,
+        source_journal_mode,
+    );
+    let source_journal_skipped_sources: BTreeSet<String> = transient_only_sources
+        .difference(&source_journal_required_sources)
+        .cloned()
+        .collect();
+    tracing::info!(
+        mode = ?source_journal_mode,
+        journaled_sources = ?source_journal_required_sources,
+        skipped_sources = ?source_journal_skipped_sources,
+        "resolved transient source journal policy"
     );
     let transient_required_columns_by_source = {
         let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
@@ -504,7 +554,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
     }
     if let Some(tick_commit) = recovered_tick_commit.as_ref()
-        && !transient_only_sources.is_empty()
+        && !source_journal_required_sources.is_empty()
     {
         let replayed = {
             let mut registry_guard = outer_registry.lock().await;
@@ -512,7 +562,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .replay_committed_entries_up_to(
                     &mut registry_guard,
                     tick_commit.tick_id,
-                    &transient_only_sources,
+                    &source_journal_required_sources,
                 )
                 .await
                 .context("replay committed source batch journal entries")?
@@ -520,7 +570,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tracing::info!(
             replayed_entries = replayed,
             committed_tick = tick_commit.tick_id,
-            transient_only_sources = ?transient_only_sources,
+            journaled_sources = ?source_journal_required_sources,
             "replayed committed source batch journal entries"
         );
         for mv_version in &tick_commit.mv_versions {
@@ -550,6 +600,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 )
             })?;
         }
+    }
+    if recovered_tick_commit.is_some() && !source_journal_skipped_sources.is_empty() {
+        tracing::info!(
+            replayable_sources = ?source_journal_skipped_sources,
+            "skipped source-batch journal replay for sources expected to resume from connector offsets"
+        );
     }
     let queue_capacity = run_args.ingest_queue_capacity;
     let max_batch = run_args.ingest_batch_size;
@@ -650,12 +706,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .map(|definition| all_required_sources.contains(definition.name()))
             .collect::<Vec<_>>(),
     );
-    let transient_only_source_ids = Arc::new(
+    let source_journal_source_ids = Arc::new(
         definitions
             .iter()
             .enumerate()
             .filter_map(|(idx, definition)| {
-                transient_only_sources
+                source_journal_required_sources
                     .contains(definition.name())
                     .then_some(idx)
             })
@@ -930,7 +986,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
-    let transient_only_source_ids_for_task = Arc::clone(&transient_only_source_ids);
+    let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
     let mut connector_receiver_for_task = connector_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -1218,7 +1274,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
 
             let mut source_journal_batches = Vec::new();
-            for &source_id in transient_only_source_ids_for_task.iter() {
+            for &source_id in source_journal_source_ids_for_task.iter() {
                 let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(source_name) else {
                     continue;
