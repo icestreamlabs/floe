@@ -96,10 +96,7 @@ impl DbspWindowAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for window aggregate")?;
-        let index = IndexedBatchZSet::new_replayable(
-            table.clone(),
-            format!("window_agg_index_{window_id}"),
-        );
+        let index = IndexedBatchZSet::new(table.clone(), format!("window_agg_index_{window_id}"));
 
         let window_op = Arc::new(AsyncMutex::new(WindowAggregateOp::new(
             state,

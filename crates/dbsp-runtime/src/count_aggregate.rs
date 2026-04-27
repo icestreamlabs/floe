@@ -195,7 +195,7 @@ impl DbspCountAggregate {
             .iter()
             .any(|kind| matches!(kind, CountAggregateSlotKind::Distinct))
             .then(|| {
-                IndexedBatchZSet::new_replayable(
+                IndexedBatchZSet::new(
                     table.clone(),
                     format!("count_aggregate_distinct_{aggregate_id}"),
                 )

@@ -531,6 +531,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             "building DBSP graph"
         );
 
+        let enable_source_batch_journal = source_batch_journal_root_sources(plan)?
+            .as_ref()
+            .is_some_and(|source_names| {
+                !source_names.is_empty() && source_names == required_sources
+            });
+
         graph_builder
             .build(BuildInputs {
                 graph_id: view_name,
@@ -541,7 +547,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 mv_registry: Arc::clone(&mv_registry),
                 outer_handle_streams: &handle_streams,
                 outer_transient_streams: &transient_streams,
-                enable_source_batch_journal: true,
+                enable_source_batch_journal,
                 mv_retention,
                 watermark: Arc::clone(&event_watermark),
             })

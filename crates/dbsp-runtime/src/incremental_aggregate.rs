@@ -162,7 +162,7 @@ impl DbspIncrementalAggregate {
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
             .then(|| {
-                IndexedBatchZSet::new_replayable(
+                IndexedBatchZSet::new(
                     table.clone(),
                     format!("incremental_aggregate_distinct_{aggregate_id}"),
                 )
@@ -176,7 +176,7 @@ impl DbspIncrementalAggregate {
                 )
             })
             .then(|| {
-                IndexedBatchZSet::new_replayable(
+                IndexedBatchZSet::new(
                     table.clone(),
                     format!("incremental_aggregate_index_{aggregate_id}"),
                 )

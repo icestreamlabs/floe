@@ -3545,34 +3545,11 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
-    if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
     // Keep orchestration durability decisions aligned with the builder by using the same
     // recursive source-root matcher here. Optimizer-inserted wrapper projections can otherwise
     // preserve the transient fast path in the builder while leaving durable outer streams enabled.
     if let Some(shape) = try_build_transient_source_root_materialization(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_name])));
-    }
-    if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
-        && shape
-            .steps
-            .iter()
-            .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
-    {
-        return Ok(Some(BTreeSet::from([
-            shape.left_source_root.source_name,
-            shape.right_source_root.source_name,
-        ])));
     }
 
     let persistence_policy = PersistencePolicy::for_plan(plan);
@@ -7086,7 +7063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q4_join_aggregate_shape_is_source_batch_journal_eligible() {
+    async fn q4_join_aggregate_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT category, AVG(max) \
              FROM (SELECT MAX(b.price) AS max, a.category \
@@ -7099,12 +7076,11 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "join aggregate uses non-checkpointed transient aggregate helper state"
         );
     }
 
@@ -7246,7 +7222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q12_window_count_star_shape_is_source_batch_journal_eligible() {
+    async fn q12_window_count_star_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT bidder, COUNT(*) AS bid_count \
              FROM nexmark_bid \
@@ -7256,17 +7232,16 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "window count-star fast path keeps non-checkpointed helper state"
         );
     }
 
     #[tokio::test]
-    async fn q5_window_count_star_shape_is_source_batch_journal_eligible() {
+    async fn q5_window_count_star_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT auction, COUNT(*) AS num \
              FROM nexmark_bid \
@@ -7276,17 +7251,16 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "window count-star fast path keeps non-checkpointed helper state"
         );
     }
 
     #[tokio::test]
-    async fn q7_window_incremental_shape_is_source_batch_journal_eligible() {
+    async fn q7_window_incremental_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT MAX(price) AS maxprice \
              FROM nexmark_bid \
@@ -7296,12 +7270,11 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "window aggregate fast path keeps non-checkpointed helper state"
         );
     }
 
@@ -7784,7 +7757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q6_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
+    async fn q6_join_topn_aggregate_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT seller, AVG(price) AS moving_avg_price \
              FROM (SELECT a.seller, b.price, b.date_time, \
@@ -7798,17 +7771,16 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "join-topn-aggregate pipeline has non-checkpointed topn/aggregate helper state"
         );
     }
 
     #[tokio::test]
-    async fn q6_alias_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
+    async fn q6_alias_join_topn_aggregate_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid_aliases(
             "SELECT seller, AVG(price) AS moving_avg_price \
              FROM (SELECT a.seller, b.price, b.\"dateTime\", \
@@ -7822,17 +7794,16 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "join-topn-aggregate pipeline has non-checkpointed topn/aggregate helper state"
         );
     }
 
     #[tokio::test]
-    async fn q9_alias_join_topn_shape_is_source_batch_journal_eligible() {
+    async fn q9_alias_join_topn_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid_aliases(
             "SELECT id, \"itemName\", description, \"initialBid\", reserve, \"dateTime\", expires, seller, category, extra, auction, bidder, price, \"bidTime\", \"bidExtra\" \
              FROM (SELECT a.id, a.\"itemName\", a.description, a.\"initialBid\", a.reserve, a.\"dateTime\", a.expires, a.seller, a.category, a.extra, \
@@ -7846,17 +7817,16 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "join-topn pipeline has non-checkpointed topn helper state"
         );
     }
 
     #[tokio::test]
-    async fn q19_source_topn_shape_is_source_batch_journal_eligible() {
+    async fn q19_source_topn_shape_is_not_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \
              FROM (SELECT auction, bidder, price, channel, url, date_time AS \"dateTime\", extra, \
@@ -7868,12 +7838,11 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources = source_batch_journal_root_sources(&plan)
-            .expect("source batch journal root sources")
-            .expect("source batch journal root sources");
-        assert_eq!(
-            transient_sources,
-            BTreeSet::from(["nexmark_bid".to_string()])
+        let transient_sources =
+            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
+        assert!(
+            transient_sources.is_none(),
+            "source topn fast path keeps non-checkpointed helper state"
         );
     }
 
