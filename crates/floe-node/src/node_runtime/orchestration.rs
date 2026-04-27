@@ -548,6 +548,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 outer_handle_streams: &handle_streams,
                 outer_transient_streams: &transient_streams,
                 enable_source_batch_journal,
+                restore_transient_helper_state: required_sources
+                    .iter()
+                    .all(|source| source_journal_skipped_sources.contains(source)),
                 mv_retention,
                 watermark: Arc::clone(&event_watermark),
             })

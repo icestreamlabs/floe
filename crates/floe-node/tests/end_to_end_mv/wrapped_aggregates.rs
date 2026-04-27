@@ -152,6 +152,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -168,6 +169,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })

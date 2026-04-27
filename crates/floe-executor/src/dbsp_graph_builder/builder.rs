@@ -11,12 +11,15 @@ use datafusion::logical_expr::Expr;
 use dbsp::circuit::plan::DbspProjectExpr;
 use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::KeyValueTable;
 use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
     DbspNodeKind, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
 };
+use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -207,6 +210,12 @@ impl DbspGraphBuilder {
             .plan
             .node(inputs.plan.root)
             .with_context(|| anyhow!("root node {} missing from circuit plan", inputs.plan.root))?;
+        let transient_state_table = if inputs.restore_transient_helper_state {
+            let bridge = self.bridge.lock().await;
+            Some(bridge.table())
+        } else {
+            None
+        };
 
         if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
             if let Some(transient_window_root) =
@@ -218,6 +227,7 @@ impl DbspGraphBuilder {
                     &inputs.cancel,
                     &inputs.task_events,
                     self.graph_id(),
+                    transient_state_table.clone(),
                 )
                 .await?
             {
@@ -253,7 +263,9 @@ impl DbspGraphBuilder {
                     &inputs.cancel,
                     &inputs.task_events,
                     self.graph_id(),
-                )?
+                    transient_state_table.clone(),
+                )
+                .await?
             {
                 tracing::info!(
                     graph_id = %self.graph_id(),
@@ -286,6 +298,7 @@ impl DbspGraphBuilder {
                     &inputs.cancel,
                     &inputs.task_events,
                     self.graph_id(),
+                    transient_state_table.clone(),
                 )
                 .await?
             {
@@ -319,6 +332,7 @@ impl DbspGraphBuilder {
                 &inputs.cancel,
                 &inputs.task_events,
                 self.graph_id(),
+                transient_state_table.clone(),
             )? {
                 tracing::info!(
                     graph_id = %self.graph_id(),
@@ -406,6 +420,7 @@ impl DbspGraphBuilder {
                         &mut mv_latest,
                         inputs.mv_retention,
                         &persistence_policy,
+                        transient_state_table.clone(),
                     )
                     .await?;
                 self.materialize_view_from_transient_overlay_receiver(
@@ -549,6 +564,7 @@ impl DbspGraphBuilder {
                         output_projection,
                         tx,
                         &inputs.task_events,
+                        inputs.restore_transient_helper_state,
                     )
                     .await?;
                     return Ok(BuildOutputs {
@@ -663,6 +679,7 @@ impl DbspGraphBuilder {
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
         mv_retention: StreamRetention,
         persistence_policy: &PersistencePolicy,
+        state_table: Option<Arc<dyn KeyValueTable>>,
     ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
         let left = self
             .compile_node(
@@ -729,6 +746,7 @@ impl DbspGraphBuilder {
             None,
             tx,
             task_events,
+            state_table.is_some(),
         )
         .await?;
 
@@ -755,6 +773,8 @@ impl DbspGraphBuilder {
                         None,
                         cancel,
                         task_events,
+                        state_table.clone(),
+                        format!("join_pipeline_topn_{step_idx}"),
                     )
                 }
                 TransientJoinPipelineStep::Aggregate(aggregate) => {
@@ -765,6 +785,8 @@ impl DbspGraphBuilder {
                         Arc::clone(&identity_transform),
                         cancel,
                         task_events,
+                        state_table.clone(),
+                        format!("join_pipeline_aggregate_{step_idx}"),
                     )
                     .await?
                 }
@@ -1118,6 +1140,7 @@ pub struct BuildInputs<'a> {
     pub outer_handle_streams: &'a HashMap<String, DeltaHandleStream>,
     pub outer_transient_streams: &'a HashMap<String, TransientSourceHandleStream>,
     pub enable_source_batch_journal: bool,
+    pub restore_transient_helper_state: bool,
     pub mv_retention: StreamRetention,
     pub watermark: Arc<AtomicI64>,
 }
@@ -1299,6 +1322,104 @@ struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+}
+
+struct PersistentTransientInputState {
+    table: Option<Arc<dyn KeyValueTable>>,
+    prefix: Vec<u8>,
+    rows: HashMap<Vec<u8>, i64>,
+}
+
+impl PersistentTransientInputState {
+    async fn load(
+        table: Option<Arc<dyn KeyValueTable>>,
+        graph_id: &str,
+        label: impl AsRef<str>,
+    ) -> Result<Self> {
+        let prefix = transient_helper_state_prefix(graph_id, label.as_ref());
+        let entries = match table.as_ref() {
+            Some(table) => table
+                .scan_prefix(&prefix, &ScanOptions::default())
+                .await
+                .with_context(|| {
+                    format!(
+                        "load transient helper input state for graph '{graph_id}' label '{}'",
+                        label.as_ref()
+                    )
+                })?,
+            None => Vec::new(),
+        };
+        let mut rows = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            if value.len() != std::mem::size_of::<i64>() {
+                tracing::warn!(
+                    graph_id,
+                    label = label.as_ref(),
+                    key_len = key.len(),
+                    value_len = value.len(),
+                    "skipping malformed transient helper state row"
+                );
+                continue;
+            }
+            let row = key[prefix.len()..].to_vec();
+            let mut weight = [0_u8; 8];
+            weight.copy_from_slice(&value);
+            let weight = i64::from_le_bytes(weight);
+            if weight != 0 {
+                rows.insert(row, weight);
+            }
+        }
+        Ok(Self {
+            table,
+            prefix,
+            rows,
+        })
+    }
+
+    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
+        self.rows
+            .iter()
+            .map(|(row, weight)| (row.clone(), *weight))
+            .collect()
+    }
+
+    async fn apply_deltas(&mut self, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        let mut dirty = false;
+        for (row, diff) in deltas {
+            if *diff == 0 {
+                continue;
+            }
+            let previous = self.rows.get(row).copied().unwrap_or(0);
+            let next = previous.saturating_add(*diff);
+            let mut key = self.prefix.clone();
+            key.extend_from_slice(row);
+            if next == 0 {
+                self.rows.remove(row);
+                batch.delete(key);
+            } else {
+                self.rows.insert(row.clone(), next);
+                batch.put(key, next.to_le_bytes());
+            }
+            dirty = true;
+        }
+        if dirty && let Some(table) = self.table.as_ref() {
+            table.write_batch(batch).await?;
+        }
+        Ok(())
+    }
+}
+
+fn transient_helper_state_prefix(graph_id: &str, label: &str) -> Vec<u8> {
+    let mut prefix = b"floe/transient_helper_state/".to_vec();
+    prefix.extend_from_slice(graph_id.as_bytes());
+    prefix.push(b'/');
+    prefix.extend_from_slice(label.as_bytes());
+    prefix.push(b'/');
+    prefix
 }
 
 #[derive(Clone)]
@@ -3545,11 +3666,34 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
     // Keep orchestration durability decisions aligned with the builder by using the same
     // recursive source-root matcher here. Optimizer-inserted wrapper projections can otherwise
     // preserve the transient fast path in the builder while leaving durable outer streams enabled.
     if let Some(shape) = try_build_transient_source_root_materialization(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_name])));
+    }
+    if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
+        && shape
+            .steps
+            .iter()
+            .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
+    {
+        return Ok(Some(BTreeSet::from([
+            shape.left_source_root.source_name,
+            shape.right_source_root.source_name,
+        ])));
     }
 
     let persistence_policy = PersistencePolicy::for_plan(plan);
@@ -4311,7 +4455,7 @@ fn try_build_transient_source_root_materialization(
                 optimized_nodes, ..
             } => optimized_nodes.clone(),
         };
-        let transform = match shape {
+        let transform = match match shape {
             TransientSourceRootShape::Source { .. } => {
                 Ok(Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()))
                     as Arc<DeltaTransformFn>)
@@ -4321,7 +4465,17 @@ fn try_build_transient_source_root_materialization(
             TransientSourceRootShape::FilterMap {
                 select, project, ..
             } => build_filter_map_transform(&select, &project),
-        }?;
+        } {
+            Ok(transform) => transform,
+            Err(err) => {
+                tracing::debug!(
+                    root_idx,
+                    error = %err,
+                    "transient source root materialization declined"
+                );
+                return Ok(None);
+            }
+        };
         return Ok(Some(TransientSourceRootMaterialization {
             source_name,
             optimized_nodes,
@@ -4683,7 +4837,7 @@ fn try_build_transient_source_window_count_star_root_shape(
     }
 }
 
-fn try_build_transient_source_window_count_star_root_materialization(
+async fn try_build_transient_source_window_count_star_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,
     outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
@@ -4691,6 +4845,7 @@ fn try_build_transient_source_window_count_star_root_materialization(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     graph_id: &str,
+    state_table: Option<Arc<dyn KeyValueTable>>,
 ) -> Result<Option<TransientSourceWindowCountStarRootMaterialization>> {
     let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, root_idx)?
     else {
@@ -4711,7 +4866,10 @@ fn try_build_transient_source_window_count_star_root_materialization(
         watermark,
         cancel,
         task_events,
-    )?;
+        state_table,
+        "source_window_count_star",
+    )
+    .await?;
     Ok(Some(TransientSourceWindowCountStarRootMaterialization {
         source_name: shape.source_root.source_name,
         optimized_nodes: shape.optimized_nodes,
@@ -4817,6 +4975,7 @@ async fn try_build_transient_source_window_aggregate_root_materialization(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     graph_id: &str,
+    state_table: Option<Arc<dyn KeyValueTable>>,
 ) -> Result<Option<TransientSourceWindowAggregateRootMaterialization>> {
     let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, root_idx)?
     else {
@@ -4837,6 +4996,8 @@ async fn try_build_transient_source_window_aggregate_root_materialization(
         watermark,
         cancel,
         task_events,
+        state_table,
+        "source_window_aggregate",
     )
     .await?;
     Ok(Some(TransientSourceWindowAggregateRootMaterialization {
@@ -4853,6 +5014,7 @@ async fn try_build_transient_source_aggregate_root_materialization(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     graph_id: &str,
+    state_table: Option<Arc<dyn KeyValueTable>>,
 ) -> Result<Option<TransientSourceAggregateRootMaterialization>> {
     let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, root_idx)? else {
         return Ok(None);
@@ -4871,6 +5033,8 @@ async fn try_build_transient_source_aggregate_root_materialization(
         Arc::clone(&shape.transform),
         cancel,
         task_events,
+        state_table,
+        "source_aggregate",
     )
     .await?;
     Ok(Some(TransientSourceAggregateRootMaterialization {
@@ -4981,6 +5145,8 @@ async fn build_transient_aggregate_receiver(
     output_transform: Arc<DeltaTransformFn>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let upstream_rx = build_transient_source_receiver(
         graph_id,
@@ -4997,6 +5163,8 @@ async fn build_transient_aggregate_receiver(
         output_transform,
         cancel,
         task_events,
+        state_table,
+        state_label,
     )
     .await
 }
@@ -5008,6 +5176,8 @@ async fn build_transient_aggregate_receiver_from_batches(
     output_transform: Arc<DeltaTransformFn>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let (precompute_evaluator, aggregate_input_schema, aggregate_expression_columns) =
@@ -5016,6 +5186,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     let task_label = format!("transient-aggregate:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let state_label = state_label.into();
     let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if aggregate
         .aggregates()
@@ -5039,6 +5210,16 @@ async fn build_transient_aggregate_receiver_from_batches(
             .await
             .context("initialize transient count aggregate")?,
         );
+        let mut persistent_state =
+            PersistentTransientInputState::load(state_table.clone(), &graph_id, &state_label)
+                .await?;
+        let restored_deltas = persistent_state.snapshot_deltas();
+        if !restored_deltas.is_empty() {
+            aggregate_processor
+                .apply_deltas(restored_deltas)
+                .await
+                .context("restore transient count aggregate input state")?;
+        }
         let precompute_evaluator = precompute_evaluator.clone();
 
         tokio::spawn(async move {
@@ -5061,6 +5242,10 @@ async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -5122,6 +5307,16 @@ async fn build_transient_aggregate_receiver_from_batches(
             .context("initialize transient incremental aggregate")?,
         );
         aggregate_processor.enable_append_only_input().await;
+        let mut persistent_state =
+            PersistentTransientInputState::load(state_table.clone(), &graph_id, &state_label)
+                .await?;
+        let restored_deltas = persistent_state.snapshot_deltas();
+        if !restored_deltas.is_empty() {
+            aggregate_processor
+                .apply_deltas(restored_deltas)
+                .await
+                .context("restore transient incremental aggregate input state")?;
+        }
         let precompute_evaluator = precompute_evaluator.clone();
 
         tokio::spawn(async move {
@@ -5144,6 +5339,10 @@ async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -5188,7 +5387,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     Ok(rx)
 }
 
-fn build_transient_window_count_star_receiver(
+async fn build_transient_window_count_star_receiver(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
     upstream: TransientSourceHandleStream,
@@ -5197,6 +5396,8 @@ fn build_transient_window_count_star_receiver(
     watermark: Arc<AtomicI64>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let upstream_rx = build_transient_source_receiver(
         graph_id,
@@ -5214,10 +5415,13 @@ fn build_transient_window_count_star_receiver(
         watermark,
         cancel,
         task_events,
+        state_table,
+        state_label,
     )
+    .await
 }
 
-fn build_transient_window_count_star_receiver_from_batches(
+async fn build_transient_window_count_star_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
@@ -5225,6 +5429,8 @@ fn build_transient_window_count_star_receiver_from_batches(
     watermark: Arc<AtomicI64>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let (precompute_evaluator, eval_schema, expression_columns) =
@@ -5252,9 +5458,27 @@ fn build_transient_window_count_star_receiver_from_batches(
     let task_label = format!("transient-window-count-star:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let mut persistent_state =
+        PersistentTransientInputState::load(state_table, &graph_id, state_label.into()).await?;
+    let restored_deltas = persistent_state.snapshot_deltas();
     tokio::spawn(async move {
         let mut counts: HashMap<TransientWindowCountKey, i64> = HashMap::new();
         let mut eviction_schedule: BTreeMap<i64, Vec<TransientWindowCountKey>> = BTreeMap::new();
+        if let Err(err) = apply_transient_window_count_star_deltas(
+            restored_deltas,
+            group_key_columns.as_ref(),
+            time_column,
+            window_size,
+            window_slide,
+            transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
+            &mut counts,
+            &mut eviction_schedule,
+        )
+        .map(|_| ())
+        {
+            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+            return;
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -5274,85 +5498,26 @@ fn build_transient_window_count_star_receiver_from_batches(
                     } else {
                         input_deltas
                     };
-                    let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
-                    let mut grouped_deltas: HashMap<TransientWindowCountKey, i64> = HashMap::new();
-                    for (row, weight) in input_deltas {
-                        if weight == 0 {
-                            continue;
-                        }
-                        let extracted = match extract_encoded_row_columns_and_i64_like_column(
-                            &row,
-                            group_key_columns.as_ref(),
-                            time_column,
-                            false,
-                        ) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                report_graph_task_error(
-                                    &task_events,
-                                    &graph_id,
-                                    task_label.clone(),
-                                    err.context("extract transient window count-star row"),
-                                );
-                                return;
-                            }
-                        };
-                        let Some((key, event_ts)) = extracted else {
-                            continue;
-                        };
-                        if event_ts < 0 {
-                            continue;
-                        }
-                        if let Some(cutoff) = cutoff
-                            && event_ts < cutoff
-                        {
-                            continue;
-                        }
-                        transient_window_for_each_window(
-                            event_ts,
-                            window_size,
-                            window_slide,
-                            |window_start, window_end| {
-                                let window_key = TransientWindowCountKey {
-                                    start: window_start,
-                                    end: window_end,
-                                    key: key.clone(),
-                                };
-                                merge_i64_delta(&mut grouped_deltas, window_key, weight);
-                            },
-                        );
+                    if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        break;
                     }
-
-                    let mut updates: HashMap<(TransientWindowCountKey, i64), i64> = HashMap::new();
-                    for (key, delta) in grouped_deltas {
-                        if delta == 0 {
-                            continue;
-                        }
-                        let old_count = counts.get(&key).copied().unwrap_or(0);
-                        let new_count = old_count.saturating_add(delta);
-                        if old_count == new_count {
-                            continue;
-                        }
-                        if old_count != 0 {
-                            merge_count_delta(&mut updates, key.clone(), old_count, -1);
-                        }
-                        if new_count != 0 {
-                            merge_count_delta(&mut updates, key.clone(), new_count, 1);
-                            if old_count == 0 {
-                                eviction_schedule.entry(key.end).or_default().push(key.clone());
-                            }
-                            counts.insert(key, new_count);
-                        } else {
-                            counts.remove(&key);
-                        }
-                    }
-
-                    transient_window_evict_expired_counts(
-                        cutoff,
+                    let updates = match apply_transient_window_count_star_deltas(
+                        input_deltas,
+                        group_key_columns.as_ref(),
+                        time_column,
+                        window_size,
+                        window_slide,
+                        transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
                         &mut counts,
                         &mut eviction_schedule,
-                        &mut updates,
-                    );
+                    ) {
+                        Ok(updates) => updates,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
 
                     let encoded_output = match encode_transient_window_count_output_deltas(updates) {
                         Ok(deltas) => deltas,
@@ -5390,6 +5555,8 @@ async fn build_transient_window_incremental_receiver(
     watermark: Arc<AtomicI64>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let upstream_rx = build_transient_source_receiver(
         graph_id,
@@ -5407,6 +5574,8 @@ async fn build_transient_window_incremental_receiver(
         watermark,
         cancel,
         task_events,
+        state_table,
+        state_label,
     )
     .await
 }
@@ -5419,6 +5588,8 @@ async fn build_transient_window_incremental_receiver_from_batches(
     watermark: Arc<AtomicI64>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let (precompute_evaluator, eval_schema, expression_columns) =
@@ -5476,6 +5647,31 @@ async fn build_transient_window_incremental_receiver_from_batches(
     let task_label = format!("transient-window-aggregate:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let mut persistent_state =
+        PersistentTransientInputState::load(state_table, &graph_id, state_label.into()).await?;
+    let restored_deltas = persistent_state
+        .snapshot_deltas()
+        .into_iter()
+        .filter_map(
+            |(row, weight)| match decode_transient_window_aggregate_input_pair(&row) {
+                Ok(pair) => Some((pair, weight)),
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %graph_id,
+                        error = %err,
+                        "skipping malformed transient window aggregate input state row"
+                    );
+                    None
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    if !restored_deltas.is_empty() {
+        aggregate_processor
+            .apply_deltas(restored_deltas)
+            .await
+            .context("restore transient window aggregate input state")?;
+    }
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -5627,6 +5823,24 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             };
                             windowed_deltas.push(((encoded_key, row_value), weight));
                         }
+                    }
+                    let persisted_window_rows = windowed_deltas
+                        .iter()
+                        .map(|((window_key, row), weight)| {
+                            encode_transient_window_aggregate_input_pair(window_key, row)
+                                .map(|encoded| (encoded, *weight))
+                        })
+                        .collect::<Result<Vec<_>>>();
+                    let persisted_window_rows = match persisted_window_rows {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    };
+                    if let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        break;
                     }
                     let aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
                         Ok(deltas) => deltas,
@@ -6023,6 +6237,83 @@ fn transient_window_evict_expired_counts(
     }
 }
 
+fn apply_transient_window_count_star_deltas(
+    input_deltas: Vec<(Vec<u8>, i64)>,
+    group_key_columns: &[usize],
+    time_column: usize,
+    window_size: i64,
+    window_slide: i64,
+    cutoff: Option<i64>,
+    counts: &mut HashMap<TransientWindowCountKey, i64>,
+    eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+) -> Result<HashMap<(TransientWindowCountKey, i64), i64>> {
+    let mut grouped_deltas: HashMap<TransientWindowCountKey, i64> = HashMap::new();
+    for (row, weight) in input_deltas {
+        if weight == 0 {
+            continue;
+        }
+        let Some((key, event_ts)) = extract_encoded_row_columns_and_i64_like_column(
+            &row,
+            group_key_columns,
+            time_column,
+            false,
+        )
+        .context("extract transient window count-star row")?
+        else {
+            continue;
+        };
+        if event_ts < 0 {
+            continue;
+        }
+        if let Some(cutoff) = cutoff
+            && event_ts < cutoff
+        {
+            continue;
+        }
+        transient_window_for_each_window(event_ts, window_size, window_slide, |start, end| {
+            merge_i64_delta(
+                &mut grouped_deltas,
+                TransientWindowCountKey {
+                    start,
+                    end,
+                    key: key.clone(),
+                },
+                weight,
+            );
+        });
+    }
+
+    let mut updates: HashMap<(TransientWindowCountKey, i64), i64> = HashMap::new();
+    for (key, delta) in grouped_deltas {
+        if delta == 0 {
+            continue;
+        }
+        let old_count = counts.get(&key).copied().unwrap_or(0);
+        let new_count = old_count.saturating_add(delta);
+        if old_count == new_count {
+            continue;
+        }
+        if old_count != 0 {
+            merge_count_delta(&mut updates, key.clone(), old_count, -1);
+        }
+        if new_count != 0 {
+            merge_count_delta(&mut updates, key.clone(), new_count, 1);
+            if old_count == 0 {
+                eviction_schedule
+                    .entry(key.end)
+                    .or_default()
+                    .push(key.clone());
+            }
+            counts.insert(key, new_count);
+        } else {
+            counts.remove(&key);
+        }
+    }
+
+    transient_window_evict_expired_counts(cutoff, counts, eviction_schedule, &mut updates);
+    Ok(updates)
+}
+
 fn encode_transient_window_count_output_deltas(
     deltas: HashMap<(TransientWindowCountKey, i64), i64>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
@@ -6048,6 +6339,32 @@ fn encode_transient_window_bounds(start: i64, end: i64) -> Result<Vec<u8>> {
     encoded.push(0x03);
     encoded.extend_from_slice(&end.to_le_bytes());
     Ok(encoded)
+}
+
+fn encode_transient_window_aggregate_input_pair(window_key: &[u8], row: &[u8]) -> Result<Vec<u8>> {
+    let key_len =
+        u32::try_from(window_key.len()).context("transient window aggregate key too large")?;
+    let mut encoded = Vec::with_capacity(4 + window_key.len() + row.len());
+    encoded.extend_from_slice(&key_len.to_le_bytes());
+    encoded.extend_from_slice(window_key);
+    encoded.extend_from_slice(row);
+    Ok(encoded)
+}
+
+fn decode_transient_window_aggregate_input_pair(encoded: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    if encoded.len() < 4 {
+        bail!("transient window aggregate input pair missing key length");
+    }
+    let mut key_len = [0_u8; 4];
+    key_len.copy_from_slice(&encoded[..4]);
+    let key_len = u32::from_le_bytes(key_len) as usize;
+    if encoded.len() < 4 + key_len {
+        bail!("transient window aggregate input pair truncated");
+    }
+    Ok((
+        encoded[4..4 + key_len].to_vec(),
+        encoded[4 + key_len..].to_vec(),
+    ))
 }
 
 fn encode_count_aggregate_output_deltas(
@@ -6256,6 +6573,7 @@ fn try_build_transient_source_topn_root_materialization(
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     graph_id: &str,
+    state_table: Option<Arc<dyn KeyValueTable>>,
 ) -> Result<Option<TransientSourceTopNRootMaterialization>> {
     let Some(shape) = try_build_transient_source_topn_root_shape(plan, root_idx)? else {
         return Ok(None);
@@ -6274,6 +6592,8 @@ fn try_build_transient_source_topn_root_materialization(
         shape.output_projection.clone(),
         cancel,
         task_events,
+        state_table,
+        "source_topn",
     );
     Ok(Some(TransientSourceTopNRootMaterialization {
         source_name: shape.source_root.source_name,
@@ -6367,6 +6687,8 @@ fn build_transient_topn_receiver(
     output_projection: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
     let upstream_rx = build_transient_source_receiver(
         graph_id,
@@ -6384,6 +6706,8 @@ fn build_transient_topn_receiver(
         output_projection,
         cancel,
         task_events,
+        state_table,
+        state_label,
     )
 }
 
@@ -6395,17 +6719,36 @@ fn build_transient_topn_receiver_from_batches(
     output_projection: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
+    state_table: Option<Arc<dyn KeyValueTable>>,
+    state_label: impl Into<String>,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
     let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-topn:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let state_label = state_label.into();
     let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
         let mut processor = TransientDirectTop1Processor::new(graph_id.clone(), config);
         let output_projection = output_projection.clone();
+        let state_table = state_table.clone();
+        let state_label = state_label.clone();
         tokio::spawn(async move {
+            let mut persistent_state =
+                match PersistentTransientInputState::load(state_table, &graph_id, &state_label)
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        return;
+                    }
+                };
+            if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                return;
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -6414,6 +6757,10 @@ fn build_transient_topn_receiver_from_batches(
                             break;
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6458,7 +6805,28 @@ fn build_transient_topn_receiver_from_batches(
             let mut processor =
                 TransientDirectInt64TopNProcessor::new(graph_id.clone(), config, topn);
             let output_projection = output_projection.clone();
+            let state_table = state_table.clone();
+            let state_label = state_label.clone();
             tokio::spawn(async move {
+                let mut persistent_state =
+                    match PersistentTransientInputState::load(state_table, &graph_id, &state_label)
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(err) => {
+                            report_graph_task_error(
+                                &task_events,
+                                &graph_id,
+                                task_label.clone(),
+                                err,
+                            );
+                            return;
+                        }
+                    };
+                if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                    return;
+                }
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -6467,6 +6835,10 @@ fn build_transient_topn_receiver_from_batches(
                                 break;
                             };
                             let input_deltas = batch.deltas.as_ref().clone();
+                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
                             let output_deltas = match processor.apply_deltas(input_deltas) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
@@ -6520,7 +6892,23 @@ fn build_transient_topn_receiver_from_batches(
         let mut processor = TransientTop1Processor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let state_table = state_table.clone();
+        let state_label = state_label.clone();
         tokio::spawn(async move {
+            let mut persistent_state =
+                match PersistentTransientInputState::load(state_table, &graph_id, &state_label)
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        return;
+                    }
+                };
+            if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                return;
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -6540,6 +6928,10 @@ fn build_transient_topn_receiver_from_batches(
                         } else {
                             input_deltas
                         };
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6588,7 +6980,23 @@ fn build_transient_topn_receiver_from_batches(
             TransientAppendOnlyTopNProcessor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let state_table = state_table.clone();
+        let state_label = state_label.clone();
         tokio::spawn(async move {
+            let mut persistent_state =
+                match PersistentTransientInputState::load(state_table, &graph_id, &state_label)
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        return;
+                    }
+                };
+            if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                return;
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -6608,6 +7016,10 @@ fn build_transient_topn_receiver_from_batches(
                         } else {
                             input_deltas
                         };
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6661,7 +7073,23 @@ fn build_transient_topn_receiver_from_batches(
         );
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let state_table = state_table.clone();
+        let state_label = state_label.clone();
         tokio::spawn(async move {
+            let mut persistent_state =
+                match PersistentTransientInputState::load(state_table, &graph_id, &state_label)
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        return;
+                    }
+                };
+            if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                return;
+            }
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -6681,6 +7109,10 @@ fn build_transient_topn_receiver_from_batches(
                         } else {
                             input_deltas
                         };
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6723,8 +7155,22 @@ fn build_transient_topn_receiver_from_batches(
         TransientTopNProcessor::new(graph_id.clone(), topn, &key_layout, append_only_input);
     let precompute_evaluator = key_layout.precompute_evaluator.clone();
     let output_projection = output_projection.clone();
+    let state_table = state_table.clone();
+    let state_label = state_label.clone();
 
     tokio::spawn(async move {
+        let mut persistent_state =
+            match PersistentTransientInputState::load(state_table, &graph_id, &state_label).await {
+                Ok(state) => state,
+                Err(err) => {
+                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                    return;
+                }
+            };
+        if let Err(err) = processor.apply_deltas(persistent_state.snapshot_deltas()) {
+            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+            return;
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -6744,6 +7190,10 @@ fn build_transient_topn_receiver_from_batches(
                     } else {
                         input_deltas
                     };
+                    if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        break;
+                    }
                     let output_deltas = match processor.apply_deltas(input_deltas) {
                         Ok(deltas) => deltas,
                         Err(err) => {
@@ -6937,6 +7387,37 @@ mod tests {
     use crate::outer_stream::OuterStreamRegistry;
     use crate::source_decoder::SourceRowDecoder;
 
+    #[tokio::test]
+    async fn persistent_transient_input_state_roundtrips_coalesced_rows() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("persistent-transient-input-state", store)
+                .await
+                .expect("open db"),
+        );
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+
+        let mut state =
+            PersistentTransientInputState::load(Some(Arc::clone(&table)), "graph-a", "topn")
+                .await
+                .expect("load empty state");
+        state
+            .apply_deltas(&[
+                (b"row-1".to_vec(), 2),
+                (b"row-2".to_vec(), 1),
+                (b"row-1".to_vec(), -1),
+            ])
+            .await
+            .expect("apply deltas");
+
+        let reloaded = PersistentTransientInputState::load(Some(table), "graph-a", "topn")
+            .await
+            .expect("reload state");
+        let mut rows = reloaded.snapshot_deltas();
+        rows.sort();
+        assert_eq!(rows, vec![(b"row-1".to_vec(), 1), (b"row-2".to_vec(), 1)]);
+    }
+
     #[test]
     fn benchmark_join_shape_still_matches_transient_join_root() {
         let logical = benchmark_join_logical_plan();
@@ -7063,7 +7544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q4_join_aggregate_shape_is_not_source_batch_journal_eligible() {
+    async fn q4_join_aggregate_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT category, AVG(max) \
              FROM (SELECT MAX(b.price) AS max, a.category \
@@ -7076,11 +7557,12 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "join aggregate uses non-checkpointed transient aggregate helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
     }
 
@@ -7222,7 +7704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q12_window_count_star_shape_is_not_source_batch_journal_eligible() {
+    async fn q12_window_count_star_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT bidder, COUNT(*) AS bid_count \
              FROM nexmark_bid \
@@ -7232,16 +7714,17 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "window count-star fast path keeps non-checkpointed helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
         );
     }
 
     #[tokio::test]
-    async fn q5_window_count_star_shape_is_not_source_batch_journal_eligible() {
+    async fn q5_window_count_star_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT auction, COUNT(*) AS num \
              FROM nexmark_bid \
@@ -7251,16 +7734,17 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "window count-star fast path keeps non-checkpointed helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
         );
     }
 
     #[tokio::test]
-    async fn q7_window_incremental_shape_is_not_source_batch_journal_eligible() {
+    async fn q7_window_incremental_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT MAX(price) AS maxprice \
              FROM nexmark_bid \
@@ -7270,11 +7754,12 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "window aggregate fast path keeps non-checkpointed helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
         );
     }
 
@@ -7757,7 +8242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q6_join_topn_aggregate_shape_is_not_source_batch_journal_eligible() {
+    async fn q6_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT seller, AVG(price) AS moving_avg_price \
              FROM (SELECT a.seller, b.price, b.date_time, \
@@ -7771,16 +8256,17 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "join-topn-aggregate pipeline has non-checkpointed topn/aggregate helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
     }
 
     #[tokio::test]
-    async fn q6_alias_join_topn_aggregate_shape_is_not_source_batch_journal_eligible() {
+    async fn q6_alias_join_topn_aggregate_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid_aliases(
             "SELECT seller, AVG(price) AS moving_avg_price \
              FROM (SELECT a.seller, b.price, b.\"dateTime\", \
@@ -7794,16 +8280,17 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "join-topn-aggregate pipeline has non-checkpointed topn/aggregate helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
     }
 
     #[tokio::test]
-    async fn q9_alias_join_topn_shape_is_not_source_batch_journal_eligible() {
+    async fn q9_alias_join_topn_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid_aliases(
             "SELECT id, \"itemName\", description, \"initialBid\", reserve, \"dateTime\", expires, seller, category, extra, auction, bidder, price, \"bidTime\", \"bidExtra\" \
              FROM (SELECT a.id, a.\"itemName\", a.description, a.\"initialBid\", a.reserve, a.\"dateTime\", a.expires, a.seller, a.category, a.extra, \
@@ -7817,16 +8304,17 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "join-topn pipeline has non-checkpointed topn helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_auction".to_string(), "nexmark_bid".to_string()])
         );
     }
 
     #[tokio::test]
-    async fn q19_source_topn_shape_is_not_source_batch_journal_eligible() {
+    async fn q19_source_topn_shape_is_source_batch_journal_eligible() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \
              FROM (SELECT auction, bidder, price, channel, url, date_time AS \"dateTime\", extra, \
@@ -7838,11 +8326,12 @@ mod tests {
         let planner = DbspPlanBuilder::new(nexmark_config());
         let plan = planner.build(&logical).expect("circuit plan");
 
-        let transient_sources =
-            source_batch_journal_root_sources(&plan).expect("source batch journal root sources");
-        assert!(
-            transient_sources.is_none(),
-            "source topn fast path keeps non-checkpointed helper state"
+        let transient_sources = source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .expect("source batch journal root sources");
+        assert_eq!(
+            transient_sources,
+            BTreeSet::from(["nexmark_bid".to_string()])
         );
     }
 

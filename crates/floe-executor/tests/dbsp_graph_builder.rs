@@ -412,6 +412,7 @@ async fn filter_and_projection_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -509,6 +510,7 @@ async fn source_batch_journal_replay_recovers_overlay_view() {
             outer_handle_streams: &restarted_handle_streams,
             outer_transient_streams: &restarted_transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -617,6 +619,7 @@ async fn inner_join_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -717,6 +720,7 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -893,6 +897,7 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1024,6 +1029,7 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1124,6 +1130,7 @@ async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_sid
             outer_handle_streams: &restarted_handle_streams,
             outer_transient_streams: &restarted_transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1231,6 +1238,7 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1337,6 +1345,7 @@ async fn left_outer_join_materializes_null_extended_rows() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1428,6 +1437,7 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1560,6 +1570,7 @@ async fn aggregate_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1697,6 +1708,7 @@ async fn topn_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1766,6 +1778,7 @@ async fn topn_materializes_mv_from_transient_source_journal() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -1878,6 +1891,7 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2002,6 +2016,7 @@ async fn row_number_topn_append_only_source_journal_updates_boundary_across_tick
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2120,6 +2135,7 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2244,6 +2260,7 @@ async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2356,6 +2373,7 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2486,6 +2504,7 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2632,6 +2651,7 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2771,6 +2791,7 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -2921,6 +2942,7 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3006,6 +3028,7 @@ async fn source_projection_with_proctime_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3105,6 +3128,7 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3212,6 +3236,7 @@ async fn source_projection_with_regexp_extract_materializes_from_transient_sourc
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3329,6 +3354,7 @@ async fn source_projection_with_split_index_materializes_from_transient_source_j
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3440,6 +3466,7 @@ async fn distinct_materializes_unique_rows() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3542,6 +3569,7 @@ async fn count_distinct_aggregate_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3641,6 +3669,7 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3754,6 +3783,7 @@ async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -3923,6 +3953,7 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4067,6 +4098,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4084,6 +4116,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4185,6 +4218,7 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4287,6 +4321,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
                 outer_handle_streams: &handle_streams,
                 outer_transient_streams: &transient_streams,
                 enable_source_batch_journal: false,
+                restore_transient_helper_state: false,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
                 watermark: Arc::new(AtomicI64::new(-1)),
             })
@@ -4311,6 +4346,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4374,6 +4410,7 @@ async fn cancel_stops_materialized_view_updates() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4462,6 +4499,7 @@ async fn graph_task_error_is_reported() {
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })
@@ -4771,6 +4809,7 @@ async fn build_window_plan_rows(
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
             enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
             mv_retention: StreamRetention::KeepLast { keep_last: 1 },
             watermark: Arc::new(AtomicI64::new(-1)),
         })

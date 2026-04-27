@@ -815,6 +815,7 @@ impl DbspGraphBuilder {
         output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
         output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
         task_events: &GraphTaskSender,
+        restore_transient_state: bool,
     ) -> Result<()> {
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
@@ -1142,7 +1143,7 @@ impl DbspGraphBuilder {
             left_transient,
             right_transient,
             true,
-            Some(format!("{}_transient_join_root", graph_id)),
+            restore_transient_state.then(|| format!("{}_transient_join_root", graph_id)),
             left_key,
             right_key,
             |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true },

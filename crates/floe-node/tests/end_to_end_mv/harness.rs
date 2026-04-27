@@ -94,6 +94,7 @@ impl MvTestHarness {
                 outer_handle_streams: &handle_streams,
                 outer_transient_streams: &transient_streams,
                 enable_source_batch_journal: false,
+                restore_transient_helper_state: false,
                 mv_retention: StreamRetention::KeepLast { keep_last: 1 },
                 watermark: Arc::new(AtomicI64::new(-1)),
             })

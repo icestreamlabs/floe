@@ -1236,6 +1236,7 @@ enum CompiledScalarFunction {
     CountChar,
     DateFormat,
     Lower,
+    Proctime,
     RegexpExtract,
     SplitIndex,
 }
@@ -1250,6 +1251,8 @@ impl CompiledScalarFunction {
             Some(Self::DateFormat)
         } else if name.eq_ignore_ascii_case("lower") {
             Some(Self::Lower)
+        } else if name.eq_ignore_ascii_case("proctime") {
+            Some(Self::Proctime)
         } else if name.eq_ignore_ascii_case("regexp_extract") {
             Some(Self::RegexpExtract)
         } else if name.eq_ignore_ascii_case("split_index") {
@@ -1265,6 +1268,7 @@ impl CompiledScalarFunction {
             Self::CountChar => 2,
             Self::DateFormat => 2,
             Self::Lower => 1,
+            Self::Proctime => 0,
             Self::RegexpExtract => 3,
             Self::SplitIndex => 3,
         }
@@ -1296,6 +1300,10 @@ impl CompiledScalarFunction {
                 }
                 Ok(Arc::new(output))
             }
+            Self::Proctime => Ok(Arc::new(vec![
+                CompiledValue::TimestampMillis(None);
+                row_count
+            ])),
             Self::CountChar => {
                 let text = args
                     .first()
