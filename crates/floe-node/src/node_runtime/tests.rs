@@ -447,14 +447,25 @@ fn source_journal_auto_skips_replayable_connector_sources() {
     )
     .expect("source")
     .with_property("connector.http.type", "http");
+    let file = SourceDefinition::new(
+        "file_source",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("source")
+    .with_property("connector.file.type", "file");
     let mut registry = SourceRegistry::new();
     registry.register(kafka);
     registry.register(http);
-    let transient = BTreeSet::from(["kafka_source".to_string(), "http_source".to_string()]);
+    registry.register(file);
+    let transient = BTreeSet::from([
+        "file_source".to_string(),
+        "http_source".to_string(),
+        "kafka_source".to_string(),
+    ]);
 
     assert_eq!(
         source_journal_required_sources(&registry, &transient, SourceJournalConfig::Auto),
-        BTreeSet::from(["http_source".to_string()])
+        BTreeSet::from(["file_source".to_string(), "http_source".to_string()])
     );
     assert_eq!(
         source_journal_required_sources(&registry, &transient, SourceJournalConfig::Full),

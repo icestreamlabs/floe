@@ -22,12 +22,7 @@ pub(super) fn source_journal_required_sources(
 
 fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
     definition.properties().iter().any(|(key, value)| {
-        key.starts_with("connector.") && key.ends_with(".type") && {
-            matches!(
-                value.as_str(),
-                "kafka" | "postgres_cdc" | "file" | "object_store"
-            )
-        }
+        key.starts_with("connector.") && key.ends_with(".type") && value.as_str() == "kafka"
     })
 }
 
@@ -725,6 +720,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .cloned()
         .map(|cursor| (cursor.sink.clone(), cursor))
         .collect();
+    let recovered_kafka_offsets = recovered_tick_commit
+        .as_ref()
+        .map(|commit| commit.kafka_offsets.clone())
+        .unwrap_or_default();
 
     for (connector_id, connector) in connector_specs.into_iter().enumerate() {
         let sender = core_source::routed_sender(
@@ -785,6 +784,27 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let default_source_id = default_source
                     .as_deref()
                     .and_then(|source| source_id_by_name.get(source).copied());
+                let connector_has_recovered_offsets = recovered_kafka_offsets
+                    .iter()
+                    .any(|offset| topics.iter().any(|topic| topic == &offset.topic));
+                let should_replay_from_kafka = connector_has_recovered_offsets
+                    && (default_source
+                        .as_ref()
+                        .is_some_and(|source| source_journal_skipped_sources.contains(source))
+                        || default_source.is_none() && !source_journal_skipped_sources.is_empty());
+                let replay_from_beginning_offsets = if should_replay_from_kafka {
+                    recovered_kafka_offsets
+                        .iter()
+                        .filter(|offset| topics.iter().any(|topic| topic == &offset.topic))
+                        .map(|offset| KafkaTopicPartitionOffset {
+                            topic: offset.topic.clone(),
+                            partition: offset.partition,
+                            offset: offset.offset,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
@@ -802,6 +822,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         max_messages_per_tick,
                         message_format: format,
                         commit_offsets_rx: Some(commit_rx),
+                        replay_from_beginning_offsets,
                     };
                     let mut connector = match KafkaConnector::new(
                         config,
@@ -1042,6 +1063,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 committed_source_offsets.insert(key.clone(), offset.offset);
                 latest_source_offsets.insert(key, offset.offset);
                 metrics::record_source_offset_lag(&offset.source, offset.partition, 0);
+            }
+            for offset in &existing_commit.kafka_offsets {
+                committed_kafka_offsets.insert(
+                    (Arc::<str>::from(offset.topic.as_str()), offset.partition),
+                    offset.offset,
+                );
             }
             let now_ms = current_unix_time_ms();
             let age_secs = now_ms.saturating_sub(existing_commit.committed_at_unix_ms) / 1_000;
@@ -1395,13 +1422,32 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
             let frontier = next_watermark.max(0).try_into().unwrap_or(0_u64);
             let mv_versions = collect_mv_versions_for_commit(&mv_for_task, &mut last_mv_versions);
+            let mut next_committed_kafka_offsets = committed_kafka_offsets.clone();
+            advance_kafka_offset_commit_state(
+                &mut next_committed_kafka_offsets,
+                &tick_kafka_offsets,
+            );
+            let mut kafka_offsets = next_committed_kafka_offsets
+                .iter()
+                .map(|((topic, partition), offset)| KafkaCheckpointOffset {
+                    topic: topic.to_string(),
+                    partition: *partition,
+                    offset: *offset,
+                })
+                .collect::<Vec<_>>();
+            kafka_offsets.sort_by(|left, right| {
+                left.topic
+                    .cmp(&right.topic)
+                    .then(left.partition.cmp(&right.partition))
+            });
             let tick_commit = TickCommit::new(
                 epoch,
                 frontier,
                 checkpoint_manager.snapshot_offsets(),
                 mv_versions.clone(),
                 checkpoint_manager.snapshot_sink_cursors(),
-            );
+            )
+            .with_kafka_offsets(kafka_offsets);
             let committed_at_ms = tick_commit.committed_at_unix_ms;
             let source_journal_commit_batches: Vec<_> = source_journal_batches
                 .iter()

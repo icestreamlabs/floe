@@ -57,6 +57,7 @@ async fn kafka_connector_ingests_messages() {
         max_messages_per_tick: 16,
         message_format: None,
         commit_offsets_rx: None,
+        replay_from_beginning_offsets: Vec::new(),
     };
     let mut connector =
         KafkaConnector::new(config, Vec::new(), HashMap::new()).expect("connector config");

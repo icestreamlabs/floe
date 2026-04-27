@@ -145,6 +145,13 @@ pub struct SinkCursor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KafkaCheckpointOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TickCommit {
     pub tick_id: u64,
     pub frontier: Timestamp,
@@ -154,6 +161,8 @@ pub struct TickCommit {
     pub mv_versions: Vec<MaterializedViewTickVersion>,
     #[serde(default)]
     pub sink_cursors: Vec<SinkCursor>,
+    #[serde(default)]
+    pub kafka_offsets: Vec<KafkaCheckpointOffset>,
     pub committed_at_unix_ms: u64,
 }
 
@@ -171,8 +180,14 @@ impl TickCommit {
             source_offsets,
             mv_versions,
             sink_cursors,
+            kafka_offsets: Vec::new(),
             committed_at_unix_ms: current_unix_time_ms(),
         }
+    }
+
+    pub fn with_kafka_offsets(mut self, kafka_offsets: Vec<KafkaCheckpointOffset>) -> Self {
+        self.kafka_offsets = kafka_offsets;
+        self
     }
 }
 
@@ -851,6 +866,27 @@ mod tests {
         assert_eq!(entries[0].tick_id, commit.tick_id);
         assert_eq!(entries[0].max_event_time_ms, Some(456));
         assert_eq!(entries[0].deltas, vec![(b"encoded".to_vec(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn tick_commit_roundtrips_kafka_offsets() {
+        let mut manager = checkpoint_manager("tick-kafka-offsets").await;
+        let commit = TickCommit::new(7, 123, Vec::new(), Vec::new(), Vec::new())
+            .with_kafka_offsets(vec![KafkaCheckpointOffset {
+                topic: "topic_a".to_string(),
+                partition: 2,
+                offset: 42,
+            }]);
+
+        manager
+            .persist_tick_commit(commit.clone())
+            .await
+            .expect("persist tick commit");
+
+        let reloaded = CheckpointManager::new("tick-kafka-offsets", manager.store().table())
+            .await
+            .expect("reload checkpoint manager");
+        assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
     }
 
     #[tokio::test]

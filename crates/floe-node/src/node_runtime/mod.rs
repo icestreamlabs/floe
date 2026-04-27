@@ -16,7 +16,7 @@ use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
-    CheckpointManager, MaterializedViewTickVersion, SinkCursor, TickCommit,
+    CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
 };
 use floe_executor::source_journal::SourceBatchJournal;
 use floe_executor::{
