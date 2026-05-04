@@ -2072,6 +2072,17 @@ impl TransientAppendOnlyTopNProcessor {
         Ok(output_deltas)
     }
 
+    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
+        self.partitions
+            .values()
+            .flat_map(|state| {
+                state.visible_rows.iter().filter_map(|(order_key, weight)| {
+                    (*weight > 0).then_some((order_key.tie_breaker.clone(), *weight))
+                })
+            })
+            .collect()
+    }
+
     fn apply_positive_delta(
         state: &mut TransientAppendOnlyTopNPartitionState,
         order_key: TransientTopNKey,
@@ -7308,9 +7319,11 @@ fn build_transient_topn_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
+                        if !compact_append_only_state {
+                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
                         }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
@@ -7319,6 +7332,12 @@ fn build_transient_topn_receiver_from_batches(
                                 break;
                             }
                         };
+                        if compact_append_only_state {
+                            if let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
                                 Ok(deltas) => deltas,
