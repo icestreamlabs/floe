@@ -20,6 +20,7 @@ pub mod incremental_aggregate;
 pub mod join;
 pub mod map;
 mod metrics;
+pub mod operator_state_registry;
 pub mod operators;
 pub mod relation_state;
 pub mod semijoin;
@@ -45,6 +46,9 @@ pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use incremental_aggregate::{DbspIncrementalAggregate, DbspTransientIncrementalAggregate};
 pub use join::DbspJoin;
 pub use map::DbspMap;
+pub use operator_state_registry::{
+    OperatorStateHandle, install_operator_state_restore, snapshot_operator_states,
+};
 pub use operators::aggregate::{AggregateOp, AggregateSpec};
 pub use operators::asof_join::AsofJoinOp;
 pub use operators::consolidate::ConsolidateOp;

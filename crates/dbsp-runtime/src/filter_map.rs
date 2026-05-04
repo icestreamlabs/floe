@@ -24,6 +24,10 @@ use crate::stream::util::{
     publish_scheduled_value, publish_transient_zset_batch, push_value_in_place,
 };
 
+type FilterMapTransform<K, R> = Arc<dyn Fn(&K) -> Option<R> + Send + Sync>;
+type FilterMapBatchTransform<K, R> =
+    Arc<dyn Fn(&[(K, i64)]) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>;
+
 /// Filter+map wrapper that evaluates a fused row transform over handle streams.
 /// The transform returns `None` to drop a row or `Some(mapped_key)` to emit it.
 pub struct DbspFilterMap {
@@ -305,7 +309,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    transform: Arc<dyn Fn(&K) -> Option<R> + Send + Sync>,
+    transform: FilterMapTransform<K, R>,
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
@@ -422,7 +426,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    transform: Arc<dyn Fn(&[(K, i64)]) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>,
+    transform: FilterMapBatchTransform<K, R>,
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,

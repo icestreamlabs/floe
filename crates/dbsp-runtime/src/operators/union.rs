@@ -141,7 +141,7 @@ where
                 let entry = merged.entry(key.clone()).or_insert(0);
                 *entry += *delta;
                 if *entry == 0 {
-                    merged.remove(&key);
+                    merged.remove(key);
                 }
             }
         }

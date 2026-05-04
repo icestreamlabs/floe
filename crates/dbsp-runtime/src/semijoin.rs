@@ -133,10 +133,64 @@ impl DbspSemiJoin {
         KL: Fn(&[(L, i64)]) -> Vec<(K, L, i64)> + Send + Sync + Clone + 'static,
         KR: Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync + Clone + 'static,
     {
+        Self::new_batch_with_state_namespace(
+            left,
+            right,
+            None,
+            left_key,
+            right_key,
+            mode,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch_with_state_namespace<L, R, K, KL, KR>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        left_key: KL,
+        right_key: KR,
+        mode: SemiJoinMode,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<Self>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&[(L, i64)]) -> Vec<(K, L, i64)> + Send + Sync + Clone + 'static,
+        KR: Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync + Clone + 'static,
+    {
         let table = left.table();
         let frontier = left.current_time().max(right.current_time());
         let horizon = left.semantic_horizon().max(right.semantic_horizon());
-        let semijoin_id = NEXT_SEMIJOIN_ID.fetch_add(1, Ordering::Relaxed);
+        let semijoin_id = state_namespace
+            .unwrap_or_else(|| NEXT_SEMIJOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
         let left_state =
             RelationState::empty(table.clone(), format!("semijoin_left_state_{semijoin_id}"))
@@ -162,6 +216,14 @@ impl DbspSemiJoin {
             table.clone(),
             format!("semijoin_right_index_{semijoin_id}"),
         );
+        left_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed left semijoin index")?;
+        right_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed right semijoin index")?;
 
         let semijoin_op = Arc::new(AsyncMutex::new(SemiJoinOp::new_batch(
             left_state,

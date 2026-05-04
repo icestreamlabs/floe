@@ -836,7 +836,7 @@ where
                 let new_state = if recompute_keys.contains(&key) {
                     self.recompute_group_state(&key)
                         .await
-                        .with_context(|| format!("recompute incremental aggregate state for key"))?
+                        .context("recompute incremental aggregate state for key")?
                 } else {
                     let mut next = old_state.clone().unwrap_or_else(|| zero_state.clone());
                     if let Some(updates) = aggregated_updates_by_key.get(&key) {
@@ -1152,17 +1152,8 @@ where
         }
 
         let mut state = GroupedIncrementalAggregateState::zero(&self.slot_kinds);
-        let mut distinct_weights: Vec<HashMap<AggregateValue, i64>> = self
-            .slot_kinds
-            .iter()
-            .map(|kind| {
-                if matches!(kind, IncrementalAggregateSlotKind::CountDistinct) {
-                    HashMap::new()
-                } else {
-                    HashMap::new()
-                }
-            })
-            .collect();
+        let mut distinct_weights: Vec<HashMap<AggregateValue, i64>> =
+            self.slot_kinds.iter().map(|_| HashMap::new()).collect();
 
         let row_updates = (self.row_evaluator)(&values);
         for (_value, row_update, weight) in row_updates {

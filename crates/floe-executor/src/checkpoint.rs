@@ -163,6 +163,8 @@ pub struct TickCommit {
     pub sink_cursors: Vec<SinkCursor>,
     #[serde(default)]
     pub kafka_offsets: Vec<KafkaCheckpointOffset>,
+    #[serde(default)]
+    pub operator_states: Vec<DbspHandleRecord>,
     pub committed_at_unix_ms: u64,
 }
 
@@ -181,12 +183,18 @@ impl TickCommit {
             mv_versions,
             sink_cursors,
             kafka_offsets: Vec::new(),
+            operator_states: Vec::new(),
             committed_at_unix_ms: current_unix_time_ms(),
         }
     }
 
     pub fn with_kafka_offsets(mut self, kafka_offsets: Vec<KafkaCheckpointOffset>) -> Self {
         self.kafka_offsets = kafka_offsets;
+        self
+    }
+
+    pub fn with_operator_states(mut self, operator_states: Vec<DbspHandleRecord>) -> Self {
+        self.operator_states = operator_states;
         self
     }
 }
@@ -510,11 +518,15 @@ impl CheckpointManager {
         mv_registry: &MaterializedViewRegistry,
         outer_registry: &OuterStreamRegistry,
     ) -> Result<CheckpointManifest> {
+        let mut dbsp_handles = Vec::new();
+        if let Some(commit) = self.latest_tick_commit.as_ref() {
+            dbsp_handles.extend(commit.operator_states.clone());
+        }
         let mut manifest = CheckpointManifest {
             id: self.next_id,
             watermark,
             format: ManifestFormat::V2,
-            dbsp_handles: Vec::new(),
+            dbsp_handles,
             source_offsets: self.snapshot_offsets(),
             operator_states: Vec::new(),
             materialized_views: materialized_view_entries(mv_registry),
@@ -884,6 +896,25 @@ mod tests {
             .expect("persist tick commit");
 
         let reloaded = CheckpointManager::new("tick-kafka-offsets", manager.store().table())
+            .await
+            .expect("reload checkpoint manager");
+        assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
+    }
+
+    #[tokio::test]
+    async fn tick_commit_roundtrips_operator_state_handles() {
+        let mut manager = checkpoint_manager("tick-operator-state").await;
+        let commit =
+            TickCommit::new(9, 321, Vec::new(), Vec::new(), Vec::new()).with_operator_states(vec![
+                DbspHandleRecord::operator_state("aggregate_state_0", "aggregate_state_0", 7),
+            ]);
+
+        manager
+            .persist_tick_commit(commit.clone())
+            .await
+            .expect("persist tick commit");
+
+        let reloaded = CheckpointManager::new("tick-operator-state", manager.store().table())
             .await
             .expect("reload checkpoint manager");
         assert_eq!(reloaded.latest_tick_commit(), Some(&commit));

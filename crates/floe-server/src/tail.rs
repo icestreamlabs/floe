@@ -114,7 +114,7 @@ fn encode_tail_row(
                 col_idx + field_offset
             ))
         })?;
-        encode_arrow_value(array, field.as_ref(), pg_field, row_idx, &mut encoder)?;
+        encode_arrow_value(array, field, pg_field, row_idx, &mut encoder)?;
     }
     Ok(encoder.take_row())
 }

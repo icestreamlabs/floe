@@ -20,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator, decode, encode};
 use crate::storage::segment::{ArrowSegmentStore, SegmentWriteStats, encode_segment_envelope};
+use crate::{handles::ZSetHandle, operator_state_registry};
 
 use super::indexed_batch_zset::{ApplyDeltaMetrics, RangeKey};
 
@@ -31,6 +32,10 @@ const SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 128;
 type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 type ValueWeightMap = FastMap<Vec<u8>, i64>;
 type TypedValueWeightMap<T> = FastMap<T, i64>;
+type RowPosting = (u32, i64);
+type RangePostingKey = (Vec<u8>, Vec<u8>);
+type SegmentPostings = Vec<RowPosting>;
+type SegmentRefsByKey = FastMap<Vec<u8>, FastMap<u64, SegmentPostings>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexedStatePersistence {
@@ -72,6 +77,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    namespace: String,
     table: Arc<dyn KeyValueTable>,
     segment_store: ArrowSegmentStore,
     schema: SchemaRef,
@@ -223,6 +229,7 @@ where
         ]));
 
         Self {
+            namespace: namespace.clone(),
             segment_store: ArrowSegmentStore::new(
                 table.clone(),
                 format!("indexed_batch_arrow/{namespace}"),
@@ -244,6 +251,21 @@ where
             persistence,
             _marker: PhantomData,
         }
+    }
+
+    pub async fn restore_committed_checkpoint(&self) -> Result<()> {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Ok(());
+        }
+        let Some(handle) = operator_state_registry::restored_operator_state(&self.namespace) else {
+            let next_segment_id = self.read_next_segment_id().await?;
+            self.record_checkpoint(next_segment_id);
+            return Ok(());
+        };
+        let next_segment_id = handle.version.max(1);
+        self.truncate_to_next_segment(next_segment_id).await?;
+        self.record_checkpoint(next_segment_id);
+        Ok(())
     }
 
     pub async fn apply_deltas<I>(&self, deltas: I) -> Result<()>
@@ -380,6 +402,7 @@ where
             .write_batch(write_batch)
             .await
             .context("persist Arrow-index segment and postings")?;
+        self.record_checkpoint(segment_id.saturating_add(1));
 
         self.insert_segment_cache(
             segment_id,
@@ -410,7 +433,7 @@ where
         let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
         let mut key_postings: FastMap<Vec<u8>, Vec<(u32, i64)>> = FastMap::default();
-        let mut range_postings: FastMap<(Vec<u8>, Vec<u8>), Vec<(u32, i64)>> = FastMap::default();
+        let mut range_postings: FastMap<RangePostingKey, SegmentPostings> = FastMap::default();
         let mut reverse_postings: FastMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = FastMap::default();
         let mut min_hash = u64::MAX;
         let mut max_hash = 0_u64;
@@ -478,7 +501,7 @@ where
             self.segment_sequence_key.clone(),
             segment_id.saturating_add(1).to_be_bytes(),
         );
-        write_batch.put(self.range_format_key.clone(), b"v2".to_vec());
+        write_batch.put(self.range_format_key.clone(), b"v2");
 
         write_batch.put(
             self.segment_store.key_for_segment(segment_id),
@@ -513,6 +536,7 @@ where
             .write_batch(write_batch)
             .await
             .context("persist Arrow-index segment and postings")?;
+        self.record_checkpoint(segment_id.saturating_add(1));
 
         self.insert_segment_cache(
             segment_id,
@@ -664,7 +688,7 @@ where
             }
         }
 
-        let mut refs_by_key: FastMap<Vec<u8>, FastMap<u64, Vec<(u32, i64)>>> = FastMap::default();
+        let mut refs_by_key: SegmentRefsByKey = FastMap::default();
         for (entry_key, entry_value) in self
             .table
             .scan_range_bytes(
@@ -843,6 +867,92 @@ where
                 .extend(decode_index_postings(&entry_value)?);
         }
         Ok(refs)
+    }
+
+    async fn truncate_to_next_segment(&self, next_segment_id: u64) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(self.segment_sequence_key.clone(), next_segment_id.to_be_bytes());
+
+        for segment_id in self
+            .segment_store
+            .list_segment_ids()
+            .await
+            .context("list Arrow-index segments for checkpoint truncate")?
+        {
+            if segment_id >= next_segment_id {
+                batch.delete(self.segment_store.key_for_segment(segment_id));
+            }
+        }
+
+        self.delete_postings_at_or_after(&mut batch, &self.index_prefix, next_segment_id, |key| {
+            self.decode_index_key(key).map(|(_, segment_id)| segment_id)
+        })
+        .await?;
+        self.delete_postings_at_or_after(&mut batch, &self.reverse_prefix, next_segment_id, |key| {
+            self.decode_reverse_key(key).map(|(_, segment_id)| segment_id)
+        })
+        .await?;
+        self.delete_postings_at_or_after(&mut batch, &self.range_prefix, next_segment_id, |key| {
+            segment_id_from_key_suffix(key)
+        })
+        .await?;
+
+        self.table
+            .write_batch(batch)
+            .await
+            .context("truncate Arrow-index to committed checkpoint")?;
+        self.clear_caches()?;
+        Ok(())
+    }
+
+    async fn delete_postings_at_or_after<F>(
+        &self,
+        batch: &mut WriteBatch,
+        prefix: &[u8],
+        next_segment_id: u64,
+        decode_segment_id: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<u64>,
+    {
+        for (key, _) in self
+            .table
+            .scan_prefix(prefix, &ScanOptions::default())
+            .await
+            .context("scan Arrow-index postings for checkpoint truncate")?
+        {
+            let segment_id = decode_segment_id(&key)?;
+            if segment_id >= next_segment_id {
+                batch.delete(key);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_checkpoint(&self, next_segment_id: u64) {
+        operator_state_registry::record_operator_state(
+            self.namespace.clone(),
+            ZSetHandle {
+                ns: self.namespace.clone(),
+                version: next_segment_id,
+            },
+        );
+    }
+
+    fn clear_caches(&self) -> Result<()> {
+        for shard in &self.lookup_cache_shards {
+            shard
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index lookup cache shard poisoned"))?
+                .clear();
+        }
+        for shard in &self.segment_cache_shards {
+            shard
+                .lock()
+                .map_err(|_| anyhow!("Arrow-index segment cache shard poisoned"))?
+                .clear();
+        }
+        Ok(())
     }
 
     async fn segment_refs_for_value(
@@ -1451,6 +1561,13 @@ fn decode_u64_payload(bytes: &[u8]) -> Result<u64> {
         .get(0..8)
         .ok_or_else(|| anyhow!("expected 8 bytes for Arrow-index u64 payload"))?;
     Ok(u64::from_be_bytes(chunk.try_into().unwrap()))
+}
+
+fn segment_id_from_key_suffix(key: &[u8]) -> Result<u64> {
+    let segment_bytes = key
+        .get(key.len().saturating_sub(8)..)
+        .ok_or_else(|| anyhow!("Arrow-index key missing segment id suffix"))?;
+    Ok(u64::from_be_bytes(segment_bytes.try_into().unwrap()))
 }
 
 #[cfg(test)]

@@ -222,7 +222,6 @@ impl DbspIncrementalAggregate {
         stream.flush().await?;
         {
             let mut op_guard = aggregate_op.lock().await;
-            op_guard.state.enable_live_replayable();
             op_guard.enable_live_output_replayable();
         }
 
@@ -382,7 +381,6 @@ where
             distinct_index,
             input_index,
         );
-        op.state.enable_live_replayable();
         op.enable_live_output_replayable();
 
         Ok(Self {

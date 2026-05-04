@@ -922,7 +922,7 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_join(join, left, right, cancel, task_events)
+                self.compile_join(node_idx, join, left, right, cancel, task_events)
                     .await?
             }
             DbspNodeKind::Aggregate(aggregate) => {

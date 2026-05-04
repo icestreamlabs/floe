@@ -601,7 +601,6 @@ impl DbspWindowCountStarAggregate {
         stream.flush().await?;
         {
             let mut op_guard = window_op.lock().await;
-            op_guard.state.enable_live_replayable();
             op_guard.enable_live_output_replayable();
         }
 

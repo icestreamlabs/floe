@@ -328,7 +328,7 @@ where
                 }
                 let mut cache = self.cache.lock().unwrap();
                 cache.remember(encoded_key, id);
-                return Ok(id);
+                Ok(id)
             }
             LookupExistingResult::Missing { first_free_slot } => {
                 {

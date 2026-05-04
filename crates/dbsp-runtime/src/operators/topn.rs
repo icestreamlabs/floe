@@ -25,6 +25,7 @@ type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
 type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
+type PartitionOrderIndex<K, P, O> = BTreeMap<P, BTreeMap<(O, K), i64>>;
 
 /// Top-N operator that applies row-number semantics: it counts multiplicity and
 /// supports OFFSET, matching ORDER BY/LIMIT/OFFSET behavior.
@@ -51,7 +52,7 @@ where
     output_cache: HashMap<K, i64>,
     partition_output_cache: BTreeMap<P, HashMap<K, i64>>,
     // In-memory ordering index for top-N row semantics; rebuilt from storage on restart.
-    order_index: Option<BTreeMap<P, BTreeMap<(O, K), i64>>>,
+    order_index: Option<PartitionOrderIndex<K, P, O>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
     key_parts: BatchKeyPartsFn<K, P, O>,
     limit: usize,
@@ -385,7 +386,7 @@ where
             let entry = delta_map.entry(key.clone()).or_insert(0);
             *entry += *diff_weight;
             if *entry == 0 {
-                delta_map.remove(&key);
+                delta_map.remove(key);
             }
         }
 

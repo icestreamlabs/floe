@@ -1845,6 +1845,7 @@ dependencies = [
  "object_store",
  "prometheus",
  "rkyv 0.8.12",
+ "serde",
  "slatedb",
  "tokio",
  "tracing",

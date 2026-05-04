@@ -134,6 +134,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_builtin_time_stream<T>(
     table: Arc<dyn crate::storage::KeyValueTable>,
     group: Arc<dyn AbelianGroup<T>>,

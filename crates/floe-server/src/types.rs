@@ -27,7 +27,7 @@ pub(super) fn encode_stream_row(
         let pg_field = fields
             .get(col_idx)
             .ok_or_else(|| user_error(format!("missing field metadata for column {col_idx}")))?;
-        encode_arrow_value(array, field.as_ref(), pg_field, row_idx, &mut encoder)?;
+        encode_arrow_value(array, field, pg_field, row_idx, &mut encoder)?;
     }
     Ok(encoder.take_row())
 }

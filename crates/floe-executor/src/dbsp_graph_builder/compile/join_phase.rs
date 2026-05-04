@@ -85,6 +85,7 @@ impl DbspGraphBuilder {
 
     pub(crate) async fn compile_join(
         &mut self,
+        node_idx: usize,
         node: &DbspJoinNode,
         left: DeltaHandleStream,
         right: DeltaHandleStream,
@@ -103,6 +104,7 @@ impl DbspGraphBuilder {
             ));
         }
         let graph_id = self.graph_id().to_string();
+        let join_state_namespace = format!("{graph_id}_join_{node_idx}");
         let join_events = task_events.clone();
         let join_graph_id = graph_id.clone();
         let join_label = format!("join:{graph_id}");
@@ -428,17 +430,19 @@ impl DbspGraphBuilder {
             }
         };
 
-        let join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-            &left_join_input,
-            &right_join_input,
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            Some(join_error_handler),
-        )
-        .await
-        .context("initialize DBSP join")?;
+        let join =
+            DbspJoin::new_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+                &left_join_input,
+                &right_join_input,
+                Some(join_state_namespace.clone()),
+                left_key,
+                right_key,
+                predicate,
+                projector,
+                Some(join_error_handler),
+            )
+            .await
+            .context("initialize DBSP join")?;
         // Log the first output handles, if any, to verify join activity.
         let mut join_cursor = StreamCursor::new(join.stream().stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {
@@ -606,16 +610,18 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let antijoin = DbspSemiJoin::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-                &left_join_input,
-                &right_join_input,
-                antijoin_left_key,
-                antijoin_right_key,
-                SemiJoinMode::Anti,
-                Some(antijoin_error_handler),
-            )
-            .await
-            .context("initialize DBSP anti-join for LEFT/FULL OUTER join")?;
+            let antijoin =
+                DbspSemiJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                    &left_join_input,
+                    &right_join_input,
+                    Some(format!("{join_state_namespace}_left_outer_antijoin")),
+                    antijoin_left_key,
+                    antijoin_right_key,
+                    SemiJoinMode::Anti,
+                    Some(antijoin_error_handler),
+                )
+                .await
+                .context("initialize DBSP anti-join for LEFT/FULL OUTER join")?;
 
             let right_null_suffix = encode_null_row_template(right_schema.as_ref())
                 .context("encode left outer null-extension right template row")?;
@@ -727,16 +733,18 @@ impl DbspGraphBuilder {
                 );
             });
 
-            let antijoin = DbspSemiJoin::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-                &right_join_input,
-                &left_join_input,
-                antijoin_left_key,
-                antijoin_right_key,
-                SemiJoinMode::Anti,
-                Some(antijoin_error_handler),
-            )
-            .await
-            .context("initialize DBSP anti-join for RIGHT/FULL OUTER join")?;
+            let antijoin =
+                DbspSemiJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                    &right_join_input,
+                    &left_join_input,
+                    Some(format!("{join_state_namespace}_right_outer_antijoin")),
+                    antijoin_left_key,
+                    antijoin_right_key,
+                    SemiJoinMode::Anti,
+                    Some(antijoin_error_handler),
+                )
+                .await
+                .context("initialize DBSP anti-join for RIGHT/FULL OUTER join")?;
 
             let left_null_prefix = encode_null_row_template(left_schema.as_ref())
                 .context("encode right outer null-extension left template row")?;

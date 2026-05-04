@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use floe_executor::checkpoint::{CheckpointManager, recover_materialized_views};
+use floe_executor::checkpoint::{
+    CheckpointManager, DbspHandleRecord, TickCommit, handle_kinds, recover_materialized_views,
+};
 use floe_executor::{
     DbspBridge, FloeQueryContext, MaterializedViewRegistry, OuterStreamRegistry,
     load_or_register_mv,
@@ -96,9 +98,32 @@ async fn checkpoint_snapshot_skips_overlay_only_materialized_view_state() -> Res
 
     let mut checkpoint_manager =
         CheckpointManager::new("mv_checkpoint_restart", harness.ingestion_bridge.table()).await?;
+    let operator_states = dbsp::snapshot_operator_states()
+        .into_iter()
+        .map(|handle| {
+            DbspHandleRecord::operator_state(handle.name, handle.namespace, handle.version)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        operator_states.iter().any(|handle| {
+            handle.kind == handle_kinds::OPERATOR_STATE
+                && handle.namespace.starts_with("incremental_aggregate_state_")
+                && handle.version > 0
+        }),
+        "aggregate operator state should be included in runtime checkpoint handles: {operator_states:?}"
+    );
+    let tick_commit = TickCommit::new(2, 2, Vec::new(), Vec::new(), Vec::new())
+        .with_operator_states(operator_states.clone());
+    checkpoint_manager.persist_tick_commit(tick_commit).await?;
     let manifest = checkpoint_manager
         .persist_snapshot(0, &harness.mv_registry, &harness.outer)
         .await?;
+    assert!(
+        operator_states
+            .iter()
+            .all(|state| manifest.dbsp_handles.contains(state)),
+        "snapshot manifest should mirror latest tick operator state handles"
+    );
     let mv_entry = manifest
         .materialized_views
         .iter()

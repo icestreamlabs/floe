@@ -1330,30 +1330,30 @@ fn resolve_join_output_column_index(
     join: &DbspJoinNode,
     relation_sides: &HashMap<String, JoinInputSide>,
 ) -> Result<usize, DataFusionError> {
-    if let Some(relation) = column.relation.as_ref().map(ToString::to_string) {
-        if let Some(side) = relation_sides.get(&relation) {
-            return match side {
-                JoinInputSide::Left => join
-                    .left_schema
-                    .field_index(column.name.as_str())
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                            "column '{}.{}' not found in left join input schema",
-                            relation, column.name
-                        ))
-                    }),
-                JoinInputSide::Right => join
-                    .right_schema
-                    .field_index(column.name.as_str())
-                    .map(|idx| join.left_schema.len() + idx)
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                            "column '{}.{}' not found in right join input schema",
-                            relation, column.name
-                        ))
-                    }),
-            };
-        }
+    if let Some(relation) = column.relation.as_ref().map(ToString::to_string)
+        && let Some(side) = relation_sides.get(&relation)
+    {
+        return match side {
+            JoinInputSide::Left => join
+                .left_schema
+                .field_index(column.name.as_str())
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "column '{}.{}' not found in left join input schema",
+                        relation, column.name
+                    ))
+                }),
+            JoinInputSide::Right => join
+                .right_schema
+                .field_index(column.name.as_str())
+                .map(|idx| join.left_schema.len() + idx)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "column '{}.{}' not found in right join input schema",
+                        relation, column.name
+                    ))
+                }),
+        };
     }
 
     if let Some(output_idx) = join.output_schema.field_index(column.name.as_str()) {

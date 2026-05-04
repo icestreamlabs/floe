@@ -21,8 +21,8 @@ pub mod semantic {
 
 pub use dbsp_runtime::{
     aggregate, algebra, collections, count_aggregate, distinct, filter, filter_map, handles,
-    incremental_aggregate, join, map, operators, relation_state, semijoin, stream, top1, topk,
-    topn, union, window, window_count_aggregate, window_count_star_aggregate,
+    incremental_aggregate, join, map, operator_state_registry, operators, relation_state, semijoin,
+    stream, top1, topk, topn, union, window, window_count_aggregate, window_count_star_aggregate,
 };
 pub use dbsp_storage::storage;
 
@@ -46,6 +46,9 @@ pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use incremental_aggregate::{DbspIncrementalAggregate, DbspTransientIncrementalAggregate};
 pub use join::DbspJoin;
 pub use map::DbspMap;
+pub use operator_state_registry::{
+    OperatorStateHandle, install_operator_state_restore, snapshot_operator_states,
+};
 pub use operators::consolidate::ConsolidateOp;
 pub use operators::count_aggregate::{
     CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,

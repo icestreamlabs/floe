@@ -10,6 +10,8 @@ type NodeId = usize;
 type InputId = usize;
 type BindingTrace = Vec<NodeId>;
 type CacheKey = (NodeId, BindingTrace, usize);
+type DeferredPlanChildren = Arc<OnceLock<Vec<Arc<PlanNodeRef>>>>;
+type ZipFunction<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 
 static NEXT_NODE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_INPUT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -153,10 +155,7 @@ impl PlanNodeRef {
         })
     }
 
-    fn new_deferred(
-        id: NodeId,
-        kind: StreamNodeKind,
-    ) -> (Arc<Self>, Arc<OnceLock<Vec<Arc<PlanNodeRef>>>>) {
+    fn new_deferred(id: NodeId, kind: StreamNodeKind) -> (Arc<Self>, DeferredPlanChildren) {
         let deferred = Arc::new(OnceLock::new());
         (
             Arc::new(Self {
@@ -374,7 +373,7 @@ where
 struct ZipNode<L, R, O> {
     left: Stream<L>,
     right: Stream<R>,
-    function: Arc<dyn Fn(&L, &R) -> O + Send + Sync>,
+    function: ZipFunction<L, R, O>,
 }
 
 impl<L, R, O> SemanticNode<O> for ZipNode<L, R, O>

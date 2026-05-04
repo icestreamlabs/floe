@@ -346,6 +346,26 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .context("initialize tick checkpoint manager")?;
     let initial_sink_cursors = checkpoint_manager.snapshot_sink_cursors();
     let recovered_tick_commit = checkpoint_manager.latest_tick_commit().cloned();
+    if let Some(tick_commit) = recovered_tick_commit.as_ref() {
+        dbsp::install_operator_state_restore(
+            tick_commit
+                .operator_states
+                .iter()
+                .filter(|handle| {
+                    handle.kind == floe_executor::checkpoint::handle_kinds::OPERATOR_STATE
+                })
+                .map(|handle| {
+                    dbsp::OperatorStateHandle::new(
+                        handle.name.clone(),
+                        handle.namespace.clone(),
+                        handle.version,
+                    )
+                })
+                .collect(),
+        );
+    } else {
+        dbsp::install_operator_state_restore(Vec::new());
+    }
     if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
         metrics::record_last_committed_tick(tick_commit.tick_id);
     }
@@ -1456,7 +1476,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 mv_versions.clone(),
                 checkpoint_manager.snapshot_sink_cursors(),
             )
-            .with_kafka_offsets(kafka_offsets);
+            .with_kafka_offsets(kafka_offsets)
+            .with_operator_states(
+                dbsp::snapshot_operator_states()
+                    .into_iter()
+                    .map(|handle| {
+                        floe_executor::checkpoint::DbspHandleRecord::operator_state(
+                            handle.name,
+                            handle.namespace,
+                            handle.version,
+                        )
+                    })
+                    .collect(),
+            );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
             let source_journal_commit_batches: Vec<_> = source_journal_batches
                 .iter()

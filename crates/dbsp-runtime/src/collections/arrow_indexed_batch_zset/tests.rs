@@ -132,6 +132,54 @@ async fn arrow_indexed_reopen_preserves_persisted_state() {
 }
 
 #[tokio::test]
+async fn arrow_indexed_restore_truncates_uncommitted_segments() {
+    crate::operator_state_registry::clear_operator_state_registry();
+    let table = build_table("arrow-indexed-checkpoint-restore").await;
+    let namespace = "arrow_indexed_checkpoint_restore";
+    let writer = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
+    writer
+        .restore_committed_checkpoint()
+        .await
+        .expect("initialize checkpoint handle");
+    writer
+        .apply_deltas(vec![(1, 10, 1)])
+        .await
+        .expect("apply committed segment");
+    let committed_handle = crate::operator_state_registry::snapshot_operator_states()
+        .into_iter()
+        .find(|handle| handle.namespace == namespace)
+        .expect("checkpointed index handle");
+    assert_eq!(committed_handle.version, 2);
+
+    writer
+        .apply_deltas(vec![(1, 99, 1)])
+        .await
+        .expect("apply uncommitted segment");
+    crate::operator_state_registry::install_operator_state_restore(vec![committed_handle]);
+
+    let restored = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
+    restored
+        .restore_committed_checkpoint()
+        .await
+        .expect("restore committed checkpoint");
+    let mut values = restored.values_for_key(&1).await.expect("lookup restored key");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1)]);
+
+    restored
+        .apply_deltas(vec![(1, 20, 1)])
+        .await
+        .expect("apply after restore");
+    let mut values = restored
+        .values_for_key(&1)
+        .await
+        .expect("lookup restored key after write");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1), (20, 1)]);
+    crate::operator_state_registry::clear_operator_state_registry();
+}
+
+#[tokio::test]
 async fn arrow_indexed_reverse_lookup_aggregates_keys() {
     let table = build_table("arrow-indexed-reverse").await;
     let index = IndexedBatchZSet::<i64, i64>::with_reverse_index(table, "arrow_indexed_reverse");

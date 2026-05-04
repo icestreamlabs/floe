@@ -266,7 +266,7 @@ where
             let entry = delta_map.entry(key.clone()).or_insert(0);
             *entry += *diff_weight;
             if *entry == 0 {
-                delta_map.remove(&key);
+                delta_map.remove(key);
             }
         }
 

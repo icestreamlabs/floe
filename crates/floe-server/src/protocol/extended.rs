@@ -42,6 +42,7 @@ pub(super) struct PreparedStatement {
     param_types: Vec<PgType>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum PreparedStatementKind {
     Query { plan: LogicalPlan },

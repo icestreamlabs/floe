@@ -145,7 +145,6 @@ impl DbspTopN {
         stream.flush().await?;
         {
             let mut op_guard = topn_op.lock().await;
-            op_guard.enable_live_state_replayable();
             op_guard.enable_live_output_replayable();
         }
 

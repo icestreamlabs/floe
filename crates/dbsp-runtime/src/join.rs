@@ -28,6 +28,7 @@ use crate::stream::{DeltaHandleStream, Stream};
 
 static JOIN_STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const JOIN_STEP_LOG_SAMPLE_EVERY: u64 = 256;
+type JoinObserver<O> = Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct TransientJoinInputBatch<T> {
@@ -98,9 +99,7 @@ impl<T> JoinTransientInputBuffer<T> {
             if let Some((ts, _)) = self.pending.first_key_value() {
                 return Some(*ts);
             }
-            let Some(receiver) = self.receiver.as_mut() else {
-                return None;
-            };
+            let receiver = self.receiver.as_mut()?;
             match receiver.recv().await {
                 Some(batch) => self.push_batch(batch),
                 None => {
@@ -116,9 +115,7 @@ impl<T> JoinTransientInputBuffer<T> {
             if let Some(batch) = self.take_pending_for_ts(ts) {
                 return Some(batch);
             }
-            let Some(receiver) = self.receiver.as_mut() else {
-                return None;
-            };
+            let receiver = self.receiver.as_mut()?;
             match receiver.recv().await {
                 Some(batch) => self.push_batch(batch),
                 None => {
@@ -212,10 +209,77 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
+        Self::new_with_state_namespace(
+            left,
+            right,
+            None,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_state_namespace<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        left_key: KL,
+        right_key: KR,
+        predicate: P,
+        projector: F,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<Self>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        O: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
+        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
+        P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+        F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
+    {
         let table = left.table();
         let frontier = left.current_time().max(right.current_time());
         let horizon = left.semantic_horizon().max(right.semantic_horizon());
-        let join_id = NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed);
+        let join_id = state_namespace
+            .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
         let left_state =
             RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
@@ -239,23 +303,28 @@ impl DbspJoin {
             table.clone(),
             format!("join_right_index_{join_id}"),
         );
+        left_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed left join index")?;
+        right_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed right join index")?;
 
-        let join_op = Arc::new(AsyncMutex::new(
-            JoinOp::new(
-                left_state,
-                right_state,
-                left_index,
-                right_index,
-                Arc::new(left_key),
-                Arc::new(right_key),
-                Arc::new(predicate),
-                Arc::new(projector),
-                table.clone(),
-                output,
-                None,
-            )
-            .with_persist_indexes(false),
-        ));
+        let join_op = Arc::new(AsyncMutex::new(JoinOp::new(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            Arc::new(left_key),
+            Arc::new(right_key),
+            Arc::new(predicate),
+            Arc::new(projector),
+            table.clone(),
+            output,
+            None,
+        )));
         let empty_handle = ZSetHandle {
             ns: output_ns.clone(),
             version: 0,
@@ -337,6 +406,7 @@ impl DbspJoin {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_transient<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
@@ -344,7 +414,7 @@ impl DbspJoin {
         right_key: KR,
         predicate: P,
         projector: F,
-        observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+        observer: JoinObserver<O>,
         error_handler: Option<RuntimeErrorHandler>,
     ) -> Result<()>
     where
@@ -418,7 +488,7 @@ impl DbspJoin {
         right_key: KR,
         predicate: P,
         projector: F,
-        observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+        observer: JoinObserver<O>,
         error_handler: Option<RuntimeErrorHandler>,
     ) -> Result<()>
     where
@@ -479,6 +549,14 @@ impl DbspJoin {
             table.clone(),
             format!("join_right_index_{join_id}"),
         );
+        left_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed left join index")?;
+        right_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed right join index")?;
 
         let join_op = Arc::new(AsyncMutex::new(JoinOp::new_without_output(
             left_state,
@@ -708,7 +786,7 @@ where
 
 async fn drive_join_transient<L, R, O, K>(
     op: &Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
-    observer: &Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+    observer: &JoinObserver<O>,
     output_version: &Arc<AtomicU64>,
     observer_version_override: Option<i64>,
     transient_inputs: Option<JoinTransientInputs<L, R>>,
@@ -790,9 +868,10 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_source_driven_join_transient<L, R, O, K>(
     op: Arc<AsyncMutex<JoinOp<L, R, O, K>>>,
-    observer: Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>,
+    observer: JoinObserver<O>,
     output_version: Arc<AtomicU64>,
     left_default: ZSetHandle,
     right_default: ZSetHandle,

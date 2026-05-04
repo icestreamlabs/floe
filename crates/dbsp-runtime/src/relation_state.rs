@@ -5,6 +5,7 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
+use crate::operator_state_registry::{record_operator_state, restored_operator_state};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -45,10 +46,11 @@ where
 {
     pub fn update(&mut self, integrated: VersionedZSet<K>, handle: ZSetHandle) {
         self.integrated = integrated;
-        self.latest_handle = handle;
+        self.update_handle(handle);
     }
 
     pub fn update_handle(&mut self, handle: ZSetHandle) {
+        record_operator_state(self.integrated.namespace().to_string(), handle.clone());
         self.latest_handle = handle;
     }
 
@@ -76,13 +78,22 @@ where
                 .await
                 .context("create relation state dictionary")?,
         );
-        let integrated = VersionedZSet::new(dict, table, namespace.clone())
-            .await
-            .context("create relation state zset")?;
-        let latest_handle = ZSetHandle {
-            ns: namespace,
-            version: 0,
+        let restored = restored_operator_state(&namespace);
+        let restored_version = restored.as_ref().map(|handle| handle.version).unwrap_or(0);
+        let integrated = if restored_version == 0 {
+            VersionedZSet::new(dict, table, namespace.clone())
+                .await
+                .context("create relation state zset")?
+        } else {
+            VersionedZSet::open_for_handle(dict, table, namespace.clone(), restored_version)
+                .await
+                .context("open relation state zset for restored operator handle")?
         };
+        let latest_handle = ZSetHandle {
+            ns: namespace.clone(),
+            version: restored_version,
+        };
+        record_operator_state(namespace, latest_handle.clone());
         Ok(RelationState {
             integrated,
             latest_handle,
@@ -212,5 +223,41 @@ mod tests {
 
         state.enable_live_replayable();
         assert_eq!(state.base_version_for_update(), None);
+    }
+
+    #[tokio::test]
+    async fn committed_operator_state_restore_opens_recorded_handle() {
+        crate::operator_state_registry::clear_operator_state_registry();
+        let table = build_table("relation-state-restore").await;
+        let namespace = "relation-state-restore".to_string();
+        let mut state = RelationState::<i64>::empty(table.clone(), namespace.clone())
+            .await
+            .expect("create relation state");
+        let key_id = state.dictionary().intern(&99).await.expect("intern key");
+        let version = state
+            .integrated
+            .create_version(vec![SegmentRecord {
+                id: 0,
+                bucket: 0,
+                deltas: vec![(key_id, 3)],
+            }])
+            .await
+            .expect("create version");
+        state.update_handle(state.integrated.handle_for_version(version));
+
+        let handles = crate::operator_state_registry::snapshot_operator_states();
+        crate::operator_state_registry::install_operator_state_restore(handles);
+
+        let restored = RelationState::<i64>::empty(table, namespace)
+            .await
+            .expect("restore relation state");
+        assert_eq!(restored.latest_handle.version, version);
+        let materialized = restored
+            .integrated
+            .materialize()
+            .await
+            .expect("materialize restored state");
+        assert_eq!(materialized.get(&99).copied(), Some(3));
+        crate::operator_state_registry::clear_operator_state_registry();
     }
 }

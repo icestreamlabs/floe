@@ -205,7 +205,7 @@ where
                 let entry = filtered.entry(key.clone()).or_insert(0);
                 *entry += *weight;
                 if *entry == 0 {
-                    filtered.remove(&key);
+                    filtered.remove(key);
                 }
             }
         }
