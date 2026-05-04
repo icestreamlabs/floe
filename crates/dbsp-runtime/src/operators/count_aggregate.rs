@@ -116,6 +116,7 @@ where
     state_cache: Option<HashMap<K, GroupedCountState>>,
     slot_kinds: Vec<CountAggregateSlotKind>,
     distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, D>>,
+    append_only_input: bool,
 }
 
 impl<K, V, D> CountAggregateOp<K, V, D>
@@ -192,11 +193,16 @@ where
             state_cache: None,
             slot_kinds,
             distinct_index,
+            append_only_input: false,
         }
     }
 
     pub fn enable_live_output_replayable(&mut self) {
         self.output.enable_replayable_persistence();
+    }
+
+    pub fn enable_append_only_input(&mut self) {
+        self.append_only_input = true;
     }
 
     async fn ensure_state_cache(&mut self) -> Result<()> {
@@ -334,21 +340,29 @@ where
         if delta_values.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let coalesced = self.coalesce_deltas(delta_values.to_vec());
-        if coalesced.is_empty() {
-            return Ok(HashMap::new());
+        if self.append_only_input && delta_values.iter().any(|(_, weight)| *weight < 0) {
+            anyhow::bail!("append-only count aggregate received negative input weight");
         }
+
+        let row_update_input;
+        let row_update_values = if self.append_only_input {
+            delta_values
+        } else {
+            row_update_input = self
+                .coalesce_deltas(delta_values.to_vec())
+                .into_iter()
+                .filter(|(_, weight)| *weight != 0)
+                .collect::<Vec<_>>();
+            if row_update_input.is_empty() {
+                return Ok(HashMap::new());
+            }
+            row_update_input.as_slice()
+        };
 
         let arity = self.slot_kinds.len();
         let mut grouped_deltas: HashMap<K, GroupedCountState> = HashMap::new();
         let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, D), i64> = HashMap::new();
-        let row_updates = (self.row_evaluator)(
-            &coalesced
-                .into_iter()
-                .filter(|(_, weight)| *weight != 0)
-                .collect::<Vec<_>>(),
-        );
+        let row_updates = (self.row_evaluator)(row_update_values);
         for (row_update, weight) in row_updates {
             if weight == 0 {
                 continue;
@@ -421,7 +435,12 @@ where
                     .value_weight_for_key_value(&distinct_key, &distinct_value)
                     .await
                     .context("load count aggregate distinct multiplicity")?;
-                let new_weight = old_weight + delta;
+                let index_delta = if self.append_only_input {
+                    if old_weight > 0 { 0 } else { 1 }
+                } else {
+                    delta
+                };
+                let new_weight = old_weight + index_delta;
                 let entry = grouped_deltas
                     .entry(distinct_key.group_key.clone())
                     .or_insert_with(|| GroupedCountState::zero(arity));
@@ -430,7 +449,9 @@ where
                 } else if old_weight <= 0 && new_weight > 0 {
                     entry.counts[distinct_key.slot as usize] += 1;
                 }
-                distinct_updates.push((distinct_key, distinct_value, delta));
+                if index_delta != 0 {
+                    distinct_updates.push((distinct_key, distinct_value, index_delta));
+                }
             }
 
             if !distinct_updates.is_empty() {
@@ -1203,5 +1224,109 @@ mod tests {
                 .await
                 .expect("materialize distinct t4");
         assert_eq!(delta_four, HashMap::from([((1, vec![1]), -1)]));
+    }
+
+    #[tokio::test]
+    async fn append_only_grouped_count_distinct_persists_membership_once() {
+        let table = build_table("append-only-grouped-count-distinct").await;
+        let input_dict = Arc::new(
+            Dictionary::<CountRow>::with_table(
+                table.clone(),
+                "append_grouped_count_distinct_input".to_string(),
+                None,
+            )
+            .await
+            .expect("create distinct input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedCountState)>::empty(
+            table.clone(),
+            "append_grouped_count_distinct_state".to_string(),
+        )
+        .await
+        .expect("create distinct state");
+        let output_dict = Arc::new(
+            Dictionary::<(i64, Vec<i64>)>::with_table(
+                table.clone(),
+                "append_grouped_count_distinct_output".to_string(),
+                None,
+            )
+            .await
+            .expect("create distinct output dictionary"),
+        );
+        let output = VersionedZSet::new(
+            output_dict,
+            table.clone(),
+            "append_grouped_count_distinct_output".to_string(),
+        )
+        .await
+        .expect("create distinct output zset");
+        let distinct_index =
+            IndexedBatchZSet::new(table.clone(), "append_grouped_count_distinct_index");
+
+        let mut op = CountAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &CountRow| {
+                Some(CountAggregateRow {
+                    key: row.group_key,
+                    slots: vec![CountAggregateSlotUpdate::Distinct(row.value)],
+                })
+            }),
+            output,
+            vec![CountAggregateSlotKind::Distinct],
+            Some(distinct_index),
+        );
+        op.enable_append_only_input();
+
+        let row = CountRow {
+            group_key: 1,
+            value: Some(10),
+            flag: false,
+        };
+        let batch_one = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "append_grouped_count_distinct_input",
+            &[(row.clone(), 3)],
+        )
+        .await;
+        op.on_step(0, std::slice::from_ref(&batch_one))
+            .await
+            .expect("run append-only distinct t1")
+            .expect("append-only distinct t1 handle");
+
+        let distinct_key = DistinctGroupKey {
+            group_key: 1,
+            slot: 0,
+        };
+        assert_eq!(
+            op.distinct_index
+                .as_ref()
+                .expect("distinct index")
+                .values_for_key(&distinct_key)
+                .await
+                .expect("distinct index after t1"),
+            vec![(10, 1)]
+        );
+
+        let batch_two = stage_version(
+            input_dict,
+            table,
+            "append_grouped_count_distinct_input",
+            &[(row, 2)],
+        )
+        .await;
+        op.on_step(1, std::slice::from_ref(&batch_two))
+            .await
+            .expect("run append-only distinct duplicate");
+        assert_eq!(
+            op.distinct_index
+                .as_ref()
+                .expect("distinct index")
+                .values_for_key(&distinct_key)
+                .await
+                .expect("distinct index after duplicate"),
+            vec![(10, 1)]
+        );
     }
 }

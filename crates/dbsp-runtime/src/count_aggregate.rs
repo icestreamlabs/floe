@@ -168,6 +168,53 @@ impl DbspCountAggregate {
         D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync + 'static,
     {
+        Self::new_batch_with_append_only_input(
+            input,
+            row_evaluator,
+            slot_kinds,
+            false,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch_with_append_only_input<K, V, D, FRow>(
+        input: &DeltaHandleStream,
+        row_evaluator: FRow,
+        slot_kinds: Vec<CountAggregateSlotKind>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        D: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -201,14 +248,18 @@ impl DbspCountAggregate {
                 )
             });
 
-        let count_aggregate_op = Arc::new(AsyncMutex::new(CountAggregateOp::new_batch(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
             Arc::new(row_evaluator) as BatchRowEvaluator<V, K, D>,
             output,
             slot_kinds,
             distinct_index,
-        )));
+        );
+        if append_only_input {
+            op.enable_append_only_input();
+        }
+        let count_aggregate_op = Arc::new(AsyncMutex::new(op));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
             default: empty_handle.clone(),

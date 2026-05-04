@@ -77,6 +77,7 @@ impl DbspGraphBuilder {
         &mut self,
         node: &DbspAggregateNode,
         mut upstream: DeltaHandleStream,
+        append_only_input: bool,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let input_schema = Arc::clone(node.input_schema());
@@ -137,10 +138,16 @@ impl DbspGraphBuilder {
                 "aggregate",
             );
 
-            let count_aggregate = DbspCountAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
+            let count_aggregate = DbspCountAggregate::new_batch_with_append_only_input::<
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                _,
+            >(
                 &upstream,
                 row_evaluator,
                 slot_kinds,
+                append_only_input,
                 Some(aggregate_error_handler),
             )
             .await

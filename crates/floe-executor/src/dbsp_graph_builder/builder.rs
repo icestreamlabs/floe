@@ -990,6 +990,8 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Aggregate(aggregate) => {
                 let input_idx = first_input(node, "aggregate")?;
+                let append_only_input =
+                    find_transient_source_root_shape(plan, input_idx)?.is_some();
                 let upstream = self
                     .compile_node(
                         plan,
@@ -1004,7 +1006,7 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_aggregate(aggregate, upstream, task_events)
+                self.compile_aggregate(aggregate, upstream, append_only_input, task_events)
                     .await?
             }
             DbspNodeKind::TopN(topn) => {
