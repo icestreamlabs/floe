@@ -5949,6 +5949,7 @@ async fn build_transient_window_incremental_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let compact_source_state = upstream.durable_enabled();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-aggregate-source:{graph_id}"),
@@ -5963,6 +5964,7 @@ async fn build_transient_window_incremental_receiver(
         upstream_rx,
         output_transform,
         watermark,
+        compact_source_state,
         cancel,
         task_events,
         state_table,
@@ -5977,6 +5979,7 @@ async fn build_transient_window_incremental_receiver_from_batches(
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     output_transform: Arc<DeltaTransformFn>,
     watermark: Arc<AtomicI64>,
+    compact_source_state: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
@@ -6038,30 +6041,45 @@ async fn build_transient_window_incremental_receiver_from_batches(
     let task_label = format!("transient-window-aggregate:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let state_label = state_label.into();
+    let state_label = if compact_source_state {
+        format!("{state_label}_incremental_state")
+    } else {
+        state_label
+    };
     let mut persistent_state =
-        PersistentTransientInputState::load(state_table, &graph_id, state_label.into()).await?;
-    let restored_deltas = persistent_state
-        .snapshot_deltas()
-        .into_iter()
-        .filter_map(
-            |(row, weight)| match decode_transient_window_aggregate_input_pair(&row) {
-                Ok(pair) => Some((pair, weight)),
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "skipping malformed transient window aggregate input state row"
-                    );
-                    None
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-    if !restored_deltas.is_empty() {
-        aggregate_processor
-            .apply_deltas(restored_deltas)
-            .await
-            .context("restore transient window aggregate input state")?;
+        PersistentTransientInputState::load(state_table, &graph_id, state_label).await?;
+    let restored_state = persistent_state.snapshot_deltas();
+    if !restored_state.is_empty() {
+        if compact_source_state {
+            let snapshot = decode_transient_window_incremental_aggregate_snapshot(restored_state)
+                .context("decode transient window aggregate state snapshot")?;
+            aggregate_processor
+                .restore_state(snapshot)
+                .await
+                .context("restore transient window aggregate state snapshot")?;
+        } else {
+            let restored_deltas = restored_state
+                .into_iter()
+                .filter_map(|(row, weight)| {
+                    match decode_transient_window_aggregate_input_pair(&row) {
+                        Ok(pair) => Some((pair, weight)),
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %graph_id,
+                                error = %err,
+                                "skipping malformed transient window aggregate input state row"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            aggregate_processor
+                .apply_deltas(restored_deltas)
+                .await
+                .context("restore transient window aggregate input state")?;
+        }
     }
     tokio::spawn(async move {
         loop {
@@ -6215,23 +6233,25 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             windowed_deltas.push(((encoded_key, row_value), weight));
                         }
                     }
-                    let persisted_window_rows = windowed_deltas
-                        .iter()
-                        .map(|((window_key, row), weight)| {
-                            encode_transient_window_aggregate_input_pair(window_key, row)
-                                .map(|encoded| (encoded, *weight))
-                        })
-                        .collect::<Result<Vec<_>>>();
-                    let persisted_window_rows = match persisted_window_rows {
-                        Ok(rows) => rows,
-                        Err(err) => {
+                    if !compact_source_state {
+                        let persisted_window_rows = windowed_deltas
+                            .iter()
+                            .map(|((window_key, row), weight)| {
+                                encode_transient_window_aggregate_input_pair(window_key, row)
+                                    .map(|encoded| (encoded, *weight))
+                            })
+                            .collect::<Result<Vec<_>>>();
+                        let persisted_window_rows = match persisted_window_rows {
+                            Ok(rows) => rows,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
-                    };
-                    if let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
-                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                        break;
                     }
                     let aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
                         Ok(deltas) => deltas,
@@ -6240,6 +6260,26 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             break;
                         }
                     };
+                    if compact_source_state {
+                        let snapshot = match aggregate_processor.snapshot_state().await {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        let encoded_snapshot = match encode_transient_window_incremental_aggregate_snapshot(snapshot) {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if let Err(err) = persistent_state.replace_with_snapshot(encoded_snapshot).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    }
                     let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
                         Ok(deltas) => deltas,
                         Err(err) => {
@@ -7017,6 +7057,52 @@ fn decode_transient_incremental_aggregate_snapshot(
         }
     }
     Ok(snapshot)
+}
+
+fn encode_transient_window_incremental_aggregate_snapshot(
+    snapshot: dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, (Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let input = snapshot
+        .input
+        .into_iter()
+        .map(|entry| {
+            let value =
+                encode_transient_window_aggregate_input_pair(&entry.value.0, &entry.value.1)?;
+            Ok(dbsp::TransientIncrementalAggregateInputWeight {
+                group_key: entry.group_key,
+                value,
+                weight: entry.weight,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    encode_transient_incremental_aggregate_snapshot(dbsp::TransientIncrementalAggregateSnapshot {
+        grouped: snapshot.grouped,
+        distinct: snapshot.distinct,
+        input,
+    })
+}
+
+fn decode_transient_window_incremental_aggregate_snapshot(
+    rows: Vec<(Vec<u8>, i64)>,
+) -> Result<dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, (Vec<u8>, Vec<u8>)>> {
+    let snapshot = decode_transient_incremental_aggregate_snapshot(rows)?;
+    let input = snapshot
+        .input
+        .into_iter()
+        .map(|entry| {
+            let value = decode_transient_window_aggregate_input_pair(&entry.value)?;
+            Ok(dbsp::TransientIncrementalAggregateInputWeight {
+                group_key: entry.group_key,
+                value,
+                weight: entry.weight,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(dbsp::TransientIncrementalAggregateSnapshot {
+        grouped: snapshot.grouped,
+        distinct: snapshot.distinct,
+        input,
+    })
 }
 
 fn encode_incremental_aggregate_slot_state(
@@ -8397,6 +8483,36 @@ mod tests {
             .expect("encode incremental aggregate snapshot");
         let decoded = decode_transient_incremental_aggregate_snapshot(encoded)
             .expect("decode incremental aggregate snapshot");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn transient_window_incremental_aggregate_state_snapshot_roundtrips() {
+        let snapshot = dbsp::TransientIncrementalAggregateSnapshot {
+            grouped: vec![dbsp::TransientIncrementalAggregateGroupedState {
+                key: b"window-group-a".to_vec(),
+                total_rows: 2,
+                slots: vec![dbsp::IncrementalAggregateSlotState::Max {
+                    current: Some(dbsp::AggregateValue::TimestampMillis(1_700_000_000_000)),
+                }],
+            }],
+            distinct: vec![dbsp::TransientIncrementalAggregateDistinctWeight {
+                group_key: b"window-group-a".to_vec(),
+                slot: 0,
+                value: dbsp::AggregateValue::Utf8("bidder-a".to_string()),
+                weight: 1,
+            }],
+            input: vec![dbsp::TransientIncrementalAggregateInputWeight {
+                group_key: b"window-group-a".to_vec(),
+                value: (b"window-group-a".to_vec(), b"input-row".to_vec()),
+                weight: 2,
+            }],
+        };
+
+        let encoded = encode_transient_window_incremental_aggregate_snapshot(snapshot.clone())
+            .expect("encode window incremental aggregate snapshot");
+        let decoded = decode_transient_window_incremental_aggregate_snapshot(encoded)
+            .expect("decode window incremental aggregate snapshot");
         assert_eq!(decoded, snapshot);
     }
 

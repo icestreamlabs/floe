@@ -4600,6 +4600,29 @@ async fn tumbling_window_max_materializes_from_transient_source_journal() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn tumbling_window_max_materializes_from_durable_transient_source_journal() {
+    let plan = tumbling_window_max_plan();
+    let rows = build_window_plan_rows_with_durable_source(
+        "tumbling-max-durable-transient",
+        "mv_tumbling_max_durable_transient",
+        &plan,
+        &[
+            (1, 42, 10, 1_700_000_000_000),
+            (2, 7, 20, 1_700_000_001_000),
+            (3, 9, 99, 1_700_000_002_000),
+        ],
+        true,
+    )
+    .await;
+
+    assert!(
+        rows.iter().any(|row| row_contains_i64(row, 99)),
+        "expected durable tumbling window output to include max price 99"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn tumbling_window_count_by_bidder_materializes_from_transient_source_journal() {
     let plan = tumbling_window_count_by_bidder_plan();
     let rows = build_window_plan_rows(
@@ -4763,6 +4786,16 @@ async fn build_window_plan_rows(
     plan: &dbsp::CircuitPlan,
     bids: &[(i64, i64, i64, i64)],
 ) -> Vec<TestRow> {
+    build_window_plan_rows_with_durable_source(db_name, view_name, plan, bids, false).await
+}
+
+async fn build_window_plan_rows_with_durable_source(
+    db_name: &str,
+    view_name: &str,
+    plan: &dbsp::CircuitPlan,
+    bids: &[(i64, i64, i64, i64)],
+    durable_source: bool,
+) -> Vec<TestRow> {
     assert_eq!(
         source_batch_journal_root_sources(plan)
             .expect("source journal root source analysis")
@@ -4785,7 +4818,7 @@ async fn build_window_plan_rows(
         OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
             .await
             .expect("outer streams");
-    registry.set_durable_enabled("nexmark_bid", false);
+    registry.set_durable_enabled("nexmark_bid", durable_source);
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
     mv_registry.register(view_name);
