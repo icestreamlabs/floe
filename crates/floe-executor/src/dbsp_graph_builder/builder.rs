@@ -1027,6 +1027,8 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Distinct(distinct) => {
                 let input_idx = first_input(node, "distinct")?;
+                let append_only_input =
+                    find_transient_source_root_shape(plan, input_idx)?.is_some();
                 let upstream = self
                     .compile_node(
                         plan,
@@ -1041,7 +1043,7 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_distinct(distinct, upstream, task_events)
+                self.compile_distinct(distinct, upstream, append_only_input, task_events)
                     .await?
             }
             DbspNodeKind::WindowAggregate(window) => {

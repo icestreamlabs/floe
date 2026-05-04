@@ -37,6 +37,7 @@ where
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     integrated_cache: Option<HashMap<K, i64>>,
+    append_only_input: bool,
 }
 
 impl<K> DistinctOp<K>
@@ -62,11 +63,16 @@ where
             output,
             dict_cache: HashMap::new(),
             integrated_cache: None,
+            append_only_input: false,
         }
     }
 
     pub fn enable_live_output_replayable(&mut self) {
         self.output.enable_replayable_persistence();
+    }
+
+    pub fn enable_append_only_input(&mut self) {
+        self.append_only_input = true;
     }
 
     async fn ensure_integrated_cache(&mut self) -> Result<()> {
@@ -227,6 +233,9 @@ where
                 .as_ref()
                 .context("integrated cache missing for distinct")?;
             for (key, diff_weight) in &delta_map {
+                if self.append_only_input && *diff_weight < 0 {
+                    anyhow::bail!("append-only distinct received negative input weight");
+                }
                 let state_weight = integrated_map.get(key).copied().unwrap_or(0);
                 let coalesced = diff_weight + state_weight;
                 if state_weight > 0 && coalesced <= 0 {
@@ -234,14 +243,25 @@ where
                 } else if state_weight <= 0 && coalesced > 0 {
                     h_deltas.insert(key.clone(), 1);
                 }
-                cache_updates.push((key.clone(), coalesced));
+                let cached_weight =
+                    if self.append_only_input && (state_weight > 0 || *diff_weight > 0) {
+                        1
+                    } else {
+                        coalesced
+                    };
+                cache_updates.push((key.clone(), cached_weight));
             }
         }
 
+        let state_deltas = if self.append_only_input {
+            &h_deltas
+        } else {
+            &delta_map
+        };
         let base_version = self.state.base_version_for_update();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
             &mut self.state.integrated,
-            &delta_map,
+            state_deltas,
             base_version,
             "integrated_input",
         )
@@ -448,6 +468,99 @@ mod tests {
         assert_eq!(out2_materialized, expected_out2);
         assert_eq!(integrated_after_t2.get("a"), None);
         assert_eq!(integrated_after_t2.get("b"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn append_only_distinct_persists_membership_not_multiplicity() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let delta_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "append_distinct_delta", None)
+                .await
+                .expect("build delta dictionary"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "append_distinct_state", None)
+                .await
+                .expect("build state dictionary"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), "append_distinct_output", None)
+                .await
+                .expect("build output dictionary"),
+        );
+        let integrated = VersionedZSet::new(
+            state_dict.clone(),
+            table.clone(),
+            "append_distinct_state".to_string(),
+        )
+        .await
+        .expect("integrated state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            "append_distinct_output".to_string(),
+        )
+        .await
+        .expect("output state");
+        let state = RelationState {
+            latest_handle: ZSetHandle {
+                ns: integrated.namespace().to_string(),
+                version: 0,
+            },
+            integrated,
+        };
+        let mut op = DistinctOp::new(state, table.clone(), output);
+        op.enable_append_only_input();
+
+        let first_delta = stage_version(
+            delta_dict.clone(),
+            table.clone(),
+            "append_distinct_delta",
+            &[("a".to_string(), 3)],
+        )
+        .await;
+        let out1 = op
+            .on_step(1, &[first_delta])
+            .await
+            .expect("run append-only distinct t1")
+            .expect("output t1");
+        let mut cache = HashMap::new();
+        cache.insert("append_distinct_output".to_string(), output_dict.clone());
+        let out1_materialized = materialize_zset_handle::<String>(table.clone(), &mut cache, &out1)
+            .await
+            .expect("materialize output t1");
+        assert_eq!(out1_materialized, HashMap::from([("a".to_string(), 1)]));
+        assert_eq!(
+            op.state
+                .integrated
+                .materialize()
+                .await
+                .expect("integrated t1"),
+            HashMap::from([("a".to_string(), 1)])
+        );
+
+        let duplicate_delta = stage_version(
+            delta_dict,
+            table.clone(),
+            "append_distinct_delta",
+            &[("a".to_string(), 2)],
+        )
+        .await;
+        let out2 = op
+            .on_step(2, &[duplicate_delta])
+            .await
+            .expect("run append-only distinct t2")
+            .expect("empty output t2");
+        assert_eq!(out2.version, 0);
+        assert_eq!(
+            op.state
+                .integrated
+                .materialize()
+                .await
+                .expect("integrated t2"),
+            HashMap::from([("a".to_string(), 1)])
+        );
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ impl DbspGraphBuilder {
         &mut self,
         _node: &DbspDistinctNode,
         upstream: DeltaHandleStream,
+        append_only_input: bool,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let graph_id = self.graph_id().to_string();
@@ -43,9 +44,13 @@ impl DbspGraphBuilder {
             );
         });
 
-        let distinct = DbspDistinct::new::<Vec<u8>>(&upstream, Some(distinct_error_handler))
-            .await
-            .context("initialize DBSP distinct")?;
+        let distinct = DbspDistinct::new_with_append_only_input::<Vec<u8>>(
+            &upstream,
+            append_only_input,
+            Some(distinct_error_handler),
+        )
+        .await
+        .context("initialize DBSP distinct")?;
         Ok(distinct.stream())
     }
 

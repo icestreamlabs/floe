@@ -44,6 +44,25 @@ impl DbspDistinct {
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
+        Self::new_with_append_only_input::<K>(input, false, error_handler).await
+    }
+
+    pub async fn new_with_append_only_input<K>(
+        input: &DeltaHandleStream,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -64,11 +83,11 @@ impl DbspDistinct {
             .await
             .context("create output zset for distinct")?;
 
-        let distinct_op = Arc::new(AsyncMutex::new(DistinctOp::new(
-            state,
-            table.clone(),
-            output,
-        )));
+        let mut op = DistinctOp::new(state, table.clone(), output);
+        if append_only_input {
+            op.enable_append_only_input();
+        }
+        let distinct_op = Arc::new(AsyncMutex::new(op));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
             default: empty_handle.clone(),
