@@ -847,6 +847,7 @@ impl DbspGraphBuilder {
                         aggregate,
                         receiver,
                         Arc::clone(&identity_transform),
+                        false,
                         cancel,
                         task_events,
                         state_table.clone(),
@@ -5439,6 +5440,7 @@ async fn build_transient_aggregate_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let compact_count_state = upstream.durable_enabled();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-aggregate-source:{graph_id}"),
@@ -5452,6 +5454,7 @@ async fn build_transient_aggregate_receiver(
         aggregate,
         upstream_rx,
         output_transform,
+        compact_count_state,
         cancel,
         task_events,
         state_table,
@@ -5465,6 +5468,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     aggregate: &DbspAggregateNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     output_transform: Arc<DeltaTransformFn>,
+    compact_count_state: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
@@ -5501,15 +5505,26 @@ async fn build_transient_aggregate_receiver_from_batches(
             .await
             .context("initialize transient count aggregate")?,
         );
+        let count_state_label = if compact_count_state {
+            format!("{state_label}_count_state")
+        } else {
+            state_label.clone()
+        };
         let mut persistent_state =
-            PersistentTransientInputState::load(state_table.clone(), &graph_id, &state_label)
+            PersistentTransientInputState::load(state_table.clone(), &graph_id, count_state_label)
                 .await?;
         let restored_deltas = persistent_state.snapshot_deltas();
         if !restored_deltas.is_empty() {
-            aggregate_processor
-                .apply_deltas(restored_deltas)
-                .await
-                .context("restore transient count aggregate input state")?;
+            if compact_count_state {
+                let snapshot = decode_transient_count_aggregate_snapshot(restored_deltas)
+                    .context("decode transient count aggregate state snapshot")?;
+                aggregate_processor.restore_state(snapshot).await;
+            } else {
+                aggregate_processor
+                    .apply_deltas(restored_deltas)
+                    .await
+                    .context("restore transient count aggregate input state")?;
+            }
         }
         let precompute_evaluator = precompute_evaluator.clone();
 
@@ -5533,9 +5548,11 @@ async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
+                        if !compact_count_state {
+                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
                         }
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
@@ -5544,6 +5561,20 @@ async fn build_transient_aggregate_receiver_from_batches(
                                 break;
                             }
                         };
+                        if compact_count_state {
+                            let snapshot = aggregate_processor.snapshot_state().await;
+                            let encoded_snapshot = match encode_transient_count_aggregate_snapshot(snapshot) {
+                                Ok(snapshot) => snapshot,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            };
+                            if let Err(err) = persistent_state.replace_with_snapshot(encoded_snapshot).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
                         let encoded_output = match encode_count_aggregate_output_deltas(aggregate_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6738,6 +6769,136 @@ fn decode_transient_window_aggregate_input_pair(encoded: &[u8]) -> Result<(Vec<u
     ))
 }
 
+const TRANSIENT_COUNT_AGGREGATE_GROUP_TAG: u8 = 1;
+const TRANSIENT_COUNT_AGGREGATE_DISTINCT_TAG: u8 = 2;
+
+fn encode_transient_count_aggregate_snapshot(
+    snapshot: dbsp::TransientCountAggregateSnapshot<Vec<u8>, Vec<u8>>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut rows = Vec::with_capacity(snapshot.grouped.len() + snapshot.distinct.len());
+    for group in snapshot.grouped {
+        if group.total_rows == 0 {
+            continue;
+        }
+        let mut row = Vec::new();
+        row.push(TRANSIENT_COUNT_AGGREGATE_GROUP_TAG);
+        write_len_prefixed_bytes(&mut row, &group.key)?;
+        row.extend_from_slice(&group.total_rows.to_le_bytes());
+        let count_len = u32::try_from(group.counts.len())
+            .map_err(|_| anyhow!("too many transient count aggregate slots"))?;
+        row.extend_from_slice(&count_len.to_le_bytes());
+        for count in group.counts {
+            row.extend_from_slice(&count.to_le_bytes());
+        }
+        rows.push((row, 1));
+    }
+    for distinct in snapshot.distinct {
+        if distinct.weight == 0 {
+            continue;
+        }
+        let mut row = Vec::new();
+        row.push(TRANSIENT_COUNT_AGGREGATE_DISTINCT_TAG);
+        write_len_prefixed_bytes(&mut row, &distinct.group_key)?;
+        row.extend_from_slice(&distinct.slot.to_le_bytes());
+        write_len_prefixed_bytes(&mut row, &distinct.value)?;
+        rows.push((row, distinct.weight));
+    }
+    Ok(rows)
+}
+
+fn decode_transient_count_aggregate_snapshot(
+    rows: Vec<(Vec<u8>, i64)>,
+) -> Result<dbsp::TransientCountAggregateSnapshot<Vec<u8>, Vec<u8>>> {
+    let mut snapshot = dbsp::TransientCountAggregateSnapshot::default();
+    for (row, weight) in rows {
+        if row.is_empty() || weight == 0 {
+            continue;
+        }
+        let mut cursor = 1usize;
+        match row[0] {
+            TRANSIENT_COUNT_AGGREGATE_GROUP_TAG => {
+                let key = read_len_prefixed_bytes(&row, &mut cursor)?;
+                let total_rows = read_i64_le(&row, &mut cursor)?;
+                let count_len = read_u32_le(&row, &mut cursor)? as usize;
+                let mut counts = Vec::with_capacity(count_len);
+                for _ in 0..count_len {
+                    counts.push(read_i64_le(&row, &mut cursor)?);
+                }
+                if cursor != row.len() {
+                    bail!("trailing bytes in transient count aggregate group state row");
+                }
+                snapshot
+                    .grouped
+                    .push(dbsp::TransientCountAggregateGroupedState {
+                        key,
+                        total_rows,
+                        counts,
+                    });
+            }
+            TRANSIENT_COUNT_AGGREGATE_DISTINCT_TAG => {
+                let group_key = read_len_prefixed_bytes(&row, &mut cursor)?;
+                let slot = read_u32_le(&row, &mut cursor)?;
+                let value = read_len_prefixed_bytes(&row, &mut cursor)?;
+                if cursor != row.len() {
+                    bail!("trailing bytes in transient count aggregate distinct state row");
+                }
+                snapshot
+                    .distinct
+                    .push(dbsp::TransientCountAggregateDistinctWeight {
+                        group_key,
+                        slot,
+                        value,
+                        weight,
+                    });
+            }
+            other => bail!("unknown transient count aggregate state row tag {other}"),
+        }
+    }
+    Ok(snapshot)
+}
+
+fn write_len_prefixed_bytes(dst: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("byte field too large"))?;
+    dst.extend_from_slice(&len.to_le_bytes());
+    dst.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn read_len_prefixed_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+    let len = read_u32_le(bytes, cursor)? as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("length-prefixed byte field overflow"))?;
+    if end > bytes.len() {
+        bail!("truncated length-prefixed byte field");
+    }
+    let value = bytes[*cursor..end].to_vec();
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u32_le(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("u32 cursor overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("truncated u32"))?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(chunk.try_into().unwrap()))
+}
+
+fn read_i64_le(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("i64 cursor overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("truncated i64"))?;
+    *cursor = end;
+    Ok(i64::from_le_bytes(chunk.try_into().unwrap()))
+}
+
 fn encode_count_aggregate_output_deltas(
     deltas: Vec<((Vec<u8>, Vec<i64>), i64)>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
@@ -7859,6 +8020,29 @@ mod tests {
             .expect("partition state");
         assert_eq!(partition.live_rows.len(), 1);
         assert_eq!(processor.snapshot_deltas(), vec![(row_20, 2)]);
+    }
+
+    #[test]
+    fn transient_count_aggregate_state_snapshot_roundtrips() {
+        let snapshot = dbsp::TransientCountAggregateSnapshot {
+            grouped: vec![dbsp::TransientCountAggregateGroupedState {
+                key: b"group-a".to_vec(),
+                total_rows: 3,
+                counts: vec![3, 2],
+            }],
+            distinct: vec![dbsp::TransientCountAggregateDistinctWeight {
+                group_key: b"group-a".to_vec(),
+                slot: 1,
+                value: b"distinct-a".to_vec(),
+                weight: 2,
+            }],
+        };
+
+        let encoded = encode_transient_count_aggregate_snapshot(snapshot.clone())
+            .expect("encode count aggregate snapshot");
+        let decoded = decode_transient_count_aggregate_snapshot(encoded)
+            .expect("decode count aggregate snapshot");
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

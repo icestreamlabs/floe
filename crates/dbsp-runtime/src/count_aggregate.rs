@@ -81,6 +81,27 @@ where
     state: AsyncMutex<TransientCountAggregateState<K, V, D>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientCountAggregateGroupedState<K> {
+    pub key: K,
+    pub total_rows: i64,
+    pub counts: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientCountAggregateDistinctWeight<K, D> {
+    pub group_key: K,
+    pub slot: u32,
+    pub value: D,
+    pub weight: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransientCountAggregateSnapshot<K, D> {
+    pub grouped: Vec<TransientCountAggregateGroupedState<K>>,
+    pub distinct: Vec<TransientCountAggregateDistinctWeight<K, D>>,
+}
+
 impl DbspCountAggregate {
     pub async fn new<K, V, D, FRow>(
         input: &DeltaHandleStream,
@@ -419,6 +440,16 @@ where
         let deltas = state.apply_deltas(delta_values);
         Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
     }
+
+    pub async fn snapshot_state(&self) -> TransientCountAggregateSnapshot<K, D> {
+        let state = self.state.lock().await;
+        state.snapshot()
+    }
+
+    pub async fn restore_state(&self, snapshot: TransientCountAggregateSnapshot<K, D>) {
+        let mut state = self.state.lock().await;
+        state.restore(snapshot);
+    }
 }
 
 impl<K, V, D> TransientCountAggregateState<K, V, D>
@@ -427,6 +458,64 @@ where
     V: Clone + Eq + Hash,
     D: Clone + Eq + Hash,
 {
+    fn snapshot(&self) -> TransientCountAggregateSnapshot<K, D> {
+        TransientCountAggregateSnapshot {
+            grouped: self
+                .grouped_state
+                .iter()
+                .filter(|(_, state)| state.is_present())
+                .map(|(key, state)| TransientCountAggregateGroupedState {
+                    key: key.clone(),
+                    total_rows: state.total_rows,
+                    counts: state.counts.clone(),
+                })
+                .collect(),
+            distinct: self
+                .distinct_weights
+                .iter()
+                .filter(|(_, weight)| **weight != 0)
+                .map(
+                    |((distinct_key, value), weight)| TransientCountAggregateDistinctWeight {
+                        group_key: distinct_key.group_key.clone(),
+                        slot: distinct_key.slot,
+                        value: value.clone(),
+                        weight: *weight,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: TransientCountAggregateSnapshot<K, D>) {
+        self.grouped_state = snapshot
+            .grouped
+            .into_iter()
+            .filter_map(|group| {
+                let state = GroupedCountState {
+                    total_rows: group.total_rows,
+                    counts: group.counts,
+                };
+                state.is_present().then_some((group.key, state))
+            })
+            .collect();
+        self.distinct_weights = snapshot
+            .distinct
+            .into_iter()
+            .filter_map(|entry| {
+                (entry.weight != 0).then_some((
+                    (
+                        DistinctGroupKey {
+                            group_key: entry.group_key,
+                            slot: entry.slot,
+                        },
+                        entry.value,
+                    ),
+                    entry.weight,
+                ))
+            })
+            .collect();
+    }
+
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64> {
         let mut merged = HashMap::new();
         for (row, weight) in deltas {

@@ -38,7 +38,10 @@ pub use circuit::{
     nexmark_person_alias_table, nexmark_person_table,
 };
 pub use collections::{ZSet, h};
-pub use count_aggregate::{DbspCountAggregate, DbspTransientCountAggregate};
+pub use count_aggregate::{
+    DbspCountAggregate, DbspTransientCountAggregate, TransientCountAggregateDistinctWeight,
+    TransientCountAggregateGroupedState, TransientCountAggregateSnapshot,
+};
 pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
