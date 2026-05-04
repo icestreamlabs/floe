@@ -3,12 +3,12 @@ use crate::dbsp_graph_builder::materialize::DeltaTransformFn;
 use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
-    EncodedRowProjectionColumn, PreparedJoinedEncodedRowProjection, concat_encoded_rows,
-    extract_encoded_row_columns, project_joined_encoded_rows_prepared,
+    EncodedRowProjectionColumn, EncodedRowProjectionSource, PreparedJoinedEncodedRowProjection,
+    concat_encoded_rows, extract_encoded_row_columns, project_joined_encoded_rows_prepared,
 };
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 fn project_encoded_delta_batch<K>(
     delta_values: &[(K, i64)],
@@ -820,7 +820,7 @@ impl DbspGraphBuilder {
         mut right_transient: Option<
             tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
         >,
-        output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
+        mut output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
         output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
         task_events: &GraphTaskSender,
         restore_transient_state: bool,
@@ -960,8 +960,192 @@ impl DbspGraphBuilder {
                 .expect("right key columns should be direct")
         };
 
+        if residual.is_none()
+            && let Some(columns) = output_projection.as_ref()
+        {
+            let mut left_required = BTreeSet::new();
+            let mut right_required = BTreeSet::new();
+            for column in columns.iter().copied() {
+                match column.source {
+                    EncodedRowProjectionSource::Left => {
+                        left_required.insert(column.index);
+                    }
+                    EncodedRowProjectionSource::Right => {
+                        right_required.insert(column.index);
+                    }
+                }
+            }
+            left_required.extend(left_key_columns_resolved.iter().copied());
+            right_required.extend(right_key_columns_resolved.iter().copied());
+            if left_required.is_empty() || right_required.is_empty() {
+                let left_key_columns = Arc::new(left_key_columns_resolved);
+                let right_key_columns = Arc::new(right_key_columns_resolved);
+                return self
+                    .spawn_transient_join_root_materialization(
+                        left,
+                        right,
+                        left_transient,
+                        right_transient,
+                        left_key_columns,
+                        right_key_columns,
+                        left_join_schema,
+                        right_join_schema,
+                        left_schema,
+                        right_schema,
+                        output_schema,
+                        residual,
+                        output_projection,
+                        output_tx,
+                        task_events,
+                        join_error_handler,
+                        restore_transient_state,
+                    )
+                    .await;
+            }
+
+            let (left_projection, left_remap) =
+                build_join_state_projection(left_join_schema.as_ref(), &left_required)
+                    .context("build transient join left state projection")?;
+            let (right_projection, right_remap) =
+                build_join_state_projection(right_join_schema.as_ref(), &right_required)
+                    .context("build transient join right state projection")?;
+
+            let remapped_left_key_columns =
+                remap_join_state_indices(&left_key_columns_resolved, &left_remap)
+                    .context("remap transient join left key columns")?;
+            let remapped_right_key_columns =
+                remap_join_state_indices(&right_key_columns_resolved, &right_remap)
+                    .context("remap transient join right key columns")?;
+            output_projection = Some(Arc::new(
+                remap_join_output_projection(columns.as_ref(), &left_remap, &right_remap)
+                    .context("remap transient join output projection")?,
+            ));
+
+            if let Some(projection) = left_projection {
+                tracing::info!(
+                    graph_id = %graph_id,
+                    input_columns = left_join_schema.len(),
+                    output_columns = projection.output_schema().len(),
+                    "pruning transient join left state payload"
+                );
+                let transform = Self::build_transient_join_precompute_transform(&projection)
+                    .context("build transient join left state-prune transform")?;
+                left = self
+                    .compile_map(&projection, left, task_events)
+                    .await
+                    .context("initialize transient join left state-prune map")?;
+                left_transient = left_transient.map(|receiver| {
+                    Self::remap_transient_join_input_batches(
+                        &graph_id,
+                        "left-state-prune",
+                        receiver,
+                        Arc::clone(&transform),
+                        task_events,
+                    )
+                });
+                left_join_schema = Arc::clone(projection.output_schema());
+            }
+
+            if let Some(projection) = right_projection {
+                tracing::info!(
+                    graph_id = %graph_id,
+                    input_columns = right_join_schema.len(),
+                    output_columns = projection.output_schema().len(),
+                    "pruning transient join right state payload"
+                );
+                let transform = Self::build_transient_join_precompute_transform(&projection)
+                    .context("build transient join right state-prune transform")?;
+                right = self
+                    .compile_map(&projection, right, task_events)
+                    .await
+                    .context("initialize transient join right state-prune map")?;
+                right_transient = right_transient.map(|receiver| {
+                    Self::remap_transient_join_input_batches(
+                        &graph_id,
+                        "right-state-prune",
+                        receiver,
+                        Arc::clone(&transform),
+                        task_events,
+                    )
+                });
+                right_join_schema = Arc::clone(projection.output_schema());
+            }
+
+            let left_key_columns = Arc::new(remapped_left_key_columns);
+            let right_key_columns = Arc::new(remapped_right_key_columns);
+            return self
+                .spawn_transient_join_root_materialization(
+                    left,
+                    right,
+                    left_transient,
+                    right_transient,
+                    left_key_columns,
+                    right_key_columns,
+                    left_join_schema,
+                    right_join_schema,
+                    left_schema,
+                    right_schema,
+                    output_schema,
+                    residual,
+                    output_projection,
+                    output_tx,
+                    task_events,
+                    join_error_handler,
+                    restore_transient_state,
+                )
+                .await;
+        }
+
         let left_key_columns = Arc::new(left_key_columns_resolved);
         let right_key_columns = Arc::new(right_key_columns_resolved);
+        self.spawn_transient_join_root_materialization(
+            left,
+            right,
+            left_transient,
+            right_transient,
+            left_key_columns,
+            right_key_columns,
+            left_join_schema,
+            right_join_schema,
+            left_schema,
+            right_schema,
+            output_schema,
+            residual,
+            output_projection,
+            output_tx,
+            task_events,
+            join_error_handler,
+            restore_transient_state,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_transient_join_root_materialization(
+        &mut self,
+        left: DeltaHandleStream,
+        right: DeltaHandleStream,
+        left_transient: Option<
+            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        >,
+        right_transient: Option<
+            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+        >,
+        left_key_columns: Arc<Vec<usize>>,
+        right_key_columns: Arc<Vec<usize>>,
+        left_join_schema: Arc<RowSchema>,
+        right_join_schema: Arc<RowSchema>,
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        output_schema: Arc<RowSchema>,
+        residual: Option<dbsp::DbspExpression>,
+        output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
+        output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
+        task_events: &GraphTaskSender,
+        join_error_handler: RuntimeErrorHandler,
+        restore_transient_state: bool,
+    ) -> Result<()> {
+        let graph_id = self.graph_id().to_string();
         let defer_residual_to_post_filter = residual.is_some();
         let deferred_residual_evaluator = if defer_residual_to_post_filter {
             let residual_expr = residual
@@ -985,16 +1169,18 @@ impl DbspGraphBuilder {
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
-        let left_output_projection = (left_join_schema.len() != left_schema.len())
-            .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
-        let right_output_projection = (right_join_schema.len() != right_schema.len())
-            .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
         let prepared_output_projection = output_projection
             .as_ref()
             .map(|columns| PreparedJoinedEncodedRowProjection::try_new(columns.as_ref()))
             .transpose()
             .context("prepare transient join output projection")?
             .map(Arc::new);
+        let left_output_projection = (prepared_output_projection.is_none()
+            && left_join_schema.len() != left_schema.len())
+        .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
+        let right_output_projection = (prepared_output_projection.is_none()
+            && right_join_schema.len() != right_schema.len())
+        .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let make_projector = {
             let left_output_projection = left_output_projection.clone();
@@ -1166,6 +1352,95 @@ impl DbspGraphBuilder {
     }
 }
 
+fn build_join_state_projection(
+    schema: &RowSchema,
+    required_columns: &BTreeSet<usize>,
+) -> Result<(Option<dbsp::DbspProjectNode>, HashMap<usize, usize>)> {
+    if required_columns
+        .iter()
+        .any(|column| *column >= schema.len())
+    {
+        return Err(anyhow!(
+            "join state projection requested column outside schema width {}",
+            schema.len()
+        ));
+    }
+
+    let mut remap = HashMap::with_capacity(required_columns.len());
+    for (new_index, old_index) in required_columns.iter().copied().enumerate() {
+        remap.insert(old_index, new_index);
+    }
+
+    let is_identity = required_columns.len() == schema.len()
+        && required_columns
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(expected, actual)| expected == actual);
+    if is_identity {
+        return Ok((None, remap));
+    }
+
+    let mut items = Vec::with_capacity(required_columns.len());
+    for old_index in required_columns {
+        let field = schema
+            .field(*old_index)
+            .ok_or_else(|| anyhow!("join state projection missing column {old_index}"))?;
+        items.push(dbsp::circuit::plan::ProjectItem {
+            expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+            alias: Some(field.name.clone()),
+        });
+    }
+    let projection = dbsp::DbspProjectNode::try_new(Arc::new(schema.clone()), items)
+        .context("build join state projection node")?;
+    Ok((Some(projection), remap))
+}
+
+fn remap_join_state_indices(
+    indices: &[usize],
+    remap: &HashMap<usize, usize>,
+) -> Result<Vec<usize>> {
+    indices
+        .iter()
+        .copied()
+        .map(|index| {
+            remap
+                .get(&index)
+                .copied()
+                .ok_or_else(|| anyhow!("join state projection dropped required column {index}"))
+        })
+        .collect()
+}
+
+fn remap_join_output_projection(
+    columns: &[EncodedRowProjectionColumn],
+    left_remap: &HashMap<usize, usize>,
+    right_remap: &HashMap<usize, usize>,
+) -> Result<Vec<EncodedRowProjectionColumn>> {
+    columns
+        .iter()
+        .copied()
+        .map(|column| {
+            let remapped_index = match column.source {
+                EncodedRowProjectionSource::Left => left_remap.get(&column.index),
+                EncodedRowProjectionSource::Right => right_remap.get(&column.index),
+            }
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "join state projection dropped output column {:?}:{}",
+                    column.source,
+                    column.index
+                )
+            })?;
+            Ok(EncodedRowProjectionColumn {
+                source: column.source,
+                index: remapped_index,
+            })
+        })
+        .collect()
+}
+
 fn encode_null_row_template(schema: &RowSchema) -> Result<Vec<u8>> {
     let count = u32::try_from(schema.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
     let mut encoded = Vec::with_capacity(4 + schema.len());
@@ -1204,4 +1479,61 @@ fn resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
     schema
         .field_index(&qualified)
         .or_else(|| schema.field_index(&column.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbsp::circuit::schema::Field;
+    use dbsp::circuit::types::DbspScalarType;
+
+    fn test_schema() -> Arc<RowSchema> {
+        RowSchema::try_new(vec![
+            Field::new("auction", DbspScalarType::Int64, false),
+            Field::new("bidder", DbspScalarType::Int64, false),
+            Field::new("price", DbspScalarType::Int64, false),
+            Field::new("extra", DbspScalarType::Utf8, true),
+        ])
+        .expect("schema")
+    }
+
+    #[test]
+    fn join_state_projection_drops_unneeded_columns_and_remaps_outputs() {
+        let schema = test_schema();
+        let required = BTreeSet::from([0usize, 2usize]);
+
+        let (projection, remap) =
+            build_join_state_projection(schema.as_ref(), &required).expect("projection");
+        let projection = projection.expect("non-identity projection");
+
+        assert_eq!(projection.output_schema().len(), 2);
+        assert_eq!(projection.output_schema().field(0).unwrap().name, "auction");
+        assert_eq!(projection.output_schema().field(1).unwrap().name, "price");
+        assert_eq!(remap.get(&0), Some(&0));
+        assert_eq!(remap.get(&2), Some(&1));
+        assert!(!remap.contains_key(&1));
+        assert!(!remap.contains_key(&3));
+
+        let columns = vec![EncodedRowProjectionColumn {
+            source: EncodedRowProjectionSource::Left,
+            index: 2,
+        }];
+        let right_remap = HashMap::new();
+        let remapped =
+            remap_join_output_projection(&columns, &remap, &right_remap).expect("remap output");
+        assert_eq!(remapped[0].index, 1);
+    }
+
+    #[test]
+    fn join_state_projection_elides_identity_projection() {
+        let schema = test_schema();
+        let required = BTreeSet::from([0usize, 1usize, 2usize, 3usize]);
+
+        let (projection, remap) =
+            build_join_state_projection(schema.as_ref(), &required).expect("projection");
+
+        assert!(projection.is_none());
+        assert_eq!(remap.get(&0), Some(&0));
+        assert_eq!(remap.get(&3), Some(&3));
+    }
 }
