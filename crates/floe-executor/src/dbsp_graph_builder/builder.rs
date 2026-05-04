@@ -4139,18 +4139,37 @@ fn join_input_direct_source_primary_key_columns<'a>(
     let Some(shape) = find_transient_source_root_shape(plan, input_idx)? else {
         return Ok(None);
     };
-    let source = match shape {
+    let (source, project) = match shape {
         TransientSourceRootShape::Source { source, .. }
-        | TransientSourceRootShape::Select { source, .. } => source,
-        TransientSourceRootShape::Project { .. } | TransientSourceRootShape::FilterMap { .. } => {
-            return Ok(None);
+        | TransientSourceRootShape::Select { source, .. } => (source, None),
+        TransientSourceRootShape::Project {
+            source, project, ..
         }
+        | TransientSourceRootShape::FilterMap {
+            source, project, ..
+        } => (source, Some(project)),
     };
 
-    let key_columns = key_expressions
+    let Some(key_columns) = key_expressions
         .into_iter()
         .map(|expr| projection_direct_column_index_expression(expr.expr(), input_schema))
-        .collect::<Option<BTreeSet<_>>>();
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let key_columns = if let Some(project) = project.as_ref() {
+        key_columns
+            .into_iter()
+            .map(|column_idx| {
+                project
+                    .expressions()
+                    .get(column_idx)
+                    .and_then(|expr| projection_direct_column_index(expr, project.input_schema()))
+            })
+            .collect::<Option<BTreeSet<_>>>()
+    } else {
+        Some(key_columns.into_iter().collect::<BTreeSet<_>>())
+    };
     let Some(key_columns) = key_columns else {
         return Ok(None);
     };
@@ -4584,10 +4603,15 @@ fn try_build_transient_join_closed_key_transform(
     let Some(closed_key_columns) = closed_key_columns else {
         return Ok(None);
     };
-    let Some(TransientSourceRootShape::Select { select, .. }) =
-        find_transient_source_root_shape(plan, input_idx)?
-    else {
+    let Some(shape) = find_transient_source_root_shape(plan, input_idx)? else {
         return Ok(None);
+    };
+    let select = match shape {
+        TransientSourceRootShape::Select { select, .. }
+        | TransientSourceRootShape::FilterMap { select, .. } => select,
+        TransientSourceRootShape::Source { .. } | TransientSourceRootShape::Project { .. } => {
+            return Ok(None);
+        }
     };
     let filter_transform = build_filter_transform(&select)?;
     Ok(Some(Arc::new(move |delta_values: &[(Vec<u8>, i64)]| {
