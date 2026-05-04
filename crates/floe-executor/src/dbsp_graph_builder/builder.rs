@@ -5690,6 +5690,7 @@ async fn build_transient_window_count_star_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    let compact_count_state = upstream.durable_enabled();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-count-star-source:{graph_id}"),
@@ -5704,6 +5705,7 @@ async fn build_transient_window_count_star_receiver(
         upstream_rx,
         output_transform,
         watermark,
+        compact_count_state,
         cancel,
         task_events,
         state_table,
@@ -5718,6 +5720,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     output_transform: Arc<DeltaTransformFn>,
     watermark: Arc<AtomicI64>,
+    compact_count_state: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
@@ -5749,24 +5752,38 @@ async fn build_transient_window_count_star_receiver_from_batches(
     let task_label = format!("transient-window-count-star:{graph_id}");
     let task_events = task_events.clone();
     let cancel = cancel.clone();
+    let state_label = state_label.into();
+    let state_label = if compact_count_state {
+        format!("{state_label}_counts")
+    } else {
+        state_label
+    };
     let mut persistent_state =
-        PersistentTransientInputState::load(state_table, &graph_id, state_label.into()).await?;
+        PersistentTransientInputState::load(state_table, &graph_id, state_label).await?;
     let restored_deltas = persistent_state.snapshot_deltas();
     tokio::spawn(async move {
         let mut counts: HashMap<TransientWindowCountKey, i64> = HashMap::new();
         let mut eviction_schedule: BTreeMap<i64, Vec<TransientWindowCountKey>> = BTreeMap::new();
-        if let Err(err) = apply_transient_window_count_star_deltas(
-            restored_deltas,
-            group_key_columns.as_ref(),
-            time_column,
-            window_size,
-            window_slide,
-            transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
-            &mut counts,
-            &mut eviction_schedule,
-        )
-        .map(|_| ())
-        {
+        let restore_result = if compact_count_state {
+            restore_transient_window_count_state(
+                restored_deltas,
+                &mut counts,
+                &mut eviction_schedule,
+            )
+        } else {
+            apply_transient_window_count_star_deltas(
+                restored_deltas,
+                group_key_columns.as_ref(),
+                time_column,
+                window_size,
+                window_slide,
+                transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
+                &mut counts,
+                &mut eviction_schedule,
+            )
+            .map(|_| ())
+        };
+        if let Err(err) = restore_result {
             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
             return;
         }
@@ -5789,9 +5806,11 @@ async fn build_transient_window_count_star_receiver_from_batches(
                     } else {
                         input_deltas
                     };
-                    if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
-                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                        break;
+                    if !compact_count_state {
+                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                     }
                     let updates = match apply_transient_window_count_star_deltas(
                         input_deltas,
@@ -5809,6 +5828,19 @@ async fn build_transient_window_count_star_receiver_from_batches(
                             break;
                         }
                     };
+                    if compact_count_state {
+                        let snapshot = match encode_transient_window_count_state(&counts) {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        if let Err(err) = persistent_state.replace_with_snapshot(snapshot).await {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
+                    }
 
                     let encoded_output = match encode_transient_window_count_output_deltas(updates) {
                         Ok(deltas) => deltas,
@@ -6603,6 +6635,54 @@ fn apply_transient_window_count_star_deltas(
 
     transient_window_evict_expired_counts(cutoff, counts, eviction_schedule, &mut updates);
     Ok(updates)
+}
+
+fn encode_transient_window_count_state(
+    counts: &HashMap<TransientWindowCountKey, i64>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    counts
+        .iter()
+        .filter(|(_, count)| **count != 0)
+        .map(|(key, count)| {
+            let encoded_window = encode_transient_window_bounds(key.start, key.end)?;
+            let row = concat_encoded_rows(&encoded_window, &key.key)?;
+            Ok((row, *count))
+        })
+        .collect()
+}
+
+fn restore_transient_window_count_state(
+    rows: Vec<(Vec<u8>, i64)>,
+    counts: &mut HashMap<TransientWindowCountKey, i64>,
+    eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+) -> Result<()> {
+    for (row, count) in rows {
+        if count == 0 {
+            continue;
+        }
+        let key = decode_transient_window_count_state_key(&row)?;
+        counts.insert(key.clone(), count);
+        eviction_schedule.entry(key.end).or_default().push(key);
+    }
+    Ok(())
+}
+
+fn decode_transient_window_count_state_key(row: &[u8]) -> Result<TransientWindowCountKey> {
+    if row.len() < 4 {
+        bail!("encoded window count state row too short");
+    }
+    let column_count = u32::from_le_bytes(row[0..4].try_into().unwrap()) as usize;
+    if column_count < 2 {
+        bail!("encoded window count state row has fewer than two window columns");
+    }
+    let start = extract_encoded_row_i64_like_column(row, 0)?
+        .ok_or_else(|| anyhow!("encoded window count state start is null"))?;
+    let end = extract_encoded_row_i64_like_column(row, 1)?
+        .ok_or_else(|| anyhow!("encoded window count state end is null"))?;
+    let key_columns = (2..column_count).collect::<Vec<_>>();
+    let key = extract_encoded_row_columns(row, &key_columns, false)?
+        .ok_or_else(|| anyhow!("encoded window count state key unexpectedly null"))?;
+    Ok(TransientWindowCountKey { start, end, key })
 }
 
 fn encode_transient_window_count_output_deltas(
