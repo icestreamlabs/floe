@@ -833,6 +833,7 @@ impl DbspGraphBuilder {
                         topn,
                         receiver,
                         false,
+                        false,
                         None,
                         cancel,
                         task_events,
@@ -1477,6 +1478,37 @@ impl PersistentTransientInputState {
         if dirty && let Some(table) = self.table.as_ref() {
             table.write_batch(batch).await?;
         }
+        Ok(())
+    }
+
+    async fn replace_with_snapshot(&mut self, rows: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        let next_rows = rows
+            .into_iter()
+            .filter(|(_, weight)| *weight != 0)
+            .collect::<HashMap<_, _>>();
+        if self.rows == next_rows {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for row in self.rows.keys() {
+            if !next_rows.contains_key(row) {
+                let mut key = self.prefix.clone();
+                key.extend_from_slice(row);
+                batch.delete(key);
+            }
+        }
+        for (row, weight) in &next_rows {
+            if self.rows.get(row).copied() != Some(*weight) {
+                let mut key = self.prefix.clone();
+                key.extend_from_slice(row);
+                batch.put(key, weight.to_le_bytes());
+            }
+        }
+        if let Some(table) = self.table.as_ref() {
+            table.write_batch(batch).await?;
+        }
+        self.rows = next_rows;
         Ok(())
     }
 }
@@ -2321,6 +2353,7 @@ struct TransientDirectTop1Processor {
     partition_layout: TransientDirectTop1PartitionLayout,
     order_idx: usize,
     ascending: bool,
+    compact_append_only_state: bool,
     row_key_cache: HashMap<Vec<u8>, Option<(TransientDirectTop1PartitionKey, i64)>>,
     partitions: HashMap<TransientDirectTop1PartitionKey, TransientDirectTop1PartitionState>,
     profile_enabled: bool,
@@ -3156,12 +3189,17 @@ impl TransientDirectInt64TopNProcessor {
     }
 }
 impl TransientDirectTop1Processor {
-    fn new(graph_id: impl Into<String>, config: TransientDirectTop1Config) -> Self {
+    fn new(
+        graph_id: impl Into<String>,
+        config: TransientDirectTop1Config,
+        compact_append_only_state: bool,
+    ) -> Self {
         Self {
             graph_id: graph_id.into(),
             partition_layout: config.partition_layout,
             order_idx: config.order_idx,
             ascending: config.ascending,
+            compact_append_only_state,
             row_key_cache: HashMap::new(),
             partitions: HashMap::new(),
             profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
@@ -3267,6 +3305,17 @@ impl TransientDirectTop1Processor {
         Ok(output_deltas)
     }
 
+    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
+        self.partitions
+            .values()
+            .filter_map(|state| {
+                let row_key = state.top_row.as_ref()?;
+                let weight = state.live_rows.get(row_key)?.weight;
+                (weight > 0).then_some((row_key.clone(), weight))
+            })
+            .collect()
+    }
+
     fn apply_partition_updates_append_only(
         &self,
         state: &mut TransientDirectTop1PartitionState,
@@ -3278,6 +3327,7 @@ impl TransientDirectTop1Processor {
             if next_weight <= 0 {
                 continue;
             }
+            let previous_top = next_top.clone();
             match next_top.as_ref() {
                 Some(current_top) => {
                     if self.compare_live_rows(state, &update.row_key, current_top)
@@ -3289,6 +3339,22 @@ impl TransientDirectTop1Processor {
                 None => {
                     next_top = Some(update.row_key.clone());
                 }
+            }
+            if next_top.as_ref() == Some(&update.row_key)
+                && previous_top.as_ref() != Some(&update.row_key)
+                && self.compact_append_only_state
+            {
+                let retained = state
+                    .live_rows
+                    .get(&update.row_key)
+                    .cloned()
+                    .expect("winning append-only top1 row must be live");
+                state.live_rows.clear();
+                state.live_rows.insert(update.row_key.clone(), retained);
+            } else if previous_top.as_ref() != Some(&update.row_key)
+                && self.compact_append_only_state
+            {
+                state.live_rows.remove(&update.row_key);
             }
         }
         next_top
@@ -6904,6 +6970,7 @@ fn build_transient_topn_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+    let compact_append_only_state = upstream.durable_enabled();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-topn-source:{graph_id}"),
@@ -6917,6 +6984,7 @@ fn build_transient_topn_receiver(
         topn,
         upstream_rx,
         true,
+        compact_append_only_state,
         output_projection,
         cancel,
         task_events,
@@ -6930,6 +6998,7 @@ fn build_transient_topn_receiver_from_batches(
     topn: &DbspTopNNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     append_only_input: bool,
+    compact_append_only_state: bool,
     output_projection: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
@@ -6944,7 +7013,8 @@ fn build_transient_topn_receiver_from_batches(
     let state_label = state_label.into();
     let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
-        let mut processor = TransientDirectTop1Processor::new(graph_id.clone(), config);
+        let mut processor =
+            TransientDirectTop1Processor::new(graph_id.clone(), config, compact_append_only_state);
         let output_projection = output_projection.clone();
         let state_table = state_table.clone();
         let state_label = state_label.clone();
@@ -6971,9 +7041,11 @@ fn build_transient_topn_receiver_from_batches(
                             break;
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
+                        if !compact_append_only_state {
+                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
                         }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
@@ -6982,6 +7054,12 @@ fn build_transient_topn_receiver_from_batches(
                                 break;
                             }
                         };
+                        if compact_append_only_state {
+                            if let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
                                 Ok(deltas) => deltas,
@@ -7630,6 +7708,58 @@ mod tests {
         let mut rows = reloaded.snapshot_deltas();
         rows.sort();
         assert_eq!(rows, vec![(b"row-1".to_vec(), 1), (b"row-2".to_vec(), 1)]);
+    }
+
+    #[test]
+    fn append_only_direct_top1_retains_only_partition_winner() {
+        let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+        let row_30 = encode_event(&decoder, bid_event_payload(1, 101, 30), "nexmark_bid");
+        let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
+        let row_40 = encode_event(&decoder, bid_event_payload(1, 103, 40), "nexmark_bid");
+        let mut processor = TransientDirectTop1Processor::new(
+            "test-graph",
+            TransientDirectTop1Config {
+                partition_layout: TransientDirectTop1PartitionLayout::One(0),
+                order_idx: 2,
+                ascending: true,
+            },
+            true,
+        );
+
+        assert_eq!(
+            processor.apply_deltas(vec![(row_30.clone(), 1)]).unwrap(),
+            vec![(row_30.clone(), 1)]
+        );
+
+        let mut output = processor.apply_deltas(vec![(row_20.clone(), 1)]).unwrap();
+        output.sort();
+        let mut expected = vec![(row_20.clone(), 1), (row_30.clone(), -1)];
+        expected.sort();
+        assert_eq!(output, expected);
+
+        assert_eq!(
+            processor.apply_deltas(vec![(row_40.clone(), 1)]).unwrap(),
+            Vec::<(Vec<u8>, i64)>::new()
+        );
+
+        let partition = processor
+            .partitions
+            .get(&TransientDirectTop1PartitionKey::One(1))
+            .expect("partition state");
+        assert_eq!(partition.live_rows.len(), 1);
+        assert!(partition.live_rows.contains_key(&row_20));
+        assert_eq!(processor.snapshot_deltas(), vec![(row_20.clone(), 1)]);
+
+        assert_eq!(
+            processor.apply_deltas(vec![(row_20.clone(), 1)]).unwrap(),
+            Vec::<(Vec<u8>, i64)>::new()
+        );
+        let partition = processor
+            .partitions
+            .get(&TransientDirectTop1PartitionKey::One(1))
+            .expect("partition state");
+        assert_eq!(partition.live_rows.len(), 1);
+        assert_eq!(processor.snapshot_deltas(), vec![(row_20, 2)]);
     }
 
     #[test]

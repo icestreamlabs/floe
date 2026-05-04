@@ -41,6 +41,7 @@ pub struct TransientSourceBatch {
 #[derive(Clone)]
 pub struct TransientSourceHandleStream {
     subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
+    durable_enabled: bool,
 }
 
 impl TransientSourceHandleStream {
@@ -51,6 +52,10 @@ impl TransientSourceHandleStream {
             .expect("transient source subscribers lock poisoned")
             .push(tx);
         rx
+    }
+
+    pub fn durable_enabled(&self) -> bool {
+        self.durable_enabled
     }
 }
 
@@ -108,6 +113,7 @@ impl OuterStreamWriter {
     pub fn transient_stream(&self) -> TransientSourceHandleStream {
         TransientSourceHandleStream {
             subscribers: Arc::clone(&self.transient_subscribers),
+            durable_enabled: self.durable_enabled,
         }
     }
 
