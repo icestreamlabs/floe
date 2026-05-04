@@ -71,7 +71,7 @@ where
     pub left_state: RelationState<L>,
     pub right_state: RelationState<R>,
     pub left_index: IndexedBatchZSet<K, L>,
-    pub right_index: IndexedBatchZSet<K, R>,
+    pub right_index: IndexedBatchZSet<K, ()>,
     pub left_key: BatchJoinKeyExtractor<L, K>,
     pub right_key: BatchJoinKeyExtractor<R, K>,
     pub mode: SemiJoinMode,
@@ -117,7 +117,7 @@ where
         left_state: RelationState<L>,
         right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
+        right_index: IndexedBatchZSet<K, ()>,
         left_key: JoinKeyExtractor<L, K>,
         right_key: JoinKeyExtractor<R, K>,
         mode: SemiJoinMode,
@@ -156,7 +156,7 @@ where
         left_state: RelationState<L>,
         right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
+        right_index: IndexedBatchZSet<K, ()>,
         left_key: BatchJoinKeyExtractor<L, K>,
         right_key: BatchJoinKeyExtractor<R, K>,
         mode: SemiJoinMode,
@@ -371,19 +371,12 @@ where
                 .values_for_key(key)
                 .await
                 .context("load right index for semijoin")?;
-            let mut current: HashMap<R, i64> = HashMap::new();
-            for (row, weight) in existing {
-                current.insert(row, weight);
+            let mut current_count = existing.into_iter().map(|(_, weight)| weight).sum::<i64>();
+            let prev_present = current_count != 0;
+            for (_, delta) in entries {
+                current_count += *delta;
             }
-            let prev_present = !current.is_empty();
-            for (row, delta) in entries {
-                let entry = current.entry(row.clone()).or_insert(0);
-                *entry += *delta;
-                if *entry == 0 {
-                    current.remove(row);
-                }
-            }
-            let new_present = !current.is_empty();
+            let new_present = current_count != 0;
             right_presence.insert(key.clone(), (prev_present, new_present));
         }
 
@@ -406,12 +399,16 @@ where
         for (key, entries) in &left_keyed {
             let right_present = match right_presence.get(key) {
                 Some((_, new_present)) => *new_present,
-                None => !self
-                    .right_index
-                    .values_for_key(key)
-                    .await
-                    .context("load right index for semijoin probe")?
-                    .is_empty(),
+                None => {
+                    self.right_index
+                        .values_for_key(key)
+                        .await
+                        .context("load right index for semijoin probe")?
+                        .into_iter()
+                        .map(|(_, weight)| weight)
+                        .sum::<i64>()
+                        != 0
+                }
             };
             if self.mode.active(right_present) {
                 for (row, weight) in entries {
@@ -456,20 +453,6 @@ where
         .context("update left integrated state")?;
         self.left_state.update_handle(new_left_handle);
 
-        let right_base = self
-            .right_state
-            .integrated
-            .current_handle()
-            .map(|handle| handle.version);
-        let new_right_handle = Self::apply_deltas_to_versioned(
-            &mut self.right_state.integrated,
-            &right_delta,
-            right_base,
-        )
-        .await
-        .context("update right integrated state")?;
-        self.right_state.update_handle(new_right_handle);
-
         let mut left_updates = Vec::new();
         for (key, entries) in &left_keyed {
             for (row, weight) in entries {
@@ -485,8 +468,8 @@ where
 
         let mut right_updates = Vec::new();
         for (key, entries) in &right_keyed {
-            for (row, weight) in entries {
-                right_updates.push((key.clone(), row.clone(), *weight));
+            for (_, weight) in entries {
+                right_updates.push((key.clone(), (), *weight));
             }
         }
         if !right_updates.is_empty() {
@@ -778,6 +761,14 @@ mod tests {
 
             prev_output = output_now;
         }
+
+        let mut right_key_one_values = op
+            .right_index
+            .values_for_key(&1)
+            .await
+            .expect("load compact right semijoin index");
+        right_key_one_values.sort_unstable();
+        assert_eq!(right_key_one_values, vec![((), 3)]);
     }
 
     #[tokio::test]

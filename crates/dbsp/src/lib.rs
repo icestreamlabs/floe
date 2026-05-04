@@ -59,7 +59,7 @@ pub use operators::incremental_aggregate::{
     AggregateValue, AggregateValueType, IncrementalAggregateRow, IncrementalAggregateSlotKind,
     IncrementalAggregateSlotUpdate,
 };
-pub use operators::join::JoinOp;
+pub use operators::join::{JoinInputRetention, JoinOp};
 pub use operators::map::MapOp;
 pub use operators::top1::PartitionedTop1Op;
 pub use operators::topk::TopKOp;

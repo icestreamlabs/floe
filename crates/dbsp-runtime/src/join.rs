@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::operators::join::{JoinOp, JoinTransientInputs};
+use crate::operators::join::{JoinInputRetention, JoinOp, JoinTransientInputs};
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -459,13 +459,15 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
-        Self::spawn_transient_with_inputs(
+        Self::spawn_transient_with_inputs_and_retention(
             left,
             right,
             None,
             None,
             false,
             None,
+            JoinInputRetention::RetainAll,
+            JoinInputRetention::RetainAll,
             left_key,
             right_key,
             predicate,
@@ -484,6 +486,84 @@ impl DbspJoin {
         right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
         prefer_source_driven_runtime: bool,
         state_namespace: Option<String>,
+        left_key: KL,
+        right_key: KR,
+        predicate: P,
+        projector: F,
+        observer: JoinObserver<O>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<()>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        O: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
+        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
+        P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+        F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
+    {
+        Self::spawn_transient_with_inputs_and_retention(
+            left,
+            right,
+            left_transient,
+            right_transient,
+            prefer_source_driven_runtime,
+            state_namespace,
+            JoinInputRetention::RetainAll,
+            JoinInputRetention::RetainAll,
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            observer,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_transient_with_inputs_and_retention<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L>>>,
+        right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R>>>,
+        prefer_source_driven_runtime: bool,
+        state_namespace: Option<String>,
+        left_retention: JoinInputRetention,
+        right_retention: JoinInputRetention,
         left_key: KL,
         right_key: KR,
         predicate: P,
@@ -558,18 +638,21 @@ impl DbspJoin {
             .await
             .context("restore committed right join index")?;
 
-        let join_op = Arc::new(AsyncMutex::new(JoinOp::new_without_output(
-            left_state,
-            right_state,
-            left_index,
-            right_index,
-            Arc::new(left_key),
-            Arc::new(right_key),
-            Arc::new(predicate),
-            Arc::new(projector),
-            table.clone(),
-            None,
-        )));
+        let join_op = Arc::new(AsyncMutex::new(
+            JoinOp::new_without_output(
+                left_state,
+                right_state,
+                left_index,
+                right_index,
+                Arc::new(left_key),
+                Arc::new(right_key),
+                Arc::new(predicate),
+                Arc::new(projector),
+                table.clone(),
+                None,
+            )
+            .with_input_retention(left_retention, right_retention),
+        ));
 
         let output_version = Arc::new(AtomicU64::new(0));
 

@@ -39,6 +39,12 @@ pub struct JoinTransientInputs<L, R> {
     pub(crate) right: Option<Arc<Vec<(R, i64)>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinInputRetention {
+    RetainAll,
+    DropMatchedAppendOnly,
+}
+
 pub struct JoinOp<L, R, O, K>
 where
     L: Archive
@@ -94,6 +100,8 @@ where
     left_memory_index: FastHashMap<K, FastHashMap<L, i64>>,
     right_memory_index: FastHashMap<K, FastHashMap<R, i64>>,
     persist_indexes: bool,
+    left_retention: JoinInputRetention,
+    right_retention: JoinInputRetention,
 }
 
 impl<L, R, O, K> JoinOp<L, R, O, K>
@@ -209,6 +217,8 @@ where
             left_memory_index: FastHashMap::new(),
             right_memory_index: FastHashMap::new(),
             persist_indexes: true,
+            left_retention: JoinInputRetention::RetainAll,
+            right_retention: JoinInputRetention::RetainAll,
         }
     }
 
@@ -289,11 +299,23 @@ where
             left_memory_index: FastHashMap::new(),
             right_memory_index: FastHashMap::new(),
             persist_indexes: true,
+            left_retention: JoinInputRetention::RetainAll,
+            right_retention: JoinInputRetention::RetainAll,
         }
     }
 
     pub fn with_persist_indexes(mut self, persist_indexes: bool) -> Self {
         self.persist_indexes = persist_indexes;
+        self
+    }
+
+    pub fn with_input_retention(
+        mut self,
+        left_retention: JoinInputRetention,
+        right_retention: JoinInputRetention,
+    ) -> Self {
+        self.left_retention = left_retention;
+        self.right_retention = right_retention;
         self
     }
 
@@ -548,6 +570,150 @@ where
         }
     }
 
+    fn add_keyed_delta<T>(keyed: &mut KeyedRowDeltas<K, T>, key: K, row: T, weight: i64)
+    where
+        T: Clone + Eq + Hash,
+    {
+        if weight == 0 {
+            return;
+        }
+        let should_remove_key = {
+            let rows = keyed.entry(key.clone()).or_default();
+            let next = rows.get(&row).copied().unwrap_or(0).saturating_add(weight);
+            if next == 0 {
+                rows.remove(&row);
+            } else {
+                rows.insert(row, next);
+            }
+            rows.is_empty()
+        };
+        if should_remove_key {
+            keyed.remove(&key);
+        }
+    }
+
+    fn left_matches_any_right(
+        &self,
+        left: &L,
+        right_state: Option<&FastHashMap<R, i64>>,
+        right_delta: Option<&FastHashMap<R, i64>>,
+    ) -> bool {
+        right_state
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .chain(right_delta.into_iter().flat_map(|rows| rows.iter()))
+            .any(|(right, weight)| *weight > 0 && (self.predicate)(left, right))
+    }
+
+    fn right_matches_any_left(
+        &self,
+        right: &R,
+        left_state: Option<&FastHashMap<L, i64>>,
+        left_delta: Option<&FastHashMap<L, i64>>,
+    ) -> bool {
+        left_state
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .chain(left_delta.into_iter().flat_map(|rows| rows.iter()))
+            .any(|(left, weight)| *weight > 0 && (self.predicate)(left, right))
+    }
+
+    fn retained_left_updates(
+        &self,
+        left_keyed: &KeyedRowDeltas<K, L>,
+        right_keyed: &KeyedRowDeltas<K, R>,
+    ) -> KeyedRowDeltas<K, L> {
+        let mut retained = KeyedRowDeltas::default();
+        for (key, rows) in left_keyed {
+            for (left, weight) in rows {
+                let matched = *weight > 0
+                    && self.left_retention == JoinInputRetention::DropMatchedAppendOnly
+                    && self.left_matches_any_right(
+                        left,
+                        self.right_memory_index.get(key),
+                        right_keyed.get(key),
+                    );
+                if !matched {
+                    Self::add_keyed_delta(&mut retained, key.clone(), left.clone(), *weight);
+                }
+            }
+        }
+
+        if self.left_retention == JoinInputRetention::DropMatchedAppendOnly {
+            for (key, right_rows) in right_keyed {
+                let Some(left_rows) = self.left_memory_index.get(key) else {
+                    continue;
+                };
+                for (left, left_weight) in left_rows {
+                    if *left_weight <= 0 {
+                        continue;
+                    }
+                    let matched = right_rows.iter().any(|(right, right_weight)| {
+                        *right_weight > 0 && (self.predicate)(left, right)
+                    });
+                    if matched {
+                        Self::add_keyed_delta(
+                            &mut retained,
+                            key.clone(),
+                            left.clone(),
+                            -*left_weight,
+                        );
+                    }
+                }
+            }
+        }
+
+        retained
+    }
+
+    fn retained_right_updates(
+        &self,
+        left_keyed: &KeyedRowDeltas<K, L>,
+        right_keyed: &KeyedRowDeltas<K, R>,
+    ) -> KeyedRowDeltas<K, R> {
+        let mut retained = KeyedRowDeltas::default();
+        for (key, rows) in right_keyed {
+            for (right, weight) in rows {
+                let matched = *weight > 0
+                    && self.right_retention == JoinInputRetention::DropMatchedAppendOnly
+                    && self.right_matches_any_left(
+                        right,
+                        self.left_memory_index.get(key),
+                        left_keyed.get(key),
+                    );
+                if !matched {
+                    Self::add_keyed_delta(&mut retained, key.clone(), right.clone(), *weight);
+                }
+            }
+        }
+
+        if self.right_retention == JoinInputRetention::DropMatchedAppendOnly {
+            for (key, left_rows) in left_keyed {
+                let Some(right_rows) = self.right_memory_index.get(key) else {
+                    continue;
+                };
+                for (right, right_weight) in right_rows {
+                    if *right_weight <= 0 {
+                        continue;
+                    }
+                    let matched = left_rows.iter().any(|(left, left_weight)| {
+                        *left_weight > 0 && (self.predicate)(left, right)
+                    });
+                    if matched {
+                        Self::add_keyed_delta(
+                            &mut retained,
+                            key.clone(),
+                            right.clone(),
+                            -*right_weight,
+                        );
+                    }
+                }
+            }
+        }
+
+        retained
+    }
+
     async fn step_internal(
         &mut self,
         _ts: i64,
@@ -659,11 +825,20 @@ where
         }
         delta_join.retain(|_, w| *w != 0);
 
-        Self::apply_keyed_updates_to_memory_index(&mut self.left_memory_index, &left_keyed);
-        Self::apply_keyed_updates_to_memory_index(&mut self.right_memory_index, &right_keyed);
+        let left_retained_updates = self.retained_left_updates(&left_keyed, &right_keyed);
+        let right_retained_updates = self.retained_right_updates(&left_keyed, &right_keyed);
+
+        Self::apply_keyed_updates_to_memory_index(
+            &mut self.left_memory_index,
+            &left_retained_updates,
+        );
+        Self::apply_keyed_updates_to_memory_index(
+            &mut self.right_memory_index,
+            &right_retained_updates,
+        );
 
         if self.persist_indexes {
-            let left_updates = Self::flatten_keyed_updates(&left_keyed);
+            let left_updates = Self::flatten_keyed_updates(&left_retained_updates);
             let left_index_persist_start = std::time::Instant::now();
             self.left_index
                 .apply_deltas(left_updates)
@@ -677,7 +852,7 @@ where
         }
 
         if self.persist_indexes {
-            let right_updates = Self::flatten_keyed_updates(&right_keyed);
+            let right_updates = Self::flatten_keyed_updates(&right_retained_updates);
             let right_index_persist_start = std::time::Instant::now();
             self.right_index
                 .apply_deltas(right_updates)

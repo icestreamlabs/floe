@@ -9,7 +9,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::Db;
 
-use super::{JoinOp, JoinTransientInputs};
+use super::{JoinInputRetention, JoinOp, JoinTransientInputs};
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
@@ -839,6 +839,121 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
         .await
         .expect("materialize join delta");
     assert_eq!(materialized.get(&14), Some(&1));
+}
+
+#[tokio::test]
+async fn join_operator_can_drop_matched_append_only_left_rows() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_drop_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let right_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_drop_right_stream", None)
+            .await
+            .expect("right dict"),
+    );
+
+    let left_state = RelationState::empty(table.clone(), "join_drop_left_state".to_string())
+        .await
+        .expect("left state");
+    let right_state = RelationState::empty(table.clone(), "join_drop_right_state".to_string())
+        .await
+        .expect("right state");
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_drop_output", None)
+            .await
+            .expect("output dict"),
+    );
+    let output = VersionedZSet::new(out_dict, table.clone(), "join_drop_output".to_string())
+        .await
+        .expect("output zset");
+
+    let mut op = JoinOp::new(
+        left_state,
+        right_state,
+        IndexedBatchZSet::new(table.clone(), "join_drop_left_index"),
+        IndexedBatchZSet::new(table.clone(), "join_drop_right_index"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        output,
+        None,
+    )
+    .with_input_retention(
+        JoinInputRetention::DropMatchedAppendOnly,
+        JoinInputRetention::RetainAll,
+    );
+
+    let left_first = stage_version(
+        left_dict.clone(),
+        table.clone(),
+        "join_drop_left_stream",
+        &[(7, 1)],
+    )
+    .await;
+    op.on_step(1, &[left_first, empty_handle("join_drop_right_stream")])
+        .await
+        .expect("left-only join step");
+    assert_eq!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index after unmatched left"),
+        vec![(7, 1)]
+    );
+
+    let right_match = stage_version(
+        right_dict.clone(),
+        table.clone(),
+        "join_drop_right_stream",
+        &[(7, 1)],
+    )
+    .await;
+    let out = op
+        .on_step(2, &[empty_handle("join_drop_left_stream"), right_match])
+        .await
+        .expect("right match join step")
+        .expect("right match output");
+    let mut cache = HashMap::new();
+    let materialized = materialize_zset_handle::<i64>(table.clone(), &mut cache, &out)
+        .await
+        .expect("materialize right match output");
+    assert_eq!(materialized, HashMap::from([(14, 1)]));
+    assert!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index after matched eviction")
+            .is_empty()
+    );
+    assert_eq!(
+        op.right_index
+            .values_for_key(&7)
+            .await
+            .expect("right index retained"),
+        vec![(7, 1)]
+    );
+
+    let left_after_right =
+        stage_version(left_dict, table.clone(), "join_drop_left_stream", &[(7, 1)]).await;
+    op.on_step(
+        3,
+        &[left_after_right, empty_handle("join_drop_right_stream")],
+    )
+    .await
+    .expect("matched left join step");
+    assert!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index after immediate match")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

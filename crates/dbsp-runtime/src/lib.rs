@@ -65,7 +65,7 @@ pub use operators::incremental_aggregate::{
     IncrementalAggregateSlotUpdate,
 };
 pub use operators::index::ArrangeByKeyOp;
-pub use operators::join::JoinOp;
+pub use operators::join::{JoinInputRetention, JoinOp};
 pub use operators::join_range::JoinRangeOp;
 pub use operators::map::MapOp;
 pub use operators::rolling_aggregate::RollingAggregateOp;

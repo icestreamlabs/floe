@@ -524,6 +524,26 @@ impl DbspGraphBuilder {
                     let output_projection =
                         try_build_direct_join_output_projection(join, &transient_opt.steps);
                     let direct_output_projection = output_projection.is_some();
+                    let left_retention = if join_input_unique_on_direct_source_primary_key(
+                        inputs.plan,
+                        right_idx,
+                        join.keys.iter().map(|key| key.right_expression()),
+                        join.right_schema.as_ref(),
+                    )? {
+                        dbsp::JoinInputRetention::DropMatchedAppendOnly
+                    } else {
+                        dbsp::JoinInputRetention::RetainAll
+                    };
+                    let right_retention = if join_input_unique_on_direct_source_primary_key(
+                        inputs.plan,
+                        left_idx,
+                        join.keys.iter().map(|key| key.left_expression()),
+                        join.left_schema.as_ref(),
+                    )? {
+                        dbsp::JoinInputRetention::DropMatchedAppendOnly
+                    } else {
+                        dbsp::JoinInputRetention::RetainAll
+                    };
                     let delta_transform = if direct_output_projection {
                         None
                     } else {
@@ -543,6 +563,8 @@ impl DbspGraphBuilder {
                         right_transient_source = ?right_transient_source,
                         right_transient_nodes = ?right_transient_nodes,
                         direct_output_projection,
+                        left_retention = ?left_retention,
+                        right_retention = ?right_retention,
                         "using transient join-to-mv root materialization"
                     );
                     self.materialize_view_from_transient_overlay_receiver(
@@ -561,6 +583,8 @@ impl DbspGraphBuilder {
                         right,
                         left_transient_input.map(|input| input.receiver),
                         right_transient_input.map(|input| input.receiver),
+                        left_retention,
+                        right_retention,
                         output_projection,
                         tx,
                         &inputs.task_events,
@@ -737,12 +761,40 @@ impl DbspGraphBuilder {
         })?;
 
         let (tx, mut receiver) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+        let left_retention = if join_input_unique_on_direct_source_primary_key(
+            plan,
+            root.right_input_idx,
+            root.join.keys.iter().map(|key| key.right_expression()),
+            root.join.right_schema.as_ref(),
+        )? {
+            dbsp::JoinInputRetention::DropMatchedAppendOnly
+        } else {
+            dbsp::JoinInputRetention::RetainAll
+        };
+        let right_retention = if join_input_unique_on_direct_source_primary_key(
+            plan,
+            root.left_input_idx,
+            root.join.keys.iter().map(|key| key.left_expression()),
+            root.join.left_schema.as_ref(),
+        )? {
+            dbsp::JoinInputRetention::DropMatchedAppendOnly
+        } else {
+            dbsp::JoinInputRetention::RetainAll
+        };
+        tracing::info!(
+            graph_id = %self.graph_id(),
+            left_retention = ?left_retention,
+            right_retention = ?right_retention,
+            "using transient join pipeline state retention"
+        );
         self.compile_transient_join_root_materialization(
             &root.join,
             left,
             right,
             Some(left_transient_input.receiver),
             Some(right_transient_input.receiver),
+            left_retention,
+            right_retention,
             None,
             tx,
             task_events,
@@ -4048,6 +4100,41 @@ fn split_join_required_columns(
         right_columns.insert(right_idx);
     }
     Ok(())
+}
+
+fn join_input_unique_on_direct_source_primary_key<'a>(
+    plan: &CircuitPlan,
+    input_idx: usize,
+    key_expressions: impl IntoIterator<Item = &'a DbspExpression>,
+    input_schema: &RowSchema,
+) -> Result<bool> {
+    let Some(shape) = find_transient_source_root_shape(plan, input_idx)? else {
+        return Ok(false);
+    };
+    let source = match shape {
+        TransientSourceRootShape::Source { source, .. }
+        | TransientSourceRootShape::Select { source, .. } => source,
+        TransientSourceRootShape::Project { .. } | TransientSourceRootShape::FilterMap { .. } => {
+            return Ok(false);
+        }
+    };
+
+    let key_columns = key_expressions
+        .into_iter()
+        .map(|expr| projection_direct_column_index_expression(expr.expr(), input_schema))
+        .collect::<Option<BTreeSet<_>>>();
+    let Some(key_columns) = key_columns else {
+        return Ok(false);
+    };
+    let primary_key_columns = source
+        .table
+        .primary_key()
+        .columns()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    Ok(key_columns == primary_key_columns)
 }
 
 fn try_build_direct_join_output_projection(
@@ -8065,6 +8152,30 @@ mod tests {
             matches!(join.kind, DbspNodeKind::Join(_)),
             "expected q20 root project to read directly from join, found {:?}",
             join.kind
+        );
+        let DbspNodeKind::Join(join_node) = &join.kind else {
+            unreachable!();
+        };
+        let (left_idx, right_idx) = join_inputs(join).expect("join inputs");
+        assert!(
+            join_input_unique_on_direct_source_primary_key(
+                &plan,
+                right_idx,
+                join_node.keys.iter().map(|key| key.right_expression()),
+                join_node.right_schema.as_ref(),
+            )
+            .expect("right uniqueness analysis"),
+            "q20 auction side should be unique on the join key"
+        );
+        assert!(
+            !join_input_unique_on_direct_source_primary_key(
+                &plan,
+                left_idx,
+                join_node.keys.iter().map(|key| key.left_expression()),
+                join_node.left_schema.as_ref(),
+            )
+            .expect("left uniqueness analysis"),
+            "q20 bid side should not be unique on auction"
         );
     }
 
