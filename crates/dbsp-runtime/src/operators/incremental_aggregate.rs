@@ -516,6 +516,9 @@ where
         }
 
         let coalesced = if self.append_only_input {
+            if delta_values.iter().any(|(_, weight)| *weight < 0) {
+                anyhow::bail!("append-only incremental aggregate received negative input weight");
+            }
             metrics::observe_operator_phase_latency_ms(
                 "incremental_aggregate",
                 "step",
@@ -779,11 +782,21 @@ where
                 if delta == 0 {
                     continue;
                 }
+                if self.append_only_input && delta < 0 {
+                    anyhow::bail!(
+                        "append-only incremental aggregate received negative distinct delta"
+                    );
+                }
                 let old_weight = distinct_index
                     .value_weight_for_key_value(&distinct_key, &distinct_value)
                     .await
                     .context("load incremental aggregate distinct multiplicity")?;
-                let new_weight = old_weight + delta;
+                let index_delta = if self.append_only_input {
+                    if old_weight > 0 { 0 } else { 1 }
+                } else {
+                    delta
+                };
+                let new_weight = old_weight + index_delta;
                 let adjustments = distinct_count_adjustments
                     .entry(distinct_key.group_key.clone())
                     .or_insert_with(|| vec![0; self.slot_kinds.len()]);
@@ -792,7 +805,9 @@ where
                 } else if old_weight <= 0 && new_weight > 0 {
                     adjustments[distinct_key.slot as usize] += 1;
                 }
-                distinct_updates.push((distinct_key, distinct_value, delta));
+                if index_delta != 0 {
+                    distinct_updates.push((distinct_key, distinct_value, index_delta));
+                }
             }
             if !distinct_updates.is_empty() {
                 distinct_index
@@ -1544,6 +1559,144 @@ mod tests {
                     1
                 ),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn append_only_incremental_count_distinct_persists_membership_once() {
+        let table = build_table("append-only-incremental-count-distinct").await;
+        let input_dict = Arc::new(
+            Dictionary::<AggregateRow>::with_table(
+                table.clone(),
+                "append_incremental_input".to_string(),
+                None,
+            )
+            .await
+            .expect("create input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            "append_incremental_state".to_string(),
+        )
+        .await
+        .expect("create incremental aggregate state");
+        let output_dict = Arc::new(
+            Dictionary::<(i64, Vec<AggregateValue>)>::with_table(
+                table.clone(),
+                "append_incremental_output".to_string(),
+                None,
+            )
+            .await
+            .expect("create incremental aggregate output dictionary"),
+        );
+        let output = VersionedZSet::new(
+            output_dict,
+            table.clone(),
+            "append_incremental_output".to_string(),
+        )
+        .await
+        .expect("create incremental aggregate output");
+        let distinct_index = IndexedBatchZSet::new(
+            table.clone(),
+            "append_incremental_distinct_index".to_string(),
+        );
+
+        let mut op = IncrementalAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &AggregateRow| {
+                Some(IncrementalAggregateRow {
+                    key: row.group_key,
+                    slots: vec![IncrementalAggregateSlotUpdate::Value(Some(
+                        AggregateValue::Utf8(row.category.clone()),
+                    ))],
+                })
+            }),
+            output,
+            vec![IncrementalAggregateSlotKind::CountDistinct],
+            Some(distinct_index),
+            None,
+        );
+        op.enable_append_only_input();
+
+        let first = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "append_incremental_input",
+            &[
+                (
+                    AggregateRow {
+                        group_key: 1,
+                        price: None,
+                        category: "a".to_string(),
+                    },
+                    2,
+                ),
+                (
+                    AggregateRow {
+                        group_key: 1,
+                        price: None,
+                        category: "b".to_string(),
+                    },
+                    1,
+                ),
+            ],
+        )
+        .await;
+        op.on_step(0, std::slice::from_ref(&first))
+            .await
+            .expect("run append-only incremental aggregate t1")
+            .expect("output t1");
+
+        let distinct_key = DistinctGroupKey {
+            group_key: 1,
+            slot: 0,
+        };
+        {
+            let distinct_index = op.distinct_index.as_ref().expect("distinct index");
+            let mut values = distinct_index
+                .values_for_key(&distinct_key)
+                .await
+                .expect("distinct values after t1");
+            values.sort_by(|left, right| format!("{:?}", left.0).cmp(&format!("{:?}", right.0)));
+            assert_eq!(
+                values,
+                vec![
+                    (AggregateValue::Utf8("a".to_string()), 1),
+                    (AggregateValue::Utf8("b".to_string()), 1),
+                ]
+            );
+        }
+
+        let duplicate = stage_version(
+            input_dict,
+            table,
+            "append_incremental_input",
+            &[(
+                AggregateRow {
+                    group_key: 1,
+                    price: None,
+                    category: "a".to_string(),
+                },
+                3,
+            )],
+        )
+        .await;
+        op.on_step(1, std::slice::from_ref(&duplicate))
+            .await
+            .expect("run append-only incremental aggregate t2");
+        let distinct_index = op.distinct_index.as_ref().expect("distinct index");
+        let mut values = distinct_index
+            .values_for_key(&distinct_key)
+            .await
+            .expect("distinct values after duplicate");
+        values.sort_by(|left, right| format!("{:?}", left.0).cmp(&format!("{:?}", right.0)));
+        assert_eq!(
+            values,
+            vec![
+                (AggregateValue::Utf8("a".to_string()), 1),
+                (AggregateValue::Utf8("b".to_string()), 1),
+            ]
         );
     }
 }
