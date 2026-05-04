@@ -46,7 +46,11 @@ pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
-pub use incremental_aggregate::{DbspIncrementalAggregate, DbspTransientIncrementalAggregate};
+pub use incremental_aggregate::{
+    DbspIncrementalAggregate, DbspTransientIncrementalAggregate,
+    TransientIncrementalAggregateDistinctWeight, TransientIncrementalAggregateGroupedState,
+    TransientIncrementalAggregateInputWeight, TransientIncrementalAggregateSnapshot,
+};
 pub use join::DbspJoin;
 pub use map::DbspMap;
 pub use operator_state_registry::{

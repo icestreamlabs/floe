@@ -606,6 +606,23 @@ where
         Ok(weight)
     }
 
+    pub fn replayable_snapshot_entries(&self) -> Result<Vec<(K, V, i64)>> {
+        if !matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Err(anyhow!(
+                "Arrow-index snapshot entries require replayable persistence"
+            ));
+        }
+        Ok(self
+            .overlay_snapshot_by_key()?
+            .into_iter()
+            .flat_map(|(key, values)| {
+                values.into_iter().filter_map(move |(value, weight)| {
+                    (weight != 0).then_some((key.clone(), value, weight))
+                })
+            })
+            .collect())
+    }
+
     pub async fn keys_for_value(&self, value: &V) -> Result<Vec<(K, i64)>> {
         if !self.reverse_enabled {
             return Err(anyhow!("reverse index not enabled"));

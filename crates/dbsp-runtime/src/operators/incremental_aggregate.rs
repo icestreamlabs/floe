@@ -91,8 +91,8 @@ pub struct IncrementalAggregateRow<K> {
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DistinctGroupKey<K> {
-    group_key: K,
-    slot: u32,
+    pub(crate) group_key: K,
+    pub(crate) slot: u32,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -128,6 +128,18 @@ pub struct GroupedIncrementalAggregateState {
 }
 
 impl GroupedIncrementalAggregateState {
+    pub fn from_parts(total_rows: i64, slots: Vec<IncrementalAggregateSlotState>) -> Self {
+        Self { total_rows, slots }
+    }
+
+    pub fn total_rows(&self) -> i64 {
+        self.total_rows
+    }
+
+    pub fn slots(&self) -> &[IncrementalAggregateSlotState] {
+        &self.slots
+    }
+
     pub(crate) fn zero(slot_kinds: &[IncrementalAggregateSlotKind]) -> Self {
         Self {
             total_rows: 0,
@@ -347,6 +359,82 @@ where
         }
         self.state_cache = Some(cache);
         Ok(())
+    }
+
+    pub(crate) async fn snapshot_grouped_state(
+        &mut self,
+    ) -> Result<Vec<(K, GroupedIncrementalAggregateState)>> {
+        self.ensure_state_cache().await?;
+        Ok(self
+            .state_cache
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .filter(|(_, state)| state.is_present())
+                    .map(|(key, state)| (key.clone(), state.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn restore_grouped_state(
+        &mut self,
+        grouped: Vec<(K, GroupedIncrementalAggregateState)>,
+    ) {
+        self.state_cache = Some(
+            grouped
+                .into_iter()
+                .filter(|(_, state)| state.is_present())
+                .collect(),
+        );
+    }
+
+    pub(crate) fn snapshot_distinct_index(
+        &self,
+    ) -> Result<Vec<(DistinctGroupKey<K>, AggregateValue, i64)>> {
+        match self.distinct_index.as_ref() {
+            Some(index) => index.replayable_snapshot_entries(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn restore_distinct_index(
+        &mut self,
+        entries: Vec<(DistinctGroupKey<K>, AggregateValue, i64)>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let distinct_index = self
+            .distinct_index
+            .as_ref()
+            .context("incremental aggregate distinct index missing during restore")?;
+        distinct_index
+            .apply_deltas(entries)
+            .await
+            .context("restore incremental aggregate distinct index")
+    }
+
+    pub(crate) fn snapshot_input_index(&self) -> Result<Vec<(K, V, i64)>> {
+        match self.input_index.as_ref() {
+            Some(index) => index.replayable_snapshot_entries(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn restore_input_index(&mut self, entries: Vec<(K, V, i64)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let input_index = self
+            .input_index
+            .as_ref()
+            .context("incremental aggregate input index missing during restore")?;
+        input_index
+            .apply_deltas(entries)
+            .await
+            .context("restore incremental aggregate input index")
     }
 
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64> {

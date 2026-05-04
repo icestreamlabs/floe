@@ -15,7 +15,7 @@ use crate::collections::zset::VersionedZSet;
 use crate::ephemeral_state::build_ephemeral_state_table;
 use crate::handles::ZSetHandle;
 use crate::operators::incremental_aggregate::{
-    AggregateValue, GroupedIncrementalAggregateState, IncrementalAggregateOp,
+    AggregateValue, DistinctGroupKey, GroupedIncrementalAggregateState, IncrementalAggregateOp,
     IncrementalAggregateRow, IncrementalAggregateSlotKind,
 };
 use crate::relation_state::RelationState;
@@ -58,6 +58,35 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     op: AsyncMutex<IncrementalAggregateOp<K, V>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientIncrementalAggregateGroupedState<K> {
+    pub key: K,
+    pub total_rows: i64,
+    pub slots: Vec<crate::operators::incremental_aggregate::IncrementalAggregateSlotState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientIncrementalAggregateDistinctWeight<K> {
+    pub group_key: K,
+    pub slot: u32,
+    pub value: AggregateValue,
+    pub weight: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientIncrementalAggregateInputWeight<K, V> {
+    pub group_key: K,
+    pub value: V,
+    pub weight: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransientIncrementalAggregateSnapshot<K, V> {
+    pub grouped: Vec<TransientIncrementalAggregateGroupedState<K>>,
+    pub distinct: Vec<TransientIncrementalAggregateDistinctWeight<K>>,
+    pub input: Vec<TransientIncrementalAggregateInputWeight<K, V>>,
 }
 
 impl DbspIncrementalAggregate {
@@ -401,6 +430,94 @@ where
         let mut op = self.op.lock().await;
         op.enable_append_only_input();
     }
+
+    pub async fn snapshot_state(
+        &self,
+    ) -> anyhow::Result<TransientIncrementalAggregateSnapshot<K, V>> {
+        let mut op = self.op.lock().await;
+        let grouped = op
+            .snapshot_grouped_state()
+            .await?
+            .into_iter()
+            .map(|(key, state)| TransientIncrementalAggregateGroupedState {
+                key,
+                total_rows: state.total_rows(),
+                slots: state.slots().to_vec(),
+            })
+            .collect();
+        let distinct = op
+            .snapshot_distinct_index()?
+            .into_iter()
+            .map(
+                |(key, value, weight)| TransientIncrementalAggregateDistinctWeight {
+                    group_key: key.group_key,
+                    slot: key.slot,
+                    value,
+                    weight,
+                },
+            )
+            .collect();
+        let input = op
+            .snapshot_input_index()?
+            .into_iter()
+            .map(
+                |(group_key, value, weight)| TransientIncrementalAggregateInputWeight {
+                    group_key,
+                    value,
+                    weight,
+                },
+            )
+            .collect();
+        Ok(TransientIncrementalAggregateSnapshot {
+            grouped,
+            distinct,
+            input,
+        })
+    }
+
+    pub async fn restore_state(
+        &self,
+        snapshot: TransientIncrementalAggregateSnapshot<K, V>,
+    ) -> anyhow::Result<()> {
+        let mut op = self.op.lock().await;
+        op.restore_grouped_state(
+            snapshot
+                .grouped
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.key,
+                        GroupedIncrementalAggregateState::from_parts(group.total_rows, group.slots),
+                    )
+                })
+                .collect(),
+        );
+        op.restore_distinct_index(
+            snapshot
+                .distinct
+                .into_iter()
+                .map(|entry| {
+                    (
+                        DistinctGroupKey {
+                            group_key: entry.group_key,
+                            slot: entry.slot,
+                        },
+                        entry.value,
+                        entry.weight,
+                    )
+                })
+                .collect(),
+        )
+        .await?;
+        op.restore_input_index(
+            snapshot
+                .input
+                .into_iter()
+                .map(|entry| (entry.group_key, entry.value, entry.weight))
+                .collect(),
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -424,3 +541,73 @@ impl AbelianGroup<ZSetHandle> for ZSetHandleGroup {
 }
 
 static NEXT_INCREMENTAL_AGGREGATE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::operators::incremental_aggregate::{
+        AggregateValueType, IncrementalAggregateSlotUpdate,
+    };
+
+    fn test_row(value: &i64) -> Option<IncrementalAggregateRow<i64>> {
+        Some(IncrementalAggregateRow {
+            key: value / 10,
+            slots: vec![
+                IncrementalAggregateSlotUpdate::Count(1),
+                IncrementalAggregateSlotUpdate::Value(Some(AggregateValue::Int64(*value))),
+                IncrementalAggregateSlotUpdate::Value(Some(AggregateValue::Int64(*value))),
+                IncrementalAggregateSlotUpdate::Value(Some(AggregateValue::Int64(*value))),
+            ],
+        })
+    }
+
+    fn test_slot_kinds() -> Vec<IncrementalAggregateSlotKind> {
+        vec![
+            IncrementalAggregateSlotKind::Count,
+            IncrementalAggregateSlotKind::Sum(AggregateValueType::Int64),
+            IncrementalAggregateSlotKind::Min(AggregateValueType::Int64),
+            IncrementalAggregateSlotKind::CountDistinct,
+        ]
+    }
+
+    #[tokio::test]
+    async fn transient_incremental_aggregate_snapshot_restores_state() {
+        let processor =
+            DbspTransientIncrementalAggregate::<i64, i64>::new(test_row, test_slot_kinds())
+                .await
+                .expect("create transient incremental aggregate");
+        processor.enable_append_only_input().await;
+        processor
+            .apply_deltas(vec![(11, 1), (12, 1), (21, 1)])
+            .await
+            .expect("apply initial rows");
+        let snapshot = processor.snapshot_state().await.expect("snapshot state");
+
+        let restored =
+            DbspTransientIncrementalAggregate::<i64, i64>::new(test_row, test_slot_kinds())
+                .await
+                .expect("create restored transient incremental aggregate");
+        restored.enable_append_only_input().await;
+        restored
+            .restore_state(snapshot)
+            .await
+            .expect("restore snapshot");
+
+        let expected = processor
+            .apply_deltas(vec![(10, 1), (12, 1)])
+            .await
+            .expect("apply follow-up to original")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let actual = restored
+            .apply_deltas(vec![(10, 1), (12, 1)])
+            .await
+            .expect("apply follow-up to restored")
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(actual, expected);
+    }
+}

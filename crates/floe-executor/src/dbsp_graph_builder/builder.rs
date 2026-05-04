@@ -5440,7 +5440,7 @@ async fn build_transient_aggregate_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_count_state = upstream.durable_enabled();
+    let compact_source_state = upstream.durable_enabled();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-aggregate-source:{graph_id}"),
@@ -5454,7 +5454,7 @@ async fn build_transient_aggregate_receiver(
         aggregate,
         upstream_rx,
         output_transform,
-        compact_count_state,
+        compact_source_state,
         cancel,
         task_events,
         state_table,
@@ -5468,7 +5468,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     aggregate: &DbspAggregateNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     output_transform: Arc<DeltaTransformFn>,
-    compact_count_state: bool,
+    compact_source_state: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
@@ -5505,7 +5505,7 @@ async fn build_transient_aggregate_receiver_from_batches(
             .await
             .context("initialize transient count aggregate")?,
         );
-        let count_state_label = if compact_count_state {
+        let count_state_label = if compact_source_state {
             format!("{state_label}_count_state")
         } else {
             state_label.clone()
@@ -5515,7 +5515,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                 .await?;
         let restored_deltas = persistent_state.snapshot_deltas();
         if !restored_deltas.is_empty() {
-            if compact_count_state {
+            if compact_source_state {
                 let snapshot = decode_transient_count_aggregate_snapshot(restored_deltas)
                     .context("decode transient count aggregate state snapshot")?;
                 aggregate_processor.restore_state(snapshot).await;
@@ -5548,7 +5548,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if !compact_count_state {
+                        if !compact_source_state {
                             if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
@@ -5561,7 +5561,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                                 break;
                             }
                         };
-                        if compact_count_state {
+                        if compact_source_state {
                             let snapshot = aggregate_processor.snapshot_state().await;
                             let encoded_snapshot = match encode_transient_count_aggregate_snapshot(snapshot) {
                                 Ok(snapshot) => snapshot,
@@ -5629,15 +5629,32 @@ async fn build_transient_aggregate_receiver_from_batches(
             .context("initialize transient incremental aggregate")?,
         );
         aggregate_processor.enable_append_only_input().await;
-        let mut persistent_state =
-            PersistentTransientInputState::load(state_table.clone(), &graph_id, &state_label)
-                .await?;
+        let incremental_state_label = if compact_source_state {
+            format!("{state_label}_incremental_state")
+        } else {
+            state_label.clone()
+        };
+        let mut persistent_state = PersistentTransientInputState::load(
+            state_table.clone(),
+            &graph_id,
+            incremental_state_label,
+        )
+        .await?;
         let restored_deltas = persistent_state.snapshot_deltas();
         if !restored_deltas.is_empty() {
-            aggregate_processor
-                .apply_deltas(restored_deltas)
-                .await
-                .context("restore transient incremental aggregate input state")?;
+            if compact_source_state {
+                let snapshot = decode_transient_incremental_aggregate_snapshot(restored_deltas)
+                    .context("decode transient incremental aggregate state snapshot")?;
+                aggregate_processor
+                    .restore_state(snapshot)
+                    .await
+                    .context("restore transient incremental aggregate state snapshot")?;
+            } else {
+                aggregate_processor
+                    .apply_deltas(restored_deltas)
+                    .await
+                    .context("restore transient incremental aggregate input state")?;
+            }
         }
         let precompute_evaluator = precompute_evaluator.clone();
 
@@ -5661,7 +5678,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_source_state && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
@@ -5672,6 +5689,26 @@ async fn build_transient_aggregate_receiver_from_batches(
                                 break;
                             }
                         };
+                        if compact_source_state {
+                            let snapshot = match aggregate_processor.snapshot_state().await {
+                                Ok(snapshot) => snapshot,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            };
+                            let encoded_snapshot = match encode_transient_incremental_aggregate_snapshot(snapshot) {
+                                Ok(snapshot) => snapshot,
+                                Err(err) => {
+                                    report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                    break;
+                                }
+                            };
+                            if let Err(err) = persistent_state.replace_with_snapshot(encoded_snapshot).await {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        }
                         let encoded_output = match encode_incremental_aggregate_output_deltas(aggregate_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -6771,6 +6808,21 @@ fn decode_transient_window_aggregate_input_pair(encoded: &[u8]) -> Result<(Vec<u
 
 const TRANSIENT_COUNT_AGGREGATE_GROUP_TAG: u8 = 1;
 const TRANSIENT_COUNT_AGGREGATE_DISTINCT_TAG: u8 = 2;
+const TRANSIENT_INCREMENTAL_AGGREGATE_GROUP_TAG: u8 = 11;
+const TRANSIENT_INCREMENTAL_AGGREGATE_DISTINCT_TAG: u8 = 12;
+const TRANSIENT_INCREMENTAL_AGGREGATE_INPUT_TAG: u8 = 13;
+const AGGREGATE_VALUE_NULL_INT64_TAG: u8 = 1;
+const AGGREGATE_VALUE_NULL_TIMESTAMP_MILLIS_TAG: u8 = 2;
+const AGGREGATE_VALUE_NULL_UTF8_TAG: u8 = 3;
+const AGGREGATE_VALUE_INT64_TAG: u8 = 4;
+const AGGREGATE_VALUE_TIMESTAMP_MILLIS_TAG: u8 = 5;
+const AGGREGATE_VALUE_UTF8_TAG: u8 = 6;
+const INCREMENTAL_AGGREGATE_SLOT_COUNT_TAG: u8 = 1;
+const INCREMENTAL_AGGREGATE_SLOT_COUNT_DISTINCT_TAG: u8 = 2;
+const INCREMENTAL_AGGREGATE_SLOT_SUM_TAG: u8 = 3;
+const INCREMENTAL_AGGREGATE_SLOT_AVG_TAG: u8 = 4;
+const INCREMENTAL_AGGREGATE_SLOT_MIN_TAG: u8 = 5;
+const INCREMENTAL_AGGREGATE_SLOT_MAX_TAG: u8 = 6;
 
 fn encode_transient_count_aggregate_snapshot(
     snapshot: dbsp::TransientCountAggregateSnapshot<Vec<u8>, Vec<u8>>,
@@ -6857,6 +6909,263 @@ fn decode_transient_count_aggregate_snapshot(
     Ok(snapshot)
 }
 
+fn encode_transient_incremental_aggregate_snapshot(
+    snapshot: dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, Vec<u8>>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut rows =
+        Vec::with_capacity(snapshot.grouped.len() + snapshot.distinct.len() + snapshot.input.len());
+    for group in snapshot.grouped {
+        if group.total_rows == 0 {
+            continue;
+        }
+        let mut row = Vec::new();
+        row.push(TRANSIENT_INCREMENTAL_AGGREGATE_GROUP_TAG);
+        write_len_prefixed_bytes(&mut row, &group.key)?;
+        row.extend_from_slice(&group.total_rows.to_le_bytes());
+        let slot_len = u32::try_from(group.slots.len())
+            .map_err(|_| anyhow!("too many transient incremental aggregate slots"))?;
+        row.extend_from_slice(&slot_len.to_le_bytes());
+        for slot in group.slots {
+            encode_incremental_aggregate_slot_state(&mut row, slot)?;
+        }
+        rows.push((row, 1));
+    }
+    for distinct in snapshot.distinct {
+        if distinct.weight == 0 {
+            continue;
+        }
+        let mut row = Vec::new();
+        row.push(TRANSIENT_INCREMENTAL_AGGREGATE_DISTINCT_TAG);
+        write_len_prefixed_bytes(&mut row, &distinct.group_key)?;
+        row.extend_from_slice(&distinct.slot.to_le_bytes());
+        encode_aggregate_value(&mut row, distinct.value)?;
+        rows.push((row, distinct.weight));
+    }
+    for input in snapshot.input {
+        if input.weight == 0 {
+            continue;
+        }
+        let mut row = Vec::new();
+        row.push(TRANSIENT_INCREMENTAL_AGGREGATE_INPUT_TAG);
+        write_len_prefixed_bytes(&mut row, &input.group_key)?;
+        write_len_prefixed_bytes(&mut row, &input.value)?;
+        rows.push((row, input.weight));
+    }
+    Ok(rows)
+}
+
+fn decode_transient_incremental_aggregate_snapshot(
+    rows: Vec<(Vec<u8>, i64)>,
+) -> Result<dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, Vec<u8>>> {
+    let mut snapshot = dbsp::TransientIncrementalAggregateSnapshot::default();
+    for (row, weight) in rows {
+        if row.is_empty() || weight == 0 {
+            continue;
+        }
+        let mut cursor = 1usize;
+        match row[0] {
+            TRANSIENT_INCREMENTAL_AGGREGATE_GROUP_TAG => {
+                let key = read_len_prefixed_bytes(&row, &mut cursor)?;
+                let total_rows = read_i64_le(&row, &mut cursor)?;
+                let slot_len = read_u32_le(&row, &mut cursor)? as usize;
+                let mut slots = Vec::with_capacity(slot_len);
+                for _ in 0..slot_len {
+                    slots.push(decode_incremental_aggregate_slot_state(&row, &mut cursor)?);
+                }
+                if cursor != row.len() {
+                    bail!("trailing bytes in transient incremental aggregate group state row");
+                }
+                snapshot
+                    .grouped
+                    .push(dbsp::TransientIncrementalAggregateGroupedState {
+                        key,
+                        total_rows,
+                        slots,
+                    });
+            }
+            TRANSIENT_INCREMENTAL_AGGREGATE_DISTINCT_TAG => {
+                let group_key = read_len_prefixed_bytes(&row, &mut cursor)?;
+                let slot = read_u32_le(&row, &mut cursor)?;
+                let value = decode_aggregate_value(&row, &mut cursor)?;
+                if cursor != row.len() {
+                    bail!("trailing bytes in transient incremental aggregate distinct state row");
+                }
+                snapshot
+                    .distinct
+                    .push(dbsp::TransientIncrementalAggregateDistinctWeight {
+                        group_key,
+                        slot,
+                        value,
+                        weight,
+                    });
+            }
+            TRANSIENT_INCREMENTAL_AGGREGATE_INPUT_TAG => {
+                let group_key = read_len_prefixed_bytes(&row, &mut cursor)?;
+                let value = read_len_prefixed_bytes(&row, &mut cursor)?;
+                if cursor != row.len() {
+                    bail!("trailing bytes in transient incremental aggregate input state row");
+                }
+                snapshot
+                    .input
+                    .push(dbsp::TransientIncrementalAggregateInputWeight {
+                        group_key,
+                        value,
+                        weight,
+                    });
+            }
+            other => bail!("unknown transient incremental aggregate state row tag {other}"),
+        }
+    }
+    Ok(snapshot)
+}
+
+fn encode_incremental_aggregate_slot_state(
+    dst: &mut Vec<u8>,
+    slot: dbsp::IncrementalAggregateSlotState,
+) -> Result<()> {
+    match slot {
+        dbsp::IncrementalAggregateSlotState::Count { count } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_COUNT_TAG);
+            dst.extend_from_slice(&count.to_le_bytes());
+        }
+        dbsp::IncrementalAggregateSlotState::CountDistinct { count } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_COUNT_DISTINCT_TAG);
+            dst.extend_from_slice(&count.to_le_bytes());
+        }
+        dbsp::IncrementalAggregateSlotState::Sum {
+            sum,
+            non_null_count,
+        } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_SUM_TAG);
+            dst.extend_from_slice(&sum.to_le_bytes());
+            dst.extend_from_slice(&non_null_count.to_le_bytes());
+        }
+        dbsp::IncrementalAggregateSlotState::Avg { sum, count } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_AVG_TAG);
+            dst.extend_from_slice(&sum.to_le_bytes());
+            dst.extend_from_slice(&count.to_le_bytes());
+        }
+        dbsp::IncrementalAggregateSlotState::Min { current } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_MIN_TAG);
+            encode_optional_aggregate_value(dst, current)?;
+        }
+        dbsp::IncrementalAggregateSlotState::Max { current } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_MAX_TAG);
+            encode_optional_aggregate_value(dst, current)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_incremental_aggregate_slot_state(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<dbsp::IncrementalAggregateSlotState> {
+    let tag = read_u8(bytes, cursor)?;
+    match tag {
+        INCREMENTAL_AGGREGATE_SLOT_COUNT_TAG => Ok(dbsp::IncrementalAggregateSlotState::Count {
+            count: read_i64_le(bytes, cursor)?,
+        }),
+        INCREMENTAL_AGGREGATE_SLOT_COUNT_DISTINCT_TAG => {
+            Ok(dbsp::IncrementalAggregateSlotState::CountDistinct {
+                count: read_i64_le(bytes, cursor)?,
+            })
+        }
+        INCREMENTAL_AGGREGATE_SLOT_SUM_TAG => Ok(dbsp::IncrementalAggregateSlotState::Sum {
+            sum: read_i64_le(bytes, cursor)?,
+            non_null_count: read_i64_le(bytes, cursor)?,
+        }),
+        INCREMENTAL_AGGREGATE_SLOT_AVG_TAG => Ok(dbsp::IncrementalAggregateSlotState::Avg {
+            sum: read_i64_le(bytes, cursor)?,
+            count: read_i64_le(bytes, cursor)?,
+        }),
+        INCREMENTAL_AGGREGATE_SLOT_MIN_TAG => Ok(dbsp::IncrementalAggregateSlotState::Min {
+            current: decode_optional_aggregate_value(bytes, cursor)?,
+        }),
+        INCREMENTAL_AGGREGATE_SLOT_MAX_TAG => Ok(dbsp::IncrementalAggregateSlotState::Max {
+            current: decode_optional_aggregate_value(bytes, cursor)?,
+        }),
+        other => bail!("unknown incremental aggregate slot state tag {other}"),
+    }
+}
+
+fn encode_optional_aggregate_value(
+    dst: &mut Vec<u8>,
+    value: Option<dbsp::AggregateValue>,
+) -> Result<()> {
+    match value {
+        Some(value) => {
+            dst.push(1);
+            encode_aggregate_value(dst, value)?;
+        }
+        None => dst.push(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_aggregate_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<Option<dbsp::AggregateValue>> {
+    match read_u8(bytes, cursor)? {
+        0 => Ok(None),
+        1 => Ok(Some(decode_aggregate_value(bytes, cursor)?)),
+        other => bail!("invalid optional aggregate value tag {other}"),
+    }
+}
+
+fn encode_aggregate_value(dst: &mut Vec<u8>, value: dbsp::AggregateValue) -> Result<()> {
+    match value {
+        dbsp::AggregateValue::Null(dbsp::AggregateValueType::Int64) => {
+            dst.push(AGGREGATE_VALUE_NULL_INT64_TAG);
+        }
+        dbsp::AggregateValue::Null(dbsp::AggregateValueType::TimestampMillis) => {
+            dst.push(AGGREGATE_VALUE_NULL_TIMESTAMP_MILLIS_TAG);
+        }
+        dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => {
+            dst.push(AGGREGATE_VALUE_NULL_UTF8_TAG);
+        }
+        dbsp::AggregateValue::Int64(value) => {
+            dst.push(AGGREGATE_VALUE_INT64_TAG);
+            dst.extend_from_slice(&value.to_le_bytes());
+        }
+        dbsp::AggregateValue::TimestampMillis(value) => {
+            dst.push(AGGREGATE_VALUE_TIMESTAMP_MILLIS_TAG);
+            dst.extend_from_slice(&value.to_le_bytes());
+        }
+        dbsp::AggregateValue::Utf8(value) => {
+            dst.push(AGGREGATE_VALUE_UTF8_TAG);
+            write_len_prefixed_bytes(dst, value.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_aggregate_value(bytes: &[u8], cursor: &mut usize) -> Result<dbsp::AggregateValue> {
+    match read_u8(bytes, cursor)? {
+        AGGREGATE_VALUE_NULL_INT64_TAG => {
+            Ok(dbsp::AggregateValue::Null(dbsp::AggregateValueType::Int64))
+        }
+        AGGREGATE_VALUE_NULL_TIMESTAMP_MILLIS_TAG => Ok(dbsp::AggregateValue::Null(
+            dbsp::AggregateValueType::TimestampMillis,
+        )),
+        AGGREGATE_VALUE_NULL_UTF8_TAG => {
+            Ok(dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8))
+        }
+        AGGREGATE_VALUE_INT64_TAG => Ok(dbsp::AggregateValue::Int64(read_i64_le(bytes, cursor)?)),
+        AGGREGATE_VALUE_TIMESTAMP_MILLIS_TAG => Ok(dbsp::AggregateValue::TimestampMillis(
+            read_i64_le(bytes, cursor)?,
+        )),
+        AGGREGATE_VALUE_UTF8_TAG => {
+            let value = read_len_prefixed_bytes(bytes, cursor)?;
+            Ok(dbsp::AggregateValue::Utf8(
+                String::from_utf8(value).context("decode aggregate UTF-8 value")?,
+            ))
+        }
+        other => bail!("unknown aggregate value tag {other}"),
+    }
+}
+
 fn write_len_prefixed_bytes(dst: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("byte field too large"))?;
     dst.extend_from_slice(&len.to_le_bytes());
@@ -6874,6 +7183,14 @@ fn read_len_prefixed_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> 
     }
     let value = bytes[*cursor..end].to_vec();
     *cursor = end;
+    Ok(value)
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
+    let value = *bytes.get(*cursor).ok_or_else(|| anyhow!("truncated u8"))?;
+    *cursor = cursor
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("u8 cursor overflow"))?;
     Ok(value)
 }
 
@@ -8042,6 +8359,44 @@ mod tests {
             .expect("encode count aggregate snapshot");
         let decoded = decode_transient_count_aggregate_snapshot(encoded)
             .expect("decode count aggregate snapshot");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn transient_incremental_aggregate_state_snapshot_roundtrips() {
+        let snapshot = dbsp::TransientIncrementalAggregateSnapshot {
+            grouped: vec![dbsp::TransientIncrementalAggregateGroupedState {
+                key: b"group-a".to_vec(),
+                total_rows: 3,
+                slots: vec![
+                    dbsp::IncrementalAggregateSlotState::Count { count: 3 },
+                    dbsp::IncrementalAggregateSlotState::Sum {
+                        sum: 120,
+                        non_null_count: 2,
+                    },
+                    dbsp::IncrementalAggregateSlotState::Min {
+                        current: Some(dbsp::AggregateValue::Int64(10)),
+                    },
+                    dbsp::IncrementalAggregateSlotState::Max { current: None },
+                ],
+            }],
+            distinct: vec![dbsp::TransientIncrementalAggregateDistinctWeight {
+                group_key: b"group-a".to_vec(),
+                slot: 1,
+                value: dbsp::AggregateValue::Int64(42),
+                weight: 1,
+            }],
+            input: vec![dbsp::TransientIncrementalAggregateInputWeight {
+                group_key: b"group-a".to_vec(),
+                value: b"input-row".to_vec(),
+                weight: 2,
+            }],
+        };
+
+        let encoded = encode_transient_incremental_aggregate_snapshot(snapshot.clone())
+            .expect("encode incremental aggregate snapshot");
+        let decoded = decode_transient_incremental_aggregate_snapshot(encoded)
+            .expect("decode incremental aggregate snapshot");
         assert_eq!(decoded, snapshot);
     }
 

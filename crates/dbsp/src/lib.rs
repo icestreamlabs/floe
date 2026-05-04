@@ -46,7 +46,11 @@ pub use distinct::DbspDistinct;
 pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
-pub use incremental_aggregate::{DbspIncrementalAggregate, DbspTransientIncrementalAggregate};
+pub use incremental_aggregate::{
+    DbspIncrementalAggregate, DbspTransientIncrementalAggregate,
+    TransientIncrementalAggregateDistinctWeight, TransientIncrementalAggregateGroupedState,
+    TransientIncrementalAggregateInputWeight, TransientIncrementalAggregateSnapshot,
+};
 pub use join::DbspJoin;
 pub use map::DbspMap;
 pub use operator_state_registry::{
@@ -60,7 +64,7 @@ pub use operators::distinct::DistinctOp;
 pub use operators::filter::FilterOp;
 pub use operators::incremental_aggregate::{
     AggregateValue, AggregateValueType, IncrementalAggregateRow, IncrementalAggregateSlotKind,
-    IncrementalAggregateSlotUpdate,
+    IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
 };
 pub use operators::join::{JoinInputRetention, JoinOp};
 pub use operators::map::MapOp;
