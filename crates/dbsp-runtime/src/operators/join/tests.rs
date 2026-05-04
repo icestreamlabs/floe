@@ -957,6 +957,118 @@ async fn join_operator_can_drop_matched_append_only_left_rows() {
 }
 
 #[tokio::test]
+async fn join_operator_can_drop_closed_append_only_left_keys() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_closed_left_stream", None)
+            .await
+            .expect("left dict"),
+    );
+    let left_state = RelationState::empty(table.clone(), "join_closed_left_state".to_string())
+        .await
+        .expect("left state");
+    let right_state = RelationState::empty(table.clone(), "join_closed_right_state".to_string())
+        .await
+        .expect("right state");
+    let out_dict = Arc::new(
+        Dictionary::<i64>::with_table(table.clone(), "join_closed_output", None)
+            .await
+            .expect("output dict"),
+    );
+    let output = VersionedZSet::new(out_dict, table.clone(), "join_closed_output".to_string())
+        .await
+        .expect("output zset");
+
+    let mut op = JoinOp::new(
+        left_state,
+        right_state,
+        IndexedBatchZSet::new(table.clone(), "join_closed_left_index"),
+        IndexedBatchZSet::new(table.clone(), "join_closed_right_index"),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table.clone(),
+        output,
+        None,
+    )
+    .with_input_retention(
+        JoinInputRetention::DropMatchedAppendOnly,
+        JoinInputRetention::RetainAll,
+    );
+
+    let left_first = stage_version(
+        left_dict.clone(),
+        table.clone(),
+        "join_closed_left_stream",
+        &[(7, 1)],
+    )
+    .await;
+    op.on_step(1, &[left_first, empty_handle("join_closed_right_stream")])
+        .await
+        .expect("left-only join step");
+    assert_eq!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index before closed key"),
+        vec![(7, 1)]
+    );
+
+    op.on_step_transient_with_inputs(
+        2,
+        &[
+            empty_handle("join_closed_left_stream"),
+            empty_handle("join_closed_right_stream"),
+        ],
+        Some(JoinTransientInputs {
+            left: None,
+            right: Some(Arc::new(Vec::new())),
+            left_closed_keys: None,
+            right_closed_keys: Some(Arc::new(vec![(7, 1)])),
+        }),
+    )
+    .await
+    .expect("closed-key join step");
+    assert!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index after closed key")
+            .is_empty()
+    );
+    assert_eq!(
+        op.right_closed_index
+            .values_for_key(&7)
+            .await
+            .expect("right closed index"),
+        vec![((), 1)]
+    );
+
+    let left_after_close = stage_version(
+        left_dict,
+        table.clone(),
+        "join_closed_left_stream",
+        &[(7, 1)],
+    )
+    .await;
+    op.on_step(
+        3,
+        &[left_after_close, empty_handle("join_closed_right_stream")],
+    )
+    .await
+    .expect("left-after-close join step");
+    assert!(
+        op.left_index
+            .values_for_key(&7)
+            .await
+            .expect("left index after immediate closed key")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
@@ -1287,6 +1399,8 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
                 Some(JoinTransientInputs {
                     left: None,
                     right: Some(Arc::new(vec![(7, 1)])),
+                    left_closed_keys: None,
+                    right_closed_keys: None,
                 }),
             )
             .await
@@ -1313,6 +1427,8 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
             Some(JoinTransientInputs {
                 left: Some(Arc::new(vec![(7, 2)])),
                 right: None,
+                left_closed_keys: None,
+                right_closed_keys: None,
             }),
         )
         .await
@@ -1334,6 +1450,8 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
             Some(JoinTransientInputs {
                 left: None,
                 right: Some(Arc::new(vec![(7, -1)])),
+                left_closed_keys: None,
+                right_closed_keys: None,
             }),
         )
         .await

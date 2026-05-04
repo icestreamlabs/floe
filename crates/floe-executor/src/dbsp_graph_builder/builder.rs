@@ -47,6 +47,9 @@ use super::vectorized_filter_project::{
     VectorizedFilterProjectEvaluator, required_encoded_input_columns,
 };
 
+type ClosedJoinKeyTransformFn =
+    dyn Fn(&[(Vec<u8>, i64)]) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync + 'static;
+
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
     pub(super) bridge: Arc<Mutex<DbspBridge>>,
@@ -485,11 +488,24 @@ impl DbspGraphBuilder {
                             &persistence_policy,
                         )
                         .await?;
+                    let left_primary_key_columns = join_input_direct_source_primary_key_columns(
+                        inputs.plan,
+                        left_idx,
+                        join.keys.iter().map(|key| key.left_expression()),
+                        join.left_schema.as_ref(),
+                    )?;
+                    let right_primary_key_columns = join_input_direct_source_primary_key_columns(
+                        inputs.plan,
+                        right_idx,
+                        join.keys.iter().map(|key| key.right_expression()),
+                        join.right_schema.as_ref(),
+                    )?;
                     let mut left_transient_input = try_build_transient_join_input_optimization(
                         self.graph_id(),
                         inputs.plan,
                         left_idx,
                         inputs.outer_transient_streams,
+                        left_primary_key_columns.clone(),
                         &inputs.cancel,
                     )?;
                     let mut right_transient_input = try_build_transient_join_input_optimization(
@@ -497,6 +513,7 @@ impl DbspGraphBuilder {
                         inputs.plan,
                         right_idx,
                         inputs.outer_transient_streams,
+                        right_primary_key_columns.clone(),
                         &inputs.cancel,
                     )?;
                     if left_transient_input.is_some() ^ right_transient_input.is_some() {
@@ -524,22 +541,12 @@ impl DbspGraphBuilder {
                     let output_projection =
                         try_build_direct_join_output_projection(join, &transient_opt.steps);
                     let direct_output_projection = output_projection.is_some();
-                    let left_retention = if join_input_unique_on_direct_source_primary_key(
-                        inputs.plan,
-                        right_idx,
-                        join.keys.iter().map(|key| key.right_expression()),
-                        join.right_schema.as_ref(),
-                    )? {
+                    let left_retention = if right_primary_key_columns.is_some() {
                         dbsp::JoinInputRetention::DropMatchedAppendOnly
                     } else {
                         dbsp::JoinInputRetention::RetainAll
                     };
-                    let right_retention = if join_input_unique_on_direct_source_primary_key(
-                        inputs.plan,
-                        left_idx,
-                        join.keys.iter().map(|key| key.left_expression()),
-                        join.left_schema.as_ref(),
-                    )? {
+                    let right_retention = if left_primary_key_columns.is_some() {
                         dbsp::JoinInputRetention::DropMatchedAppendOnly
                     } else {
                         dbsp::JoinInputRetention::RetainAll
@@ -733,11 +740,24 @@ impl DbspGraphBuilder {
                 persistence_policy,
             )
             .await?;
+        let left_primary_key_columns = join_input_direct_source_primary_key_columns(
+            plan,
+            root.left_input_idx,
+            root.join.keys.iter().map(|key| key.left_expression()),
+            root.join.left_schema.as_ref(),
+        )?;
+        let right_primary_key_columns = join_input_direct_source_primary_key_columns(
+            plan,
+            root.right_input_idx,
+            root.join.keys.iter().map(|key| key.right_expression()),
+            root.join.right_schema.as_ref(),
+        )?;
         let left_transient_input = try_build_transient_join_input_optimization(
             self.graph_id(),
             plan,
             root.left_input_idx,
             outer_transient_streams,
+            left_primary_key_columns.clone(),
             cancel,
         )?
         .ok_or_else(|| {
@@ -751,6 +771,7 @@ impl DbspGraphBuilder {
             plan,
             root.right_input_idx,
             outer_transient_streams,
+            right_primary_key_columns.clone(),
             cancel,
         )?
         .ok_or_else(|| {
@@ -761,22 +782,12 @@ impl DbspGraphBuilder {
         })?;
 
         let (tx, mut receiver) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
-        let left_retention = if join_input_unique_on_direct_source_primary_key(
-            plan,
-            root.right_input_idx,
-            root.join.keys.iter().map(|key| key.right_expression()),
-            root.join.right_schema.as_ref(),
-        )? {
+        let left_retention = if right_primary_key_columns.is_some() {
             dbsp::JoinInputRetention::DropMatchedAppendOnly
         } else {
             dbsp::JoinInputRetention::RetainAll
         };
-        let right_retention = if join_input_unique_on_direct_source_primary_key(
-            plan,
-            root.left_input_idx,
-            root.join.keys.iter().map(|key| key.left_expression()),
-            root.join.left_schema.as_ref(),
-        )? {
+        let right_retention = if left_primary_key_columns.is_some() {
             dbsp::JoinInputRetention::DropMatchedAppendOnly
         } else {
             dbsp::JoinInputRetention::RetainAll
@@ -1373,7 +1384,8 @@ struct TransientSourceWindowAggregateRootMaterialization {
 struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+    receiver:
+        tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
 }
 
 struct PersistentTransientInputState {
@@ -4102,20 +4114,36 @@ fn split_join_required_columns(
     Ok(())
 }
 
+#[cfg(test)]
 fn join_input_unique_on_direct_source_primary_key<'a>(
     plan: &CircuitPlan,
     input_idx: usize,
     key_expressions: impl IntoIterator<Item = &'a DbspExpression>,
     input_schema: &RowSchema,
 ) -> Result<bool> {
+    Ok(join_input_direct_source_primary_key_columns(
+        plan,
+        input_idx,
+        key_expressions,
+        input_schema,
+    )?
+    .is_some())
+}
+
+fn join_input_direct_source_primary_key_columns<'a>(
+    plan: &CircuitPlan,
+    input_idx: usize,
+    key_expressions: impl IntoIterator<Item = &'a DbspExpression>,
+    input_schema: &RowSchema,
+) -> Result<Option<Arc<Vec<usize>>>> {
     let Some(shape) = find_transient_source_root_shape(plan, input_idx)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let source = match shape {
         TransientSourceRootShape::Source { source, .. }
         | TransientSourceRootShape::Select { source, .. } => source,
         TransientSourceRootShape::Project { .. } | TransientSourceRootShape::FilterMap { .. } => {
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -4124,7 +4152,7 @@ fn join_input_unique_on_direct_source_primary_key<'a>(
         .map(|expr| projection_direct_column_index_expression(expr.expr(), input_schema))
         .collect::<Option<BTreeSet<_>>>();
     let Some(key_columns) = key_columns else {
-        return Ok(false);
+        return Ok(None);
     };
     let primary_key_columns = source
         .table
@@ -4134,7 +4162,11 @@ fn join_input_unique_on_direct_source_primary_key<'a>(
         .copied()
         .collect::<BTreeSet<_>>();
 
-    Ok(key_columns == primary_key_columns)
+    if key_columns == primary_key_columns {
+        Ok(Some(Arc::new(primary_key_columns.into_iter().collect())))
+    } else {
+        Ok(None)
+    }
 }
 
 fn try_build_direct_join_output_projection(
@@ -4433,6 +4465,7 @@ fn try_build_transient_join_input_optimization(
     plan: &CircuitPlan,
     input_idx: usize,
     outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
+    closed_key_columns: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
 ) -> Result<Option<TransientJoinInputOptimization>> {
     let Some(source_root) = try_build_transient_source_root_materialization(plan, input_idx)?
@@ -4453,6 +4486,8 @@ fn try_build_transient_join_input_optimization(
     let source_name = source_root.source_name.clone();
     let optimized_nodes = source_root.optimized_nodes.clone();
     let transform = Arc::clone(&source_root.transform);
+    let closed_key_transform =
+        try_build_transient_join_closed_key_transform(plan, input_idx, closed_key_columns)?;
     let cancel = cancel.clone();
     let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
 
@@ -4479,20 +4514,39 @@ fn try_build_transient_join_input_optimization(
                         }
                     };
                         let join_ts = batch.version.saturating_add(1);
+                        let closed_keys = match closed_key_transform.as_ref() {
+                            Some(transform) => match transform(batch.deltas.as_ref()) {
+                                Ok(closed_keys) => closed_keys,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        graph_id = %graph_id,
+                                        input_idx,
+                                        source = %batch.source,
+                                        version = batch.version,
+                                        error = %err,
+                                        "dropping transient join closed-key batch after transform failure"
+                                    );
+                                    Vec::new()
+                                }
+                            },
+                            None => Vec::new(),
+                        };
                         if debug_transient_join {
                             eprintln!(
-                                "transient-join-input graph_id={} input_idx={} source={} version={} join_ts={} rows={}",
+                                "transient-join-input graph_id={} input_idx={} source={} version={} join_ts={} rows={} closed_keys={}",
                                 graph_id,
                                 input_idx,
                                 batch.source,
                                 batch.version,
                                 join_ts,
-                                transformed.len()
+                                transformed.len(),
+                                closed_keys.len()
                             );
                         }
                         if tx.send(dbsp::join::TransientJoinInputBatch {
                             ts: join_ts,
                             deltas: Arc::new(transformed),
+                            closed_keys: Arc::new(closed_keys),
                         }).is_err() {
                         tracing::debug!(
                             graph_id = %graph_id,
@@ -4520,6 +4574,51 @@ fn try_build_transient_join_input_optimization(
         optimized_nodes: source_root.optimized_nodes,
         receiver,
     }))
+}
+
+fn try_build_transient_join_closed_key_transform(
+    plan: &CircuitPlan,
+    input_idx: usize,
+    closed_key_columns: Option<Arc<Vec<usize>>>,
+) -> Result<Option<Arc<ClosedJoinKeyTransformFn>>> {
+    let Some(closed_key_columns) = closed_key_columns else {
+        return Ok(None);
+    };
+    let Some(TransientSourceRootShape::Select { select, .. }) =
+        find_transient_source_root_shape(plan, input_idx)?
+    else {
+        return Ok(None);
+    };
+    let filter_transform = build_filter_transform(&select)?;
+    Ok(Some(Arc::new(move |delta_values: &[(Vec<u8>, i64)]| {
+        let selected = filter_transform(delta_values)?;
+        let mut selected_keys = BTreeSet::new();
+        for (row, weight) in selected.iter() {
+            if *weight <= 0 {
+                continue;
+            }
+            if let Some(key) = extract_encoded_row_columns(row, closed_key_columns.as_ref(), true)?
+            {
+                selected_keys.insert(key);
+            }
+        }
+
+        let mut closed = BTreeMap::new();
+        for (row, weight) in delta_values {
+            if *weight <= 0 {
+                continue;
+            }
+            let Some(key) = extract_encoded_row_columns(row, closed_key_columns.as_ref(), true)?
+            else {
+                continue;
+            };
+            if selected_keys.contains(&key) {
+                continue;
+            }
+            *closed.entry(key).or_insert(0_i64) += *weight;
+        }
+        Ok(closed.into_iter().collect())
+    })))
 }
 
 fn try_build_transient_source_root_materialization(
@@ -8180,6 +8279,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn q20_filtered_unique_auction_side_emits_closed_join_keys() {
+        let logical = sql_plan_with_auction_and_bid(
+            "SELECT b.auction, b.bidder, b.price, b.channel, b.url, \
+                    b.date_time AS \"dateTime\", b.extra, \
+                    a.item_name AS \"itemName\", a.description, \
+                    a.initial_bid AS \"initialBid\", a.reserve, \
+                    a.date_time AS auction_time, a.expires, a.seller, \
+                    a.category, a.extra AS auction_extra \
+             FROM nexmark_bid AS b \
+             JOIN nexmark_auction AS a ON b.auction = a.id \
+             WHERE a.category = 10",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        let plan = planner.build(&logical).expect("circuit plan");
+        let project_node = plan.node(plan.root).expect("root node");
+        let &join_idx = project_node.inputs.first().expect("join input");
+        let join_node = plan.node(join_idx).expect("join node");
+        let DbspNodeKind::Join(join) = &join_node.kind else {
+            panic!("expected q20 join node");
+        };
+        let (_, right_idx) = join_inputs(join_node).expect("join inputs");
+        let right_key_columns = join_input_direct_source_primary_key_columns(
+            &plan,
+            right_idx,
+            join.keys.iter().map(|key| key.right_expression()),
+            join.right_schema.as_ref(),
+        )
+        .expect("right key columns")
+        .expect("q20 right side primary key columns");
+        let closed_key_transform = try_build_transient_join_closed_key_transform(
+            &plan,
+            right_idx,
+            Some(Arc::clone(&right_key_columns)),
+        )
+        .expect("closed-key transform")
+        .expect("filtered right side should produce closed-key transform");
+
+        let requirements = plan_source_requirements(&plan)
+            .expect("source requirements")
+            .expect("source requirements");
+        let auction_definition = nexmark_auction_source_definition();
+        let auction_mask = required_mask(&requirements, &auction_definition, "nexmark_auction");
+        let auction_decoder = SourceRowDecoder::new_with_encoded_required_columns(
+            auction_definition,
+            Some(Arc::clone(&auction_mask)),
+        );
+        let matching = encode_event(
+            &auction_decoder,
+            auction_event_payload(1, 100, 10),
+            "nexmark_auction",
+        );
+        let nonmatching = encode_event(
+            &auction_decoder,
+            auction_event_payload(2, 200, 5),
+            "nexmark_auction",
+        );
+        let closed_keys = closed_key_transform(&vec![(matching, 1), (nonmatching.clone(), 1)])
+            .expect("closed keys");
+        let expected_key =
+            extract_encoded_row_columns(&nonmatching, right_key_columns.as_ref(), true)
+                .expect("extract nonmatching auction key")
+                .expect("nonmatching auction key");
+        assert_eq!(closed_keys, vec![(expected_key, 1)]);
+    }
+
+    #[tokio::test]
     async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
         let logical = sql_plan_with_auction_and_bid(
             "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
@@ -9106,9 +9272,9 @@ mod tests {
             let _ = observer_tx.send((version, deltas));
         });
         let (left_transient_tx, left_transient_rx) =
-            mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>>>();
+            mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>();
         let (right_transient_tx, right_transient_rx) =
-            mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>>>();
+            mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>();
         DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
             &left_stream,
             &right_stream,
@@ -9152,6 +9318,7 @@ mod tests {
             .send(TransientJoinInputBatch {
                 ts: 1,
                 deltas: Arc::new(transformed_right_tick1),
+                closed_keys: Arc::new(Vec::new()),
             })
             .expect("send auction transient batch");
         {
@@ -9232,6 +9399,7 @@ mod tests {
                     .send(TransientJoinInputBatch {
                         ts,
                         deltas: Arc::new(transformed_left),
+                        closed_keys: Arc::new(Vec::new()),
                     })
                     .expect("send bid transient batch");
             }
@@ -9239,6 +9407,7 @@ mod tests {
                 .send(TransientJoinInputBatch {
                     ts,
                     deltas: Arc::new(Vec::new()),
+                    closed_keys: Arc::new(Vec::new()),
                 })
                 .expect("send empty right transient batch");
             {
@@ -9429,6 +9598,7 @@ mod tests {
             &plan,
             left_idx,
             &transient_streams,
+            None,
             &cancel,
         )
         .expect("left transient input opt")
@@ -9438,6 +9608,7 @@ mod tests {
             &plan,
             right_idx,
             &transient_streams,
+            None,
             &cancel,
         )
         .expect("right transient input opt")

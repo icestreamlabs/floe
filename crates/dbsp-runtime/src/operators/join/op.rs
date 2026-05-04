@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ahash::AHashMap;
 use anyhow::{Context, Result};
@@ -28,15 +29,18 @@ type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
 type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
+static NEXT_JOIN_CLOSED_INDEX_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct JoinStepResult<O> {
     pub(crate) delta_batch: Arc<Vec<(O, i64)>>,
     pub(crate) persisted_handle: Option<ZSetHandle>,
 }
 
-pub struct JoinTransientInputs<L, R> {
+pub struct JoinTransientInputs<L, R, K> {
     pub(crate) left: Option<Arc<Vec<(L, i64)>>>,
     pub(crate) right: Option<Arc<Vec<(R, i64)>>>,
+    pub(crate) left_closed_keys: Option<Arc<Vec<(K, i64)>>>,
+    pub(crate) right_closed_keys: Option<Arc<Vec<(K, i64)>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +92,8 @@ where
     pub right_state: RelationState<R>,
     pub left_index: IndexedBatchZSet<K, L>,
     pub right_index: IndexedBatchZSet<K, R>,
+    pub left_closed_index: IndexedBatchZSet<K, ()>,
+    pub right_closed_index: IndexedBatchZSet<K, ()>,
     pub left_key: BatchJoinKeyExtractor<L, K>,
     pub right_key: BatchJoinKeyExtractor<R, K>,
     pub predicate: JoinPredicate<L, R>,
@@ -99,6 +105,8 @@ where
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
     left_memory_index: FastHashMap<K, FastHashMap<L, i64>>,
     right_memory_index: FastHashMap<K, FastHashMap<R, i64>>,
+    left_closed_memory_index: FastHashMap<K, i64>,
+    right_closed_memory_index: FastHashMap<K, i64>,
     persist_indexes: bool,
     left_retention: JoinInputRetention,
     right_retention: JoinInputRetention,
@@ -198,6 +206,43 @@ where
         output: VersionedZSet<O>,
         integrated: Option<RelationState<O>>,
     ) -> Self {
+        let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
+        Self::new_batch_with_closed_indexes(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
+            IndexedBatchZSet::new(
+                table.clone(),
+                format!("join_right_closed_index_{closed_id}"),
+            ),
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            table,
+            output,
+            integrated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch_with_closed_indexes(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_closed_index: IndexedBatchZSet<K, ()>,
+        right_closed_index: IndexedBatchZSet<K, ()>,
+        left_key: BatchJoinKeyExtractor<L, K>,
+        right_key: BatchJoinKeyExtractor<R, K>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<O>,
+        integrated: Option<RelationState<O>>,
+    ) -> Self {
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
@@ -205,6 +250,8 @@ where
             right_state,
             left_index,
             right_index,
+            left_closed_index,
+            right_closed_index,
             left_key,
             right_key,
             predicate,
@@ -216,6 +263,8 @@ where
             dict_cache_right: HashMap::new(),
             left_memory_index: FastHashMap::new(),
             right_memory_index: FastHashMap::new(),
+            left_closed_memory_index: FastHashMap::new(),
+            right_closed_memory_index: FastHashMap::new(),
             persist_indexes: true,
             left_retention: JoinInputRetention::RetainAll,
             right_retention: JoinInputRetention::RetainAll,
@@ -280,6 +329,41 @@ where
         table: Arc<dyn KeyValueTable>,
         integrated: Option<RelationState<O>>,
     ) -> Self {
+        let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
+        Self::new_without_output_batch_with_closed_indexes(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
+            IndexedBatchZSet::new(
+                table.clone(),
+                format!("join_right_closed_index_{closed_id}"),
+            ),
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            table,
+            integrated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_without_output_batch_with_closed_indexes(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        left_index: IndexedBatchZSet<K, L>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_closed_index: IndexedBatchZSet<K, ()>,
+        right_closed_index: IndexedBatchZSet<K, ()>,
+        left_key: BatchJoinKeyExtractor<L, K>,
+        right_key: BatchJoinKeyExtractor<R, K>,
+        predicate: JoinPredicate<L, R>,
+        projector: JoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        integrated: Option<RelationState<O>>,
+    ) -> Self {
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
@@ -287,6 +371,8 @@ where
             right_state,
             left_index,
             right_index,
+            left_closed_index,
+            right_closed_index,
             left_key,
             right_key,
             predicate,
@@ -298,6 +384,8 @@ where
             dict_cache_right: HashMap::new(),
             left_memory_index: FastHashMap::new(),
             right_memory_index: FastHashMap::new(),
+            left_closed_memory_index: FastHashMap::new(),
+            right_closed_memory_index: FastHashMap::new(),
             persist_indexes: true,
             left_retention: JoinInputRetention::RetainAll,
             right_retention: JoinInputRetention::RetainAll,
@@ -446,6 +534,37 @@ where
         Ok(())
     }
 
+    async fn seed_closed_memory_index_for_keys(
+        index_store: &IndexedBatchZSet<K, ()>,
+        memory_index: &mut FastHashMap<K, i64>,
+        keys: impl Iterator<Item = &K>,
+    ) -> Result<()> {
+        let mut missing_keys = Vec::new();
+        for key in keys {
+            if !memory_index.contains_key(key) {
+                missing_keys.push(key.clone());
+            }
+        }
+
+        for key in missing_keys {
+            let values = index_store
+                .values_for_key(&key)
+                .await
+                .context("load closed join key entries into memory cache")?;
+            let weight = values
+                .into_iter()
+                .filter_map(|(_, weight)| (weight != 0).then_some(weight))
+                .sum::<i64>();
+            if weight > 0 {
+                memory_index.insert(key, weight);
+            } else {
+                memory_index.insert(key, 0);
+            }
+        }
+
+        Ok(())
+    }
+
     async fn apply_deltas_to_versioned<T>(
         versioned: &mut VersionedZSet<T>,
         deltas: &FastHashMap<T, i64>,
@@ -570,6 +689,42 @@ where
         }
     }
 
+    fn apply_closed_key_updates_to_memory_index(
+        index: &mut FastHashMap<K, i64>,
+        updates: &FastHashMap<K, i64>,
+    ) {
+        for (key, weight) in updates {
+            if *weight == 0 {
+                continue;
+            }
+            let next = index.get(key).copied().unwrap_or(0).saturating_add(*weight);
+            index.insert(key.clone(), next.max(0));
+        }
+    }
+
+    fn coalesce_closed_key_updates(updates: Option<&Arc<Vec<(K, i64)>>>) -> FastHashMap<K, i64> {
+        let mut coalesced = FastHashMap::new();
+        let Some(updates) = updates else {
+            return coalesced;
+        };
+        for (key, weight) in updates.iter() {
+            if *weight == 0 {
+                continue;
+            }
+            let next = coalesced
+                .get(key)
+                .copied()
+                .unwrap_or(0_i64)
+                .saturating_add(*weight);
+            if next == 0 {
+                coalesced.remove(key);
+            } else {
+                coalesced.insert(key.clone(), next);
+            }
+        }
+        coalesced
+    }
+
     fn add_keyed_delta<T>(keyed: &mut KeyedRowDeltas<K, T>, key: K, row: T, weight: i64)
     where
         T: Clone + Eq + Hash,
@@ -622,10 +777,20 @@ where
         &self,
         left_keyed: &KeyedRowDeltas<K, L>,
         right_keyed: &KeyedRowDeltas<K, R>,
+        right_closed_key_updates: &FastHashMap<K, i64>,
     ) -> KeyedRowDeltas<K, L> {
         let mut retained = KeyedRowDeltas::default();
         for (key, rows) in left_keyed {
             for (left, weight) in rows {
+                let closed = *weight > 0
+                    && self.left_retention == JoinInputRetention::DropMatchedAppendOnly
+                    && self
+                        .right_closed_memory_index
+                        .get(key)
+                        .copied()
+                        .unwrap_or(0)
+                        + right_closed_key_updates.get(key).copied().unwrap_or(0)
+                        > 0;
                 let matched = *weight > 0
                     && self.left_retention == JoinInputRetention::DropMatchedAppendOnly
                     && self.left_matches_any_right(
@@ -633,13 +798,27 @@ where
                         self.right_memory_index.get(key),
                         right_keyed.get(key),
                     );
-                if !matched {
+                if !matched && !closed {
                     Self::add_keyed_delta(&mut retained, key.clone(), left.clone(), *weight);
                 }
             }
         }
 
         if self.left_retention == JoinInputRetention::DropMatchedAppendOnly {
+            for (key, close_weight) in right_closed_key_updates {
+                if *close_weight <= 0 {
+                    continue;
+                }
+                let Some(left_rows) = self.left_memory_index.get(key) else {
+                    continue;
+                };
+                for (left, left_weight) in left_rows {
+                    if *left_weight <= 0 {
+                        continue;
+                    }
+                    Self::add_keyed_delta(&mut retained, key.clone(), left.clone(), -*left_weight);
+                }
+            }
             for (key, right_rows) in right_keyed {
                 let Some(left_rows) = self.left_memory_index.get(key) else {
                     continue;
@@ -670,10 +849,16 @@ where
         &self,
         left_keyed: &KeyedRowDeltas<K, L>,
         right_keyed: &KeyedRowDeltas<K, R>,
+        left_closed_key_updates: &FastHashMap<K, i64>,
     ) -> KeyedRowDeltas<K, R> {
         let mut retained = KeyedRowDeltas::default();
         for (key, rows) in right_keyed {
             for (right, weight) in rows {
+                let closed = *weight > 0
+                    && self.right_retention == JoinInputRetention::DropMatchedAppendOnly
+                    && self.left_closed_memory_index.get(key).copied().unwrap_or(0)
+                        + left_closed_key_updates.get(key).copied().unwrap_or(0)
+                        > 0;
                 let matched = *weight > 0
                     && self.right_retention == JoinInputRetention::DropMatchedAppendOnly
                     && self.right_matches_any_left(
@@ -681,13 +866,32 @@ where
                         self.left_memory_index.get(key),
                         left_keyed.get(key),
                     );
-                if !matched {
+                if !matched && !closed {
                     Self::add_keyed_delta(&mut retained, key.clone(), right.clone(), *weight);
                 }
             }
         }
 
         if self.right_retention == JoinInputRetention::DropMatchedAppendOnly {
+            for (key, close_weight) in left_closed_key_updates {
+                if *close_weight <= 0 {
+                    continue;
+                }
+                let Some(right_rows) = self.right_memory_index.get(key) else {
+                    continue;
+                };
+                for (right, right_weight) in right_rows {
+                    if *right_weight <= 0 {
+                        continue;
+                    }
+                    Self::add_keyed_delta(
+                        &mut retained,
+                        key.clone(),
+                        right.clone(),
+                        -*right_weight,
+                    );
+                }
+            }
             for (key, left_rows) in left_keyed {
                 let Some(right_rows) = self.right_memory_index.get(key) else {
                     continue;
@@ -718,7 +922,7 @@ where
         &mut self,
         _ts: i64,
         inputs: &[ZSetHandle],
-        transient_inputs: Option<JoinTransientInputs<L, R>>,
+        transient_inputs: Option<JoinTransientInputs<L, R, K>>,
         persist_output: bool,
     ) -> anyhow::Result<Option<JoinStepResult<O>>> {
         let left_delta_handle = inputs
@@ -764,6 +968,16 @@ where
         };
         let left_keyed = self.stage_keyed_deltas(left_delta_values, &self.left_key);
         let right_keyed = self.stage_keyed_deltas(right_delta_values, &self.right_key);
+        let left_closed_key_updates = Self::coalesce_closed_key_updates(
+            transient_inputs
+                .as_ref()
+                .and_then(|inputs| inputs.left_closed_keys.as_ref()),
+        );
+        let right_closed_key_updates = Self::coalesce_closed_key_updates(
+            transient_inputs
+                .as_ref()
+                .and_then(|inputs| inputs.right_closed_keys.as_ref()),
+        );
 
         if self.persist_indexes {
             Self::seed_memory_index_for_keys(
@@ -780,6 +994,34 @@ where
             )
             .await
             .context("seed left join memory index")?;
+            Self::seed_memory_index_for_keys(
+                &self.left_index,
+                &mut self.left_memory_index,
+                right_closed_key_updates.keys(),
+            )
+            .await
+            .context("seed left join memory index for right closed keys")?;
+            Self::seed_memory_index_for_keys(
+                &self.right_index,
+                &mut self.right_memory_index,
+                left_closed_key_updates.keys(),
+            )
+            .await
+            .context("seed right join memory index for left closed keys")?;
+            Self::seed_closed_memory_index_for_keys(
+                &self.right_closed_index,
+                &mut self.right_closed_memory_index,
+                left_keyed.keys(),
+            )
+            .await
+            .context("seed right closed join key index")?;
+            Self::seed_closed_memory_index_for_keys(
+                &self.left_closed_index,
+                &mut self.left_closed_memory_index,
+                right_keyed.keys(),
+            )
+            .await
+            .context("seed left closed join key index")?;
         }
 
         // Build output delta from pre-update state (A, B) and current deltas
@@ -825,8 +1067,10 @@ where
         }
         delta_join.retain(|_, w| *w != 0);
 
-        let left_retained_updates = self.retained_left_updates(&left_keyed, &right_keyed);
-        let right_retained_updates = self.retained_right_updates(&left_keyed, &right_keyed);
+        let left_retained_updates =
+            self.retained_left_updates(&left_keyed, &right_keyed, &right_closed_key_updates);
+        let right_retained_updates =
+            self.retained_right_updates(&left_keyed, &right_keyed, &left_closed_key_updates);
 
         Self::apply_keyed_updates_to_memory_index(
             &mut self.left_memory_index,
@@ -835,6 +1079,14 @@ where
         Self::apply_keyed_updates_to_memory_index(
             &mut self.right_memory_index,
             &right_retained_updates,
+        );
+        Self::apply_closed_key_updates_to_memory_index(
+            &mut self.left_closed_memory_index,
+            &left_closed_key_updates,
+        );
+        Self::apply_closed_key_updates_to_memory_index(
+            &mut self.right_closed_memory_index,
+            &right_closed_key_updates,
         );
 
         if self.persist_indexes {
@@ -862,6 +1114,38 @@ where
                 "join",
                 "right_index",
                 right_index_persist_start.elapsed().as_millis() as u64,
+            );
+        }
+
+        if self.persist_indexes && !left_closed_key_updates.is_empty() {
+            let left_closed_updates = left_closed_key_updates
+                .iter()
+                .map(|(key, weight)| (key.clone(), (), *weight));
+            let left_closed_persist_start = std::time::Instant::now();
+            self.left_closed_index
+                .apply_deltas(left_closed_updates)
+                .await
+                .context("update left closed join key index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "join",
+                "left_closed_index",
+                left_closed_persist_start.elapsed().as_millis() as u64,
+            );
+        }
+
+        if self.persist_indexes && !right_closed_key_updates.is_empty() {
+            let right_closed_updates = right_closed_key_updates
+                .iter()
+                .map(|(key, weight)| (key.clone(), (), *weight));
+            let right_closed_persist_start = std::time::Instant::now();
+            self.right_closed_index
+                .apply_deltas(right_closed_updates)
+                .await
+                .context("update right closed join key index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "join",
+                "right_closed_index",
+                right_closed_persist_start.elapsed().as_millis() as u64,
             );
         }
 
@@ -929,7 +1213,7 @@ where
         &mut self,
         ts: i64,
         inputs: &[ZSetHandle],
-        transient_inputs: Option<JoinTransientInputs<L, R>>,
+        transient_inputs: Option<JoinTransientInputs<L, R, K>>,
     ) -> anyhow::Result<Option<Arc<Vec<(O, i64)>>>> {
         Ok(self
             .step_internal(ts, inputs, transient_inputs, false)

@@ -51,11 +51,12 @@ impl DbspGraphBuilder {
         graph_id: &str,
         side: &'static str,
         mut input: tokio::sync::mpsc::UnboundedReceiver<
-            dbsp::join::TransientJoinInputBatch<Vec<u8>>,
+            dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
         >,
         transform: Arc<DeltaTransformFn>,
         task_events: &GraphTaskSender,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>
+    {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let graph_id = graph_id.to_string();
         let task_events = task_events.clone();
@@ -73,6 +74,7 @@ impl DbspGraphBuilder {
                     .send(dbsp::join::TransientJoinInputBatch {
                         ts: batch.ts,
                         deltas: Arc::new(transformed),
+                        closed_keys: Arc::clone(&batch.closed_keys),
                     })
                     .is_err()
                 {
@@ -815,10 +817,14 @@ impl DbspGraphBuilder {
         mut left: DeltaHandleStream,
         mut right: DeltaHandleStream,
         mut left_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+            tokio::sync::mpsc::UnboundedReceiver<
+                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
+            >,
         >,
         mut right_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+            tokio::sync::mpsc::UnboundedReceiver<
+                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
+            >,
         >,
         left_retention: dbsp::JoinInputRetention,
         right_retention: dbsp::JoinInputRetention,
@@ -1134,10 +1140,14 @@ impl DbspGraphBuilder {
         left: DeltaHandleStream,
         right: DeltaHandleStream,
         left_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+            tokio::sync::mpsc::UnboundedReceiver<
+                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
+            >,
         >,
         right_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>>>,
+            tokio::sync::mpsc::UnboundedReceiver<
+                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
+            >,
         >,
         left_key_columns: Arc<Vec<usize>>,
         right_key_columns: Arc<Vec<usize>>,
