@@ -2582,6 +2582,22 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     assert_eq!(rows, vec![int_row(&[7, 60]), int_row(&[9, 90])]);
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 13, 90, 1_700_000_003_000), 1)
+        .expect("append later winning bid");
+    registry
+        .tick_all_with_version(3)
+        .await
+        .expect("tick second bid batch");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 3, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 2).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(rows, vec![int_row(&[7, 80]), int_row(&[9, 90])]);
 }
 
 #[tokio::test]

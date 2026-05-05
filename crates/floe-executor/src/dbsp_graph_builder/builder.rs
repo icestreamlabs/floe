@@ -815,6 +815,7 @@ impl DbspGraphBuilder {
 
         let identity_transform: Arc<DeltaTransformFn> =
             Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+        let mut current_output_append_only = true;
         for (step_idx, step) in root.steps.iter().enumerate() {
             receiver = match step {
                 TransientJoinPipelineStep::Transform(transform) => {
@@ -828,32 +829,37 @@ impl DbspGraphBuilder {
                     )
                 }
                 TransientJoinPipelineStep::TopN(topn) => {
-                    build_transient_topn_receiver_from_batches(
+                    let next = build_transient_topn_receiver_from_batches(
                         self.graph_id(),
                         topn,
                         receiver,
-                        false,
+                        current_output_append_only,
                         false,
                         None,
                         cancel,
                         task_events,
                         state_table.clone(),
                         format!("join_pipeline_topn_{step_idx}"),
-                    )
+                    );
+                    current_output_append_only = false;
+                    next
                 }
                 TransientJoinPipelineStep::Aggregate(aggregate) => {
-                    build_transient_aggregate_receiver_from_batches(
+                    let next = build_transient_aggregate_receiver_from_batches(
                         self.graph_id(),
                         aggregate,
                         receiver,
                         Arc::clone(&identity_transform),
+                        current_output_append_only,
                         false,
                         cancel,
                         task_events,
                         state_table.clone(),
                         format!("join_pipeline_aggregate_{step_idx}"),
                     )
-                    .await?
+                    .await?;
+                    current_output_append_only = false;
+                    next
                 }
             };
         }
@@ -992,8 +998,7 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Aggregate(aggregate) => {
                 let input_idx = first_input(node, "aggregate")?;
-                let append_only_input =
-                    find_transient_source_root_shape(plan, input_idx)?.is_some();
+                let append_only_input = plan_node_output_append_only(plan, input_idx)?;
                 let upstream = self
                     .compile_node(
                         plan,
@@ -1031,8 +1036,7 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::Distinct(distinct) => {
                 let input_idx = first_input(node, "distinct")?;
-                let append_only_input =
-                    find_transient_source_root_shape(plan, input_idx)?.is_some();
+                let append_only_input = plan_node_output_append_only(plan, input_idx)?;
                 let upstream = self
                     .compile_node(
                         plan,
@@ -1232,6 +1236,33 @@ fn join_inputs(node: &CircuitNode) -> Result<(usize, usize)> {
         bail!("join node requires two inputs");
     }
     Ok((node.inputs[0], node.inputs[1]))
+}
+
+fn plan_node_output_append_only(plan: &CircuitPlan, node_idx: usize) -> Result<bool> {
+    let node = plan
+        .node(node_idx)
+        .with_context(|| anyhow!("append-only analysis missing node {node_idx}"))?;
+    let input_append_only = |input_idx| plan_node_output_append_only(plan, input_idx);
+
+    match &node.kind {
+        DbspNodeKind::Source(_) => Ok(true),
+        DbspNodeKind::Select(_) | DbspNodeKind::Project(_) | DbspNodeKind::Passthrough => {
+            input_append_only(first_input(node, "append-only passthrough")?)
+        }
+        DbspNodeKind::Join(_) | DbspNodeKind::Union(_) => {
+            for &input_idx in &node.inputs {
+                if !input_append_only(input_idx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        DbspNodeKind::Distinct(_) => input_append_only(first_input(node, "append-only distinct")?),
+        DbspNodeKind::Aggregate(_) | DbspNodeKind::WindowAggregate(_) | DbspNodeKind::TopN(_) => {
+            Ok(false)
+        }
+        DbspNodeKind::Sink(_) => input_append_only(first_input(node, "append-only sink")?),
+    }
 }
 
 fn fuseable_select_input(
@@ -5497,6 +5528,7 @@ async fn build_transient_aggregate_receiver(
         aggregate,
         upstream_rx,
         output_transform,
+        true,
         compact_source_state,
         cancel,
         task_events,
@@ -5511,6 +5543,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     aggregate: &DbspAggregateNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
     output_transform: Arc<DeltaTransformFn>,
+    append_only_input: bool,
     compact_source_state: bool,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
@@ -5671,7 +5704,9 @@ async fn build_transient_aggregate_receiver_from_batches(
             .await
             .context("initialize transient incremental aggregate")?,
         );
-        aggregate_processor.enable_append_only_input().await;
+        if append_only_input {
+            aggregate_processor.enable_append_only_input().await;
+        }
         let incremental_state_label = if compact_source_state {
             format!("{state_label}_incremental_state")
         } else {
