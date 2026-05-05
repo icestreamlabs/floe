@@ -1925,6 +1925,32 @@ impl TransientTopNProcessor {
         output
     }
 
+    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
+        let retain_count = self.offset.saturating_add(self.limit);
+        if retain_count == 0 {
+            return Vec::new();
+        }
+
+        self.order_index
+            .values()
+            .flat_map(|partition_index| {
+                let mut remaining = retain_count;
+                partition_index
+                    .iter()
+                    .filter_map(move |(order_key, weight)| {
+                        if remaining == 0 || *weight <= 0 {
+                            return None;
+                        }
+                        let retained = usize::try_from(*weight)
+                            .unwrap_or(usize::MAX)
+                            .min(remaining);
+                        remaining -= retained;
+                        Some((order_key.tie_breaker.clone(), retained as i64))
+                    })
+            })
+            .collect()
+    }
+
     fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
         if let Some(cache) = self.row_key_cache.as_ref()
             && let Some(cached) = cache.get(row_key)
@@ -2242,6 +2268,23 @@ impl TransientTop1Processor {
             .into_iter()
             .filter(|(_, diff)| *diff != 0)
             .collect())
+    }
+
+    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
+        self.partition_output_cache
+            .values()
+            .filter_map(|row_key| {
+                let (partition_key, order_key) = self.compute_key_parts(row_key);
+                let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
+                    return None;
+                };
+                let weight = self
+                    .order_index
+                    .get(&partition_key)?
+                    .get(&(order_key, row_key.clone()))?;
+                (*weight > 0).then_some((row_key.clone(), 1))
+            })
+            .collect()
     }
 
     fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
@@ -7875,7 +7918,9 @@ fn build_transient_topn_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&input_deltas).await
+                        {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
@@ -7886,6 +7931,12 @@ fn build_transient_topn_receiver_from_batches(
                                 break;
                             }
                         };
+                        if compact_append_only_state
+                            && let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await
+                        {
+                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                            break;
+                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
                                 Ok(deltas) => deltas,
@@ -8145,7 +8196,9 @@ fn build_transient_topn_receiver_from_batches(
                     } else {
                         input_deltas
                     };
-                    if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                    if !compact_append_only_state
+                        && let Err(err) = persistent_state.apply_deltas(&input_deltas).await
+                    {
                         report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                         break;
                     }
@@ -8156,6 +8209,12 @@ fn build_transient_topn_receiver_from_batches(
                             break;
                         }
                     };
+                    if compact_append_only_state
+                        && let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await
+                    {
+                        report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                        break;
+                    }
                     let output_deltas = match output_projection.as_ref() {
                         Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
                             Ok(deltas) => deltas,
@@ -8423,6 +8482,68 @@ mod tests {
             .expect("partition state");
         assert_eq!(partition.live_rows.len(), 1);
         assert_eq!(processor.snapshot_deltas(), vec![(row_20, 2)]);
+    }
+
+    #[test]
+    fn generic_top1_snapshot_retains_only_partition_winner() {
+        let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+        let row_30 = encode_event(&decoder, bid_event_payload(1, 101, 30), "nexmark_bid");
+        let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
+        let row_40 = encode_event(&decoder, bid_event_payload(1, 103, 40), "nexmark_bid");
+        let key_layout = test_topn_key_layout();
+        let topn = test_topn_node(1, 0);
+        let mut processor = TransientTop1Processor::new("test-graph", &topn, &key_layout);
+
+        processor
+            .apply_deltas(vec![(row_30.clone(), 1), (row_20.clone(), 1), (row_40, 1)])
+            .expect("apply top1 rows");
+
+        assert_eq!(processor.snapshot_deltas(), vec![(row_20, 1)]);
+    }
+
+    #[test]
+    fn generic_topn_snapshot_retains_offset_plus_limit_rows() {
+        let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+        let row_10 = encode_event(&decoder, bid_event_payload(1, 101, 10), "nexmark_bid");
+        let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
+        let row_30 = encode_event(&decoder, bid_event_payload(1, 103, 30), "nexmark_bid");
+        let row_40 = encode_event(&decoder, bid_event_payload(1, 104, 40), "nexmark_bid");
+        let row_05 = encode_event(&decoder, bid_event_payload(1, 105, 5), "nexmark_bid");
+        let key_layout = test_topn_key_layout();
+        let topn = test_topn_node(2, 1);
+        let mut processor = TransientTopNProcessor::new("test-graph", &topn, &key_layout, true);
+
+        processor
+            .apply_deltas(vec![
+                (row_10.clone(), 1),
+                (row_20.clone(), 1),
+                (row_30.clone(), 1),
+                (row_40, 1),
+            ])
+            .expect("apply topn rows");
+
+        let mut snapshot = processor.snapshot_deltas();
+        snapshot.sort();
+        let mut expected_snapshot = vec![(row_10.clone(), 1), (row_20.clone(), 1), (row_30, 1)];
+        expected_snapshot.sort();
+        assert_eq!(snapshot, expected_snapshot);
+
+        let mut restored = TransientTopNProcessor::new("test-graph", &topn, &key_layout, true);
+        restored
+            .apply_deltas(snapshot)
+            .expect("restore compact topn snapshot");
+
+        let original_output = processor
+            .apply_deltas(vec![(row_05.clone(), 1)])
+            .expect("apply follow-up to original")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let restored_output = restored
+            .apply_deltas(vec![(row_05, 1)])
+            .expect("apply follow-up to restored")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(restored_output, original_output);
     }
 
     #[test]
@@ -11219,6 +11340,25 @@ mod tests {
             .encode_row_key(&event)
             .expect("encode source event")
             .0
+    }
+
+    fn test_topn_key_layout() -> TransientTopNKeyLayout {
+        TransientTopNKeyLayout {
+            partition_columns: Arc::new(vec![0]),
+            order_columns: Arc::new(vec![2]),
+            order_types: Arc::new(vec![DbspScalarType::Int64]),
+            precompute_evaluator: None,
+        }
+    }
+
+    fn test_topn_node(limit: usize, offset: usize) -> DbspTopNNode {
+        let input_schema = nexmark_bid_table().schema().clone();
+        let order_by = vec![
+            dbsp::OrderExpr::try_new(col("price"), Arc::clone(&input_schema), true, true)
+                .expect("order expr"),
+        ];
+        DbspTopNNode::try_new(input_schema, vec![col("auction")], order_by, limit, offset)
+            .expect("topn node")
     }
 
     fn bid_event_payload(auction: i64, bidder: i64, price: i64) -> Value {
