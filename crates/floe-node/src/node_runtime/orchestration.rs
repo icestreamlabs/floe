@@ -1799,7 +1799,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     drop(mv_registry);
     drop(outer_registry);
 
-    let close_result = db.close().await.map_err(anyhow::Error::new);
+    let close_timeout = slatedb_close_timeout();
+    let close_result = match tokio::time::timeout(close_timeout, db.close()).await {
+        Ok(result) => result.map_err(anyhow::Error::new),
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = close_timeout.as_millis() as u64,
+                env = SLATEDB_CLOSE_TIMEOUT_MS_ENV,
+                "timed out closing SlateDB; continuing shutdown"
+            );
+            Ok(())
+        }
+    };
 
     if let Some(message) = runtime_failure
         .lock()
@@ -1812,4 +1823,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     close_result?;
 
     server_result
+}
+
+fn slatedb_close_timeout() -> Duration {
+    std::env::var(SLATEDB_CLOSE_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS))
 }
