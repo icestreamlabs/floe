@@ -162,7 +162,10 @@ async fn arrow_indexed_restore_truncates_uncommitted_segments() {
         .restore_committed_checkpoint()
         .await
         .expect("restore committed checkpoint");
-    let mut values = restored.values_for_key(&1).await.expect("lookup restored key");
+    let mut values = restored
+        .values_for_key(&1)
+        .await
+        .expect("lookup restored key");
     values.sort_unstable();
     assert_eq!(values, vec![(10, 1)]);
 
@@ -248,4 +251,32 @@ async fn arrow_indexed_writes_one_posting_per_key_per_segment() {
         .await
         .expect("scan postings entries");
     assert_eq!(entries.len(), 1, "expected one key+segment posting record");
+}
+
+#[tokio::test]
+async fn arrow_indexed_segments_store_only_values() {
+    let table = build_table("arrow-indexed-value-only-segment").await;
+    let index =
+        IndexedBatchZSet::<i64, i64>::new(table.clone(), "arrow_indexed_value_only_segment");
+    index
+        .apply_deltas(vec![(1, 10, 1), (1, 11, 1), (2, 20, 1)])
+        .await
+        .expect("apply deltas");
+
+    let segment = index
+        .segment_store
+        .read_segment(1)
+        .await
+        .expect("read segment")
+        .expect("segment exists");
+    assert_eq!(segment.batches.len(), 1);
+    assert_eq!(
+        segment.batches[0].num_columns(),
+        1,
+        "indexed segments should not duplicate key or delta columns"
+    );
+
+    let mut values = index.values_for_key(&1).await.expect("lookup values");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1), (11, 1)]);
 }

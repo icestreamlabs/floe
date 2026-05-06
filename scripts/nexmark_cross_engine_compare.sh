@@ -66,6 +66,10 @@ FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY="${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY:-1}"
 FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 FLOE_SLATEDB_AWAIT_DURABLE="${FLOE_SLATEDB_AWAIT_DURABLE:-false}"
+FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT:-0}"
+FLOE_STATE_SETTLE_AFTER_CATCHUP="${FLOE_STATE_SETTLE_AFTER_CATCHUP:-0}"
+FLOE_STATE_SETTLE_REQUIRED="${FLOE_STATE_SETTLE_REQUIRED:-0}"
+FLOE_STATE_SETTLE_TIMEOUT_SECONDS="${FLOE_STATE_SETTLE_TIMEOUT_SECONDS:-300}"
 
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 STRICT_RESULT_CORRECTNESS="${STRICT_RESULT_CORRECTNESS:-1}"
@@ -727,6 +731,35 @@ wait_for_http_ok() {
     sleep 1
   done
   return 1
+}
+
+settle_floe_state_if_requested() {
+  local artifact_dir="$1"
+  if ! env_enabled "${FLOE_STATE_SETTLE_AFTER_CATCHUP}"; then
+    return 0
+  fi
+  if [[ "${FLOE_ADMIN_PORT}" == "0" ]]; then
+    printf 'state_settle_requested_but_FLOE_ADMIN_PORT_is_0\n' > "${artifact_dir}/state_settle.error"
+    return 1
+  fi
+
+  local response_path="${artifact_dir}/state_settle.json"
+  local stderr_path="${artifact_dir}/state_settle.stderr.log"
+  local start_ms end_ms
+  start_ms="$(date +%s%3N)"
+  if ! timeout "${FLOE_STATE_SETTLE_TIMEOUT_SECONDS}"s \
+    curl -fsS -X POST "http://127.0.0.1:${FLOE_ADMIN_PORT}/debug/storage/flush" \
+      > "${response_path}" \
+      2> "${stderr_path}"; then
+    printf 'state_settle_failed_or_timed_out\n' > "${artifact_dir}/state_settle.error"
+    return 1
+  fi
+  end_ms="$(date +%s%3N)"
+  jq -n \
+    --argjson elapsed_ms "$((end_ms - start_ms))" \
+    --slurpfile response "${response_path}" \
+    '{settle_elapsed_ms: $elapsed_ms, response: ($response[0] // null)}' \
+    > "${artifact_dir}/state_settle_summary.json"
 }
 
 build_producer() {
@@ -2850,7 +2883,7 @@ run_floe_query() {
   # Prevent stale external floe-node runners from holding the shared pgwire port.
   pkill -f "/target/release/floe-node run" >/dev/null 2>&1 || true
   FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-    FLOE_ADMIN_PORT=0 \
+    FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT}" \
     "${REPO_ROOT}/target/release/floe-node" run \
     --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
     --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
@@ -2936,6 +2969,8 @@ run_floe_query() {
   fi
 
   local observed_hash=""
+  local main_state_settled=0
+  local main_state_settle_failed=0
   if env_enabled "${STRICT_RESULT_CONTENT_CHECK}"; then
     local retry_attempts="${STRICT_CONTENT_RETRY_ATTEMPTS}"
     if [[ -z "${retry_attempts}" || ! "${retry_attempts}" =~ ^[0-9]+$ || ${retry_attempts} -lt 1 ]]; then
@@ -2970,6 +3005,14 @@ run_floe_query() {
       return 1
     fi
 
+    if ! settle_floe_state_if_requested "${artifact_dir}"; then
+      main_state_settle_failed=1
+      if env_enabled "${FLOE_STATE_SETTLE_REQUIRED}"; then
+        stop_floe_process
+        return 1
+      fi
+    fi
+    main_state_settled=1
     stop_floe_process
 
     local validation_artifact_dir="${artifact_dir}/validation"
@@ -3064,6 +3107,23 @@ run_floe_query() {
   notes="${notes};correctness_exact_rows=${expected_result_rows}"
   if [[ -n "${observed_hash}" ]]; then
     notes="${notes};content_sha256=${observed_hash:0:16}"
+  fi
+  if [[ "${main_state_settled}" != "1" ]]; then
+    if ! settle_floe_state_if_requested "${artifact_dir}"; then
+      main_state_settle_failed=1
+      if env_enabled "${FLOE_STATE_SETTLE_REQUIRED}"; then
+        stop_floe_process
+        return 1
+      fi
+    fi
+    main_state_settled=1
+  fi
+  if env_enabled "${FLOE_STATE_SETTLE_AFTER_CATCHUP}"; then
+    if [[ "${main_state_settle_failed}" == "1" ]]; then
+      notes="${notes};state_settle_after_catchup=failed"
+    else
+      notes="${notes};state_settled_after_catchup=true"
+    fi
   fi
 
   stop_floe_process

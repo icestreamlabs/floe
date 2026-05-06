@@ -7,6 +7,7 @@ use slatedb::config::ScanOptions;
 
 const SLATEDB_NAME_ENV: &str = "FLOE_SLATEDB_NAME";
 const OBJECT_STORE_ENV_FILE_ENV: &str = "FLOE_OBJECT_STORE_ENV_FILE";
+const PROGRESS_EVERY_ENV: &str = "FLOE_KEYSPACE_SUMMARY_PROGRESS_EVERY";
 
 #[derive(Default)]
 struct Bucket {
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
     let mut by_namespace = BTreeMap::<String, Bucket>::new();
     let mut by_keyspace = BTreeMap::<String, Bucket>::new();
     let mut total = Bucket::default();
+    let progress_every = args.progress_every;
 
     let ranges = if args.keyspaces.is_empty() {
         vec![vec![0x00]..vec![0xFF]]
@@ -83,6 +85,13 @@ async fn main() -> Result<()> {
                 .entry(keyspace)
                 .or_default()
                 .add(key_len, value_len);
+            if progress_every > 0 && total.keys % progress_every == 0 {
+                eprintln!(
+                    "scanned_keys={} logical_bytes={}",
+                    total.keys,
+                    total.logical_bytes()
+                );
+            }
         }
     }
 
@@ -105,10 +114,17 @@ async fn main() -> Result<()> {
 struct Args {
     db_name: Option<String>,
     keyspaces: Vec<String>,
+    progress_every: u64,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut parsed = Args::default();
+    let mut parsed = Args {
+        progress_every: std::env::var(PROGRESS_EVERY_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
+        ..Args::default()
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--keyspace" {
@@ -116,6 +132,13 @@ fn parse_args() -> Result<Args> {
                 .next()
                 .ok_or_else(|| anyhow!("--keyspace requires a prefix"))?;
             parsed.keyspaces.push(keyspace);
+        } else if arg == "--progress-every" {
+            let progress_every = args
+                .next()
+                .ok_or_else(|| anyhow!("--progress-every requires a key count"))?;
+            parsed.progress_every = progress_every
+                .parse::<u64>()
+                .with_context(|| format!("parse --progress-every value '{progress_every}'"))?;
         } else if parsed.db_name.is_none() {
             parsed.db_name = Some(arg);
         } else {
@@ -155,6 +178,7 @@ fn classify_key(key: &str) -> String {
         || namespace.contains("source_window")
         || namespace == "floe"
         || keyspace == "indexed_batch_arrow"
+        || keyspace == "iba"
     {
         "operator_state".to_string()
     } else {
@@ -173,6 +197,10 @@ fn namespace_summary_key(key: &str) -> String {
         "index" => namespace_before_marker(parts, &["segment", "manifest"]),
         "gc" => namespace_before_marker(parts, &["tombstone", "pin"]),
         "stream" => namespace_before_marker(parts, &["data", "metadata"]),
+        "iba" => namespace_before_marker(
+            parts,
+            &["idx", "rev", "rng", "range_format", "next_segment_id"],
+        ),
         _ => keyspace.to_string(),
     }
 }

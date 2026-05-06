@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
-use arrow_array::builder::{BinaryBuilder, Int64Builder};
+use arrow_array::builder::BinaryBuilder;
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use hashbrown::HashMap as FastHashMap;
@@ -203,8 +203,8 @@ where
         range_enabled: bool,
         persistence: IndexedStatePersistence,
     ) -> Self {
-        let mut base = b"indexed_batch_arrow/".to_vec();
-        base.extend_from_slice(namespace.as_bytes());
+        let namespace_hash = stable_namespace_hash(namespace.as_bytes());
+        let mut base = format!("iba/{namespace_hash:016x}").into_bytes();
         base.push(b'/');
 
         let mut index_prefix = base.clone();
@@ -222,17 +222,17 @@ where
         let mut segment_sequence_key = base;
         segment_sequence_key.extend_from_slice(b"next_segment_id");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Binary, false),
-            Field::new("value", DataType::Binary, false),
-            Field::new("delta", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Binary,
+            false,
+        )]));
 
         Self {
             namespace: namespace.clone(),
             segment_store: ArrowSegmentStore::new(
                 table.clone(),
-                format!("indexed_batch_arrow/{namespace}"),
+                format!("iba/{namespace_hash:016x}"),
             ),
             table,
             schema,
@@ -888,7 +888,10 @@ where
 
     async fn truncate_to_next_segment(&self, next_segment_id: u64) -> Result<()> {
         let mut batch = WriteBatch::new();
-        batch.put(self.segment_sequence_key.clone(), next_segment_id.to_be_bytes());
+        batch.put(
+            self.segment_sequence_key.clone(),
+            next_segment_id.to_be_bytes(),
+        );
 
         for segment_id in self
             .segment_store
@@ -905,9 +908,15 @@ where
             self.decode_index_key(key).map(|(_, segment_id)| segment_id)
         })
         .await?;
-        self.delete_postings_at_or_after(&mut batch, &self.reverse_prefix, next_segment_id, |key| {
-            self.decode_reverse_key(key).map(|(_, segment_id)| segment_id)
-        })
+        self.delete_postings_at_or_after(
+            &mut batch,
+            &self.reverse_prefix,
+            next_segment_id,
+            |key| {
+                self.decode_reverse_key(key)
+                    .map(|(_, segment_id)| segment_id)
+            },
+        )
         .await?;
         self.delete_postings_at_or_after(&mut batch, &self.range_prefix, next_segment_id, |key| {
             segment_id_from_key_suffix(key)
@@ -1012,23 +1021,15 @@ where
     }
 
     fn record_batch_from_rows(&self, rows: &[(Vec<u8>, Vec<u8>, i64)]) -> Result<RecordBatch> {
-        let mut key_builder = BinaryBuilder::new();
         let mut value_builder = BinaryBuilder::new();
-        let mut delta_builder = Int64Builder::new();
 
-        for (key, value, delta) in rows {
-            key_builder.append_value(key);
+        for (_, value, _) in rows {
             value_builder.append_value(value);
-            delta_builder.append_value(*delta);
         }
 
         RecordBatch::try_new(
             Arc::clone(&self.schema),
-            vec![
-                Arc::new(key_builder.finish()) as ArrayRef,
-                Arc::new(value_builder.finish()) as ArrayRef,
-                Arc::new(delta_builder.finish()) as ArrayRef,
-            ],
+            vec![Arc::new(value_builder.finish()) as ArrayRef],
         )
         .context("build Arrow-index record batch")
     }
@@ -1395,8 +1396,9 @@ where
 
         let mut values = Vec::new();
         for batch in &segment.batches {
+            let value_column_index = if batch.num_columns() == 1 { 0 } else { 1 };
             let value_col = batch
-                .column(1)
+                .column(value_column_index)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| anyhow!("invalid Arrow-index value column type"))?;
@@ -1465,6 +1467,17 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = ahash::AHasher::default();
     hasher.write(bytes);
     hasher.finish()
+}
+
+fn stable_namespace_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn encode_index_postings(postings: &[(u32, i64)]) -> Vec<u8> {

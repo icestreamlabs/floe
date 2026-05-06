@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use prometheus::{Encoder, TextEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use slatedb::Db;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -26,11 +27,12 @@ pub struct HttpIngestConfig {
     pub health: Option<HttpIngestHealth>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpAdminConfig {
     pub host: String,
     pub port: u16,
     pub health: HttpIngestHealth,
+    pub storage_db: Option<Arc<Db>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,7 @@ struct HttpIngestState {
 struct HttpAdminState {
     cancel: CancellationToken,
     health: HttpIngestHealth,
+    storage_db: Option<Arc<Db>>,
 }
 
 #[derive(Deserialize)]
@@ -111,11 +114,13 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
     let state = HttpAdminState {
         cancel: cancel.clone(),
         health: config.health,
+        storage_db: config.storage_db,
     };
     let app = Router::new()
         .route("/healthz", get(admin_healthz))
         .route("/readyz", get(admin_readyz))
         .route("/debug/watermarks", get(debug_watermarks_admin))
+        .route("/debug/storage/flush", post(debug_storage_flush_admin))
         .route("/metrics", get(metrics))
         .with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
@@ -268,6 +273,36 @@ async fn debug_watermarks_admin(State(state): State<HttpAdminState>) -> impl Int
     };
     let snapshot = shared.read().await.clone();
     (StatusCode::OK, Json(snapshot)).into_response()
+}
+
+async fn debug_storage_flush_admin(State(state): State<HttpAdminState>) -> impl IntoResponse {
+    let Some(db) = &state.storage_db else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage unavailable"})),
+        )
+            .into_response();
+    };
+    let started_at = std::time::Instant::now();
+    match db.flush().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "flushed": true,
+                "elapsed_ms": started_at.elapsed().as_millis() as u64,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "flushed": false,
+                "error": err.to_string(),
+                "elapsed_ms": started_at.elapsed().as_millis() as u64,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn metrics() -> impl IntoResponse {

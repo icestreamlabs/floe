@@ -668,6 +668,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         host: run_args.http_host.clone(),
         port: admin_port,
         health: admin_health,
+        storage_db: Some(db.clone()),
     };
     let admin_cancel = service_cancel.clone();
     let runtime_cancel_for_admin = runtime_cancel.clone();
