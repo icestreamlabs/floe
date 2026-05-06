@@ -66,10 +66,12 @@ FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY="${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY:-1}"
 FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 FLOE_SLATEDB_AWAIT_DURABLE="${FLOE_SLATEDB_AWAIT_DURABLE:-false}"
+FLOE_SLATEDB_NAME_PREFIX="${FLOE_SLATEDB_NAME_PREFIX:-}"
 FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT:-0}"
 FLOE_STATE_SETTLE_AFTER_CATCHUP="${FLOE_STATE_SETTLE_AFTER_CATCHUP:-0}"
 FLOE_STATE_SETTLE_REQUIRED="${FLOE_STATE_SETTLE_REQUIRED:-0}"
 FLOE_STATE_SETTLE_TIMEOUT_SECONDS="${FLOE_STATE_SETTLE_TIMEOUT_SECONDS:-300}"
+FLOE_REQUIRE_OBJECT_STORE="${FLOE_REQUIRE_OBJECT_STORE:-0}"
 
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 STRICT_RESULT_CORRECTNESS="${STRICT_RESULT_CORRECTNESS:-1}"
@@ -105,6 +107,30 @@ env_enabled() {
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+floe_slatedb_name_for_query() {
+  local query_id="$1"
+  if [[ -n "${FLOE_SLATEDB_NAME_PREFIX}" ]]; then
+    printf '%s-%s\n' "${FLOE_SLATEDB_NAME_PREFIX}" "${query_id}"
+  elif [[ -n "${FLOE_SLATEDB_NAME:-}" ]]; then
+    printf '%s\n' "${FLOE_SLATEDB_NAME}"
+  fi
+}
+
+verify_floe_storage_mode_if_requested() {
+  local artifact_dir="$1"
+  if ! env_enabled "${FLOE_REQUIRE_OBJECT_STORE}"; then
+    return 0
+  fi
+  if grep -Fq 'opening SlateDB database [path=in-memory' "${artifact_dir}/floe-node.stdout.log"; then
+    printf 'floe_started_with_in_memory_storage_but_FLOE_REQUIRE_OBJECT_STORE_is_enabled\n' > "${artifact_dir}/storage_mode.error"
+    return 1
+  fi
+  if [[ -z "${CLOUD_PROVIDER:-}" ]]; then
+    printf 'FLOE_REQUIRE_OBJECT_STORE_enabled_but_CLOUD_PROVIDER_is_unset\n' > "${artifact_dir}/storage_mode.error"
+    return 1
+  fi
 }
 
 has_source() {
@@ -2878,13 +2904,20 @@ run_floe_query() {
 
   local program_sql
   program_sql="$(tr '\n' ' ' < "${program_path}")"
+  local main_slatedb_name
+  main_slatedb_name="$(floe_slatedb_name_for_query "${query_id}")"
+  if [[ -n "${main_slatedb_name}" ]]; then
+    printf '%s\n' "${main_slatedb_name}" > "${artifact_dir}/slatedb_name.txt"
+  fi
 
   stop_floe_process
   # Prevent stale external floe-node runners from holding the shared pgwire port.
   pkill -f "/target/release/floe-node run" >/dev/null 2>&1 || true
-  FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-    FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT}" \
-    "${REPO_ROOT}/target/release/floe-node" run \
+  local floe_run_env=("FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" "FLOE_ADMIN_PORT=${FLOE_ADMIN_PORT}")
+  if [[ -n "${main_slatedb_name}" ]]; then
+    floe_run_env+=("FLOE_SLATEDB_NAME=${main_slatedb_name}")
+  fi
+  env "${floe_run_env[@]}" "${REPO_ROOT}/target/release/floe-node" run \
     --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
     --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
     --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
@@ -2895,6 +2928,10 @@ run_floe_query() {
   FLOE_NODE_PID=$!
 
   if ! wait_for_floe_pg "${artifact_dir}"; then
+    stop_floe_process
+    return 1
+  fi
+  if ! verify_floe_storage_mode_if_requested "${artifact_dir}"; then
     stop_floe_process
     return 1
   fi
@@ -3022,7 +3059,7 @@ run_floe_query() {
     local validation_person_group_id="${person_group_id}_validation"
     local validation_config_path="${validation_artifact_dir}/floe_config.json"
     local validation_program_path="${validation_artifact_dir}/program.sql"
-    local validation_slatedb_name="${FLOE_SLATEDB_NAME:-}"
+    local validation_slatedb_name="${main_slatedb_name}"
     write_floe_config "${validation_config_path}" "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}" "${validation_bid_group_id}" "${validation_auction_group_id}" "${validation_person_group_id}"
     write_floe_program_sql "${validation_program_path}" "${query_id}" "${sources}" 1
 
@@ -3034,9 +3071,10 @@ run_floe_query() {
     fi
 
     if [[ -n "${validation_slatedb_name}" ]]; then
-      FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-        FLOE_ADMIN_PORT=0 \
-        FLOE_SLATEDB_NAME="${validation_slatedb_name}" \
+      env \
+        "FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" \
+        "FLOE_ADMIN_PORT=0" \
+        "FLOE_SLATEDB_NAME=${validation_slatedb_name}" \
         "${REPO_ROOT}/target/release/floe-node" run \
         --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
         --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
@@ -3047,8 +3085,9 @@ run_floe_query() {
         2> "${validation_artifact_dir}/floe-node.stderr.log" &
       FLOE_NODE_PID=$!
     else
-    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-      FLOE_ADMIN_PORT=0 \
+    env \
+      "FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" \
+      "FLOE_ADMIN_PORT=0" \
       "${REPO_ROOT}/target/release/floe-node" run \
       --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
       --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
