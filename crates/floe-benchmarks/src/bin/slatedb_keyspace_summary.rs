@@ -29,10 +29,13 @@ impl Bucket {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db_name = std::env::args()
-        .nth(1)
+    let args = parse_args()?;
+    let db_name = args
+        .db_name
         .or_else(|| std::env::var(SLATEDB_NAME_ENV).ok())
-        .ok_or_else(|| anyhow!("usage: slatedb_keyspace_summary <slatedb-name>"))?;
+        .ok_or_else(|| {
+            anyhow!("usage: slatedb_keyspace_summary [--keyspace <prefix>] <slatedb-name>")
+        })?;
     let env_file = std::env::var(OBJECT_STORE_ENV_FILE_ENV).ok();
     let object_store = slatedb::admin::load_object_store_from_env(env_file)
         .map_err(|err| anyhow!("{err}"))
@@ -48,28 +51,39 @@ async fn main() -> Result<()> {
     let mut by_keyspace = BTreeMap::<String, Bucket>::new();
     let mut total = Bucket::default();
 
-    let mut iter = db
-        .scan_with_options(vec![0x00]..vec![0xFF], &ScanOptions::default())
-        .await
-        .context("scan SlateDB keyspace")?;
-    while let Some(kv) = iter.next().await.context("scan next SlateDB key")? {
-        let key = String::from_utf8_lossy(kv.key.as_ref());
-        let class = classify_key(&key);
-        let namespace = namespace_summary_key(&key);
-        let keyspace = key.split('/').next().unwrap_or("<empty>").to_string();
-        let key_len = kv.key.len();
-        let value_len = kv.value.len();
+    let ranges = if args.keyspaces.is_empty() {
+        vec![vec![0x00]..vec![0xFF]]
+    } else {
+        args.keyspaces
+            .iter()
+            .map(|keyspace| prefix_range(keyspace.as_bytes()))
+            .collect()
+    };
 
-        total.add(key_len, value_len);
-        by_class.entry(class).or_default().add(key_len, value_len);
-        by_namespace
-            .entry(namespace)
-            .or_default()
-            .add(key_len, value_len);
-        by_keyspace
-            .entry(keyspace)
-            .or_default()
-            .add(key_len, value_len);
+    for range in ranges {
+        let mut iter = db
+            .scan_with_options(range, &ScanOptions::default())
+            .await
+            .context("scan SlateDB keyspace")?;
+        while let Some(kv) = iter.next().await.context("scan next SlateDB key")? {
+            let key = String::from_utf8_lossy(kv.key.as_ref());
+            let class = classify_key(&key);
+            let namespace = namespace_summary_key(&key);
+            let keyspace = key.split('/').next().unwrap_or("<empty>").to_string();
+            let key_len = kv.key.len();
+            let value_len = kv.value.len();
+
+            total.add(key_len, value_len);
+            by_class.entry(class).or_default().add(key_len, value_len);
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .add(key_len, value_len);
+            by_keyspace
+                .entry(keyspace)
+                .or_default()
+                .add(key_len, value_len);
+        }
     }
 
     print_table("class", &by_class);
@@ -85,6 +99,42 @@ async fn main() -> Result<()> {
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), db.close()).await;
     Ok(())
+}
+
+#[derive(Default)]
+struct Args {
+    db_name: Option<String>,
+    keyspaces: Vec<String>,
+}
+
+fn parse_args() -> Result<Args> {
+    let mut parsed = Args::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--keyspace" {
+            let keyspace = args
+                .next()
+                .ok_or_else(|| anyhow!("--keyspace requires a prefix"))?;
+            parsed.keyspaces.push(keyspace);
+        } else if parsed.db_name.is_none() {
+            parsed.db_name = Some(arg);
+        } else {
+            return Err(anyhow!("unexpected argument '{arg}'"));
+        }
+    }
+    Ok(parsed)
+}
+
+fn prefix_range(prefix: &[u8]) -> std::ops::Range<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != u8::MAX {
+            end[idx] += 1;
+            end.truncate(idx + 1);
+            return prefix.to_vec()..end;
+        }
+    }
+    prefix.to_vec()..vec![0xFF]
 }
 
 fn classify_key(key: &str) -> String {
@@ -127,10 +177,7 @@ fn namespace_summary_key(key: &str) -> String {
     }
 }
 
-fn namespace_before_marker<'a>(
-    parts: impl Iterator<Item = &'a str>,
-    markers: &[&str],
-) -> String {
+fn namespace_before_marker<'a>(parts: impl Iterator<Item = &'a str>, markers: &[&str]) -> String {
     let mut namespace = Vec::new();
     for part in parts {
         if markers.contains(&part) {
@@ -150,11 +197,23 @@ fn print_table(label: &str, buckets: &BTreeMap<String, Bucket>) {
     for (name, bucket) in buckets {
         println!(
             "{}\t{}\t{}\t{}\t{}",
-            name,
+            sanitize_label(name),
             bucket.keys,
             bucket.key_bytes,
             bucket.value_bytes,
             bucket.logical_bytes()
         );
     }
+}
+
+fn sanitize_label(label: &str) -> String {
+    let mut sanitized = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_control() {
+            sanitized.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    sanitized
 }

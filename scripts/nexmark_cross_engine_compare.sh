@@ -65,6 +65,7 @@ FLOE_MV_FLUSH_MAX_DELAY_MS="${FLOE_MV_FLUSH_MAX_DELAY_MS:-0}"
 FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY="${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY:-1}"
 FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
+FLOE_SLATEDB_AWAIT_DURABLE="${FLOE_SLATEDB_AWAIT_DURABLE:-false}"
 
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 STRICT_RESULT_CORRECTNESS="${STRICT_RESULT_CORRECTNESS:-1}"
@@ -2618,6 +2619,7 @@ write_floe_config() {
     --argjson mv_flush_max_pending_deltas "${FLOE_MV_FLUSH_MAX_PENDING_DELTAS}" \
     --argjson mv_flush_max_delay_ms "${FLOE_MV_FLUSH_MAX_DELAY_MS}" \
     --argjson mv_flush_on_catchup_boundary "${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY}" \
+    --arg await_durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
     '{
       connectors: (
         []
@@ -2663,7 +2665,7 @@ write_floe_config() {
         }
       },
       storage: {
-        await_durable: false
+        await_durable: ($await_durable == "true")
       }
     }' > "${path}"
 }
@@ -2850,7 +2852,7 @@ run_floe_query() {
   FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
     FLOE_ADMIN_PORT=0 \
     "${REPO_ROOT}/target/release/floe-node" run \
-    --slatedb-await-durable false \
+    --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
     --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
     --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
     --config "${config_path}" \
@@ -2977,16 +2979,35 @@ run_floe_query() {
     local validation_person_group_id="${person_group_id}_validation"
     local validation_config_path="${validation_artifact_dir}/floe_config.json"
     local validation_program_path="${validation_artifact_dir}/program.sql"
+    local validation_slatedb_name="${FLOE_SLATEDB_NAME:-}"
     write_floe_config "${validation_config_path}" "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}" "${validation_bid_group_id}" "${validation_auction_group_id}" "${validation_person_group_id}"
     write_floe_program_sql "${validation_program_path}" "${query_id}" "${sources}" 1
 
     local validation_program_sql
     validation_program_sql="$(tr '\n' ' ' < "${validation_program_path}")"
 
+    if [[ -n "${validation_slatedb_name}" ]]; then
+      validation_slatedb_name="${validation_slatedb_name}-validation"
+    fi
+
+    if [[ -n "${validation_slatedb_name}" ]]; then
+      FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+        FLOE_ADMIN_PORT=0 \
+        FLOE_SLATEDB_NAME="${validation_slatedb_name}" \
+        "${REPO_ROOT}/target/release/floe-node" run \
+        --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
+        --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
+        --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
+        --config "${validation_config_path}" \
+        --mv-query "${validation_program_sql}" \
+        > "${validation_artifact_dir}/floe-node.stdout.log" \
+        2> "${validation_artifact_dir}/floe-node.stderr.log" &
+      FLOE_NODE_PID=$!
+    else
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
       FLOE_ADMIN_PORT=0 \
       "${REPO_ROOT}/target/release/floe-node" run \
-      --slatedb-await-durable false \
+      --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
       --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
       --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
       --config "${validation_config_path}" \
@@ -2994,6 +3015,7 @@ run_floe_query() {
       > "${validation_artifact_dir}/floe-node.stdout.log" \
       2> "${validation_artifact_dir}/floe-node.stderr.log" &
     FLOE_NODE_PID=$!
+    fi
 
     if ! wait_for_floe_pg "${validation_artifact_dir}"; then
       stop_floe_process
