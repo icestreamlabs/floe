@@ -222,42 +222,6 @@ impl DbspGraphBuilder {
 
         if !matches!(root_node.kind, DbspNodeKind::Sink(_)) && inputs.enable_source_batch_journal {
             if let Some(transient_window_root) =
-                try_build_transient_source_window_aggregate_root_materialization(
-                    inputs.plan,
-                    inputs.plan.root,
-                    inputs.outer_transient_streams,
-                    Arc::clone(&self.watermark),
-                    &inputs.cancel,
-                    &inputs.task_events,
-                    self.graph_id(),
-                    transient_state_table.clone(),
-                )
-                .await?
-            {
-                tracing::info!(
-                    graph_id = %self.graph_id(),
-                    view = %inputs.view_name,
-                    source = %transient_window_root.source_name,
-                    optimized_nodes = ?transient_window_root.optimized_nodes,
-                    "using transient window aggregate root materialization with source batch journal"
-                );
-                self.materialize_view_from_transient_overlay_receiver(
-                    inputs.view_name,
-                    Arc::clone(&root_node.output_schema),
-                    transient_window_root.receiver,
-                    None,
-                    &inputs.cancel,
-                    &inputs.task_events,
-                    &inputs.mv_registry,
-                )
-                .await?;
-                return Ok(BuildOutputs {
-                    node_streams: built,
-                    mv_latest,
-                    required_sources,
-                });
-            }
-            if let Some(transient_window_root) =
                 try_build_transient_source_window_count_star_root_materialization(
                     inputs.plan,
                     inputs.plan.root,
@@ -276,6 +240,42 @@ impl DbspGraphBuilder {
                     source = %transient_window_root.source_name,
                     optimized_nodes = ?transient_window_root.optimized_nodes,
                     "using transient window count-star root materialization with source batch journal"
+                );
+                self.materialize_view_from_transient_overlay_receiver(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    transient_window_root.receiver,
+                    None,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
+            }
+            if let Some(transient_window_root) =
+                try_build_transient_source_window_aggregate_root_materialization(
+                    inputs.plan,
+                    inputs.plan.root,
+                    inputs.outer_transient_streams,
+                    Arc::clone(&self.watermark),
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    self.graph_id(),
+                    transient_state_table.clone(),
+                )
+                .await?
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_window_root.source_name,
+                    optimized_nodes = ?transient_window_root.optimized_nodes,
+                    "using transient window aggregate root materialization with source batch journal"
                 );
                 self.materialize_view_from_transient_overlay_receiver(
                     inputs.view_name,
