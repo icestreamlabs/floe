@@ -378,6 +378,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .context("initialize outer DBSP streams for sources")?;
         for source in &transient_only_sources {
             registry.set_durable_enabled(source, false);
+            let recoverable = source_journal_required_sources.contains(source)
+                || source_registry
+                    .get(source.as_str())
+                    .is_some_and(source_is_replayable_from_connector);
+            registry.set_recoverable(source, recoverable);
         }
         registry
     };

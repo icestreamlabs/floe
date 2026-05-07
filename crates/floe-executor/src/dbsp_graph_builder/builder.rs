@@ -1956,6 +1956,8 @@ impl TransientTopNProcessor {
         output
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         let retain_count = self.offset.saturating_add(self.limit);
         if retain_count == 0 {
@@ -2130,6 +2132,8 @@ impl TransientAppendOnlyTopNProcessor {
         Ok(output_deltas)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         self.partitions
             .values()
@@ -2301,6 +2305,8 @@ impl TransientTop1Processor {
             .collect())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         self.partition_output_cache
             .values()
@@ -3391,6 +3397,7 @@ impl TransientDirectTop1Processor {
         Ok(output_deltas)
     }
 
+    #[cfg(test)]
     fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         self.partitions
             .values()
@@ -5514,7 +5521,7 @@ async fn build_transient_aggregate_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_source_state = upstream.durable_enabled();
+    let compact_source_state = upstream.recoverable();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-aggregate-source:{graph_id}"),
@@ -5836,7 +5843,7 @@ async fn build_transient_window_count_star_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_count_state = upstream.durable_enabled();
+    let compact_count_state = upstream.recoverable();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-count-star-source:{graph_id}"),
@@ -6027,7 +6034,7 @@ async fn build_transient_window_incremental_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_source_state = upstream.durable_enabled();
+    let compact_source_state = upstream.recoverable();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-aggregate-source:{graph_id}"),
@@ -7703,7 +7710,7 @@ fn build_transient_topn_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let compact_append_only_state = upstream.durable_enabled();
+    let compact_append_only_state = upstream.recoverable();
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-topn-source:{graph_id}"),
@@ -7788,7 +7795,7 @@ fn build_transient_topn_receiver_from_batches(
                             }
                         };
                         if compact_append_only_state {
-                            if let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await {
+                            if let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
@@ -7967,7 +7974,7 @@ fn build_transient_topn_receiver_from_batches(
                             }
                         };
                         if compact_append_only_state
-                            && let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await
+                            && let Err(err) = persistent_state.apply_deltas(&output_deltas).await
                         {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
@@ -8063,7 +8070,7 @@ fn build_transient_topn_receiver_from_batches(
                             }
                         };
                         if compact_append_only_state {
-                            if let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await {
+                            if let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
@@ -8245,7 +8252,7 @@ fn build_transient_topn_receiver_from_batches(
                         }
                     };
                     if compact_append_only_state
-                        && let Err(err) = persistent_state.replace_with_snapshot(processor.snapshot_deltas()).await
+                        && let Err(err) = persistent_state.apply_deltas(&output_deltas).await
                     {
                         report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                         break;
@@ -8465,6 +8472,54 @@ mod tests {
         let mut rows = reloaded.snapshot_deltas();
         rows.sort();
         assert_eq!(rows, vec![(b"row-1".to_vec(), 1), (b"row-2".to_vec(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn persistent_transient_top1_output_deltas_store_only_winners() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("persistent-transient-top1-compact-state", store)
+                .await
+                .expect("open db"),
+        );
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+        let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+        let row_30 = encode_event(&decoder, bid_event_payload(1, 101, 30), "nexmark_bid");
+        let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
+        let row_40 = encode_event(&decoder, bid_event_payload(1, 103, 40), "nexmark_bid");
+        let topn = test_topn_node(1, 0);
+        let key_layout = test_topn_key_layout();
+        let mut processor = TransientTop1Processor::new("graph-top1", &topn, &key_layout);
+        let output_deltas = processor
+            .apply_deltas(vec![(row_30, 1), (row_20.clone(), 1), (row_40, 1)])
+            .expect("apply top1 rows");
+
+        let mut state = PersistentTransientInputState::load(
+            Some(Arc::clone(&table)),
+            "graph-top1",
+            "source_topn",
+        )
+        .await
+        .expect("load empty state");
+        state
+            .apply_deltas(&output_deltas)
+            .await
+            .expect("persist compact output deltas");
+
+        let row_10 = encode_event(&decoder, bid_event_payload(1, 104, 10), "nexmark_bid");
+        let output_deltas = processor
+            .apply_deltas(vec![(row_10.clone(), 1)])
+            .expect("apply replacement winner");
+        state
+            .apply_deltas(&output_deltas)
+            .await
+            .expect("persist replacement output deltas");
+
+        let reloaded =
+            PersistentTransientInputState::load(Some(table), "graph-top1", "source_topn")
+                .await
+                .expect("reload compact state");
+        assert_eq!(reloaded.snapshot_deltas(), vec![(row_10, 1)]);
     }
 
     #[test]

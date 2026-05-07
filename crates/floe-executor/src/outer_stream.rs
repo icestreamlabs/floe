@@ -42,6 +42,7 @@ pub struct TransientSourceBatch {
 pub struct TransientSourceHandleStream {
     subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
     durable_enabled: bool,
+    recoverable: bool,
 }
 
 impl TransientSourceHandleStream {
@@ -57,6 +58,10 @@ impl TransientSourceHandleStream {
     pub fn durable_enabled(&self) -> bool {
         self.durable_enabled
     }
+
+    pub fn recoverable(&self) -> bool {
+        self.recoverable
+    }
 }
 
 /// Batches decoded source rows into a DBSP `ZSetStream`.
@@ -65,6 +70,7 @@ pub struct OuterStreamWriter {
     namespace: String,
     stream: ZSetStream<Vec<u8>>,
     durable_enabled: bool,
+    recoverable: bool,
     transient_version: i64,
     pending_transient_deltas: EncodedDeltaBatch,
     pending_transient_bytes: usize,
@@ -86,6 +92,7 @@ impl OuterStreamWriter {
             namespace: namespace.into(),
             stream,
             durable_enabled: true,
+            recoverable: true,
             transient_version: 0,
             pending_transient_deltas: Arc::new(Vec::new()),
             pending_transient_bytes: 0,
@@ -114,6 +121,7 @@ impl OuterStreamWriter {
         TransientSourceHandleStream {
             subscribers: Arc::clone(&self.transient_subscribers),
             durable_enabled: self.durable_enabled,
+            recoverable: self.recoverable,
         }
     }
 
@@ -123,6 +131,14 @@ impl OuterStreamWriter {
 
     pub fn durable_enabled(&self) -> bool {
         self.durable_enabled
+    }
+
+    pub fn set_recoverable(&mut self, recoverable: bool) {
+        self.recoverable = recoverable;
+    }
+
+    pub fn recoverable(&self) -> bool {
+        self.recoverable
     }
 
     pub fn append_encoded(&mut self, key: Vec<u8>, diff: Diff) -> Result<()> {
@@ -380,6 +396,17 @@ impl OuterStreamRegistry {
         }
     }
 
+    pub fn set_recoverable(&mut self, source: &str, recoverable: bool) {
+        if let Some(writer) = self.writers.get_mut(source) {
+            tracing::info!(
+                source,
+                recoverable,
+                "configured outer stream recoverability"
+            );
+            writer.set_recoverable(recoverable);
+        }
+    }
+
     pub fn handle_stream(&self, source: &str) -> Option<SnapshotHandleStream> {
         self.writers
             .get(source)
@@ -528,6 +555,35 @@ mod tests {
             .expect("transient batch");
         assert_eq!(batch.version, 7);
         assert!(batch.deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transient_stream_tracks_recoverability_separately_from_durability() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::open("outer-recoverable-transient", store)
+                .await
+                .expect("db"),
+        );
+        let mut bridge = DbspBridge::new(db).await.expect("bridge");
+        let namespace = namespaces::source("bid").expect("namespace");
+        let stream = bridge
+            .new_stream(
+                namespace.clone(),
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await
+            .expect("stream");
+        let mut writer = OuterStreamWriter::new("bid", namespace, stream);
+
+        writer.set_durable_enabled(false);
+        writer.set_recoverable(true);
+        let transient = writer.transient_stream();
+        assert!(!transient.durable_enabled());
+        assert!(transient.recoverable());
+
+        writer.set_recoverable(false);
+        assert!(!writer.transient_stream().recoverable());
     }
 
     #[tokio::test]
