@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -138,6 +139,32 @@ impl SourceBatchJournal {
             }
         }
         Ok(replayed)
+    }
+
+    pub async fn materialize_committed_source_up_to(
+        &self,
+        source: &str,
+        max_tick_id: u64,
+    ) -> Result<HashMap<Vec<u8>, i64>> {
+        let allowed_sources = BTreeSet::from([source.to_string()]);
+        let entries = self
+            .load_committed_entries_up_to(max_tick_id, &allowed_sources)
+            .await?;
+        let mut snapshot = HashMap::new();
+        for entry in entries {
+            if entry.source != source {
+                continue;
+            }
+            for (key, diff) in entry.deltas {
+                let next = snapshot.get(&key).copied().unwrap_or(0) + diff;
+                if next == 0 {
+                    snapshot.remove(&key);
+                } else {
+                    snapshot.insert(key, next);
+                }
+            }
+        }
+        Ok(snapshot)
     }
 }
 

@@ -53,6 +53,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
     let awaited_durable = run_args.slatedb_await_durable.unwrap_or(true);
     SlateTable::set_default_await_durable(awaited_durable);
+    if !awaited_durable {
+        tracing::warn!(
+            "SlateDB durable-await is disabled; committed writes may be acknowledged before object-store durability"
+        );
+    }
     let stream_gc = StreamGcConfig {
         grace_period_ms: run_args.zset_gc_grace_period_ms,
     };
@@ -258,7 +263,22 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         skipped_sources = ?source_journal_skipped_sources,
         "resolved transient source journal policy"
     );
-    let transient_required_columns_by_source = {
+    let non_replayable_skipped_sources: BTreeSet<String> = source_journal_skipped_sources
+        .iter()
+        .filter(|source| {
+            source_registry
+                .get(source.as_str())
+                .is_none_or(|definition| !source_is_replayable_from_connector(definition))
+        })
+        .cloned()
+        .collect();
+    if !non_replayable_skipped_sources.is_empty() {
+        tracing::warn!(
+            sources = ?non_replayable_skipped_sources,
+            "source journal disabled for non-replayable transient sources; committed source rows will not be recoverable or queryable after restart"
+        );
+    }
+    let mut transient_required_columns_by_source = {
         let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
             .definitions()
             .iter()
@@ -314,6 +334,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
         masks
     };
+    for source in &source_journal_required_sources {
+        transient_required_columns_by_source.remove(source);
+    }
     if !transient_required_columns_by_source.is_empty() {
         let pruned_sources = transient_required_columns_by_source
             .iter()
@@ -341,9 +364,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let storage = storage.expect("storage initialized when not in dry-run");
     let db = storage.db();
     let checkpoint_table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
-    let checkpoint_manager = CheckpointManager::new(CHECKPOINT_GRAPH_ID, checkpoint_table)
-        .await
-        .context("initialize tick checkpoint manager")?;
+    let checkpoint_manager =
+        CheckpointManager::new(CHECKPOINT_GRAPH_ID, Arc::clone(&checkpoint_table))
+            .await
+            .context("initialize tick checkpoint manager")?;
     let initial_sink_cursors = checkpoint_manager.snapshot_sink_cursors();
     let recovered_tick_commit = checkpoint_manager.latest_tick_commit().cloned();
     if let Some(tick_commit) = recovered_tick_commit.as_ref() {
@@ -1692,9 +1716,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .preload_tables()
         .await
         .context("failed to register tables with DataFusion")?;
-    register_source_tables(&query, &source_registry, Arc::clone(&source_bridge))
-        .await
-        .context("register source tables")?;
+    register_source_tables(
+        &query,
+        &source_registry,
+        Arc::clone(&source_bridge),
+        &source_journal_required_sources,
+        Arc::clone(&checkpoint_table),
+        CHECKPOINT_GRAPH_ID,
+    )
+    .await
+    .context("register source tables")?;
     register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
         .await
         .context("register materialized view tables")?;

@@ -12,9 +12,12 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use tokio::sync::Mutex;
 
+use crate::checkpoint::CheckpointStore;
 use crate::dbsp_bridge::DbspBridge;
 use crate::namespaces;
+use crate::source_journal::SourceBatchJournal;
 use crate::table_provider::SnapshotScanExec;
+use dbsp::storage::KeyValueTable;
 
 use super::filters::{PrimaryKeyFilter, extract_primary_key_filter, parse_primary_key_expr};
 use super::helpers::{build_batches_from_encoded_snapshot, to_datafusion_error};
@@ -26,6 +29,14 @@ pub struct SourceTableProvider {
     schema: datafusion::arrow::datatypes::SchemaRef,
     primary_key_column: Option<String>,
     primary_key_index: Option<usize>,
+    journal: Option<SourceJournalSnapshot>,
+}
+
+#[derive(Clone)]
+struct SourceJournalSnapshot {
+    table: Arc<dyn KeyValueTable>,
+    graph_id: String,
+    source_name: String,
 }
 
 impl SourceTableProvider {
@@ -49,10 +60,28 @@ impl SourceTableProvider {
             schema,
             primary_key_column,
             primary_key_index,
+            journal: None,
         })
     }
 
+    pub fn with_source_journal(
+        mut self,
+        table: Arc<dyn KeyValueTable>,
+        graph_id: impl Into<String>,
+        source_name: impl Into<String>,
+    ) -> Self {
+        self.journal = Some(SourceJournalSnapshot {
+            table,
+            graph_id: graph_id.into(),
+            source_name: source_name.into(),
+        });
+        self
+    }
+
     async fn load_snapshot(&self) -> DFResult<HashMap<Vec<u8>, i64>> {
+        if let Some(journal) = &self.journal {
+            return self.load_journal_snapshot(journal).await;
+        }
         let mut bridge = self.bridge.lock().await;
         let handle = bridge
             .latest_view_handle(&self.namespace)
@@ -65,6 +94,25 @@ impl SourceTableProvider {
         view.materialize()
             .await
             .map_err(|err| DataFusionError::Execution(err.to_string()))
+    }
+
+    async fn load_journal_snapshot(
+        &self,
+        journal: &SourceJournalSnapshot,
+    ) -> DFResult<HashMap<Vec<u8>, i64>> {
+        let checkpoint_store =
+            CheckpointStore::new(Arc::clone(&journal.table), journal.graph_id.clone());
+        let Some(commit) = checkpoint_store
+            .load_latest_tick_commit()
+            .await
+            .map_err(to_datafusion_error)?
+        else {
+            return Ok(HashMap::new());
+        };
+        SourceBatchJournal::new(Arc::clone(&journal.table))
+            .materialize_committed_source_up_to(&journal.source_name, commit.tick_id)
+            .await
+            .map_err(to_datafusion_error)
     }
 
     async fn build_batches(

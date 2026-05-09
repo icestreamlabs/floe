@@ -110,30 +110,47 @@ pub(super) async fn register_source_tables(
     context: &FloeQueryContext,
     sources: &SourceRegistry,
     bridge: Arc<Mutex<DbspBridge>>,
+    journaled_sources: &BTreeSet<String>,
+    checkpoint_table: Arc<dyn KeyValueTable>,
+    checkpoint_graph_id: &str,
 ) -> anyhow::Result<()> {
     let session = context.session();
     for definition in sources.definitions() {
         let schema = definition.to_arrow_schema();
-        let provider = SourceTableProvider::new(
+        let mut provider = SourceTableProvider::new(
             Arc::clone(&bridge),
             definition.name(),
             definition.name(),
             schema,
             definition.property(SOURCE_PRIMARY_KEY_PROPERTY),
         )?;
+        if journaled_sources.contains(definition.name()) {
+            provider = provider.with_source_journal(
+                Arc::clone(&checkpoint_table),
+                checkpoint_graph_id,
+                definition.name(),
+            );
+        }
         session
             .register_table(definition.name(), Arc::new(provider))
             .with_context(|| format!("register source table {}", definition.name()))?;
 
         if let Some(short_name) = definition.name().strip_prefix("nexmark_") {
             let alias_schema = camel_case_schema(definition);
-            let alias_provider = SourceTableProvider::new(
+            let mut alias_provider = SourceTableProvider::new(
                 Arc::clone(&bridge),
                 short_name,
                 definition.name(),
                 alias_schema,
                 definition.property(SOURCE_PRIMARY_KEY_PROPERTY),
             )?;
+            if journaled_sources.contains(definition.name()) {
+                alias_provider = alias_provider.with_source_journal(
+                    Arc::clone(&checkpoint_table),
+                    checkpoint_graph_id,
+                    definition.name(),
+                );
+            }
             session
                 .register_table(short_name, Arc::new(alias_provider))
                 .with_context(|| {

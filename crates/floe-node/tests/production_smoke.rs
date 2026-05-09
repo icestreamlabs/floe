@@ -165,6 +165,39 @@ append = true
 }
 
 #[tokio::test]
+async fn smoke_http_source_journal_is_queryable_as_source_table() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let pg_port = find_unused_port()?;
+    let http_port = find_unused_port()?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("http_source_journal.toml");
+    let config = format!(
+        r#"
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = {http_port}
+default_source = "nexmark_bid"
+"#
+    );
+    std::fs::write(&config_path, config).context("write http source journal config")?;
+    let http_addr = format!("http://127.0.0.1:{http_port}");
+
+    let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
+    wait_for_healthz(&http_addr).await?;
+    post_bid(&http_addr, 17, 117, 170).await?;
+    let row = wait_for_source_bid(pg_port, 17).await?;
+    stop_child(&mut child, "INT").await;
+
+    assert_eq!(row.bidder, 117);
+    assert_eq!(row.price, 170);
+    assert_eq!(row.channel, "web");
+    assert_eq!(row.url, "http://example.com");
+    assert_eq!(row.extra, "smoke");
+    Ok(())
+}
+
+#[tokio::test]
 async fn smoke_sigterm_restart_recovers_and_processes_new_ticks() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
     let pg_port = find_unused_port()?;
@@ -448,6 +481,54 @@ async fn query_auction_count(pg_port: u16, auction: i64) -> Result<i64> {
     connection_task.abort();
     let _ = connection_task.await;
     Ok(count)
+}
+
+struct SourceBidRow {
+    bidder: i64,
+    price: i64,
+    channel: String,
+    url: String,
+    extra: String,
+}
+
+async fn wait_for_source_bid(pg_port: u16, auction: i64) -> Result<SourceBidRow> {
+    for _ in 0..80 {
+        match query_source_bid(pg_port, auction).await {
+            Ok(Some(row)) => return Ok(row),
+            Ok(None) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!("timed out waiting for source journal row for auction {auction}");
+}
+
+async fn query_source_bid(pg_port: u16, auction: i64) -> Result<Option<SourceBidRow>> {
+    let dsn = format!("host=127.0.0.1 port={pg_port} user=postgres");
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to pgwire endpoint")?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_opt(
+            "SELECT bidder, price, channel, url, extra FROM nexmark_bid WHERE auction = $1",
+            &[&auction],
+        )
+        .await
+        .with_context(|| format!("query source journal row for auction {auction}"))?;
+    drop(client);
+    connection_task.abort();
+    let _ = connection_task.await;
+    row.map(|row| {
+        Ok(SourceBidRow {
+            bidder: row.try_get(0).context("decode bidder")?,
+            price: row.try_get(1).context("decode price")?,
+            channel: row.try_get(2).context("decode channel")?,
+            url: row.try_get(3).context("decode url")?,
+            extra: row.try_get(4).context("decode extra")?,
+        })
+    })
+    .transpose()
 }
 
 async fn read_rows(path: &Path) -> Result<Vec<Value>> {

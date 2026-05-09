@@ -8,10 +8,12 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit};
 use datafusion::physical_plan::collect;
 use dbsp::StreamRetention;
+use dbsp::storage::{KeyValueTable, SlateTable};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::Db;
 
+use crate::checkpoint::{CheckpointStore, TickCommit};
 use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::namespaces;
@@ -756,6 +758,66 @@ async fn source_provider_emits_rows() {
         .downcast_ref::<Int64Array>()
         .expect("auction array");
     assert_eq!(auction_col.value(0), 42);
+}
+
+#[tokio::test]
+async fn source_provider_emits_rows_from_committed_source_journal() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("source-provider-journal", store)
+            .await
+            .expect("open SlateDB"),
+    );
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let checkpoint_store = CheckpointStore::new(Arc::clone(&table), "test_graph");
+    let row = encode_i64_utf8_row(7, "http");
+    checkpoint_store
+        .persist_tick_commit_with_source_batches(
+            &TickCommit::new(1, 0, Vec::new(), Vec::new(), Vec::new()),
+            &[("orders_journal".to_string(), None, Arc::new(vec![(row, 1)]))],
+        )
+        .await
+        .expect("persist committed journal batch");
+
+    let bridge = Arc::new(tokio::sync::Mutex::new(
+        DbspBridge::new(Arc::clone(&db)).await.expect("bridge"),
+    ));
+    let source = SourceDefinition::new(
+        "orders_journal",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("label", SourceDataType::Utf8),
+        ],
+    )
+    .expect("source definition");
+    let provider = SourceTableProvider::new(
+        bridge,
+        "orders_journal",
+        "orders_journal",
+        source.to_arrow_schema(),
+        None,
+    )
+    .expect("provider")
+    .with_source_journal(Arc::clone(&table), "test_graph", "orders_journal");
+
+    let batches = provider
+        .build_batches_for_test()
+        .await
+        .expect("build journal batches");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id array");
+    let labels = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("label array");
+    assert_eq!(ids.value(0), 7);
+    assert_eq!(labels.value(0), "http");
 }
 
 #[tokio::test]
