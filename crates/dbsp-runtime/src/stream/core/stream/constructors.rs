@@ -192,21 +192,6 @@ where
     ) -> Result<Self> {
         let stream = Self::evaluated_with_table(table, namespace, group, evaluator).await?;
         match descriptor {
-            StreamEvaluatorDescriptor::BuiltinTime {
-                kind,
-                input_namespace,
-            } => {
-                let encoded = encoding::encode(&(
-                    "builtin-time".to_string(),
-                    kind.to_string(),
-                    input_namespace,
-                ))
-                .context("encode stream evaluator descriptor")?;
-                stream
-                    .table()
-                    .put(&stream.core.evaluator_key, &encoded)
-                    .await?;
-            }
             StreamEvaluatorDescriptor::BuiltinUnary {
                 kind,
                 input_namespace,
@@ -249,38 +234,22 @@ where
     ) -> Result<Option<Arc<dyn StreamEvaluator<T>>>> {
         if let Ok((family, kind, input_namespace)) =
             encoding::decode::<(String, String, String)>(evaluator_bytes)
+            && family == "builtin-unary"
         {
-            if family == "builtin-time" {
-                let input = Box::pin(Stream::with_table(
-                    self.table(),
-                    input_namespace.clone(),
-                    self.group(),
-                ))
-                .await
-                .with_context(|| {
-                    format!("rebuild {kind} evaluator input stream `{input_namespace}`")
-                })?;
-                return Ok(Some(
-                    crate::stream::operations::basic::time::builtin_time_evaluator(kind, input)?,
-                ));
-            }
-
-            if family == "builtin-unary" {
-                let input = Box::pin(Stream::with_table(
-                    self.table(),
-                    input_namespace.clone(),
-                    self.group(),
-                ))
-                .await
-                .with_context(|| {
-                    format!("rebuild {kind} evaluator input stream `{input_namespace}`")
-                })?;
-                return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
-                    kind,
-                    Some(input),
-                    None,
-                )?));
-            }
+            let input = Box::pin(Stream::with_table(
+                self.table(),
+                input_namespace.clone(),
+                self.group(),
+            ))
+            .await
+            .with_context(|| {
+                format!("rebuild {kind} evaluator input stream `{input_namespace}`")
+            })?;
+            return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
+                kind,
+                Some(input),
+                None,
+            )?));
         }
 
         if let Ok((family, kind, left_namespace, right_namespace)) =

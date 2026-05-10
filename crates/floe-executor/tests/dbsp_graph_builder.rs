@@ -614,7 +614,7 @@ async fn inner_join_materializes_mv() {
             view_name,
             plan: &plan,
             cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
+            task_events: task_tx,
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
@@ -879,7 +879,7 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -944,6 +944,22 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
             &int_row(&[1, 1_000 + idx as i64, 10 + idx as i64, 100])
         );
     }
+
+    let retract_version = i64::try_from(expected_rows + 2).expect("retract version");
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row_with_category(1, 100, 10), -1)
+        .expect("retract matching auction");
+    registry
+        .tick_all_with_version(retract_version)
+        .await
+        .expect("tick auction retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, retract_version, &mut task_rx)
+        .await;
+    wait_for_exact_visible_row_count(&mv_registry, view_name, 0).await;
 }
 
 #[tokio::test]
@@ -1565,7 +1581,7 @@ async fn aggregate_materializes_mv() {
             view_name,
             plan: &plan,
             cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
+            task_events: task_tx,
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
@@ -2602,6 +2618,113 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
 
 #[tokio::test]
 #[serial_test::serial]
+async fn join_aggregate_pipeline_recomputes_from_transient_source_journal_retraction() {
+    let db = test_db("join-aggregate-retraction-transient-source").await;
+    let view_name = "mv_join_aggregate_retraction_transient_source";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT a.seller, SUM(b.price) AS total_price \
+             FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+             GROUP BY a.seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_auction", "nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_auction", false);
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("seller", DataType::Int64, true),
+            Field::new("total_price", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient join aggregate graph");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row(1, 7), 1)
+        .expect("append auction");
+    registry
+        .tick_all_with_version(1)
+        .await
+        .expect("tick auction");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 10, 10), 1)
+        .expect("append first bid");
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 11, 30), 1)
+        .expect("append second bid");
+    registry.tick_all_with_version(2).await.expect("tick bids");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[7, 40])]);
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 11, 30), -1)
+        .expect("retract second bid");
+    registry
+        .tick_all_with_version(3)
+        .await
+        .expect("tick bid retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 3, &mut task_rx).await;
+
+    let rows = visible_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[7, 10])]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal() {
     let db = test_db("join-proctime-q13-transient-source").await;
     let view_name = "mv_join_proctime_q13_transient_source";
@@ -2942,7 +3065,7 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2977,12 +3100,26 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
-    wait_for_logical_version(&mv_registry, view_name, 1).await;
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 1, &mut task_rx).await;
     wait_for_visible_row_count(&mv_registry, view_name, 2).await;
 
     let mut rows = visible_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     assert_eq!(rows, vec![int_row(&[10, 2, 75]), int_row(&[11, 1, 40])]);
+
+    bid_writer
+        .append_encoded(encoded_bid_row(2, 10, 25), -1)
+        .expect("retract aggregate input");
+    bid_writer
+        .flush()
+        .await
+        .expect("flush aggregate retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+
+    let mut rows = visible_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(rows, vec![int_row(&[10, 1, 50]), int_row(&[11, 1, 40])]);
 }
 
 #[tokio::test]
@@ -3458,13 +3595,13 @@ async fn distinct_materializes_unique_rows() {
             .expect("outer streams");
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let view_handle = mv_registry.register(view_name);
+    mv_registry.register(view_name);
     mv_registry.set_schema(
         view_name,
         arrow_schema(vec![Field::new("bidder", DataType::Int64, true)]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -3477,7 +3614,7 @@ async fn distinct_materializes_unique_rows() {
             view_name,
             plan: &plan,
             cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
+            task_events: task_tx,
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
@@ -3488,9 +3625,6 @@ async fn distinct_materializes_unique_rows() {
         })
         .await
         .expect("build distinct graph");
-
-    let mut version_rx = view_handle.version_watch();
-    version_rx.borrow_and_update();
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
@@ -3504,10 +3638,7 @@ async fn distinct_materializes_unique_rows() {
         .expect("append second bidder");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
-        .await
-        .expect("distinct update timeout")
-        .expect("distinct update");
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 1, &mut task_rx).await;
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
@@ -3517,6 +3648,39 @@ async fn distinct_materializes_unique_rows() {
         zset_from_rows(&rows),
         zset_from_rows(&expected),
         "full distinct MV graph should match ZSet reference semantics"
+    );
+
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 42, 10), -1)
+        .expect("retract duplicate bidder");
+    bid_writer
+        .flush()
+        .await
+        .expect("flush duplicate retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    let expected = vec![int_row(&[7]), int_row(&[42])];
+    assert_eq!(
+        rows, expected,
+        "distinct output should keep bidder 42 while one duplicate remains"
+    );
+
+    bid_writer
+        .append_encoded(encoded_bid_row(2, 42, 20), -1)
+        .expect("retract final bidder duplicate");
+    bid_writer.flush().await.expect("flush final retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 3, &mut task_rx).await;
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(
+        rows,
+        vec![int_row(&[7])],
+        "distinct output should retract bidder 42 after its final row is removed"
     );
 }
 
@@ -3559,7 +3723,7 @@ async fn count_distinct_aggregate_materializes_mv() {
             .expect("outer streams");
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let view_handle = mv_registry.register(view_name);
+    mv_registry.register(view_name);
     let arrow_schema = arrow_schema(vec![
         Field::new("bidder", DataType::Int64, true),
         Field::new("cnt", DataType::Int64, true),
@@ -3567,7 +3731,7 @@ async fn count_distinct_aggregate_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -3580,7 +3744,7 @@ async fn count_distinct_aggregate_materializes_mv() {
             view_name,
             plan: &plan,
             cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
+            task_events: task_tx,
             mv_registry: Arc::clone(&mv_registry),
             outer_handle_streams: &handle_streams,
             outer_transient_streams: &transient_streams,
@@ -3591,9 +3755,6 @@ async fn count_distinct_aggregate_materializes_mv() {
         })
         .await
         .expect("build count-distinct aggregate graph");
-
-    let mut version_rx = view_handle.version_watch();
-    version_rx.borrow_and_update();
 
     let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
     bid_writer
@@ -3610,14 +3771,39 @@ async fn count_distinct_aggregate_materializes_mv() {
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
-        .await
-        .expect("count-distinct aggregate update timeout")
-        .expect("count-distinct aggregate update");
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 1, &mut task_rx).await;
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
     assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 3, 2])]);
+
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 42, 10), -1)
+        .expect("retract one duplicate distinct value");
+    bid_writer
+        .flush()
+        .await
+        .expect("flush duplicate distinct retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 2, 2])]);
+
+    bid_writer
+        .append_encoded(encoded_bid_row(1, 42, 20), -1)
+        .expect("retract final duplicate distinct value");
+    bid_writer
+        .flush()
+        .await
+        .expect("flush final distinct retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 3, &mut task_rx).await;
+
+    let mut rows = materialized_rows(&mv_registry, view_name).await;
+    sort_rows_by_first_column(&mut rows);
+    assert_eq!(rows, vec![int_row(&[7, 1, 1]), int_row(&[42, 1, 1])]);
 }
 
 #[tokio::test]
@@ -4616,6 +4802,103 @@ async fn tumbling_window_max_materializes_from_transient_source_journal() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn tumbling_window_max_recomputes_from_transient_source_journal_retraction() {
+    let plan = tumbling_window_max_plan();
+    let db = test_db("tumbling-max-retraction-transient").await;
+    let view_name = "mv_tumbling_max_retraction_transient";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let available_sources = ["nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+    registry.set_durable_enabled("nexmark_bid", false);
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(view_name, root_arrow_schema(&plan));
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        .await
+        .expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: true,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build transient window max graph");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 42, 10, 1_700_000_000_000), 1)
+        .expect("append");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(2, 7, 20, 1_700_000_001_000), 1)
+        .expect("append");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(3, 9, 99, 1_700_000_002_000), 1)
+        .expect("append");
+    bid_writer.flush().await.expect("flush bids");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 1, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+    assert_eq!(
+        zset_from_rows(&visible_rows(&mv_registry, view_name).await),
+        ZSet::from_weights([(
+            row_key(&timestamp_int_row(
+                1_700_000_000_000,
+                1_700_000_010_000,
+                &[99]
+            )),
+            1,
+        )])
+    );
+
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(3, 9, 99, 1_700_000_002_000), -1)
+        .expect("retract max row");
+    bid_writer.flush().await.expect("flush max retraction");
+
+    wait_for_logical_version_or_task_error(&mv_registry, view_name, 2, &mut task_rx).await;
+    wait_for_visible_row_count(&mv_registry, view_name, 1).await;
+    assert_eq!(
+        zset_from_rows(&visible_rows(&mv_registry, view_name).await),
+        ZSet::from_weights([(
+            row_key(&timestamp_int_row(
+                1_700_000_000_000,
+                1_700_000_010_000,
+                &[20]
+            )),
+            1,
+        )])
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn tumbling_window_max_materializes_from_durable_transient_source_journal() {
     let plan = tumbling_window_max_plan();
     let rows = build_window_plan_rows_with_durable_source(
@@ -4995,6 +5278,23 @@ async fn wait_for_visible_row_count(
     })
     .await
     .expect("wait for visible rows");
+}
+
+async fn wait_for_exact_visible_row_count(
+    registry: &MaterializedViewRegistry,
+    view_name: &str,
+    expected_rows: usize,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if visible_rows(registry, view_name).await.len() == expected_rows {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("wait for exact visible rows");
 }
 
 type TestRow = Vec<Option<EncodedRowScalar>>;

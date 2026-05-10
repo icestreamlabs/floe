@@ -488,24 +488,12 @@ impl DbspGraphBuilder {
                             &persistence_policy,
                         )
                         .await?;
-                    let left_primary_key_columns = join_input_direct_source_primary_key_columns(
-                        inputs.plan,
-                        left_idx,
-                        join.keys.iter().map(|key| key.left_expression()),
-                        join.left_schema.as_ref(),
-                    )?;
-                    let right_primary_key_columns = join_input_direct_source_primary_key_columns(
-                        inputs.plan,
-                        right_idx,
-                        join.keys.iter().map(|key| key.right_expression()),
-                        join.right_schema.as_ref(),
-                    )?;
                     let mut left_transient_input = try_build_transient_join_input_optimization(
                         self.graph_id(),
                         inputs.plan,
                         left_idx,
                         inputs.outer_transient_streams,
-                        left_primary_key_columns.clone(),
+                        None,
                         &inputs.cancel,
                     )?;
                     let mut right_transient_input = try_build_transient_join_input_optimization(
@@ -513,7 +501,7 @@ impl DbspGraphBuilder {
                         inputs.plan,
                         right_idx,
                         inputs.outer_transient_streams,
-                        right_primary_key_columns.clone(),
+                        None,
                         &inputs.cancel,
                     )?;
                     if left_transient_input.is_some() ^ right_transient_input.is_some() {
@@ -541,16 +529,11 @@ impl DbspGraphBuilder {
                     let output_projection =
                         try_build_direct_join_output_projection(join, &transient_opt.steps);
                     let direct_output_projection = output_projection.is_some();
-                    let left_retention = if right_primary_key_columns.is_some() {
-                        dbsp::JoinInputRetention::DropMatchedAppendOnly
-                    } else {
-                        dbsp::JoinInputRetention::RetainAll
-                    };
-                    let right_retention = if left_primary_key_columns.is_some() {
-                        dbsp::JoinInputRetention::DropMatchedAppendOnly
-                    } else {
-                        dbsp::JoinInputRetention::RetainAll
-                    };
+                    // CDC-capable sources can retract previously matched rows, so transient
+                    // join state must retain both sides unless an explicit append-only source
+                    // contract proves that dropping matched rows is safe.
+                    let left_retention = dbsp::JoinInputRetention::RetainAll;
+                    let right_retention = dbsp::JoinInputRetention::RetainAll;
                     let delta_transform = if direct_output_projection {
                         None
                     } else {
@@ -740,24 +723,12 @@ impl DbspGraphBuilder {
                 persistence_policy,
             )
             .await?;
-        let left_primary_key_columns = join_input_direct_source_primary_key_columns(
-            plan,
-            root.left_input_idx,
-            root.join.keys.iter().map(|key| key.left_expression()),
-            root.join.left_schema.as_ref(),
-        )?;
-        let right_primary_key_columns = join_input_direct_source_primary_key_columns(
-            plan,
-            root.right_input_idx,
-            root.join.keys.iter().map(|key| key.right_expression()),
-            root.join.right_schema.as_ref(),
-        )?;
         let left_transient_input = try_build_transient_join_input_optimization(
             self.graph_id(),
             plan,
             root.left_input_idx,
             outer_transient_streams,
-            left_primary_key_columns.clone(),
+            None,
             cancel,
         )?
         .ok_or_else(|| {
@@ -771,7 +742,7 @@ impl DbspGraphBuilder {
             plan,
             root.right_input_idx,
             outer_transient_streams,
-            right_primary_key_columns.clone(),
+            None,
             cancel,
         )?
         .ok_or_else(|| {
@@ -782,16 +753,10 @@ impl DbspGraphBuilder {
         })?;
 
         let (tx, mut receiver) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
-        let left_retention = if right_primary_key_columns.is_some() {
-            dbsp::JoinInputRetention::DropMatchedAppendOnly
-        } else {
-            dbsp::JoinInputRetention::RetainAll
-        };
-        let right_retention = if left_primary_key_columns.is_some() {
-            dbsp::JoinInputRetention::DropMatchedAppendOnly
-        } else {
-            dbsp::JoinInputRetention::RetainAll
-        };
+        // Join pipeline outputs are general ZSets under CDC. Matched input rows
+        // must remain available for future retractions and replacement joins.
+        let left_retention = dbsp::JoinInputRetention::RetainAll;
+        let right_retention = dbsp::JoinInputRetention::RetainAll;
         tracing::info!(
             graph_id = %self.graph_id(),
             left_retention = ?left_retention,
@@ -815,7 +780,7 @@ impl DbspGraphBuilder {
 
         let identity_transform: Arc<DeltaTransformFn> =
             Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
-        let mut current_output_append_only = true;
+        let mut current_output_append_only = false;
         for (step_idx, step) in root.steps.iter().enumerate() {
             receiver = match step {
                 TransientJoinPipelineStep::Transform(transform) => {
@@ -1245,7 +1210,11 @@ fn plan_node_output_append_only(plan: &CircuitPlan, node_idx: usize) -> Result<b
     let input_append_only = |input_idx| plan_node_output_append_only(plan, input_idx);
 
     match &node.kind {
-        DbspNodeKind::Source(_) => Ok(true),
+        DbspNodeKind::Source(_) => {
+            // A source root is a ZSet input, not an append-only guarantee. CDC
+            // sources can emit deletes and before-image retractions.
+            Ok(false)
+        }
         DbspNodeKind::Select(_) | DbspNodeKind::Project(_) | DbspNodeKind::Passthrough => {
             input_append_only(first_input(node, "append-only passthrough")?)
         }
@@ -4293,6 +4262,7 @@ fn join_input_unique_on_direct_source_primary_key<'a>(
     .is_some())
 }
 
+#[cfg(test)]
 fn join_input_direct_source_primary_key_columns<'a>(
     plan: &CircuitPlan,
     input_idx: usize,
@@ -5535,7 +5505,9 @@ async fn build_transient_aggregate_receiver(
         aggregate,
         upstream_rx,
         output_transform,
-        true,
+        // Source-journal deltas are signed ZSet updates. Do not enable
+        // append-only aggregate shortcuts without explicit source metadata.
+        false,
         compact_source_state,
         cancel,
         task_events,
@@ -6120,7 +6092,6 @@ async fn build_transient_window_incremental_receiver_from_batches(
         .await
         .context("initialize transient window incremental aggregate")?,
     );
-    aggregate_processor.enable_append_only_input().await;
     let group_key_columns = Arc::new(group_key_columns);
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-window-aggregate:{graph_id}");
@@ -7710,7 +7681,12 @@ fn build_transient_topn_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let compact_append_only_state = upstream.recoverable();
+    // Source roots are ZSet inputs, not a proven append-only contract. Keeping
+    // full TopN input state is required to recompute replacement winners after
+    // retractions; winner-only compact state is only correct for strictly
+    // append-only streams.
+    let append_only_input = false;
+    let compact_append_only_state = false;
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-topn-source:{graph_id}"),
@@ -7723,7 +7699,7 @@ fn build_transient_topn_receiver(
         graph_id,
         topn,
         upstream_rx,
-        true,
+        append_only_input,
         compact_append_only_state,
         output_projection,
         cancel,

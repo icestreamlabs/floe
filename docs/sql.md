@@ -98,11 +98,8 @@ Sink execution behavior:
 
 ## Nexmark Support Matrix
 
-The canonical Sprint 0005 Nexmark suite (`q0-q9`, `q12-q22`) is tracked by:
-
-- `reports/nexmark_query_coverage_status.json`
-- `reports/NEXMARK_QUERY_MATRIX.md`
-- `crates/floe-node-core/tests/nexmark_query_coverage.rs`
+The canonical Sprint 0005 Nexmark suite (`q0-q9`, `q12-q22`) is guarded by
+`crates/floe-node-core/tests/nexmark_query_coverage.rs`.
 
 Current status:
 - All canonical queries pass logical planning, circuit planning, and runtime

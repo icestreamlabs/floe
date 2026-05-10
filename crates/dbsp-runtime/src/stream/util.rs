@@ -1,7 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -15,29 +14,15 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::VersionedZSet;
-use crate::handles::{StreamHandle, ZSetHandle, ZSetHandleView};
+use crate::handles::{ZSetHandle, ZSetHandleView};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
-use super::core::stream::{Stream, StreamEvaluator};
-use super::groups::HandleGroup;
+use super::core::stream::Stream;
 
 pub(crate) static DERIVED_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
-pub(crate) static LIFTED_ZSET_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) const LIFTED_SELECT_ZSET_PREFIX: &str = "zset_lifted_select/";
-pub(crate) const LIFTED_PROJECT_ZSET_PREFIX: &str = "zset_lifted_project/";
-pub(crate) const LIFTED_JOIN_ZSET_PREFIX: &str = "zset_lifted_join/";
-pub(crate) const LIFTED_H_ZSET_PREFIX: &str = "zset_lifted_h/";
-pub(crate) const LIFTED_SELECT_STREAM_PREFIX: &str = "stream_lifted_select/";
-pub(crate) const LIFTED_PROJECT_STREAM_PREFIX: &str = "stream_lifted_project/";
-pub(crate) const LIFTED_JOIN_STREAM_PREFIX: &str = "stream_lifted_join/";
-pub(crate) const LIFTED_H_STREAM_PREFIX: &str = "stream_lifted_h/";
-pub(crate) const ZSET_SUM_PREFIX: &str = "zset_sum/";
-pub(crate) const ZSET_INTEGRAL_PREFIX: &str = "zset_integral/";
-pub(crate) const ZSET_INTEGRAL_STREAM_PREFIX: &str = "stream_zset_integral/";
-pub(crate) const DELTA_LIFTED_JOIN_STREAM_PREFIX: &str = "stream_delta_lifted_join/";
 pub(crate) const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
 const TRANSIENT_ZSET_BATCH_REGISTRY_MAX_ENTRIES: usize = 512;
 
@@ -229,24 +214,6 @@ where
     }
 }
 
-pub(crate) fn delta_handle_namespace(namespace: &str) -> String {
-    format!("{namespace}{DELTA_NAMESPACE_SUFFIX}")
-}
-
-pub(crate) async fn open_delta_handle_stream(
-    input: &Stream<ZSetHandle>,
-) -> Result<Stream<ZSetHandle>> {
-    let delta_namespace = delta_handle_namespace(input.namespace());
-    let default_hint = ZSetHandle {
-        ns: delta_namespace.clone(),
-        version: 0,
-    };
-    let group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(HandleGroup::new(default_hint));
-    Stream::with_table(input.table(), delta_namespace, group)
-        .await
-        .context("open companion delta handle stream")
-}
-
 pub(crate) async fn collect_values<T>(stream: &Stream<T>, up_to: i64) -> Result<Vec<T>>
 where
     T: Archive
@@ -272,11 +239,6 @@ where
 pub(crate) fn next_derived_namespace(prefix: &str) -> String {
     let id = DERIVED_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}{}", prefix, id)
-}
-
-pub(crate) fn next_lifted_zset_namespace(prefix: &str) -> String {
-    let id = LIFTED_ZSET_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}{id}")
 }
 
 pub(crate) async fn build_derived_stream<T>(
@@ -340,44 +302,6 @@ where
     Ok(result)
 }
 
-pub(crate) async fn build_evaluated_stream<T>(
-    table: Arc<dyn KeyValueTable>,
-    group: Arc<dyn AbelianGroup<T>>,
-    evaluator: Arc<dyn StreamEvaluator<T>>,
-    namespace_prefix: &str,
-    frontier: i64,
-    horizon: i64,
-) -> Result<Stream<T>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let namespace = next_derived_namespace(namespace_prefix);
-    let mut result = Stream::evaluated_with_table(table, namespace, group, evaluator).await?;
-
-    for t in 0..=horizon {
-        let value = result
-            .derived_value_at(t)
-            .await?
-            .expect("evaluated stream missing evaluator");
-        if t == 0 {
-            set_default_in_place(&mut result, value);
-        } else if t <= frontier {
-            push_value_in_place(&mut result, value);
-        } else {
-            set_value_at_in_place(&result, t, value);
-        }
-    }
-
-    Ok(result)
-}
-
 pub(crate) async fn publish_scheduled_value<T>(stream: &mut Stream<T>, ts: i64) -> Result<()>
 where
     T: Archive
@@ -396,127 +320,6 @@ where
     push_value_in_place(stream, value);
     stream.flush().await?;
     Ok(())
-}
-
-struct HandleOpEvaluator<T, F, Fut>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
-{
-    input: Stream<StreamHandle>,
-    inner_group: Arc<dyn AbelianGroup<T>>,
-    op: Arc<F>,
-}
-
-#[async_trait::async_trait]
-impl<T, F, Fut> StreamEvaluator<StreamHandle> for HandleOpEvaluator<T, F, Fut>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
-{
-    async fn value_at(
-        &self,
-        timestamp: i64,
-        _group: Arc<dyn AbelianGroup<StreamHandle>>,
-    ) -> Result<StreamHandle> {
-        let mut input = self.input.clone();
-        let handle = input.get(timestamp).await?;
-        let inner = self
-            .input
-            .resolve_handle(&handle, self.inner_group.clone())
-            .await
-            .context("resolve handle for lifted evaluator")?;
-        let mut derived = (self.op)(inner).await?;
-        derived.flush().await?;
-        Ok(derived.handle())
-    }
-}
-
-pub(crate) async fn apply_on_resolved_handles<T, F, Fut>(
-    input: &Stream<StreamHandle>,
-    inner_group: Arc<dyn AbelianGroup<T>>,
-    namespace_prefix: &str,
-    op: F,
-) -> Result<Stream<StreamHandle>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
-{
-    let frontier = input.current_time();
-    let horizon = input.semantic_horizon();
-    let mut input_for_identity = input.clone();
-    let first_handle = input_for_identity.get(0).await?;
-    let first_inner = input
-        .resolve_handle(&first_handle, inner_group.clone())
-        .await
-        .context("resolve first handle for lifted operator identity")?;
-    let mut first_derived = op(first_inner).await?;
-    first_derived.flush().await?;
-    let default_handle = first_derived.handle();
-    let handle_group: Arc<dyn AbelianGroup<StreamHandle>> =
-        Arc::new(HandleGroup::new(default_handle.clone()));
-
-    let mut result = build_evaluated_stream(
-        input.table(),
-        handle_group,
-        Arc::new(HandleOpEvaluator {
-            input: input.clone(),
-            inner_group,
-            op: Arc::new(op),
-        }),
-        namespace_prefix,
-        frontier,
-        horizon,
-    )
-    .await?;
-
-    result.flush().await?;
-    Ok(result)
-}
-
-pub(crate) async fn resolve_apply_handle_op<T, F, Fut>(
-    outer: &Stream<StreamHandle>,
-    inner_group: Arc<dyn AbelianGroup<T>>,
-    op: F,
-    out_prefix: &str,
-) -> Result<Stream<StreamHandle>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-    F: Fn(Stream<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Stream<T>>> + Send + 'static,
-{
-    apply_on_resolved_handles(outer, inner_group, out_prefix, op).await
 }
 
 // Use this for operators that require the full integrated ZSet snapshot.

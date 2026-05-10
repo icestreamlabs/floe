@@ -20,9 +20,9 @@ pub mod semantic {
 }
 
 pub use dbsp_runtime::{
-    aggregate, algebra, collections, count_aggregate, distinct, filter, filter_map, handles,
-    incremental_aggregate, join, map, operator_state_registry, operators, relation_state, semijoin,
-    stream, top1, topk, topn, union, window, window_count_aggregate, window_count_star_aggregate,
+    aggregate, algebra, collections, count_aggregate, distinct, filter_map, handles,
+    incremental_aggregate, join, operator_state_registry, operators, relation_state, semijoin,
+    stream, top1, topn, union, window, window_count_aggregate, window_count_star_aggregate,
 };
 pub use dbsp_storage::storage;
 
@@ -43,7 +43,6 @@ pub use count_aggregate::{
     TransientCountAggregateGroupedState, TransientCountAggregateSnapshot,
 };
 pub use distinct::DbspDistinct;
-pub use filter::DbspFilter;
 pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use incremental_aggregate::{
@@ -52,24 +51,19 @@ pub use incremental_aggregate::{
     TransientIncrementalAggregateInputWeight, TransientIncrementalAggregateSnapshot,
 };
 pub use join::DbspJoin;
-pub use map::DbspMap;
 pub use operator_state_registry::{
     OperatorStateHandle, install_operator_state_restore, snapshot_operator_states,
 };
-pub use operators::consolidate::ConsolidateOp;
 pub use operators::count_aggregate::{
     CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
 };
 pub use operators::distinct::DistinctOp;
-pub use operators::filter::FilterOp;
 pub use operators::incremental_aggregate::{
     AggregateValue, AggregateValueType, IncrementalAggregateRow, IncrementalAggregateSlotKind,
     IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
 };
 pub use operators::join::{JoinInputRetention, JoinOp};
-pub use operators::map::MapOp;
 pub use operators::top1::PartitionedTop1Op;
-pub use operators::topk::TopKOp;
 pub use operators::topn::TopNOp;
 pub use operators::window::WindowKey;
 pub use relation_state::RelationState;
@@ -78,7 +72,6 @@ pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
 pub use top1::DbspPartitionedTop1;
-pub use topk::DbspTopK;
 pub use topn::DbspTopN;
 pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;

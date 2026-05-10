@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use floe_executor::dbsp_plan::{DbspPlanBuilder, nexmark_config, validate_dbsp_plan};
 use floe_node_core::generator;
@@ -11,15 +10,15 @@ use floe_node_core::planner::plan_materialized_views;
 use floe_node_core::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct QueryCoverage {
     logical_planner: bool,
     circuit_planner: bool,
     runtime_validation: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CoverageBaseline {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct CoverageSnapshot {
     queries: BTreeMap<String, QueryCoverage>,
 }
 
@@ -38,57 +37,48 @@ async fn guards_nexmark_query_coverage_regressions() {
             eprintln!("{query} diagnostic: {error}");
         }
     }
-    let baseline = load_baseline().expect("load baseline coverage file");
 
     let expected_ids = CANONICAL_NEXMARK_QUERY_IDS
         .into_iter()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let baseline_ids = baseline.queries.keys().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(
-        baseline_ids, expected_ids,
-        "coverage baseline file must contain exactly the canonical query ids",
-    );
-
     let actual_ids = actual.keys().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
         actual_ids, expected_ids,
         "coverage harness did not evaluate exactly the canonical query ids",
     );
 
-    let mut regressions = Vec::new();
-    for (query, expected) in &baseline.queries {
-        let Some(result) = actual.get(query) else {
-            regressions.push(format!("{query}: missing from actual coverage"));
-            continue;
-        };
-
+    let mut failures = Vec::new();
+    for query in &expected_ids {
+        let result = actual
+            .get(query)
+            .expect("actual query set already checked against canonical ids");
         let current = &result.coverage;
-        if expected.logical_planner && !current.logical_planner {
-            regressions.push(format!(
-                "{query}: logical planner regressed to fail ({})",
+        if !current.logical_planner {
+            failures.push(format!(
+                "{query}: logical planner failed ({})",
                 result.error.as_deref().unwrap_or("no diagnostic provided")
             ));
         }
-        if expected.circuit_planner && !current.circuit_planner {
-            regressions.push(format!(
-                "{query}: circuit planner regressed to fail ({})",
+        if !current.circuit_planner {
+            failures.push(format!(
+                "{query}: circuit planner failed ({})",
                 result.error.as_deref().unwrap_or("no diagnostic provided")
             ));
         }
-        if expected.runtime_validation && !current.runtime_validation {
-            regressions.push(format!(
-                "{query}: runtime validation regressed to fail ({})",
+        if !current.runtime_validation {
+            failures.push(format!(
+                "{query}: runtime validation failed ({})",
                 result.error.as_deref().unwrap_or("no diagnostic provided")
             ));
         }
     }
 
-    if !regressions.is_empty() {
+    if !failures.is_empty() {
         let summary = render_status_json(&actual);
         panic!(
-            "Nexmark query coverage regression(s):\n{}\n\nCurrent status snapshot:\n{}",
-            regressions.join("\n"),
+            "Nexmark query coverage failure(s):\n{}\n\nCurrent status snapshot:\n{}",
+            failures.join("\n"),
             summary
         );
     }
@@ -205,23 +195,12 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     Ok(out)
 }
 
-fn load_baseline() -> Result<CoverageBaseline> {
-    let path = baseline_path();
-    let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn baseline_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../reports/nexmark_query_coverage_status.json")
-}
-
 fn render_status_json(results: &BTreeMap<String, QueryCoverageResult>) -> String {
-    let baseline = CoverageBaseline {
+    let snapshot = CoverageSnapshot {
         queries: results
             .iter()
             .map(|(query, status)| (query.clone(), status.coverage.clone()))
             .collect(),
     };
-    serde_json::to_string_pretty(&baseline).expect("serialize coverage")
+    serde_json::to_string_pretty(&snapshot).expect("serialize coverage")
 }

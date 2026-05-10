@@ -109,10 +109,6 @@ where
 
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum StreamEvaluatorDescriptor {
-    BuiltinTime {
-        kind: &'static str,
-        input_namespace: String,
-    },
     BuiltinUnary {
         kind: &'static str,
         input_namespace: String,
@@ -163,14 +159,6 @@ where
         .cloned()?;
     let typed = Arc::downcast::<Arc<dyn StreamEvaluator<T>>>(erased).ok()?;
     Some(typed.as_ref().clone())
-}
-
-#[cfg(test)]
-pub(crate) fn unregister_stream_evaluator_for_test(namespace: &str) {
-    STREAM_EVALUATOR_REGISTRY
-        .lock()
-        .expect("stream evaluator registry lock poisoned")
-        .remove(namespace);
 }
 
 struct StreamState<T>
