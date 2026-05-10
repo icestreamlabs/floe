@@ -55,6 +55,13 @@ fn event(source: &str, id: i64) -> core_source::SourceEvent {
     core_source::SourceEvent::new(source, json!({ "id": id }))
 }
 
+fn queued_event(source: &str, id: i64) -> QueuedSourceEvent {
+    QueuedSourceEvent {
+        event: event(source, id),
+        commit_ack: None,
+    }
+}
+
 #[test]
 fn build_batch_limits_per_connector() {
     let pending_events = core_source::PendingEventCounter::default();
@@ -63,12 +70,12 @@ fn build_batch_limits_per_connector() {
         ConnectorQueue {
             id: 0,
             name: "a".to_string(),
-            pending: VecDeque::from([event("s1", 1), event("s1", 2)]),
+            pending: VecDeque::from([queued_event("s1", 1), queued_event("s1", 2)]),
         },
         ConnectorQueue {
             id: 1,
             name: "b".to_string(),
-            pending: VecDeque::from([event("s2", 3), event("s2", 4)]),
+            pending: VecDeque::from([queued_event("s2", 3), queued_event("s2", 4)]),
         },
     ];
 
@@ -99,7 +106,11 @@ fn build_batch_limits_per_source() {
     let mut queues = vec![ConnectorQueue {
         id: 0,
         name: "a".to_string(),
-        pending: VecDeque::from([event("s1", 1), event("s1", 2), event("s1", 3)]),
+        pending: VecDeque::from([
+            queued_event("s1", 1),
+            queued_event("s1", 2),
+            queued_event("s1", 3),
+        ]),
     }];
 
     let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);

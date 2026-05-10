@@ -230,7 +230,12 @@ pub(super) async fn recv_from_ready(
         return false;
     };
     if let Some(queue) = queues.get_mut(batch.connector_id) {
-        queue.pending.extend(batch.events);
+        queue
+            .pending
+            .extend(batch.events.into_iter().map(|event| QueuedSourceEvent {
+                event,
+                commit_ack: batch.commit_ack.clone(),
+            }));
     }
     true
 }
@@ -243,7 +248,12 @@ pub(super) fn drain_ready(
         match receiver.try_recv() {
             Ok(batch) => {
                 if let Some(queue) = queues.get_mut(batch.connector_id) {
-                    queue.pending.extend(batch.events);
+                    queue
+                        .pending
+                        .extend(batch.events.into_iter().map(|event| QueuedSourceEvent {
+                            event,
+                            commit_ack: batch.commit_ack.clone(),
+                        }));
                 }
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -270,7 +280,8 @@ pub(super) fn build_batch(
         .max()
         .map_or(0, |id| id + 1);
     let mut per_connector_counts = vec![0usize; per_connector_count_len];
-    let mut deferred: Vec<VecDeque<core_source::SourceEvent>> = vec![VecDeque::new(); queues.len()];
+    let mut deferred: Vec<VecDeque<QueuedSourceEvent>> =
+        (0..queues.len()).map(|_| VecDeque::new()).collect();
     let connector_count = queues.len();
     for step in 0..connector_count {
         let idx = (start_index + step) % connector_count;
@@ -278,26 +289,31 @@ pub(super) fn build_batch(
         let deferred_queue = &mut deferred[idx];
         let per_connector = &mut per_connector_counts[queue.id];
         while *per_connector < max_per_connector && batch.len() < max_batch {
-            let Some(event) = queue.pending.pop_front() else {
+            let Some(queued) = queue.pending.pop_front() else {
                 break;
             };
-            let source_id = event
+            let source_id = queued
+                .event
                 .source_id()
-                .or_else(|| source_id_by_name.get(event.source()).copied());
+                .or_else(|| source_id_by_name.get(queued.event.source()).copied());
             let count = if let Some(source_id) = source_id {
                 &mut per_source_counts[source_id]
             } else {
                 unknown_source_counts
-                    .entry(event.source().to_string())
+                    .entry(queued.event.source().to_string())
                     .or_insert(0)
             };
             if *count >= max_per_source {
-                deferred_queue.push_back(event);
+                deferred_queue.push_back(queued);
                 continue;
             }
             *count += 1;
             *per_connector += 1;
-            batch.push(SelectedSourceEvent { source_id, event });
+            batch.push(SelectedSourceEvent {
+                source_id,
+                event: queued.event,
+                commit_ack: queued.commit_ack,
+            });
         }
     }
     for (queue, mut deferred_queue) in queues.iter_mut().zip(deferred) {

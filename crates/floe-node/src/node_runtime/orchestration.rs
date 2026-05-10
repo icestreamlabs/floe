@@ -1204,6 +1204,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let source_count = source_names_by_id_for_task.len();
             let decode_start = Instant::now();
             let mut encoded_rows = Vec::with_capacity(batch_len);
+            let mut tick_commit_acks = Vec::new();
             let mut decoded_counts = vec![0usize; source_count];
             let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
             let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
@@ -1218,6 +1219,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             for SelectedSourceEvent {
                 source_id,
                 mut event,
+                commit_ack,
             } in batch
             {
                 let Some(source_id) = source_id else {
@@ -1226,6 +1228,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         source = %source_name,
                         "dropping event for unknown source"
                     );
+                    if let Some(ack) = commit_ack {
+                        ack.record_failed(format!("unknown source '{source_name}'"))
+                            .await;
+                    }
                     continue;
                 };
                 let source_name = source_names_by_id_for_task[source_id].as_str();
@@ -1262,6 +1268,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         source = %source_name,
                         "dropping event for source outside active materialization set"
                     );
+                    if let Some(ack) = commit_ack {
+                        ack.record_failed(format!(
+                            "source '{source_name}' is outside the active materialization set"
+                        ))
+                        .await;
+                    }
                     continue;
                 }
                 let Some(decoder) = decoders_by_source_id_for_task
@@ -1270,17 +1282,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 else {
                     let message = format!("received event for unknown source '{source_name}'");
                     tracing::error!(source = %source_name, "{message}");
+                    if let Some(ack) = commit_ack {
+                        ack.record_failed(message.clone()).await;
+                    }
                     record_runtime_failure(&failure_for_executor, message);
                     executor_cancel.cancel();
                     break 'executor;
                 };
                 let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
-                    encoded_rows.push((source_id, preencoded_row_key));
+                    encoded_rows.push((source_id, preencoded_row_key, commit_ack));
                     None
                 } else {
                     match decoder.encode_row_key(&event) {
                         Ok((encoded, event_ts)) => {
-                            encoded_rows.push((source_id, encoded));
+                            encoded_rows.push((source_id, encoded, commit_ack));
                             event_ts
                         }
                         Err(err) => {
@@ -1289,6 +1304,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 error = %err,
                                 "failed to encode source event"
                             );
+                            if let Some(ack) = commit_ack {
+                                ack.record_failed(format!(
+                                    "failed to encode source event for '{source_name}': {err}"
+                                ))
+                                .await;
+                            }
                             continue;
                         }
                     }
@@ -1330,8 +1351,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
             let decoded_rows_len = encoded_rows.len();
             let mut encoded_batches_by_source = vec![Vec::new(); source_count];
-            for (source_id, encoded) in encoded_rows {
+            let mut commit_acks_by_source = vec![Vec::new(); source_count];
+            for (source_id, encoded, commit_ack) in encoded_rows {
                 encoded_batches_by_source[source_id].push((encoded, 1));
+                if let Some(ack) = commit_ack {
+                    commit_acks_by_source[source_id].push(ack);
+                }
             }
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
@@ -1354,8 +1379,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         error = %err,
                         "failed to append encoded row batch"
                     );
+                    for ack in commit_acks_by_source[source_id].drain(..) {
+                        ack.record_failed(format!(
+                            "failed to append encoded row batch for '{source_name}': {err}"
+                        ))
+                        .await;
+                    }
                     continue;
                 }
+                tick_commit_acks.append(&mut commit_acks_by_source[source_id]);
                 changed = true;
             }
 
@@ -1543,6 +1575,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     checkpoint_write_start.elapsed().as_millis() as u64,
                 );
                 tracing::error!(epoch, error = %err, "failed to persist tick commit");
+                for ack in tick_commit_acks {
+                    ack.record_failed(format!("failed to persist tick commit {epoch}: {err}"))
+                        .await;
+                }
                 record_runtime_failure(
                     &failure_for_executor,
                     format!("failed to persist tick commit {epoch}: {err}"),
@@ -1574,6 +1610,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         executor_loop_started.elapsed().as_millis() as u64,
                     "executor committed first tick"
                 );
+            }
+            for ack in tick_commit_acks {
+                ack.record_committed().await;
             }
             for (source_id, offsets) in tick_source_offsets.iter().enumerate() {
                 let Some(offsets) = offsets.as_ref() else {

@@ -481,7 +481,7 @@ async fn post_bid(addr: &str, auction: i64, bidder: i64, price: i64) -> Result<(
         .send()
         .await
         .context("post acceptance bid payload")?;
-    if response.status() != StatusCode::ACCEPTED {
+    if response.status() != StatusCode::OK {
         bail!("ingest returned {}", response.status());
     }
     Ok(())

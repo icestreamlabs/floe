@@ -82,9 +82,9 @@ async fn http_ingest_tail_streams_rows() -> Result<()> {
             .send()
             .await
             .context("send http ingest request")?;
-        if response.status() != StatusCode::ACCEPTED {
+        if response.status() != StatusCode::OK {
             bail!(
-                "expected 202 from ingest endpoint, got {}",
+                "expected 200 from ingest endpoint, got {}",
                 response.status()
             );
         }

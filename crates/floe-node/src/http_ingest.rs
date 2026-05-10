@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch};
+use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch_with_commit_ack};
 
 #[derive(Debug, Clone)]
 pub struct HttpIngestConfig {
@@ -149,14 +149,26 @@ async fn ingest(
         )
     })?;
 
-    send_batch(&state.sender, events).await.map_err(|err| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("ingest channel closed: {err}"),
-        )
-    })?;
+    let commit_ack = send_batch_with_commit_ack(&state.sender, events)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("ingest channel closed: {err}"),
+            )
+        })?;
 
-    Ok(StatusCode::ACCEPTED)
+    commit_ack
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("ingest commit ack closed: {err}"),
+            )
+        })?
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    Ok(StatusCode::OK)
 }
 
 async fn healthz(State(state): State<HttpIngestState>) -> impl IntoResponse {
@@ -400,11 +412,53 @@ mod tests {
             .body(Body::from(payload.to_string()))
             .expect("request");
         let response = app.oneshot(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let batch = rx.recv().await.expect("batch");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].source(), "nexmark_bid");
+    }
+
+    #[tokio::test]
+    async fn http_ingest_waits_for_commit_ack() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let state = HttpIngestState {
+            sender: SourceEventSender::Routed {
+                connector_id: 0,
+                sender: tx,
+                pending: Default::default(),
+            },
+            default_source: Some("nexmark_bid".to_string()),
+            cancel: CancellationToken::new(),
+            health: None,
+        };
+        let app = Router::new()
+            .route("/ingest", post(ingest))
+            .with_state(state);
+
+        let payload = json!({"auction": 1});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request");
+        let response_task = tokio::spawn(async move { app.oneshot(request).await });
+
+        let batch = rx.recv().await.expect("batch");
+        assert_eq!(batch.events.len(), 1);
+        assert!(!response_task.is_finished());
+        batch
+            .commit_ack
+            .expect("commit ack")
+            .record_committed()
+            .await;
+
+        let response = response_task
+            .await
+            .expect("response task")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

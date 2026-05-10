@@ -298,9 +298,15 @@ default_source = "nexmark_bid"
     )
     .await?;
     wait_for_healthz(&http_addr).await?;
-    post_bid(&http_addr, 30, 130, 300).await?;
+    let precommit_addr = http_addr.clone();
+    let precommit_post = tokio::spawn(async move { post_bid(&precommit_addr, 30, 130, 300).await });
     sleep(Duration::from_millis(200)).await;
+    assert!(
+        !precommit_post.is_finished(),
+        "HTTP ingest should wait for tick commit before returning"
+    );
     stop_child(&mut first, "KILL").await;
+    let _ = precommit_post.await;
 
     let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
     wait_for_healthz(&http_addr).await?;
@@ -398,7 +404,7 @@ async fn post_bid(addr: &str, auction: i64, bidder: i64, price: i64) -> Result<(
         .send()
         .await
         .context("post bid payload")?;
-    if response.status() != StatusCode::ACCEPTED {
+    if response.status() != StatusCode::OK {
         bail!("ingest returned {}", response.status());
     }
     Ok(())
