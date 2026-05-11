@@ -96,15 +96,25 @@ impl PostgresTransactionAssembler {
     }
 
     fn accept_xlog_data(&mut self, data: bytes::Bytes) -> Result<()> {
-        let Some(change) = self.decoder.decode_cdc_change(data)? else {
+        let routed_changes = self
+            .decoder
+            .decode_cdc_changes(data)?
+            .into_iter()
+            .map(|change| {
+                let table_id = self.route_change(&change)?;
+                Ok((table_id, change.into_change()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if routed_changes.is_empty() {
             return Ok(());
-        };
-        let table_id = self.route_change(&change)?;
+        }
         let current = self
             .current
             .as_mut()
             .ok_or_else(|| anyhow!("Postgres CDC change arrived outside a transaction boundary"))?;
-        current.push(table_id, change.into_change());
+        for (table_id, change) in routed_changes {
+            current.push(table_id, change);
+        }
         Ok(())
     }
 
@@ -474,6 +484,18 @@ mod tests {
         Bytes::from(out)
     }
 
+    fn truncate_message(relation_ids: impl IntoIterator<Item = u32>) -> Bytes {
+        let relation_ids: Vec<u32> = relation_ids.into_iter().collect();
+        let mut out = Vec::new();
+        put_u8(&mut out, b'T');
+        put_u32(&mut out, relation_ids.len() as u32);
+        put_u8(&mut out, 0);
+        for relation_id in relation_ids {
+            put_u32(&mut out, relation_id);
+        }
+        Bytes::from(out)
+    }
+
     fn begin(xid: u32) -> PostgresReplicationEvent {
         PostgresReplicationEvent::Begin {
             final_lsn: PostgresLsn::from_u64(10),
@@ -689,6 +711,42 @@ mod tests {
             .map(|batch| batch.table_id().as_str())
             .collect();
         assert_eq!(tables, vec!["orders", "customers"]);
+    }
+
+    #[test]
+    fn groups_multi_relation_truncate_in_one_source_transaction() {
+        let mut router = router();
+        router.insert(
+            UpstreamTableRef::new("public", "customers").expect("upstream"),
+            CdcTableId::new("customers").expect("table id"),
+        );
+        let mut assembler =
+            PostgresTransactionAssembler::new(CdcSourceId::new("pg_main").expect("source"), router);
+
+        assembler
+            .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+            .expect("orders relation");
+        assembler
+            .accept_event(xlog(relation_message(OTHER_RELATION_ID, "customers")))
+            .expect("customers relation");
+        assembler.accept_event(begin(62)).expect("begin");
+        assembler
+            .accept_event(xlog(truncate_message([RELATION_ID, OTHER_RELATION_ID])))
+            .expect("truncate");
+
+        let transaction = assembler
+            .accept_event(commit(45))
+            .expect("commit")
+            .expect("transaction");
+        assert_eq!(transaction.change_batches().len(), 2);
+        assert_eq!(
+            transaction.change_batches()[0].changes(),
+            &[CdcChange::Truncate]
+        );
+        assert_eq!(
+            transaction.change_batches()[1].changes(),
+            &[CdcChange::Truncate]
+        );
     }
 
     #[test]

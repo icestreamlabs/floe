@@ -309,20 +309,26 @@ impl PgOutputDecoder {
     }
 
     pub fn decode_cdc_change(&mut self, data: Bytes) -> Result<Option<PgOutputCdcChange>> {
+        Ok(self.decode_cdc_changes(data)?.into_iter().next())
+    }
+
+    pub fn decode_cdc_changes(&mut self, data: Bytes) -> Result<Vec<PgOutputCdcChange>> {
         let message = self.decode_message(data)?;
-        let Some((relation_id, change)) = message_relation_change(&message) else {
-            return Ok(None);
-        };
-        let relation = self.relations.get(&relation_id).ok_or_else(|| {
-            anyhow!(
-                "pgoutput change references unknown relation id {}",
-                relation_id.as_u32()
-            )
-        })?;
-        Ok(Some(PgOutputCdcChange {
-            relation: relation.clone(),
-            change: change_to_cdc(relation, change)?,
-        }))
+        message_relation_changes(&message)
+            .into_iter()
+            .map(|(relation_id, change)| {
+                let relation = self.relations.get(&relation_id).ok_or_else(|| {
+                    anyhow!(
+                        "pgoutput change references unknown relation id {}",
+                        relation_id.as_u32()
+                    )
+                })?;
+                Ok(PgOutputCdcChange {
+                    relation: relation.clone(),
+                    change: change_to_cdc(relation, change)?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -486,41 +492,43 @@ enum RelationChange<'a> {
     Truncate,
 }
 
-fn message_relation_change(
+fn message_relation_changes(
     message: &PgOutputMessage,
-) -> Option<(PostgresRelationId, RelationChange<'_>)> {
+) -> Vec<(PostgresRelationId, RelationChange<'_>)> {
     match message {
         PgOutputMessage::Insert { relation_id, new } => {
-            Some((*relation_id, RelationChange::Insert(new)))
+            vec![(*relation_id, RelationChange::Insert(new))]
         }
         PgOutputMessage::Update {
             relation_id,
             old,
             key,
             new,
-        } => Some((
+        } => vec![(
             *relation_id,
             RelationChange::Update {
                 old: old.as_ref(),
                 key: key.as_ref(),
                 new,
             },
-        )),
+        )],
         PgOutputMessage::Delete {
             relation_id,
             old,
             key,
-        } => Some((
+        } => vec![(
             *relation_id,
             RelationChange::Delete {
                 old: old.as_ref(),
                 key: key.as_ref(),
             },
-        )),
-        PgOutputMessage::Truncate { relation_ids, .. } if relation_ids.len() == 1 => {
-            Some((relation_ids[0], RelationChange::Truncate))
-        }
-        _ => None,
+        )],
+        PgOutputMessage::Truncate { relation_ids, .. } => relation_ids
+            .iter()
+            .copied()
+            .map(|relation_id| (relation_id, RelationChange::Truncate))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -746,11 +754,15 @@ mod tests {
     }
 
     fn relation_message() -> Bytes {
+        relation_message_for(42, "orders")
+    }
+
+    fn relation_message_for(relation_id: u32, table: &str) -> Bytes {
         let mut out = Vec::new();
         put_u8(&mut out, b'R');
-        put_u32(&mut out, 42);
+        put_u32(&mut out, relation_id);
         put_cstring(&mut out, "public");
-        put_cstring(&mut out, "orders");
+        put_cstring(&mut out, table);
         put_u8(&mut out, b'd');
         put_u16(&mut out, 4);
 
@@ -774,6 +786,18 @@ mod tests {
         put_u32(&mut out, PG_BOOL_OID);
         put_i32(&mut out, -1);
 
+        Bytes::from(out)
+    }
+
+    fn truncate_message(relation_ids: impl IntoIterator<Item = u32>) -> Bytes {
+        let relation_ids: Vec<u32> = relation_ids.into_iter().collect();
+        let mut out = Vec::new();
+        put_u8(&mut out, b'T');
+        put_u32(&mut out, relation_ids.len() as u32);
+        put_u8(&mut out, 0);
+        for relation_id in relation_ids {
+            put_u32(&mut out, relation_id);
+        }
         Bytes::from(out)
     }
 
@@ -967,6 +991,32 @@ mod tests {
                 commit_lsn: PostgresLsn::from_u64(0x16B6C50),
                 name: "upstream".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn decodes_multi_relation_truncate_to_cdc_changes() {
+        let mut decoder = PgOutputDecoder::new();
+        decoder
+            .decode_message(relation_message_for(42, "orders"))
+            .expect("orders relation");
+        decoder
+            .decode_message(relation_message_for(43, "customers"))
+            .expect("customers relation");
+
+        let changes = decoder
+            .decode_cdc_changes(truncate_message([42, 43]))
+            .expect("decode truncate changes");
+        let observed: Vec<(String, CdcChange)> = changes
+            .into_iter()
+            .map(|change| (change.relation().name().to_string(), change.into_change()))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("orders".to_string(), CdcChange::Truncate),
+                ("customers".to_string(), CdcChange::Truncate)
+            ]
         );
     }
 
