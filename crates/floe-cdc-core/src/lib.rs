@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use serde::{Deserialize, Serialize};
@@ -745,6 +745,16 @@ impl CdcCheckpoint {
     pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
         self.transaction_id.as_ref()
     }
+
+    pub fn covers(&self, other: &Self) -> Result<bool> {
+        ensure!(
+            self.source_id == other.source_id,
+            "CDC checkpoint source '{}' cannot cover source '{}'",
+            self.source_id.as_str(),
+            other.source_id.as_str()
+        );
+        self.position.covers(&other.position)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -796,6 +806,64 @@ impl CdcSourcePosition {
         );
         Ok(Self::Opaque { value })
     }
+
+    pub fn covers(&self, other: &Self) -> Result<bool> {
+        match (self, other) {
+            (
+                Self::Postgres {
+                    commit_lsn,
+                    event_lsn,
+                },
+                Self::Postgres {
+                    commit_lsn: other_commit_lsn,
+                    event_lsn: other_event_lsn,
+                },
+            ) => postgres_position_covers(
+                commit_lsn,
+                event_lsn.as_deref(),
+                other_commit_lsn,
+                other_event_lsn.as_deref(),
+            ),
+            (Self::Opaque { value }, Self::Opaque { value: other }) => Ok(value == other),
+            _ => bail!(
+                "cannot compare CDC source positions from different position kinds: {:?} and {:?}",
+                self,
+                other
+            ),
+        }
+    }
+}
+
+fn postgres_position_covers(
+    commit_lsn: &str,
+    event_lsn: Option<&str>,
+    other_commit_lsn: &str,
+    other_event_lsn: Option<&str>,
+) -> Result<bool> {
+    let commit_lsn = parse_postgres_lsn(commit_lsn)?;
+    let other_commit_lsn = parse_postgres_lsn(other_commit_lsn)?;
+    if commit_lsn != other_commit_lsn {
+        return Ok(commit_lsn > other_commit_lsn);
+    }
+
+    match (event_lsn, other_event_lsn) {
+        (None, _) => Ok(true),
+        (Some(_), None) => Ok(false),
+        (Some(event_lsn), Some(other_event_lsn)) => {
+            Ok(parse_postgres_lsn(event_lsn)? >= parse_postgres_lsn(other_event_lsn)?)
+        }
+    }
+}
+
+fn parse_postgres_lsn(value: &str) -> Result<u64> {
+    let (high, low) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("invalid Postgres LSN '{value}'"))?;
+    let high = u64::from_str_radix(high, 16)
+        .with_context(|| format!("parse high half of Postgres LSN '{value}'"))?;
+    let low = u64::from_str_radix(low, 16)
+        .with_context(|| format!("parse low half of Postgres LSN '{value}'"))?;
+    Ok((high << 32) | low)
 }
 
 #[cfg(test)]
@@ -1003,6 +1071,56 @@ mod tests {
                 event_lsn: Some("0/16B6C20".to_string())
             }
         );
+    }
+
+    #[test]
+    fn source_positions_compare_postgres_frontiers() {
+        let commit_20 = CdcSourcePosition::postgres("0/20", None).expect("position");
+        let commit_10 = CdcSourcePosition::postgres("0/10", None).expect("position");
+        assert!(commit_20.covers(&commit_10).expect("compare"));
+        assert!(commit_20.covers(&commit_20).expect("compare"));
+        assert!(!commit_10.covers(&commit_20).expect("compare"));
+
+        let event_21 =
+            CdcSourcePosition::postgres("0/20", Some("0/21".to_string())).expect("event position");
+        let event_22 =
+            CdcSourcePosition::postgres("0/20", Some("0/22".to_string())).expect("event position");
+        assert!(commit_20.covers(&event_22).expect("compare"));
+        assert!(!event_22.covers(&commit_20).expect("compare"));
+        assert!(event_22.covers(&event_21).expect("compare"));
+        assert!(!event_21.covers(&event_22).expect("compare"));
+
+        let opaque = CdcSourcePosition::opaque("same").expect("opaque");
+        assert!(opaque.covers(&opaque).expect("compare"));
+        assert!(
+            opaque
+                .covers(&CdcSourcePosition::opaque("other").expect("opaque"))
+                .is_ok_and(|covers| !covers)
+        );
+        assert!(opaque.covers(&commit_20).is_err());
+    }
+
+    #[test]
+    fn checkpoints_compare_source_and_position() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let checkpoint = CdcCheckpoint::new(
+            source_id.clone(),
+            CdcSourcePosition::postgres("0/20", None).expect("position"),
+            None,
+        );
+        let older = CdcCheckpoint::new(
+            source_id,
+            CdcSourcePosition::postgres("0/10", None).expect("position"),
+            None,
+        );
+        assert!(checkpoint.covers(&older).expect("checkpoint covers"));
+
+        let different_source = CdcCheckpoint::new(
+            CdcSourceId::new("pg_other").expect("source id"),
+            CdcSourcePosition::postgres("0/10", None).expect("position"),
+            None,
+        );
+        assert!(checkpoint.covers(&different_source).is_err());
     }
 
     #[test]

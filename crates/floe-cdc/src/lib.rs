@@ -240,17 +240,14 @@ impl CdcTableStore {
     ) -> Result<CdcApplyResult> {
         transaction.validate_against_schemas(schemas)?;
         let next_checkpoint = CdcCheckpoint::from_transaction(transaction);
-        if self
-            .load_checkpoint(transaction.source_id())
-            .await?
-            .as_ref()
-            == Some(&next_checkpoint)
-        {
-            return Ok(CdcApplyResult {
-                checkpoint: next_checkpoint,
-                table_deltas: Vec::new(),
-                already_committed: true,
-            });
+        if let Some(current_checkpoint) = self.load_checkpoint(transaction.source_id()).await? {
+            if current_checkpoint.covers(&next_checkpoint)? {
+                return Ok(CdcApplyResult {
+                    checkpoint: current_checkpoint,
+                    table_deltas: Vec::new(),
+                    already_committed: true,
+                });
+            }
         }
 
         let mut batch = WriteBatch::new();
@@ -883,6 +880,62 @@ mod tests {
         assert_eq!(
             store.load_row(&table_id, &key(9)).await.expect("load row"),
             Some(row(9, Some(90), Some("open")))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_checkpoint_replay_is_ignored_without_rewinding_state() {
+        let store = test_store("cdc-apply-stale-replay").await;
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let newer = tx(
+            "0/20",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(20, Some(200), Some("newer")),
+                    }],
+                )
+                .expect("batch"),
+            ],
+        );
+        let newer_checkpoint = store
+            .apply_transaction(&schemas(schema.clone()), &newer)
+            .await
+            .expect("apply newer")
+            .checkpoint()
+            .clone();
+
+        let stale = tx(
+            "0/10",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(10, Some(100), Some("stale")),
+                    }],
+                )
+                .expect("batch"),
+            ],
+        );
+        let replay = store
+            .apply_transaction(&schemas(schema), &stale)
+            .await
+            .expect("ignore stale replay");
+        assert!(replay.already_committed());
+        assert_eq!(replay.checkpoint(), &newer_checkpoint);
+        assert!(replay.table_deltas().is_empty());
+        assert_eq!(
+            store.load_row(&table_id, &key(10)).await.expect("load row"),
+            None
+        );
+        assert_eq!(
+            store
+                .load_checkpoint(stale.source_id())
+                .await
+                .expect("load checkpoint"),
+            Some(newer_checkpoint)
         );
     }
 
