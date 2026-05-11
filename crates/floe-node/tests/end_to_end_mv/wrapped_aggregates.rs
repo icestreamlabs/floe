@@ -175,7 +175,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
         })
         .await?;
 
-    let handles = vec![
+    let handles = [
         append_bid(&mut outer, &mut ingestion_bridge, 1, 42, 10).await?,
         append_bid(&mut outer, &mut ingestion_bridge, 1, 42, 30).await?,
         append_bid(&mut outer, &mut ingestion_bridge, 2, 42, 15).await?,

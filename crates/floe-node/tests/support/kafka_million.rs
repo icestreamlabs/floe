@@ -116,6 +116,97 @@ struct NoSinkVerificationTiming {
     total: Duration,
 }
 
+struct TailVerification {
+    pg_port: u16,
+    mv_name: &'static str,
+    output_fields: &'static [FieldSpec],
+    sample_match_field: &'static str,
+    expected: ExpectedDataset,
+    verify_mode: TailVerifyMode,
+    timeout: Duration,
+    ready_tx: oneshot::Sender<()>,
+}
+
+struct NoSinkVerification {
+    pg_port: u16,
+    mv_name: &'static str,
+    output_fields: &'static [FieldSpec],
+    sample_match_field: &'static str,
+    expected: ExpectedDataset,
+    timeout: Duration,
+    verify_mode: NoSinkVerifyMode,
+    end_count_settle: Duration,
+    end_count_poll: Duration,
+}
+
+struct CountProgressLogger {
+    count_wait_started: Instant,
+    first_nonzero_logged: bool,
+    progress_targets: [(&'static str, usize); 6],
+    next_progress_idx: usize,
+    last_progress_rows: usize,
+    last_observed_rows: usize,
+    last_observed_elapsed: Duration,
+}
+
+impl CountProgressLogger {
+    fn new(count_wait_started: Instant, expected_rows: usize) -> Self {
+        Self {
+            count_wait_started,
+            first_nonzero_logged: false,
+            progress_targets: count_progress_targets(expected_rows),
+            next_progress_idx: 0,
+            last_progress_rows: 0,
+            last_observed_rows: 0,
+            last_observed_elapsed: Duration::ZERO,
+        }
+    }
+
+    fn log(&mut self, observed_rows: usize) {
+        let elapsed = self.count_wait_started.elapsed();
+        let poll_rows = observed_rows.saturating_sub(self.last_observed_rows);
+        let poll_elapsed = elapsed.saturating_sub(self.last_observed_elapsed);
+        let poll_rows_per_sec = safe_rows_per_sec(poll_rows as f64, poll_elapsed.as_secs_f64());
+        if !self.first_nonzero_logged && observed_rows > 0 {
+            self.first_nonzero_logged = true;
+            eprintln!(
+                "timing.no_sink.count_progress.first_nonzero_s={:.3} rows={observed_rows}",
+                elapsed.as_secs_f64()
+            );
+        }
+        while let Some((label, target_rows)) = self.progress_targets.get(self.next_progress_idx) {
+            if observed_rows < *target_rows {
+                break;
+            }
+            let interval_rows = target_rows.saturating_sub(self.last_progress_rows);
+            eprintln!(
+                "timing.no_sink.count_progress.{label}_s={:.3} observed_rows={} interval_rows={} poll_rows_per_sec={:.0} cumulative_rows_per_sec={:.0}",
+                elapsed.as_secs_f64(),
+                observed_rows,
+                interval_rows,
+                poll_rows_per_sec,
+                safe_rows_per_sec(*target_rows as f64, elapsed.as_secs_f64())
+            );
+            self.last_progress_rows = *target_rows;
+            self.next_progress_idx += 1;
+        }
+        self.last_observed_rows = observed_rows;
+        self.last_observed_elapsed = elapsed;
+    }
+}
+
+struct NodeSpawnConfig<'a> {
+    config_path: &'a Path,
+    pg_port: u16,
+    mv_sql: &'a str,
+    stdout_log_path: &'a Path,
+    stderr_log_path: &'a Path,
+    ingest_batch_size: usize,
+    ingest_batch_per_source: usize,
+    ingest_batch_per_connector: usize,
+    slatedb_flush_interval_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SampleSelection {
     FirstN(usize),
@@ -494,17 +585,17 @@ async fn run_redpanda_kafka_million_test_impl(
     }
 
     let node_spawn_started = Instant::now();
-    let mut child = spawn_node(
-        &config_path,
+    let mut child = spawn_node(NodeSpawnConfig {
+        config_path: &config_path,
         pg_port,
-        spec.mv_sql,
-        &stdout_log_path,
-        &stderr_log_path,
+        mv_sql: spec.mv_sql,
+        stdout_log_path: &stdout_log_path,
+        stderr_log_path: &stderr_log_path,
         ingest_batch_size,
         ingest_batch_per_source,
         ingest_batch_per_connector,
         slatedb_flush_interval_ms,
-    )
+    })
     .await?;
     eprintln!(
         "timing.node.spawn_s={:.3}",
@@ -526,16 +617,16 @@ async fn run_redpanda_kafka_million_test_impl(
                 let (pgwire_ready_tx, pgwire_ready_rx) = oneshot::channel();
                 let expected_for_pgwire = expected.clone();
                 let pgwire_task = tokio::spawn(async move {
-                    verify_pgwire_tail(
+                    verify_pgwire_tail(TailVerification {
                         pg_port,
-                        spec.mv_name,
-                        spec.output_fields,
-                        spec.sample_match_field,
-                        expected_for_pgwire,
-                        TailVerifyMode::SamplesOnly,
-                        Duration::from_secs(1800),
-                        pgwire_ready_tx,
-                    )
+                        mv_name: spec.mv_name,
+                        output_fields: spec.output_fields,
+                        sample_match_field: spec.sample_match_field,
+                        expected: expected_for_pgwire,
+                        verify_mode: TailVerifyMode::SamplesOnly,
+                        timeout: Duration::from_secs(1800),
+                        ready_tx: pgwire_ready_tx,
+                    })
                     .await
                 });
                 pgwire_ready_rx
@@ -617,17 +708,17 @@ async fn run_redpanda_kafka_million_test_impl(
                     produce_elapsed
                 );
 
-                let verify_timing = verify_mv_snapshot_count_and_samples(
+                let verify_timing = verify_mv_snapshot_count_and_samples(NoSinkVerification {
                     pg_port,
-                    spec.mv_name,
-                    spec.output_fields,
-                    spec.sample_match_field,
-                    expected.clone(),
-                    Duration::from_secs(1800),
-                    no_sink_verify_mode,
-                    Duration::from_millis(no_sink_end_count_settle_ms),
-                    Duration::from_millis(no_sink_end_count_poll_ms),
-                )
+                    mv_name: spec.mv_name,
+                    output_fields: spec.output_fields,
+                    sample_match_field: spec.sample_match_field,
+                    expected: expected.clone(),
+                    timeout: Duration::from_secs(1800),
+                    verify_mode: no_sink_verify_mode,
+                    end_count_settle: Duration::from_millis(no_sink_end_count_settle_ms),
+                    end_count_poll: Duration::from_millis(no_sink_end_count_poll_ms),
+                })
                 .await?;
 
                 let ingest_completion =
@@ -942,10 +1033,10 @@ fn produce_dataset_file(
         }
 
         produced += 1;
-        if produced % 10_000 == 0 {
+        if produced.is_multiple_of(10_000) {
             producer.poll(Duration::from_millis(0));
         }
-        if produced % 100_000 == 0 {
+        if produced.is_multiple_of(100_000) {
             eprintln!("produced {produced} rows to topic={topic}");
         }
     }
@@ -1011,7 +1102,7 @@ fn consume_sink_metrics(
                 messages_seen += 1;
                 last_message_at = Instant::now();
 
-                if messages_seen % 100_000 == 0 {
+                if messages_seen.is_multiple_of(100_000) {
                     eprintln!("consumed {messages_seen} sink rows from topic={topic}");
                 }
             }
@@ -1041,16 +1132,17 @@ fn consume_sink_metrics(
     Ok(metrics)
 }
 
-async fn verify_pgwire_tail(
-    pg_port: u16,
-    mv_name: &str,
-    output_fields: &'static [FieldSpec],
-    sample_match_field: &'static str,
-    expected: ExpectedDataset,
-    verify_mode: TailVerifyMode,
-    timeout: Duration,
-    ready_tx: oneshot::Sender<()>,
-) -> Result<()> {
+async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
+    let TailVerification {
+        pg_port,
+        mv_name,
+        output_fields,
+        sample_match_field,
+        expected,
+        verify_mode,
+        timeout,
+        ready_tx,
+    } = config;
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={pg_port} user=postgres"),
         NoTls,
@@ -1105,7 +1197,7 @@ async fn verify_pgwire_tail(
                         break;
                     }
                 }
-                if tail_rows_seen % 100_000 == 0 {
+                if tail_rows_seen.is_multiple_of(100_000) {
                     eprintln!("consumed {tail_rows_seen} pgwire tail rows from mv={mv_name}");
                 }
                 if matches!(verify_mode, TailVerifyMode::SamplesOnly)
@@ -1155,16 +1247,19 @@ async fn verify_pgwire_tail(
 }
 
 async fn verify_mv_snapshot_count_and_samples(
-    pg_port: u16,
-    mv_name: &str,
-    output_fields: &'static [FieldSpec],
-    sample_match_field: &'static str,
-    expected: ExpectedDataset,
-    timeout: Duration,
-    verify_mode: NoSinkVerifyMode,
-    end_count_settle: Duration,
-    end_count_poll: Duration,
+    config: NoSinkVerification,
 ) -> Result<NoSinkVerificationTiming> {
+    let NoSinkVerification {
+        pg_port,
+        mv_name,
+        output_fields,
+        sample_match_field,
+        expected,
+        timeout,
+        verify_mode,
+        end_count_settle,
+        end_count_poll,
+    } = config;
     let verify_started = Instant::now();
     let pgwire_connect_started = Instant::now();
     let (client, connection) = tokio_postgres::connect(
@@ -1190,24 +1285,10 @@ async fn verify_mv_snapshot_count_and_samples(
     if !settle_before_poll.is_zero() {
         sleep(settle_before_poll).await;
     }
-    let progress_targets = count_progress_targets(expected_rows);
-    let mut first_nonzero_logged = false;
-    let mut next_progress_idx = 0usize;
-    let mut last_progress_rows = 0usize;
-    let mut last_observed_rows = 0usize;
-    let mut last_observed_elapsed = Duration::ZERO;
+    let mut progress_logger = CountProgressLogger::new(count_wait_started, expected_rows);
     loop {
         let observed_rows = query_mv_count(&client, mv_name).await?;
-        log_count_progress(
-            observed_rows,
-            &count_wait_started,
-            &mut first_nonzero_logged,
-            &progress_targets,
-            &mut next_progress_idx,
-            &mut last_progress_rows,
-            &mut last_observed_rows,
-            &mut last_observed_elapsed,
-        );
+        progress_logger.log(observed_rows);
         if observed_rows == expected_rows {
             break;
         }
@@ -1321,47 +1402,6 @@ fn count_progress_targets(expected_rows: usize) -> [(&'static str, usize); 6] {
     ]
 }
 
-fn log_count_progress(
-    observed_rows: usize,
-    count_wait_started: &Instant,
-    first_nonzero_logged: &mut bool,
-    progress_targets: &[(&'static str, usize)],
-    next_progress_idx: &mut usize,
-    last_progress_rows: &mut usize,
-    last_observed_rows: &mut usize,
-    last_observed_elapsed: &mut Duration,
-) {
-    let elapsed = count_wait_started.elapsed();
-    let poll_rows = observed_rows.saturating_sub(*last_observed_rows);
-    let poll_elapsed = elapsed.saturating_sub(*last_observed_elapsed);
-    let poll_rows_per_sec = safe_rows_per_sec(poll_rows as f64, poll_elapsed.as_secs_f64());
-    if !*first_nonzero_logged && observed_rows > 0 {
-        *first_nonzero_logged = true;
-        eprintln!(
-            "timing.no_sink.count_progress.first_nonzero_s={:.3} rows={observed_rows}",
-            elapsed.as_secs_f64()
-        );
-    }
-    while let Some((label, target_rows)) = progress_targets.get(*next_progress_idx) {
-        if observed_rows < *target_rows {
-            break;
-        }
-        let interval_rows = target_rows.saturating_sub(*last_progress_rows);
-        eprintln!(
-            "timing.no_sink.count_progress.{label}_s={:.3} observed_rows={} interval_rows={} poll_rows_per_sec={:.0} cumulative_rows_per_sec={:.0}",
-            elapsed.as_secs_f64(),
-            observed_rows,
-            interval_rows,
-            poll_rows_per_sec,
-            safe_rows_per_sec(*target_rows as f64, elapsed.as_secs_f64())
-        );
-        *last_progress_rows = *target_rows;
-        *next_progress_idx += 1;
-    }
-    *last_observed_rows = observed_rows;
-    *last_observed_elapsed = elapsed;
-}
-
 async fn query_mv_count(client: &tokio_postgres::Client, mv_name: &str) -> Result<usize> {
     let sql = format!("SELECT COUNT(*) AS row_count FROM {mv_name}");
     let messages = client
@@ -1403,17 +1443,18 @@ where
     Ok(values.join(", "))
 }
 
-async fn spawn_node(
-    config_path: &Path,
-    pg_port: u16,
-    mv_sql: &str,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
-    ingest_batch_size: usize,
-    ingest_batch_per_source: usize,
-    ingest_batch_per_connector: usize,
-    slatedb_flush_interval_ms: Option<u64>,
-) -> Result<Child> {
+async fn spawn_node(config: NodeSpawnConfig<'_>) -> Result<Child> {
+    let NodeSpawnConfig {
+        config_path,
+        pg_port,
+        mv_sql,
+        stdout_log_path,
+        stderr_log_path,
+        ingest_batch_size,
+        ingest_batch_per_source,
+        ingest_batch_per_connector,
+        slatedb_flush_interval_ms,
+    } = config;
     let stdout_log = File::create(stdout_log_path)
         .with_context(|| format!("create {}", stdout_log_path.display()))?;
     let stderr_log = File::create(stderr_log_path)

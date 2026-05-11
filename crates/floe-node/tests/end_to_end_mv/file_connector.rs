@@ -100,7 +100,7 @@ fn write_temp_events(events: &[serde_json::Value]) -> Result<PathBuf> {
 
     let contents = events
         .iter()
-        .map(|event| serde_json::to_string(event))
+        .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?
         .join("\n");
     std::fs::write(&path, contents)?;

@@ -416,7 +416,7 @@ async fn wait_for_rows_matching(
 ) -> Result<Vec<Value>> {
     for _ in 0..80 {
         let rows = read_rows(path).await?;
-        if rows.iter().any(|row| predicate(row)) {
+        if rows.iter().any(&predicate) {
             return Ok(rows);
         }
         sleep(Duration::from_millis(100)).await;

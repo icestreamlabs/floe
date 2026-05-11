@@ -1100,13 +1100,13 @@ mod tests {
         )
         .expect("definition");
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
-        let lookup = build_direct_decode_lookup(&[definition.clone()], &HashMap::new());
+        let lookup = build_direct_decode_lookup(std::slice::from_ref(&definition), &HashMap::new());
 
         let direct = parse_direct_floe_json_event(
             payload,
             None,
             "topic",
-            &[definition.clone()],
+            std::slice::from_ref(&definition),
             &lookup,
             None,
         )
@@ -1153,12 +1153,12 @@ mod tests {
         )
         .expect("definition");
         let payload = br#"{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}"#;
-        let lookup = build_direct_decode_lookup(&[definition.clone()], &HashMap::new());
+        let lookup = build_direct_decode_lookup(std::slice::from_ref(&definition), &HashMap::new());
 
         let direct = parse_direct_default_source_payload_event(
             payload,
             Some("nexmark_bid"),
-            &[definition.clone()],
+            std::slice::from_ref(&definition),
             &lookup,
             Some(7),
         )
@@ -1204,7 +1204,7 @@ mod tests {
         .expect("definition");
         let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99}}"#;
         let lookup = build_direct_decode_lookup(
-            &[definition.clone()],
+            std::slice::from_ref(&definition),
             &HashMap::from([(
                 "nexmark_bid".to_string(),
                 Arc::from([true, true, true, false]),
@@ -1215,7 +1215,7 @@ mod tests {
             payload,
             None,
             "topic",
-            &[definition.clone()],
+            std::slice::from_ref(&definition),
             &lookup,
             None,
         )
