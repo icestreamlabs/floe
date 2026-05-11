@@ -1001,16 +1001,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ConnectorConfig::PostgresCdc {
                 connection,
                 slot,
-                poll_ms,
-                max_changes,
-                default_schema,
+                publication,
                 include_tables,
                 include_schema_in_source,
                 ..
             } => {
-                let poll_interval = Duration::from_millis(poll_ms.unwrap_or(1000));
-                let max_changes = max_changes.unwrap_or(1000);
-                let default_schema = default_schema.unwrap_or_else(|| "public".to_string());
+                let publication = publication.unwrap_or_else(default_postgres_publication);
                 let include_schema_in_source = include_schema_in_source.unwrap_or(false);
                 let (commit_tx, commit_rx) = watch::channel(PostgresCdcCommit::default());
                 postgres_cdc_commit_senders.push(commit_tx);
@@ -1020,9 +1016,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     let config = PostgresCdcConnectorConfig {
                         connection_string: connection,
                         slot,
-                        poll_interval,
-                        max_changes,
-                        default_schema,
+                        publication,
                         include_tables,
                         include_schema_in_source,
                         commit_lsn_rx: Some(commit_rx),

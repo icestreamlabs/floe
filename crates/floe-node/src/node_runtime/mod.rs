@@ -38,6 +38,7 @@ use floe_node_core::planner::{
 };
 use floe_node_core::postgres_cdc_connector::{
     PostgresCdcCommit, PostgresCdcConnector, PostgresCdcConnectorConfig, PostgresSlotCommit,
+    default_postgres_publication,
 };
 use floe_node_core::tail_client;
 use floe_server as server;

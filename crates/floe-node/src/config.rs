@@ -216,11 +216,7 @@ pub enum ConnectorConfig {
         connection: String,
         slot: String,
         #[serde(default)]
-        poll_ms: Option<u64>,
-        #[serde(default)]
-        max_changes: Option<usize>,
-        #[serde(default)]
-        default_schema: Option<String>,
+        publication: Option<String>,
         #[serde(default)]
         include_tables: Option<Vec<String>>,
         #[serde(default)]

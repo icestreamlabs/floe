@@ -2225,6 +2225,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "floe-cdc-core",
+ "floe-cdc-pg",
  "floe-core",
  "floe-executor",
  "floe-sql-parser",

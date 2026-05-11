@@ -4,6 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+floe-cdc-core = { path = "../floe-cdc-core" }
+floe-cdc-pg = { path = "../floe-cdc-pg" }
 floe-core = { path = "../floe-core" }
 floe-executor = { path = "../floe-executor" }
 floe-sql-parser = { path = "../floe-sql-parser" }

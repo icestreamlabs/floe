@@ -238,27 +238,23 @@ fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
             name,
             connection,
             slot,
-            poll_ms: _,
-            max_changes,
-            default_schema,
+            publication,
             include_tables,
             include_schema_in_source: _,
         } => {
             ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
             ensure_non_empty(connection, &format!("connectors[{index}].connection"))?;
-            Url::parse(connection).with_context(|| {
-                format!(
-                    "connectors[{index}].connection must be a valid postgres URL (found '{connection}')"
-                )
-            })?;
+            connection
+                .parse::<tokio_postgres::Config>()
+                .with_context(|| {
+                    format!(
+                        "connectors[{index}].connection must be a valid Postgres connection string (found '{connection}')"
+                    )
+                })?;
             ensure_non_empty(slot, &format!("connectors[{index}].slot"))?;
-            ensure_optional_positive_usize(
-                *max_changes,
-                &format!("connectors[{index}].max_changes"),
-            )?;
             ensure_optional_non_empty(
-                default_schema.as_deref(),
-                &format!("connectors[{index}].default_schema"),
+                publication.as_deref(),
+                &format!("connectors[{index}].publication"),
             )?;
             if let Some(tables) = include_tables {
                 if tables.is_empty() {

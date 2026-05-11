@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 datafusion = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 tokio-util = { workspace = true }
 floe-sql-parser = { workspace = true }
 tracing = { workspace = true }
@@ -44,7 +45,6 @@ arrow-array = "57.1.0"
 arrow-buffer = "57.1.0"
 arrow-data = "57.1.0"
 tempfile = "3.10"
-tokio-postgres = { version = "0.7", features = ["runtime"] }
 serde_json = { workspace = true }
 tower = "0.5"
 serial_test = "3"

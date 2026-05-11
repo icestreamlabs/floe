@@ -305,22 +305,14 @@ impl ConnectorSpec {
             }
             ConnectorConfig::PostgresCdc {
                 slot,
-                poll_ms,
-                max_changes,
-                default_schema,
+                publication,
                 include_tables,
                 include_schema_in_source,
                 ..
             } => {
                 let mut props = vec![("slot".to_string(), slot.clone())];
-                if let Some(poll_ms) = poll_ms {
-                    props.push(("poll_ms".to_string(), poll_ms.to_string()));
-                }
-                if let Some(max_changes) = max_changes {
-                    props.push(("max_changes".to_string(), max_changes.to_string()));
-                }
-                if let Some(default_schema) = default_schema {
-                    props.push(("default_schema".to_string(), default_schema.clone()));
+                if let Some(publication) = publication {
+                    props.push(("publication".to_string(), publication.clone()));
                 }
                 if let Some(include_tables) = include_tables {
                     props.push(("include_tables".to_string(), include_tables.join(",")));

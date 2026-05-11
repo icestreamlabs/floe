@@ -1,24 +1,30 @@
 use std::collections::HashSet;
+use std::str;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use floe_cdc_core::{CdcChange, CdcRow};
+use floe_cdc_pg::{
+    PgOutputCdcChange, PgOutputDecoder, PgOutputRelation, PostgresCdcConfig, PostgresLsn,
+    PostgresReplicationClient, PostgresReplicationEvent,
+};
+use floe_core::RowValue;
+use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
 use serde_json::Value;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::config::Host;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::SourceEventSender;
-use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
+
+const DEFAULT_POSTGRES_PUBLICATION: &str = "floe_publication";
 
 #[derive(Debug, Clone)]
 pub struct PostgresCdcConnectorConfig {
     pub connection_string: String,
     pub slot: String,
-    pub poll_interval: Duration,
-    pub max_changes: usize,
-    pub default_schema: String,
+    pub publication: String,
     pub include_tables: Option<Vec<String>>,
     pub include_schema_in_source: bool,
     pub commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
@@ -39,9 +45,11 @@ pub struct PostgresCdcCommit {
 pub struct PostgresCdcConnector {
     config: PostgresCdcConnectorConfig,
     definitions: Vec<SourceDefinition>,
-    client: Option<Client>,
-    connection_task: Option<JoinHandle<()>>,
+    replication: Option<PostgresReplicationClient>,
+    decoder: PgOutputDecoder,
     include_tables: Option<HashSet<String>>,
+    staged_events: Vec<SourceEvent>,
+    current_txid: Option<u64>,
     last_committed_tick_id: u64,
 }
 
@@ -59,8 +67,8 @@ impl PostgresCdcConnector {
             "postgres slot must not be empty"
         );
         ensure!(
-            config.max_changes > 0,
-            "postgres max_changes must be positive"
+            !config.publication.trim().is_empty(),
+            "postgres publication must not be empty"
         );
         let include_tables = config
             .include_tables
@@ -69,9 +77,11 @@ impl PostgresCdcConnector {
         Ok(Self {
             config,
             definitions,
-            client: None,
-            connection_task: None,
+            replication: None,
+            decoder: PgOutputDecoder::new(),
             include_tables,
+            staged_events: Vec::new(),
+            current_txid: None,
             last_committed_tick_id: 0,
         })
     }
@@ -94,92 +104,149 @@ impl Connector for PostgresCdcConnector {
     }
 
     fn tick_interval(&self) -> Duration {
-        self.config.poll_interval
+        Duration::ZERO
     }
 
     async fn init(&mut self, _ctx: &ConnectorContext) -> Result<()> {
-        let (client, connection) = tokio_postgres::connect(&self.config.connection_string, NoTls)
+        let start_lsn = stored_slot_start_lsn(&self.config.connection_string, &self.config.slot)
             .await
-            .context("connect to postgres")?;
-        let handle = tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::error!(error = %err, "postgres cdc connection closed");
-            }
-        });
-        self.client = Some(client);
-        self.connection_task = Some(handle);
+            .with_context(|| {
+                format!(
+                    "load Postgres logical slot '{}' start LSN",
+                    self.config.slot
+                )
+            })?;
+        let replication_config = replication_config_from_connection_string(
+            &self.config.connection_string,
+            &self.config.slot,
+            &self.config.publication,
+            start_lsn,
+        )?;
+        self.replication = Some(
+            PostgresReplicationClient::connect(&replication_config)
+                .await
+                .context("connect native Postgres pgoutput replication client")?,
+        );
         Ok(())
     }
 
     async fn tick(&mut self, ctx: &ConnectorContext) -> Result<ConnectorTick> {
         self.commit_lsn_if_requested().await?;
 
-        let client = self
-            .client
-            .as_ref()
-            .context("postgres cdc connector is not initialized")?;
-        let rows = client
-            .query(
-                "SELECT lsn::text, xid, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
-                &[&self.config.slot, &(self.config.max_changes as i64)],
-            )
-            .await
-            .context("peek logical slot changes")?;
-
-        let mut emitted = 0usize;
-        let mut staged = Vec::new();
-        rows.into_iter().try_for_each(|row| -> Result<()> {
-            let lsn: String = row.try_get(0).context("read logical slot lsn")?;
-            let txid: Option<i64> = row.try_get(1).context("read logical slot txid")?;
-            let payload: String = row.try_get(2).context("read logical slot payload")?;
-            let events = match parse_wal2json_payload(
-                &payload,
-                &self.config,
-                self.include_tables.as_ref(),
-            ) {
-                Ok(events) => events,
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to parse wal2json payload");
-                    return Ok(());
-                }
-            };
-            let txid = txid.and_then(|value| u64::try_from(value).ok());
-            emitted = emitted.saturating_add(events.len());
-            staged.extend(events.into_iter().map(|event| {
-                event.with_resume_token(SourceResumeToken::PostgresCdc {
-                    slot: Some(self.config.slot.clone()),
-                    lsn: lsn.clone(),
-                    txid,
-                })
-            }));
-            Ok(())
-        })?;
-
-        if !staged.is_empty() {
-            ctx.send_batch(staged)
+        loop {
+            let event = self
+                .replication
+                .as_mut()
+                .context("postgres cdc connector is not initialized")?
+                .recv()
                 .await
-                .context("failed to enqueue postgres cdc batch")?;
-        }
+                .context("receive native Postgres pgoutput event")?;
+            let Some(event) = event else {
+                return Ok(ConnectorTick::Finished);
+            };
 
-        if emitted > 0 {
-            Ok(ConnectorTick::Emitted(emitted))
-        } else {
-            Ok(ConnectorTick::Idle)
+            match event {
+                PostgresReplicationEvent::Begin { xid, .. } => {
+                    self.current_txid = Some(u64::from(xid));
+                    self.staged_events.clear();
+                }
+                PostgresReplicationEvent::XLogData { data, .. } => {
+                    for change in self.decoder.decode_cdc_changes(data)? {
+                        if let Some(event) = self.change_to_source_event(change)? {
+                            self.staged_events.push(event);
+                        }
+                    }
+                }
+                PostgresReplicationEvent::Commit { end_lsn, .. } => {
+                    return self.commit_staged_events(ctx, end_lsn).await;
+                }
+                PostgresReplicationEvent::KeepAlive { .. }
+                | PostgresReplicationEvent::Message { .. } => {
+                    return Ok(ConnectorTick::Idle);
+                }
+                PostgresReplicationEvent::StoppedAt { .. } => {
+                    return Ok(ConnectorTick::Finished);
+                }
+            }
         }
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        self.client = None;
-        if let Some(task) = self.connection_task.take() {
-            task.abort();
+        if let Some(mut replication) = self.replication.take() {
+            replication.stop();
+            let _ = replication.shutdown().await;
         }
         Ok(())
     }
 }
 
 impl PostgresCdcConnector {
+    async fn commit_staged_events(
+        &mut self,
+        ctx: &ConnectorContext,
+        commit_lsn: PostgresLsn,
+    ) -> Result<ConnectorTick> {
+        let txid = self.current_txid.take();
+        if self.staged_events.is_empty() {
+            return Ok(ConnectorTick::Idle);
+        }
+
+        let lsn = commit_lsn.to_pg_string();
+        let events = self
+            .staged_events
+            .drain(..)
+            .map(|event| {
+                event.with_resume_token(SourceResumeToken::PostgresCdc {
+                    slot: Some(self.config.slot.clone()),
+                    lsn: lsn.clone(),
+                    txid,
+                })
+            })
+            .collect::<Vec<_>>();
+        let emitted = events.len();
+        ctx.send_batch(events)
+            .await
+            .context("failed to enqueue postgres cdc batch")?;
+        Ok(ConnectorTick::Emitted(emitted))
+    }
+
+    fn change_to_source_event(&self, change: PgOutputCdcChange) -> Result<Option<SourceEvent>> {
+        let source = source_name_for_relation(change.relation(), &self.config);
+        if let Some(allowed) = self.include_tables.as_ref()
+            && !allowed.contains(&source)
+            && !allowed.contains(change.relation().name())
+        {
+            return Ok(None);
+        }
+
+        match change.change() {
+            CdcChange::Insert { row } => Ok(Some(SourceEvent::new(
+                source,
+                cdc_row_to_json(change.relation(), row)?,
+            ))),
+            CdcChange::Update { after, .. } => Ok(Some(SourceEvent::new(
+                source,
+                cdc_row_to_json(change.relation(), after)?,
+            ))),
+            CdcChange::Delete { .. } => {
+                tracing::warn!(
+                    table = %source,
+                    "native Postgres CDC delete skipped by the legacy SourceEvent bridge; CDC table support will handle deletes"
+                );
+                Ok(None)
+            }
+            CdcChange::Truncate => {
+                tracing::warn!(
+                    table = %source,
+                    "native Postgres CDC truncate skipped by the legacy SourceEvent bridge; CDC table support will handle truncates"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     async fn commit_lsn_if_requested(&mut self) -> Result<()> {
-        let Some(client) = self.client.as_ref() else {
+        let Some(replication) = self.replication.as_mut() else {
             return Ok(());
         };
         let Some(receiver) = self.config.commit_lsn_rx.as_mut() else {
@@ -207,97 +274,136 @@ impl PostgresCdcConnector {
             return Ok(());
         };
 
-        client
-            .query(
-                "SELECT end_lsn::text \
-                 FROM pg_replication_slot_advance($1, $2::pg_lsn) AS advanced(slot_name, end_lsn)",
-                &[&self.config.slot, &target_lsn],
-            )
-            .await
-            .context("advance postgres replication slot after tick commit")?;
+        replication.update_applied_lsn(PostgresLsn::parse(target_lsn)?);
         self.last_committed_tick_id = commit.tick_id;
         Ok(())
     }
 }
 
-fn parse_wal2json_payload(
-    payload: &str,
+fn source_name_for_relation(
+    relation: &PgOutputRelation,
     config: &PostgresCdcConnectorConfig,
-    include_tables: Option<&HashSet<String>>,
-) -> Result<Vec<SourceEvent>> {
-    let value: Value = serde_json::from_str(payload).context("decode wal2json payload")?;
-    let changes = value
-        .get("change")
-        .and_then(Value::as_array)
-        .context("wal2json payload missing change array")?;
-    let mut events = Vec::new();
-
-    for change in changes {
-        let kind = change
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !matches!(kind, "insert" | "update") {
-            continue;
-        }
-        let table = change
-            .get("table")
-            .and_then(Value::as_str)
-            .context("wal2json change missing table name")?;
-        let schema = change
-            .get("schema")
-            .and_then(Value::as_str)
-            .unwrap_or(config.default_schema.as_str());
-        let source = if config.include_schema_in_source {
-            format!("{schema}.{table}")
-        } else {
-            table.to_string()
-        };
-        if let Some(allowed) = include_tables
-            && !allowed.contains(&source)
-            && !allowed.contains(table)
-        {
-            continue;
-        }
-
-        let names = change
-            .get("columnnames")
-            .and_then(Value::as_array)
-            .context("wal2json change missing columnnames")?;
-        let values = change
-            .get("columnvalues")
-            .and_then(Value::as_array)
-            .context("wal2json change missing columnvalues")?;
-        ensure!(
-            names.len() == values.len(),
-            "wal2json column name/value length mismatch"
-        );
-
-        let mut payload_object = serde_json::Map::with_capacity(names.len());
-        for (name, value) in names.iter().zip(values.iter()) {
-            let key = name
-                .as_str()
-                .context("wal2json column name must be a string")?;
-            payload_object.insert(key.to_string(), value.clone());
-        }
-
-        events.push(SourceEvent::new(source, Value::Object(payload_object)));
+) -> String {
+    if config.include_schema_in_source {
+        format!("{}.{}", relation.namespace(), relation.name())
+    } else {
+        relation.name().to_string()
     }
+}
 
-    Ok(events)
+fn cdc_row_to_json(relation: &PgOutputRelation, row: &CdcRow) -> Result<Value> {
+    ensure!(
+        relation.columns().len() == row.values().len(),
+        "pgoutput relation '{}' column count {} does not match row length {}",
+        relation.name(),
+        relation.columns().len(),
+        row.values().len()
+    );
+
+    let mut payload = serde_json::Map::with_capacity(relation.columns().len());
+    for (column, value) in relation.columns().iter().zip(row.values()) {
+        payload.insert(column.name().to_string(), row_value_to_json(value));
+    }
+    Ok(Value::Object(payload))
+}
+
+fn row_value_to_json(value: &Option<RowValue>) -> Value {
+    match value {
+        Some(RowValue::Int64(value)) => Value::from(*value),
+        Some(RowValue::Bool(value)) => Value::from(*value),
+        Some(RowValue::Utf8(value)) => Value::from(value.clone()),
+        Some(RowValue::TimestampMillis(value)) => Value::from(*value),
+        None => Value::Null,
+    }
+}
+
+async fn stored_slot_start_lsn(connection_string: &str, slot: &str) -> Result<PostgresLsn> {
+    let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+        .await
+        .context("connect Postgres control plane for native CDC")?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(error = %err, "Postgres native CDC control connection closed");
+        }
+    });
+
+    let row = client
+        .query_opt(
+            "SELECT confirmed_flush_lsn::text, restart_lsn::text
+             FROM pg_replication_slots
+             WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .context("query pg_replication_slots for native CDC start LSN")?
+        .ok_or_else(|| {
+            anyhow!(
+                "Postgres logical replication slot '{slot}' does not exist; create it with pg_create_logical_replication_slot(..., 'pgoutput')"
+            )
+        })?;
+    let confirmed: Option<String> = row.get(0);
+    let restart: Option<String> = row.get(1);
+    drop(client);
+    connection_task.abort();
+
+    let lsn = confirmed
+        .or(restart)
+        .ok_or_else(|| anyhow!("Postgres logical replication slot '{slot}' has no start LSN"))?;
+    PostgresLsn::parse(&lsn)
+}
+
+fn replication_config_from_connection_string(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    start_lsn: PostgresLsn,
+) -> Result<PostgresCdcConfig> {
+    let config = connection_string
+        .parse::<tokio_postgres::Config>()
+        .with_context(|| format!("parse Postgres connection string '{connection_string}'"))?;
+    let host = match config.get_hosts().first() {
+        Some(Host::Tcp(host)) => host.clone(),
+        Some(Host::Unix(_)) => bail!("native Postgres CDC requires a TCP host"),
+        None => "localhost".to_string(),
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    let user = config
+        .get_user()
+        .ok_or_else(|| anyhow!("native Postgres CDC connection string must include user"))?
+        .to_string();
+    let database = config
+        .get_dbname()
+        .map(str::to_string)
+        .unwrap_or_else(|| user.clone());
+    let password = config
+        .get_password()
+        .map(str::from_utf8)
+        .transpose()
+        .context("native Postgres CDC password must be valid UTF-8")?
+        .unwrap_or_default()
+        .to_string();
+
+    PostgresCdcConfig::new(host, user, password, database, slot, publication)?
+        .with_port(port)?
+        .with_start_lsn(start_lsn)
+        .with_status_interval(Duration::from_millis(100))
+}
+
+pub fn default_postgres_publication() -> String {
+    DEFAULT_POSTGRES_PUBLICATION.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_cdc_core::{CdcColumn, CdcPrimaryKey, CdcTableId, CdcTableSchema, UpstreamTableRef};
+    use floe_core::catalog::ColumnType;
 
     fn base_config() -> PostgresCdcConnectorConfig {
         PostgresCdcConnectorConfig {
-            connection_string: "postgres://localhost/postgres".to_string(),
+            connection_string: "postgres://floe:secret@localhost:5432/postgres".to_string(),
             slot: "floe_slot".to_string(),
-            poll_interval: Duration::from_millis(10),
-            max_changes: 128,
-            default_schema: "public".to_string(),
+            publication: DEFAULT_POSTGRES_PUBLICATION.to_string(),
             include_tables: None,
             include_schema_in_source: false,
             commit_lsn_rx: None,
@@ -315,99 +421,62 @@ mod tests {
         assert!(PostgresCdcConnector::new(config.clone(), Vec::new()).is_err());
 
         config = base_config();
-        config.max_changes = 0;
-        assert!(PostgresCdcConnector::new(config, Vec::new()).is_err());
+        config.publication = " ".to_string();
+        assert!(PostgresCdcConnector::new(config.clone(), Vec::new()).is_err());
     }
 
     #[test]
-    fn parse_wal2json_payload_emits_insert_and_update_rows() {
-        let payload = r#"{
-            "change": [
-                {
-                    "kind": "insert",
-                    "schema": "public",
-                    "table": "bid",
-                    "columnnames": ["auction", "price"],
-                    "columnvalues": [1, 99]
-                },
-                {
-                    "kind": "update",
-                    "schema": "public",
-                    "table": "bid",
-                    "columnnames": ["auction", "price"],
-                    "columnvalues": [1, 100]
-                },
-                {
-                    "kind": "delete",
-                    "schema": "public",
-                    "table": "bid",
-                    "columnnames": ["auction"],
-                    "columnvalues": [1]
-                }
-            ]
-        }"#;
+    fn parses_replication_config_from_postgres_url() {
+        let config = replication_config_from_connection_string(
+            "postgres://floe:secret@127.0.0.1:55432/app",
+            "slot",
+            "publication",
+            PostgresLsn::from_u64(0x50),
+        )
+        .expect("parse config");
 
-        let events = parse_wal2json_payload(payload, &base_config(), None).expect("parse payload");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].source(), "bid");
+        assert_eq!(config.host(), "127.0.0.1");
+        assert_eq!(config.port(), 55432);
+        assert_eq!(config.user(), "floe");
+        assert_eq!(config.password(), "secret");
+        assert_eq!(config.database(), "app");
+        assert_eq!(config.slot(), "slot");
+        assert_eq!(config.publication(), "publication");
+        assert_eq!(config.start_lsn(), Some(PostgresLsn::from_u64(0x50)));
+    }
+
+    #[test]
+    fn cdc_rows_convert_to_json_payloads() {
+        let relation = CdcTableSchema::new(
+            CdcTableId::new("orders").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).expect("id"),
+                CdcColumn::new("paid", ColumnType::Bool, false).expect("paid"),
+                CdcColumn::new("note", ColumnType::Utf8, true).expect("note"),
+            ],
+            CdcPrimaryKey::new(["id"]).expect("primary key"),
+        )
+        .expect("schema");
+        let row =
+            CdcRow::new([Some(RowValue::Int64(7)), Some(RowValue::Bool(true)), None]).expect("row");
+        let payload = serde_json::json!({
+            "id": 7,
+            "paid": true,
+            "note": null,
+        });
+
         assert_eq!(
-            events[0].payload().and_then(|v| v.get("auction")),
-            Some(&Value::from(1))
-        );
-        assert_eq!(
-            events[1].payload().and_then(|v| v.get("price")),
-            Some(&Value::from(100))
+            schema_row_to_json_for_test(&relation, &row).expect("json"),
+            payload
         );
     }
 
-    #[test]
-    fn parse_wal2json_payload_honors_schema_and_include_tables_filter() {
-        let mut config = base_config();
-        config.include_schema_in_source = true;
-
-        let payload = r#"{
-            "change": [
-                {
-                    "kind": "insert",
-                    "schema": "public",
-                    "table": "bid",
-                    "columnnames": ["auction"],
-                    "columnvalues": [1]
-                },
-                {
-                    "kind": "insert",
-                    "schema": "private",
-                    "table": "auction",
-                    "columnnames": ["id"],
-                    "columnvalues": [2]
-                }
-            ]
-        }"#;
-
-        let mut include = HashSet::new();
-        include.insert("public.bid".to_string());
-        let events =
-            parse_wal2json_payload(payload, &config, Some(&include)).expect("parse payload");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source(), "public.bid");
-    }
-
-    #[test]
-    fn parse_wal2json_payload_rejects_mismatched_columns() {
-        let payload = r#"{
-            "change": [
-                {
-                    "kind": "insert",
-                    "schema": "public",
-                    "table": "bid",
-                    "columnnames": ["auction", "price"],
-                    "columnvalues": [1]
-                }
-            ]
-        }"#;
-
-        let err = parse_wal2json_payload(payload, &base_config(), None).unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("length mismatch"));
+    fn schema_row_to_json_for_test(schema: &CdcTableSchema, row: &CdcRow) -> Result<Value> {
+        let mut payload = serde_json::Map::with_capacity(schema.columns().len());
+        for (column, value) in schema.columns().iter().zip(row.values()) {
+            payload.insert(column.name().to_string(), row_value_to_json(value));
+        }
+        Ok(Value::Object(payload))
     }
 }

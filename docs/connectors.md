@@ -187,10 +187,12 @@ event payload.
 
 ## Postgres CDC Connector
 
-The Postgres CDC connector polls a logical replication slot using
-`pg_logical_slot_peek_changes` with the `wal2json` output plugin and advances
-the slot only after a durable tick-commit barrier. Only insert and update
-events are emitted (delete events are ignored).
+The Postgres CDC connector uses native logical replication with the built-in
+`pgoutput` plugin. It reads from an existing logical replication slot and
+publication, and reports the applied LSN only after Floe's durable tick-commit
+barrier. In the current `SourceEvent` bridge, insert and update rows are emitted
+to the normal Floe ingest path; delete and truncate correctness will be handled
+by the CDC table runtime.
 
 Example (TOML):
 
@@ -199,8 +201,7 @@ Example (TOML):
 type = "postgres_cdc"
 connection = "postgres://user:password@localhost:5432/db"
 slot = "floe_slot"
-poll_ms = 1000
-max_changes = 500
+publication = "floe_publication"
 include_tables = ["nexmark_bid", "nexmark_auction"]
 ```
 

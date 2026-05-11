@@ -249,7 +249,7 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
 }
 
 #[tokio::test]
-#[ignore = "requires wal2json Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
 async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
@@ -257,8 +257,9 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let table = format!("orders_acceptance_{run_id}");
+    let table = "nexmark_bid";
     let slot = format!("floe_acceptance_{run_id}");
+    let publication = format!("floe_acceptance_pub_{run_id}");
     let temp_dir = TempDir::new().context("create temp dir")?;
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("cdc_sink.jsonl");
@@ -275,12 +276,18 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
 
     client
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {table};
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
              CREATE TABLE {table} (
-               id BIGINT PRIMARY KEY,
-               amount BIGINT NOT NULL,
-               note TEXT
-             );"
+               auction BIGINT NOT NULL,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
         ))
         .await
         .context("prepare cdc acceptance table")?;
@@ -289,11 +296,11 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
         .await;
     client
         .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'wal2json')",
+            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&slot],
         )
         .await
-        .context("create wal2json replication slot")?;
+        .context("create pgoutput replication slot")?;
 
     let config = json!({
         "connectors": [
@@ -301,16 +308,14 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
                 "type": "postgres_cdc",
                 "connection": dsn,
                 "slot": slot,
-                "poll_ms": 200,
-                "max_changes": 256,
-                "default_schema": "public",
+                "publication": publication,
                 "include_tables": [table]
             }
         ],
         "sinks": [
             {
                 "type": "file",
-                "mv": "mv_cdc_acceptance",
+                "mv": "mv_acceptance_bid",
                 "path": sink_path,
                 "with_snapshot": true,
                 "append": true
@@ -320,15 +325,11 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write cdc acceptance config")?;
 
-    let mv_sql = format!(
-        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, amount BIGINT, note TEXT); \
-         CREATE MATERIALIZED VIEW mv_cdc_acceptance AS SELECT id, amount, note FROM {table}"
-    );
     let mut child = spawn_node_with_env(
         &config_path,
         &data_dir,
         0,
-        Some(&mv_sql),
+        Some(BID_MV_SQL),
         &[("FLOE_DISABLE_PGWIRE".to_string(), "1".to_string())],
     )
     .await?;
@@ -337,14 +338,27 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
         sleep(Duration::from_millis(500)).await;
         client
             .execute(
-                &format!("INSERT INTO {table} (id, amount, note) VALUES ($1, $2, $3)"),
-                &[&1_i64, &500_i64, &"cdc_acceptance".to_string()],
+                &format!(
+                    "INSERT INTO {table} \
+                     (auction, bidder, price, channel, url, date_time, extra) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                ),
+                &[
+                    &901_i64,
+                    &7001_i64,
+                    &500_i64,
+                    &"web".to_string(),
+                    &"http://example.com".to_string(),
+                    &1_700_000_901_i64,
+                    &"cdc_acceptance".to_string(),
+                ],
             )
             .await
             .context("insert cdc acceptance row")?;
         wait_for_rows_matching(&sink_path, |value| {
-            value.get("id").and_then(Value::as_i64) == Some(1)
-                && value.get("amount").and_then(Value::as_i64) == Some(500)
+            value.get("auction").and_then(Value::as_i64) == Some(901)
+                && value.get("bidder").and_then(Value::as_i64) == Some(7001)
+                && value.get("price").and_then(Value::as_i64) == Some(500)
         })
         .await?;
         Ok(())
@@ -354,6 +368,9 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     stop_child(&mut child, "INT").await;
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
         .await;
     let _ = client
         .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
