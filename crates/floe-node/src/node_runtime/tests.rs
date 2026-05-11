@@ -1,5 +1,7 @@
 use super::*;
-use crate::node_runtime::orchestration::source_journal_required_sources;
+use crate::node_runtime::orchestration::{
+    postgres_cdc_runtime_plan, source_journal_required_sources,
+};
 use floe_sql_parser::parse_floe_statement;
 use serde_json::json;
 
@@ -618,6 +620,54 @@ fn source_definition_from_table_sets_pk_property() {
     assert!(source_definition_has_primary_key(&source));
     assert!(!source.columns()[0].nullable());
     assert!(source.columns()[1].nullable());
+}
+
+#[test]
+fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
+    let statement = parse_floe_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, note TEXT)",
+    )
+    .expect("parse create table");
+    let FloeStatement::CreateTable(definition) = statement else {
+        panic!("expected create table statement");
+    };
+    let table = table_definition_from_sql(&definition).expect("table definition");
+    let source = source_definition_from_table(&table).expect("source definition");
+    let mut registry = SourceRegistry::new();
+    registry.register(source);
+    let include_tables = vec!["public.orders".to_string()];
+
+    let plan = postgres_cdc_runtime_plan("pg_main", Some(&include_tables), &registry)
+        .expect("runtime plan")
+        .expect("native runtime plan");
+
+    assert_eq!(plan.source_id.as_str(), "pg_main");
+    let schema = plan
+        .schemas
+        .get(&CdcTableId::new("orders").expect("table id"))
+        .expect("orders schema");
+    assert_eq!(schema.upstream_table().schema(), "public");
+    assert_eq!(schema.upstream_table().table(), "orders");
+    assert_eq!(schema.primary_key().columns(), &["id".to_string()]);
+    assert_eq!(schema.columns().len(), 3);
+    assert!(!schema.columns()[0].nullable());
+}
+
+#[test]
+fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
+    let source = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("source");
+    let mut registry = SourceRegistry::new();
+    registry.register(source);
+    let include_tables = vec!["orders".to_string()];
+
+    let plan = postgres_cdc_runtime_plan("pg_main", Some(&include_tables), &registry)
+        .expect("runtime plan");
+
+    assert!(plan.is_none());
 }
 
 #[test]

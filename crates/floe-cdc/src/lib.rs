@@ -242,6 +242,25 @@ impl CdcTableStore {
         schemas: &HashMap<CdcTableId, CdcTableSchema>,
         transaction: &TransactionBatch,
     ) -> Result<CdcApplyResult> {
+        let mut batch = WriteBatch::new();
+        let result = self
+            .stage_transaction(schemas, transaction, &mut batch)
+            .await?;
+        if !result.already_committed {
+            self.table
+                .write_batch(batch)
+                .await
+                .context("commit CDC transaction batch")?;
+        }
+        Ok(result)
+    }
+
+    pub async fn stage_transaction(
+        &self,
+        schemas: &HashMap<CdcTableId, CdcTableSchema>,
+        transaction: &TransactionBatch,
+        batch: &mut WriteBatch,
+    ) -> Result<CdcApplyResult> {
         transaction.validate_against_schemas(schemas)?;
         let next_checkpoint = CdcCheckpoint::from_transaction(transaction);
         if let Some(current_checkpoint) = self.load_checkpoint(transaction.source_id()).await?
@@ -254,7 +273,6 @@ impl CdcTableStore {
             });
         }
 
-        let mut batch = WriteBatch::new();
         let mut overlay = HashMap::<Vec<u8>, Option<CdcRow>>::new();
         let mut table_deltas = Vec::new();
 
@@ -263,7 +281,7 @@ impl CdcTableStore {
                 anyhow!("missing schema for '{}'", change_batch.table_id().as_str())
             })?;
             let deltas = self
-                .stage_change_batch(schema, change_batch, &mut overlay, &mut batch)
+                .stage_change_batch(schema, change_batch, &mut overlay, batch)
                 .await
                 .with_context(|| {
                     format!(
@@ -283,10 +301,6 @@ impl CdcTableStore {
             checkpoint_key(transaction.source_id()),
             serde_json::to_vec(&next_checkpoint).context("encode CDC checkpoint")?,
         );
-        self.table
-            .write_batch(batch)
-            .await
-            .context("commit CDC transaction batch")?;
 
         Ok(CdcApplyResult {
             checkpoint: next_checkpoint,

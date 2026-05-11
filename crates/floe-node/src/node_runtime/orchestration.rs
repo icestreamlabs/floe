@@ -26,6 +26,192 @@ fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
     })
 }
 
+pub(super) fn postgres_cdc_runtime_plan(
+    connector_name: &str,
+    include_tables: Option<&[String]>,
+    registry: &SourceRegistry,
+) -> anyhow::Result<Option<PostgresCdcRuntimePlan>> {
+    let Some(include_tables) = include_tables else {
+        return Ok(None);
+    };
+    if include_tables.is_empty() {
+        return Ok(None);
+    }
+
+    let mut schemas = HashMap::new();
+    for include_table in include_tables {
+        let source_name = source_name_for_postgres_include_table(include_table, registry);
+        let Some(definition) = registry.get(&source_name) else {
+            tracing::warn!(
+                connector = %connector_name,
+                table = %include_table,
+                source = %source_name,
+                "Postgres CDC table has no source definition; using append-only compatibility path"
+            );
+            return Ok(None);
+        };
+        if !source_definition_has_primary_key(definition) {
+            tracing::warn!(
+                connector = %connector_name,
+                source = %definition.name(),
+                "Postgres CDC source has no primary key; using append-only compatibility path"
+            );
+            return Ok(None);
+        }
+        let schema = cdc_table_schema_from_source_definition(
+            definition,
+            upstream_table_ref_for_postgres_include_table(include_table)?,
+        )?;
+        schemas.insert(schema.table_id().clone(), schema);
+    }
+
+    Ok(Some(PostgresCdcRuntimePlan {
+        source_id: CdcSourceId::new(connector_name)?,
+        schemas,
+    }))
+}
+
+fn source_name_for_postgres_include_table(table: &str, registry: &SourceRegistry) -> String {
+    if registry.contains(table) {
+        return table.to_string();
+    }
+    table
+        .rsplit_once('.')
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| table.to_string())
+}
+
+fn upstream_table_ref_for_postgres_include_table(table: &str) -> anyhow::Result<UpstreamTableRef> {
+    match table.split_once('.') {
+        Some((schema, name)) => Ok(UpstreamTableRef::new(schema, name)?),
+        None => Ok(UpstreamTableRef::new("public", table)?),
+    }
+}
+
+async fn run_native_postgres_cdc_connector(
+    mut config: PostgresCdcConnectorConfig,
+    runtime_plan: PostgresCdcRuntimePlan,
+    table_store: CdcTableStore,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let start_lsn = stored_slot_start_lsn(&config.connection_string, &config.slot)
+        .await
+        .with_context(|| format!("load Postgres logical slot '{}' start LSN", config.slot))?;
+    let replication_config = replication_config_from_connection_string(
+        &config.connection_string,
+        &config.slot,
+        &config.publication,
+        start_lsn,
+    )?;
+    let replication_config = config_with_stored_cdc_checkpoint(
+        replication_config,
+        &table_store,
+        &runtime_plan.source_id,
+    )
+    .await?;
+    tracing::info!(
+        source = %runtime_plan.source_id.as_str(),
+        slot = %config.slot,
+        tables = runtime_plan.schemas.len(),
+        start_lsn = ?replication_config.start_lsn(),
+        "starting native Postgres CDC replication stream"
+    );
+    let mut replication = PostgresReplicationClient::connect(&replication_config)
+        .await
+        .context("connect native Postgres CDC transaction stream")?;
+    tracing::info!(
+        source = %runtime_plan.source_id.as_str(),
+        slot = %config.slot,
+        "native Postgres CDC replication stream connected"
+    );
+    let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
+    let mut assembler = PostgresTransactionAssembler::new(runtime_plan.source_id.clone(), router);
+    let mut last_committed_tick_id = 0_u64;
+
+    let result = async {
+        loop {
+            update_native_postgres_applied_lsn(
+                &mut replication,
+                config.commit_lsn_rx.as_mut(),
+                &config.slot,
+                &mut last_committed_tick_id,
+            )?;
+
+            let event = tokio::select! {
+                _ = cancel.cancelled() => break,
+                event = replication.recv() => event.context("receive native Postgres CDC event")?,
+            };
+            let Some(event) = event else {
+                break;
+            };
+            if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
+                break;
+            }
+            let Some(transaction) = assembler.accept_event(event)? else {
+                continue;
+            };
+            tracing::debug!(
+                source = %runtime_plan.source_id.as_str(),
+                slot = %config.slot,
+                change_batches = transaction.change_batches().len(),
+                commit_position = ?transaction.commit_position(),
+                "assembled native Postgres CDC transaction"
+            );
+            sender
+                .send(QueuedCdcTransaction {
+                    slot: config.slot.clone(),
+                    source_id: runtime_plan.source_id.clone(),
+                    transaction,
+                })
+                .await
+                .map_err(|err| {
+                    anyhow!("failed to enqueue native Postgres CDC transaction: {err}")
+                })?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    replication.stop();
+    let shutdown_result = replication.shutdown().await;
+    result?;
+    shutdown_result
+}
+
+fn update_native_postgres_applied_lsn(
+    replication: &mut PostgresReplicationClient,
+    receiver: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    slot: &str,
+    last_committed_tick_id: &mut u64,
+) -> anyhow::Result<()> {
+    let Some(receiver) = receiver else {
+        return Ok(());
+    };
+
+    let mut latest_commit = None;
+    while receiver.has_changed().unwrap_or(false) {
+        latest_commit = Some(receiver.borrow_and_update().clone());
+    }
+    let Some(commit) = latest_commit else {
+        return Ok(());
+    };
+    if commit.tick_id <= *last_committed_tick_id {
+        return Ok(());
+    }
+
+    if let Some(target_lsn) = commit
+        .slots
+        .iter()
+        .find(|entry| entry.slot == slot)
+        .map(|entry| entry.lsn.as_str())
+    {
+        replication.update_applied_lsn(PostgresLsn::parse(target_lsn)?);
+    }
+    *last_committed_tick_id = commit.tick_id;
+    Ok(())
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
     init_tracing();
     metrics::init();
@@ -364,6 +550,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let storage = storage.expect("storage initialized when not in dry-run");
     let db = storage.db();
     let checkpoint_table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+    let cdc_table_store = CdcTableStore::new(Arc::clone(&checkpoint_table));
     let checkpoint_manager =
         CheckpointManager::new(CHECKPOINT_GRAPH_ID, Arc::clone(&checkpoint_table))
             .await
@@ -733,6 +920,26 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .enumerate()
         .map(|(idx, definition)| (definition.name().to_string(), idx))
         .collect();
+    let postgres_cdc_runtime_plans_by_connector = connector_specs
+        .iter()
+        .filter_map(|connector| {
+            let ConnectorConfig::PostgresCdc { include_tables, .. } = &connector.config else {
+                return None;
+            };
+            match postgres_cdc_runtime_plan(
+                &connector.name,
+                include_tables.as_deref(),
+                &source_registry,
+            ) {
+                Ok(Some(plan)) => Some(Ok((connector.name.clone(), plan))),
+                Ok(None) => None,
+                Err(err) => Some(Err(err.context(format!(
+                    "build native Postgres CDC runtime plan for connector '{}'",
+                    connector.name
+                )))),
+            }
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
     let source_names_by_id = Arc::new(
         definitions
             .iter()
@@ -771,7 +978,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>(),
     );
+    let cdc_schemas_by_source_id = Arc::new(
+        postgres_cdc_runtime_plans_by_connector
+            .values()
+            .map(|plan| (plan.source_id.clone(), plan.schemas.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
+    let (cdc_transaction_sender, cdc_transaction_receiver) =
+        mpsc::channel::<QueuedCdcTransaction>(queue_capacity);
     let pending_event_counter = core_source::PendingEventCounter::default();
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
@@ -790,6 +1005,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             connector_sender.clone(),
             pending_event_counter.clone(),
         );
+        let postgres_cdc_runtime_plan = postgres_cdc_runtime_plans_by_connector
+            .get(&connector.name)
+            .cloned();
         connector_queues.push(ConnectorQueue::new(connector_id, connector.name.clone()));
         let cancel = ingest_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
@@ -1010,44 +1228,77 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let include_schema_in_source = include_schema_in_source.unwrap_or(false);
                 let (commit_tx, commit_rx) = watch::channel(PostgresCdcCommit::default());
                 postgres_cdc_commit_senders.push(commit_tx);
-                let definitions = definitions.clone();
                 let failure_state = Arc::clone(&failure_state);
-                connector_handles.push(tokio::spawn(async move {
-                    let config = PostgresCdcConnectorConfig {
-                        connection_string: connection,
-                        slot,
-                        publication,
-                        include_tables,
-                        include_schema_in_source,
-                        commit_lsn_rx: Some(commit_rx),
-                    };
-                    let mut connector = match PostgresCdcConnector::new(config, definitions) {
-                        Ok(connector) => connector,
-                        Err(err) => {
-                            tracing::error!(error = %err, "Postgres CDC connector config invalid");
+                let config = PostgresCdcConnectorConfig {
+                    connection_string: connection,
+                    slot,
+                    publication,
+                    include_tables,
+                    include_schema_in_source,
+                    commit_lsn_rx: Some(commit_rx),
+                };
+                if let Some(runtime_plan) = postgres_cdc_runtime_plan {
+                    tracing::info!(
+                        connector = %connector.name,
+                        source = %runtime_plan.source_id.as_str(),
+                        tables = runtime_plan.schemas.len(),
+                        "using native Postgres CDC table runtime"
+                    );
+                    let transaction_sender = cdc_transaction_sender.clone();
+                    let table_store = cdc_table_store.clone();
+                    connector_handles.push(tokio::spawn(async move {
+                        if let Err(err) = run_native_postgres_cdc_connector(
+                            config,
+                            runtime_plan,
+                            table_store,
+                            transaction_sender,
+                            cancel.clone(),
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %err, "native Postgres CDC connector failed");
                             record_runtime_failure(
                                 &failure_state,
-                                format!("Postgres CDC connector config invalid: {err}"),
+                                format!("native Postgres CDC connector failed: {err}"),
                             );
                             runtime_cancel.cancel();
-                            return;
                         }
-                    };
-                    let ctx = ConnectorContext::new(sender);
-                    if let Err(err) = run_connector(&mut connector, &ctx, cancel.clone()).await {
-                        tracing::error!(error = %err, "Postgres CDC connector failed");
-                        record_runtime_failure(
-                            &failure_state,
-                            format!("Postgres CDC connector failed: {err}"),
-                        );
-                        runtime_cancel.cancel();
-                    }
-                }));
+                    }));
+                } else {
+                    let definitions = definitions.clone();
+                    connector_handles.push(tokio::spawn(async move {
+                        let mut connector = match PostgresCdcConnector::new(config, definitions) {
+                            Ok(connector) => connector,
+                            Err(err) => {
+                                tracing::error!(error = %err, "Postgres CDC connector config invalid");
+                                record_runtime_failure(
+                                    &failure_state,
+                                    format!("Postgres CDC connector config invalid: {err}"),
+                                );
+                                runtime_cancel.cancel();
+                                return;
+                            }
+                        };
+                        let ctx = ConnectorContext::new(sender);
+                        if let Err(err) = run_connector(&mut connector, &ctx, cancel.clone()).await
+                        {
+                            tracing::error!(error = %err, "Postgres CDC connector failed");
+                            record_runtime_failure(
+                                &failure_state,
+                                format!("Postgres CDC connector failed: {err}"),
+                            );
+                            runtime_cancel.cancel();
+                        }
+                    }));
+                }
             }
         }
     }
     drop(connector_sender);
+    drop(cdc_transaction_sender);
     let outer_for_task = Arc::clone(&outer_registry);
+    let cdc_table_store_for_task = cdc_table_store.clone();
+    let cdc_schemas_by_source_id_for_task = Arc::clone(&cdc_schemas_by_source_id);
     let decoders_by_source_id_for_task = Arc::clone(&decoders_by_source_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
@@ -1063,6 +1314,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
     let mut connector_receiver_for_task = connector_receiver;
+    let mut cdc_transaction_receiver_for_task = cdc_transaction_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -1070,6 +1322,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let executor_cancel = runtime_cancel.clone();
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut connector_queues = connector_queues;
+        let mut cdc_transaction_queue = VecDeque::new();
         let mut checkpoint_manager = checkpoint_manager;
         let mut next_connector = 0usize;
         let mut epoch: u64 = 0;
@@ -1152,171 +1405,345 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if executor_cancel.is_cancelled() {
                 break;
             }
-            if connector_queues.is_empty() {
+            if connector_queues.is_empty() && cdc_transaction_queue.is_empty() {
                 break;
             }
             if connector_queues
                 .iter()
                 .all(|queue| queue.pending.is_empty())
+                && cdc_transaction_queue.is_empty()
             {
-                let has_events = tokio::select! {
-                    _ = executor_cancel.cancelled() => false,
-                    has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
+                let has_events = loop {
+                    let connector_receiver_active = !connector_receiver_for_task.is_closed();
+                    let cdc_receiver_active = !cdc_schemas_by_source_id_for_task.is_empty()
+                        && !cdc_transaction_receiver_for_task.is_closed();
+                    match (connector_receiver_active, cdc_receiver_active) {
+                        (false, false) => break false,
+                        (true, false) => {
+                            break tokio::select! {
+                                _ = executor_cancel.cancelled() => false,
+                                has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
+                            };
+                        }
+                        (false, true) => {
+                            break tokio::select! {
+                                _ = executor_cancel.cancelled() => false,
+                                has_events = recv_cdc_from_ready(
+                                    &mut cdc_transaction_receiver_for_task,
+                                    &mut cdc_transaction_queue,
+                                ) => has_events,
+                            };
+                        }
+                        (true, true) => {
+                            let has_events = tokio::select! {
+                                _ = executor_cancel.cancelled() => false,
+                                has_events = recv_cdc_from_ready(
+                                    &mut cdc_transaction_receiver_for_task,
+                                    &mut cdc_transaction_queue,
+                                ) => has_events,
+                                has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
+                            };
+                            if has_events {
+                                break true;
+                            }
+                        }
+                    }
                 };
                 if !has_events {
                     break;
                 }
             }
             drain_ready(&mut connector_receiver_for_task, &mut connector_queues);
-
-            let BatchSelection {
-                batch,
-                per_connector_counts,
-            } = build_batch(
-                &mut connector_queues,
-                &source_id_by_name_for_task,
-                source_id_by_name_for_task.len(),
-                next_connector,
-                max_batch,
-                max_batch_per_source,
-                max_batch_per_connector,
-                &pending_event_counter,
-            );
-
-            if batch.is_empty() {
-                continue;
+            if !cdc_schemas_by_source_id_for_task.is_empty() {
+                drain_cdc_ready(
+                    &mut cdc_transaction_receiver_for_task,
+                    &mut cdc_transaction_queue,
+                );
             }
 
-            next_connector = if connector_queues.is_empty() {
-                0
-            } else {
-                (next_connector + 1) % connector_queues.len()
-            };
-
             let pending_epoch = epoch.saturating_add(1);
-            let batch_len = batch.len();
             let source_count = source_names_by_id_for_task.len();
             let decode_start = Instant::now();
-            let mut encoded_rows = Vec::with_capacity(batch_len);
             let mut tick_commit_acks = Vec::new();
             let mut decoded_counts = vec![0usize; source_count];
             let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
             let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
             let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
             let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
-            let decode_span = tracing::debug_span!(
-                "ingest_decode",
-                epoch = pending_epoch,
-                raw_batch_size = batch_len
-            );
-            let _decode_guard = decode_span.enter();
-            for SelectedSourceEvent {
-                source_id,
-                mut event,
-                commit_ack,
-            } in batch
-            {
-                let Some(source_id) = source_id else {
-                    let source_name = event.source().to_string();
-                    tracing::debug!(
-                        source = %source_name,
-                        "dropping event for unknown source"
-                    );
-                    if let Some(ack) = commit_ack {
-                        ack.record_failed(format!("unknown source '{source_name}'"))
-                            .await;
-                    }
-                    continue;
-                };
-                let source_name = source_names_by_id_for_task[source_id].as_str();
-                if let Some((partition, offset)) = event_fast_resume_offset(&event)
-                    .or_else(|| event_resume_offset(event.resume_token()))
-                {
-                    let entry = tick_source_offsets[source_id]
-                        .get_or_insert_with(HashMap::new)
-                        .entry(partition)
-                        .or_insert(0);
-                    *entry = (*entry).max(offset);
-                }
-                if let Some((topic, partition, offset)) = event_fast_kafka_offset(&event)
-                    .or_else(|| event_kafka_offset(event.resume_token()))
-                {
-                    let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
-                    *entry = (*entry).max(offset);
-                }
-                if let Some((slot, lsn_value, lsn_text)) = event_postgres_lsn(event.resume_token())
-                {
-                    let entry = tick_postgres_lsns
-                        .entry(slot)
-                        .or_insert_with(|| (lsn_value, lsn_text.clone()));
-                    if lsn_value > entry.0 {
-                        *entry = (lsn_value, lsn_text);
-                    }
-                }
-                if !materialized_source_ids_for_task
-                    .get(source_id)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    tracing::debug!(
-                        source = %source_name,
-                        "dropping event for source outside active materialization set"
-                    );
-                    if let Some(ack) = commit_ack {
-                        ack.record_failed(format!(
-                            "source '{source_name}' is outside the active materialization set"
-                        ))
-                        .await;
-                    }
-                    continue;
-                }
-                let Some(decoder) = decoders_by_source_id_for_task
-                    .get(source_id)
-                    .and_then(|decoder| decoder.as_ref())
+            let mut encoded_batches_by_source = vec![Vec::new(); source_count];
+            let mut commit_acks_by_source = vec![Vec::new(); source_count];
+            let mut cdc_staged_writes = None::<WriteBatch>;
+            let mut per_connector_counts = vec![0usize; connector_queues.len()];
+            let batch_len: usize;
+            let mut decoded_rows_len = 0usize;
+
+            if let Some(cdc_transaction) = cdc_transaction_queue.pop_front() {
+                batch_len = 1;
+                tracing::debug!(
+                    source = %cdc_transaction.source_id.as_str(),
+                    slot = %cdc_transaction.slot,
+                    change_batches = cdc_transaction.transaction.change_batches().len(),
+                    commit_position = ?cdc_transaction.transaction.commit_position(),
+                    "executor applying native CDC transaction"
+                );
+                let Some(schemas) =
+                    cdc_schemas_by_source_id_for_task.get(&cdc_transaction.source_id)
                 else {
-                    let message = format!("received event for unknown source '{source_name}'");
-                    tracing::error!(source = %source_name, "{message}");
-                    if let Some(ack) = commit_ack {
-                        ack.record_failed(message.clone()).await;
-                    }
+                    let message = format!(
+                        "received native CDC transaction for unknown source '{}'",
+                        cdc_transaction.source_id.as_str()
+                    );
+                    tracing::error!("{message}");
                     record_runtime_failure(&failure_for_executor, message);
                     executor_cancel.cancel();
                     break 'executor;
                 };
-                let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
-                    encoded_rows.push((source_id, preencoded_row_key, commit_ack));
-                    None
-                } else {
-                    match decoder.encode_row_key(&event) {
-                        Ok((encoded, event_ts)) => {
-                            encoded_rows.push((source_id, encoded, commit_ack));
-                            event_ts
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                source = %source_name,
-                                error = %err,
-                                "failed to encode source event"
-                            );
-                            if let Some(ack) = commit_ack {
-                                ack.record_failed(format!(
-                                    "failed to encode source event for '{source_name}': {err}"
-                                ))
-                                .await;
-                            }
-                            continue;
-                        }
+                let mut staged_writes = WriteBatch::new();
+                let apply_result = match cdc_table_store_for_task
+                    .stage_transaction(schemas, &cdc_transaction.transaction, &mut staged_writes)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let message = format!(
+                            "failed to stage native CDC transaction for source '{}': {err}",
+                            cdc_transaction.source_id.as_str()
+                        );
+                        tracing::error!(error = %err, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
                     }
                 };
-                // Prefer row-derived event time (from decoded timestamp columns) when available.
-                // Connector-level event_time_ms is a fallback for sources without row timestamps.
-                let event_ts = event_ts.or(event.event_time_ms());
-                if let Some(ts) = event_ts {
-                    let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
-                    let entry = tick_source_max_event_ts[source_id].get_or_insert(i64::MIN);
-                    *entry = (*entry).max(ts_i64);
+                let feedback_lsn =
+                    match PostgresLsn::from_source_position(apply_result.checkpoint().position()) {
+                        Ok(lsn) => lsn,
+                        Err(err) => {
+                            let message = format!(
+                                "failed to derive native CDC feedback LSN for source '{}': {err}",
+                                cdc_transaction.source_id.as_str()
+                            );
+                            tracing::error!(error = %err, "{message}");
+                            record_runtime_failure(&failure_for_executor, message);
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
+                    };
+                tick_postgres_lsns.insert(
+                    cdc_transaction.slot,
+                    (feedback_lsn.as_u64(), feedback_lsn.to_pg_string()),
+                );
+
+                for table_deltas in apply_result.table_deltas() {
+                    let source_name = table_deltas.table_id().as_str();
+                    let Some(source_id) = source_id_by_name_for_task.get(source_name).copied()
+                    else {
+                        tracing::warn!(
+                            source = %source_name,
+                            "native CDC table delta references unknown source"
+                        );
+                        continue;
+                    };
+                    if !materialized_source_ids_for_task
+                        .get(source_id)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(
+                            source = %source_name,
+                            "dropping native CDC deltas for source outside active materialization set"
+                        );
+                        continue;
+                    }
+                    let Some(decoder) = decoders_by_source_id_for_task
+                        .get(source_id)
+                        .and_then(|decoder| decoder.as_ref())
+                    else {
+                        let message =
+                            format!("received CDC deltas for unknown source '{source_name}'");
+                        tracing::error!(source = %source_name, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    };
+                    match encode_cdc_table_deltas(decoder, table_deltas) {
+                        Ok(mut encoded) => {
+                            decoded_counts[source_id] =
+                                decoded_counts[source_id].saturating_add(encoded.len());
+                            decoded_rows_len = decoded_rows_len.saturating_add(encoded.len());
+                            encoded_batches_by_source[source_id].append(&mut encoded);
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "failed to encode native CDC deltas for source '{source_name}': {err}"
+                            );
+                            tracing::error!(source = %source_name, error = %err, "{message}");
+                            record_runtime_failure(&failure_for_executor, message);
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
+                    }
                 }
-                decoded_counts[source_id] = decoded_counts[source_id].saturating_add(1);
+                if !apply_result.already_committed() {
+                    cdc_staged_writes = Some(staged_writes);
+                }
+            } else {
+                let selection = build_batch(
+                    &mut connector_queues,
+                    &source_id_by_name_for_task,
+                    source_id_by_name_for_task.len(),
+                    next_connector,
+                    max_batch,
+                    max_batch_per_source,
+                    max_batch_per_connector,
+                    &pending_event_counter,
+                );
+                let BatchSelection {
+                    batch,
+                    per_connector_counts: selected_per_connector_counts,
+                } = selection;
+                per_connector_counts = selected_per_connector_counts;
+
+                if batch.is_empty() {
+                    continue;
+                }
+
+                next_connector = if connector_queues.is_empty() {
+                    0
+                } else {
+                    (next_connector + 1) % connector_queues.len()
+                };
+
+                batch_len = batch.len();
+                let mut encoded_rows = Vec::with_capacity(batch_len);
+                let decode_span = tracing::debug_span!(
+                    "ingest_decode",
+                    epoch = pending_epoch,
+                    raw_batch_size = batch_len
+                );
+                let _decode_guard = decode_span.enter();
+                for SelectedSourceEvent {
+                    source_id,
+                    mut event,
+                    commit_ack,
+                } in batch
+                {
+                    let Some(source_id) = source_id else {
+                        let source_name = event.source().to_string();
+                        tracing::debug!(
+                            source = %source_name,
+                            "dropping event for unknown source"
+                        );
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(format!("unknown source '{source_name}'"))
+                                .await;
+                        }
+                        continue;
+                    };
+                    let source_name = source_names_by_id_for_task[source_id].as_str();
+                    if let Some((partition, offset)) = event_fast_resume_offset(&event)
+                        .or_else(|| event_resume_offset(event.resume_token()))
+                    {
+                        let entry = tick_source_offsets[source_id]
+                            .get_or_insert_with(HashMap::new)
+                            .entry(partition)
+                            .or_insert(0);
+                        *entry = (*entry).max(offset);
+                    }
+                    if let Some((topic, partition, offset)) = event_fast_kafka_offset(&event)
+                        .or_else(|| event_kafka_offset(event.resume_token()))
+                    {
+                        let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
+                        *entry = (*entry).max(offset);
+                    }
+                    if let Some((slot, lsn_value, lsn_text)) =
+                        event_postgres_lsn(event.resume_token())
+                    {
+                        let entry = tick_postgres_lsns
+                            .entry(slot)
+                            .or_insert_with(|| (lsn_value, lsn_text.clone()));
+                        if lsn_value > entry.0 {
+                            *entry = (lsn_value, lsn_text);
+                        }
+                    }
+                    if !materialized_source_ids_for_task
+                        .get(source_id)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(
+                            source = %source_name,
+                            "dropping event for source outside active materialization set"
+                        );
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(format!(
+                                "source '{source_name}' is outside the active materialization set"
+                            ))
+                            .await;
+                        }
+                        continue;
+                    }
+                    let Some(decoder) = decoders_by_source_id_for_task
+                        .get(source_id)
+                        .and_then(|decoder| decoder.as_ref())
+                    else {
+                        let message = format!("received event for unknown source '{source_name}'");
+                        tracing::error!(source = %source_name, "{message}");
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(message.clone()).await;
+                        }
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    };
+                    let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key()
+                    {
+                        encoded_rows.push((source_id, preencoded_row_key, commit_ack));
+                        None
+                    } else {
+                        match decoder.encode_row_key(&event) {
+                            Ok((encoded, event_ts)) => {
+                                encoded_rows.push((source_id, encoded, commit_ack));
+                                event_ts
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    source = %source_name,
+                                    error = %err,
+                                    "failed to encode source event"
+                                );
+                                if let Some(ack) = commit_ack {
+                                    ack.record_failed(format!(
+                                        "failed to encode source event for '{source_name}': {err}"
+                                    ))
+                                    .await;
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    // Prefer row-derived event time (from decoded timestamp columns) when available.
+                    // Connector-level event_time_ms is a fallback for sources without row timestamps.
+                    let event_ts = event_ts.or(event.event_time_ms());
+                    if let Some(ts) = event_ts {
+                        let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
+                        let entry = tick_source_max_event_ts[source_id].get_or_insert(i64::MIN);
+                        *entry = (*entry).max(ts_i64);
+                    }
+                    decoded_counts[source_id] = decoded_counts[source_id].saturating_add(1);
+                }
+
+                if encoded_rows.is_empty() {
+                    continue;
+                }
+
+                decoded_rows_len = encoded_rows.len();
+                for (source_id, encoded, commit_ack) in encoded_rows {
+                    encoded_batches_by_source[source_id].push((encoded, 1));
+                    if let Some(ack) = commit_ack {
+                        commit_acks_by_source[source_id].push(ack);
+                    }
+                }
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
             metrics::observe_decode_latency_ms(decode_latency_ms);
@@ -1326,7 +1753,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 tracing::info!(
                     epoch = pending_epoch,
                     batch_size = batch_len,
-                    decoded_rows = encoded_rows.len(),
+                    decoded_rows = decoded_rows_len,
                     decode_latency_ms,
                     time_to_first_nonempty_decode_ms =
                         executor_loop_started.elapsed().as_millis() as u64,
@@ -1334,23 +1761,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 );
             }
             tracing::debug!(
-                decoded_rows = encoded_rows.len(),
+                decoded_rows = decoded_rows_len,
                 latency_ms = decode_latency_ms,
                 "decoded ingest batch"
             );
 
-            if encoded_rows.is_empty() {
+            if decoded_rows_len == 0 {
                 continue;
-            }
-
-            let decoded_rows_len = encoded_rows.len();
-            let mut encoded_batches_by_source = vec![Vec::new(); source_count];
-            let mut commit_acks_by_source = vec![Vec::new(); source_count];
-            for (source_id, encoded, commit_ack) in encoded_rows {
-                encoded_batches_by_source[source_id].push((encoded, 1));
-                if let Some(ack) = commit_ack {
-                    commit_acks_by_source[source_id].push(ack);
-                }
             }
             let mut registry = outer_for_task.lock().await;
             let mut changed = false;
@@ -1557,13 +1974,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 })
                 .collect();
             let checkpoint_write_start = Instant::now();
-            if let Err(err) = checkpoint_manager
-                .persist_tick_commit_with_source_batches(
-                    tick_commit,
-                    &source_journal_commit_batches,
-                )
-                .await
-            {
+            let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
+                checkpoint_manager
+                    .persist_tick_commit_with_source_batches_and_staged_writes(
+                        tick_commit,
+                        &source_journal_commit_batches,
+                        staged_writes,
+                    )
+                    .await
+            } else {
+                checkpoint_manager
+                    .persist_tick_commit_with_source_batches(
+                        tick_commit,
+                        &source_journal_commit_batches,
+                    )
+                    .await
+            };
+            if let Err(err) = checkpoint_result {
                 metrics::observe_tick_phase_latency_ms(
                     "checkpoint_write",
                     checkpoint_write_start.elapsed().as_millis() as u64,

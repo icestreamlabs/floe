@@ -317,7 +317,7 @@ fn row_value_to_json(value: &Option<RowValue>) -> Value {
     }
 }
 
-async fn stored_slot_start_lsn(connection_string: &str, slot: &str) -> Result<PostgresLsn> {
+pub async fn stored_slot_start_lsn(connection_string: &str, slot: &str) -> Result<PostgresLsn> {
     let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
         .await
         .context("connect Postgres control plane for native CDC")?;
@@ -352,7 +352,7 @@ async fn stored_slot_start_lsn(connection_string: &str, slot: &str) -> Result<Po
     PostgresLsn::parse(&lsn)
 }
 
-fn replication_config_from_connection_string(
+pub fn replication_config_from_connection_string(
     connection_string: &str,
     slot: &str,
     publication: &str,

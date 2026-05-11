@@ -240,6 +240,29 @@ pub(super) async fn recv_from_ready(
     true
 }
 
+pub(super) async fn recv_cdc_from_ready(
+    receiver: &mut mpsc::Receiver<QueuedCdcTransaction>,
+    queue: &mut VecDeque<QueuedCdcTransaction>,
+) -> bool {
+    let Some(transaction) = receiver.recv().await else {
+        return false;
+    };
+    queue.push_back(transaction);
+    true
+}
+
+pub(super) fn drain_cdc_ready(
+    receiver: &mut mpsc::Receiver<QueuedCdcTransaction>,
+    queue: &mut VecDeque<QueuedCdcTransaction>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(transaction) => queue.push_back(transaction),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 pub(super) fn drain_ready(
     receiver: &mut core_source::RoutedSourceEventReceiver,
     queues: &mut [ConnectorQueue],

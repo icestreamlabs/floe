@@ -53,8 +53,8 @@ docker exec "${CONTAINER_NAME}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
   -c "SHOW max_replication_slots;" \
   -c "SHOW max_wal_senders;"
 
-echo "Running Floe binary native Postgres CDC e2e test"
-TEST_ARGS=(-p floe-node --test ga_acceptance postgres_cdc_to_mv_to_file_sink_acceptance -- --ignored --nocapture)
+echo "Running Floe binary native Postgres CDC e2e tests"
+TEST_ARGS=(-p floe-node --test ga_acceptance postgres_cdc -- --ignored --nocapture --test-threads=1)
 if [[ "${FLOE_TEST_RELEASE}" == "1" ]]; then
   TEST_ARGS=(--release "${TEST_ARGS[@]}")
 fi

@@ -51,7 +51,47 @@ pub(super) fn source_definition_from_table(
 }
 
 pub(super) fn source_definition_has_primary_key(definition: &SourceDefinition) -> bool {
-    definition.property(SOURCE_PRIMARY_KEY_PROPERTY).is_some()
+    source_definition_primary_key_columns(definition).is_some()
+}
+
+pub(super) fn source_definition_primary_key_columns(
+    definition: &SourceDefinition,
+) -> Option<Vec<String>> {
+    let columns = definition
+        .property(SOURCE_PRIMARY_KEY_PROPERTY)?
+        .split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!columns.is_empty()).then_some(columns)
+}
+
+pub(super) fn cdc_table_schema_from_source_definition(
+    definition: &SourceDefinition,
+    upstream_table: UpstreamTableRef,
+) -> anyhow::Result<CdcTableSchema> {
+    let columns = definition
+        .columns()
+        .iter()
+        .map(|column| {
+            CdcColumn::new(
+                column.name(),
+                column.data_type().column_type(),
+                column.nullable(),
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let primary_key = CdcPrimaryKey::new(
+        source_definition_primary_key_columns(definition)
+            .ok_or_else(|| anyhow!("source '{}' has no primary key", definition.name()))?,
+    )?;
+    CdcTableSchema::new(
+        CdcTableId::new(definition.name())?,
+        upstream_table,
+        columns,
+        primary_key,
+    )
 }
 
 pub(super) fn resolve_output_consolidation_mode(
@@ -131,6 +171,7 @@ pub(super) async fn register_source_tables(
                 definition.name(),
             );
         }
+        let _ = session.deregister_table(definition.name());
         session
             .register_table(definition.name(), Arc::new(provider))
             .with_context(|| format!("register source table {}", definition.name()))?;
@@ -151,6 +192,7 @@ pub(super) async fn register_source_tables(
                     definition.name(),
                 );
             }
+            let _ = session.deregister_table(short_name);
             session
                 .register_table(short_name, Arc::new(alias_provider))
                 .with_context(|| {

@@ -250,6 +250,7 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
 
 #[tokio::test]
 #[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
 async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
@@ -378,6 +379,185 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     test_result
 }
 
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let table = "nexmark_bid".to_string();
+    let mv_name = format!("mv_floe_cdc_bid_{run_id}");
+    let slot = format!("floe_acceptance_native_{run_id}");
+    let publication = format!("floe_acceptance_native_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let sink_path = temp_dir.path().join("cdc_native_sink.jsonl");
+    let config_path = temp_dir.path().join("cdc_native_file_sink_acceptance.json");
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for native cdc acceptance setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres native cdc acceptance setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
+        ))
+        .await
+        .context("prepare native cdc acceptance table")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    client
+        .query_one(
+            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&slot],
+        )
+        .await
+        .context("create native pgoutput replication slot")?;
+
+    let config = json!({
+        "connectors": [
+            {
+                "type": "postgres_cdc",
+                "connection": dsn,
+                "slot": slot,
+                "publication": publication,
+                "include_tables": [table]
+            }
+        ],
+        "sinks": [
+            {
+                "type": "file",
+                "mv": mv_name,
+                "path": sink_path,
+                "with_snapshot": true,
+                "append": true
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .context("write native cdc acceptance config")?;
+
+    let sql = format!(
+        "CREATE TABLE {table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         );
+         CREATE MATERIALIZED VIEW {mv_name} AS SELECT auction, bidder, price FROM {table}"
+    );
+    let mut child = spawn_node_with_env(
+        &config_path,
+        &data_dir,
+        0,
+        Some(&sql),
+        &[("FLOE_DISABLE_PGWIRE".to_string(), "1".to_string())],
+    )
+    .await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (auction, bidder, price, channel, url, date_time, extra) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                ),
+                &[
+                    &1_i64,
+                    &10_i64,
+                    &100_i64,
+                    &"web",
+                    &"http://example.com",
+                    &1_700_000_001_i64,
+                    &"open",
+                ],
+            )
+            .await
+            .context("insert native cdc row")?;
+        wait_for_rows_matching(&sink_path, |value| {
+            value.get("__op").and_then(Value::as_i64) == Some(1)
+                && value.get("auction").and_then(Value::as_i64) == Some(1)
+                && value.get("bidder").and_then(Value::as_i64) == Some(10)
+                && value.get("price").and_then(Value::as_i64) == Some(100)
+        })
+        .await?;
+
+        client
+            .execute(
+                &format!("UPDATE {table} SET price = $1, extra = $2 WHERE auction = $3"),
+                &[&150_i64, &"paid", &1_i64],
+            )
+            .await
+            .context("update native cdc row")?;
+        wait_for_rows_matching(&sink_path, |value| {
+            value.get("__op").and_then(Value::as_i64) == Some(-1)
+                && value.get("auction").and_then(Value::as_i64) == Some(1)
+                && value.get("price").and_then(Value::as_i64) == Some(100)
+        })
+        .await?;
+        wait_for_rows_matching(&sink_path, |value| {
+            value.get("__op").and_then(Value::as_i64) == Some(1)
+                && value.get("auction").and_then(Value::as_i64) == Some(1)
+                && value.get("price").and_then(Value::as_i64) == Some(150)
+        })
+        .await?;
+
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE auction = $1"),
+                &[&1_i64],
+            )
+            .await
+            .context("delete native cdc row")?;
+        wait_for_rows_matching(&sink_path, |value| {
+            value.get("__op").and_then(Value::as_i64) == Some(-1)
+                && value.get("auction").and_then(Value::as_i64) == Some(1)
+                && value.get("price").and_then(Value::as_i64) == Some(150)
+        })
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+        .await;
+    test_result
+}
+
 #[derive(Clone)]
 struct SinkCaptureState {
     sender: mpsc::Sender<Value>,
@@ -445,8 +625,16 @@ async fn spawn_node_with_env(
         .arg("run")
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(if std::env::var_os("FLOE_TEST_NODE_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if std::env::var_os("FLOE_TEST_NODE_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
     for (key, value) in extra_env {
         cmd.env(key, value);
     }

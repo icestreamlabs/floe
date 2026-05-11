@@ -300,24 +300,41 @@ impl CheckpointStore {
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
     ) -> Result<()> {
         let mut batch = WriteBatch::new();
+        self.stage_tick_commit_with_source_batches(&mut batch, commit, source_batches)?;
+        self.table
+            .write_batch(batch)
+            .await
+            .context("persist tick commit batch")
+    }
+
+    pub async fn persist_tick_commit_with_source_batches_and_staged_writes(
+        &self,
+        commit: &TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        mut batch: WriteBatch,
+    ) -> Result<()> {
+        self.stage_tick_commit_with_source_batches(&mut batch, commit, source_batches)?;
+        self.table
+            .write_batch(batch)
+            .await
+            .context("persist tick commit batch with staged writes")
+    }
+
+    fn stage_tick_commit_with_source_batches(
+        &self,
+        batch: &mut WriteBatch,
+        commit: &TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+    ) -> Result<()> {
         for (source, max_event_time_ms, deltas) in source_batches {
-            append_entry_to_batch(
-                &mut batch,
-                source,
-                commit.tick_id,
-                *max_event_time_ms,
-                deltas,
-            )?;
+            append_entry_to_batch(batch, source, commit.tick_id, *max_event_time_ms, deltas)?;
         }
         let commit_key = self.tick_commit_key(commit.tick_id);
         let serialized = serde_json::to_vec(commit).context("serialize tick commit to JSON")?;
         batch.put(commit_key, serialized);
         let latest_key = self.latest_tick_commit_key();
         batch.put(latest_key, commit.tick_id.to_be_bytes());
-        self.table
-            .write_batch(batch)
-            .await
-            .context("persist tick commit batch")
+        Ok(())
     }
 
     pub async fn load_latest_tick_commit(&self) -> Result<Option<TickCommit>> {
@@ -579,6 +596,27 @@ impl CheckpointManager {
     ) -> Result<()> {
         self.store
             .persist_tick_commit_with_source_batches(&commit, source_batches)
+            .await?;
+        for cursor in &commit.sink_cursors {
+            self.sink_cursors
+                .insert(cursor.sink.clone(), cursor.clone());
+        }
+        self.latest_tick_commit = Some(commit);
+        Ok(())
+    }
+
+    pub async fn persist_tick_commit_with_source_batches_and_staged_writes(
+        &mut self,
+        commit: TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        batch: WriteBatch,
+    ) -> Result<()> {
+        self.store
+            .persist_tick_commit_with_source_batches_and_staged_writes(
+                &commit,
+                source_batches,
+                batch,
+            )
             .await?;
         for cursor in &commit.sink_cursors {
             self.sink_cursors

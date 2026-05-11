@@ -13,6 +13,15 @@ use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{CompactionSchedulerConfig, StreamRetention};
+use floe_cdc::CdcTableStore;
+use floe_cdc_core::{
+    CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, TransactionBatch,
+    UpstreamTableRef,
+};
+use floe_cdc_pg::{
+    PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent, PostgresTableRouter,
+    PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
+};
 use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
@@ -25,6 +34,7 @@ use floe_executor::{
     OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
     ValidatedPlan, plan_source_requirements, source_batch_journal_root_sources, validate_dbsp_plan,
 };
+use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
 #[cfg(test)]
@@ -38,7 +48,7 @@ use floe_node_core::planner::{
 };
 use floe_node_core::postgres_cdc_connector::{
     PostgresCdcCommit, PostgresCdcConnector, PostgresCdcConnectorConfig, PostgresSlotCommit,
-    default_postgres_publication,
+    default_postgres_publication, replication_config_from_connection_string, stored_slot_start_lsn,
 };
 use floe_node_core::tail_client;
 use floe_server as server;
@@ -47,6 +57,7 @@ use floe_sql_parser::{
     parse_floe_program,
 };
 use floe_storage::MaterializedViewMetadata;
+use slatedb::WriteBatch;
 use slatedb::config::{CompactorOptions, Settings};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -113,6 +124,18 @@ struct SelectedSourceEvent {
 struct BatchSelection {
     batch: Vec<SelectedSourceEvent>,
     per_connector_counts: Vec<usize>,
+}
+
+struct QueuedCdcTransaction {
+    slot: String,
+    source_id: CdcSourceId,
+    transaction: TransactionBatch,
+}
+
+#[derive(Clone)]
+struct PostgresCdcRuntimePlan {
+    source_id: CdcSourceId,
+    schemas: HashMap<CdcTableId, CdcTableSchema>,
 }
 
 impl ConnectorQueue {
