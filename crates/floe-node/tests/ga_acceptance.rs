@@ -558,6 +558,313 @@ async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
     test_result
 }
 
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_table_restart_resumes_from_committed_lsn() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pg_port = find_unused_port()?;
+    let table = "nexmark_bid".to_string();
+    let mv_name = format!("mv_floe_cdc_restart_{run_id}");
+    let slot = format!("floe_acceptance_restart_{run_id}");
+    let publication = format!("floe_acceptance_restart_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("cdc_restart_acceptance.json");
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for native cdc restart setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres native cdc restart setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
+        ))
+        .await
+        .context("prepare native cdc restart table")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    client
+        .query_one(
+            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&slot],
+        )
+        .await
+        .context("create native pgoutput restart replication slot")?;
+
+    let config = json!({
+        "connectors": [
+            {
+                "type": "postgres_cdc",
+                "connection": dsn,
+                "slot": slot,
+                "publication": publication,
+                "include_tables": [table]
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .context("write native cdc restart config")?;
+
+    let sql = format!(
+        "CREATE TABLE {table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         );
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} AS
+         SELECT auction, bidder, price FROM {table}"
+    );
+    let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+
+    let first_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (auction, bidder, price, channel, url, date_time, extra) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                ),
+                &[
+                    &11_i64,
+                    &20_i64,
+                    &100_i64,
+                    &"web",
+                    &"http://example.com",
+                    &1_700_000_011_i64,
+                    &"before_restart",
+                ],
+            )
+            .await
+            .context("insert native cdc restart row")?;
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 11, 100, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stop_child(&mut first, "INT").await;
+    first_result?;
+
+    let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+    let restart_result = async {
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 11, 100, 1).await?;
+        assert_eq!(
+            query_mv_price_count(pg_port, &mv_name, 11, 100).await?,
+            1,
+            "restarted CDC MV should expose the committed pre-restart row once"
+        );
+
+        client
+            .execute(
+                &format!("UPDATE {table} SET price = $1, extra = $2 WHERE auction = $3"),
+                &[&175_i64, &"after_restart", &11_i64],
+            )
+            .await
+            .context("update native cdc row after restart")?;
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 11, 175, 1).await?;
+        assert_eq!(
+            query_mv_price_count(pg_port, &mv_name, 11, 100).await?,
+            0,
+            "post-restart CDC update should retract the old MV row"
+        );
+        assert_eq!(
+            query_mv_price_count(pg_port, &mv_name, 11, 175).await?,
+            1,
+            "post-restart CDC update should insert the new MV row once"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stop_child(&mut restarted, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+        .await;
+    restart_result
+}
+
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_shared_source_transaction_feeds_multiple_mvs() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pg_port = find_unused_port()?;
+    let bid_table = "nexmark_bid".to_string();
+    let auction_table = "nexmark_auction".to_string();
+    let bid_mv = format!("mv_floe_cdc_shared_bid_{run_id}");
+    let auction_mv = format!("mv_floe_cdc_shared_auction_{run_id}");
+    let slot = format!("floe_acceptance_join_{run_id}");
+    let publication = format!("floe_acceptance_join_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("cdc_join_acceptance.json");
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for shared-source cdc setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres shared-source cdc setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {bid_table};
+             DROP TABLE IF EXISTS {auction_table};
+             CREATE TABLE {auction_table} (
+               id BIGINT PRIMARY KEY,
+               seller BIGINT NOT NULL,
+               category BIGINT NOT NULL,
+               initial_bid BIGINT NOT NULL,
+               reserve BIGINT NOT NULL,
+               item_name TEXT,
+               description TEXT,
+               expires BIGINT NOT NULL,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE TABLE {bid_table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {auction_table}, {bid_table};"
+        ))
+        .await
+        .context("prepare shared-source cdc tables")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    client
+        .query_one(
+            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&slot],
+        )
+        .await
+        .context("create shared-source pgoutput replication slot")?;
+
+    let config = json!({
+        "connectors": [
+            {
+                "type": "postgres_cdc",
+                "connection": dsn,
+                "slot": slot,
+                "publication": publication,
+                "include_tables": [auction_table, bid_table]
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .context("write shared-source cdc config")?;
+
+    let sql = format!(
+        "CREATE TABLE {auction_table} (
+            id BIGINT PRIMARY KEY,
+            seller BIGINT NOT NULL,
+            category BIGINT NOT NULL,
+            initial_bid BIGINT NOT NULL,
+            reserve BIGINT NOT NULL,
+            item_name TEXT,
+            description TEXT,
+            expires BIGINT NOT NULL,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         );
+         CREATE TABLE {bid_table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         );
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {bid_mv} AS
+         SELECT auction, bidder, price FROM {bid_table};
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {auction_mv} AS
+         SELECT id, seller FROM {auction_table}"
+    );
+    let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .batch_execute(&format!(
+                "BEGIN;
+                 INSERT INTO {auction_table}
+                   (id, seller, category, initial_bid, reserve, item_name, description, expires, date_time, extra)
+                   VALUES (21, 9001, 17, 100, 500, 'item', 'description', 1700100021, 1700000021, 'auction');
+                 INSERT INTO {bid_table}
+                   (auction, bidder, price, channel, url, date_time, extra)
+                   VALUES (21, 42, 650, 'web', 'http://example.com', 1700000021, 'bid');
+                 COMMIT;"
+            ))
+            .await
+            .context("commit shared-source cdc transaction")?;
+        wait_for_mv_price_count_at_least(pg_port, &bid_mv, 21, 650, 1).await?;
+        wait_for_auction_seller_count_at_least(pg_port, &auction_mv, 21, 9001, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {bid_table};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {auction_table};"))
+        .await;
+    test_result
+}
+
 #[derive(Clone)]
 struct SinkCaptureState {
     sender: mpsc::Sender<Value>,
@@ -833,6 +1140,90 @@ async fn query_join_count(pg_port: u16, auction: i64) -> Result<i64> {
         )
         .await
         .context("query acceptance join mv count")?;
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    Ok(row.get::<_, i64>(0))
+}
+
+async fn wait_for_mv_price_count_at_least(
+    pg_port: u16,
+    mv_name: &str,
+    auction: i64,
+    price: i64,
+    min_count: i64,
+) -> Result<i64> {
+    for _ in 0..120 {
+        match query_mv_price_count(pg_port, mv_name, auction, price).await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!(
+        "timed out waiting for {mv_name} count >= {min_count} for auction={auction}, price={price}"
+    );
+}
+
+async fn query_mv_price_count(
+    pg_port: u16,
+    mv_name: &str,
+    auction: i64,
+    price: i64,
+) -> Result<i64> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+        NoTls,
+    )
+    .await
+    .context("connect to pgwire")?;
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let query = format!("SELECT COUNT(*) FROM {mv_name} WHERE auction = $1 AND price = $2");
+    let row = client
+        .query_one(&query, &[&auction, &price])
+        .await
+        .with_context(|| format!("query {mv_name} count"))?;
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    Ok(row.get::<_, i64>(0))
+}
+
+async fn wait_for_auction_seller_count_at_least(
+    pg_port: u16,
+    mv_name: &str,
+    id: i64,
+    seller: i64,
+    min_count: i64,
+) -> Result<i64> {
+    for _ in 0..120 {
+        match query_auction_seller_count(pg_port, mv_name, id, seller).await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!("timed out waiting for {mv_name} count >= {min_count} for id={id}, seller={seller}");
+}
+
+async fn query_auction_seller_count(
+    pg_port: u16,
+    mv_name: &str,
+    id: i64,
+    seller: i64,
+) -> Result<i64> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+        NoTls,
+    )
+    .await
+    .context("connect to pgwire")?;
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let query = format!("SELECT COUNT(*) FROM {mv_name} WHERE id = $1 AND seller = $2");
+    let row = client
+        .query_one(&query, &[&id, &seller])
+        .await
+        .with_context(|| format!("query {mv_name} auction count"))?;
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(row.get::<_, i64>(0))
