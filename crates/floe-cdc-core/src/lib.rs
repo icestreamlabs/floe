@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Result, bail, ensure};
 use floe_core::RowValue;
@@ -171,6 +171,118 @@ impl CdcSourceSemantics {
             bail!("{:?} tables require a primary key", self.category);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcSourceDefinition {
+    source_id: CdcSourceId,
+    connector: String,
+    semantics: CdcSourceSemantics,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+impl CdcSourceDefinition {
+    pub fn new(
+        source_id: CdcSourceId,
+        connector: impl Into<String>,
+        semantics: CdcSourceSemantics,
+    ) -> Result<Self> {
+        let connector = connector.into();
+        ensure!(
+            !connector.trim().is_empty(),
+            "CDC source connector cannot be empty"
+        );
+        Ok(Self {
+            source_id,
+            connector,
+            semantics,
+            properties: BTreeMap::new(),
+        })
+    }
+
+    pub fn postgres(source_id: CdcSourceId) -> Result<Self> {
+        Self::new(
+            source_id,
+            "postgres-cdc",
+            CdcSourceSemantics::for_category(CdcSourceCategory::NativeDatabaseCdc),
+        )
+    }
+
+    pub fn source_id(&self) -> &CdcSourceId {
+        &self.source_id
+    }
+
+    pub fn connector(&self) -> &str {
+        &self.connector
+    }
+
+    pub fn semantics(&self) -> CdcSourceSemantics {
+        self.semantics
+    }
+
+    pub fn properties(&self) -> &BTreeMap<String, String> {
+        &self.properties
+    }
+
+    pub fn property(&self, key: &str) -> Option<&str> {
+        self.properties.get(key).map(String::as_str)
+    }
+
+    pub fn with_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        self.set_property(key, value)?;
+        Ok(self)
+    }
+
+    pub fn set_property(&mut self, key: impl Into<String>, value: impl Into<String>) -> Result<()> {
+        let key = key.into();
+        ensure!(
+            !key.trim().is_empty(),
+            "CDC source property key cannot be empty"
+        );
+        self.properties.insert(key, value.into());
+        Ok(())
+    }
+
+    pub fn validate_table_definition(&self, table: &CdcTableDefinition) -> Result<()> {
+        ensure!(
+            table.source_id() == &self.source_id,
+            "CDC table '{}' belongs to source '{}', not '{}'",
+            table.table_id().as_str(),
+            table.source_id().as_str(),
+            self.source_id.as_str()
+        );
+        self.semantics
+            .validate_table_primary_key(Some(table.schema().primary_key()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcTableDefinition {
+    source_id: CdcSourceId,
+    schema: CdcTableSchema,
+}
+
+impl CdcTableDefinition {
+    pub fn new(source_id: CdcSourceId, schema: CdcTableSchema) -> Self {
+        Self { source_id, schema }
+    }
+
+    pub fn source_id(&self) -> &CdcSourceId {
+        &self.source_id
+    }
+
+    pub fn table_id(&self) -> &CdcTableId {
+        self.schema.table_id()
+    }
+
+    pub fn schema(&self) -> &CdcTableSchema {
+        &self.schema
     }
 }
 
@@ -770,6 +882,53 @@ mod tests {
             .expect("stateless direct query should be allowed");
         assert!(semantics.validate_direct_query(true).is_err());
         assert!(semantics.validate_table_primary_key(None).is_err());
+    }
+
+    #[test]
+    fn source_definitions_record_connector_semantics_and_properties() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let source = CdcSourceDefinition::postgres(source_id.clone())
+            .expect("source")
+            .with_property("slot.name", "floe_slot")
+            .expect("property")
+            .with_property("publication.name", "floe_pub")
+            .expect("property");
+
+        assert_eq!(source.source_id(), &source_id);
+        assert_eq!(source.connector(), "postgres-cdc");
+        assert_eq!(
+            source.semantics().category(),
+            CdcSourceCategory::NativeDatabaseCdc
+        );
+        assert_eq!(source.property("slot.name"), Some("floe_slot"));
+        assert!(
+            CdcSourceDefinition::new(
+                source_id,
+                "",
+                CdcSourceSemantics::for_category(CdcSourceCategory::NativeDatabaseCdc)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_definitions_validate_owned_table_definitions() {
+        let source = CdcSourceDefinition::postgres(CdcSourceId::new("pg_main").expect("source id"))
+            .expect("source");
+        let table = CdcTableDefinition::new(source.source_id().clone(), orders_schema());
+        source
+            .validate_table_definition(&table)
+            .expect("table should match source semantics");
+
+        let other_source_table = CdcTableDefinition::new(
+            CdcSourceId::new("pg_other").expect("source id"),
+            table.schema().clone(),
+        );
+        assert!(
+            source
+                .validate_table_definition(&other_source_table)
+                .is_err()
+        );
     }
 
     #[test]

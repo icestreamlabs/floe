@@ -4,11 +4,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use dbsp_storage::storage::KeyValueTable;
 use floe_cdc_core::{
-    CdcChange, CdcCheckpoint, CdcRow, CdcRowKey, CdcSourceId, CdcTableId, CdcTableSchema,
-    ChangeBatch, TransactionBatch,
+    CdcChange, CdcCheckpoint, CdcRow, CdcRowKey, CdcSourceDefinition, CdcSourceId,
+    CdcTableDefinition, CdcTableId, CdcTableSchema, ChangeBatch, TransactionBatch,
 };
 use serde::Deserialize;
 use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 
 const CDC_PREFIX: &[u8] = b"floe_cdc/v1/";
 
@@ -70,6 +71,134 @@ impl CdcApplyResult {
 
     pub fn already_committed(&self) -> bool {
         self.already_committed
+    }
+}
+
+#[derive(Clone)]
+pub struct CdcMetadataStore {
+    table: Arc<dyn KeyValueTable>,
+}
+
+impl CdcMetadataStore {
+    pub fn new(table: Arc<dyn KeyValueTable>) -> Self {
+        Self { table }
+    }
+
+    pub async fn upsert_source(&self, source: &CdcSourceDefinition) -> Result<()> {
+        let encoded = serde_json::to_vec(source).with_context(|| {
+            format!(
+                "encode CDC source metadata for '{}'",
+                source.source_id().as_str()
+            )
+        })?;
+        self.table
+            .put(&source_metadata_key(source.source_id()), &encoded)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist CDC source metadata for '{}'",
+                    source.source_id().as_str()
+                )
+            })
+    }
+
+    pub async fn load_source(
+        &self,
+        source_id: &CdcSourceId,
+    ) -> Result<Option<CdcSourceDefinition>> {
+        let Some(bytes) = self
+            .table
+            .get(&source_metadata_key(source_id))
+            .await
+            .with_context(|| format!("load CDC source metadata for '{}'", source_id.as_str()))?
+        else {
+            return Ok(None);
+        };
+        decode_json(&bytes, "CDC source metadata")
+    }
+
+    pub async fn sources(&self) -> Result<Vec<CdcSourceDefinition>> {
+        self.table
+            .scan_prefix(source_metadata_prefix().as_slice(), &ScanOptions::default())
+            .await
+            .context("scan CDC source metadata")?
+            .into_iter()
+            .map(|(_, value)| decode_json_value(&value, "CDC source metadata"))
+            .collect()
+    }
+
+    pub async fn upsert_table(&self, table_definition: &CdcTableDefinition) -> Result<()> {
+        let source = self
+            .load_source(table_definition.source_id())
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "CDC source '{}' does not exist",
+                    table_definition.source_id().as_str()
+                )
+            })?;
+        source.validate_table_definition(table_definition)?;
+
+        let previous = self.load_table(table_definition.table_id()).await?;
+        let encoded = serde_json::to_vec(table_definition).with_context(|| {
+            format!(
+                "encode CDC table metadata for '{}'",
+                table_definition.table_id().as_str()
+            )
+        })?;
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            table_metadata_key(table_definition.table_id()),
+            encoded.clone(),
+        );
+        batch.put(
+            source_table_index_key(table_definition.source_id(), table_definition.table_id()),
+            encoded,
+        );
+        if let Some(previous) = previous
+            && previous.source_id() != table_definition.source_id()
+        {
+            batch.delete(source_table_index_key(
+                previous.source_id(),
+                previous.table_id(),
+            ));
+        }
+
+        self.table.write_batch(batch).await.with_context(|| {
+            format!(
+                "persist CDC table metadata for '{}'",
+                table_definition.table_id().as_str()
+            )
+        })
+    }
+
+    pub async fn load_table(&self, table_id: &CdcTableId) -> Result<Option<CdcTableDefinition>> {
+        let Some(bytes) = self
+            .table
+            .get(&table_metadata_key(table_id))
+            .await
+            .with_context(|| format!("load CDC table metadata for '{}'", table_id.as_str()))?
+        else {
+            return Ok(None);
+        };
+        decode_json(&bytes, "CDC table metadata")
+    }
+
+    pub async fn tables_for_source(
+        &self,
+        source_id: &CdcSourceId,
+    ) -> Result<Vec<CdcTableDefinition>> {
+        self.table
+            .scan_prefix(
+                source_table_index_prefix(source_id).as_slice(),
+                &ScanOptions::default(),
+            )
+            .await
+            .with_context(|| format!("scan CDC table metadata for '{}'", source_id.as_str()))?
+            .into_iter()
+            .map(|(_, value)| decode_json_value(&value, "CDC table metadata"))
+            .collect()
     }
 }
 
@@ -311,6 +440,38 @@ fn stage_delete_row(
     overlay.insert(storage_key, None);
 }
 
+fn source_metadata_prefix() -> Vec<u8> {
+    let mut key = CDC_PREFIX.to_vec();
+    key.extend_from_slice(b"meta/source/");
+    key
+}
+
+fn source_metadata_key(source_id: &CdcSourceId) -> Vec<u8> {
+    let mut key = source_metadata_prefix();
+    push_component(&mut key, source_id.as_str().as_bytes());
+    key
+}
+
+fn table_metadata_key(table_id: &CdcTableId) -> Vec<u8> {
+    let mut key = CDC_PREFIX.to_vec();
+    key.extend_from_slice(b"meta/table/");
+    push_component(&mut key, table_id.as_str().as_bytes());
+    key
+}
+
+fn source_table_index_prefix(source_id: &CdcSourceId) -> Vec<u8> {
+    let mut key = CDC_PREFIX.to_vec();
+    key.extend_from_slice(b"meta/source_table/");
+    push_component(&mut key, source_id.as_str().as_bytes());
+    key
+}
+
+fn source_table_index_key(source_id: &CdcSourceId, table_id: &CdcTableId) -> Vec<u8> {
+    let mut key = source_table_index_prefix(source_id);
+    push_component(&mut key, table_id.as_str().as_bytes());
+    key
+}
+
 fn checkpoint_key(source_id: &CdcSourceId) -> Vec<u8> {
     let mut key = CDC_PREFIX.to_vec();
     key.extend_from_slice(b"checkpoint/");
@@ -341,22 +502,31 @@ fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Resul
         .map(Some)
 }
 
+fn decode_json_value<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Result<T> {
+    serde_json::from_slice(bytes).with_context(|| format!("decode {label} from JSON"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dbsp_storage::storage::SlateTable;
     use floe_cdc_core::{
-        CdcColumn, CdcPrimaryKey, CdcSourcePosition, CdcTransactionId, UpstreamTableRef,
+        CdcColumn, CdcPrimaryKey, CdcSourceDefinition, CdcSourcePosition, CdcTableDefinition,
+        CdcTransactionId, UpstreamTableRef,
     };
     use floe_core::RowValue;
     use floe_core::catalog::ColumnType;
     use object_store::memory::InMemory;
     use slatedb::Db;
 
-    async fn test_store(name: &str) -> CdcTableStore {
+    async fn test_table(name: &str) -> Arc<dyn KeyValueTable> {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open(name, object_store).await.expect("open SlateDB"));
-        CdcTableStore::new(Arc::new(SlateTable::new(db)))
+        Arc::new(SlateTable::new(db))
+    }
+
+    async fn test_store(name: &str) -> CdcTableStore {
+        CdcTableStore::new(test_table(name).await)
     }
 
     fn orders_schema() -> CdcTableSchema {
@@ -399,6 +569,148 @@ mod tests {
             batches,
         )
         .expect("transaction")
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trips_sources_tables_and_checkpoints() {
+        let table = test_table("cdc-metadata-round-trip").await;
+        let metadata = CdcMetadataStore::new(Arc::clone(&table));
+        let apply_store = CdcTableStore::new(Arc::clone(&table));
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let source = CdcSourceDefinition::postgres(source_id.clone())
+            .expect("source")
+            .with_property("slot.name", "floe_slot")
+            .expect("slot property")
+            .with_property("publication.name", "floe_publication")
+            .expect("publication property");
+        metadata
+            .upsert_source(&source)
+            .await
+            .expect("persist source");
+
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let table_definition = CdcTableDefinition::new(source_id.clone(), schema.clone());
+        metadata
+            .upsert_table(&table_definition)
+            .await
+            .expect("persist table");
+
+        let transaction = tx(
+            "0/50",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(50, Some(5000), Some("open")),
+                    }],
+                )
+                .expect("batch"),
+            ],
+        );
+        let checkpoint = apply_store
+            .apply_transaction(&schemas(schema), &transaction)
+            .await
+            .expect("apply transaction")
+            .checkpoint()
+            .clone();
+
+        let reloaded_metadata = CdcMetadataStore::new(Arc::clone(&table));
+        let reloaded_apply_store = CdcTableStore::new(table);
+        assert_eq!(
+            reloaded_metadata
+                .load_source(&source_id)
+                .await
+                .expect("load source"),
+            Some(source.clone())
+        );
+        assert_eq!(
+            reloaded_metadata.sources().await.expect("load sources"),
+            vec![source]
+        );
+        assert_eq!(
+            reloaded_metadata
+                .load_table(&table_id)
+                .await
+                .expect("load table"),
+            Some(table_definition.clone())
+        );
+        assert_eq!(
+            reloaded_metadata
+                .tables_for_source(&source_id)
+                .await
+                .expect("load source tables"),
+            vec![table_definition]
+        );
+        assert_eq!(
+            reloaded_apply_store
+                .load_checkpoint(&source_id)
+                .await
+                .expect("load checkpoint"),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_rejects_missing_source_and_moves_source_index() {
+        let table = test_table("cdc-metadata-index").await;
+        let metadata = CdcMetadataStore::new(table);
+        let pg_main = CdcSourceId::new("pg_main").expect("source id");
+        let pg_other = CdcSourceId::new("pg_other").expect("source id");
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let table_definition = CdcTableDefinition::new(pg_main.clone(), schema.clone());
+
+        let err = metadata
+            .upsert_table(&table_definition)
+            .await
+            .expect_err("table should require source metadata first");
+        assert!(format!("{err:#}").contains("does not exist"));
+
+        metadata
+            .upsert_source(&CdcSourceDefinition::postgres(pg_main.clone()).expect("source"))
+            .await
+            .expect("persist main source");
+        metadata
+            .upsert_source(&CdcSourceDefinition::postgres(pg_other.clone()).expect("source"))
+            .await
+            .expect("persist other source");
+        metadata
+            .upsert_table(&table_definition)
+            .await
+            .expect("persist table on main source");
+        assert_eq!(
+            metadata
+                .tables_for_source(&pg_main)
+                .await
+                .expect("main tables")
+                .len(),
+            1
+        );
+
+        let moved = CdcTableDefinition::new(pg_other.clone(), schema);
+        metadata
+            .upsert_table(&moved)
+            .await
+            .expect("move table to other source");
+        assert!(
+            metadata
+                .tables_for_source(&pg_main)
+                .await
+                .expect("main tables")
+                .is_empty()
+        );
+        assert_eq!(
+            metadata
+                .tables_for_source(&pg_other)
+                .await
+                .expect("other tables"),
+            vec![moved.clone()]
+        );
+        assert_eq!(
+            metadata.load_table(&table_id).await.expect("load table"),
+            Some(moved)
+        );
     }
 
     #[tokio::test]
