@@ -20,3 +20,4 @@ dbsp-storage = { path = "../dbsp-storage" }
 object_store = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
+tokio-postgres = { workspace = true }
