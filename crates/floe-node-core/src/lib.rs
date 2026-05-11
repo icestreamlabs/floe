@@ -1,3 +1,4 @@
+pub mod cdc_delta_encoder;
 pub mod connector;
 pub mod event_parser;
 pub mod executor;

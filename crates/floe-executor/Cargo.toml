@@ -32,6 +32,8 @@ regex = "1.11"
 criterion = "0.5"
 arrow-schema = { workspace = true }
 dbsp-semantic = { path = "../dbsp-semantic" }
+floe-cdc = { path = "../floe-cdc" }
+floe-cdc-core = { path = "../floe-cdc-core" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 proptest = "1.5"
 serial_test = "3"

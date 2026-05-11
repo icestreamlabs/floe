@@ -44,6 +44,10 @@ pub struct CdcTableDeltas {
 }
 
 impl CdcTableDeltas {
+    pub fn new(table_id: CdcTableId, deltas: Vec<CdcRowDelta>) -> Self {
+        Self { table_id, deltas }
+    }
+
     pub fn table_id(&self) -> &CdcTableId {
         &self.table_id
     }

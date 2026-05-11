@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use floe_core::RowValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 use serde_json::Value;
 
@@ -85,12 +86,98 @@ impl SourceRowDecoder {
         Ok((buf, event_ts))
     }
 
+    pub fn encode_row_values(
+        &self,
+        values: &[Option<RowValue>],
+    ) -> Result<(Vec<u8>, Option<Timestamp>)> {
+        if values.len() != self.definition.columns().len() {
+            bail!(
+                "source row value count {} does not match definition '{}' column count {}",
+                values.len(),
+                self.definition.name(),
+                self.definition.columns().len()
+            );
+        }
+
+        let mut buf = Vec::with_capacity(64);
+        let count = u32::try_from(self.definition.columns().len())
+            .context("too many source columns to encode")?;
+        buf.extend_from_slice(&count.to_le_bytes());
+        let mut event_ts = None;
+        for (idx, (column, value)) in self.definition.columns().iter().zip(values).enumerate() {
+            if !self.column_required(idx) {
+                encode_typed_null(&mut buf, column.data_type());
+                continue;
+            }
+            encode_row_value_direct(
+                &mut buf,
+                column.name(),
+                column.data_type(),
+                value.as_ref(),
+                column.nullable(),
+                &mut event_ts,
+            )?;
+        }
+        Ok((buf, event_ts))
+    }
+
     fn column_required(&self, idx: usize) -> bool {
         self.encoded_required_columns
             .as_ref()
             .and_then(|columns| columns.get(idx))
             .copied()
             .unwrap_or(true)
+    }
+}
+
+fn encode_row_value_direct(
+    buf: &mut Vec<u8>,
+    column_name: &str,
+    data_type: &SourceDataType,
+    value: Option<&RowValue>,
+    nullable: bool,
+    event_ts: &mut Option<Timestamp>,
+) -> Result<()> {
+    match value {
+        None if nullable => {
+            encode_typed_null(buf, data_type);
+            Ok(())
+        }
+        None => bail!("null value violates non-nullable column '{column_name}'"),
+        Some(RowValue::Int64(number)) if matches!(data_type, SourceDataType::Int64) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&number.to_le_bytes());
+            Ok(())
+        }
+        Some(RowValue::Utf8(string)) if matches!(data_type, SourceDataType::Utf8) => {
+            buf.push(0x02);
+            let bytes = string.as_bytes();
+            let len = u32::try_from(bytes.len()).context("utf8 value too large for MV key")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
+            Ok(())
+        }
+        Some(RowValue::TimestampMillis(number))
+            if matches!(data_type, SourceDataType::TimestampMillis) =>
+        {
+            buf.push(0x03);
+            buf.extend_from_slice(&number.to_le_bytes());
+            if event_ts.is_none() && *number >= 0 {
+                *event_ts = Some(*number as u64);
+            }
+            Ok(())
+        }
+        Some(RowValue::Bool(flag)) if matches!(data_type, SourceDataType::Bool) => {
+            buf.push(0x04);
+            buf.push(if *flag { 1 } else { 0 });
+            Ok(())
+        }
+        Some(value) => bail!(
+            "source row value for column '{}' does not match type {:?}: {:?}",
+            column_name,
+            data_type,
+            value
+        ),
     }
 }
 
@@ -169,6 +256,7 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
 
 #[cfg(test)]
 mod tests {
+    use floe_core::RowValue;
     use floe_core::source::{SourceColumn, SourceDataType};
     use serde_json::json;
 
@@ -383,5 +471,81 @@ mod tests {
             Some(EncodedRowScalar::TimestampMillis(1_700_000_000))
         );
         assert_eq!(direct_ts, Some(1_700_000_000_u64));
+    }
+
+    #[test]
+    fn typed_row_encoding_matches_json_event_encoding() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note", SourceDataType::Utf8, true),
+                SourceColumn::new_nullable("created_at", SourceDataType::TimestampMillis, false),
+                SourceColumn::new_nullable("enabled", SourceDataType::Bool, false),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+        let event = SourceEvent::new(
+            "orders",
+            json!({
+                "id": 42,
+                "note": null,
+                "created_at": 1_700_000_000_i64,
+                "enabled": true
+            }),
+        );
+        let row_values = vec![
+            Some(RowValue::Int64(42)),
+            None,
+            Some(RowValue::TimestampMillis(1_700_000_000)),
+            Some(RowValue::Bool(true)),
+        ];
+
+        let json_encoded = decoder.encode_row_key(&event).expect("json encode");
+        let typed_encoded = decoder
+            .encode_row_values(&row_values)
+            .expect("typed row encode");
+
+        assert_eq!(typed_encoded, json_encoded);
+        let decoded = decode_test_row(&typed_encoded.0);
+        assert_eq!(decoded[0], Some(EncodedRowScalar::Int64(42)));
+        assert_eq!(decoded[1], None);
+        assert_eq!(
+            decoded[2],
+            Some(EncodedRowScalar::TimestampMillis(1_700_000_000))
+        );
+        assert_eq!(decoded[3], Some(EncodedRowScalar::Bool(true)));
+    }
+
+    #[test]
+    fn typed_row_encoding_rejects_wrong_shape_and_types() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note", SourceDataType::Utf8, true),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition);
+
+        let err = decoder
+            .encode_row_values(&[Some(RowValue::Int64(42))])
+            .expect_err("row shape should fail");
+        assert!(err.to_string().contains("value count"));
+
+        let err = decoder
+            .encode_row_values(&[Some(RowValue::Utf8("oops".to_string())), None])
+            .expect_err("wrong type should fail");
+        assert!(err.to_string().contains("does not match type"));
+
+        let err = decoder
+            .encode_row_values(&[None, None])
+            .expect_err("null primary column should fail");
+        assert!(
+            err.to_string()
+                .contains("null value violates non-nullable column 'id'")
+        );
     }
 }
