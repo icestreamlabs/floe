@@ -13,7 +13,9 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
 mod pgoutput;
+mod transaction;
 pub use pgoutput::*;
+pub use transaction::*;
 
 const DEFAULT_POSTGRES_PORT: u16 = 5432;
 const DEFAULT_STATUS_INTERVAL_MS: u64 = 1_000;

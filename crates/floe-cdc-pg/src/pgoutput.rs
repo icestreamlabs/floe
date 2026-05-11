@@ -114,6 +114,10 @@ impl PgOutputRelation {
         &self.columns
     }
 
+    pub fn upstream_table_ref(&self) -> Result<UpstreamTableRef> {
+        UpstreamTableRef::new(self.upstream_schema_name(), self.name())
+    }
+
     pub fn to_cdc_schema(&self, table_id: CdcTableId) -> Result<CdcTableSchema> {
         let columns = self
             .columns
@@ -132,12 +136,7 @@ impl PgOutputRelation {
                 .filter(|column| column.is_key())
                 .map(|column| column.name()),
         )?;
-        CdcTableSchema::new(
-            table_id,
-            UpstreamTableRef::new(self.upstream_schema_name(), self.name())?,
-            columns,
-            primary_key,
-        )
+        CdcTableSchema::new(table_id, self.upstream_table_ref()?, columns, primary_key)
     }
 
     pub fn tuple_to_cdc_row(&self, tuple: &PgOutputTuple) -> Result<CdcRow> {
