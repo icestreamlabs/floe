@@ -12,6 +12,9 @@ use pgwire_replication::{
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
+mod pgoutput;
+pub use pgoutput::*;
+
 const DEFAULT_POSTGRES_PORT: u16 = 5432;
 const DEFAULT_STATUS_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_IDLE_WAKEUP_INTERVAL_MS: u64 = 10_000;

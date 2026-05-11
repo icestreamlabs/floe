@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow = { workspace = true }
 bytes = { workspace = true }
 floe-cdc-core = { path = "../floe-cdc-core" }
+floe-core = { path = "../floe-core" }
 pgwire-replication = { workspace = true }
 serde = { workspace = true }
 

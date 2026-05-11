@@ -2107,6 +2107,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "floe-cdc-core",
+ "floe-core",
  "pgwire-replication",
  "serde",
  "serde_json",
