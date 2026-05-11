@@ -2105,6 +2105,7 @@ name = "floe-cdc-pg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "dbsp-storage",
  "floe-cdc",
@@ -2116,6 +2117,7 @@ dependencies = [
  "serde_json",
  "slatedb",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

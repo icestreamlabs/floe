@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use floe_cdc::{CdcApplyResult, CdcTableStore};
 use floe_cdc_core::{
     CdcChange, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId,
@@ -8,8 +10,8 @@ use floe_cdc_core::{
 };
 
 use crate::{
-    PgOutputCdcChange, PgOutputDecoder, PostgresLsn, PostgresReplicationClient,
-    PostgresReplicationEvent,
+    PgOutputCdcChange, PgOutputDecoder, PostgresCdcConfig, PostgresLsn, PostgresReplicationClient,
+    PostgresReplicationEvent, config_with_stored_cdc_checkpoint,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +80,11 @@ impl PostgresTransactionAssembler {
 
     pub fn decoder(&self) -> &PgOutputDecoder {
         &self.decoder
+    }
+
+    pub fn reset_stream_state(&mut self) {
+        self.decoder = PgOutputDecoder::new();
+        self.current = None;
     }
 
     fn begin(&mut self, xid: u32) -> Result<()> {
@@ -180,6 +187,10 @@ impl PostgresCdcEventApplier {
     pub fn schemas(&self) -> &HashMap<CdcTableId, CdcTableSchema> {
         &self.schemas
     }
+
+    pub fn reset_stream_state(&mut self) {
+        self.assembler.reset_stream_state();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,17 +223,137 @@ impl PostgresCdcApplyOutcome {
     }
 }
 
-pub async fn run_postgres_cdc_apply_loop(
-    client: &mut PostgresReplicationClient,
+#[async_trait]
+pub trait PostgresReplicationStream {
+    async fn recv_event(&mut self) -> Result<Option<PostgresReplicationEvent>>;
+    fn update_applied_lsn(&mut self, lsn: PostgresLsn);
+}
+
+#[async_trait]
+impl PostgresReplicationStream for PostgresReplicationClient {
+    async fn recv_event(&mut self) -> Result<Option<PostgresReplicationEvent>> {
+        self.recv().await
+    }
+
+    fn update_applied_lsn(&mut self, lsn: PostgresLsn) {
+        PostgresReplicationClient::update_applied_lsn(self, lsn);
+    }
+}
+
+pub async fn run_postgres_cdc_apply_loop<C>(
+    client: &mut C,
     applier: &mut PostgresCdcEventApplier,
-) -> Result<()> {
-    while let Some(event) = client.recv().await? {
+) -> Result<()>
+where
+    C: PostgresReplicationStream + Send,
+{
+    while let Some(event) = client.recv_event().await? {
         let outcome = applier.accept_event(event).await?;
         if let Some(feedback_lsn) = outcome.feedback_lsn() {
             client.update_applied_lsn(feedback_lsn);
         }
     }
     Ok(())
+}
+
+#[async_trait]
+pub trait PostgresReplicationClientFactory {
+    type Stream: PostgresReplicationStream + Send;
+
+    async fn connect(&self, config: &PostgresCdcConfig) -> Result<Self::Stream>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PgWireReplicationClientFactory;
+
+#[async_trait]
+impl PostgresReplicationClientFactory for PgWireReplicationClientFactory {
+    type Stream = PostgresReplicationClient;
+
+    async fn connect(&self, config: &PostgresCdcConfig) -> Result<Self::Stream> {
+        PostgresReplicationClient::connect(config).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresCdcReconnectPolicy {
+    max_reconnects: usize,
+    retry_delay: Duration,
+}
+
+impl PostgresCdcReconnectPolicy {
+    pub fn new(max_reconnects: usize, retry_delay: Duration) -> Self {
+        Self {
+            max_reconnects,
+            retry_delay,
+        }
+    }
+
+    pub fn max_reconnects(&self) -> usize {
+        self.max_reconnects
+    }
+
+    pub fn retry_delay(&self) -> Duration {
+        self.retry_delay
+    }
+}
+
+impl Default for PostgresCdcReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            max_reconnects: 10,
+            retry_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+pub async fn run_postgres_cdc_apply_loop_with_reconnect<F>(
+    base_config: PostgresCdcConfig,
+    source_id: &CdcSourceId,
+    table_store: &CdcTableStore,
+    applier: &mut PostgresCdcEventApplier,
+    factory: &F,
+    policy: PostgresCdcReconnectPolicy,
+) -> Result<()>
+where
+    F: PostgresReplicationClientFactory + Sync,
+{
+    let mut reconnects = 0usize;
+    loop {
+        let config =
+            config_with_stored_cdc_checkpoint(base_config.clone(), table_store, source_id).await?;
+        let mut client = factory.connect(&config).await.with_context(|| {
+            format!(
+                "connect Postgres CDC replication stream from LSN {:?}",
+                config.start_lsn()
+            )
+        })?;
+
+        match run_postgres_cdc_apply_loop(&mut client, applier).await {
+            Ok(()) => return Ok(()),
+            Err(err) if reconnects < policy.max_reconnects => {
+                reconnects += 1;
+                applier.reset_stream_state();
+                if !policy.retry_delay.is_zero() {
+                    tokio::time::sleep(policy.retry_delay).await;
+                }
+                tracing::warn!(
+                    error = %err,
+                    reconnects,
+                    max_reconnects = policy.max_reconnects,
+                    "Postgres CDC stream failed; reconnecting from durable checkpoint"
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Postgres CDC stream failed after {} reconnect attempt(s)",
+                        reconnects
+                    )
+                });
+            }
+        }
+    }
 }
 
 struct InFlightTransaction {
@@ -265,13 +396,16 @@ struct TableChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use bytes::Bytes;
     use dbsp_storage::storage::{KeyValueTable, SlateTable};
     use floe_cdc_core::{CdcRow, CdcRowKey, UpstreamTableRef};
     use floe_core::RowValue;
     use object_store::memory::InMemory;
     use slatedb::Db;
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use crate::{PgOutputMessage, decode_pgoutput_message};
 
@@ -396,6 +530,80 @@ mod tests {
         let db = Arc::new(Db::open(name, object_store).await.expect("open SlateDB"));
         let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
         CdcTableStore::new(table)
+    }
+
+    enum FakeStep {
+        Event(PostgresReplicationEvent),
+        End,
+        Error(&'static str),
+    }
+
+    struct FakeStream {
+        steps: VecDeque<FakeStep>,
+        feedbacks: Arc<Mutex<Vec<PostgresLsn>>>,
+    }
+
+    impl FakeStream {
+        fn new(
+            steps: impl IntoIterator<Item = FakeStep>,
+            feedbacks: Arc<Mutex<Vec<PostgresLsn>>>,
+        ) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                feedbacks,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PostgresReplicationStream for FakeStream {
+        async fn recv_event(&mut self) -> Result<Option<PostgresReplicationEvent>> {
+            match self.steps.pop_front().unwrap_or(FakeStep::End) {
+                FakeStep::Event(event) => Ok(Some(event)),
+                FakeStep::End => Ok(None),
+                FakeStep::Error(message) => Err(anyhow!(message)),
+            }
+        }
+
+        fn update_applied_lsn(&mut self, lsn: PostgresLsn) {
+            self.feedbacks.lock().expect("feedback lock").push(lsn);
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeFactory {
+        streams: Arc<Mutex<VecDeque<FakeStream>>>,
+        configs: Arc<Mutex<Vec<PostgresCdcConfig>>>,
+    }
+
+    impl FakeFactory {
+        fn new(streams: impl IntoIterator<Item = FakeStream>) -> Self {
+            Self {
+                streams: Arc::new(Mutex::new(streams.into_iter().collect())),
+                configs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn configs(&self) -> Vec<PostgresCdcConfig> {
+            self.configs.lock().expect("configs lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl PostgresReplicationClientFactory for FakeFactory {
+        type Stream = FakeStream;
+
+        async fn connect(&self, config: &PostgresCdcConfig) -> Result<Self::Stream> {
+            self.configs
+                .lock()
+                .expect("configs lock")
+                .push(config.clone());
+            self.streams
+                .lock()
+                .expect("streams lock")
+                .pop_front()
+                .ok_or_else(|| anyhow!("no fake stream configured"))
+        }
     }
 
     #[test]
@@ -603,5 +811,110 @@ mod tests {
                 .expect("load checkpoint"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn apply_loop_ignores_idle_events_and_feedbacks_after_commit() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-loop-feedback").await;
+        let mut applier = PostgresCdcEventApplier::new(source_id, table_store, orders_schemas());
+        let feedbacks = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = FakeStream::new(
+            [
+                FakeStep::Event(PostgresReplicationEvent::KeepAlive {
+                    wal_end: PostgresLsn::from_u64(11),
+                    reply_requested: true,
+                    server_time_micros: 1,
+                }),
+                FakeStep::Event(xlog(relation_message(RELATION_ID, "orders"))),
+                FakeStep::Event(begin(60)),
+                FakeStep::Event(xlog(insert_message(RELATION_ID, 11, "open"))),
+                FakeStep::Event(PostgresReplicationEvent::Message {
+                    transactional: false,
+                    lsn: PostgresLsn::from_u64(12),
+                    prefix: "noop".to_string(),
+                    content: Bytes::new(),
+                }),
+                FakeStep::Event(commit(80)),
+                FakeStep::End,
+            ],
+            Arc::clone(&feedbacks),
+        );
+
+        run_postgres_cdc_apply_loop(&mut stream, &mut applier)
+            .await
+            .expect("run apply loop");
+        assert_eq!(
+            *feedbacks.lock().expect("feedback lock"),
+            vec![PostgresLsn::from_u64(80)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_reloads_checkpoint_as_next_start_lsn() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-loop-reconnect").await;
+        let mut applier =
+            PostgresCdcEventApplier::new(source_id.clone(), table_store.clone(), orders_schemas());
+        let feedbacks = Arc::new(Mutex::new(Vec::new()));
+        let first_stream = FakeStream::new(
+            [
+                FakeStep::Event(xlog(relation_message(RELATION_ID, "orders"))),
+                FakeStep::Event(begin(61)),
+                FakeStep::Event(xlog(insert_message(RELATION_ID, 12, "open"))),
+                FakeStep::Event(commit(90)),
+                FakeStep::Error("disconnect"),
+            ],
+            Arc::clone(&feedbacks),
+        );
+        let second_stream = FakeStream::new([FakeStep::End], Arc::clone(&feedbacks));
+        let factory = FakeFactory::new([first_stream, second_stream]);
+
+        run_postgres_cdc_apply_loop_with_reconnect(
+            PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+                .expect("config"),
+            &source_id,
+            &table_store,
+            &mut applier,
+            &factory,
+            PostgresCdcReconnectPolicy::new(1, Duration::ZERO),
+        )
+        .await
+        .expect("run reconnect loop");
+
+        assert_eq!(
+            *feedbacks.lock().expect("feedback lock"),
+            vec![PostgresLsn::from_u64(90)]
+        );
+        let configs = factory.configs();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].start_lsn(), None);
+        assert_eq!(configs[1].start_lsn(), Some(PostgresLsn::from_u64(90)));
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_errors_after_max_reconnects() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-loop-reconnect-exhausted").await;
+        let mut applier =
+            PostgresCdcEventApplier::new(source_id.clone(), table_store.clone(), orders_schemas());
+        let feedbacks = Arc::new(Mutex::new(Vec::new()));
+        let factory = FakeFactory::new([
+            FakeStream::new([FakeStep::Error("disconnect 1")], Arc::clone(&feedbacks)),
+            FakeStream::new([FakeStep::Error("disconnect 2")], feedbacks),
+        ]);
+
+        let err = run_postgres_cdc_apply_loop_with_reconnect(
+            PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+                .expect("config"),
+            &source_id,
+            &table_store,
+            &mut applier,
+            &factory,
+            PostgresCdcReconnectPolicy::new(1, Duration::ZERO),
+        )
+        .await
+        .expect_err("reconnects should be exhausted");
+        assert!(format!("{err:#}").contains("failed after 1 reconnect"));
     }
 }
