@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
-use floe_cdc_core::CdcSourcePosition;
+use floe_cdc::CdcTableStore;
+use floe_cdc_core::{CdcCheckpoint, CdcSourceId, CdcSourcePosition};
 use pgwire_replication::{
     Lsn as PgWireLsn, ReplicationClient, ReplicationConfig,
     ReplicationEvent as PgWireReplicationEvent, TlsConfig,
@@ -215,6 +216,18 @@ impl PostgresCdcConfig {
         self
     }
 
+    pub fn with_start_position(mut self, position: &CdcSourcePosition) -> Result<Self> {
+        self.start_lsn = Some(PostgresLsn::from_source_position(position)?);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_start_checkpoint(mut self, checkpoint: &CdcCheckpoint) -> Result<Self> {
+        self.start_lsn = Some(PostgresLsn::from_source_position(checkpoint.position())?);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn with_stop_lsn(mut self, stop_lsn: PostgresLsn) -> Self {
         self.stop_lsn = Some(stop_lsn);
         self
@@ -299,6 +312,17 @@ impl PostgresCdcConfig {
             buffer_events: self.buffer_events,
         })
     }
+}
+
+pub async fn config_with_stored_cdc_checkpoint(
+    config: PostgresCdcConfig,
+    table_store: &CdcTableStore,
+    source_id: &CdcSourceId,
+) -> Result<PostgresCdcConfig> {
+    let Some(checkpoint) = table_store.load_checkpoint(source_id).await? else {
+        return Ok(config);
+    };
+    config.with_start_checkpoint(&checkpoint)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +482,62 @@ fn millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use dbsp_storage::storage::{KeyValueTable, SlateTable};
+    use floe_cdc_core::{
+        CdcChange, CdcColumn, CdcPrimaryKey, CdcRow, CdcTableId, CdcTableSchema, CdcTransactionId,
+        ChangeBatch, TransactionBatch, UpstreamTableRef,
+    };
+    use floe_core::RowValue;
+    use floe_core::catalog::ColumnType;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+
+    async fn test_store(name: &str) -> CdcTableStore {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, object_store).await.expect("open SlateDB"));
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+        CdcTableStore::new(table)
+    }
+
+    fn orders_schema() -> CdcTableSchema {
+        CdcTableSchema::new(
+            CdcTableId::new("orders").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).expect("id column"),
+                CdcColumn::new("status", ColumnType::Utf8, true).expect("status column"),
+            ],
+            CdcPrimaryKey::new(["id"]).expect("primary key"),
+        )
+        .expect("schema")
+    }
+
+    fn checkpoint_transaction(source_id: CdcSourceId, position: &str) -> TransactionBatch {
+        let schema = orders_schema();
+        TransactionBatch::new(
+            source_id,
+            Some(CdcTransactionId::new(format!("tx-{position}")).expect("txid")),
+            None,
+            CdcSourcePosition::postgres(position, None).expect("position"),
+            vec![
+                ChangeBatch::new(
+                    schema.table_id().clone(),
+                    vec![CdcChange::Insert {
+                        row: CdcRow::new([
+                            Some(RowValue::Int64(1)),
+                            Some(RowValue::Utf8("open".to_string())),
+                        ])
+                        .expect("row"),
+                    }],
+                )
+                .expect("change batch"),
+            ],
+        )
+        .expect("transaction")
+    }
 
     #[test]
     fn postgres_lsn_parses_formats_and_serializes_as_pg_lsn() {
@@ -524,6 +604,56 @@ mod tests {
         assert_eq!(pgwire.status_interval, Duration::from_millis(250));
         assert_eq!(pgwire.idle_wakeup_interval, Duration::from_millis(500));
         assert_eq!(pgwire.buffer_events, 64);
+    }
+
+    #[test]
+    fn config_can_resume_from_cdc_checkpoint() {
+        let checkpoint = CdcCheckpoint::new(
+            CdcSourceId::new("pg_main").expect("source id"),
+            CdcSourcePosition::postgres("0/80", None).expect("position"),
+            None,
+        );
+        let config = PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+            .expect("config")
+            .with_start_checkpoint(&checkpoint)
+            .expect("resume from checkpoint");
+        assert_eq!(config.start_lsn(), Some(PostgresLsn::from_u64(0x80)));
+        assert_eq!(
+            PostgresLsn::from(config.to_replication_config().expect("pgwire").start_lsn),
+            PostgresLsn::from_u64(0x80)
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_checkpoint_configures_start_lsn() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-config-checkpoint").await;
+        let schema = orders_schema();
+        table_store
+            .apply_transaction(
+                &HashMap::from([(schema.table_id().clone(), schema)]),
+                &checkpoint_transaction(source_id.clone(), "0/90"),
+            )
+            .await
+            .expect("apply checkpoint transaction");
+
+        let config = PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+            .expect("config");
+        let resumed = config_with_stored_cdc_checkpoint(config, &table_store, &source_id)
+            .await
+            .expect("resume config");
+        assert_eq!(resumed.start_lsn(), Some(PostgresLsn::from_u64(0x90)));
+
+        let no_checkpoint_source = CdcSourceId::new("pg_other").expect("source id");
+        let unchanged = config_with_stored_cdc_checkpoint(
+            PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+                .expect("config"),
+            &table_store,
+            &no_checkpoint_source,
+        )
+        .await
+        .expect("no checkpoint config");
+        assert_eq!(unchanged.start_lsn(), None);
     }
 
     #[test]
