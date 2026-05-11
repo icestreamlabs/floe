@@ -1,0 +1,974 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{Result, bail, ensure};
+use floe_core::RowValue;
+use floe_core::catalog::ColumnType;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CdcSourceId(String);
+
+impl CdcSourceId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(!value.trim().is_empty(), "CDC source id cannot be empty");
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CdcTableId(String);
+
+impl CdcTableId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(!value.trim().is_empty(), "CDC table id cannot be empty");
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct UpstreamTableRef {
+    schema: String,
+    table: String,
+}
+
+impl UpstreamTableRef {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Result<Self> {
+        let schema = schema.into();
+        let table = table.into();
+        ensure!(
+            !schema.trim().is_empty(),
+            "upstream table schema cannot be empty"
+        );
+        ensure!(
+            !table.trim().is_empty(),
+            "upstream table name cannot be empty"
+        );
+        Ok(Self { schema, table })
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcSourceCategory {
+    AppendOnly,
+    Upsert,
+    NativeDatabaseCdc,
+    Changelog,
+    ObjectBatch,
+    ExternalTable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectQuerySupport {
+    Full,
+    StatelessOnly,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableMaterializationRequirement {
+    Optional,
+    RequiredForStatefulQueries,
+    AlwaysRequired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcSourceSemantics {
+    category: CdcSourceCategory,
+    direct_query_support: DirectQuerySupport,
+    table_materialization: TableMaterializationRequirement,
+    primary_key_required_for_table: bool,
+}
+
+impl CdcSourceSemantics {
+    pub fn for_category(category: CdcSourceCategory) -> Self {
+        match category {
+            CdcSourceCategory::AppendOnly => Self {
+                category,
+                direct_query_support: DirectQuerySupport::Full,
+                table_materialization: TableMaterializationRequirement::Optional,
+                primary_key_required_for_table: false,
+            },
+            CdcSourceCategory::Upsert => Self {
+                category,
+                direct_query_support: DirectQuerySupport::StatelessOnly,
+                table_materialization: TableMaterializationRequirement::RequiredForStatefulQueries,
+                primary_key_required_for_table: true,
+            },
+            CdcSourceCategory::NativeDatabaseCdc => Self {
+                category,
+                direct_query_support: DirectQuerySupport::None,
+                table_materialization: TableMaterializationRequirement::AlwaysRequired,
+                primary_key_required_for_table: true,
+            },
+            CdcSourceCategory::Changelog => Self {
+                category,
+                direct_query_support: DirectQuerySupport::StatelessOnly,
+                table_materialization: TableMaterializationRequirement::RequiredForStatefulQueries,
+                primary_key_required_for_table: true,
+            },
+            CdcSourceCategory::ObjectBatch | CdcSourceCategory::ExternalTable => Self {
+                category,
+                direct_query_support: DirectQuerySupport::Full,
+                table_materialization: TableMaterializationRequirement::Optional,
+                primary_key_required_for_table: false,
+            },
+        }
+    }
+
+    pub fn category(&self) -> CdcSourceCategory {
+        self.category
+    }
+
+    pub fn direct_query_support(&self) -> DirectQuerySupport {
+        self.direct_query_support
+    }
+
+    pub fn table_materialization(&self) -> TableMaterializationRequirement {
+        self.table_materialization
+    }
+
+    pub fn primary_key_required_for_table(&self) -> bool {
+        self.primary_key_required_for_table
+    }
+
+    pub fn validate_direct_query(&self, stateful: bool) -> Result<()> {
+        match (self.direct_query_support, stateful) {
+            (DirectQuerySupport::Full, _) | (DirectQuerySupport::StatelessOnly, false) => Ok(()),
+            (DirectQuerySupport::StatelessOnly, true) => bail!(
+                "{:?} sources must be materialized as tables before stateful queries",
+                self.category
+            ),
+            (DirectQuerySupport::None, _) => bail!(
+                "{:?} sources must be materialized as tables before they can be queried",
+                self.category
+            ),
+        }
+    }
+
+    pub fn validate_table_primary_key(&self, primary_key: Option<&CdcPrimaryKey>) -> Result<()> {
+        if self.primary_key_required_for_table && primary_key.is_none() {
+            bail!("{:?} tables require a primary key", self.category);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcPrimaryKey {
+    columns: Vec<String>,
+}
+
+impl CdcPrimaryKey {
+    pub fn new(columns: impl IntoIterator<Item = impl Into<String>>) -> Result<Self> {
+        let columns: Vec<String> = columns.into_iter().map(Into::into).collect();
+        ensure!(!columns.is_empty(), "CDC primary key cannot be empty");
+
+        let mut seen = HashSet::new();
+        for column in &columns {
+            ensure!(
+                !column.trim().is_empty(),
+                "CDC primary key column cannot be empty"
+            );
+            if !seen.insert(column.as_str()) {
+                bail!("duplicate CDC primary key column '{column}'");
+            }
+        }
+
+        Ok(Self { columns })
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn contains_column(&self, column: &str) -> bool {
+        self.columns.iter().any(|existing| existing == column)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcColumn {
+    name: String,
+    data_type: ColumnType,
+    nullable: bool,
+}
+
+impl CdcColumn {
+    pub fn new(name: impl Into<String>, data_type: ColumnType, nullable: bool) -> Result<Self> {
+        let name = name.into();
+        ensure!(!name.trim().is_empty(), "CDC column name cannot be empty");
+        Ok(Self {
+            name,
+            data_type,
+            nullable,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &ColumnType {
+        &self.data_type
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcTableSchema {
+    table_id: CdcTableId,
+    upstream_table: UpstreamTableRef,
+    columns: Vec<CdcColumn>,
+    primary_key: CdcPrimaryKey,
+}
+
+impl CdcTableSchema {
+    pub fn new(
+        table_id: CdcTableId,
+        upstream_table: UpstreamTableRef,
+        columns: Vec<CdcColumn>,
+        primary_key: CdcPrimaryKey,
+    ) -> Result<Self> {
+        ensure!(!columns.is_empty(), "CDC table schema must have columns");
+
+        let mut seen = HashSet::new();
+        for column in &columns {
+            if !seen.insert(column.name()) {
+                bail!("duplicate CDC column '{}'", column.name());
+            }
+        }
+
+        for key_column in primary_key.columns() {
+            let Some(column) = columns.iter().find(|column| column.name() == key_column) else {
+                bail!("CDC primary key column '{key_column}' is not in table schema");
+            };
+            if column.nullable() {
+                bail!("CDC primary key column '{key_column}' cannot be nullable");
+            }
+        }
+
+        Ok(Self {
+            table_id,
+            upstream_table,
+            columns,
+            primary_key,
+        })
+    }
+
+    pub fn table_id(&self) -> &CdcTableId {
+        &self.table_id
+    }
+
+    pub fn upstream_table(&self) -> &UpstreamTableRef {
+        &self.upstream_table
+    }
+
+    pub fn columns(&self) -> &[CdcColumn] {
+        &self.columns
+    }
+
+    pub fn primary_key(&self) -> &CdcPrimaryKey {
+        &self.primary_key
+    }
+
+    pub fn column_index(&self, column_name: &str) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.name() == column_name)
+    }
+
+    pub fn primary_key_indices(&self) -> Vec<usize> {
+        self.primary_key
+            .columns()
+            .iter()
+            .map(|column| {
+                self.column_index(column)
+                    .expect("CDC table schema validated primary-key columns")
+            })
+            .collect()
+    }
+
+    pub fn validate_row(&self, row: &CdcRow) -> Result<()> {
+        ensure!(
+            row.values().len() == self.columns.len(),
+            "CDC row length {} does not match table '{}' column count {}",
+            row.values().len(),
+            self.table_id().as_str(),
+            self.columns.len()
+        );
+        for (idx, (column, value)) in self.columns.iter().zip(row.values()).enumerate() {
+            match value {
+                Some(value) if column.data_type().matches_value(value) => {}
+                Some(_) => bail!(
+                    "CDC row value at column '{}' (index {idx}) does not match type {:?}",
+                    column.name(),
+                    column.data_type()
+                ),
+                None if column.nullable() => {}
+                None => bail!("CDC row column '{}' cannot be NULL", column.name()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn primary_key_from_row(&self, row: &CdcRow) -> Result<CdcRowKey> {
+        self.validate_row(row)?;
+        let mut values = Vec::with_capacity(self.primary_key.columns().len());
+        for idx in self.primary_key_indices() {
+            let column = &self.columns[idx];
+            let Some(value) = row.values()[idx].clone() else {
+                bail!("CDC primary key column '{}' cannot be NULL", column.name());
+            };
+            values.push(value);
+        }
+        CdcRowKey::new(values)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcRow {
+    values: Vec<Option<RowValue>>,
+}
+
+impl CdcRow {
+    pub fn new(values: impl IntoIterator<Item = Option<RowValue>>) -> Result<Self> {
+        let values: Vec<Option<RowValue>> = values.into_iter().collect();
+        ensure!(!values.is_empty(), "CDC row cannot be empty");
+        Ok(Self { values })
+    }
+
+    pub fn values(&self) -> &[Option<RowValue>] {
+        &self.values
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcRowKey {
+    values: Vec<RowValue>,
+}
+
+impl CdcRowKey {
+    pub fn new(values: impl IntoIterator<Item = RowValue>) -> Result<Self> {
+        let values: Vec<RowValue> = values.into_iter().collect();
+        ensure!(!values.is_empty(), "CDC row key cannot be empty");
+        Ok(Self { values })
+    }
+
+    pub fn values(&self) -> &[RowValue] {
+        &self.values
+    }
+
+    pub fn validate_against_schema(&self, schema: &CdcTableSchema) -> Result<()> {
+        let indices = schema.primary_key_indices();
+        ensure!(
+            self.values.len() == indices.len(),
+            "CDC row key length {} does not match primary-key column count {}",
+            self.values.len(),
+            indices.len()
+        );
+        for (value, column_idx) in self.values.iter().zip(indices) {
+            let column = &schema.columns()[column_idx];
+            if !column.data_type().matches_value(value) {
+                bail!(
+                    "CDC row key value for column '{}' does not match type {:?}",
+                    column.name(),
+                    column.data_type()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CdcChange {
+    Insert {
+        row: CdcRow,
+    },
+    Update {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<CdcRowKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<CdcRow>,
+        after: CdcRow,
+    },
+    Delete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<CdcRowKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<CdcRow>,
+    },
+    Truncate,
+}
+
+impl CdcChange {
+    pub fn operation(&self) -> CdcOperation {
+        match self {
+            CdcChange::Insert { .. } => CdcOperation::Insert,
+            CdcChange::Update { .. } => CdcOperation::Update,
+            CdcChange::Delete { .. } => CdcOperation::Delete,
+            CdcChange::Truncate => CdcOperation::Truncate,
+        }
+    }
+
+    pub fn validate_against_schema(&self, schema: &CdcTableSchema) -> Result<()> {
+        match self {
+            CdcChange::Insert { row } => {
+                schema.validate_row(row)?;
+                schema.primary_key_from_row(row)?;
+            }
+            CdcChange::Update { key, before, after } => {
+                if let Some(key) = key {
+                    key.validate_against_schema(schema)?;
+                }
+                if let Some(before) = before {
+                    schema.validate_row(before)?;
+                    schema.primary_key_from_row(before)?;
+                }
+                schema.validate_row(after)?;
+                schema.primary_key_from_row(after)?;
+            }
+            CdcChange::Delete { key, before } => {
+                ensure!(
+                    key.is_some() || before.is_some(),
+                    "CDC delete requires a key or before row"
+                );
+                if let Some(key) = key {
+                    key.validate_against_schema(schema)?;
+                }
+                if let Some(before) = before {
+                    schema.validate_row(before)?;
+                    schema.primary_key_from_row(before)?;
+                }
+            }
+            CdcChange::Truncate => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeBatch {
+    table_id: CdcTableId,
+    changes: Vec<CdcChange>,
+}
+
+impl ChangeBatch {
+    pub fn new(table_id: CdcTableId, changes: Vec<CdcChange>) -> Result<Self> {
+        ensure!(!changes.is_empty(), "CDC change batch cannot be empty");
+        Ok(Self { table_id, changes })
+    }
+
+    pub fn table_id(&self) -> &CdcTableId {
+        &self.table_id
+    }
+
+    pub fn changes(&self) -> &[CdcChange] {
+        &self.changes
+    }
+
+    pub fn validate_against_schema(&self, schema: &CdcTableSchema) -> Result<()> {
+        ensure!(
+            &self.table_id == schema.table_id(),
+            "CDC change batch table '{}' does not match schema table '{}'",
+            self.table_id.as_str(),
+            schema.table_id().as_str()
+        );
+        for change in &self.changes {
+            change.validate_against_schema(schema)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcTransactionId(String);
+
+impl CdcTransactionId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(
+            !value.trim().is_empty(),
+            "CDC transaction id cannot be empty"
+        );
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionBatch {
+    source_id: CdcSourceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<CdcTransactionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_position: Option<CdcSourcePosition>,
+    commit_position: CdcSourcePosition,
+    change_batches: Vec<ChangeBatch>,
+}
+
+impl TransactionBatch {
+    pub fn new(
+        source_id: CdcSourceId,
+        transaction_id: Option<CdcTransactionId>,
+        start_position: Option<CdcSourcePosition>,
+        commit_position: CdcSourcePosition,
+        change_batches: Vec<ChangeBatch>,
+    ) -> Result<Self> {
+        ensure!(
+            !change_batches.is_empty(),
+            "CDC transaction batch cannot be empty"
+        );
+        Ok(Self {
+            source_id,
+            transaction_id,
+            start_position,
+            commit_position,
+            change_batches,
+        })
+    }
+
+    pub fn source_id(&self) -> &CdcSourceId {
+        &self.source_id
+    }
+
+    pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.transaction_id.as_ref()
+    }
+
+    pub fn start_position(&self) -> Option<&CdcSourcePosition> {
+        self.start_position.as_ref()
+    }
+
+    pub fn commit_position(&self) -> &CdcSourcePosition {
+        &self.commit_position
+    }
+
+    pub fn change_batches(&self) -> &[ChangeBatch] {
+        &self.change_batches
+    }
+
+    pub fn validate_against_schemas(
+        &self,
+        schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    ) -> Result<()> {
+        for batch in &self.change_batches {
+            let Some(schema) = schemas.get(batch.table_id()) else {
+                bail!(
+                    "CDC transaction batch references unknown table '{}'",
+                    batch.table_id().as_str()
+                );
+            };
+            batch.validate_against_schema(schema)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcCheckpoint {
+    source_id: CdcSourceId,
+    position: CdcSourcePosition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<CdcTransactionId>,
+}
+
+impl CdcCheckpoint {
+    pub fn new(
+        source_id: CdcSourceId,
+        position: CdcSourcePosition,
+        transaction_id: Option<CdcTransactionId>,
+    ) -> Self {
+        Self {
+            source_id,
+            position,
+            transaction_id,
+        }
+    }
+
+    pub fn from_transaction(transaction: &TransactionBatch) -> Self {
+        Self {
+            source_id: transaction.source_id().clone(),
+            position: transaction.commit_position().clone(),
+            transaction_id: transaction.transaction_id().cloned(),
+        }
+    }
+
+    pub fn source_id(&self) -> &CdcSourceId {
+        &self.source_id
+    }
+
+    pub fn position(&self) -> &CdcSourcePosition {
+        &self.position
+    }
+
+    pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.transaction_id.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcOperation {
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CdcSourcePosition {
+    Postgres {
+        commit_lsn: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_lsn: Option<String>,
+    },
+    Opaque {
+        value: String,
+    },
+}
+
+impl CdcSourcePosition {
+    pub fn postgres(commit_lsn: impl Into<String>, event_lsn: Option<String>) -> Result<Self> {
+        let commit_lsn = commit_lsn.into();
+        ensure!(
+            !commit_lsn.trim().is_empty(),
+            "Postgres CDC commit LSN cannot be empty"
+        );
+        if let Some(event_lsn) = event_lsn.as_deref() {
+            ensure!(
+                !event_lsn.trim().is_empty(),
+                "Postgres CDC event LSN cannot be empty"
+            );
+        }
+        Ok(Self::Postgres {
+            commit_lsn,
+            event_lsn,
+        })
+    }
+
+    pub fn opaque(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        ensure!(
+            !value.trim().is_empty(),
+            "CDC source position cannot be empty"
+        );
+        Ok(Self::Opaque { value })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id_column(nullable: bool) -> CdcColumn {
+        CdcColumn::new("id", ColumnType::Int64, nullable).expect("id column")
+    }
+
+    fn amount_column() -> CdcColumn {
+        CdcColumn::new("amount", ColumnType::Int64, true).expect("amount column")
+    }
+
+    fn orders_schema() -> CdcTableSchema {
+        CdcTableSchema::new(
+            CdcTableId::new("orders").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("tenant_id", ColumnType::Int64, false).expect("tenant column"),
+                id_column(false),
+                amount_column(),
+                CdcColumn::new("status", ColumnType::Utf8, true).expect("status column"),
+            ],
+            CdcPrimaryKey::new(["tenant_id", "id"]).expect("primary key"),
+        )
+        .expect("orders schema")
+    }
+
+    fn orders_row(tenant_id: i64, id: i64, amount: Option<i64>, status: Option<&str>) -> CdcRow {
+        CdcRow::new([
+            Some(RowValue::Int64(tenant_id)),
+            Some(RowValue::Int64(id)),
+            amount.map(RowValue::Int64),
+            status.map(|value| RowValue::Utf8(value.to_string())),
+        ])
+        .expect("orders row")
+    }
+
+    #[test]
+    fn native_database_cdc_requires_table_materialization_and_primary_key() {
+        let semantics = CdcSourceSemantics::for_category(CdcSourceCategory::NativeDatabaseCdc);
+        assert_eq!(semantics.direct_query_support(), DirectQuerySupport::None);
+        assert_eq!(
+            semantics.table_materialization(),
+            TableMaterializationRequirement::AlwaysRequired
+        );
+        assert!(semantics.primary_key_required_for_table());
+        assert!(semantics.validate_direct_query(false).is_err());
+        assert!(semantics.validate_table_primary_key(None).is_err());
+
+        let key = CdcPrimaryKey::new(["id"]).expect("primary key");
+        semantics
+            .validate_table_primary_key(Some(&key))
+            .expect("primary key should satisfy CDC table contract");
+    }
+
+    #[test]
+    fn append_only_sources_allow_direct_queries_without_primary_keys() {
+        let semantics = CdcSourceSemantics::for_category(CdcSourceCategory::AppendOnly);
+        assert_eq!(semantics.direct_query_support(), DirectQuerySupport::Full);
+        assert_eq!(
+            semantics.table_materialization(),
+            TableMaterializationRequirement::Optional
+        );
+        assert!(!semantics.primary_key_required_for_table());
+        semantics
+            .validate_direct_query(true)
+            .expect("append-only sources can be directly queried");
+        semantics
+            .validate_table_primary_key(None)
+            .expect("append-only sources do not require a table primary key");
+    }
+
+    #[test]
+    fn upsert_sources_allow_only_stateless_direct_queries() {
+        let semantics = CdcSourceSemantics::for_category(CdcSourceCategory::Upsert);
+        assert_eq!(
+            semantics.direct_query_support(),
+            DirectQuerySupport::StatelessOnly
+        );
+        semantics
+            .validate_direct_query(false)
+            .expect("stateless direct query should be allowed");
+        assert!(semantics.validate_direct_query(true).is_err());
+        assert!(semantics.validate_table_primary_key(None).is_err());
+    }
+
+    #[test]
+    fn primary_key_rejects_empty_and_duplicate_columns() {
+        assert!(CdcPrimaryKey::new(Vec::<String>::new()).is_err());
+        assert!(CdcPrimaryKey::new(["id", ""]).is_err());
+        assert!(CdcPrimaryKey::new(["id", "id"]).is_err());
+
+        let key = CdcPrimaryKey::new(["tenant_id", "id"]).expect("composite primary key");
+        assert_eq!(key.columns(), &["tenant_id".to_string(), "id".to_string()]);
+        assert!(key.contains_column("tenant_id"));
+    }
+
+    #[test]
+    fn table_schema_validates_primary_key_columns() {
+        let table_id = CdcTableId::new("orders").expect("table id");
+        let upstream = UpstreamTableRef::new("public", "orders").expect("upstream");
+        let key = CdcPrimaryKey::new(["id"]).expect("primary key");
+
+        CdcTableSchema::new(
+            table_id.clone(),
+            upstream.clone(),
+            vec![id_column(false), amount_column()],
+            key.clone(),
+        )
+        .expect("valid schema");
+
+        let missing_key = CdcTableSchema::new(
+            table_id.clone(),
+            upstream.clone(),
+            vec![amount_column()],
+            key.clone(),
+        )
+        .expect_err("missing primary key column should fail");
+        assert!(missing_key.to_string().contains("is not in table schema"));
+
+        let nullable_key = CdcTableSchema::new(
+            table_id,
+            upstream,
+            vec![id_column(true), amount_column()],
+            key,
+        )
+        .expect_err("nullable primary key column should fail");
+        assert!(nullable_key.to_string().contains("cannot be nullable"));
+    }
+
+    #[test]
+    fn table_schema_with_composite_primary_key_serializes() {
+        let schema = orders_schema();
+        let encoded = serde_json::to_vec(&schema).expect("serialize schema");
+        let decoded: CdcTableSchema = serde_json::from_slice(&encoded).expect("decode schema");
+
+        assert_eq!(decoded, schema);
+        assert_eq!(
+            decoded.primary_key().columns(),
+            &["tenant_id".to_string(), "id".to_string()]
+        );
+    }
+
+    #[test]
+    fn source_positions_reject_empty_values() {
+        assert!(CdcSourcePosition::postgres("", None).is_err());
+        assert!(CdcSourcePosition::postgres("0/16B6C50", Some(String::new())).is_err());
+        assert!(CdcSourcePosition::opaque("").is_err());
+
+        let position = CdcSourcePosition::postgres("0/16B6C50", Some("0/16B6C20".to_string()))
+            .expect("postgres position");
+        assert_eq!(
+            position,
+            CdcSourcePosition::Postgres {
+                commit_lsn: "0/16B6C50".to_string(),
+                event_lsn: Some("0/16B6C20".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rows_validate_against_schema_and_extract_composite_keys() {
+        let schema = orders_schema();
+        let row = orders_row(7, 42, Some(100), Some("open"));
+        schema.validate_row(&row).expect("valid row");
+
+        let key = schema.primary_key_from_row(&row).expect("primary key");
+        assert_eq!(key.values(), &[RowValue::Int64(7), RowValue::Int64(42)]);
+        key.validate_against_schema(&schema).expect("valid key");
+
+        let wrong_width = CdcRow::new([Some(RowValue::Int64(7))]).expect("row");
+        assert!(schema.validate_row(&wrong_width).is_err());
+
+        let null_pk = CdcRow::new([
+            Some(RowValue::Int64(7)),
+            None,
+            Some(RowValue::Int64(100)),
+            None,
+        ])
+        .expect("row");
+        assert!(schema.validate_row(&null_pk).is_err());
+
+        let wrong_type = CdcRow::new([
+            Some(RowValue::Int64(7)),
+            Some(RowValue::Utf8("not-an-id".to_string())),
+            Some(RowValue::Int64(100)),
+            None,
+        ])
+        .expect("row");
+        assert!(schema.validate_row(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn change_batches_validate_change_shapes() {
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let before = orders_row(7, 42, Some(100), Some("open"));
+        let after = orders_row(7, 42, Some(150), Some("paid"));
+        let key = schema.primary_key_from_row(&before).expect("primary key");
+
+        let batch = ChangeBatch::new(
+            table_id.clone(),
+            vec![
+                CdcChange::Insert {
+                    row: before.clone(),
+                },
+                CdcChange::Update {
+                    key: Some(key.clone()),
+                    before: Some(before),
+                    after,
+                },
+                CdcChange::Delete {
+                    key: Some(key),
+                    before: None,
+                },
+            ],
+        )
+        .expect("change batch");
+        batch
+            .validate_against_schema(&schema)
+            .expect("valid change batch");
+
+        let invalid_delete = ChangeBatch::new(
+            table_id,
+            vec![CdcChange::Delete {
+                key: None,
+                before: None,
+            }],
+        )
+        .expect("invalid delete batch");
+        assert!(invalid_delete.validate_against_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn transaction_batches_validate_table_schemas_and_checkpoint_frontier() {
+        let schema = orders_schema();
+        let batch = ChangeBatch::new(
+            schema.table_id().clone(),
+            vec![CdcChange::Insert {
+                row: orders_row(7, 42, Some(100), Some("open")),
+            }],
+        )
+        .expect("change batch");
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let txid = CdcTransactionId::new("tx-1").expect("txid");
+        let commit_position =
+            CdcSourcePosition::postgres("0/16B6C50", Some("0/16B6C20".to_string()))
+                .expect("position");
+        let transaction = TransactionBatch::new(
+            source_id.clone(),
+            Some(txid.clone()),
+            None,
+            commit_position.clone(),
+            vec![batch],
+        )
+        .expect("transaction batch");
+
+        let schemas = HashMap::from([(schema.table_id().clone(), schema)]);
+        transaction
+            .validate_against_schemas(&schemas)
+            .expect("valid transaction");
+
+        let checkpoint = CdcCheckpoint::from_transaction(&transaction);
+        assert_eq!(checkpoint.source_id(), &source_id);
+        assert_eq!(checkpoint.transaction_id(), Some(&txid));
+        assert_eq!(checkpoint.position(), &commit_position);
+
+        let missing_schemas = HashMap::new();
+        assert!(
+            transaction
+                .validate_against_schemas(&missing_schemas)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_batches_and_transactions_are_rejected() {
+        let table_id = CdcTableId::new("orders").expect("table id");
+        assert!(ChangeBatch::new(table_id, Vec::new()).is_err());
+
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let commit_position = CdcSourcePosition::opaque("frontier-1").expect("position");
+        assert!(TransactionBatch::new(source_id, None, None, commit_position, Vec::new()).is_err());
+        assert!(CdcTransactionId::new("").is_err());
+    }
+}

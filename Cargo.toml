@@ -2,6 +2,8 @@
 members = [
     "crates/floe-node",
     "crates/floe-node-core",
+    "crates/floe-cdc",
+    "crates/floe-cdc-core",
     "crates/floe-core",
     "crates/floe-executor",
     "crates/floe-benchmarks",

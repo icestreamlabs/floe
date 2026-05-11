@@ -1,0 +1,17 @@
+[package]
+name = "floe-cdc"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dbsp-storage = { path = "../dbsp-storage" }
+floe-cdc-core = { path = "../floe-cdc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slatedb = { workspace = true }
+
+[dev-dependencies]
+floe-core = { path = "../floe-core" }
+object_store = { workspace = true }
+tokio = { workspace = true }

@@ -2076,6 +2076,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "floe-cdc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dbsp-storage",
+ "floe-cdc-core",
+ "floe-core",
+ "object_store",
+ "serde",
+ "serde_json",
+ "slatedb",
+ "tokio",
+]
+
+[[package]]
+name = "floe-cdc-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "floe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "floe-connector-sdk"
 version = "0.1.0"
 dependencies = [
