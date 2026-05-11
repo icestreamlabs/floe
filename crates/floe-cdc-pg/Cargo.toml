@@ -1,0 +1,14 @@
+[package]
+name = "floe-cdc-pg"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+floe-cdc-core = { path = "../floe-cdc-core" }
+pgwire-replication = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

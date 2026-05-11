@@ -2101,6 +2101,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "floe-cdc-pg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "floe-cdc-core",
+ "pgwire-replication",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "floe-connector-sdk"
 version = "0.1.0"
 dependencies = [
@@ -3591,6 +3603,24 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "x509-certificate",
+]
+
+[[package]]
+name = "pgwire-replication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eec6334b2466a0163bd91c29e06a25b391c155231934aee80381b99560e240e"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "hmac",
+ "rand 0.9.2",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

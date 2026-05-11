@@ -4,6 +4,7 @@ members = [
     "crates/floe-node-core",
     "crates/floe-cdc",
     "crates/floe-cdc-core",
+    "crates/floe-cdc-pg",
     "crates/floe-core",
     "crates/floe-executor",
     "crates/floe-benchmarks",
@@ -43,6 +44,7 @@ object_store = "0.12.4"
 pgwire = { version = "0.38.0", default-features = false, features = ["server-api-ring", "pg-ext-types"] }
 postgres-protocol = "0.6"
 postgres-types = "0.2"
+pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram"] }
 rkyv = "0.8.12"
 rdkafka = { version = "0.36", features = ["tokio", "cmake-build"] }
 arrow-array = "57.1.0"
