@@ -2,7 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use floe_cdc_core::CdcSourcePosition;
 use pgwire_replication::{
@@ -52,6 +52,13 @@ impl PostgresLsn {
 
     pub fn to_source_position(self) -> Result<CdcSourcePosition> {
         CdcSourcePosition::postgres(self.to_pg_string(), None)
+    }
+
+    pub fn from_source_position(position: &CdcSourcePosition) -> Result<Self> {
+        let CdcSourcePosition::Postgres { commit_lsn, .. } = position else {
+            bail!("expected Postgres CDC source position, got {position:?}");
+        };
+        Self::parse(commit_lsn)
     }
 }
 

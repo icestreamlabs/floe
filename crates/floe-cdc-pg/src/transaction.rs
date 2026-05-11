@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
+use floe_cdc::{CdcApplyResult, CdcTableStore};
 use floe_cdc_core::{
-    CdcChange, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTransactionId, ChangeBatch,
-    TransactionBatch, UpstreamTableRef,
+    CdcChange, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId,
+    ChangeBatch, TransactionBatch, UpstreamTableRef,
 };
 
-use crate::{PgOutputCdcChange, PgOutputDecoder, PostgresLsn, PostgresReplicationEvent};
+use crate::{
+    PgOutputCdcChange, PgOutputDecoder, PostgresLsn, PostgresReplicationClient,
+    PostgresReplicationEvent,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct PostgresTableRouter {
@@ -24,6 +28,14 @@ impl PostgresTableRouter {
 
     pub fn get(&self, upstream_table: &UpstreamTableRef) -> Option<&CdcTableId> {
         self.by_upstream_table.get(upstream_table)
+    }
+
+    pub fn from_schemas<'a>(schemas: impl IntoIterator<Item = &'a CdcTableSchema>) -> Self {
+        let mut router = Self::new();
+        for schema in schemas {
+            router.insert(schema.upstream_table().clone(), schema.table_id().clone());
+        }
+        router
     }
 }
 
@@ -117,6 +129,102 @@ impl PostgresTransactionAssembler {
     }
 }
 
+pub struct PostgresCdcEventApplier {
+    table_store: CdcTableStore,
+    schemas: HashMap<CdcTableId, CdcTableSchema>,
+    assembler: PostgresTransactionAssembler,
+}
+
+impl PostgresCdcEventApplier {
+    pub fn new(
+        source_id: CdcSourceId,
+        table_store: CdcTableStore,
+        schemas: HashMap<CdcTableId, CdcTableSchema>,
+    ) -> Self {
+        let router = PostgresTableRouter::from_schemas(schemas.values());
+        Self::with_router(source_id, table_store, schemas, router)
+    }
+
+    pub fn with_router(
+        source_id: CdcSourceId,
+        table_store: CdcTableStore,
+        schemas: HashMap<CdcTableId, CdcTableSchema>,
+        router: PostgresTableRouter,
+    ) -> Self {
+        Self {
+            table_store,
+            schemas,
+            assembler: PostgresTransactionAssembler::new(source_id, router),
+        }
+    }
+
+    pub async fn accept_event(
+        &mut self,
+        event: PostgresReplicationEvent,
+    ) -> Result<PostgresCdcApplyOutcome> {
+        let Some(transaction) = self.assembler.accept_event(event)? else {
+            return Ok(PostgresCdcApplyOutcome::idle());
+        };
+        let apply_result = self
+            .table_store
+            .apply_transaction(&self.schemas, &transaction)
+            .await?;
+        let feedback_lsn = PostgresLsn::from_source_position(apply_result.checkpoint().position())?;
+        Ok(PostgresCdcApplyOutcome::applied(apply_result, feedback_lsn))
+    }
+
+    pub fn table_store(&self) -> &CdcTableStore {
+        &self.table_store
+    }
+
+    pub fn schemas(&self) -> &HashMap<CdcTableId, CdcTableSchema> {
+        &self.schemas
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresCdcApplyOutcome {
+    apply_result: Option<CdcApplyResult>,
+    feedback_lsn: Option<PostgresLsn>,
+}
+
+impl PostgresCdcApplyOutcome {
+    pub fn idle() -> Self {
+        Self {
+            apply_result: None,
+            feedback_lsn: None,
+        }
+    }
+
+    pub fn applied(apply_result: CdcApplyResult, feedback_lsn: PostgresLsn) -> Self {
+        Self {
+            apply_result: Some(apply_result),
+            feedback_lsn: Some(feedback_lsn),
+        }
+    }
+
+    pub fn apply_result(&self) -> Option<&CdcApplyResult> {
+        self.apply_result.as_ref()
+    }
+
+    pub fn feedback_lsn(&self) -> Option<PostgresLsn> {
+        self.feedback_lsn
+    }
+}
+
+pub async fn run_postgres_cdc_apply_loop(
+    client: &mut PostgresReplicationClient,
+    applier: &mut PostgresCdcEventApplier,
+) -> Result<()> {
+    while let Some(event) = client.recv().await? {
+        let outcome = applier.accept_event(event).await?;
+        if let Some(feedback_lsn) = outcome.feedback_lsn() {
+            client.update_applied_lsn(feedback_lsn);
+        }
+    }
+    Ok(())
+}
+
 struct InFlightTransaction {
     transaction_id: CdcTransactionId,
     table_changes: Vec<TableChanges>,
@@ -158,8 +266,14 @@ struct TableChanges {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use floe_cdc_core::{CdcRow, UpstreamTableRef};
+    use dbsp_storage::storage::{KeyValueTable, SlateTable};
+    use floe_cdc_core::{CdcRow, CdcRowKey, UpstreamTableRef};
     use floe_core::RowValue;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+    use std::sync::Arc;
+
+    use crate::{PgOutputMessage, decode_pgoutput_message};
 
     const RELATION_ID: u32 = 42;
     const OTHER_RELATION_ID: u32 = 43;
@@ -258,6 +372,30 @@ mod tests {
             CdcTableId::new("orders").expect("table id"),
         );
         router
+    }
+
+    fn orders_schema() -> CdcTableSchema {
+        let PgOutputMessage::Relation(relation) =
+            decode_pgoutput_message(relation_message(RELATION_ID, "orders"))
+                .expect("decode relation")
+        else {
+            panic!("expected relation");
+        };
+        relation
+            .to_cdc_schema(CdcTableId::new("orders").expect("table id"))
+            .expect("schema")
+    }
+
+    fn orders_schemas() -> HashMap<CdcTableId, CdcTableSchema> {
+        let schema = orders_schema();
+        HashMap::from([(schema.table_id().clone(), schema)])
+    }
+
+    async fn test_store(name: &str) -> CdcTableStore {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, object_store).await.expect("open SlateDB"));
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
+        CdcTableStore::new(table)
     }
 
     #[test]
@@ -379,5 +517,91 @@ mod tests {
             .accept_event(xlog(insert_message(RELATION_ID, 7, "open")))
             .expect_err("dml outside transaction should fail");
         assert!(format!("{err:#}").contains("outside a transaction"));
+    }
+
+    #[tokio::test]
+    async fn applier_returns_feedback_lsn_only_after_table_apply() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-applier-apply").await;
+        let mut applier =
+            PostgresCdcEventApplier::new(source_id.clone(), table_store.clone(), orders_schemas());
+
+        let relation_outcome = applier
+            .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+            .await
+            .expect("relation");
+        assert!(relation_outcome.apply_result().is_none());
+        assert_eq!(relation_outcome.feedback_lsn(), None);
+
+        applier.accept_event(begin(58)).await.expect("begin");
+        applier
+            .accept_event(xlog(insert_message(RELATION_ID, 9, "open")))
+            .await
+            .expect("insert");
+        let outcome = applier
+            .accept_event(commit(60))
+            .await
+            .expect("commit apply");
+
+        assert_eq!(outcome.feedback_lsn(), Some(PostgresLsn::from_u64(60)));
+        let apply_result = outcome.apply_result().expect("apply result");
+        assert!(!apply_result.already_committed());
+        assert_eq!(
+            table_store
+                .load_checkpoint(&source_id)
+                .await
+                .expect("load checkpoint"),
+            Some(apply_result.checkpoint().clone())
+        );
+        assert_eq!(
+            table_store
+                .load_row(
+                    &CdcTableId::new("orders").expect("table id"),
+                    &CdcRowKey::new([RowValue::Int64(9)]).expect("key")
+                )
+                .await
+                .expect("load row"),
+            Some(
+                CdcRow::new([
+                    Some(RowValue::Int64(9)),
+                    Some(RowValue::Utf8("open".to_string()))
+                ])
+                .expect("row")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn applier_does_not_persist_or_feedback_when_table_apply_fails() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-applier-apply-fails").await;
+        let mut applier = PostgresCdcEventApplier::with_router(
+            source_id.clone(),
+            table_store.clone(),
+            HashMap::new(),
+            router(),
+        );
+
+        applier
+            .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+            .await
+            .expect("relation");
+        applier.accept_event(begin(59)).await.expect("begin");
+        applier
+            .accept_event(xlog(insert_message(RELATION_ID, 10, "open")))
+            .await
+            .expect("insert");
+        let err = applier
+            .accept_event(commit(70))
+            .await
+            .expect_err("missing schema should fail apply");
+        assert!(format!("{err:#}").contains("unknown table"));
+        assert_eq!(
+            table_store
+                .load_checkpoint(&source_id)
+                .await
+                .expect("load checkpoint"),
+            None
+        );
     }
 }

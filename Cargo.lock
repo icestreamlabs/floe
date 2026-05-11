@@ -2106,11 +2106,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "dbsp-storage",
+ "floe-cdc",
  "floe-cdc-core",
  "floe-core",
+ "object_store",
  "pgwire-replication",
  "serde",
  "serde_json",
+ "slatedb",
+ "tokio",
 ]
 
 [[package]]
