@@ -147,9 +147,13 @@ impl PostgresTransactionAssembler {
 }
 
 pub struct PostgresCdcEventApplier {
+    source_id: CdcSourceId,
     table_store: CdcTableStore,
     schemas: HashMap<CdcTableId, CdcTableSchema>,
     assembler: PostgresTransactionAssembler,
+    upstream_wal_end: Option<PostgresLsn>,
+    durable_lsn: Option<PostgresLsn>,
+    table_applied_lsns: HashMap<CdcTableId, PostgresLsn>,
 }
 
 impl PostgresCdcEventApplier {
@@ -169,9 +173,13 @@ impl PostgresCdcEventApplier {
         router: PostgresTableRouter,
     ) -> Self {
         Self {
+            source_id: source_id.clone(),
             table_store,
             schemas,
             assembler: PostgresTransactionAssembler::new(source_id, router),
+            upstream_wal_end: None,
+            durable_lsn: None,
+            table_applied_lsns: HashMap::new(),
         }
     }
 
@@ -179,15 +187,32 @@ impl PostgresCdcEventApplier {
         &mut self,
         event: PostgresReplicationEvent,
     ) -> Result<PostgresCdcApplyOutcome> {
+        self.observe_event_frontier(&event);
         let Some(transaction) = self.assembler.accept_event(event)? else {
-            return Ok(PostgresCdcApplyOutcome::idle());
+            return Ok(PostgresCdcApplyOutcome::idle(self.lag_snapshot()));
         };
+        let commit_lsn = PostgresLsn::from_source_position(transaction.commit_position())?;
+        let changed_table_ids = transaction
+            .change_batches()
+            .iter()
+            .map(|batch| batch.table_id().clone())
+            .collect::<Vec<_>>();
         let apply_result = self
             .table_store
             .apply_transaction(&self.schemas, &transaction)
             .await?;
         let feedback_lsn = PostgresLsn::from_source_position(apply_result.checkpoint().position())?;
-        Ok(PostgresCdcApplyOutcome::applied(apply_result, feedback_lsn))
+        self.record_committed_apply(
+            feedback_lsn,
+            commit_lsn,
+            apply_result.already_committed(),
+            &changed_table_ids,
+        );
+        Ok(PostgresCdcApplyOutcome::applied(
+            apply_result,
+            feedback_lsn,
+            self.lag_snapshot(),
+        ))
     }
 
     pub fn table_store(&self) -> &CdcTableStore {
@@ -198,8 +223,64 @@ impl PostgresCdcEventApplier {
         &self.schemas
     }
 
+    pub fn lag_snapshot(&self) -> PostgresCdcLagSnapshot {
+        let mut table_ids = self.schemas.keys().collect::<Vec<_>>();
+        table_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let table_lags = table_ids
+            .into_iter()
+            .map(|table_id| {
+                let last_applied_lsn = self.table_applied_lsns.get(table_id).copied();
+                PostgresCdcTableLag::new(table_id.clone(), last_applied_lsn, self.upstream_wal_end)
+            })
+            .collect();
+
+        PostgresCdcLagSnapshot::new(
+            self.source_id.clone(),
+            self.upstream_wal_end,
+            self.durable_lsn,
+            table_lags,
+        )
+    }
+
     pub fn reset_stream_state(&mut self) {
         self.assembler.reset_stream_state();
+    }
+
+    fn observe_event_frontier(&mut self, event: &PostgresReplicationEvent) {
+        let event_lsn = match event {
+            PostgresReplicationEvent::KeepAlive { wal_end, .. } => Some(*wal_end),
+            PostgresReplicationEvent::Begin { final_lsn, .. } => Some(*final_lsn),
+            PostgresReplicationEvent::XLogData { wal_end, .. } => Some(*wal_end),
+            PostgresReplicationEvent::Commit { end_lsn, .. } => Some(*end_lsn),
+            PostgresReplicationEvent::Message { lsn, .. } => Some(*lsn),
+            PostgresReplicationEvent::StoppedAt { reached } => Some(*reached),
+        };
+        if let Some(event_lsn) = event_lsn {
+            record_max_lsn(&mut self.upstream_wal_end, event_lsn);
+        }
+    }
+
+    fn record_committed_apply(
+        &mut self,
+        feedback_lsn: PostgresLsn,
+        transaction_commit_lsn: PostgresLsn,
+        already_committed: bool,
+        changed_table_ids: &[CdcTableId],
+    ) {
+        record_max_lsn(&mut self.durable_lsn, feedback_lsn);
+        if already_committed && transaction_commit_lsn != feedback_lsn {
+            return;
+        }
+
+        for table_id in changed_table_ids {
+            let table_lsn = self
+                .table_applied_lsns
+                .entry(table_id.clone())
+                .or_insert(feedback_lsn);
+            if *table_lsn < feedback_lsn {
+                *table_lsn = feedback_lsn;
+            }
+        }
     }
 }
 
@@ -207,20 +288,27 @@ impl PostgresCdcEventApplier {
 pub struct PostgresCdcApplyOutcome {
     apply_result: Option<CdcApplyResult>,
     feedback_lsn: Option<PostgresLsn>,
+    lag_snapshot: PostgresCdcLagSnapshot,
 }
 
 impl PostgresCdcApplyOutcome {
-    pub fn idle() -> Self {
+    pub fn idle(lag_snapshot: PostgresCdcLagSnapshot) -> Self {
         Self {
             apply_result: None,
             feedback_lsn: None,
+            lag_snapshot,
         }
     }
 
-    pub fn applied(apply_result: CdcApplyResult, feedback_lsn: PostgresLsn) -> Self {
+    pub fn applied(
+        apply_result: CdcApplyResult,
+        feedback_lsn: PostgresLsn,
+        lag_snapshot: PostgresCdcLagSnapshot,
+    ) -> Self {
         Self {
             apply_result: Some(apply_result),
             feedback_lsn: Some(feedback_lsn),
+            lag_snapshot,
         }
     }
 
@@ -231,6 +319,99 @@ impl PostgresCdcApplyOutcome {
     pub fn feedback_lsn(&self) -> Option<PostgresLsn> {
         self.feedback_lsn
     }
+
+    pub fn lag_snapshot(&self) -> &PostgresCdcLagSnapshot {
+        &self.lag_snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresCdcLagSnapshot {
+    source_id: CdcSourceId,
+    upstream_wal_end: Option<PostgresLsn>,
+    durable_lsn: Option<PostgresLsn>,
+    source_lag_bytes: Option<u64>,
+    table_lags: Vec<PostgresCdcTableLag>,
+}
+
+impl PostgresCdcLagSnapshot {
+    fn new(
+        source_id: CdcSourceId,
+        upstream_wal_end: Option<PostgresLsn>,
+        durable_lsn: Option<PostgresLsn>,
+        table_lags: Vec<PostgresCdcTableLag>,
+    ) -> Self {
+        Self {
+            source_id,
+            upstream_wal_end,
+            durable_lsn,
+            source_lag_bytes: lsn_lag_bytes(upstream_wal_end, durable_lsn),
+            table_lags,
+        }
+    }
+
+    pub fn source_id(&self) -> &CdcSourceId {
+        &self.source_id
+    }
+
+    pub fn upstream_wal_end(&self) -> Option<PostgresLsn> {
+        self.upstream_wal_end
+    }
+
+    pub fn durable_lsn(&self) -> Option<PostgresLsn> {
+        self.durable_lsn
+    }
+
+    pub fn source_lag_bytes(&self) -> Option<u64> {
+        self.source_lag_bytes
+    }
+
+    pub fn table_lags(&self) -> &[PostgresCdcTableLag] {
+        &self.table_lags
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresCdcTableLag {
+    table_id: CdcTableId,
+    last_applied_lsn: Option<PostgresLsn>,
+    table_lag_bytes: Option<u64>,
+}
+
+impl PostgresCdcTableLag {
+    fn new(
+        table_id: CdcTableId,
+        last_applied_lsn: Option<PostgresLsn>,
+        upstream_wal_end: Option<PostgresLsn>,
+    ) -> Self {
+        Self {
+            table_id,
+            last_applied_lsn,
+            table_lag_bytes: lsn_lag_bytes(upstream_wal_end, last_applied_lsn),
+        }
+    }
+
+    pub fn table_id(&self) -> &CdcTableId {
+        &self.table_id
+    }
+
+    pub fn last_applied_lsn(&self) -> Option<PostgresLsn> {
+        self.last_applied_lsn
+    }
+
+    pub fn table_lag_bytes(&self) -> Option<u64> {
+        self.table_lag_bytes
+    }
+}
+
+fn record_max_lsn(slot: &mut Option<PostgresLsn>, lsn: PostgresLsn) {
+    if slot.is_none_or(|current| lsn > current) {
+        *slot = Some(lsn);
+    }
+}
+
+fn lsn_lag_bytes(upstream: Option<PostgresLsn>, durable: Option<PostgresLsn>) -> Option<u64> {
+    Some(upstream?.as_u64().saturating_sub(durable?.as_u64()))
 }
 
 #[async_trait]
@@ -531,14 +712,18 @@ mod tests {
     }
 
     fn orders_schema() -> CdcTableSchema {
+        schema_for(RELATION_ID, "orders", "orders")
+    }
+
+    fn schema_for(relation_id: u32, upstream_table: &str, table_id: &str) -> CdcTableSchema {
         let PgOutputMessage::Relation(relation) =
-            decode_pgoutput_message(relation_message(RELATION_ID, "orders"))
+            decode_pgoutput_message(relation_message(relation_id, upstream_table))
                 .expect("decode relation")
         else {
             panic!("expected relation");
         };
         relation
-            .to_cdc_schema(CdcTableId::new("orders").expect("table id"))
+            .to_cdc_schema(CdcTableId::new(table_id).expect("table id"))
             .expect("schema")
     }
 
@@ -835,6 +1020,22 @@ mod tests {
                 .expect("row")
             )
         );
+
+        let lag = outcome.lag_snapshot();
+        assert_eq!(lag.source_id(), &source_id);
+        assert_eq!(lag.upstream_wal_end(), Some(PostgresLsn::from_u64(60)));
+        assert_eq!(lag.durable_lsn(), Some(PostgresLsn::from_u64(60)));
+        assert_eq!(lag.source_lag_bytes(), Some(0));
+        assert_eq!(lag.table_lags().len(), 1);
+        assert_eq!(
+            lag.table_lags()[0].table_id(),
+            &CdcTableId::new("orders").expect("table id")
+        );
+        assert_eq!(
+            lag.table_lags()[0].last_applied_lsn(),
+            Some(PostgresLsn::from_u64(60))
+        );
+        assert_eq!(lag.table_lags()[0].table_lag_bytes(), Some(0));
     }
 
     #[tokio::test]
@@ -906,6 +1107,80 @@ mod tests {
             *feedbacks.lock().expect("feedback lock"),
             vec![PostgresLsn::from_u64(80)]
         );
+    }
+
+    #[tokio::test]
+    async fn applier_exposes_shared_source_and_per_table_lag() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-lag-snapshot").await;
+        let orders = schema_for(RELATION_ID, "orders", "orders");
+        let customers = schema_for(OTHER_RELATION_ID, "customers", "customers");
+        let schemas = HashMap::from([
+            (orders.table_id().clone(), orders),
+            (customers.table_id().clone(), customers),
+        ]);
+        let mut router = PostgresTableRouter::new();
+        router.insert(
+            UpstreamTableRef::new("public", "orders").expect("orders upstream"),
+            CdcTableId::new("orders").expect("orders id"),
+        );
+        router.insert(
+            UpstreamTableRef::new("public", "customers").expect("customers upstream"),
+            CdcTableId::new("customers").expect("customers id"),
+        );
+        let mut applier =
+            PostgresCdcEventApplier::with_router(source_id.clone(), table_store, schemas, router);
+
+        applier
+            .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+            .await
+            .expect("orders relation");
+        applier
+            .accept_event(xlog(relation_message(OTHER_RELATION_ID, "customers")))
+            .await
+            .expect("customers relation");
+        applier.accept_event(begin(63)).await.expect("begin");
+        applier
+            .accept_event(xlog(insert_message(RELATION_ID, 20, "open")))
+            .await
+            .expect("orders insert");
+        let applied = applier
+            .accept_event(commit(100))
+            .await
+            .expect("commit apply");
+
+        assert_eq!(applied.lag_snapshot().source_lag_bytes(), Some(0));
+        let idle = applier
+            .accept_event(PostgresReplicationEvent::KeepAlive {
+                wal_end: PostgresLsn::from_u64(150),
+                reply_requested: false,
+                server_time_micros: 200,
+            })
+            .await
+            .expect("keepalive");
+        let lag = idle.lag_snapshot();
+        assert_eq!(lag.source_id(), &source_id);
+        assert_eq!(lag.upstream_wal_end(), Some(PostgresLsn::from_u64(150)));
+        assert_eq!(lag.durable_lsn(), Some(PostgresLsn::from_u64(100)));
+        assert_eq!(lag.source_lag_bytes(), Some(50));
+
+        let table_lags = lag.table_lags();
+        assert_eq!(table_lags.len(), 2);
+        assert_eq!(
+            table_lags[0].table_id(),
+            &CdcTableId::new("customers").expect("customers id")
+        );
+        assert_eq!(table_lags[0].last_applied_lsn(), None);
+        assert_eq!(table_lags[0].table_lag_bytes(), None);
+        assert_eq!(
+            table_lags[1].table_id(),
+            &CdcTableId::new("orders").expect("orders id")
+        );
+        assert_eq!(
+            table_lags[1].last_applied_lsn(),
+            Some(PostgresLsn::from_u64(100))
+        );
+        assert_eq!(table_lags[1].table_lag_bytes(), Some(50));
     }
 
     #[tokio::test]

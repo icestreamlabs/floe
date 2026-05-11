@@ -240,14 +240,14 @@ impl CdcTableStore {
     ) -> Result<CdcApplyResult> {
         transaction.validate_against_schemas(schemas)?;
         let next_checkpoint = CdcCheckpoint::from_transaction(transaction);
-        if let Some(current_checkpoint) = self.load_checkpoint(transaction.source_id()).await? {
-            if current_checkpoint.covers(&next_checkpoint)? {
-                return Ok(CdcApplyResult {
-                    checkpoint: current_checkpoint,
-                    table_deltas: Vec::new(),
-                    already_committed: true,
-                });
-            }
+        if let Some(current_checkpoint) = self.load_checkpoint(transaction.source_id()).await?
+            && current_checkpoint.covers(&next_checkpoint)?
+        {
+            return Ok(CdcApplyResult {
+                checkpoint: current_checkpoint,
+                table_deltas: Vec::new(),
+                already_committed: true,
+            });
         }
 
         let mut batch = WriteBatch::new();

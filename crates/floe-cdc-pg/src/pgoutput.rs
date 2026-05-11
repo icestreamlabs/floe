@@ -123,11 +123,11 @@ impl PgOutputRelation {
             .columns
             .iter()
             .map(|column| {
-                Ok(CdcColumn::new(
+                CdcColumn::new(
                     column.name(),
                     column_type_for_oid(column.type_oid())?,
                     !column.is_key(),
-                )?)
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let primary_key = CdcPrimaryKey::new(
