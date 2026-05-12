@@ -268,6 +268,16 @@ async fn run_native_postgres_cdc_connector(
         "native Postgres CDC replication stream connected"
     );
     if let Some(lsn) = initial_snapshot_lsn {
+        metrics::record_postgres_cdc_upstream_lsn(
+            runtime_plan.source_id.as_str(),
+            &slot,
+            lsn.as_u64(),
+        );
+        metrics::record_postgres_cdc_durable_lsn(
+            runtime_plan.source_id.as_str(),
+            &slot,
+            lsn.as_u64(),
+        );
         replication.update_applied_lsn(lsn);
     }
     let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
@@ -290,6 +300,13 @@ async fn run_native_postgres_cdc_connector(
             let Some(event) = event else {
                 break;
             };
+            if let Some(frontier_lsn) = postgres_replication_event_frontier_lsn(&event) {
+                metrics::record_postgres_cdc_upstream_lsn(
+                    runtime_plan.source_id.as_str(),
+                    &slot,
+                    frontier_lsn.as_u64(),
+                );
+            }
             if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
                 break;
             }
@@ -322,6 +339,19 @@ async fn run_native_postgres_cdc_connector(
     let shutdown_result = replication.shutdown().await;
     result?;
     shutdown_result
+}
+
+fn postgres_replication_event_frontier_lsn(
+    event: &PostgresReplicationEvent,
+) -> Option<PostgresLsn> {
+    match event {
+        PostgresReplicationEvent::KeepAlive { wal_end, .. } => Some(*wal_end),
+        PostgresReplicationEvent::Begin { final_lsn, .. } => Some(*final_lsn),
+        PostgresReplicationEvent::XLogData { wal_end, .. } => Some(*wal_end),
+        PostgresReplicationEvent::Commit { end_lsn, .. } => Some(*end_lsn),
+        PostgresReplicationEvent::Message { lsn, .. } => Some(*lsn),
+        PostgresReplicationEvent::StoppedAt { reached } => Some(*reached),
+    }
 }
 
 fn update_native_postgres_applied_lsn(
@@ -1676,6 +1706,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
             let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
             let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
+            let mut tick_postgres_sources: HashMap<String, String> = HashMap::new();
+            let mut tick_postgres_table_lsns: Vec<(String, String, String, u64)> = Vec::new();
             let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
             let mut encoded_batches_by_source = vec![Vec::new(); source_count];
             let mut commit_acks_by_source = vec![Vec::new(); source_count];
@@ -1737,9 +1769,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         }
                     };
                 tick_postgres_lsns.insert(
-                    cdc_transaction.slot,
+                    cdc_transaction.slot.clone(),
                     (feedback_lsn.as_u64(), feedback_lsn.to_pg_string()),
                 );
+                tick_postgres_sources.insert(
+                    cdc_transaction.slot.clone(),
+                    cdc_transaction.source_id.as_str().to_string(),
+                );
+                for change_batch in cdc_transaction.transaction.change_batches() {
+                    tick_postgres_table_lsns.push((
+                        cdc_transaction.source_id.as_str().to_string(),
+                        cdc_transaction.slot.clone(),
+                        change_batch.table_id().as_str().to_string(),
+                        feedback_lsn.as_u64(),
+                    ));
+                }
 
                 for table_deltas in apply_result.table_deltas() {
                     let source_name = table_deltas.table_id().as_str();
@@ -1866,6 +1910,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     if let Some((slot, lsn_value, lsn_text)) =
                         event_postgres_lsn(event.resume_token())
                     {
+                        tick_postgres_sources.insert(slot.clone(), source_name.to_string());
                         let entry = tick_postgres_lsns
                             .entry(slot)
                             .or_insert_with(|| (lsn_value, lsn_text.clone()));
@@ -2264,6 +2309,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
             advance_kafka_offset_commit_state(&mut committed_kafka_offsets, &tick_kafka_offsets);
             advance_postgres_cdc_commit_state(&mut committed_postgres_lsns, &tick_postgres_lsns);
+            for (slot, (lsn_value, _)) in &tick_postgres_lsns {
+                if let Some(source) = tick_postgres_sources.get(slot) {
+                    metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
+                }
+            }
+            for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {
+                metrics::record_postgres_cdc_table_applied_lsn(source, slot, table, *lsn_value);
+            }
             record_mv_freshness_metrics(&mv_last_update_at_ms, current_unix_time_ms());
             metrics::record_last_committed_tick(epoch);
             metrics::record_checkpoint_age_seconds(0);

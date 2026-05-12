@@ -1,4 +1,5 @@
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use prometheus::{
     Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
@@ -152,6 +153,93 @@ static RUNTIME_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register floe_runtime_errors_total")
 });
 
+static POSTGRES_CDC_UPSTREAM_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_upstream_lsn",
+        "Latest observed upstream Postgres WAL LSN per CDC source and slot",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_upstream_lsn")
+});
+
+static POSTGRES_CDC_DURABLE_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_durable_lsn",
+        "Latest SlateDB-durable Postgres CDC LSN per source and slot",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_durable_lsn")
+});
+
+static POSTGRES_CDC_SOURCE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_source_lag_bytes",
+        "Byte lag between latest observed upstream Postgres WAL LSN and durable Floe CDC LSN",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_source_lag_bytes")
+});
+
+static POSTGRES_CDC_TABLE_LAST_APPLIED_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_table_last_applied_lsn",
+        "Latest SlateDB-durable Postgres CDC LSN applied to each CDC table",
+        &["source", "slot", "table"]
+    )
+    .expect("register floe_postgres_cdc_table_last_applied_lsn")
+});
+
+static POSTGRES_CDC_TABLE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_table_lag_bytes",
+        "Byte lag between latest observed upstream Postgres WAL LSN and each CDC table's durable applied LSN",
+        &["source", "slot", "table"]
+    )
+    .expect("register floe_postgres_cdc_table_lag_bytes")
+});
+
+static POSTGRES_CDC_METRIC_STATE: LazyLock<Mutex<PostgresCdcMetricState>> =
+    LazyLock::new(|| Mutex::new(PostgresCdcMetricState::default()));
+
+#[derive(Debug, Default)]
+struct PostgresCdcMetricState {
+    upstream_lsn_by_source: HashMap<PostgresSourceMetricKey, u64>,
+    durable_lsn_by_source: HashMap<PostgresSourceMetricKey, u64>,
+    table_applied_lsn: HashMap<PostgresTableMetricKey, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PostgresSourceMetricKey {
+    source: String,
+    slot: String,
+}
+
+impl PostgresSourceMetricKey {
+    fn new(source: &str, slot: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            slot: slot.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PostgresTableMetricKey {
+    source: String,
+    slot: String,
+    table: String,
+}
+
+impl PostgresTableMetricKey {
+    fn new(source: &str, slot: &str, table: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            slot: slot.to_string(),
+            table: table.to_string(),
+        }
+    }
+}
+
 pub(crate) fn record_ingest_queue_depth(depth: usize) {
     INGEST_QUEUE_DEPTH.set(depth as i64);
 }
@@ -231,6 +319,71 @@ pub(crate) fn inc_runtime_error(component: &str) {
     RUNTIME_ERRORS.with_label_values(&[component]).inc();
 }
 
+pub(crate) fn record_postgres_cdc_upstream_lsn(source: &str, slot: &str, lsn: u64) {
+    let mut state = POSTGRES_CDC_METRIC_STATE
+        .lock()
+        .expect("Postgres CDC metric state poisoned");
+    let key = PostgresSourceMetricKey::new(source, slot);
+    let upstream_lsn = record_max_lsn(&mut state.upstream_lsn_by_source, key.clone(), lsn);
+    POSTGRES_CDC_UPSTREAM_LSN
+        .with_label_values(&[source, slot])
+        .set(i64_from_u64(upstream_lsn));
+
+    if let Some(durable_lsn) = state.durable_lsn_by_source.get(&key).copied() {
+        POSTGRES_CDC_SOURCE_LAG_BYTES
+            .with_label_values(&[source, slot])
+            .set(i64_from_u64(upstream_lsn.saturating_sub(durable_lsn)));
+    }
+
+    for (table_key, applied_lsn) in &state.table_applied_lsn {
+        if table_key.source == source && table_key.slot == slot {
+            POSTGRES_CDC_TABLE_LAG_BYTES
+                .with_label_values(&[source, slot, table_key.table.as_str()])
+                .set(i64_from_u64(upstream_lsn.saturating_sub(*applied_lsn)));
+        }
+    }
+}
+
+pub(crate) fn record_postgres_cdc_durable_lsn(source: &str, slot: &str, lsn: u64) {
+    let mut state = POSTGRES_CDC_METRIC_STATE
+        .lock()
+        .expect("Postgres CDC metric state poisoned");
+    let key = PostgresSourceMetricKey::new(source, slot);
+    let durable_lsn = record_max_lsn(&mut state.durable_lsn_by_source, key.clone(), lsn);
+    POSTGRES_CDC_DURABLE_LSN
+        .with_label_values(&[source, slot])
+        .set(i64_from_u64(durable_lsn));
+
+    if let Some(upstream_lsn) = state.upstream_lsn_by_source.get(&key).copied() {
+        POSTGRES_CDC_SOURCE_LAG_BYTES
+            .with_label_values(&[source, slot])
+            .set(i64_from_u64(upstream_lsn.saturating_sub(durable_lsn)));
+    }
+}
+
+pub(crate) fn record_postgres_cdc_table_applied_lsn(
+    source: &str,
+    slot: &str,
+    table: &str,
+    lsn: u64,
+) {
+    let mut state = POSTGRES_CDC_METRIC_STATE
+        .lock()
+        .expect("Postgres CDC metric state poisoned");
+    let key = PostgresTableMetricKey::new(source, slot, table);
+    let applied_lsn = record_max_lsn(&mut state.table_applied_lsn, key, lsn);
+    POSTGRES_CDC_TABLE_LAST_APPLIED_LSN
+        .with_label_values(&[source, slot, table])
+        .set(i64_from_u64(applied_lsn));
+
+    let source_key = PostgresSourceMetricKey::new(source, slot);
+    if let Some(upstream_lsn) = state.upstream_lsn_by_source.get(&source_key).copied() {
+        POSTGRES_CDC_TABLE_LAG_BYTES
+            .with_label_values(&[source, slot, table])
+            .set(i64_from_u64(upstream_lsn.saturating_sub(applied_lsn)));
+    }
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
@@ -249,4 +402,55 @@ pub(crate) fn init() {
     let _ = &*SINK_FAILURES;
     let _ = &*SINK_RETRIES;
     let _ = &*RUNTIME_ERRORS;
+    let _ = &*POSTGRES_CDC_UPSTREAM_LSN;
+    let _ = &*POSTGRES_CDC_DURABLE_LSN;
+    let _ = &*POSTGRES_CDC_SOURCE_LAG_BYTES;
+    let _ = &*POSTGRES_CDC_TABLE_LAST_APPLIED_LSN;
+    let _ = &*POSTGRES_CDC_TABLE_LAG_BYTES;
+    let _ = &*POSTGRES_CDC_METRIC_STATE;
+}
+
+fn record_max_lsn<K>(values: &mut HashMap<K, u64>, key: K, lsn: u64) -> u64
+where
+    K: Eq + std::hash::Hash,
+{
+    let entry = values.entry(key).or_insert(lsn);
+    *entry = (*entry).max(lsn);
+    *entry
+}
+
+fn i64_from_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use prometheus::{Encoder, TextEncoder};
+
+    use super::*;
+
+    #[test]
+    fn postgres_cdc_metrics_record_source_and_table_lag() {
+        let source = "pg_metrics_test";
+        let slot = "slot_metrics_test";
+        let table = "orders_metrics_test";
+
+        record_postgres_cdc_upstream_lsn(source, slot, 150);
+        record_postgres_cdc_durable_lsn(source, slot, 100);
+        record_postgres_cdc_table_applied_lsn(source, slot, table, 90);
+
+        let encoder = TextEncoder::new();
+        let mut buffer = Vec::new();
+        encoder
+            .encode(&prometheus::gather(), &mut buffer)
+            .expect("encode metrics");
+        let body = String::from_utf8(buffer).expect("metrics utf8");
+
+        assert!(body.contains(
+            "floe_postgres_cdc_source_lag_bytes{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 50"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_table_lag_bytes{slot=\"slot_metrics_test\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 60"
+        ));
+    }
 }
