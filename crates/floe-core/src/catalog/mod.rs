@@ -89,6 +89,33 @@ pub struct TableDefinition {
     columns: Vec<ColumnDefinition>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogSourceDefinition {
+    name: String,
+    connector: CatalogSourceConnector,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CatalogSourceConnector {
+    PostgresCdc(PostgresCdcSourceDefinition),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostgresCdcSourceDefinition {
+    connection: String,
+    slot: String,
+    publication: Option<String>,
+    #[serde(default)]
+    include_schema_in_source: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceBackedTableDefinition {
+    table_name: String,
+    source_name: String,
+    upstream_table: String,
+}
+
 impl<'de> Deserialize<'de> for TableDefinition {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -174,6 +201,102 @@ impl TableDefinition {
             }
         }
         Ok(())
+    }
+}
+
+impl CatalogSourceDefinition {
+    pub fn new(name: impl Into<String>, connector: CatalogSourceConnector) -> Result<Self> {
+        let name = name.into();
+        ensure!(!name.trim().is_empty(), "source name cannot be empty");
+        Ok(Self { name, connector })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn connector(&self) -> &CatalogSourceConnector {
+        &self.connector
+    }
+}
+
+impl PostgresCdcSourceDefinition {
+    pub fn new(
+        connection: impl Into<String>,
+        slot: impl Into<String>,
+        publication: Option<String>,
+        include_schema_in_source: Option<bool>,
+    ) -> Result<Self> {
+        let connection = connection.into();
+        let slot = slot.into();
+        ensure!(
+            !connection.trim().is_empty(),
+            "Postgres CDC source connection cannot be empty"
+        );
+        ensure!(
+            !slot.trim().is_empty(),
+            "Postgres CDC source slot cannot be empty"
+        );
+        Ok(Self {
+            connection,
+            slot,
+            publication,
+            include_schema_in_source,
+        })
+    }
+
+    pub fn connection(&self) -> &str {
+        &self.connection
+    }
+
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    pub fn publication(&self) -> Option<&str> {
+        self.publication.as_deref()
+    }
+
+    pub fn include_schema_in_source(&self) -> Option<bool> {
+        self.include_schema_in_source
+    }
+}
+
+impl SourceBackedTableDefinition {
+    pub fn new(
+        table_name: impl Into<String>,
+        source_name: impl Into<String>,
+        upstream_table: impl Into<String>,
+    ) -> Result<Self> {
+        let table_name = table_name.into();
+        let source_name = source_name.into();
+        let upstream_table = upstream_table.into();
+        ensure!(!table_name.trim().is_empty(), "table name cannot be empty");
+        ensure!(
+            !source_name.trim().is_empty(),
+            "source name cannot be empty"
+        );
+        ensure!(
+            !upstream_table.trim().is_empty(),
+            "upstream table cannot be empty"
+        );
+        Ok(Self {
+            table_name,
+            source_name,
+            upstream_table,
+        })
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn upstream_table(&self) -> &str {
+        &self.upstream_table
     }
 }
 

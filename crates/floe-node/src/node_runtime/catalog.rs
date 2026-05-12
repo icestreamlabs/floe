@@ -24,6 +24,37 @@ pub(super) fn table_definition_from_sql(
     TableDefinition::new(definition.name(), columns)
 }
 
+pub(super) fn catalog_source_definition_from_sql(
+    definition: &CreateSourceDefinition,
+) -> anyhow::Result<CatalogSourceDefinition> {
+    let connector = match definition.connector() {
+        SourceConnector::PostgresCdc(options) => {
+            CatalogSourceConnector::PostgresCdc(PostgresCdcSourceDefinition::new(
+                options.connection(),
+                options.slot(),
+                options.publication().map(ToString::to_string),
+                options.include_schema_in_source(),
+            )?)
+        }
+    };
+    CatalogSourceDefinition::new(definition.name(), connector)
+}
+
+pub(super) fn source_backed_table_definition_from_sql(
+    definition: &CreateTableDefinition,
+) -> anyhow::Result<Option<SourceBackedTableDefinition>> {
+    definition
+        .source()
+        .map(|source| {
+            SourceBackedTableDefinition::new(
+                definition.name(),
+                source.source_name(),
+                source.upstream_table(),
+            )
+        })
+        .transpose()
+}
+
 pub(super) fn source_definition_from_table(
     table: &TableDefinition,
 ) -> anyhow::Result<SourceDefinition> {

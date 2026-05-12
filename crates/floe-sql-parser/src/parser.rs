@@ -6,8 +6,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::definitions::{
-    CreateTableColumnDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
-    SinkConnector, SinkDefinition, SqlColumnType,
+    CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
+    CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
+    PostgresCdcSourceOptions, SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
 };
 
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
@@ -22,6 +23,11 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
     let mut statements = Vec::new();
     for statement in split_sql_statements(sql)? {
         let normalized = normalize_sql(&statement)?;
+        if starts_with_keyword(normalized, "CREATE SOURCE") {
+            let definition = parse_create_source(normalized)?;
+            statements.push(FloeStatement::CreateSource(definition));
+            continue;
+        }
         if starts_with_keyword(normalized, "CREATE SINK") {
             let definition = parse_sink_statement(normalized)?;
             statements.push(FloeStatement::CreateSink(definition));
@@ -47,6 +53,48 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
         return Err(anyhow!("SQL program cannot be empty"));
     }
     Ok(statements)
+}
+
+pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
+    let normalized = normalize_sql(sql)?;
+    let mut rest = consume_keyword(normalized, "CREATE")
+        .ok_or_else(|| anyhow!("expected CREATE at start of source statement"))?;
+    rest = consume_keyword(rest, "SOURCE")
+        .ok_or_else(|| anyhow!("expected SOURCE after CREATE in source statement"))?;
+    let (next, source_name) = parse_identifier(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "WITH")
+        .ok_or_else(|| anyhow!("expected WITH (...) in CREATE SOURCE statement"))?;
+    let (next, options) = parse_parenthesized_options(rest)?;
+    rest = next;
+
+    if !rest.trim().is_empty() {
+        return Err(anyhow!(
+            "unexpected tokens after CREATE SOURCE statement: {}",
+            rest.trim()
+        ));
+    }
+
+    let connector = option_any(&options, &["connector", "type"])
+        .ok_or_else(|| anyhow!("CREATE SOURCE requires connector/type option"))?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let connector = match connector.as_str() {
+        "postgres_cdc" => SourceConnector::PostgresCdc(PostgresCdcSourceOptions::new(
+            postgres_connection_string_from_options(&options)?,
+            option_any(&options, &["slot.name", "slot"])
+                .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires slot.name/slot"))?
+                .to_string(),
+            option_any(&options, &["publication.name", "publication"]).map(ToString::to_string),
+            options
+                .get("include_schema_in_source")
+                .map(|value| parse_bool_option("include_schema_in_source", value))
+                .transpose()?,
+        )?),
+        other => return Err(anyhow!("unsupported source connector type '{other}'")),
+    };
+
+    CreateSourceDefinition::new(source_name, connector)
 }
 
 pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> {
@@ -124,8 +172,9 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
 
 pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
     let normalized = normalize_sql(sql)?;
+    let (table_sql, source) = split_create_table_source_clause(normalized)?;
     let dialect = GenericDialect {};
-    let mut statements = Parser::parse_sql(&dialect, normalized)
+    let mut statements = Parser::parse_sql(&dialect, &table_sql)
         .map_err(|err| anyhow!("failed to parse create table statement: {err}"))?;
     if statements.len() != 1 {
         return Err(anyhow!(
@@ -201,7 +250,47 @@ pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
             ));
         }
     }
-    CreateTableDefinition::new(table_name, columns)
+    CreateTableDefinition::new_with_source(table_name, columns, source)
+}
+
+fn split_create_table_source_clause(
+    sql: &str,
+) -> Result<(String, Option<CreateTableSourceDefinition>)> {
+    let Some(from_idx) = find_top_level_keyword(sql, "FROM") else {
+        return Ok((sql.to_string(), None));
+    };
+    let table_sql = sql[..from_idx].trim().to_string();
+    let mut rest = &sql[from_idx..];
+    rest = consume_keyword(rest, "FROM")
+        .ok_or_else(|| anyhow!("expected FROM in source-backed CREATE TABLE statement"))?;
+    let (next, source_name) = parse_identifier(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "TABLE")
+        .ok_or_else(|| anyhow!("expected TABLE after source name in CREATE TABLE FROM clause"))?;
+    let (next, upstream_table) = parse_table_reference_literal(rest)?;
+    rest = next;
+    if !rest.trim().is_empty() {
+        return Err(anyhow!(
+            "unexpected tokens after CREATE TABLE FROM clause: {}",
+            rest.trim()
+        ));
+    }
+    Ok((
+        table_sql,
+        Some(CreateTableSourceDefinition::new(
+            source_name,
+            upstream_table,
+        )?),
+    ))
+}
+
+fn parse_table_reference_literal(input: &str) -> Result<(&str, String)> {
+    let trimmed = input.trim_start();
+    if trimmed.starts_with('\'') {
+        parse_single_quoted_literal(trimmed)
+    } else {
+        parse_identifier(trimmed)
+    }
 }
 
 fn primary_key_columns(constraints: &[TableConstraint]) -> Result<Vec<String>> {
@@ -337,6 +426,36 @@ fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
         with_snapshot,
         as_of,
     ))
+}
+
+fn postgres_connection_string_from_options(
+    options: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    if let Some(connection) =
+        option_any(options, &["connection", "connection_string", "dsn", "url"])
+    {
+        return Ok(connection.to_string());
+    }
+
+    let host = option_any(options, &["hostname", "host"])
+        .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires connection or hostname"))?;
+    let port = option_any(options, &["port"]).unwrap_or("5432");
+    let user = option_any(options, &["username", "user"])
+        .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires connection or username"))?;
+    let database =
+        option_any(options, &["database.name", "database", "dbname"]).ok_or_else(|| {
+            anyhow!("CREATE SOURCE postgres-cdc requires connection or database.name")
+        })?;
+    let mut parts = vec![
+        format!("host={host}"),
+        format!("port={port}"),
+        format!("user={user}"),
+        format!("dbname={database}"),
+    ];
+    if let Some(password) = option_any(options, &["password"]) {
+        parts.push(format!("password={password}"));
+    }
+    Ok(parts.join(" "))
 }
 
 fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
@@ -515,6 +634,60 @@ fn parse_unquoted_identifier(input: &str) -> Result<(&str, String)> {
 
 fn starts_with_keyword(input: &str, keyword: &str) -> bool {
     consume_keyword(input, keyword).is_some()
+}
+
+fn option_any<'a>(
+    options: &'a std::collections::HashMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| options.get(*key).map(String::as_str))
+}
+
+fn find_top_level_keyword(input: &str, keyword: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        if in_single {
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '\'' {
+                    idx += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if in_double {
+            if ch == '"' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '"' {
+                    idx += 1;
+                } else {
+                    in_double = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 => {
+                    let rest = &input[byte_idx..];
+                    if consume_keyword(rest, keyword).is_some() {
+                        return Some(byte_idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+
+    None
 }
 
 fn object_name_to_string(name: &ObjectName) -> Result<String> {

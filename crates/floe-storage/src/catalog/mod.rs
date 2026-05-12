@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
-use floe_core::catalog::TableDefinition;
+use floe_core::catalog::{CatalogSourceDefinition, SourceBackedTableDefinition, TableDefinition};
 use floe_core::encoding::{self, ArchivedRow};
 use floe_core::{RowValue, RowValues};
 use object_store::ObjectStore;
@@ -20,6 +20,8 @@ use tokio::fs;
 
 const TABLE_DEF_PREFIX: &str = "meta/table/";
 const TABLE_DATA_PREFIX: &str = "data/";
+const SOURCE_DEF_PREFIX: &str = "meta/source/definition/";
+const SOURCE_TABLE_PREFIX: &str = "meta/source/table/";
 const MV_DEF_PREFIX: &str = "meta/mv/definition/";
 const MV_SCHEMA_PREFIX: &str = "meta/mv/schema/";
 
@@ -190,6 +192,104 @@ impl SlateCatalog {
             .collect()
     }
 
+    pub async fn upsert_catalog_source(&self, definition: CatalogSourceDefinition) -> Result<()> {
+        ensure!(
+            !definition.name().trim().is_empty(),
+            "catalog source name cannot be empty"
+        );
+        let key = source_definition_key(definition.name());
+        let encoded = serde_json::to_vec(&definition).with_context(|| {
+            format!(
+                "failed to serialize source definition {}",
+                definition.name()
+            )
+        })?;
+        self.db
+            .put(&key, encoded)
+            .await
+            .map(|_| ())
+            .map_err(map_slate_err)
+            .with_context(|| format!("failed to write source definition {}", definition.name()))
+    }
+
+    pub async fn catalog_source(&self, name: &str) -> Result<Option<CatalogSourceDefinition>> {
+        let key = source_definition_key(name);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let definition = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse source definition for {name}"))?;
+            Ok(Some(definition))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn catalog_sources(&self) -> Result<Vec<CatalogSourceDefinition>> {
+        scan_prefix(&self.db, SOURCE_DEF_PREFIX.as_bytes())
+            .await?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_slice::<CatalogSourceDefinition>(&value)
+                    .context("failed to deserialize source definition")
+            })
+            .collect()
+    }
+
+    pub async fn upsert_source_backed_table(
+        &self,
+        definition: SourceBackedTableDefinition,
+    ) -> Result<()> {
+        ensure!(
+            !definition.table_name().trim().is_empty(),
+            "source-backed table name cannot be empty"
+        );
+        let key = source_table_key(definition.table_name());
+        let encoded = serde_json::to_vec(&definition).with_context(|| {
+            format!(
+                "failed to serialize source-backed table definition {}",
+                definition.table_name()
+            )
+        })?;
+        self.db
+            .put(&key, encoded)
+            .await
+            .map(|_| ())
+            .map_err(map_slate_err)
+            .with_context(|| {
+                format!(
+                    "failed to write source-backed table definition {}",
+                    definition.table_name()
+                )
+            })
+    }
+
+    pub async fn source_backed_table(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<SourceBackedTableDefinition>> {
+        let key = source_table_key(table_name);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let definition = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse source-backed table definition for {table_name}")
+            })?;
+            Ok(Some(definition))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn source_backed_tables(&self) -> Result<Vec<SourceBackedTableDefinition>> {
+        scan_prefix(&self.db, SOURCE_TABLE_PREFIX.as_bytes())
+            .await?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_slice::<SourceBackedTableDefinition>(&value)
+                    .context("failed to deserialize source-backed table definition")
+            })
+            .collect()
+    }
+
     pub async fn insert_row(&self, table: &TableDefinition, row: &RowValues) -> Result<()> {
         table.validate_row(row)?;
         let key = table_row_key(table, row)?;
@@ -338,6 +438,14 @@ fn table_definition_key(name: &str) -> Vec<u8> {
     format!("{TABLE_DEF_PREFIX}{name}").into_bytes()
 }
 
+fn source_definition_key(name: &str) -> Vec<u8> {
+    format!("{SOURCE_DEF_PREFIX}{name}").into_bytes()
+}
+
+fn source_table_key(name: &str) -> Vec<u8> {
+    format!("{SOURCE_TABLE_PREFIX}{name}").into_bytes()
+}
+
 fn mv_definition_key(name: &str) -> Vec<u8> {
     format!("{MV_DEF_PREFIX}{name}").into_bytes()
 }
@@ -396,7 +504,10 @@ fn map_slate_err(err: SlateError) -> anyhow::Error {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
-    use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
+    use floe_core::catalog::{
+        CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
+        PostgresCdcSourceDefinition, SourceBackedTableDefinition, TableDefinition,
+    };
 
     #[tokio::test]
     async fn roundtrip_typed_rows() {
@@ -457,6 +568,50 @@ mod tests {
             .expect("load schema")
             .expect("schema exists");
         assert_eq!(loaded_schema.as_ref(), schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn roundtrip_catalog_sources_and_source_backed_tables() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+        let source = CatalogSourceDefinition::new(
+            "pg_main",
+            CatalogSourceConnector::PostgresCdc(
+                PostgresCdcSourceDefinition::new(
+                    "postgres://postgres:postgres@localhost/postgres",
+                    "floe_slot",
+                    Some("floe_pub".to_string()),
+                    Some(false),
+                )
+                .expect("postgres source"),
+            ),
+        )
+        .expect("source");
+        catalog
+            .upsert_catalog_source(source.clone())
+            .await
+            .expect("persist source");
+
+        let loaded = catalog
+            .catalog_source("pg_main")
+            .await
+            .expect("load source")
+            .expect("source exists");
+        assert_eq!(loaded, source);
+        assert_eq!(catalog.catalog_sources().await.unwrap(), vec![source]);
+
+        let binding = SourceBackedTableDefinition::new("orders", "pg_main", "public.orders")
+            .expect("binding");
+        catalog
+            .upsert_source_backed_table(binding.clone())
+            .await
+            .expect("persist binding");
+        let loaded_binding = catalog
+            .source_backed_table("orders")
+            .await
+            .expect("load binding")
+            .expect("binding exists");
+        assert_eq!(loaded_binding, binding);
+        assert_eq!(catalog.source_backed_tables().await.unwrap(), vec![binding]);
     }
 
     #[tokio::test]

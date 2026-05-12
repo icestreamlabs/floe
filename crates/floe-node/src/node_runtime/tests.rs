@@ -1,6 +1,6 @@
 use super::*;
 use crate::node_runtime::orchestration::{
-    postgres_cdc_runtime_plan, source_journal_required_sources,
+    merge_catalog_source_connectors, postgres_cdc_runtime_plan, source_journal_required_sources,
 };
 use floe_sql_parser::parse_floe_statement;
 use serde_json::json;
@@ -620,6 +620,101 @@ fn source_definition_from_table_sets_pk_property() {
     assert!(source_definition_has_primary_key(&source));
     assert!(!source.columns()[0].nullable());
     assert!(source.columns()[1].nullable());
+}
+
+#[test]
+fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
+    let statement = parse_floe_statement(
+        "CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot.name = 'floe_slot',
+            publication.name = 'floe_pub'
+        )",
+    )
+    .expect("parse create source");
+    let FloeStatement::CreateSource(definition) = statement else {
+        panic!("expected create source statement");
+    };
+    let source = catalog_source_definition_from_sql(&definition).expect("catalog source");
+    assert_eq!(source.name(), "pg_main");
+    let CatalogSourceConnector::PostgresCdc(postgres) = source.connector();
+    assert_eq!(
+        postgres.connection(),
+        "postgres://postgres:postgres@localhost/postgres"
+    );
+    assert_eq!(postgres.slot(), "floe_slot");
+    assert_eq!(postgres.publication(), Some("floe_pub"));
+}
+
+#[test]
+fn source_backed_table_definition_from_sql_preserves_binding() {
+    let statement = parse_floe_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT)
+         FROM pg_main TABLE 'public.orders'",
+    )
+    .expect("parse source-backed table");
+    let FloeStatement::CreateTable(definition) = statement else {
+        panic!("expected create table statement");
+    };
+    let binding = source_backed_table_definition_from_sql(&definition)
+        .expect("source-backed table")
+        .expect("binding");
+    assert_eq!(binding.table_name(), "orders");
+    assert_eq!(binding.source_name(), "pg_main");
+    assert_eq!(binding.upstream_table(), "public.orders");
+}
+
+#[test]
+fn catalog_postgres_source_connector_merges_include_tables() {
+    let mut connector_specs = Vec::new();
+    let mut catalog_sources = HashMap::new();
+    let source = CatalogSourceDefinition::new(
+        "pg_main",
+        CatalogSourceConnector::PostgresCdc(
+            PostgresCdcSourceDefinition::new(
+                "postgres://postgres:postgres@localhost/postgres",
+                "floe_slot",
+                Some("floe_pub".to_string()),
+                Some(false),
+            )
+            .expect("postgres source"),
+        ),
+    )
+    .expect("source");
+    catalog_sources.insert(source.name().to_string(), source);
+    let mut source_tables = HashMap::new();
+    let binding =
+        SourceBackedTableDefinition::new("orders", "pg_main", "public.orders").expect("binding");
+    source_tables.insert(binding.table_name().to_string(), binding);
+
+    merge_catalog_source_connectors(&mut connector_specs, &catalog_sources, &source_tables)
+        .expect("merge connector");
+
+    assert_eq!(connector_specs.len(), 1);
+    assert_eq!(connector_specs[0].name, "pg_main");
+    let ConnectorConfig::PostgresCdc {
+        connection,
+        slot,
+        publication,
+        include_tables,
+        include_schema_in_source,
+        ..
+    } = &connector_specs[0].config
+    else {
+        panic!("expected postgres cdc connector");
+    };
+    assert_eq!(
+        connection,
+        "postgres://postgres:postgres@localhost/postgres"
+    );
+    assert_eq!(slot, "floe_slot");
+    assert_eq!(publication.as_deref(), Some("floe_pub"));
+    assert_eq!(
+        include_tables.as_deref(),
+        Some(&["public.orders".to_string()][..])
+    );
+    assert_eq!(include_schema_in_source.as_ref().copied(), Some(false));
 }
 
 #[test]

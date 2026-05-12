@@ -22,7 +22,10 @@ use floe_cdc_pg::{
     PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent, PostgresTableRouter,
     PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
 };
-use floe_core::catalog::{ColumnDefinition, ColumnType, TableDefinition};
+use floe_core::catalog::{
+    CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
+    PostgresCdcSourceDefinition, SourceBackedTableDefinition, TableDefinition,
+};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
@@ -53,8 +56,8 @@ use floe_node_core::postgres_cdc_connector::{
 use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
-    CreateTableDefinition, FloeStatement, MaterializedViewDefinition, SqlColumnType,
-    parse_floe_program,
+    CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
+    SourceConnector, SqlColumnType, parse_floe_program,
 };
 use floe_storage::MaterializedViewMetadata;
 use slatedb::WriteBatch;

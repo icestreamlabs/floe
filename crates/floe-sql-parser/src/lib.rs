@@ -3,7 +3,8 @@ mod parser;
 
 pub use definitions::*;
 pub use parser::{
-    parse_create_table, parse_floe_program, parse_floe_statement, parse_materialized_view,
+    parse_create_source, parse_create_table, parse_floe_program, parse_floe_statement,
+    parse_materialized_view,
 };
 
 #[cfg(test)]

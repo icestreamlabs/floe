@@ -94,6 +94,66 @@ fn parse_create_sink_statement() {
 }
 
 #[test]
+fn parse_create_postgres_cdc_source_statement() {
+    let stmt = parse_floe_statement(
+        "CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot.name = 'floe_slot',
+            publication.name = 'floe_pub',
+            include_schema_in_source = true
+        )",
+    )
+    .expect("parse source");
+    match stmt {
+        FloeStatement::CreateSource(definition) => {
+            assert_eq!(definition.name(), "pg_main");
+            assert_eq!(
+                definition.connector(),
+                &SourceConnector::PostgresCdc(
+                    PostgresCdcSourceOptions::new(
+                        "postgres://postgres:postgres@localhost/postgres",
+                        "floe_slot",
+                        Some("floe_pub".to_string()),
+                        Some(true),
+                    )
+                    .expect("options")
+                )
+            );
+        }
+        other => panic!("expected CREATE SOURCE statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_postgres_cdc_source_from_connection_parts() {
+    let stmt = parse_floe_statement(
+        "CREATE SOURCE pg_main WITH (
+            type = 'postgres_cdc',
+            hostname = 'localhost',
+            port = '55433',
+            username = 'postgres',
+            password = 'postgres',
+            database.name = 'postgres',
+            slot = 'floe_slot'
+        )",
+    )
+    .expect("parse source");
+    match stmt {
+        FloeStatement::CreateSource(definition) => {
+            let SourceConnector::PostgresCdc(options) = definition.connector();
+            assert_eq!(
+                options.connection(),
+                "host=localhost port=55433 user=postgres dbname=postgres password=postgres"
+            );
+            assert_eq!(options.slot(), "floe_slot");
+            assert_eq!(options.publication(), None);
+        }
+        other => panic!("expected CREATE SOURCE statement, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_create_table_statement() {
     let stmt = parse_floe_statement(
         "CREATE TABLE bids (id BIGINT PRIMARY KEY, price BIGINT NOT NULL, channel TEXT)",
@@ -108,6 +168,28 @@ fn parse_create_table_statement() {
             assert_eq!(id.data_type(), &SqlColumnType::Int64);
             assert!(!id.nullable());
             assert!(id.primary_key());
+        }
+        other => panic!("expected CREATE TABLE statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_source_backed_create_table_statement() {
+    let stmt = parse_floe_statement(
+        "CREATE TABLE orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT NOT NULL,
+            status TEXT
+        ) FROM pg_main TABLE 'public.orders'",
+    )
+    .expect("parse source-backed table");
+    match stmt {
+        FloeStatement::CreateTable(definition) => {
+            assert_eq!(definition.name(), "orders");
+            assert_eq!(definition.columns().len(), 3);
+            let source = definition.source().expect("source binding");
+            assert_eq!(source.source_name(), "pg_main");
+            assert_eq!(source.upstream_table(), "public.orders");
         }
         other => panic!("expected CREATE TABLE statement, got {other:?}"),
     }

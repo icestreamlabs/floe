@@ -91,3 +91,99 @@ topics = []
     );
     Ok(())
 }
+
+#[test]
+fn dry_run_accepts_sql_postgres_cdc_source_table_and_mv() -> Result<()> {
+    let sql = r#"
+        CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot.name = 'floe_slot',
+            publication.name = 'floe_pub'
+        );
+        CREATE TABLE orders (
+            id BIGINT PRIMARY KEY,
+            customer_id BIGINT NOT NULL,
+            amount BIGINT NOT NULL,
+            status TEXT
+        ) FROM pg_main TABLE 'public.orders';
+        CREATE MATERIALIZED VIEW mv_orders AS
+        SELECT id, amount FROM orders WHERE amount > 100;
+    "#;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node SQL CDC dry-run")?;
+    if !output.status.success() {
+        bail!(
+            "expected SQL CDC dry-run to succeed, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dry_run_rejects_sql_cdc_table_without_primary_key() -> Result<()> {
+    let sql = r#"
+        CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot.name = 'floe_slot'
+        );
+        CREATE TABLE orders (id BIGINT, amount BIGINT)
+        FROM pg_main TABLE 'public.orders';
+    "#;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node invalid SQL CDC dry-run")?;
+    assert!(
+        !output.status.success(),
+        "expected missing-primary-key CDC table to fail dry-run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must declare exactly one primary key column"),
+        "expected primary-key validation error in stderr, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dry_run_rejects_mv_over_raw_cdc_source() -> Result<()> {
+    let sql = r#"
+        CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot.name = 'floe_slot'
+        );
+        CREATE MATERIALIZED VIEW mv_raw AS SELECT * FROM pg_main;
+    "#;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node raw CDC source dry-run")?;
+    assert!(
+        !output.status.success(),
+        "expected raw CDC source MV to fail dry-run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pg_main"),
+        "expected raw source name in dry-run error, got:\n{stderr}"
+    );
+    Ok(())
+}

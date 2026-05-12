@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloeStatement {
+    CreateSource(CreateSourceDefinition),
     CreateTable(CreateTableDefinition),
     CreateMaterializedView(MaterializedViewDefinition),
     CreateSink(SinkDefinition),
@@ -16,6 +17,7 @@ pub enum FloeStatement {
 pub struct CreateTableDefinition {
     name: String,
     columns: Vec<CreateTableColumnDefinition>,
+    source: Option<CreateTableSourceDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +29,12 @@ pub struct CreateTableColumnDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableSourceDefinition {
+    source_name: String,
+    upstream_table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlColumnType {
     Int64,
     Bool,
@@ -34,8 +42,35 @@ pub enum SqlColumnType {
     TimestampMillis,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSourceDefinition {
+    name: String,
+    connector: SourceConnector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceConnector {
+    PostgresCdc(PostgresCdcSourceOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresCdcSourceOptions {
+    connection: String,
+    slot: String,
+    publication: Option<String>,
+    include_schema_in_source: Option<bool>,
+}
+
 impl CreateTableDefinition {
     pub fn new(name: impl Into<String>, columns: Vec<CreateTableColumnDefinition>) -> Result<Self> {
+        Self::new_with_source(name, columns, None)
+    }
+
+    pub fn new_with_source(
+        name: impl Into<String>,
+        columns: Vec<CreateTableColumnDefinition>,
+        source: Option<CreateTableSourceDefinition>,
+    ) -> Result<Self> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(anyhow!("table name cannot be empty"));
@@ -49,7 +84,11 @@ impl CreateTableDefinition {
                 "table {name} must declare exactly one primary key column"
             ));
         }
-        Ok(Self { name, columns })
+        Ok(Self {
+            name,
+            columns,
+            source,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -58,6 +97,10 @@ impl CreateTableDefinition {
 
     pub fn columns(&self) -> &[CreateTableColumnDefinition] {
         &self.columns
+    }
+
+    pub fn source(&self) -> Option<&CreateTableSourceDefinition> {
+        self.source.as_ref()
     }
 }
 
@@ -90,6 +133,89 @@ impl CreateTableColumnDefinition {
 
     pub fn primary_key(&self) -> bool {
         self.primary_key
+    }
+}
+
+impl CreateTableSourceDefinition {
+    pub fn new(source_name: impl Into<String>, upstream_table: impl Into<String>) -> Result<Self> {
+        let source_name = source_name.into();
+        let upstream_table = upstream_table.into();
+        if source_name.trim().is_empty() {
+            return Err(anyhow!("source name cannot be empty"));
+        }
+        if upstream_table.trim().is_empty() {
+            return Err(anyhow!("upstream table cannot be empty"));
+        }
+        Ok(Self {
+            source_name,
+            upstream_table,
+        })
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn upstream_table(&self) -> &str {
+        &self.upstream_table
+    }
+}
+
+impl CreateSourceDefinition {
+    pub fn new(name: impl Into<String>, connector: SourceConnector) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(anyhow!("source name cannot be empty"));
+        }
+        Ok(Self { name, connector })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn connector(&self) -> &SourceConnector {
+        &self.connector
+    }
+}
+
+impl PostgresCdcSourceOptions {
+    pub fn new(
+        connection: impl Into<String>,
+        slot: impl Into<String>,
+        publication: Option<String>,
+        include_schema_in_source: Option<bool>,
+    ) -> Result<Self> {
+        let connection = connection.into();
+        let slot = slot.into();
+        if connection.trim().is_empty() {
+            return Err(anyhow!("Postgres CDC source connection cannot be empty"));
+        }
+        if slot.trim().is_empty() {
+            return Err(anyhow!("Postgres CDC source slot cannot be empty"));
+        }
+        Ok(Self {
+            connection,
+            slot,
+            publication,
+            include_schema_in_source,
+        })
+    }
+
+    pub fn connection(&self) -> &str {
+        &self.connection
+    }
+
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    pub fn publication(&self) -> Option<&str> {
+        self.publication.as_deref()
+    }
+
+    pub fn include_schema_in_source(&self) -> Option<bool> {
+        self.include_schema_in_source
     }
 }
 

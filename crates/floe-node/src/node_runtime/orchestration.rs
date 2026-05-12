@@ -88,6 +88,127 @@ fn upstream_table_ref_for_postgres_include_table(table: &str) -> anyhow::Result<
     }
 }
 
+fn insert_catalog_source_definition(
+    sources: &mut HashMap<String, CatalogSourceDefinition>,
+    definition: CatalogSourceDefinition,
+    origin: &str,
+) -> anyhow::Result<()> {
+    if sources
+        .insert(definition.name().to_string(), definition)
+        .is_some()
+    {
+        return Err(anyhow!("duplicate source definition from {origin}"));
+    }
+    Ok(())
+}
+
+fn insert_source_backed_table_definition(
+    tables: &mut HashMap<String, SourceBackedTableDefinition>,
+    definition: SourceBackedTableDefinition,
+    origin: &str,
+) -> anyhow::Result<()> {
+    if tables
+        .insert(definition.table_name().to_string(), definition)
+        .is_some()
+    {
+        return Err(anyhow!(
+            "duplicate source-backed table definition from {origin}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_backed_tables(
+    catalog_sources: &HashMap<String, CatalogSourceDefinition>,
+    source_tables: &HashMap<String, SourceBackedTableDefinition>,
+    source_registry: &SourceRegistry,
+) -> anyhow::Result<()> {
+    for binding in source_tables.values() {
+        let source = catalog_sources.get(binding.source_name()).ok_or_else(|| {
+            anyhow!(
+                "table '{}' references unknown source '{}'",
+                binding.table_name(),
+                binding.source_name()
+            )
+        })?;
+        match source.connector() {
+            CatalogSourceConnector::PostgresCdc(_) => {}
+        }
+        let table_definition = source_registry.get(binding.table_name()).ok_or_else(|| {
+            anyhow!(
+                "source-backed table '{}' has no registered table definition",
+                binding.table_name()
+            )
+        })?;
+        if !source_definition_has_primary_key(table_definition) {
+            return Err(anyhow!(
+                "CDC table '{}' must declare a primary key",
+                binding.table_name()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn merge_catalog_source_connectors(
+    connector_specs: &mut Vec<config::ConnectorSpec>,
+    catalog_sources: &HashMap<String, CatalogSourceDefinition>,
+    source_tables: &HashMap<String, SourceBackedTableDefinition>,
+) -> anyhow::Result<()> {
+    let mut existing_names = connector_specs
+        .iter()
+        .map(|connector| connector.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut sorted_sources = catalog_sources.values().collect::<Vec<_>>();
+    sorted_sources.sort_by(|left, right| left.name().cmp(right.name()));
+
+    for source in sorted_sources {
+        let include_tables = source_tables
+            .values()
+            .filter(|table| table.source_name() == source.name())
+            .map(|table| table.upstream_table().to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if include_tables.is_empty() {
+            continue;
+        }
+        if !existing_names.insert(source.name().to_string()) {
+            return Err(anyhow!(
+                "source '{}' conflicts with an existing connector name",
+                source.name()
+            ));
+        }
+        let config = match source.connector() {
+            CatalogSourceConnector::PostgresCdc(postgres) => {
+                postgres
+                    .connection()
+                    .parse::<tokio_postgres::Config>()
+                    .with_context(|| {
+                        format!(
+                            "source '{}' has an invalid Postgres connection string",
+                            source.name()
+                        )
+                    })?;
+                ConnectorConfig::PostgresCdc {
+                    name: Some(source.name().to_string()),
+                    connection: postgres.connection().to_string(),
+                    slot: postgres.slot().to_string(),
+                    publication: postgres.publication().map(ToString::to_string),
+                    include_tables: Some(include_tables),
+                    include_schema_in_source: postgres.include_schema_in_source(),
+                }
+            }
+        };
+        connector_specs.push(config::ConnectorSpec {
+            name: source.name().to_string(),
+            config,
+        });
+    }
+
+    Ok(())
+}
+
 async fn run_native_postgres_cdc_connector(
     mut config: PostgresCdcConnectorConfig,
     runtime_plan: PostgresCdcRuntimePlan,
@@ -261,19 +382,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let (connector_specs, mut sink_specs) = if let Some(config) = config.as_ref() {
+    let (mut connector_specs, mut sink_specs) = if let Some(config) = config.as_ref() {
         let connectors = normalize_connectors(config.connectors.clone())?;
-        if connectors.is_empty() {
-            return Err(anyhow!("config must declare at least one connector"));
-        }
         let sinks = normalize_sinks(config.sinks.clone())?;
         (connectors, sinks)
     } else {
         let connectors = normalize_connectors(connectors_from_cli(&run_args))?;
         (connectors, Vec::new())
     };
-    log_startup_banner(&run_args, &connector_specs);
-
     let mut source_registry = SourceRegistry::new();
     source_registry.extend(floe_node_core::generator::definitions()?);
 
@@ -284,8 +400,28 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         Some(server::init_storage(slate_settings).await?)
     };
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
+    let mut catalog_sources: HashMap<String, CatalogSourceDefinition> = HashMap::new();
+    let mut source_backed_tables: HashMap<String, SourceBackedTableDefinition> = HashMap::new();
     let mut sql_sink_specs = Vec::new();
     if let Some(storage) = storage.as_ref() {
+        for definition in storage
+            .catalog_sources()
+            .await
+            .context("load persisted source definitions")?
+        {
+            insert_catalog_source_definition(&mut catalog_sources, definition, "catalog")?;
+        }
+        for definition in storage
+            .source_backed_tables()
+            .await
+            .context("load persisted source-backed table definitions")?
+        {
+            insert_source_backed_table_definition(
+                &mut source_backed_tables,
+                definition,
+                "catalog",
+            )?;
+        }
         let db = storage.db();
         let stored_views = storage
             .materialized_views()
@@ -339,14 +475,50 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(sql_program) = run_args.mv_query.as_deref() {
         for statement in parse_floe_program(sql_program)? {
             match statement {
+                FloeStatement::CreateSource(definition) => {
+                    let source = catalog_source_definition_from_sql(&definition)?;
+                    if let Some(storage) = storage.as_ref() {
+                        storage
+                            .upsert_catalog_source(source.clone())
+                            .await
+                            .with_context(|| {
+                                format!("persist source definition '{}'", source.name())
+                            })?;
+                    }
+                    catalog_sources.insert(source.name().to_string(), source);
+                }
                 FloeStatement::CreateTable(definition) => {
                     let table = table_definition_from_sql(&definition)?;
+                    let source_backed_table = source_backed_table_definition_from_sql(&definition)?;
+                    if let Some(binding) = source_backed_table.as_ref()
+                        && !catalog_sources.contains_key(binding.source_name())
+                    {
+                        return Err(anyhow!(
+                            "table '{}' references unknown source '{}'",
+                            binding.table_name(),
+                            binding.source_name()
+                        ));
+                    }
                     if let Some(storage) = storage.as_ref() {
                         storage.upsert_table(table.clone()).await.with_context(|| {
                             format!("persist table definition '{}'", table.name())
                         })?;
+                        if let Some(binding) = source_backed_table.as_ref() {
+                            storage
+                                .upsert_source_backed_table(binding.clone())
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "persist source-backed table definition '{}'",
+                                        binding.table_name()
+                                    )
+                                })?;
+                        }
                     }
                     source_registry.register(source_definition_from_table(&table)?);
+                    if let Some(binding) = source_backed_table {
+                        source_backed_tables.insert(binding.table_name().to_string(), binding);
+                    }
                 }
                 FloeStatement::CreateMaterializedView(definition) => {
                     upsert_materialized_view_definition(
@@ -380,6 +552,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             source_registry.register(source_definition_from_table(&table)?);
         }
     }
+    validate_source_backed_tables(&catalog_sources, &source_backed_tables, &source_registry)?;
+    merge_catalog_source_connectors(
+        &mut connector_specs,
+        &catalog_sources,
+        &source_backed_tables,
+    )?;
+    log_startup_banner(&run_args, &connector_specs);
     apply_connector_properties(&mut source_registry, &connector_specs);
     let available_sources = available_sources_from_registry(&source_registry);
 

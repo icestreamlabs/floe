@@ -208,9 +208,21 @@ impl ConnectorSpec {
             | ConnectorConfig::ObjectStore { default_source, .. } => {
                 default_source.clone().into_iter().collect()
             }
-            ConnectorConfig::PostgresCdc { include_tables, .. } => {
-                include_tables.clone().unwrap_or_default()
-            }
+            ConnectorConfig::PostgresCdc { include_tables, .. } => include_tables
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|table| {
+                    if registry.contains(&table) {
+                        table
+                    } else {
+                        table
+                            .rsplit_once('.')
+                            .map(|(_, name)| name.to_string())
+                            .unwrap_or(table)
+                    }
+                })
+                .collect(),
         }
     }
 
