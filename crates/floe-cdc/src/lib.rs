@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,11 +7,18 @@ use floe_cdc_core::{
     CdcChange, CdcCheckpoint, CdcRow, CdcRowKey, CdcSourceDefinition, CdcSourceId,
     CdcTableDefinition, CdcTableId, CdcTableSchema, ChangeBatch, TransactionBatch,
 };
+use floe_core::RowValue;
 use serde::Deserialize;
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
 const CDC_PREFIX: &[u8] = b"floe_cdc/v1/";
+const CDC_ROW_STATE_MAGIC: &[u8; 8] = b"FCDCRW1\0";
+const CDC_ROW_VALUE_NULL: u8 = 0;
+const CDC_ROW_VALUE_INT64: u8 = 1;
+const CDC_ROW_VALUE_BOOL: u8 = 2;
+const CDC_ROW_VALUE_UTF8: u8 = 3;
+const CDC_ROW_VALUE_TIMESTAMP_MILLIS: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcRowDelta {
@@ -325,6 +332,9 @@ impl CdcTableStore {
         batch: &mut WriteBatch,
     ) -> Result<Vec<CdcRowDelta>> {
         let mut deltas = Vec::new();
+        let prefetched_rows = self
+            .prefetch_old_rows(schema, change_batch, overlay)
+            .await?;
         for change in change_batch.changes() {
             match change {
                 CdcChange::Insert { row } => {
@@ -338,9 +348,7 @@ impl CdcTableStore {
                     let before_storage_key = row_key_bytes(schema.table_id(), &before_key)?;
                     let old_row = match before {
                         Some(row) => row.clone(),
-                        None => self
-                            .load_row_with_overlay(&before_storage_key, overlay)
-                            .await?
+                        None => row_with_overlay(&before_storage_key, overlay, &prefetched_rows)
                             .ok_or_else(|| {
                                 anyhow!(
                                     "CDC update for table '{}' could not find previous row",
@@ -363,9 +371,7 @@ impl CdcTableStore {
                     let storage_key = row_key_bytes(schema.table_id(), &delete_key)?;
                     let old_row = match before {
                         Some(row) => row.clone(),
-                        None => self
-                            .load_row_with_overlay(&storage_key, overlay)
-                            .await?
+                        None => row_with_overlay(&storage_key, overlay, &prefetched_rows)
                             .ok_or_else(|| {
                                 anyhow!(
                                     "CDC delete for table '{}' could not find previous row",
@@ -387,15 +393,48 @@ impl CdcTableStore {
         Ok(deltas)
     }
 
-    async fn load_row_with_overlay(
+    async fn prefetch_old_rows(
         &self,
-        storage_key: &[u8],
+        schema: &CdcTableSchema,
+        change_batch: &ChangeBatch,
         overlay: &HashMap<Vec<u8>, Option<CdcRow>>,
-    ) -> Result<Option<CdcRow>> {
-        if let Some(row) = overlay.get(storage_key) {
-            return Ok(row.clone());
+    ) -> Result<HashMap<Vec<u8>, Option<CdcRow>>> {
+        let mut storage_keys = Vec::new();
+        let mut seen = HashSet::new();
+        for change in change_batch.changes() {
+            let storage_key = match change {
+                CdcChange::Update { key, before, after } if before.is_none() => {
+                    let before_key = key_for_update_lookup(schema, key.as_ref(), before, after)?;
+                    row_key_bytes(schema.table_id(), &before_key)?
+                }
+                CdcChange::Delete { key, before } if before.is_none() => {
+                    let delete_key = key_for_delete_lookup(schema, key.as_ref(), before)?;
+                    row_key_bytes(schema.table_id(), &delete_key)?
+                }
+                _ => continue,
+            };
+            if overlay.contains_key(&storage_key) {
+                continue;
+            }
+            if seen.insert(storage_key.clone()) {
+                storage_keys.push(storage_key);
+            }
         }
-        self.load_row_by_storage_key(storage_key).await
+        self.load_rows_by_storage_key(&storage_keys).await
+    }
+
+    async fn load_rows_by_storage_key(
+        &self,
+        storage_keys: &[Vec<u8>],
+    ) -> Result<HashMap<Vec<u8>, Option<CdcRow>>> {
+        let mut rows = HashMap::with_capacity(storage_keys.len());
+        for storage_key in storage_keys {
+            rows.insert(
+                storage_key.clone(),
+                self.load_row_by_storage_key(storage_key).await?,
+            );
+        }
+        Ok(rows)
     }
 
     async fn load_row_by_storage_key(&self, storage_key: &[u8]) -> Result<Option<CdcRow>> {
@@ -407,8 +446,19 @@ impl CdcTableStore {
         else {
             return Ok(None);
         };
-        decode_json(&bytes, "CDC row state")
+        decode_cdc_row_state(&bytes).map(Some)
     }
+}
+
+fn row_with_overlay(
+    storage_key: &[u8],
+    overlay: &HashMap<Vec<u8>, Option<CdcRow>>,
+    prefetched_rows: &HashMap<Vec<u8>, Option<CdcRow>>,
+) -> Option<CdcRow> {
+    if let Some(row) = overlay.get(storage_key) {
+        return row.clone();
+    }
+    prefetched_rows.get(storage_key).cloned().flatten()
 }
 
 fn stage_checkpoint(checkpoint: &CdcCheckpoint, batch: &mut WriteBatch) -> Result<()> {
@@ -454,10 +504,7 @@ fn stage_put_row(
     storage_key: Vec<u8>,
     row: CdcRow,
 ) -> Result<()> {
-    batch.put(
-        storage_key.clone(),
-        serde_json::to_vec(&row).context("encode CDC row state")?,
-    );
+    batch.put(storage_key.clone(), encode_cdc_row_state(&row)?);
     overlay.insert(storage_key, Some(row));
     Ok(())
 }
@@ -525,6 +572,137 @@ fn push_component(out: &mut Vec<u8>, component: &[u8]) {
     let len = u32::try_from(component.len()).expect("CDC key component length exceeds u32");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(component);
+}
+
+fn encode_cdc_row_state(row: &CdcRow) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(CDC_ROW_STATE_MAGIC.len() + 4 + row.values().len() * 9);
+    out.extend_from_slice(CDC_ROW_STATE_MAGIC);
+    push_u32(&mut out, row.values().len(), "CDC row value count")?;
+    for value in row.values() {
+        encode_cdc_row_value(&mut out, value.as_ref())?;
+    }
+    Ok(out)
+}
+
+fn encode_cdc_row_value(out: &mut Vec<u8>, value: Option<&RowValue>) -> Result<()> {
+    match value {
+        None => out.push(CDC_ROW_VALUE_NULL),
+        Some(RowValue::Int64(value)) => {
+            out.push(CDC_ROW_VALUE_INT64);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(RowValue::Bool(value)) => {
+            out.push(CDC_ROW_VALUE_BOOL);
+            out.push(u8::from(*value));
+        }
+        Some(RowValue::Utf8(value)) => {
+            out.push(CDC_ROW_VALUE_UTF8);
+            push_u32(out, value.len(), "CDC UTF-8 value length")?;
+            out.extend_from_slice(value.as_bytes());
+        }
+        Some(RowValue::TimestampMillis(value)) => {
+            out.push(CDC_ROW_VALUE_TIMESTAMP_MILLIS);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_cdc_row_state(bytes: &[u8]) -> Result<CdcRow> {
+    if !bytes.starts_with(CDC_ROW_STATE_MAGIC) {
+        return decode_json_value(bytes, "legacy CDC row state");
+    }
+    let mut cursor = CdcRowStateCursor::new(&bytes[CDC_ROW_STATE_MAGIC.len()..]);
+    let value_count = cursor.read_u32()? as usize;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(cursor.read_value()?);
+    }
+    if !cursor.is_empty() {
+        bail!(
+            "CDC row state has {} trailing bytes",
+            cursor.remaining_len()
+        );
+    }
+    CdcRow::new(values)
+}
+
+fn push_u32(out: &mut Vec<u8>, value: usize, label: &str) -> Result<()> {
+    let value = u32::try_from(value).with_context(|| format!("{label} exceeds u32"))?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+struct CdcRowStateCursor<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CdcRowStateCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn read_value(&mut self) -> Result<Option<RowValue>> {
+        let tag = self.read_u8()?;
+        match tag {
+            CDC_ROW_VALUE_NULL => Ok(None),
+            CDC_ROW_VALUE_INT64 => Ok(Some(RowValue::Int64(self.read_i64()?))),
+            CDC_ROW_VALUE_BOOL => match self.read_u8()? {
+                0 => Ok(Some(RowValue::Bool(false))),
+                1 => Ok(Some(RowValue::Bool(true))),
+                other => bail!("invalid CDC bool value byte {other}"),
+            },
+            CDC_ROW_VALUE_UTF8 => {
+                let len = self.read_u32()? as usize;
+                let bytes = self.take(len)?;
+                let value = std::str::from_utf8(bytes)
+                    .context("decode CDC UTF-8 row value")?
+                    .to_string();
+                Ok(Some(RowValue::Utf8(value)))
+            }
+            CDC_ROW_VALUE_TIMESTAMP_MILLIS => Ok(Some(RowValue::TimestampMillis(self.read_i64()?))),
+            other => bail!("unknown CDC row value tag {other}"),
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        let bytes = self.take(1)?;
+        Ok(bytes[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("slice length checked"),
+        ))
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        let bytes = self.take(8)?;
+        Ok(i64::from_le_bytes(
+            bytes.try_into().expect("slice length checked"),
+        ))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        if self.bytes.len() < len {
+            bail!(
+                "CDC row state ended early: needed {len} bytes, had {}",
+                self.bytes.len()
+            );
+        }
+        let (head, tail) = self.bytes.split_at(len);
+        self.bytes = tail;
+        Ok(head)
+    }
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Result<Option<T>> {
@@ -600,6 +778,25 @@ mod tests {
             batches,
         )
         .expect("transaction")
+    }
+
+    #[test]
+    fn binary_row_state_codec_round_trips_all_value_types() {
+        let source = CdcRow::new([
+            Some(RowValue::Int64(7)),
+            Some(RowValue::Bool(true)),
+            Some(RowValue::Utf8("paid".to_string())),
+            Some(RowValue::TimestampMillis(1_700_000_000_000)),
+            None,
+        ])
+        .expect("row");
+
+        let encoded = encode_cdc_row_state(&source).expect("encode row state");
+        assert!(encoded.starts_with(CDC_ROW_STATE_MAGIC));
+        assert_eq!(
+            decode_cdc_row_state(&encoded).expect("decode row state"),
+            source
+        );
     }
 
     #[tokio::test]
@@ -859,6 +1056,60 @@ mod tests {
                 .await
                 .expect("load deleted row"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn row_state_uses_binary_codec_and_reads_legacy_json() {
+        let table = test_table("cdc-row-state-binary").await;
+        let store = CdcTableStore::new(Arc::clone(&table));
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let binary_row = row(1, Some(100), Some("open"));
+        let transaction = tx(
+            "0/5",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: binary_row.clone(),
+                    }],
+                )
+                .expect("batch"),
+            ],
+        );
+        store
+            .apply_transaction(&schemas(schema), &transaction)
+            .await
+            .expect("apply binary row");
+
+        let binary_key = row_key_bytes(&table_id, &key(1)).expect("row key");
+        let binary_bytes = table
+            .get(&binary_key)
+            .await
+            .expect("load raw binary row")
+            .expect("binary row should exist");
+        assert!(binary_bytes.starts_with(CDC_ROW_STATE_MAGIC));
+        assert_ne!(binary_bytes.first(), Some(&b'{'));
+        assert_eq!(
+            store.load_row(&table_id, &key(1)).await.expect("load row"),
+            Some(binary_row)
+        );
+
+        let legacy_row = row(88, None, Some("legacy"));
+        let legacy_key = row_key_bytes(&table_id, &key(88)).expect("legacy row key");
+        let mut batch = WriteBatch::new();
+        batch.put(
+            legacy_key,
+            serde_json::to_vec(&legacy_row).expect("legacy JSON row"),
+        );
+        table.write_batch(batch).await.expect("write legacy row");
+        assert_eq!(
+            store
+                .load_row(&table_id, &key(88))
+                .await
+                .expect("load legacy row"),
+            Some(legacy_row)
         );
     }
 
