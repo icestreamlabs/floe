@@ -115,7 +115,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
         parse_materialized_view(result_sql)?,
     ];
     let planned = plan_materialized_views(&registry, &definitions).await?;
-    let circuit_plans = build_dataflows(&planned, &available_sources)?;
+    let circuit_plans = build_dataflows(&planned, &available_sources, &registry)?;
     assert_eq!(circuit_plans.len(), 2);
 
     let mut required_sources = std::collections::BTreeSet::new();

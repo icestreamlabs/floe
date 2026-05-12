@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use datafusion::common::TableReference;
 
@@ -6,7 +7,7 @@ use dbsp_circuit::circuit::tables::TableDescriptor;
 
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
-    tables: HashMap<String, &'static TableDescriptor>,
+    tables: HashMap<String, Arc<TableDescriptor>>,
 }
 
 impl PlannerConfig {
@@ -22,18 +23,23 @@ impl PlannerConfig {
     }
 
     pub fn register_table(&mut self, table: &'static TableDescriptor) {
-        self.tables.insert(table.name.to_string(), table);
+        self.register_owned_table(table.clone());
     }
 
     pub fn register_alias(&mut self, alias: &str, table: &'static TableDescriptor) {
-        self.tables.insert(alias.to_string(), table);
+        self.tables
+            .insert(alias.to_string(), Arc::new(table.clone()));
     }
 
-    pub(super) fn table(&self, name: &TableReference) -> Option<&'static TableDescriptor> {
+    pub fn register_owned_table(&mut self, table: TableDescriptor) {
+        self.tables.insert(table.name.to_string(), Arc::new(table));
+    }
+
+    pub(super) fn table(&self, name: &TableReference) -> Option<Arc<TableDescriptor>> {
         self.tables
             .get(name.table())
-            .copied()
-            .or_else(|| self.tables.get(&name.to_string()).copied())
+            .cloned()
+            .or_else(|| self.tables.get(&name.to_string()).cloned())
     }
 }
 

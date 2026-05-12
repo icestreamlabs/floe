@@ -395,7 +395,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
-    let circuit_plans = build_dataflows(&planned_materialized_views, &available_sources)?;
+    let circuit_plans = build_dataflows(
+        &planned_materialized_views,
+        &available_sources,
+        &source_registry,
+    )?;
     let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
     let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
     let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());

@@ -717,7 +717,7 @@ async fn postgres_cdc_table_restart_resumes_from_committed_lsn() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
 #[serial_test::serial(postgres_cdc_acceptance)]
-async fn postgres_cdc_shared_source_transaction_feeds_multiple_mvs() -> Result<()> {
+async fn postgres_cdc_shared_source_transaction_feeds_join_mv() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
     let run_id = SystemTime::now()
@@ -729,6 +729,7 @@ async fn postgres_cdc_shared_source_transaction_feeds_multiple_mvs() -> Result<(
     let auction_table = "nexmark_auction".to_string();
     let bid_mv = format!("mv_floe_cdc_shared_bid_{run_id}");
     let auction_mv = format!("mv_floe_cdc_shared_auction_{run_id}");
+    let join_mv = format!("mv_floe_cdc_shared_join_{run_id}");
     let slot = format!("floe_acceptance_join_{run_id}");
     let publication = format!("floe_acceptance_join_pub_{run_id}");
     let temp_dir = TempDir::new().context("create temp dir")?;
@@ -824,7 +825,10 @@ async fn postgres_cdc_shared_source_transaction_feeds_multiple_mvs() -> Result<(
          CREATE MATERIALIZED VIEW IF NOT EXISTS {bid_mv} AS
          SELECT auction, bidder, price FROM {bid_table};
          CREATE MATERIALIZED VIEW IF NOT EXISTS {auction_mv} AS
-         SELECT id, seller FROM {auction_table}"
+         SELECT id, seller FROM {auction_table};
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {join_mv} AS
+         SELECT b.auction, b.bidder, b.price, a.seller
+         FROM {bid_table} AS b JOIN {auction_table} AS a ON b.auction = a.id"
     );
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
@@ -845,6 +849,7 @@ async fn postgres_cdc_shared_source_transaction_feeds_multiple_mvs() -> Result<(
             .context("commit shared-source cdc transaction")?;
         wait_for_mv_price_count_at_least(pg_port, &bid_mv, 21, 650, 1).await?;
         wait_for_auction_seller_count_at_least(pg_port, &auction_mv, 21, 9001, 1).await?;
+        wait_for_join_mv_count_at_least(pg_port, &join_mv, 21, 42, 9001, 1).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -1224,6 +1229,53 @@ async fn query_auction_seller_count(
         .query_one(&query, &[&id, &seller])
         .await
         .with_context(|| format!("query {mv_name} auction count"))?;
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    Ok(row.get::<_, i64>(0))
+}
+
+async fn wait_for_join_mv_count_at_least(
+    pg_port: u16,
+    mv_name: &str,
+    auction: i64,
+    bidder: i64,
+    seller: i64,
+    min_count: i64,
+) -> Result<i64> {
+    for _ in 0..120 {
+        match query_join_mv_count(pg_port, mv_name, auction, bidder, seller).await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!(
+        "timed out waiting for {mv_name} count >= {min_count} for auction={auction}, bidder={bidder}, seller={seller}"
+    );
+}
+
+async fn query_join_mv_count(
+    pg_port: u16,
+    mv_name: &str,
+    auction: i64,
+    bidder: i64,
+    seller: i64,
+) -> Result<i64> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+        NoTls,
+    )
+    .await
+    .context("connect to pgwire")?;
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let query = format!(
+        "SELECT COUNT(*) FROM {mv_name} WHERE auction = $1 AND bidder = $2 AND seller = $3"
+    );
+    let row = client
+        .query_one(&query, &[&auction, &bidder, &seller])
+        .await
+        .with_context(|| format!("query {mv_name} join count"))?;
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(row.get::<_, i64>(0))

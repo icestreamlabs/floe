@@ -104,7 +104,9 @@ impl<'cfg> PlannerContext<'cfg> {
                 let source_schema = table.schema().clone();
                 let source_id = self.add_node(
                     vec![],
-                    DbspNodeKind::Source(DbspSourceNode { table }),
+                    DbspNodeKind::Source(DbspSourceNode {
+                        table: table.clone(),
+                    }),
                     source_schema.clone(),
                 );
                 let mut current = PlannedNode {

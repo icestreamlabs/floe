@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use crate::circuit::schema::{Field, PrimaryKey, RowSchema};
 use crate::circuit::types::DbspScalarType;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableDescriptor {
     pub name: &'static str,
     schema: Arc<RowSchema>,
@@ -13,6 +13,36 @@ pub struct TableDescriptor {
 }
 
 impl TableDescriptor {
+    pub fn try_new(
+        name: &'static str,
+        fields: Vec<Field>,
+        primary_key_columns: &[&str],
+    ) -> anyhow::Result<Self> {
+        let schema = RowSchema::try_new(fields)?;
+        let primary_key = PrimaryKey::new(schema.clone(), primary_key_columns)?;
+        Ok(Self {
+            name,
+            schema,
+            primary_key,
+        })
+    }
+
+    pub fn try_new_dynamic(
+        name: impl Into<String>,
+        fields: Vec<Field>,
+        primary_key_columns: &[String],
+    ) -> anyhow::Result<Self> {
+        // Dynamic descriptors are created at planning/startup time, while the
+        // descriptor name is still stored as a static str for legacy source
+        // node compatibility.
+        let name = Box::leak(name.into().into_boxed_str());
+        let primary_key_columns = primary_key_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        Self::try_new(name, fields, &primary_key_columns)
+    }
+
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.schema.field_index(name)
     }

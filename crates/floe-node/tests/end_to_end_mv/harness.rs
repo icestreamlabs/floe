@@ -61,7 +61,7 @@ impl MvTestHarness {
             1,
             "expected a single planned materialized view"
         );
-        let circuit_plans = build_dataflows(&planned, &available_sources)?;
+        let circuit_plans = build_dataflows(&planned, &available_sources, &registry)?;
         assert_eq!(
             circuit_plans.len(),
             1,

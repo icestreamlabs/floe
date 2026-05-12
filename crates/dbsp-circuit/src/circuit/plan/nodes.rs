@@ -34,7 +34,7 @@ impl DbspPredicate {
 
 #[derive(Clone, Debug)]
 pub struct DbspSourceNode {
-    pub table: &'static TableDescriptor,
+    pub table: Arc<TableDescriptor>,
 }
 
 impl DbspSourceNode {

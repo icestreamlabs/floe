@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_schema::SchemaRef;
@@ -295,7 +296,9 @@ fn window_aggregate_plan() -> Result<CircuitPlan> {
 
     let source = CircuitNode {
         id: 0,
-        kind: DbspNodeKind::Source(DbspSourceNode { table: bid }),
+        kind: DbspNodeKind::Source(DbspSourceNode {
+            table: Arc::new(bid.clone()),
+        }),
         inputs: vec![],
         output_schema: input_schema,
     };

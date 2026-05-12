@@ -5059,7 +5059,9 @@ fn build_window_plan(
 
     let source = dbsp::CircuitNode {
         id: 0,
-        kind: dbsp::DbspNodeKind::Source(dbsp::DbspSourceNode { table }),
+        kind: dbsp::DbspNodeKind::Source(dbsp::DbspSourceNode {
+            table: Arc::new(table.clone()),
+        }),
         inputs: vec![],
         output_schema: input_schema,
     };

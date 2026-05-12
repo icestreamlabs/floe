@@ -8793,7 +8793,7 @@ mod tests {
                 CircuitNode {
                     id: 0,
                     kind: DbspNodeKind::Source(DbspSourceNode {
-                        table: source_table,
+                        table: Arc::new(source_table.clone()),
                     }),
                     inputs: vec![],
                     output_schema: source_schema,
