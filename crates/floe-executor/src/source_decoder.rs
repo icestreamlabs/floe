@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use datafusion::arrow::array::{
+    Array, BooleanArray, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+};
 use floe_core::RowValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
 use serde_json::Value;
@@ -121,12 +124,187 @@ impl SourceRowDecoder {
         Ok((buf, event_ts))
     }
 
+    pub fn encode_arrow_batch(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<Vec<(Vec<u8>, Option<Timestamp>)>> {
+        if batch.num_columns() != self.definition.columns().len() {
+            bail!(
+                "Arrow batch column count {} does not match definition '{}' column count {}",
+                batch.num_columns(),
+                self.definition.name(),
+                self.definition.columns().len()
+            );
+        }
+        let columns = self.prepare_arrow_columns(batch)?;
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            rows.push(self.encode_prepared_arrow_row(&columns, row_idx)?);
+        }
+        Ok(rows)
+    }
+
+    fn prepare_arrow_columns<'a>(
+        &self,
+        batch: &'a RecordBatch,
+    ) -> Result<Vec<PreparedArrowColumn<'a>>> {
+        self.definition
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                let values = if self.column_required(idx) {
+                    Some(ArrowColumnValues::new(
+                        column.name(),
+                        column.data_type(),
+                        batch.column(idx).as_ref(),
+                    )?)
+                } else {
+                    None
+                };
+                Ok(PreparedArrowColumn {
+                    name: column.name().to_string(),
+                    data_type: column.data_type().clone(),
+                    nullable: column.nullable(),
+                    values,
+                })
+            })
+            .collect()
+    }
+
+    fn encode_prepared_arrow_row(
+        &self,
+        columns: &[PreparedArrowColumn<'_>],
+        row_idx: usize,
+    ) -> Result<(Vec<u8>, Option<Timestamp>)> {
+        let mut buf = Vec::with_capacity(64);
+        let count = u32::try_from(columns.len()).context("too many source columns to encode")?;
+        buf.extend_from_slice(&count.to_le_bytes());
+        let mut event_ts = None;
+        for column in columns {
+            let Some(values) = column.values.as_ref() else {
+                encode_typed_null(&mut buf, &column.data_type);
+                continue;
+            };
+            encode_prepared_arrow_value_direct(
+                &mut buf,
+                column.name.as_str(),
+                &column.data_type,
+                values,
+                row_idx,
+                column.nullable,
+                &mut event_ts,
+            )?;
+        }
+        Ok((buf, event_ts))
+    }
+
     fn column_required(&self, idx: usize) -> bool {
         self.encoded_required_columns
             .as_ref()
             .and_then(|columns| columns.get(idx))
             .copied()
             .unwrap_or(true)
+    }
+}
+
+struct PreparedArrowColumn<'a> {
+    name: String,
+    data_type: SourceDataType,
+    nullable: bool,
+    values: Option<ArrowColumnValues<'a>>,
+}
+
+enum ArrowColumnValues<'a> {
+    Int64(&'a Int64Array),
+    Bool(&'a BooleanArray),
+    Utf8(&'a StringArray),
+    TimestampMillis(&'a TimestampMillisecondArray),
+}
+
+impl<'a> ArrowColumnValues<'a> {
+    fn new(column_name: &str, data_type: &SourceDataType, array: &'a dyn Array) -> Result<Self> {
+        match data_type {
+            SourceDataType::Int64 => array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(Self::Int64)
+                .with_context(|| format!("Arrow column '{column_name}' is not Int64")),
+            SourceDataType::Utf8 => array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(Self::Utf8)
+                .with_context(|| format!("Arrow column '{column_name}' is not Utf8")),
+            SourceDataType::TimestampMillis => array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .map(Self::TimestampMillis)
+                .with_context(|| format!("Arrow column '{column_name}' is not TimestampMillis")),
+            SourceDataType::Bool => array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .map(Self::Bool)
+                .with_context(|| format!("Arrow column '{column_name}' is not Boolean")),
+        }
+    }
+
+    fn is_null(&self, row_idx: usize) -> bool {
+        match self {
+            Self::Int64(array) => array.is_null(row_idx),
+            Self::Bool(array) => array.is_null(row_idx),
+            Self::Utf8(array) => array.is_null(row_idx),
+            Self::TimestampMillis(array) => array.is_null(row_idx),
+        }
+    }
+}
+
+fn encode_prepared_arrow_value_direct(
+    buf: &mut Vec<u8>,
+    column_name: &str,
+    data_type: &SourceDataType,
+    values: &ArrowColumnValues<'_>,
+    row_idx: usize,
+    nullable: bool,
+    event_ts: &mut Option<Timestamp>,
+) -> Result<()> {
+    if values.is_null(row_idx) {
+        if nullable {
+            encode_typed_null(buf, data_type);
+            return Ok(());
+        }
+        bail!("null value violates non-nullable column '{column_name}'");
+    }
+
+    match (data_type, values) {
+        (SourceDataType::Int64, ArrowColumnValues::Int64(array)) => {
+            let number = array.value(row_idx);
+            buf.push(0x01);
+            buf.extend_from_slice(&number.to_le_bytes());
+            Ok(())
+        }
+        (SourceDataType::Utf8, ArrowColumnValues::Utf8(array)) => {
+            let bytes = array.value(row_idx).as_bytes();
+            buf.push(0x02);
+            let len = u32::try_from(bytes.len()).context("utf8 value too large for MV key")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
+            Ok(())
+        }
+        (SourceDataType::TimestampMillis, ArrowColumnValues::TimestampMillis(array)) => {
+            let number = array.value(row_idx);
+            buf.push(0x03);
+            buf.extend_from_slice(&number.to_le_bytes());
+            if event_ts.is_none() && number >= 0 {
+                *event_ts = Some(number as u64);
+            }
+            Ok(())
+        }
+        (SourceDataType::Bool, ArrowColumnValues::Bool(array)) => {
+            buf.push(0x04);
+            buf.push(if array.value(row_idx) { 1 } else { 0 });
+            Ok(())
+        }
+        _ => bail!("prepared Arrow column '{column_name}' does not match type {data_type:?}"),
     }
 }
 
@@ -256,6 +434,12 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{
+        BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+    };
+    use datafusion::arrow::record_batch::RecordBatch;
     use floe_core::RowValue;
     use floe_core::source::{SourceColumn, SourceDataType};
     use serde_json::json;
@@ -267,6 +451,19 @@ mod tests {
         let mut decoded = Vec::new();
         decode_all_encoded_row_scalars_into(encoded, &mut decoded).expect("decode encoded row");
         decoded
+    }
+
+    fn mixed_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "mixed",
+            vec![
+                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("label", SourceDataType::Utf8, true),
+                SourceColumn::new_nullable("seen_at", SourceDataType::TimestampMillis, false),
+                SourceColumn::new_nullable("enabled", SourceDataType::Bool, false),
+            ],
+        )
+        .expect("definition")
     }
 
     #[test]
@@ -341,6 +538,46 @@ mod tests {
         assert_eq!(row[0], Some(EncodedRowScalar::Int64(1)));
         assert_eq!(row[1], Some(EncodedRowScalar::Bool(true)));
         assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn encodes_arrow_batch_without_json_payloads() {
+        let definition = mixed_definition();
+        let decoder = SourceRowDecoder::new(definition.clone());
+        let batch = RecordBatch::try_new(
+            definition.to_arrow_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("one"), None])),
+                Arc::new(TimestampMillisecondArray::from(vec![1000, 2000])),
+                Arc::new(BooleanArray::from(vec![true, false])),
+            ],
+        )
+        .expect("record batch");
+
+        let encoded = decoder.encode_arrow_batch(&batch).expect("encode arrow");
+
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].1, Some(1000));
+        assert_eq!(encoded[1].1, Some(2000));
+        assert_eq!(
+            decode_test_row(&encoded[0].0),
+            vec![
+                Some(EncodedRowScalar::Int64(1)),
+                Some(EncodedRowScalar::Utf8("one".to_string())),
+                Some(EncodedRowScalar::TimestampMillis(1000)),
+                Some(EncodedRowScalar::Bool(true)),
+            ]
+        );
+        assert_eq!(
+            decode_test_row(&encoded[1].0),
+            vec![
+                Some(EncodedRowScalar::Int64(2)),
+                None,
+                Some(EncodedRowScalar::TimestampMillis(2000)),
+                Some(EncodedRowScalar::Bool(false)),
+            ]
+        );
     }
 
     #[test]

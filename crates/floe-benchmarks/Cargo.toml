@@ -24,6 +24,9 @@ async-trait = { workspace = true }
 criterion = "0.5"
 datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }
+floe-cdc = { path = "../floe-cdc" }
+floe-cdc-core = { path = "../floe-cdc-core" }
+floe-core = { path = "../floe-core" }
 parking_lot = "0.12"
 rkyv = { workspace = true }
 arrow-ipc = "57.1.0"
@@ -40,4 +43,8 @@ harness = false
 
 [[bench]]
 name = "update_model_storage"
+harness = false
+
+[[bench]]
+name = "postgres_cdc_arrow_encoder"
 harness = false
