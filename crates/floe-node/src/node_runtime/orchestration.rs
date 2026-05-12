@@ -1402,6 +1402,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .values()
             .flat_map(|plan| plan.replication_pipelines.iter().cloned()),
     )?;
+    let replayed_replication_records = replication_pipeline_runtime
+        .replay_buffered(&storage)
+        .await
+        .context("replay buffered replication pipeline records")?;
+    if replayed_replication_records > 0 {
+        tracing::info!(
+            records = replayed_replication_records,
+            "replayed buffered replication pipeline records during startup"
+        );
+    }
     let source_names_by_id = Arc::new(
         definitions
             .iter()

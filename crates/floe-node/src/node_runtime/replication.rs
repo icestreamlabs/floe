@@ -1,19 +1,25 @@
 use super::*;
 
-use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use floe_node_core::debezium_encoder::{
     DebeziumEncodeContext, DebeziumEncodedRecord, DebeziumEnvelopeConfig, encode_debezium_change,
     encode_debezium_snapshot_row,
 };
-use floe_storage::{ReplicationPipelineCheckpoint, SlateCatalog};
+use floe_storage::{
+    CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferRecord, CdcBufferStore,
+    CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, SlateCatalog,
+};
 use futures::future::join_all;
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;
+const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
+const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
+const REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
 
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
@@ -60,6 +66,20 @@ impl ReplicationPipelineRuntime {
             .is_some_and(|plans| !plans.is_empty())
     }
 
+    pub(super) async fn replay_buffered(&self, storage: &SlateCatalog) -> anyhow::Result<usize> {
+        let buffer_store = CdcBufferStore::new(storage.db());
+        let mut delivered = 0usize;
+        for plans in self.pipelines_by_source.values() {
+            for plan in plans {
+                delivered = delivered.saturating_add(
+                    self.replay_pending_for_plan(plan, &buffer_store, storage)
+                        .await?,
+                );
+            }
+        }
+        Ok(delivered)
+    }
+
     pub(super) async fn run_transaction(
         &self,
         source_id: &CdcSourceId,
@@ -91,7 +111,89 @@ impl ReplicationPipelineRuntime {
             if records.is_empty() {
                 continue;
             }
-            let mut target_state = match &plan.target {
+            let buffered_records = debezium_records_to_buffer_records(&records)?;
+            if let Some(storage) = storage {
+                let buffer_store = CdcBufferStore::new(storage.db());
+                let manifest = buffer_store
+                    .append_transaction(CdcBufferAppend::new(
+                        &plan.name,
+                        &plan.source_name,
+                        plan.table_id.as_str(),
+                        transaction.commit_position().clone(),
+                        transaction.transaction_id().cloned(),
+                        buffered_records,
+                        current_unix_time_ms(),
+                    )?)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "append replication pipeline '{}' transaction buffer",
+                            plan.name
+                        )
+                    })?;
+                storage
+                    .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                        &plan.name,
+                        &plan.source_name,
+                        transaction.commit_position().clone(),
+                        transaction.transaction_id().cloned(),
+                        pending_target_state(plan, &manifest),
+                        current_unix_time_ms(),
+                    )?)
+                    .await
+                    .with_context(|| {
+                        format!("persist replication pipeline '{}' checkpoint", plan.name)
+                    })?;
+                written = written.saturating_add(manifest.record_count());
+                self.replay_pending_for_plan(plan, &buffer_store, storage)
+                    .await?;
+                record_buffer_stats(&buffer_store, &plan.name).await?;
+            } else {
+                match &plan.target {
+                    ReplicationPipelineRuntimeTarget::Kafka { .. } => {
+                        let writer =
+                            self.kafka_writers_by_pipeline
+                                .get(&plan.name)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "replication pipeline '{}' has no Kafka writer",
+                                        plan.name
+                                    )
+                                })?;
+                        writer.send_records(&buffered_records).await?;
+                    }
+                }
+                written = written.saturating_add(records.len());
+            }
+        }
+
+        Ok(written)
+    }
+
+    async fn replay_pending_for_plan(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+        storage: &SlateCatalog,
+    ) -> anyhow::Result<usize> {
+        let mut delivered_records = 0usize;
+        let pending = buffer_store
+            .pending_transactions(&plan.name, REPLICATION_BUFFER_REPLAY_LIMIT)
+            .await
+            .with_context(|| {
+                format!(
+                    "load pending replication pipeline '{}' buffer transactions",
+                    plan.name
+                )
+            })?;
+        for manifest in pending {
+            let records = buffer_store.records(&manifest).await.with_context(|| {
+                format!(
+                    "load replication pipeline '{}' buffered payloads",
+                    plan.name
+                )
+            })?;
+            let target_state = match &plan.target {
                 ReplicationPipelineRuntimeTarget::Kafka { .. } => {
                     let writer =
                         self.kafka_writers_by_pipeline
@@ -99,29 +201,71 @@ impl ReplicationPipelineRuntime {
                             .ok_or_else(|| {
                                 anyhow!("replication pipeline '{}' has no Kafka writer", plan.name)
                             })?;
-                    writer.send_records(&records).await?
+                    match writer.send_records(&records).await {
+                        Ok(mut target_state) => {
+                            target_state
+                                .insert("source.table".to_string(), plan.upstream_table.clone());
+                            target_state
+                        }
+                        Err(err) => {
+                            crate::metrics::inc_sink_failure(&plan.name, "kafka_replication");
+                            tracing::warn!(
+                                pipeline = %plan.name,
+                                error = %err,
+                                "replication pipeline target write failed; buffered transaction remains pending"
+                            );
+                            break;
+                        }
+                    }
                 }
             };
-            target_state.insert("source.table".to_string(), plan.upstream_table.clone());
-            if let Some(storage) = storage {
-                storage
-                    .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
-                        &plan.name,
-                        &plan.source_name,
-                        transaction.commit_position().clone(),
-                        transaction.transaction_id().cloned(),
-                        target_state,
-                        current_unix_time_ms(),
-                    )?)
-                    .await
-                    .with_context(|| {
-                        format!("persist replication pipeline '{}' checkpoint", plan.name)
-                    })?;
-            }
-            written = written.saturating_add(records.len());
+            let delivered_at = current_unix_time_ms();
+            buffer_store
+                .mark_delivered(&manifest, delivered_at)
+                .await
+                .with_context(|| {
+                    format!(
+                        "mark replication pipeline '{}' buffered transaction delivered",
+                        plan.name
+                    )
+                })?;
+            storage
+                .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                    &plan.name,
+                    &plan.source_name,
+                    buffer_store
+                        .source_frontier(&plan.name)
+                        .await?
+                        .map(|frontier| frontier.source_position().clone())
+                        .unwrap_or_else(|| manifest.source_position().clone()),
+                    manifest.transaction_id().cloned(),
+                    delivered_target_state(&manifest, target_state),
+                    delivered_at,
+                )?)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist replication pipeline '{}' delivery checkpoint",
+                        plan.name
+                    )
+                })?;
+            delivered_records = delivered_records.saturating_add(records.len());
+            buffer_store
+                .cleanup_delivered(
+                    &plan.name,
+                    CdcBufferCleanupPolicy::new(REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
+                    current_unix_time_ms(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "cleanup replication pipeline '{}' delivered buffer",
+                        plan.name
+                    )
+                })?;
         }
-
-        Ok(written)
+        record_buffer_stats(buffer_store, &plan.name).await?;
+        Ok(delivered_records)
     }
 }
 
@@ -139,7 +283,8 @@ impl KafkaReplicationPipelineWriter {
         config
             .set("bootstrap.servers", brokers)
             .set("acks", "all")
-            .set("enable.idempotence", "true");
+            .set("enable.idempotence", "true")
+            .set("message.timeout.ms", REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS);
         let producer: FutureProducer = config
             .create()
             .context("create replication pipeline Kafka producer")?;
@@ -151,8 +296,8 @@ impl KafkaReplicationPipelineWriter {
 
     async fn send_records(
         &self,
-        records: &[DebeziumEncodedRecord],
-    ) -> anyhow::Result<BTreeMap<String, String>> {
+        records: &[CdcBufferRecord],
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
         let deliveries = join_all(
             records
                 .iter()
@@ -162,7 +307,7 @@ impl KafkaReplicationPipelineWriter {
         .into_iter()
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let mut target_state = BTreeMap::new();
+        let mut target_state = std::collections::BTreeMap::new();
         target_state.insert("kafka.topic".to_string(), self.topic.clone());
         for (partition, offset) in deliveries {
             let key = format!("kafka.partition.{partition}.offset");
@@ -176,28 +321,24 @@ impl KafkaReplicationPipelineWriter {
         Ok(target_state)
     }
 
-    async fn send_record_with_retry(
-        &self,
-        record: &DebeziumEncodedRecord,
-    ) -> anyhow::Result<(i32, i64)> {
-        let key = record.key_json_bytes()?;
-        let value = record.value_json_bytes()?;
+    async fn send_record_with_retry(&self, record: &CdcBufferRecord) -> anyhow::Result<(i32, i64)> {
         for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
             let mut kafka_record = FutureRecord::<[u8], [u8]>::to(&self.topic);
-            if let Some(key) = key.as_deref() {
+            if let Some(key) = record.key() {
                 kafka_record = kafka_record.key(key);
             }
-            if let Some(value) = value.as_deref() {
+            if let Some(value) = record.value() {
                 kafka_record = kafka_record.payload(value);
             }
 
-            match self
-                .producer
-                .send(kafka_record, Duration::from_secs(0))
-                .await
-            {
-                Ok((partition, offset)) => return Ok((partition, offset)),
-                Err((err, _message)) if attempt + 1 < REPLICATION_KAFKA_RETRY_ATTEMPTS => {
+            let send_result = tokio::time::timeout(
+                REPLICATION_KAFKA_SEND_TIMEOUT,
+                self.producer.send(kafka_record, Duration::from_secs(0)),
+            )
+            .await;
+            match send_result {
+                Ok(Ok((partition, offset))) => return Ok((partition, offset)),
+                Ok(Err((err, _message))) if attempt + 1 < REPLICATION_KAFKA_RETRY_ATTEMPTS => {
                     let delay_ms = REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(
                         1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16),
                     );
@@ -209,9 +350,22 @@ impl KafkaReplicationPipelineWriter {
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                Err((err, _message)) => {
+                Ok(Err((err, _message))) => {
                     return Err(anyhow!(
                         "replication pipeline Kafka send failed after retries: {err}"
+                    ));
+                }
+                Err(_) if attempt + 1 < REPLICATION_KAFKA_RETRY_ATTEMPTS => {
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt + 1,
+                        timeout_ms = REPLICATION_KAFKA_SEND_TIMEOUT.as_millis() as u64,
+                        "replication pipeline Kafka send timed out; retrying"
+                    );
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "replication pipeline Kafka send timed out after retries"
                     ));
                 }
             }
@@ -247,6 +401,72 @@ fn encode_pipeline_records(
         records.extend(encode_debezium_change(schema, change, &config, context)?);
     }
     Ok(records)
+}
+
+fn debezium_records_to_buffer_records(
+    records: &[DebeziumEncodedRecord],
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    records
+        .iter()
+        .map(|record| {
+            Ok(CdcBufferRecord::new(
+                record.key_json_bytes()?,
+                record.value_json_bytes()?,
+            ))
+        })
+        .collect()
+}
+
+fn pending_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    manifest: &CdcBufferedTransactionManifest,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = std::collections::BTreeMap::new();
+    state.insert("source.table".to_string(), plan.upstream_table.clone());
+    state.insert("buffer.status".to_string(), "pending".to_string());
+    state.insert(
+        "buffer.transaction_key".to_string(),
+        manifest.transaction_key().to_string(),
+    );
+    state.insert(
+        "buffer.record_count".to_string(),
+        manifest.record_count().to_string(),
+    );
+    state
+}
+
+fn delivered_target_state(
+    manifest: &CdcBufferedTransactionManifest,
+    mut target_state: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    target_state.insert("buffer.status".to_string(), "delivered".to_string());
+    target_state.insert(
+        "buffer.transaction_key".to_string(),
+        manifest.transaction_key().to_string(),
+    );
+    target_state.insert(
+        "buffer.record_count".to_string(),
+        manifest.record_count().to_string(),
+    );
+    target_state
+}
+
+async fn record_buffer_stats(
+    buffer_store: &CdcBufferStore,
+    pipeline_name: &str,
+) -> anyhow::Result<()> {
+    let stats = buffer_store
+        .stats(pipeline_name, current_unix_time_ms())
+        .await
+        .with_context(|| format!("load CDC buffer stats for pipeline '{pipeline_name}'"))?;
+    crate::metrics::record_cdc_buffer_pending(
+        pipeline_name,
+        stats.pending_transactions(),
+        stats.pending_records(),
+        stats.pending_bytes(),
+        stats.oldest_pending_age_ms(),
+    );
+    Ok(())
 }
 
 pub(super) fn replication_pipeline_table_id(

@@ -198,6 +198,42 @@ static POSTGRES_CDC_TABLE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register floe_postgres_cdc_table_lag_bytes")
 });
 
+static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_pending_transactions",
+        "Number of pending transactions in each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_pending_transactions")
+});
+
+static CDC_BUFFER_PENDING_RECORDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_pending_records",
+        "Number of pending records in each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_pending_records")
+});
+
+static CDC_BUFFER_PENDING_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_pending_bytes",
+        "Approximate pending payload bytes in each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_pending_bytes")
+});
+
+static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_oldest_pending_age_ms",
+        "Age in milliseconds of the oldest pending transaction in each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_oldest_pending_age_ms")
+});
+
 static POSTGRES_CDC_METRIC_STATE: LazyLock<Mutex<PostgresCdcMetricState>> =
     LazyLock::new(|| Mutex::new(PostgresCdcMetricState::default()));
 
@@ -384,6 +420,27 @@ pub(crate) fn record_postgres_cdc_table_applied_lsn(
     }
 }
 
+pub(crate) fn record_cdc_buffer_pending(
+    pipeline: &str,
+    transactions: usize,
+    records: usize,
+    bytes: usize,
+    oldest_age_ms: Option<u64>,
+) {
+    CDC_BUFFER_PENDING_TRANSACTIONS
+        .with_label_values(&[pipeline])
+        .set(i64::try_from(transactions).unwrap_or(i64::MAX));
+    CDC_BUFFER_PENDING_RECORDS
+        .with_label_values(&[pipeline])
+        .set(i64::try_from(records).unwrap_or(i64::MAX));
+    CDC_BUFFER_PENDING_BYTES
+        .with_label_values(&[pipeline])
+        .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    CDC_BUFFER_OLDEST_PENDING_AGE_MS
+        .with_label_values(&[pipeline])
+        .set(oldest_age_ms.map(i64_from_u64).unwrap_or(0));
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
@@ -407,6 +464,10 @@ pub(crate) fn init() {
     let _ = &*POSTGRES_CDC_SOURCE_LAG_BYTES;
     let _ = &*POSTGRES_CDC_TABLE_LAST_APPLIED_LSN;
     let _ = &*POSTGRES_CDC_TABLE_LAG_BYTES;
+    let _ = &*CDC_BUFFER_PENDING_TRANSACTIONS;
+    let _ = &*CDC_BUFFER_PENDING_RECORDS;
+    let _ = &*CDC_BUFFER_PENDING_BYTES;
+    let _ = &*CDC_BUFFER_OLDEST_PENDING_AGE_MS;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
 }
 
