@@ -216,13 +216,34 @@ async fn run_native_postgres_cdc_connector(
     sender: mpsc::Sender<QueuedCdcTransaction>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let start_lsn = stored_slot_start_lsn(&config.connection_string, &config.slot)
+    let connection_string = config.connection_string.clone();
+    let slot = config.slot.clone();
+    let publication = config.publication.clone();
+    super::postgres_snapshot::ensure_postgres_cdc_publication_and_slot(
+        &connection_string,
+        &slot,
+        &publication,
+        &runtime_plan,
+    )
+    .await?;
+    let start_lsn = stored_slot_start_lsn(&connection_string, &slot)
         .await
-        .with_context(|| format!("load Postgres logical slot '{}' start LSN", config.slot))?;
+        .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
+    let initial_snapshot_lsn = super::postgres_snapshot::run_initial_postgres_snapshot_if_needed(
+        &connection_string,
+        &slot,
+        &publication,
+        &runtime_plan,
+        &table_store,
+        &sender,
+        config.commit_lsn_rx.as_mut(),
+        &cancel,
+    )
+    .await?;
     let replication_config = replication_config_from_connection_string(
-        &config.connection_string,
-        &config.slot,
-        &config.publication,
+        &connection_string,
+        &slot,
+        &publication,
         start_lsn,
     )?;
     let replication_config = config_with_stored_cdc_checkpoint(
@@ -233,7 +254,7 @@ async fn run_native_postgres_cdc_connector(
     .await?;
     tracing::info!(
         source = %runtime_plan.source_id.as_str(),
-        slot = %config.slot,
+        slot = %slot,
         tables = runtime_plan.schemas.len(),
         start_lsn = ?replication_config.start_lsn(),
         "starting native Postgres CDC replication stream"
@@ -243,9 +264,12 @@ async fn run_native_postgres_cdc_connector(
         .context("connect native Postgres CDC transaction stream")?;
     tracing::info!(
         source = %runtime_plan.source_id.as_str(),
-        slot = %config.slot,
+        slot = %slot,
         "native Postgres CDC replication stream connected"
     );
+    if let Some(lsn) = initial_snapshot_lsn {
+        replication.update_applied_lsn(lsn);
+    }
     let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
     let mut assembler = PostgresTransactionAssembler::new(runtime_plan.source_id.clone(), router);
     let mut last_committed_tick_id = 0_u64;

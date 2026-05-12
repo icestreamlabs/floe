@@ -228,6 +228,17 @@ impl CdcTableStore {
         decode_json(&bytes, "CDC checkpoint")
     }
 
+    pub async fn commit_checkpoint(&self, checkpoint: &CdcCheckpoint) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        stage_checkpoint(checkpoint, &mut batch)?;
+        self.table.write_batch(batch).await.with_context(|| {
+            format!(
+                "commit CDC checkpoint for source '{}'",
+                checkpoint.source_id().as_str()
+            )
+        })
+    }
+
     pub async fn load_row(
         &self,
         table_id: &CdcTableId,
@@ -297,10 +308,7 @@ impl CdcTableStore {
             }
         }
 
-        batch.put(
-            checkpoint_key(transaction.source_id()),
-            serde_json::to_vec(&next_checkpoint).context("encode CDC checkpoint")?,
-        );
+        stage_checkpoint(&next_checkpoint, batch)?;
 
         Ok(CdcApplyResult {
             checkpoint: next_checkpoint,
@@ -401,6 +409,14 @@ impl CdcTableStore {
         };
         decode_json(&bytes, "CDC row state")
     }
+}
+
+fn stage_checkpoint(checkpoint: &CdcCheckpoint, batch: &mut WriteBatch) -> Result<()> {
+    batch.put(
+        checkpoint_key(checkpoint.source_id()),
+        serde_json::to_vec(checkpoint).context("encode CDC checkpoint")?,
+    );
+    Ok(())
 }
 
 fn key_for_update_lookup(
@@ -659,6 +675,30 @@ mod tests {
         );
         assert_eq!(
             reloaded_apply_store
+                .load_checkpoint(&source_id)
+                .await
+                .expect("load checkpoint"),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_checkpoint_commit_round_trips_without_rows() {
+        let store = test_store("cdc-explicit-checkpoint").await;
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let checkpoint = CdcCheckpoint::new(
+            source_id.clone(),
+            CdcSourcePosition::postgres("0/70", None).expect("position"),
+            Some(CdcTransactionId::new("snapshot-0-70").expect("transaction id")),
+        );
+
+        store
+            .commit_checkpoint(&checkpoint)
+            .await
+            .expect("commit checkpoint");
+
+        assert_eq!(
+            store
                 .load_checkpoint(&source_id)
                 .await
                 .expect("load checkpoint"),

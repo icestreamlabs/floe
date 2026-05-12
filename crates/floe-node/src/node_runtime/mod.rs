@@ -162,6 +162,7 @@ mod catalog;
 mod command;
 mod ingest;
 mod orchestration;
+mod postgres_snapshot;
 mod shutdown;
 mod startup;
 

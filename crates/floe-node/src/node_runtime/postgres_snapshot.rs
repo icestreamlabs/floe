@@ -1,0 +1,672 @@
+use super::*;
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use floe_cdc_core::{
+    CdcChange, CdcCheckpoint, CdcRow, CdcTransactionId, ChangeBatch, TransactionBatch,
+};
+use floe_core::RowValue;
+use tokio_postgres::types::Type;
+
+struct PostgresSnapshot {
+    lsn: PostgresLsn,
+    transaction: Option<TransactionBatch>,
+    row_count: usize,
+}
+
+pub(super) async fn ensure_postgres_cdc_publication_and_slot(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+) -> Result<()> {
+    let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+        .await
+        .context("connect Postgres control plane for CDC setup")?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(error = %err, "Postgres CDC setup connection closed");
+        }
+    });
+
+    let setup_result = ensure_postgres_cdc_publication_and_slot_with_client(
+        &client,
+        slot,
+        publication,
+        runtime_plan,
+    )
+    .await;
+    drop(client);
+    connection_task.abort();
+    setup_result
+}
+
+async fn ensure_postgres_cdc_publication_and_slot_with_client(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+) -> Result<()> {
+    let publication_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&publication],
+        )
+        .await
+        .with_context(|| format!("check Postgres CDC publication '{publication}'"))?
+        .get(0);
+    if !publication_exists {
+        let schemas = sorted_snapshot_schemas(&runtime_plan.schemas);
+        ensure!(
+            !schemas.is_empty(),
+            "cannot create Postgres CDC publication '{publication}' without tables"
+        );
+        let mut tables = schemas
+            .iter()
+            .map(|schema| qualified_table_name(schema.upstream_table()))
+            .collect::<Vec<_>>();
+        tables.sort();
+        tables.dedup();
+        client
+            .batch_execute(&format!(
+                "CREATE PUBLICATION {} FOR TABLE {}",
+                quote_pg_ident(publication),
+                tables.join(", ")
+            ))
+            .await
+            .with_context(|| format!("create Postgres CDC publication '{publication}'"))?;
+        tracing::info!(
+            source = %runtime_plan.source_id.as_str(),
+            publication = %publication,
+            tables = tables.len(),
+            "created Postgres CDC publication"
+        );
+    }
+
+    let slot_row = client
+        .query_opt(
+            "SELECT plugin
+             FROM pg_replication_slots
+             WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .with_context(|| format!("check Postgres CDC logical replication slot '{slot}'"))?;
+    match slot_row {
+        Some(row) => {
+            let plugin: Option<String> = row.get(0);
+            ensure!(
+                plugin.as_deref() == Some("pgoutput"),
+                "Postgres CDC logical replication slot '{slot}' must use pgoutput, got {:?}",
+                plugin
+            );
+        }
+        None => {
+            client
+                .query_one(
+                    "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+                    &[&slot],
+                )
+                .await
+                .with_context(|| {
+                    format!("create Postgres CDC pgoutput replication slot '{slot}'")
+                })?;
+            tracing::info!(
+                source = %runtime_plan.source_id.as_str(),
+                slot = %slot,
+                "created Postgres CDC logical replication slot"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) async fn run_initial_postgres_snapshot_if_needed(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    table_store: &CdcTableStore,
+    sender: &mpsc::Sender<QueuedCdcTransaction>,
+    commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    cancel: &CancellationToken,
+) -> Result<Option<PostgresLsn>> {
+    if table_store
+        .load_checkpoint(&runtime_plan.source_id)
+        .await
+        .with_context(|| {
+            format!(
+                "load CDC checkpoint before Postgres snapshot for '{}'",
+                runtime_plan.source_id.as_str()
+            )
+        })?
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let snapshot =
+        load_postgres_initial_snapshot(connection_string, publication, runtime_plan).await?;
+    match snapshot.transaction {
+        Some(transaction) => {
+            sender
+                .send(QueuedCdcTransaction {
+                    slot: slot.to_string(),
+                    source_id: runtime_plan.source_id.clone(),
+                    transaction,
+                })
+                .await
+                .map_err(|err| anyhow!("failed to enqueue initial Postgres CDC snapshot: {err}"))?;
+            wait_for_postgres_snapshot_commit(commit_lsn_rx, slot, snapshot.lsn, cancel).await?;
+        }
+        None => {
+            let checkpoint = snapshot_checkpoint(&runtime_plan.source_id, snapshot.lsn)?;
+            table_store.commit_checkpoint(&checkpoint).await?;
+        }
+    }
+
+    tracing::info!(
+        source = %runtime_plan.source_id.as_str(),
+        slot = %slot,
+        publication = %publication,
+        lsn = %snapshot.lsn,
+        rows = snapshot.row_count,
+        "completed initial Postgres CDC snapshot"
+    );
+    Ok(Some(snapshot.lsn))
+}
+
+async fn load_postgres_initial_snapshot(
+    connection_string: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+) -> Result<PostgresSnapshot> {
+    let (mut client, connection) =
+        tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+            .await
+            .context("connect Postgres control plane for initial CDC snapshot")?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(error = %err, "Postgres initial snapshot connection closed");
+        }
+    });
+
+    let snapshot = load_postgres_initial_snapshot_from_client(
+        &mut client,
+        publication,
+        &runtime_plan.source_id,
+        &runtime_plan.schemas,
+    )
+    .await;
+    drop(client);
+    connection_task.abort();
+    snapshot
+}
+
+async fn load_postgres_initial_snapshot_from_client(
+    client: &mut tokio_postgres::Client,
+    publication: &str,
+    source_id: &CdcSourceId,
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+) -> Result<PostgresSnapshot> {
+    let transaction = client
+        .transaction()
+        .await
+        .context("begin initial Postgres CDC snapshot transaction")?;
+    let sorted_schemas = sorted_snapshot_schemas(schemas);
+
+    if !sorted_schemas.is_empty() {
+        transaction
+            .batch_execute(&snapshot_lock_sql(&sorted_schemas))
+            .await
+            .context("lock Postgres CDC snapshot tables")?;
+    }
+
+    validate_publication_tables(&transaction, publication, &sorted_schemas).await?;
+    for schema in &sorted_schemas {
+        validate_upstream_table_schema(&transaction, schema).await?;
+    }
+
+    let lsn_row = transaction
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .context("capture Postgres CDC snapshot LSN")?;
+    let lsn_text: String = lsn_row.get(0);
+    let snapshot_lsn = PostgresLsn::parse(&lsn_text)?;
+
+    let mut change_batches = Vec::new();
+    let mut row_count = 0_usize;
+    for schema in sorted_schemas {
+        let changes = snapshot_table_rows(&transaction, schema).await?;
+        row_count += changes.len();
+        if !changes.is_empty() {
+            change_batches.push(ChangeBatch::new(schema.table_id().clone(), changes)?);
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .context("commit initial Postgres CDC snapshot transaction")?;
+
+    let transaction = if change_batches.is_empty() {
+        None
+    } else {
+        let position = snapshot_lsn.to_source_position()?;
+        Some(TransactionBatch::new(
+            source_id.clone(),
+            Some(snapshot_transaction_id(snapshot_lsn)?),
+            Some(position.clone()),
+            position,
+            change_batches,
+        )?)
+    };
+
+    Ok(PostgresSnapshot {
+        lsn: snapshot_lsn,
+        transaction,
+        row_count,
+    })
+}
+
+fn sorted_snapshot_schemas(schemas: &HashMap<CdcTableId, CdcTableSchema>) -> Vec<&CdcTableSchema> {
+    let mut sorted = schemas.values().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        left.upstream_table()
+            .schema()
+            .cmp(right.upstream_table().schema())
+            .then(
+                left.upstream_table()
+                    .table()
+                    .cmp(right.upstream_table().table()),
+            )
+            .then(left.table_id().as_str().cmp(right.table_id().as_str()))
+    });
+    sorted
+}
+
+fn snapshot_lock_sql(schemas: &[&CdcTableSchema]) -> String {
+    let mut tables = schemas
+        .iter()
+        .map(|schema| qualified_table_name(schema.upstream_table()))
+        .collect::<Vec<_>>();
+    tables.sort();
+    tables.dedup();
+    format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "))
+}
+
+async fn validate_publication_tables(
+    transaction: &tokio_postgres::Transaction<'_>,
+    publication: &str,
+    schemas: &[&CdcTableSchema],
+) -> Result<()> {
+    let exists_row = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&publication],
+        )
+        .await
+        .with_context(|| format!("validate Postgres publication '{publication}'"))?;
+    let publication_exists: bool = exists_row.get(0);
+    ensure!(
+        publication_exists,
+        "Postgres CDC publication '{publication}' does not exist"
+    );
+
+    for schema in schemas {
+        let upstream = schema.upstream_table();
+        let row = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_publication_tables
+                    WHERE pubname = $1
+                      AND schemaname = $2
+                      AND tablename = $3
+                 )",
+                &[&publication, &upstream.schema(), &upstream.table()],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "validate Postgres publication '{publication}' includes '{}.{}'",
+                    upstream.schema(),
+                    upstream.table()
+                )
+            })?;
+        let included: bool = row.get(0);
+        ensure!(
+            included,
+            "Postgres CDC publication '{publication}' does not include table '{}.{}'",
+            upstream.schema(),
+            upstream.table()
+        );
+    }
+
+    Ok(())
+}
+
+async fn validate_upstream_table_schema(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &CdcTableSchema,
+) -> Result<()> {
+    let upstream = schema.upstream_table();
+    let column_rows = transaction
+        .query(
+            "SELECT column_name, is_nullable, data_type, udt_name
+             FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = $2
+             ORDER BY ordinal_position",
+            &[&upstream.schema(), &upstream.table()],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "discover Postgres table schema for '{}.{}'",
+                upstream.schema(),
+                upstream.table()
+            )
+        })?;
+    ensure!(
+        !column_rows.is_empty(),
+        "Postgres CDC table '{}.{}' does not exist or has no columns",
+        upstream.schema(),
+        upstream.table()
+    );
+
+    let mut columns = HashMap::new();
+    for row in column_rows {
+        let name: String = row.get("column_name");
+        let is_nullable: String = row.get("is_nullable");
+        let data_type: String = row.get("data_type");
+        let udt_name: String = row.get("udt_name");
+        columns.insert(name, (is_nullable == "YES", data_type, udt_name));
+    }
+
+    for column in schema.columns() {
+        let Some((nullable, data_type, udt_name)) = columns.get(column.name()) else {
+            bail!(
+                "Postgres CDC table '{}.{}' is missing configured column '{}'",
+                upstream.schema(),
+                upstream.table(),
+                column.name()
+            );
+        };
+        ensure!(
+            column.nullable() || !nullable,
+            "Postgres CDC column '{}.{}' is nullable but Floe table column '{}' is NOT NULL",
+            upstream.schema(),
+            upstream.table(),
+            column.name()
+        );
+        ensure!(
+            postgres_type_compatible(column.data_type(), udt_name, data_type),
+            "Postgres CDC column '{}.{}' type '{}' is not compatible with Floe type {:?}",
+            upstream.schema(),
+            upstream.table(),
+            udt_name,
+            column.data_type()
+        );
+    }
+
+    let primary_key = discover_primary_key(transaction, upstream).await?;
+    ensure!(
+        primary_key == schema.primary_key().columns(),
+        "Postgres CDC table '{}.{}' primary key {:?} does not match Floe primary key {:?}",
+        upstream.schema(),
+        upstream.table(),
+        primary_key,
+        schema.primary_key().columns()
+    );
+
+    let replica_identity: String = transaction
+        .query_one(
+            "SELECT c.relreplident::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&upstream.schema(), &upstream.table()],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "discover Postgres replica identity for '{}.{}'",
+                upstream.schema(),
+                upstream.table()
+            )
+        })?
+        .get(0);
+    ensure!(
+        replica_identity != "n",
+        "Postgres CDC table '{}.{}' has REPLICA IDENTITY NOTHING",
+        upstream.schema(),
+        upstream.table()
+    );
+
+    Ok(())
+}
+
+async fn discover_primary_key(
+    transaction: &tokio_postgres::Transaction<'_>,
+    upstream: &UpstreamTableRef,
+) -> Result<Vec<String>> {
+    let rows = transaction
+        .query(
+            "SELECT a.attname
+             FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+             WHERE n.nspname = $1
+               AND c.relname = $2
+               AND i.indisprimary
+             ORDER BY k.ord",
+            &[&upstream.schema(), &upstream.table()],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "discover Postgres primary key for '{}.{}'",
+                upstream.schema(),
+                upstream.table()
+            )
+        })?;
+    ensure!(
+        !rows.is_empty(),
+        "Postgres CDC table '{}.{}' must have a primary key",
+        upstream.schema(),
+        upstream.table()
+    );
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect())
+}
+
+fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &str) -> bool {
+    let udt_name = udt_name.to_ascii_lowercase();
+    let data_type = data_type.to_ascii_lowercase();
+    match expected {
+        ColumnType::Int64 => matches!(udt_name.as_str(), "int8" | "int4" | "int2"),
+        ColumnType::Bool => udt_name == "bool",
+        ColumnType::Utf8 => matches!(udt_name.as_str(), "text" | "varchar" | "bpchar" | "name"),
+        ColumnType::TimestampMillis => {
+            matches!(udt_name.as_str(), "timestamp" | "timestamptz")
+                || matches!(
+                    data_type.as_str(),
+                    "timestamp without time zone" | "timestamp with time zone"
+                )
+        }
+    }
+}
+
+async fn snapshot_table_rows(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &CdcTableSchema,
+) -> Result<Vec<CdcChange>> {
+    let query = snapshot_table_query(schema);
+    let rows = transaction.query(&query, &[]).await.with_context(|| {
+        format!(
+            "snapshot Postgres CDC table '{}.{}'",
+            schema.upstream_table().schema(),
+            schema.upstream_table().table()
+        )
+    })?;
+    rows.into_iter()
+        .map(|row| snapshot_row(schema, &row))
+        .collect()
+}
+
+fn snapshot_table_query(schema: &CdcTableSchema) -> String {
+    let select_list = schema
+        .columns()
+        .iter()
+        .map(snapshot_select_expr)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = schema
+        .primary_key()
+        .columns()
+        .iter()
+        .map(|column| quote_pg_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {select_list} FROM {} ORDER BY {order_by}",
+        qualified_table_name(schema.upstream_table())
+    )
+}
+
+fn snapshot_select_expr(column: &CdcColumn) -> String {
+    let quoted = quote_pg_ident(column.name());
+    match column.data_type() {
+        ColumnType::TimestampMillis => {
+            format!("floor(extract(epoch from {quoted}) * 1000)::bigint AS {quoted}")
+        }
+        ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => quoted,
+    }
+}
+
+fn snapshot_row(schema: &CdcTableSchema, row: &tokio_postgres::Row) -> Result<CdcChange> {
+    let values = schema
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| snapshot_row_value(row, idx, column))
+        .collect::<Result<Vec<_>>>()?;
+    let cdc_row = CdcRow::new(values)?;
+    schema.validate_row(&cdc_row)?;
+    Ok(CdcChange::Insert { row: cdc_row })
+}
+
+fn snapshot_row_value(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    column: &CdcColumn,
+) -> Result<Option<RowValue>> {
+    let postgres_type = row.columns()[idx].type_();
+    match column.data_type() {
+        ColumnType::Int64 => snapshot_int64_value(row, idx, postgres_type),
+        ColumnType::Bool => row
+            .try_get::<_, Option<bool>>(idx)
+            .with_context(|| format!("decode Postgres CDC snapshot bool '{}'", column.name()))
+            .map(|value| value.map(RowValue::Bool)),
+        ColumnType::Utf8 => row
+            .try_get::<_, Option<String>>(idx)
+            .with_context(|| format!("decode Postgres CDC snapshot text '{}'", column.name()))
+            .map(|value| value.map(RowValue::Utf8)),
+        ColumnType::TimestampMillis => row
+            .try_get::<_, Option<i64>>(idx)
+            .with_context(|| {
+                format!(
+                    "decode Postgres CDC snapshot timestamp millis '{}'",
+                    column.name()
+                )
+            })
+            .map(|value| value.map(RowValue::TimestampMillis)),
+    }
+}
+
+fn snapshot_int64_value(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    postgres_type: &Type,
+) -> Result<Option<RowValue>> {
+    match *postgres_type {
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(idx)
+            .context("decode Postgres CDC snapshot int8")
+            .map(|value| value.map(RowValue::Int64)),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
+            .context("decode Postgres CDC snapshot int4")
+            .map(|value| value.map(|value| RowValue::Int64(i64::from(value)))),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
+            .context("decode Postgres CDC snapshot int2")
+            .map(|value| value.map(|value| RowValue::Int64(i64::from(value)))),
+        _ => bail!("unsupported Postgres integer snapshot type {postgres_type}"),
+    }
+}
+
+fn snapshot_checkpoint(source_id: &CdcSourceId, lsn: PostgresLsn) -> Result<CdcCheckpoint> {
+    Ok(CdcCheckpoint::new(
+        source_id.clone(),
+        lsn.to_source_position()?,
+        Some(snapshot_transaction_id(lsn)?),
+    ))
+}
+
+fn snapshot_transaction_id(lsn: PostgresLsn) -> Result<CdcTransactionId> {
+    CdcTransactionId::new(format!("snapshot:{}", lsn.to_pg_string()))
+}
+
+async fn wait_for_postgres_snapshot_commit(
+    receiver: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    slot: &str,
+    target_lsn: PostgresLsn,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let Some(receiver) = receiver else {
+        bail!("cannot wait for initial Postgres snapshot durability without commit receiver");
+    };
+
+    loop {
+        let commit = receiver.borrow_and_update().clone();
+        if postgres_commit_covers_lsn(&commit, slot, target_lsn)? {
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                bail!("cancelled while waiting for initial Postgres snapshot durability");
+            }
+            changed = receiver.changed() => {
+                changed.context("Postgres CDC commit channel closed before initial snapshot became durable")?;
+            }
+        }
+    }
+}
+
+fn postgres_commit_covers_lsn(
+    commit: &PostgresCdcCommit,
+    slot: &str,
+    target_lsn: PostgresLsn,
+) -> Result<bool> {
+    let Some(slot_commit) = commit.slots.iter().find(|entry| entry.slot == slot) else {
+        return Ok(false);
+    };
+    Ok(PostgresLsn::parse(&slot_commit.lsn)?.as_u64() >= target_lsn.as_u64())
+}
+
+fn qualified_table_name(upstream: &UpstreamTableRef) -> String {
+    format!(
+        "{}.{}",
+        quote_pg_ident(upstream.schema()),
+        quote_pg_ident(upstream.table())
+    )
+}
+
+fn quote_pg_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}

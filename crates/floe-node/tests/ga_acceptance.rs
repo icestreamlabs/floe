@@ -991,6 +991,129 @@ async fn postgres_cdc_sql_source_table_mv_acceptance() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
 #[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_sql_source_table_snapshot_backfill_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pg_port = find_unused_port()?;
+    let table = format!("nexmark_bid_snapshot_{run_id}");
+    let source_name = format!("pg_sql_snapshot_{run_id}");
+    let mv_name = format!("mv_floe_cdc_sql_snapshot_{run_id}");
+    let slot = format!("floe_acceptance_snapshot_{run_id}");
+    let publication = format!("floe_acceptance_snapshot_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("empty.json");
+    std::fs::write(&config_path, "{}").context("write empty config")?;
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for SQL CDC snapshot setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres SQL CDC snapshot setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             INSERT INTO {table}
+               (auction, bidder, price, channel, url, date_time, extra)
+               VALUES (71, 971, 701, 'web', 'http://example.com', 1700000071, 'snapshot');"
+        ))
+        .await
+        .context("prepare SQL CDC snapshot acceptance table")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+
+    let sql = format!(
+        "CREATE SOURCE {source_name} WITH (
+            connector = 'postgres-cdc',
+            connection = '{dsn}',
+            slot.name = '{slot}',
+            publication.name = '{publication}'
+         );
+         CREATE TABLE {table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         ) FROM {source_name} TABLE 'public.{table}';
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} AS
+         SELECT auction, bidder, price FROM {table}"
+    );
+    let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+
+    let test_result = async {
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 71, 701, 1).await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (auction, bidder, price, channel, url, date_time, extra) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                ),
+                &[
+                    &72_i64,
+                    &972_i64,
+                    &702_i64,
+                    &"web",
+                    &"http://example.com",
+                    &1_700_000_072_i64,
+                    &"wal_after_snapshot",
+                ],
+            )
+            .await
+            .context("insert SQL CDC row after snapshot")?;
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 72, 702, 1).await?;
+
+        client
+            .execute(
+                &format!("UPDATE {table} SET price = $1, extra = $2 WHERE auction = $3"),
+                &[&731_i64, &"snapshot_updated", &71_i64],
+            )
+            .await
+            .context("update SQL CDC snapshot row")?;
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 71, 731, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+        .await;
+    test_result
+}
+
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
 async fn postgres_cdc_table_aggregate_update_delete_acceptance() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
