@@ -870,6 +870,144 @@ async fn postgres_cdc_shared_source_transaction_feeds_join_mv() -> Result<()> {
     test_result
 }
 
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_table_aggregate_update_delete_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pg_port = find_unused_port()?;
+    let table = "nexmark_bid".to_string();
+    let mv_name = format!("mv_floe_cdc_aggregate_{run_id}");
+    let slot = format!("floe_acceptance_aggregate_{run_id}");
+    let publication = format!("floe_acceptance_aggregate_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("cdc_aggregate_acceptance.json");
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for aggregate cdc setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres aggregate cdc setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {table};"
+        ))
+        .await
+        .context("prepare aggregate cdc table")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    client
+        .query_one(
+            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&slot],
+        )
+        .await
+        .context("create aggregate pgoutput replication slot")?;
+
+    let config = json!({
+        "connectors": [
+            {
+                "type": "postgres_cdc",
+                "connection": dsn,
+                "slot": slot,
+                "publication": publication,
+                "include_tables": [table]
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .context("write aggregate cdc config")?;
+
+    let sql = format!(
+        "CREATE TABLE {table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         );
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} AS
+         SELECT bidder, COUNT(*) AS bid_count, SUM(price) AS total_price
+         FROM {table}
+         GROUP BY bidder"
+    );
+    let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .batch_execute(&format!(
+                "BEGIN;
+                 INSERT INTO {table}
+                   (auction, bidder, price, channel, url, date_time, extra)
+                   VALUES (31, 900, 100, 'web', 'http://example.com', 1700000031, 'first');
+                 INSERT INTO {table}
+                   (auction, bidder, price, channel, url, date_time, extra)
+                   VALUES (32, 900, 200, 'web', 'http://example.com', 1700000032, 'second');
+                 COMMIT;"
+            ))
+            .await
+            .context("commit aggregate cdc inserts")?;
+        wait_for_bidder_aggregate(pg_port, &mv_name, 900, 2, 300).await?;
+
+        client
+            .execute(
+                &format!("UPDATE {table} SET price = $1, extra = $2 WHERE auction = $3"),
+                &[&150_i64, &"updated", &31_i64],
+            )
+            .await
+            .context("update aggregate cdc row")?;
+        wait_for_bidder_aggregate(pg_port, &mv_name, 900, 2, 350).await?;
+
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE auction = $1"),
+                &[&32_i64],
+            )
+            .await
+            .context("delete aggregate cdc row")?;
+        wait_for_bidder_aggregate(pg_port, &mv_name, 900, 1, 150).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+        .await;
+    test_result
+}
+
 #[derive(Clone)]
 struct SinkCaptureState {
     sender: mpsc::Sender<Value>,
@@ -1279,6 +1417,65 @@ async fn query_join_mv_count(
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(row.get::<_, i64>(0))
+}
+
+async fn wait_for_bidder_aggregate(
+    pg_port: u16,
+    mv_name: &str,
+    bidder: i64,
+    expected_count: i64,
+    expected_total: i64,
+) -> Result<(i64, i64)> {
+    for _ in 0..120 {
+        match query_bidder_aggregate(pg_port, mv_name, bidder).await {
+            Ok(Some((bid_count, total_price)))
+                if bid_count == expected_count && total_price == expected_total =>
+            {
+                return Ok((bid_count, total_price));
+            }
+            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    bail!(
+        "timed out waiting for {mv_name} aggregate bidder={bidder} count={expected_count} total={expected_total}"
+    );
+}
+
+async fn query_bidder_aggregate(
+    pg_port: u16,
+    mv_name: &str,
+    bidder: i64,
+) -> Result<Option<(i64, i64)>> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={pg_port} user=postgres"),
+        NoTls,
+    )
+    .await
+    .context("connect to pgwire")?;
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let query = format!("SELECT bid_count, total_price FROM {mv_name} WHERE bidder = $1");
+    let rows = client
+        .query(&query, &[&bidder])
+        .await
+        .with_context(|| format!("query {mv_name} aggregate"))?;
+    let aggregate = match rows.as_slice() {
+        [] => None,
+        [row] => {
+            let bid_count = row.try_get::<_, i64>(0).context("decode bid_count")?;
+            let total_price = row.try_get::<_, i64>(1).context("decode total_price")?;
+            Some((bid_count, total_price))
+        }
+        rows => bail!(
+            "{mv_name} returned {} aggregate rows for bidder={bidder}",
+            rows.len()
+        ),
+    };
+    drop(client);
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    Ok(aggregate)
 }
 
 async fn wait_for_rows_matching(
