@@ -6,7 +6,6 @@ use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::SourceRowDecoder;
 use floe_node_core::cdc_delta_encoder::{
     CdcArrowDeltaBatch, encode_cdc_arrow_delta_batch, encode_cdc_table_deltas,
-    encode_cdc_table_deltas_rowwise,
 };
 
 fn source_definition() -> SourceDefinition {
@@ -66,15 +65,6 @@ fn bench_postgres_cdc_arrow_encoder(c: &mut Criterion) {
         let arrow_batch =
             CdcArrowDeltaBatch::from_table_deltas(&definition, &deltas).expect("arrow batch");
         group.throughput(Throughput::Elements(batch_size as u64));
-
-        group.bench_function(BenchmarkId::new("rowwise_encode", batch_size), |b| {
-            b.iter(|| {
-                let encoded =
-                    encode_cdc_table_deltas_rowwise(black_box(&decoder), black_box(&deltas))
-                        .expect("rowwise encode");
-                black_box(encoded);
-            });
-        });
 
         group.bench_function(
             BenchmarkId::new("arrow_build_and_encode", batch_size),

@@ -116,25 +116,6 @@ pub fn encode_cdc_table_deltas(
     encode_cdc_arrow_delta_batch(decoder, &arrow_batch)
 }
 
-pub fn encode_cdc_table_deltas_rowwise(
-    decoder: &SourceRowDecoder,
-    table_deltas: &CdcTableDeltas,
-) -> Result<Vec<EncodedDelta>> {
-    ensure!(
-        table_deltas.table_id().as_str() == decoder.definition().name(),
-        "CDC table '{}' cannot be encoded with source decoder '{}'",
-        table_deltas.table_id().as_str(),
-        decoder.definition().name()
-    );
-
-    let mut encoded = Vec::with_capacity(table_deltas.deltas().len());
-    for delta in table_deltas.deltas() {
-        let (row, _) = decoder.encode_row_values(delta.row().values())?;
-        encoded.push((row, delta.diff()));
-    }
-    Ok(encoded)
-}
-
 pub fn encode_cdc_arrow_delta_batch(
     decoder: &SourceRowDecoder,
     arrow_batch: &CdcArrowDeltaBatch,
@@ -440,17 +421,6 @@ mod tests {
                 Some(EncodedRowScalar::Bool(false)),
             ]
         );
-    }
-
-    #[test]
-    fn arrow_and_rowwise_encoders_match() {
-        let decoder = SourceRowDecoder::new(orders_definition());
-        let deltas = deltas();
-
-        let arrow = encode_cdc_table_deltas(&decoder, &deltas).expect("arrow encode");
-        let rowwise = encode_cdc_table_deltas_rowwise(&decoder, &deltas).expect("rowwise encode");
-
-        assert_eq!(arrow, rowwise);
     }
 
     #[test]
