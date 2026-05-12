@@ -4,8 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use dbsp_storage::storage::KeyValueTable;
 use floe_cdc_core::{
-    CdcChange, CdcCheckpoint, CdcRow, CdcRowKey, CdcSourceDefinition, CdcSourceId,
-    CdcTableDefinition, CdcTableId, CdcTableSchema, ChangeBatch, TransactionBatch,
+    CdcChange, CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey,
+    CdcSourceDefinition, CdcSourceId, CdcTableDefinition, CdcTableId, CdcTableSchema, ChangeBatch,
+    TransactionBatch,
 };
 use floe_core::RowValue;
 use serde::Deserialize;
@@ -47,12 +48,28 @@ impl CdcRowDelta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcTableDeltas {
     table_id: CdcTableId,
-    deltas: Vec<CdcRowDelta>,
+    payload: CdcTableDeltaPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CdcTableDeltaPayload {
+    RowDeltas(Vec<CdcRowDelta>),
+    SnapshotInserts(CdcColumnarRowBatch),
 }
 
 impl CdcTableDeltas {
     pub fn new(table_id: CdcTableId, deltas: Vec<CdcRowDelta>) -> Self {
-        Self { table_id, deltas }
+        Self {
+            table_id,
+            payload: CdcTableDeltaPayload::RowDeltas(deltas),
+        }
+    }
+
+    pub fn snapshot_insert(table_id: CdcTableId, rows: CdcColumnarRowBatch) -> Self {
+        Self {
+            table_id,
+            payload: CdcTableDeltaPayload::SnapshotInserts(rows),
+        }
     }
 
     pub fn table_id(&self) -> &CdcTableId {
@@ -60,7 +77,24 @@ impl CdcTableDeltas {
     }
 
     pub fn deltas(&self) -> &[CdcRowDelta] {
-        &self.deltas
+        match &self.payload {
+            CdcTableDeltaPayload::RowDeltas(deltas) => deltas,
+            CdcTableDeltaPayload::SnapshotInserts(_) => &[],
+        }
+    }
+
+    pub fn snapshot_insert_rows(&self) -> Option<&CdcColumnarRowBatch> {
+        match &self.payload {
+            CdcTableDeltaPayload::RowDeltas(_) => None,
+            CdcTableDeltaPayload::SnapshotInserts(rows) => Some(rows),
+        }
+    }
+
+    pub fn row_count(&self) -> usize {
+        match &self.payload {
+            CdcTableDeltaPayload::RowDeltas(deltas) => deltas.len(),
+            CdcTableDeltaPayload::SnapshotInserts(rows) => rows.row_count(),
+        }
     }
 }
 
@@ -298,7 +332,7 @@ impl CdcTableStore {
             let schema = schemas.get(change_batch.table_id()).ok_or_else(|| {
                 anyhow!("missing schema for '{}'", change_batch.table_id().as_str())
             })?;
-            let deltas = self
+            let table_delta = self
                 .stage_change_batch(schema, change_batch, &mut overlay, batch)
                 .await
                 .with_context(|| {
@@ -307,11 +341,8 @@ impl CdcTableStore {
                         change_batch.table_id().as_str()
                     )
                 })?;
-            if !deltas.is_empty() {
-                table_deltas.push(CdcTableDeltas {
-                    table_id: change_batch.table_id().clone(),
-                    deltas,
-                });
+            if let Some(table_delta) = table_delta {
+                table_deltas.push(table_delta);
             }
         }
 
@@ -330,7 +361,15 @@ impl CdcTableStore {
         change_batch: &ChangeBatch,
         overlay: &mut HashMap<Vec<u8>, Option<CdcRow>>,
         batch: &mut WriteBatch,
-    ) -> Result<Vec<CdcRowDelta>> {
+    ) -> Result<Option<CdcTableDeltas>> {
+        if let Some(rows) = change_batch.snapshot_insert_rows() {
+            self.stage_snapshot_insert_batch(schema, rows, batch)?;
+            return Ok(Some(CdcTableDeltas::snapshot_insert(
+                schema.table_id().clone(),
+                rows.clone(),
+            )));
+        }
+
         let mut deltas = Vec::new();
         let prefetched_rows = self
             .prefetch_old_rows(schema, change_batch, overlay)
@@ -390,7 +429,29 @@ impl CdcTableStore {
                 }
             }
         }
-        Ok(deltas)
+        if deltas.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CdcTableDeltas::new(
+                change_batch.table_id().clone(),
+                deltas,
+            )))
+        }
+    }
+
+    fn stage_snapshot_insert_batch(
+        &self,
+        schema: &CdcTableSchema,
+        rows: &CdcColumnarRowBatch,
+        batch: &mut WriteBatch,
+    ) -> Result<()> {
+        schema.validate_columnar_rows(rows)?;
+        for row_idx in 0..rows.row_count() {
+            let key = schema.primary_key_from_columnar_row(rows, row_idx)?;
+            let storage_key = row_key_bytes(schema.table_id(), &key)?;
+            batch.put(storage_key, encode_cdc_columnar_row_state(rows, row_idx)?);
+        }
+        Ok(())
     }
 
     async fn prefetch_old_rows(
@@ -584,6 +645,16 @@ fn encode_cdc_row_state(row: &CdcRow) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn encode_cdc_columnar_row_state(rows: &CdcColumnarRowBatch, row_idx: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(CDC_ROW_STATE_MAGIC.len() + 4 + rows.columns().len() * 9);
+    out.extend_from_slice(CDC_ROW_STATE_MAGIC);
+    push_u32(&mut out, rows.columns().len(), "CDC row value count")?;
+    for column in rows.columns() {
+        encode_cdc_columnar_row_value(&mut out, column, row_idx)?;
+    }
+    Ok(out)
+}
+
 fn encode_cdc_row_value(out: &mut Vec<u8>, value: Option<&RowValue>) -> Result<()> {
     match value {
         None => out.push(CDC_ROW_VALUE_NULL),
@@ -604,6 +675,49 @@ fn encode_cdc_row_value(out: &mut Vec<u8>, value: Option<&RowValue>) -> Result<(
             out.push(CDC_ROW_VALUE_TIMESTAMP_MILLIS);
             out.extend_from_slice(&value.to_le_bytes());
         }
+    }
+    Ok(())
+}
+
+fn encode_cdc_columnar_row_value(
+    out: &mut Vec<u8>,
+    column: &CdcColumnarColumn,
+    row_idx: usize,
+) -> Result<()> {
+    match column {
+        CdcColumnarColumn::Int64(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_INT64);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::Bool(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_BOOL);
+                out.push(u8::from(*value));
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::Utf8(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_UTF8);
+                push_u32(out, value.len(), "CDC UTF-8 value length")?;
+                out.extend_from_slice(value.as_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::TimestampMillis(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_TIMESTAMP_MILLIS);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
     }
     Ok(())
 }
@@ -796,6 +910,67 @@ mod tests {
         assert_eq!(
             decode_cdc_row_state(&encoded).expect("decode row state"),
             source
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_columnar_snapshot_insert_batch() {
+        let store = test_store("cdc-table-columnar-snapshot").await;
+        let schema = orders_schema();
+        let rows = CdcColumnarRowBatch::new(vec![
+            CdcColumnarColumn::Int64(vec![Some(1), Some(2)]),
+            CdcColumnarColumn::Int64(vec![Some(10), None]),
+            CdcColumnarColumn::Utf8(vec![Some("open".to_string()), Some("closed".to_string())]),
+        ])
+        .expect("columnar rows");
+        let transaction = tx(
+            "0/10",
+            vec![
+                ChangeBatch::new_snapshot_insert(schema.table_id().clone(), rows)
+                    .expect("snapshot batch"),
+            ],
+        );
+
+        let apply_result = store
+            .apply_transaction(&schemas(schema.clone()), &transaction)
+            .await
+            .expect("apply columnar snapshot");
+        assert_eq!(apply_result.table_deltas().len(), 1);
+        assert_eq!(apply_result.table_deltas()[0].row_count(), 2);
+        assert_eq!(
+            apply_result.table_deltas()[0]
+                .snapshot_insert_rows()
+                .expect("snapshot rows")
+                .row_count(),
+            2
+        );
+        assert!(apply_result.table_deltas()[0].deltas().is_empty());
+
+        assert_eq!(
+            store
+                .load_row(schema.table_id(), &key(1))
+                .await
+                .expect("load first row")
+                .expect("first row exists")
+                .values(),
+            &[
+                Some(RowValue::Int64(1)),
+                Some(RowValue::Int64(10)),
+                Some(RowValue::Utf8("open".to_string()))
+            ]
+        );
+        assert_eq!(
+            store
+                .load_row(schema.table_id(), &key(2))
+                .await
+                .expect("load second row")
+                .expect("second row exists")
+                .values(),
+            &[
+                Some(RowValue::Int64(2)),
+                None,
+                Some(RowValue::Utf8("closed".to_string()))
+            ]
         );
     }
 

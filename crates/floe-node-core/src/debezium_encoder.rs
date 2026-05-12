@@ -107,6 +107,25 @@ pub fn encode_debezium_change_batch(
         batch.table_id().as_str(),
         schema.table_id().as_str()
     );
+    if let Some(rows) = batch.snapshot_insert_rows() {
+        let mut records = Vec::with_capacity(rows.row_count());
+        for row_idx in 0..rows.row_count() {
+            let mut change_context = context;
+            change_context.sequence = Some(
+                context
+                    .sequence
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(row_idx).unwrap_or(u64::MAX)),
+            );
+            records.push(encode_debezium_snapshot_row(
+                schema,
+                &rows.row(row_idx)?,
+                config,
+                change_context,
+            )?);
+        }
+        return Ok(records);
+    }
     let mut records = Vec::new();
     for (idx, change) in batch.changes().iter().enumerate() {
         let mut change_context = context;

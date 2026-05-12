@@ -2,10 +2,14 @@ use super::*;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use floe_cdc_core::{
-    CdcChange, CdcCheckpoint, CdcRow, CdcTransactionId, ChangeBatch, TransactionBatch,
+    CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcTransactionId, ChangeBatch,
+    TransactionBatch,
 };
-use floe_core::RowValue;
+use futures::{TryStreamExt, pin_mut};
+use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
+
+const POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 8192;
 
 struct PostgresSnapshot {
     lsn: PostgresLsn,
@@ -237,11 +241,9 @@ async fn load_postgres_initial_snapshot_from_client(
     let mut change_batches = Vec::new();
     let mut row_count = 0_usize;
     for schema in sorted_schemas {
-        let changes = snapshot_table_rows(&transaction, schema).await?;
-        row_count += changes.len();
-        if !changes.is_empty() {
-            change_batches.push(ChangeBatch::new(schema.table_id().clone(), changes)?);
-        }
+        let table_snapshot = snapshot_table_change_batches(&transaction, schema).await?;
+        row_count = row_count.saturating_add(table_snapshot.row_count);
+        change_batches.extend(table_snapshot.change_batches);
     }
     transaction
         .commit()
@@ -632,21 +634,53 @@ fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &s
     }
 }
 
-async fn snapshot_table_rows(
+struct SnapshotTableChangeBatches {
+    change_batches: Vec<ChangeBatch>,
+    row_count: usize,
+}
+
+async fn snapshot_table_change_batches(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
-) -> Result<Vec<CdcChange>> {
+) -> Result<SnapshotTableChangeBatches> {
     let query = snapshot_table_query(schema);
-    let rows = transaction.query(&query, &[]).await.with_context(|| {
+    let params = std::iter::empty::<&(dyn ToSql + Sync)>();
+    let stream = transaction
+        .query_raw(&query, params)
+        .await
+        .with_context(|| {
+            format!(
+                "snapshot Postgres CDC table '{}.{}'",
+                schema.upstream_table().schema(),
+                schema.upstream_table().table()
+            )
+        })?;
+    pin_mut!(stream);
+
+    let mut change_batches = Vec::new();
+    let mut row_count = 0_usize;
+    let mut builder = SnapshotColumnarBatchBuilder::new(schema, POSTGRES_SNAPSHOT_ROWS_PER_BATCH);
+    while let Some(row) = stream.try_next().await.with_context(|| {
         format!(
-            "snapshot Postgres CDC table '{}.{}'",
+            "stream Postgres CDC snapshot table '{}.{}'",
             schema.upstream_table().schema(),
             schema.upstream_table().table()
         )
-    })?;
-    rows.into_iter()
-        .map(|row| snapshot_row(schema, &row))
-        .collect()
+    })? {
+        builder.append_row(schema, &row)?;
+        row_count = row_count.saturating_add(1);
+        if builder.len() >= POSTGRES_SNAPSHOT_ROWS_PER_BATCH {
+            change_batches.push(builder.finish_change_batch(schema)?);
+        }
+    }
+    if !builder.is_empty() {
+        change_batches.push(builder.finish_change_batch(schema)?);
+    }
+
+    Ok(SnapshotTableChangeBatches {
+        change_batches,
+        row_count,
+    })
 }
 
 fn snapshot_table_query(schema: &CdcTableSchema) -> String {
@@ -679,43 +713,125 @@ fn snapshot_select_expr(column: &CdcColumn) -> String {
     }
 }
 
-fn snapshot_row(schema: &CdcTableSchema, row: &tokio_postgres::Row) -> Result<CdcChange> {
-    let values = schema
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(idx, column)| snapshot_row_value(row, idx, column))
-        .collect::<Result<Vec<_>>>()?;
-    let cdc_row = CdcRow::new(values)?;
-    schema.validate_row(&cdc_row)?;
-    Ok(CdcChange::Insert { row: cdc_row })
+struct SnapshotColumnarBatchBuilder {
+    columns: Vec<SnapshotColumnBuilder>,
+    len: usize,
+    capacity: usize,
 }
 
-fn snapshot_row_value(
-    row: &tokio_postgres::Row,
-    idx: usize,
-    column: &CdcColumn,
-) -> Result<Option<RowValue>> {
-    let postgres_type = row.columns()[idx].type_();
-    match column.data_type() {
-        ColumnType::Int64 => snapshot_int64_value(row, idx, postgres_type),
-        ColumnType::Bool => row
-            .try_get::<_, Option<bool>>(idx)
-            .with_context(|| format!("decode Postgres CDC snapshot bool '{}'", column.name()))
-            .map(|value| value.map(RowValue::Bool)),
-        ColumnType::Utf8 => row
-            .try_get::<_, Option<String>>(idx)
-            .with_context(|| format!("decode Postgres CDC snapshot text '{}'", column.name()))
-            .map(|value| value.map(RowValue::Utf8)),
-        ColumnType::TimestampMillis => row
-            .try_get::<_, Option<i64>>(idx)
-            .with_context(|| {
-                format!(
-                    "decode Postgres CDC snapshot timestamp millis '{}'",
-                    column.name()
-                )
-            })
-            .map(|value| value.map(RowValue::TimestampMillis)),
+impl SnapshotColumnarBatchBuilder {
+    fn new(schema: &CdcTableSchema, capacity: usize) -> Self {
+        Self {
+            columns: schema
+                .columns()
+                .iter()
+                .map(|column| SnapshotColumnBuilder::new(column.data_type(), capacity))
+                .collect(),
+            len: 0,
+            capacity,
+        }
+    }
+
+    fn append_row(&mut self, schema: &CdcTableSchema, row: &tokio_postgres::Row) -> Result<()> {
+        ensure!(
+            row.columns().len() == schema.columns().len(),
+            "Postgres CDC snapshot row has {} columns, expected {}",
+            row.columns().len(),
+            schema.columns().len()
+        );
+        for ((builder, column), idx) in self
+            .columns
+            .iter_mut()
+            .zip(schema.columns())
+            .zip(0..schema.columns().len())
+        {
+            builder.append(row, idx, column)?;
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn finish_change_batch(&mut self, schema: &CdcTableSchema) -> Result<ChangeBatch> {
+        let columns = std::mem::take(&mut self.columns)
+            .into_iter()
+            .map(SnapshotColumnBuilder::finish)
+            .collect::<Vec<_>>();
+        let rows = CdcColumnarRowBatch::new(columns)?;
+        schema.validate_columnar_rows(&rows)?;
+        self.columns = schema
+            .columns()
+            .iter()
+            .map(|column| SnapshotColumnBuilder::new(column.data_type(), self.capacity))
+            .collect();
+        self.len = 0;
+        ChangeBatch::new_snapshot_insert(schema.table_id().clone(), rows)
+    }
+}
+
+enum SnapshotColumnBuilder {
+    Int64(Vec<Option<i64>>),
+    Bool(Vec<Option<bool>>),
+    Utf8(Vec<Option<String>>),
+    TimestampMillis(Vec<Option<i64>>),
+}
+
+impl SnapshotColumnBuilder {
+    fn new(data_type: &ColumnType, capacity: usize) -> Self {
+        match data_type {
+            ColumnType::Int64 => Self::Int64(Vec::with_capacity(capacity)),
+            ColumnType::Bool => Self::Bool(Vec::with_capacity(capacity)),
+            ColumnType::Utf8 => Self::Utf8(Vec::with_capacity(capacity)),
+            ColumnType::TimestampMillis => Self::TimestampMillis(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn append(&mut self, row: &tokio_postgres::Row, idx: usize, column: &CdcColumn) -> Result<()> {
+        match (self, column.data_type()) {
+            (Self::Int64(values), ColumnType::Int64) => {
+                values.push(snapshot_int64_value(row, idx, row.columns()[idx].type_())?);
+            }
+            (Self::Bool(values), ColumnType::Bool) => {
+                values.push(row.try_get::<_, Option<bool>>(idx).with_context(|| {
+                    format!("decode Postgres CDC snapshot bool '{}'", column.name())
+                })?);
+            }
+            (Self::Utf8(values), ColumnType::Utf8) => {
+                values.push(row.try_get::<_, Option<String>>(idx).with_context(|| {
+                    format!("decode Postgres CDC snapshot text '{}'", column.name())
+                })?);
+            }
+            (Self::TimestampMillis(values), ColumnType::TimestampMillis) => {
+                values.push(row.try_get::<_, Option<i64>>(idx).with_context(|| {
+                    format!(
+                        "decode Postgres CDC snapshot timestamp millis '{}'",
+                        column.name()
+                    )
+                })?);
+            }
+            _ => bail!(
+                "Postgres CDC snapshot builder for column '{}' does not match type {:?}",
+                column.name(),
+                column.data_type()
+            ),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> CdcColumnarColumn {
+        match self {
+            Self::Int64(values) => CdcColumnarColumn::Int64(values),
+            Self::Bool(values) => CdcColumnarColumn::Bool(values),
+            Self::Utf8(values) => CdcColumnarColumn::Utf8(values),
+            Self::TimestampMillis(values) => CdcColumnarColumn::TimestampMillis(values),
+        }
     }
 }
 
@@ -723,20 +839,19 @@ fn snapshot_int64_value(
     row: &tokio_postgres::Row,
     idx: usize,
     postgres_type: &Type,
-) -> Result<Option<RowValue>> {
+) -> Result<Option<i64>> {
     match *postgres_type {
         Type::INT8 => row
             .try_get::<_, Option<i64>>(idx)
-            .context("decode Postgres CDC snapshot int8")
-            .map(|value| value.map(RowValue::Int64)),
+            .context("decode Postgres CDC snapshot int8"),
         Type::INT4 => row
             .try_get::<_, Option<i32>>(idx)
             .context("decode Postgres CDC snapshot int4")
-            .map(|value| value.map(|value| RowValue::Int64(i64::from(value)))),
+            .map(|value| value.map(i64::from)),
         Type::INT2 => row
             .try_get::<_, Option<i16>>(idx)
             .context("decode Postgres CDC snapshot int2")
-            .map(|value| value.map(|value| RowValue::Int64(i64::from(value)))),
+            .map(|value| value.map(i64::from)),
         _ => bail!("unsupported Postgres integer snapshot type {postgres_type}"),
     }
 }

@@ -1968,6 +1968,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     source = %cdc_transaction.source_id.as_str(),
                     slot = %cdc_transaction.slot,
                     change_batches = cdc_transaction.transaction.change_batches().len(),
+                    changes = cdc_transaction
+                        .transaction
+                        .change_batches()
+                        .iter()
+                        .map(ChangeBatch::change_count)
+                        .sum::<usize>(),
                     commit_position = ?cdc_transaction.transaction.commit_position(),
                     "executor applying native CDC transaction"
                 );

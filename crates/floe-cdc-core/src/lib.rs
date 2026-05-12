@@ -447,12 +447,81 @@ impl CdcTableSchema {
         Ok(())
     }
 
+    pub fn validate_columnar_rows(&self, rows: &CdcColumnarRowBatch) -> Result<()> {
+        ensure!(
+            rows.columns().len() == self.columns.len(),
+            "CDC columnar row batch column count {} does not match table '{}' column count {}",
+            rows.columns().len(),
+            self.table_id().as_str(),
+            self.columns.len()
+        );
+        for (idx, (column, values)) in self.columns.iter().zip(rows.columns()).enumerate() {
+            ensure!(
+                values.data_type() == column.data_type().clone(),
+                "CDC columnar batch column '{}' (index {idx}) type {:?} does not match {:?}",
+                column.name(),
+                values.data_type(),
+                column.data_type()
+            );
+            if !column.nullable() {
+                ensure!(
+                    !values.has_nulls(),
+                    "CDC columnar batch column '{}' cannot contain NULL",
+                    column.name()
+                );
+            }
+        }
+        for key_column in self.primary_key.columns() {
+            let column_idx = self
+                .column_index(key_column)
+                .expect("CDC table schema validated primary-key columns");
+            let values = &rows.columns()[column_idx];
+            ensure!(
+                !values.has_nulls(),
+                "CDC columnar batch primary-key column '{key_column}' cannot contain NULL"
+            );
+        }
+        Ok(())
+    }
+
     pub fn primary_key_from_row(&self, row: &CdcRow) -> Result<CdcRowKey> {
         self.validate_row(row)?;
         let mut values = Vec::with_capacity(self.primary_key.columns().len());
         for idx in self.primary_key_indices() {
             let column = &self.columns[idx];
             let Some(value) = row.values()[idx].clone() else {
+                bail!("CDC primary key column '{}' cannot be NULL", column.name());
+            };
+            values.push(value);
+        }
+        CdcRowKey::new(values)
+    }
+
+    pub fn primary_key_from_columnar_row(
+        &self,
+        rows: &CdcColumnarRowBatch,
+        row_idx: usize,
+    ) -> Result<CdcRowKey> {
+        ensure!(
+            row_idx < rows.row_count(),
+            "CDC columnar row index {row_idx} out of bounds for {} rows",
+            rows.row_count()
+        );
+        let mut values = Vec::with_capacity(self.primary_key.columns().len());
+        for idx in self.primary_key_indices() {
+            let column = &self.columns[idx];
+            let column_values = rows
+                .columns()
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("CDC column index {idx} out of bounds"))?;
+            ensure!(
+                column_values.data_type() == column.data_type().clone(),
+                "CDC primary-key column '{}' type {:?} does not match {:?}",
+                column.name(),
+                column_values.data_type(),
+                column.data_type()
+            );
+            let Some(value) = rows.value(idx, row_idx)? else {
                 bail!("CDC primary key column '{}' cannot be NULL", column.name());
             };
             values.push(value);
@@ -475,6 +544,135 @@ impl CdcRow {
 
     pub fn values(&self) -> &[Option<RowValue>] {
         &self.values
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "values", rename_all = "snake_case")]
+pub enum CdcColumnarColumn {
+    Int64(Vec<Option<i64>>),
+    Bool(Vec<Option<bool>>),
+    Utf8(Vec<Option<String>>),
+    TimestampMillis(Vec<Option<i64>>),
+}
+
+impl CdcColumnarColumn {
+    pub fn data_type(&self) -> ColumnType {
+        match self {
+            Self::Int64(_) => ColumnType::Int64,
+            Self::Bool(_) => ColumnType::Bool,
+            Self::Utf8(_) => ColumnType::Utf8,
+            Self::TimestampMillis(_) => ColumnType::TimestampMillis,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Int64(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::Utf8(values) => values.len(),
+            Self::TimestampMillis(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn has_nulls(&self) -> bool {
+        match self {
+            Self::Int64(values) => values.iter().any(Option::is_none),
+            Self::Bool(values) => values.iter().any(Option::is_none),
+            Self::Utf8(values) => values.iter().any(Option::is_none),
+            Self::TimestampMillis(values) => values.iter().any(Option::is_none),
+        }
+    }
+
+    pub fn value(&self, row_idx: usize) -> Result<Option<RowValue>> {
+        match self {
+            Self::Int64(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::Int64))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::Bool(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::Bool))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::Utf8(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::Utf8))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::TimestampMillis(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::TimestampMillis))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcColumnarRowBatch {
+    columns: Vec<CdcColumnarColumn>,
+    row_count: usize,
+}
+
+impl CdcColumnarRowBatch {
+    pub fn new(columns: Vec<CdcColumnarColumn>) -> Result<Self> {
+        ensure!(
+            !columns.is_empty(),
+            "CDC columnar row batch cannot be empty"
+        );
+        let row_count = columns[0].len();
+        ensure!(
+            row_count > 0,
+            "CDC columnar row batch must contain at least one row"
+        );
+        for column in &columns {
+            ensure!(
+                column.len() == row_count,
+                "CDC columnar row batch has mismatched column lengths: expected {row_count}, got {}",
+                column.len()
+            );
+        }
+        Ok(Self { columns, row_count })
+    }
+
+    pub fn columns(&self) -> &[CdcColumnarColumn] {
+        &self.columns
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn value(&self, column_idx: usize, row_idx: usize) -> Result<Option<RowValue>> {
+        ensure!(
+            row_idx < self.row_count,
+            "CDC columnar row index {row_idx} out of bounds for {} rows",
+            self.row_count
+        );
+        let column = self
+            .columns
+            .get(column_idx)
+            .ok_or_else(|| anyhow::anyhow!("CDC column index {column_idx} out of bounds"))?;
+        column.value(row_idx)
+    }
+
+    pub fn row(&self, row_idx: usize) -> Result<CdcRow> {
+        ensure!(
+            row_idx < self.row_count,
+            "CDC columnar row index {row_idx} out of bounds for {} rows",
+            self.row_count
+        );
+        self.columns
+            .iter()
+            .map(|column| column.value(row_idx))
+            .collect::<Result<Vec<_>>>()
+            .and_then(CdcRow::new)
     }
 }
 
@@ -587,13 +785,32 @@ impl CdcChange {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeBatch {
     table_id: CdcTableId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     changes: Vec<CdcChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_insert_rows: Option<CdcColumnarRowBatch>,
 }
 
 impl ChangeBatch {
     pub fn new(table_id: CdcTableId, changes: Vec<CdcChange>) -> Result<Self> {
         ensure!(!changes.is_empty(), "CDC change batch cannot be empty");
-        Ok(Self { table_id, changes })
+        Ok(Self {
+            table_id,
+            changes,
+            snapshot_insert_rows: None,
+        })
+    }
+
+    pub fn new_snapshot_insert(table_id: CdcTableId, rows: CdcColumnarRowBatch) -> Result<Self> {
+        ensure!(
+            rows.row_count() > 0,
+            "CDC snapshot insert batch cannot be empty"
+        );
+        Ok(Self {
+            table_id,
+            changes: Vec::new(),
+            snapshot_insert_rows: Some(rows),
+        })
     }
 
     pub fn table_id(&self) -> &CdcTableId {
@@ -604,6 +821,17 @@ impl ChangeBatch {
         &self.changes
     }
 
+    pub fn snapshot_insert_rows(&self) -> Option<&CdcColumnarRowBatch> {
+        self.snapshot_insert_rows.as_ref()
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.snapshot_insert_rows
+            .as_ref()
+            .map(CdcColumnarRowBatch::row_count)
+            .unwrap_or(self.changes.len())
+    }
+
     pub fn validate_against_schema(&self, schema: &CdcTableSchema) -> Result<()> {
         ensure!(
             &self.table_id == schema.table_id(),
@@ -611,6 +839,18 @@ impl ChangeBatch {
             self.table_id.as_str(),
             schema.table_id().as_str()
         );
+        ensure!(
+            !self.changes.is_empty() || self.snapshot_insert_rows.is_some(),
+            "CDC change batch cannot be empty"
+        );
+        ensure!(
+            self.changes.is_empty() || self.snapshot_insert_rows.is_none(),
+            "CDC change batch cannot mix row changes with snapshot insert rows"
+        );
+        if let Some(rows) = &self.snapshot_insert_rows {
+            schema.validate_columnar_rows(rows)?;
+            return Ok(());
+        }
         for change in &self.changes {
             change.validate_against_schema(schema)?;
         }

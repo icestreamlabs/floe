@@ -6,7 +6,9 @@ use datafusion::arrow::array::{
     StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
 use floe_cdc::CdcTableDeltas;
-use floe_cdc_core::{CdcRowKey, CdcTableId, CdcTableSchema};
+use floe_cdc_core::{
+    CdcColumnarColumn, CdcColumnarRowBatch, CdcRowKey, CdcTableId, CdcTableSchema,
+};
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
@@ -38,6 +40,10 @@ impl CdcArrowDeltaBatch {
             table_deltas.table_id().as_str(),
             definition.name()
         );
+
+        if let Some(rows) = table_deltas.snapshot_insert_rows() {
+            return Self::from_snapshot_insert_rows(definition, table_deltas.table_id(), rows);
+        }
 
         let row_count = table_deltas.deltas().len();
         let mut builders = definition
@@ -83,6 +89,35 @@ impl CdcArrowDeltaBatch {
         })
     }
 
+    fn from_snapshot_insert_rows(
+        definition: &SourceDefinition,
+        table_id: &CdcTableId,
+        rows: &CdcColumnarRowBatch,
+    ) -> Result<Self> {
+        ensure!(
+            rows.columns().len() == definition.columns().len(),
+            "CDC snapshot column count {} does not match source '{}' column count {}",
+            rows.columns().len(),
+            definition.name(),
+            definition.columns().len()
+        );
+        let arrays = rows
+            .columns()
+            .iter()
+            .zip(definition.columns())
+            .map(|(values, column)| columnar_values_to_arrow(values, column))
+            .collect::<Result<Vec<_>>>()?;
+        let record_batch = RecordBatch::try_new(definition.to_arrow_schema(), arrays)
+            .context("build CDC snapshot Arrow delta batch")?;
+        let row_count = rows.row_count();
+        Ok(Self {
+            table_id: table_id.clone(),
+            record_batch,
+            operations: vec![CdcDeltaOperation::Insert; row_count],
+            diffs: vec![1; row_count],
+        })
+    }
+
     pub fn table_id(&self) -> &CdcTableId {
         &self.table_id
     }
@@ -106,6 +141,42 @@ impl CdcArrowDeltaBatch {
     pub fn is_empty(&self) -> bool {
         self.diffs.is_empty()
     }
+}
+
+fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -> Result<ArrayRef> {
+    ensure!(
+        values.data_type() == column.data_type().column_type(),
+        "CDC snapshot column '{}' type {:?} does not match source type {:?}",
+        column.name(),
+        values.data_type(),
+        column.data_type()
+    );
+    if !column.nullable() {
+        ensure!(
+            !values.has_nulls(),
+            "CDC snapshot column '{}' cannot contain NULL",
+            column.name()
+        );
+    }
+
+    let array: ArrayRef = match values {
+        CdcColumnarColumn::Int64(values) => Arc::new(Int64Array::from(values.clone())),
+        CdcColumnarColumn::Bool(values) => Arc::new(BooleanArray::from(values.clone())),
+        CdcColumnarColumn::Utf8(values) => {
+            let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 16);
+            for value in values {
+                match value {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        CdcColumnarColumn::TimestampMillis(values) => {
+            Arc::new(TimestampMillisecondArray::from(values.clone()))
+        }
+    };
+    Ok(array)
 }
 
 pub fn encode_cdc_table_deltas(
@@ -306,7 +377,10 @@ fn arrow_row_value(
 #[cfg(test)]
 mod tests {
     use floe_cdc::{CdcRowDelta, CdcTableDeltas};
-    use floe_cdc_core::{CdcColumn, CdcPrimaryKey, CdcRow, CdcTableId, UpstreamTableRef};
+    use floe_cdc_core::{
+        CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey, CdcRow, CdcTableId,
+        UpstreamTableRef,
+    };
     use floe_core::RowValue;
     use floe_core::catalog::ColumnType;
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
@@ -412,6 +486,39 @@ mod tests {
         );
         assert_eq!(
             decode_all_encoded_row_scalars(&encoded[1].0).expect("decode delete"),
+            vec![
+                Some(EncodedRowScalar::Int64(7)),
+                Some(EncodedRowScalar::Int64(2)),
+                Some(EncodedRowScalar::Int64(100)),
+                None,
+                Some(EncodedRowScalar::TimestampMillis(2000)),
+                Some(EncodedRowScalar::Bool(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_columnar_snapshot_deltas_through_arrow_batch() {
+        let rows = CdcColumnarRowBatch::new(vec![
+            CdcColumnarColumn::Int64(vec![Some(7), Some(7)]),
+            CdcColumnarColumn::Int64(vec![Some(1), Some(2)]),
+            CdcColumnarColumn::Int64(vec![Some(500), Some(100)]),
+            CdcColumnarColumn::Utf8(vec![Some("new".to_string()), None]),
+            CdcColumnarColumn::TimestampMillis(vec![Some(1000), Some(2000)]),
+            CdcColumnarColumn::Bool(vec![Some(true), Some(false)]),
+        ])
+        .expect("columnar rows");
+        let deltas =
+            CdcTableDeltas::snapshot_insert(CdcTableId::new("orders").expect("table id"), rows);
+        let decoder = SourceRowDecoder::new(orders_definition());
+
+        let encoded = encode_cdc_table_deltas(&decoder, &deltas).expect("encode snapshot deltas");
+
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].1, 1);
+        assert_eq!(encoded[1].1, 1);
+        assert_eq!(
+            decode_all_encoded_row_scalars(&encoded[1].0).expect("decode snapshot row"),
             vec![
                 Some(EncodedRowScalar::Int64(7)),
                 Some(EncodedRowScalar::Int64(2)),
