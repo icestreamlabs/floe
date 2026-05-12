@@ -2294,6 +2294,7 @@ dependencies = [
  "anyhow",
  "arrow-ipc",
  "arrow-schema",
+ "floe-cdc-core",
  "floe-core",
  "object_store",
  "serde",

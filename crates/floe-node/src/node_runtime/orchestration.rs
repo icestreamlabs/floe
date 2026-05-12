@@ -26,29 +26,71 @@ fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
     })
 }
 
-pub(super) fn postgres_cdc_runtime_plan(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn postgres_cdc_runtime_plan(
     connector_name: &str,
+    connection_string: &str,
     include_tables: Option<&[String]>,
     registry: &SourceRegistry,
+    source_tables: &HashMap<String, SourceBackedTableDefinition>,
+    replication_pipelines: &HashMap<String, CatalogReplicationPipelineDefinition>,
 ) -> anyhow::Result<Option<PostgresCdcRuntimePlan>> {
-    let Some(include_tables) = include_tables else {
+    let has_source_tables = source_tables
+        .values()
+        .any(|table| table.source_name() == connector_name);
+    let has_replication_pipelines = replication_pipelines
+        .values()
+        .any(|pipeline| pipeline.source_name() == connector_name);
+    let include_tables = include_tables.unwrap_or(&[]);
+    if include_tables.is_empty() && !has_source_tables && !has_replication_pipelines {
         return Ok(None);
     };
-    if include_tables.is_empty() {
-        return Ok(None);
-    }
 
     let mut schemas = HashMap::new();
+    let mut materialized_table_ids = HashSet::new();
+    let mut table_id_by_upstream = HashMap::<String, CdcTableId>::new();
+
+    for binding in source_tables
+        .values()
+        .filter(|table| table.source_name() == connector_name)
+    {
+        let definition = registry.get(binding.table_name()).ok_or_else(|| {
+            anyhow!(
+                "source-backed table '{}' has no registered table definition",
+                binding.table_name()
+            )
+        })?;
+        if !source_definition_has_primary_key(definition) {
+            return Err(anyhow!(
+                "Postgres CDC source-backed table '{}' has no primary key",
+                definition.name()
+            ));
+        }
+        let schema = cdc_table_schema_from_source_definition(
+            definition,
+            upstream_table_ref_for_postgres_include_table(binding.upstream_table())?,
+        )?;
+        materialized_table_ids.insert(schema.table_id().clone());
+        table_id_by_upstream.insert(
+            binding.upstream_table().to_string(),
+            schema.table_id().clone(),
+        );
+        schemas.insert(schema.table_id().clone(), schema);
+    }
+
     for include_table in include_tables {
+        if table_id_by_upstream.contains_key(include_table) {
+            continue;
+        }
         let source_name = source_name_for_postgres_include_table(include_table, registry);
         let Some(definition) = registry.get(&source_name) else {
             tracing::warn!(
                 connector = %connector_name,
                 table = %include_table,
                 source = %source_name,
-                "Postgres CDC table has no source definition; using append-only compatibility path"
+                "Postgres CDC table has no source definition; it may be replication-pipeline-only"
             );
-            return Ok(None);
+            continue;
         };
         if !source_definition_has_primary_key(definition) {
             tracing::warn!(
@@ -56,19 +98,88 @@ pub(super) fn postgres_cdc_runtime_plan(
                 source = %definition.name(),
                 "Postgres CDC source has no primary key; using append-only compatibility path"
             );
-            return Ok(None);
+            continue;
         }
         let schema = cdc_table_schema_from_source_definition(
             definition,
             upstream_table_ref_for_postgres_include_table(include_table)?,
         )?;
+        materialized_table_ids.insert(schema.table_id().clone());
+        table_id_by_upstream.insert(include_table.to_string(), schema.table_id().clone());
         schemas.insert(schema.table_id().clone(), schema);
+    }
+
+    let mut pipeline_plans = Vec::new();
+    for pipeline in replication_pipelines
+        .values()
+        .filter(|pipeline| pipeline.source_name() == connector_name)
+    {
+        let table_id = if let Some(table_id) = table_id_by_upstream.get(pipeline.upstream_table()) {
+            table_id.clone()
+        } else {
+            let table_id =
+                replication_pipeline_table_id(connector_name, pipeline.upstream_table())?;
+            let schema = super::postgres_snapshot::discover_postgres_cdc_table_schema(
+                connection_string,
+                table_id.clone(),
+                upstream_table_ref_for_postgres_include_table(pipeline.upstream_table())?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "discover schema for replication pipeline '{}' table '{}'",
+                    pipeline.name(),
+                    pipeline.upstream_table()
+                )
+            })?;
+            table_id_by_upstream.insert(pipeline.upstream_table().to_string(), table_id.clone());
+            schemas.insert(table_id.clone(), schema);
+            table_id
+        };
+        pipeline_plans.push(replication_pipeline_runtime_plan_from_catalog(
+            pipeline, table_id,
+        )?);
+    }
+
+    if schemas.is_empty() {
+        return Ok(None);
     }
 
     Ok(Some(PostgresCdcRuntimePlan {
         source_id: CdcSourceId::new(connector_name)?,
         schemas,
+        materialized_table_ids,
+        replication_pipelines: pipeline_plans,
     }))
+}
+
+fn replication_pipeline_runtime_plan_from_catalog(
+    pipeline: &CatalogReplicationPipelineDefinition,
+    table_id: CdcTableId,
+) -> anyhow::Result<ReplicationPipelineRuntimePlan> {
+    let target = match pipeline.target() {
+        CatalogReplicationPipelineTarget::Kafka { brokers, topic } => {
+            ReplicationPipelineRuntimeTarget::Kafka {
+                brokers: brokers.clone(),
+                topic: topic.clone(),
+            }
+        }
+        CatalogReplicationPipelineTarget::Postgres { .. } => {
+            return Err(anyhow!(
+                "replication pipeline '{}' uses Postgres target, which is not implemented yet",
+                pipeline.name()
+            ));
+        }
+    };
+    Ok(ReplicationPipelineRuntimePlan {
+        name: pipeline.name().to_string(),
+        source_name: pipeline.source_name().to_string(),
+        upstream_table: pipeline.upstream_table().to_string(),
+        table_id,
+        target,
+        emit_tombstones: pipeline.emit_tombstones(),
+        include_transaction_metadata: pipeline.include_transaction_metadata(),
+    })
 }
 
 fn source_name_for_postgres_include_table(table: &str, registry: &SourceRegistry) -> String {
@@ -118,6 +229,22 @@ fn insert_source_backed_table_definition(
     Ok(())
 }
 
+fn insert_replication_pipeline_definition(
+    pipelines: &mut HashMap<String, CatalogReplicationPipelineDefinition>,
+    definition: CatalogReplicationPipelineDefinition,
+    origin: &str,
+) -> anyhow::Result<()> {
+    if pipelines
+        .insert(definition.name().to_string(), definition)
+        .is_some()
+    {
+        return Err(anyhow!(
+            "duplicate replication pipeline definition from {origin}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_source_backed_tables(
     catalog_sources: &HashMap<String, CatalogSourceDefinition>,
     source_tables: &HashMap<String, SourceBackedTableDefinition>,
@@ -150,10 +277,48 @@ fn validate_source_backed_tables(
     Ok(())
 }
 
+fn validate_replication_pipelines(
+    catalog_sources: &HashMap<String, CatalogSourceDefinition>,
+    pipelines: &HashMap<String, CatalogReplicationPipelineDefinition>,
+) -> anyhow::Result<()> {
+    for pipeline in pipelines.values() {
+        let source = catalog_sources.get(pipeline.source_name()).ok_or_else(|| {
+            anyhow!(
+                "replication pipeline '{}' references unknown source '{}'",
+                pipeline.name(),
+                pipeline.source_name()
+            )
+        })?;
+        match source.connector() {
+            CatalogSourceConnector::PostgresCdc(_) => {}
+        }
+        match pipeline.target() {
+            CatalogReplicationPipelineTarget::Kafka { .. } => {}
+            CatalogReplicationPipelineTarget::Postgres { .. } => {}
+        }
+        if pipeline.format() != CatalogReplicationPipelineFormat::DebeziumJson {
+            return Err(anyhow!(
+                "replication pipeline '{}' uses unsupported format {:?}",
+                pipeline.name(),
+                pipeline.format()
+            ));
+        }
+        if pipeline.delivery() != CatalogReplicationDelivery::AtLeastOnce {
+            return Err(anyhow!(
+                "replication pipeline '{}' uses unsupported delivery {:?}",
+                pipeline.name(),
+                pipeline.delivery()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn merge_catalog_source_connectors(
     connector_specs: &mut Vec<config::ConnectorSpec>,
     catalog_sources: &HashMap<String, CatalogSourceDefinition>,
     source_tables: &HashMap<String, SourceBackedTableDefinition>,
+    replication_pipelines: &HashMap<String, CatalogReplicationPipelineDefinition>,
 ) -> anyhow::Result<()> {
     let mut existing_names = connector_specs
         .iter()
@@ -167,6 +332,12 @@ pub(super) fn merge_catalog_source_connectors(
             .values()
             .filter(|table| table.source_name() == source.name())
             .map(|table| table.upstream_table().to_string())
+            .chain(
+                replication_pipelines
+                    .values()
+                    .filter(|pipeline| pipeline.source_name() == source.name())
+                    .map(|pipeline| pipeline.upstream_table().to_string()),
+            )
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -456,6 +627,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
     let mut catalog_sources: HashMap<String, CatalogSourceDefinition> = HashMap::new();
     let mut source_backed_tables: HashMap<String, SourceBackedTableDefinition> = HashMap::new();
+    let mut replication_pipelines: HashMap<String, CatalogReplicationPipelineDefinition> =
+        HashMap::new();
     let mut sql_sink_specs = Vec::new();
     if let Some(storage) = storage.as_ref() {
         for definition in storage
@@ -472,6 +645,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         {
             insert_source_backed_table_definition(
                 &mut source_backed_tables,
+                definition,
+                "catalog",
+            )?;
+        }
+        for definition in storage
+            .replication_pipelines()
+            .await
+            .context("load persisted replication pipeline definitions")?
+        {
+            insert_replication_pipeline_definition(
+                &mut replication_pipelines,
                 definition,
                 "catalog",
             )?;
@@ -586,6 +770,32 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 FloeStatement::CreateSink(definition) => {
                     sql_sink_specs.push(sink_spec_from_sql(&definition)?);
                 }
+                FloeStatement::CreateReplicationPipeline(definition) => {
+                    let pipeline = replication_pipeline_definition_from_sql(&definition)?;
+                    if !catalog_sources.contains_key(pipeline.source_name()) {
+                        return Err(anyhow!(
+                            "replication pipeline '{}' references unknown source '{}'",
+                            pipeline.name(),
+                            pipeline.source_name()
+                        ));
+                    }
+                    if let Some(storage) = storage.as_ref() {
+                        storage
+                            .upsert_replication_pipeline(pipeline.clone())
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "persist replication pipeline definition '{}'",
+                                    pipeline.name()
+                                )
+                            })?;
+                    }
+                    insert_replication_pipeline_definition(
+                        &mut replication_pipelines,
+                        pipeline,
+                        "--mv-query",
+                    )?;
+                }
                 FloeStatement::Tail { .. } => {
                     return Err(anyhow!(
                         "TAIL statements are not supported in --mv-query programs"
@@ -607,10 +817,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
     validate_source_backed_tables(&catalog_sources, &source_backed_tables, &source_registry)?;
+    validate_replication_pipelines(&catalog_sources, &replication_pipelines)?;
     merge_catalog_source_connectors(
         &mut connector_specs,
         &catalog_sources,
         &source_backed_tables,
+        &replication_pipelines,
     )?;
     log_startup_banner(&run_args, &connector_specs);
     apply_connector_properties(&mut source_registry, &connector_specs);
@@ -1157,26 +1369,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .enumerate()
         .map(|(idx, definition)| (definition.name().to_string(), idx))
         .collect();
-    let postgres_cdc_runtime_plans_by_connector = connector_specs
-        .iter()
-        .filter_map(|connector| {
-            let ConnectorConfig::PostgresCdc { include_tables, .. } = &connector.config else {
-                return None;
-            };
-            match postgres_cdc_runtime_plan(
-                &connector.name,
-                include_tables.as_deref(),
-                &source_registry,
-            ) {
-                Ok(Some(plan)) => Some(Ok((connector.name.clone(), plan))),
-                Ok(None) => None,
-                Err(err) => Some(Err(err.context(format!(
-                    "build native Postgres CDC runtime plan for connector '{}'",
-                    connector.name
-                )))),
-            }
-        })
-        .collect::<anyhow::Result<HashMap<_, _>>>()?;
+    let mut postgres_cdc_runtime_plans_by_connector = HashMap::new();
+    for connector in &connector_specs {
+        let ConnectorConfig::PostgresCdc {
+            connection,
+            include_tables,
+            ..
+        } = &connector.config
+        else {
+            continue;
+        };
+        if let Some(plan) = postgres_cdc_runtime_plan(
+            &connector.name,
+            connection,
+            include_tables.as_deref(),
+            &source_registry,
+            &source_backed_tables,
+            &replication_pipelines,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "build native Postgres CDC runtime plan for connector '{}'",
+                connector.name
+            )
+        })? {
+            postgres_cdc_runtime_plans_by_connector.insert(connector.name.clone(), plan);
+        }
+    }
+    let replication_pipeline_runtime = ReplicationPipelineRuntime::new(
+        postgres_cdc_runtime_plans_by_connector
+            .values()
+            .flat_map(|plan| plan.replication_pipelines.iter().cloned()),
+    )?;
     let source_names_by_id = Arc::new(
         definitions
             .iter()
@@ -1219,6 +1444,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         postgres_cdc_runtime_plans_by_connector
             .values()
             .map(|plan| (plan.source_id.clone(), plan.schemas.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
+    let cdc_materialized_table_ids_by_source_id = Arc::new(
+        postgres_cdc_runtime_plans_by_connector
+            .values()
+            .map(|plan| (plan.source_id.clone(), plan.materialized_table_ids.clone()))
             .collect::<HashMap<_, _>>(),
     );
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
@@ -1536,6 +1767,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let outer_for_task = Arc::clone(&outer_registry);
     let cdc_table_store_for_task = cdc_table_store.clone();
     let cdc_schemas_by_source_id_for_task = Arc::clone(&cdc_schemas_by_source_id);
+    let cdc_materialized_table_ids_by_source_id_for_task =
+        Arc::clone(&cdc_materialized_table_ids_by_source_id);
     let decoders_by_source_id_for_task = Arc::clone(&decoders_by_source_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
@@ -1550,6 +1783,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
+    let storage_for_replication_task = storage.clone();
+    let replication_pipeline_runtime_for_task = replication_pipeline_runtime;
     let mut connector_receiver_for_task = connector_receiver;
     let mut cdc_transaction_receiver_for_task = cdc_transaction_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -1737,15 +1972,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     executor_cancel.cancel();
                     break 'executor;
                 };
-                let mut staged_writes = WriteBatch::new();
-                let apply_result = match cdc_table_store_for_task
-                    .stage_transaction(schemas, &cdc_transaction.transaction, &mut staged_writes)
-                    .await
-                {
-                    Ok(result) => result,
+                let materialized_table_ids = cdc_materialized_table_ids_by_source_id_for_task
+                    .get(&cdc_transaction.source_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let materialized_transaction = match materialized_transaction(
+                    &cdc_transaction.source_id,
+                    &materialized_table_ids,
+                    &cdc_transaction.transaction,
+                ) {
+                    Ok(transaction) => transaction,
                     Err(err) => {
                         let message = format!(
-                            "failed to stage native CDC transaction for source '{}': {err}",
+                            "failed to split native CDC transaction for source '{}': {err}",
                             cdc_transaction.source_id.as_str()
                         );
                         tracing::error!(error = %err, "{message}");
@@ -1754,12 +1993,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         break 'executor;
                     }
                 };
-                let feedback_lsn =
-                    match PostgresLsn::from_source_position(apply_result.checkpoint().position()) {
-                        Ok(lsn) => lsn,
+                let mut staged_writes = WriteBatch::new();
+                let mut apply_result = None;
+                if let Some(transaction) = materialized_transaction.as_ref() {
+                    apply_result = match cdc_table_store_for_task
+                        .stage_transaction(schemas, transaction, &mut staged_writes)
+                        .await
+                    {
+                        Ok(result) => Some(result),
                         Err(err) => {
                             let message = format!(
-                                "failed to derive native CDC feedback LSN for source '{}': {err}",
+                                "failed to stage native CDC transaction for source '{}': {err}",
                                 cdc_transaction.source_id.as_str()
                             );
                             tracing::error!(error = %err, "{message}");
@@ -1768,6 +2012,68 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             break 'executor;
                         }
                     };
+                }
+                let pipeline_records = if replication_pipeline_runtime_for_task
+                    .has_pipelines_for_source(&cdc_transaction.source_id)
+                {
+                    match replication_pipeline_runtime_for_task
+                        .run_transaction(
+                            &cdc_transaction.source_id,
+                            schemas,
+                            &cdc_transaction.transaction,
+                            Some(&storage_for_replication_task),
+                        )
+                        .await
+                    {
+                        Ok(records) => records,
+                        Err(err) => {
+                            let message = format!(
+                                "failed to run replication pipelines for source '{}': {err}",
+                                cdc_transaction.source_id.as_str()
+                            );
+                            tracing::error!(error = %err, "{message}");
+                            record_runtime_failure(&failure_for_executor, message);
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
+                    }
+                } else {
+                    0
+                };
+                let feedback_position = apply_result
+                    .as_ref()
+                    .map(|result| result.checkpoint().position())
+                    .unwrap_or_else(|| cdc_transaction.transaction.commit_position());
+                let feedback_lsn = match PostgresLsn::from_source_position(feedback_position) {
+                    Ok(lsn) => lsn,
+                    Err(err) => {
+                        let message = format!(
+                            "failed to derive native CDC feedback LSN for source '{}': {err}",
+                            cdc_transaction.source_id.as_str()
+                        );
+                        tracing::error!(error = %err, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    }
+                };
+                if materialized_transaction.is_none() && pipeline_records > 0 {
+                    let checkpoint =
+                        pipeline_checkpoint_from_transaction(&cdc_transaction.transaction);
+                    if let Err(err) = cdc_table_store_for_task
+                        .commit_checkpoint(&checkpoint)
+                        .await
+                    {
+                        let message = format!(
+                            "failed to commit replication-only CDC checkpoint for source '{}': {err}",
+                            cdc_transaction.source_id.as_str()
+                        );
+                        tracing::error!(error = %err, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    }
+                }
                 tick_postgres_lsns.insert(
                     cdc_transaction.slot.clone(),
                     (feedback_lsn.as_u64(), feedback_lsn.to_pg_string()),
@@ -1784,7 +2090,36 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         feedback_lsn.as_u64(),
                     ));
                 }
-
+                if materialized_transaction.is_none() {
+                    if pipeline_records > 0 {
+                        advance_postgres_cdc_commit_state(
+                            &mut committed_postgres_lsns,
+                            &tick_postgres_lsns,
+                        );
+                        for (slot, (lsn_value, _)) in &tick_postgres_lsns {
+                            if let Some(source) = tick_postgres_sources.get(slot) {
+                                metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
+                            }
+                        }
+                        for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {
+                            metrics::record_postgres_cdc_table_applied_lsn(
+                                source, slot, table, *lsn_value,
+                            );
+                        }
+                        if !postgres_cdc_commit_senders_for_task.is_empty() {
+                            let commit = build_postgres_cdc_commit(epoch, &committed_postgres_lsns);
+                            for sender in &postgres_cdc_commit_senders_for_task {
+                                let _ = sender.send(commit.clone());
+                            }
+                        }
+                        metrics::record_checkpoint_age_seconds(0);
+                        last_checkpoint_commit_at = Instant::now();
+                    }
+                    continue;
+                }
+                let apply_result = apply_result
+                    .as_ref()
+                    .expect("materialized transaction should produce apply result");
                 for table_deltas in apply_result.table_deltas() {
                     let source_name = table_deltas.table_id().as_str();
                     let Some(source_id) = source_id_by_name_for_task.get(source_name).copied()

@@ -1,3 +1,3 @@
 pub mod catalog;
 
-pub use catalog::{MaterializedViewMetadata, SlateCatalog};
+pub use catalog::{MaterializedViewMetadata, ReplicationPipelineCheckpoint, SlateCatalog};

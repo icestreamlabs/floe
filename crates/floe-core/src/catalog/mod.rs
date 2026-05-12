@@ -116,6 +116,39 @@ pub struct SourceBackedTableDefinition {
     upstream_table: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationPipelineDefinition {
+    name: String,
+    source_name: String,
+    upstream_table: String,
+    target: ReplicationPipelineTarget,
+    format: ReplicationPipelineFormat,
+    delivery: ReplicationDelivery,
+    #[serde(default)]
+    emit_tombstones: bool,
+    #[serde(default)]
+    include_transaction_metadata: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplicationPipelineTarget {
+    Kafka { brokers: String, topic: String },
+    Postgres { connection: String, table: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationPipelineFormat {
+    DebeziumJson,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationDelivery {
+    AtLeastOnce,
+}
+
 impl<'de> Deserialize<'de> for TableDefinition {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -297,6 +330,107 @@ impl SourceBackedTableDefinition {
 
     pub fn upstream_table(&self) -> &str {
         &self.upstream_table
+    }
+}
+
+impl ReplicationPipelineDefinition {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: impl Into<String>,
+        source_name: impl Into<String>,
+        upstream_table: impl Into<String>,
+        target: ReplicationPipelineTarget,
+        format: ReplicationPipelineFormat,
+        delivery: ReplicationDelivery,
+        emit_tombstones: bool,
+        include_transaction_metadata: bool,
+    ) -> Result<Self> {
+        let name = name.into();
+        let source_name = source_name.into();
+        let upstream_table = upstream_table.into();
+        ensure!(
+            !name.trim().is_empty(),
+            "replication pipeline name cannot be empty"
+        );
+        ensure!(
+            !source_name.trim().is_empty(),
+            "replication pipeline source name cannot be empty"
+        );
+        ensure!(
+            !upstream_table.trim().is_empty(),
+            "replication pipeline upstream table cannot be empty"
+        );
+        target.validate()?;
+        Ok(Self {
+            name,
+            source_name,
+            upstream_table,
+            target,
+            format,
+            delivery,
+            emit_tombstones,
+            include_transaction_metadata,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn upstream_table(&self) -> &str {
+        &self.upstream_table
+    }
+
+    pub fn target(&self) -> &ReplicationPipelineTarget {
+        &self.target
+    }
+
+    pub fn format(&self) -> ReplicationPipelineFormat {
+        self.format
+    }
+
+    pub fn delivery(&self) -> ReplicationDelivery {
+        self.delivery
+    }
+
+    pub fn emit_tombstones(&self) -> bool {
+        self.emit_tombstones
+    }
+
+    pub fn include_transaction_metadata(&self) -> bool {
+        self.include_transaction_metadata
+    }
+}
+
+impl ReplicationPipelineTarget {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Kafka { brokers, topic } => {
+                ensure!(
+                    !brokers.trim().is_empty(),
+                    "replication pipeline Kafka brokers cannot be empty"
+                );
+                ensure!(
+                    !topic.trim().is_empty(),
+                    "replication pipeline Kafka topic cannot be empty"
+                );
+            }
+            Self::Postgres { connection, table } => {
+                ensure!(
+                    !connection.trim().is_empty(),
+                    "replication pipeline Postgres connection cannot be empty"
+                );
+                ensure!(
+                    !table.trim().is_empty(),
+                    "replication pipeline Postgres target table cannot be empty"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

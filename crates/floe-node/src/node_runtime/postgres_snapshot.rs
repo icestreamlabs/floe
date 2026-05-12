@@ -445,6 +445,115 @@ async fn validate_upstream_table_schema(
     Ok(())
 }
 
+pub(super) async fn discover_postgres_cdc_table_schema(
+    connection_string: &str,
+    table_id: CdcTableId,
+    upstream: UpstreamTableRef,
+) -> Result<CdcTableSchema> {
+    let (mut client, connection) =
+        tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+            .await
+            .context("connect Postgres control plane for CDC schema discovery")?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(error = %err, "Postgres CDC schema discovery connection closed");
+        }
+    });
+
+    let result = async {
+        let transaction = client
+            .transaction()
+            .await
+            .context("begin Postgres CDC schema discovery transaction")?;
+        let schema =
+            discover_postgres_cdc_table_schema_from_transaction(&transaction, table_id, upstream)
+                .await?;
+        transaction
+            .commit()
+            .await
+            .context("commit Postgres CDC schema discovery transaction")?;
+        Ok(schema)
+    }
+    .await;
+    drop(client);
+    connection_task.abort();
+    result
+}
+
+async fn discover_postgres_cdc_table_schema_from_transaction(
+    transaction: &tokio_postgres::Transaction<'_>,
+    table_id: CdcTableId,
+    upstream: UpstreamTableRef,
+) -> Result<CdcTableSchema> {
+    let rows = transaction
+        .query(
+            "SELECT column_name, is_nullable, data_type, udt_name
+             FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = $2
+             ORDER BY ordinal_position",
+            &[&upstream.schema(), &upstream.table()],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "discover Postgres table schema for '{}.{}'",
+                upstream.schema(),
+                upstream.table()
+            )
+        })?;
+    ensure!(
+        !rows.is_empty(),
+        "Postgres CDC table '{}.{}' does not exist or has no columns",
+        upstream.schema(),
+        upstream.table()
+    );
+
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get("column_name");
+        let is_nullable: String = row.get("is_nullable");
+        let data_type: String = row.get("data_type");
+        let udt_name: String = row.get("udt_name");
+        columns.push(CdcColumn::new(
+            name,
+            postgres_column_type(&udt_name, &data_type)?,
+            is_nullable == "YES",
+        )?);
+    }
+
+    let primary_key = discover_primary_key(transaction, &upstream).await?;
+    let replica_identity: String = transaction
+        .query_one(
+            "SELECT c.relreplident::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&upstream.schema(), &upstream.table()],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "discover Postgres replica identity for '{}.{}'",
+                upstream.schema(),
+                upstream.table()
+            )
+        })?
+        .get(0);
+    ensure!(
+        replica_identity != "n",
+        "Postgres CDC table '{}.{}' has REPLICA IDENTITY NOTHING",
+        upstream.schema(),
+        upstream.table()
+    );
+
+    CdcTableSchema::new(
+        table_id,
+        upstream,
+        columns,
+        CdcPrimaryKey::new(primary_key)?,
+    )
+}
+
 async fn discover_primary_key(
     transaction: &tokio_postgres::Transaction<'_>,
     upstream: &UpstreamTableRef,
@@ -481,6 +590,29 @@ async fn discover_primary_key(
         .into_iter()
         .map(|row| row.get::<_, String>(0))
         .collect())
+}
+
+fn postgres_column_type(udt_name: &str, data_type: &str) -> Result<ColumnType> {
+    let udt_name = udt_name.to_ascii_lowercase();
+    let data_type = data_type.to_ascii_lowercase();
+    match udt_name.as_str() {
+        "int8" | "int4" | "int2" => Ok(ColumnType::Int64),
+        "bool" => Ok(ColumnType::Bool),
+        "text" | "varchar" | "bpchar" | "name" => Ok(ColumnType::Utf8),
+        "timestamp" | "timestamptz" => Ok(ColumnType::TimestampMillis),
+        _ if matches!(
+            data_type.as_str(),
+            "timestamp without time zone" | "timestamp with time zone"
+        ) =>
+        {
+            Ok(ColumnType::TimestampMillis)
+        }
+        _ => bail!(
+            "unsupported Postgres CDC column type '{}' ({}) for schema discovery",
+            udt_name,
+            data_type
+        ),
+    }
 }
 
 fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &str) -> bool {

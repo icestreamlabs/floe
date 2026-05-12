@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,11 @@ use anyhow::{Context, Result, anyhow, ensure};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
-use floe_core::catalog::{CatalogSourceDefinition, SourceBackedTableDefinition, TableDefinition};
+use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
+use floe_core::catalog::{
+    CatalogSourceDefinition, ReplicationPipelineDefinition, SourceBackedTableDefinition,
+    TableDefinition,
+};
 use floe_core::encoding::{self, ArchivedRow};
 use floe_core::{RowValue, RowValues};
 use object_store::ObjectStore;
@@ -24,6 +29,8 @@ const SOURCE_DEF_PREFIX: &str = "meta/source/definition/";
 const SOURCE_TABLE_PREFIX: &str = "meta/source/table/";
 const MV_DEF_PREFIX: &str = "meta/mv/definition/";
 const MV_SCHEMA_PREFIX: &str = "meta/mv/schema/";
+const REPLICATION_PIPELINE_DEF_PREFIX: &str = "meta/replication_pipeline/definition/";
+const REPLICATION_PIPELINE_CHECKPOINT_PREFIX: &str = "meta/replication_pipeline/checkpoint/";
 
 #[derive(Clone)]
 pub struct SlateCatalog {
@@ -35,6 +42,18 @@ pub struct MaterializedViewMetadata {
     name: String,
     query: String,
     if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationPipelineCheckpoint {
+    pipeline_name: String,
+    source_name: String,
+    source_position: CdcSourcePosition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<CdcTransactionId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    target_state: BTreeMap<String, String>,
+    committed_at_unix_ms: u64,
 }
 
 impl MaterializedViewMetadata {
@@ -56,6 +75,60 @@ impl MaterializedViewMetadata {
 
     pub fn if_not_exists(&self) -> bool {
         self.if_not_exists
+    }
+}
+
+impl ReplicationPipelineCheckpoint {
+    pub fn new(
+        pipeline_name: impl Into<String>,
+        source_name: impl Into<String>,
+        source_position: CdcSourcePosition,
+        transaction_id: Option<CdcTransactionId>,
+        target_state: BTreeMap<String, String>,
+        committed_at_unix_ms: u64,
+    ) -> Result<Self> {
+        let pipeline_name = pipeline_name.into();
+        let source_name = source_name.into();
+        ensure!(
+            !pipeline_name.trim().is_empty(),
+            "replication pipeline checkpoint name cannot be empty"
+        );
+        ensure!(
+            !source_name.trim().is_empty(),
+            "replication pipeline checkpoint source name cannot be empty"
+        );
+        Ok(Self {
+            pipeline_name,
+            source_name,
+            source_position,
+            transaction_id,
+            target_state,
+            committed_at_unix_ms,
+        })
+    }
+
+    pub fn pipeline_name(&self) -> &str {
+        &self.pipeline_name
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn source_position(&self) -> &CdcSourcePosition {
+        &self.source_position
+    }
+
+    pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.transaction_id.as_ref()
+    }
+
+    pub fn target_state(&self) -> &BTreeMap<String, String> {
+        &self.target_state
+    }
+
+    pub fn committed_at_unix_ms(&self) -> u64 {
+        self.committed_at_unix_ms
     }
 }
 
@@ -363,6 +436,101 @@ impl SlateCatalog {
             .collect()
     }
 
+    pub async fn upsert_replication_pipeline(
+        &self,
+        definition: ReplicationPipelineDefinition,
+    ) -> Result<()> {
+        ensure!(
+            !definition.name().trim().is_empty(),
+            "replication pipeline name cannot be empty"
+        );
+        let key = replication_pipeline_definition_key(definition.name());
+        let encoded = serde_json::to_vec(&definition).with_context(|| {
+            format!(
+                "failed to serialize replication pipeline definition {}",
+                definition.name()
+            )
+        })?;
+        self.db
+            .put(&key, encoded)
+            .await
+            .map(|_| ())
+            .map_err(map_slate_err)
+            .with_context(|| {
+                format!(
+                    "failed to persist replication pipeline definition {}",
+                    definition.name()
+                )
+            })
+    }
+
+    pub async fn replication_pipeline(
+        &self,
+        name: &str,
+    ) -> Result<Option<ReplicationPipelineDefinition>> {
+        let key = replication_pipeline_definition_key(name);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let metadata = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse replication pipeline definition for {name}")
+            })?;
+            Ok(Some(metadata))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn replication_pipelines(&self) -> Result<Vec<ReplicationPipelineDefinition>> {
+        scan_prefix(&self.db, REPLICATION_PIPELINE_DEF_PREFIX.as_bytes())
+            .await?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_slice::<ReplicationPipelineDefinition>(&value)
+                    .context("failed to deserialize replication pipeline definition")
+            })
+            .collect()
+    }
+
+    pub async fn put_replication_pipeline_checkpoint(
+        &self,
+        checkpoint: ReplicationPipelineCheckpoint,
+    ) -> Result<()> {
+        let key = replication_pipeline_checkpoint_key(checkpoint.pipeline_name());
+        let encoded = serde_json::to_vec(&checkpoint).with_context(|| {
+            format!(
+                "failed to serialize replication pipeline checkpoint {}",
+                checkpoint.pipeline_name()
+            )
+        })?;
+        self.db
+            .put(&key, encoded)
+            .await
+            .map(|_| ())
+            .map_err(map_slate_err)
+            .with_context(|| {
+                format!(
+                    "failed to persist replication pipeline checkpoint {}",
+                    checkpoint.pipeline_name()
+                )
+            })
+    }
+
+    pub async fn replication_pipeline_checkpoint(
+        &self,
+        name: &str,
+    ) -> Result<Option<ReplicationPipelineCheckpoint>> {
+        let key = replication_pipeline_checkpoint_key(name);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let checkpoint = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse replication pipeline checkpoint for {name}")
+            })?;
+            Ok(Some(checkpoint))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn save_materialized_view_schema(&self, name: &str, schema: SchemaRef) -> Result<()> {
         let key = mv_schema_key(name);
         let mut payload = Vec::new();
@@ -454,6 +622,14 @@ fn mv_schema_key(name: &str) -> Vec<u8> {
     format!("{MV_SCHEMA_PREFIX}{name}").into_bytes()
 }
 
+fn replication_pipeline_definition_key(name: &str) -> Vec<u8> {
+    format!("{REPLICATION_PIPELINE_DEF_PREFIX}{name}").into_bytes()
+}
+
+fn replication_pipeline_checkpoint_key(name: &str) -> Vec<u8> {
+    format!("{REPLICATION_PIPELINE_CHECKPOINT_PREFIX}{name}").into_bytes()
+}
+
 fn table_row_prefix(name: &str) -> Vec<u8> {
     format!("{TABLE_DATA_PREFIX}{name}/").into_bytes()
 }
@@ -504,9 +680,12 @@ fn map_slate_err(err: SlateError) -> anyhow::Error {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
     use floe_core::catalog::{
         CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
-        PostgresCdcSourceDefinition, SourceBackedTableDefinition, TableDefinition,
+        PostgresCdcSourceDefinition, ReplicationDelivery, ReplicationPipelineDefinition,
+        ReplicationPipelineFormat, ReplicationPipelineTarget, SourceBackedTableDefinition,
+        TableDefinition,
     };
 
     #[tokio::test]
@@ -612,6 +791,63 @@ mod tests {
             .expect("binding exists");
         assert_eq!(loaded_binding, binding);
         assert_eq!(catalog.source_backed_tables().await.unwrap(), vec![binding]);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_replication_pipeline_and_checkpoint() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+        let pipeline = ReplicationPipelineDefinition::new(
+            "pg_orders_to_kafka",
+            "pg_main",
+            "public.orders",
+            ReplicationPipelineTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders_cdc".to_string(),
+            },
+            ReplicationPipelineFormat::DebeziumJson,
+            ReplicationDelivery::AtLeastOnce,
+            true,
+            true,
+        )
+        .expect("pipeline");
+        catalog
+            .upsert_replication_pipeline(pipeline.clone())
+            .await
+            .expect("persist pipeline");
+
+        let loaded = catalog
+            .replication_pipeline("pg_orders_to_kafka")
+            .await
+            .expect("load pipeline")
+            .expect("pipeline exists");
+        assert_eq!(loaded, pipeline);
+        assert_eq!(
+            catalog.replication_pipelines().await.unwrap(),
+            vec![pipeline]
+        );
+
+        let mut target_state = BTreeMap::new();
+        target_state.insert("kafka.topic".to_string(), "orders_cdc".to_string());
+        target_state.insert("kafka.partition.0.offset".to_string(), "42".to_string());
+        let checkpoint = ReplicationPipelineCheckpoint::new(
+            "pg_orders_to_kafka",
+            "pg_main",
+            CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+            Some(CdcTransactionId::new("tx-7").expect("transaction")),
+            target_state,
+            1_700_000_000_000,
+        )
+        .expect("checkpoint");
+        catalog
+            .put_replication_pipeline_checkpoint(checkpoint.clone())
+            .await
+            .expect("persist checkpoint");
+        let loaded_checkpoint = catalog
+            .replication_pipeline_checkpoint("pg_orders_to_kafka")
+            .await
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(loaded_checkpoint, checkpoint);
     }
 
     #[tokio::test]

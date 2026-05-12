@@ -1,5 +1,6 @@
 pub mod cdc_delta_encoder;
 pub mod connector;
+pub mod debezium_encoder;
 pub mod event_parser;
 pub mod executor;
 pub mod file_connector;

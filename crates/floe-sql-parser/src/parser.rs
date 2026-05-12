@@ -8,7 +8,9 @@ use sqlparser::parser::Parser;
 use crate::definitions::{
     CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
     CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
-    PostgresCdcSourceOptions, SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
+    PostgresCdcSourceOptions, ReplicationDelivery, ReplicationPipelineDefinition,
+    ReplicationPipelineFormat, ReplicationPipelineTarget, SinkConnector, SinkDefinition,
+    SourceConnector, SqlColumnType,
 };
 
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
@@ -31,6 +33,11 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
         if starts_with_keyword(normalized, "CREATE SINK") {
             let definition = parse_sink_statement(normalized)?;
             statements.push(FloeStatement::CreateSink(definition));
+            continue;
+        }
+        if starts_with_keyword(normalized, "CREATE REPLICATION PIPELINE") {
+            let definition = parse_replication_pipeline_statement(normalized)?;
+            statements.push(FloeStatement::CreateReplicationPipeline(definition));
             continue;
         }
         if starts_with_keyword(normalized, "CREATE TABLE") {
@@ -426,6 +433,96 @@ fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
         with_snapshot,
         as_of,
     ))
+}
+
+fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipelineDefinition> {
+    let mut rest = consume_keyword(sql, "CREATE")
+        .ok_or_else(|| anyhow!("expected CREATE at start of replication pipeline statement"))?;
+    rest = consume_keyword(rest, "REPLICATION")
+        .ok_or_else(|| anyhow!("expected REPLICATION after CREATE in pipeline statement"))?;
+    rest = consume_keyword(rest, "PIPELINE")
+        .ok_or_else(|| anyhow!("expected PIPELINE after CREATE REPLICATION"))?;
+    let (next, pipeline_name) = parse_identifier(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "FROM")
+        .ok_or_else(|| anyhow!("expected FROM in CREATE REPLICATION PIPELINE statement"))?;
+    let (next, source_name) = parse_identifier(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "TABLE")
+        .ok_or_else(|| anyhow!("expected TABLE after source name in replication pipeline"))?;
+    let (next, upstream_table) = parse_table_reference_literal(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "INTO")
+        .ok_or_else(|| anyhow!("expected INTO in CREATE REPLICATION PIPELINE statement"))?;
+    let (next, target_name) = parse_identifier(rest)?;
+    rest = next;
+    rest = consume_keyword(rest, "WITH")
+        .ok_or_else(|| anyhow!("expected WITH (...) in CREATE REPLICATION PIPELINE statement"))?;
+    let (next, options) = parse_parenthesized_options(rest)?;
+    rest = next;
+
+    if !rest.trim().is_empty() {
+        return Err(anyhow!(
+            "unexpected tokens after CREATE REPLICATION PIPELINE statement: {}",
+            rest.trim()
+        ));
+    }
+
+    let format = match option_any(&options, &["format"])
+        .unwrap_or("debezium_json")
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "debezium_json" => ReplicationPipelineFormat::DebeziumJson,
+        other => return Err(anyhow!("unsupported replication pipeline format '{other}'")),
+    };
+    let delivery = match option_any(&options, &["delivery"])
+        .unwrap_or("at_least_once")
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "at_least_once" => ReplicationDelivery::AtLeastOnce,
+        other => {
+            return Err(anyhow!(
+                "unsupported replication pipeline delivery guarantee '{other}'"
+            ));
+        }
+    };
+    let emit_tombstones = option_any(
+        &options,
+        &["emit_tombstones", "tombstones", "delete.tombstones"],
+    )
+    .map(|value| parse_bool_option("emit_tombstones", value))
+    .transpose()?
+    .unwrap_or(false);
+    let include_transaction_metadata = option_any(
+        &options,
+        &["include_transaction_metadata", "transaction_metadata"],
+    )
+    .map(|value| parse_bool_option("include_transaction_metadata", value))
+    .transpose()?
+    .unwrap_or(false);
+
+    let target = match target_name.to_ascii_lowercase().replace('-', "_").as_str() {
+        "kafka" => ReplicationPipelineTarget::Kafka {
+            brokers: required_replication_option(&options, "brokers")?.to_string(),
+            topic: required_replication_option(&options, "topic")?.to_string(),
+        },
+        other => return Err(anyhow!("unsupported replication pipeline target '{other}'")),
+    };
+
+    ReplicationPipelineDefinition::new(
+        pipeline_name,
+        source_name,
+        upstream_table,
+        target,
+        format,
+        delivery,
+        emit_tombstones,
+        include_transaction_metadata,
+    )
 }
 
 fn postgres_connection_string_from_options(
@@ -831,6 +928,16 @@ fn required_option<'a>(
         .get(key)
         .map(String::as_str)
         .ok_or_else(|| anyhow!("CREATE SINK requires '{key}' option"))
+}
+
+fn required_replication_option<'a>(
+    options: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<&'a str> {
+    options
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("CREATE REPLICATION PIPELINE requires '{key}' option"))
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>> {

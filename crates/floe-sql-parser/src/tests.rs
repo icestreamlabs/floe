@@ -126,6 +126,76 @@ fn parse_create_postgres_cdc_source_statement() {
 }
 
 #[test]
+fn parse_create_replication_pipeline_statement() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE pg_orders_to_kafka
+         FROM pg_main TABLE 'public.orders'
+         INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc',
+            format = 'debezium-json',
+            delivery = 'at-least-once',
+            tombstones = true,
+            transaction_metadata = true
+         )",
+    )
+    .expect("parse replication pipeline");
+    match stmt {
+        FloeStatement::CreateReplicationPipeline(definition) => {
+            assert_eq!(definition.name(), "pg_orders_to_kafka");
+            assert_eq!(definition.source_name(), "pg_main");
+            assert_eq!(definition.upstream_table(), "public.orders");
+            assert_eq!(definition.format(), ReplicationPipelineFormat::DebeziumJson);
+            assert_eq!(definition.delivery(), ReplicationDelivery::AtLeastOnce);
+            assert!(definition.emit_tombstones());
+            assert!(definition.include_transaction_metadata());
+            assert_eq!(
+                definition.target(),
+                &ReplicationPipelineTarget::Kafka {
+                    brokers: "localhost:9092".to_string(),
+                    topic: "orders_cdc".to_string(),
+                }
+            );
+        }
+        other => panic!("expected CREATE REPLICATION PIPELINE statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_replication_pipeline_defaults() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc'
+        )",
+    )
+    .expect("parse replication pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
+        panic!("expected replication pipeline");
+    };
+    assert_eq!(definition.format(), ReplicationPipelineFormat::DebeziumJson);
+    assert_eq!(definition.delivery(), ReplicationDelivery::AtLeastOnce);
+    assert!(!definition.emit_tombstones());
+    assert!(!definition.include_transaction_metadata());
+}
+
+#[test]
+fn parse_create_replication_pipeline_rejects_unknown_format() {
+    let err = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc',
+            format = 'avro'
+        )",
+    )
+    .expect_err("unknown format");
+    assert!(
+        err.to_string()
+            .contains("unsupported replication pipeline format")
+    );
+}
+
+#[test]
 fn parse_create_postgres_cdc_source_from_connection_parts() {
     let stmt = parse_floe_statement(
         "CREATE SOURCE pg_main WITH (

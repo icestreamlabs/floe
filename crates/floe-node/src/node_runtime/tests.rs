@@ -688,8 +688,13 @@ fn catalog_postgres_source_connector_merges_include_tables() {
         SourceBackedTableDefinition::new("orders", "pg_main", "public.orders").expect("binding");
     source_tables.insert(binding.table_name().to_string(), binding);
 
-    merge_catalog_source_connectors(&mut connector_specs, &catalog_sources, &source_tables)
-        .expect("merge connector");
+    merge_catalog_source_connectors(
+        &mut connector_specs,
+        &catalog_sources,
+        &source_tables,
+        &HashMap::new(),
+    )
+    .expect("merge connector");
 
     assert_eq!(connector_specs.len(), 1);
     assert_eq!(connector_specs[0].name, "pg_main");
@@ -718,7 +723,59 @@ fn catalog_postgres_source_connector_merges_include_tables() {
 }
 
 #[test]
-fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
+fn catalog_postgres_source_connector_merges_pipeline_tables() {
+    let mut connector_specs = Vec::new();
+    let mut catalog_sources = HashMap::new();
+    let source = CatalogSourceDefinition::new(
+        "pg_main",
+        CatalogSourceConnector::PostgresCdc(
+            PostgresCdcSourceDefinition::new(
+                "postgres://postgres:postgres@localhost/postgres",
+                "floe_slot",
+                Some("floe_pub".to_string()),
+                Some(false),
+            )
+            .expect("postgres source"),
+        ),
+    )
+    .expect("source");
+    catalog_sources.insert(source.name().to_string(), source);
+    let pipeline = CatalogReplicationPipelineDefinition::new(
+        "pg_orders_to_kafka",
+        "pg_main",
+        "public.orders",
+        CatalogReplicationPipelineTarget::Kafka {
+            brokers: "localhost:9092".to_string(),
+            topic: "orders_cdc".to_string(),
+        },
+        CatalogReplicationPipelineFormat::DebeziumJson,
+        CatalogReplicationDelivery::AtLeastOnce,
+        false,
+        false,
+    )
+    .expect("pipeline");
+    let mut pipelines = HashMap::new();
+    pipelines.insert(pipeline.name().to_string(), pipeline);
+
+    merge_catalog_source_connectors(
+        &mut connector_specs,
+        &catalog_sources,
+        &HashMap::new(),
+        &pipelines,
+    )
+    .expect("merge connector");
+
+    let ConnectorConfig::PostgresCdc { include_tables, .. } = &connector_specs[0].config else {
+        panic!("expected postgres cdc connector");
+    };
+    assert_eq!(
+        include_tables.as_deref(),
+        Some(&["public.orders".to_string()][..])
+    );
+}
+
+#[tokio::test]
+async fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     let statement = parse_floe_statement(
         "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, note TEXT)",
     )
@@ -732,9 +789,17 @@ fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     registry.register(source);
     let include_tables = vec!["public.orders".to_string()];
 
-    let plan = postgres_cdc_runtime_plan("pg_main", Some(&include_tables), &registry)
-        .expect("runtime plan")
-        .expect("native runtime plan");
+    let plan = postgres_cdc_runtime_plan(
+        "pg_main",
+        "postgres://postgres:postgres@localhost/postgres",
+        Some(&include_tables),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("runtime plan")
+    .expect("native runtime plan");
 
     assert_eq!(plan.source_id.as_str(), "pg_main");
     let schema = plan
@@ -748,8 +813,8 @@ fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     assert!(!schema.columns()[0].nullable());
 }
 
-#[test]
-fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
+#[tokio::test]
+async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
     let source = SourceDefinition::new(
         "orders",
         vec![SourceColumn::new("id", SourceDataType::Int64)],
@@ -759,8 +824,16 @@ fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
     registry.register(source);
     let include_tables = vec!["orders".to_string()];
 
-    let plan = postgres_cdc_runtime_plan("pg_main", Some(&include_tables), &registry)
-        .expect("runtime plan");
+    let plan = postgres_cdc_runtime_plan(
+        "pg_main",
+        "postgres://postgres:postgres@localhost/postgres",
+        Some(&include_tables),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("runtime plan");
 
     assert!(plan.is_none());
 }

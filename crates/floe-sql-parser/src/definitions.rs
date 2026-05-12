@@ -6,6 +6,7 @@ pub enum FloeStatement {
     CreateTable(CreateTableDefinition),
     CreateMaterializedView(MaterializedViewDefinition),
     CreateSink(SinkDefinition),
+    CreateReplicationPipeline(ReplicationPipelineDefinition),
     Tail {
         mv_name: String,
         with_snapshot: bool,
@@ -244,6 +245,33 @@ pub enum SinkConnector {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPipelineDefinition {
+    name: String,
+    source_name: String,
+    upstream_table: String,
+    target: ReplicationPipelineTarget,
+    format: ReplicationPipelineFormat,
+    delivery: ReplicationDelivery,
+    emit_tombstones: bool,
+    include_transaction_metadata: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicationPipelineTarget {
+    Kafka { brokers: String, topic: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationPipelineFormat {
+    DebeziumJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationDelivery {
+    AtLeastOnce,
+}
+
 impl SinkDefinition {
     pub fn new(
         name: impl Into<String>,
@@ -279,6 +307,96 @@ impl SinkDefinition {
 
     pub fn as_of(&self) -> Option<i64> {
         self.as_of
+    }
+}
+
+impl ReplicationPipelineDefinition {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: impl Into<String>,
+        source_name: impl Into<String>,
+        upstream_table: impl Into<String>,
+        target: ReplicationPipelineTarget,
+        format: ReplicationPipelineFormat,
+        delivery: ReplicationDelivery,
+        emit_tombstones: bool,
+        include_transaction_metadata: bool,
+    ) -> Result<Self> {
+        let name = name.into();
+        let source_name = source_name.into();
+        let upstream_table = upstream_table.into();
+        if name.trim().is_empty() {
+            return Err(anyhow!("replication pipeline name cannot be empty"));
+        }
+        if source_name.trim().is_empty() {
+            return Err(anyhow!("replication pipeline source name cannot be empty"));
+        }
+        if upstream_table.trim().is_empty() {
+            return Err(anyhow!(
+                "replication pipeline upstream table cannot be empty"
+            ));
+        }
+        target.validate()?;
+        Ok(Self {
+            name,
+            source_name,
+            upstream_table,
+            target,
+            format,
+            delivery,
+            emit_tombstones,
+            include_transaction_metadata,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn upstream_table(&self) -> &str {
+        &self.upstream_table
+    }
+
+    pub fn target(&self) -> &ReplicationPipelineTarget {
+        &self.target
+    }
+
+    pub fn format(&self) -> ReplicationPipelineFormat {
+        self.format
+    }
+
+    pub fn delivery(&self) -> ReplicationDelivery {
+        self.delivery
+    }
+
+    pub fn emit_tombstones(&self) -> bool {
+        self.emit_tombstones
+    }
+
+    pub fn include_transaction_metadata(&self) -> bool {
+        self.include_transaction_metadata
+    }
+}
+
+impl ReplicationPipelineTarget {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Kafka { brokers, topic } => {
+                if brokers.trim().is_empty() {
+                    return Err(anyhow!(
+                        "replication pipeline Kafka brokers cannot be empty"
+                    ));
+                }
+                if topic.trim().is_empty() {
+                    return Err(anyhow!("replication pipeline Kafka topic cannot be empty"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

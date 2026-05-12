@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+floe-cdc-core = { path = "../floe-cdc-core" }
 floe-core = { path = "../floe-core" }
 anyhow = { workspace = true }
 arrow-ipc = "57.1.0"

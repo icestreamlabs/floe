@@ -55,6 +55,37 @@ pub(super) fn source_backed_table_definition_from_sql(
         .transpose()
 }
 
+pub(super) fn replication_pipeline_definition_from_sql(
+    definition: &SqlReplicationPipelineDefinition,
+) -> anyhow::Result<CatalogReplicationPipelineDefinition> {
+    let target = match definition.target() {
+        SqlReplicationPipelineTarget::Kafka { brokers, topic } => {
+            CatalogReplicationPipelineTarget::Kafka {
+                brokers: brokers.clone(),
+                topic: topic.clone(),
+            }
+        }
+    };
+    let format = match definition.format() {
+        SqlReplicationPipelineFormat::DebeziumJson => {
+            CatalogReplicationPipelineFormat::DebeziumJson
+        }
+    };
+    let delivery = match definition.delivery() {
+        SqlReplicationDelivery::AtLeastOnce => CatalogReplicationDelivery::AtLeastOnce,
+    };
+    CatalogReplicationPipelineDefinition::new(
+        definition.name(),
+        definition.source_name(),
+        definition.upstream_table(),
+        target,
+        format,
+        delivery,
+        definition.emit_tombstones(),
+        definition.include_transaction_metadata(),
+    )
+}
+
 pub(super) fn source_definition_from_table(
     table: &TableDefinition,
 ) -> anyhow::Result<SourceDefinition> {

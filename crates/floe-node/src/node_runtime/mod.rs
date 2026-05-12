@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -15,8 +15,8 @@ use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
-    CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, TransactionBatch,
-    UpstreamTableRef,
+    CdcChange, CdcCheckpoint, CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema,
+    ChangeBatch, TransactionBatch, UpstreamTableRef,
 };
 use floe_cdc_pg::{
     PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent, PostgresTableRouter,
@@ -24,7 +24,11 @@ use floe_cdc_pg::{
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
-    PostgresCdcSourceDefinition, SourceBackedTableDefinition, TableDefinition,
+    PostgresCdcSourceDefinition, ReplicationDelivery as CatalogReplicationDelivery,
+    ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
+    ReplicationPipelineFormat as CatalogReplicationPipelineFormat,
+    ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
+    TableDefinition,
 };
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
@@ -57,7 +61,11 @@ use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
     CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
-    SourceConnector, SqlColumnType, parse_floe_program,
+    ReplicationDelivery as SqlReplicationDelivery,
+    ReplicationPipelineDefinition as SqlReplicationPipelineDefinition,
+    ReplicationPipelineFormat as SqlReplicationPipelineFormat,
+    ReplicationPipelineTarget as SqlReplicationPipelineTarget, SourceConnector, SqlColumnType,
+    parse_floe_program,
 };
 use floe_storage::MaterializedViewMetadata;
 use slatedb::WriteBatch;
@@ -136,9 +144,27 @@ struct QueuedCdcTransaction {
 }
 
 #[derive(Clone)]
+struct ReplicationPipelineRuntimePlan {
+    name: String,
+    source_name: String,
+    upstream_table: String,
+    table_id: CdcTableId,
+    target: ReplicationPipelineRuntimeTarget,
+    emit_tombstones: bool,
+    include_transaction_metadata: bool,
+}
+
+#[derive(Clone)]
+enum ReplicationPipelineRuntimeTarget {
+    Kafka { brokers: String, topic: String },
+}
+
+#[derive(Clone)]
 struct PostgresCdcRuntimePlan {
     source_id: CdcSourceId,
     schemas: HashMap<CdcTableId, CdcTableSchema>,
+    materialized_table_ids: HashSet<CdcTableId>,
+    replication_pipelines: Vec<ReplicationPipelineRuntimePlan>,
 }
 
 impl ConnectorQueue {
@@ -163,6 +189,7 @@ mod command;
 mod ingest;
 mod orchestration;
 mod postgres_snapshot;
+mod replication;
 mod shutdown;
 mod startup;
 
@@ -173,5 +200,6 @@ use catalog::*;
 use command::*;
 use ingest::*;
 pub(crate) use orchestration::run;
+use replication::*;
 use shutdown::*;
 use startup::*;
