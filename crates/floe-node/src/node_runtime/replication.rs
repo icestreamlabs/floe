@@ -2,6 +2,14 @@ use super::*;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow_array::builder::{
+    BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use floe_cdc_core::{CdcRow, CdcRowKey, CdcSourcePosition};
+use floe_core::RowValue;
 use floe_node_core::debezium_encoder::{
     DebeziumEncodeContext, DebeziumEncodedRecord, DebeziumEnvelopeConfig, encode_debezium_change,
     encode_debezium_snapshot_row,
@@ -20,6 +28,7 @@ const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 const REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
+const REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 8192;
 
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
@@ -107,11 +116,11 @@ impl ReplicationPipelineRuntime {
                     plan.table_id.as_str()
                 )
             })?;
-            let records = encode_pipeline_records(plan, schema, change_batch, transaction)?;
-            if records.is_empty() {
+            let buffered_records =
+                encode_pipeline_buffer_records(plan, schema, change_batch, transaction)?;
+            if buffered_records.is_empty() {
                 continue;
             }
-            let buffered_records = debezium_records_to_buffer_records(&records)?;
             if let Some(storage) = storage {
                 let buffer_store = CdcBufferStore::new(storage.db());
                 let manifest = buffer_store
@@ -163,7 +172,7 @@ impl ReplicationPipelineRuntime {
                         writer.send_records(&buffered_records).await?;
                     }
                 }
-                written = written.saturating_add(records.len());
+                written = written.saturating_add(buffered_records.len());
             }
         }
 
@@ -374,7 +383,24 @@ impl KafkaReplicationPipelineWriter {
     }
 }
 
-fn encode_pipeline_records(
+fn encode_pipeline_buffer_records(
+    plan: &ReplicationPipelineRuntimePlan,
+    schema: &CdcTableSchema,
+    batch: &ChangeBatch,
+    transaction: &TransactionBatch,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    match plan.format {
+        ReplicationPipelineRuntimeFormat::DebeziumJson => {
+            let records = encode_debezium_pipeline_records(plan, schema, batch, transaction)?;
+            debezium_records_to_buffer_records(&records)
+        }
+        ReplicationPipelineRuntimeFormat::ArrowIpc => {
+            encode_arrow_ipc_pipeline_records(plan, schema, batch, transaction)
+        }
+    }
+}
+
+fn encode_debezium_pipeline_records(
     plan: &ReplicationPipelineRuntimePlan,
     schema: &CdcTableSchema,
     batch: &ChangeBatch,
@@ -415,6 +441,327 @@ fn debezium_records_to_buffer_records(
             ))
         })
         .collect()
+}
+
+fn encode_arrow_ipc_pipeline_records(
+    plan: &ReplicationPipelineRuntimePlan,
+    schema: &CdcTableSchema,
+    batch: &ChangeBatch,
+    transaction: &TransactionBatch,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    let mut records = Vec::new();
+    let mut builder =
+        ArrowIpcChangeBatchBuilder::new(schema, REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+    let is_snapshot = transaction
+        .transaction_id()
+        .is_some_and(|tx| tx.as_str().starts_with("snapshot:"));
+    for (idx, change) in batch.changes().iter().enumerate() {
+        let sequence = u64::try_from(idx).unwrap_or(u64::MAX);
+        match change {
+            CdcChange::Insert { row } => {
+                builder.append_row(row, if is_snapshot { "r" } else { "c" }, 1, sequence)?;
+            }
+            CdcChange::Update { before, after, .. } => {
+                if let Some(before) = before {
+                    builder.append_row(before, "u_before", -1, sequence)?;
+                    flush_arrow_ipc_record_if_full(plan, transaction, &mut builder, &mut records)?;
+                }
+                builder.append_row(after, "u", 1, sequence)?;
+            }
+            CdcChange::Delete { key, before } => match before {
+                Some(row) => builder.append_row(row, "d", -1, sequence)?,
+                None => {
+                    let key = key.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "CDC Arrow IPC delete for table '{}' requires a key or before row",
+                            schema.table_id().as_str()
+                        )
+                    })?;
+                    let key_row = key_only_row(schema, key)?;
+                    builder.append_values(&key_row, "d", -1, sequence)?;
+                }
+            },
+            CdcChange::Truncate => {
+                return Err(anyhow!(
+                    "CDC Arrow IPC truncate for table '{}' is not supported",
+                    schema.table_id().as_str()
+                ));
+            }
+        }
+        flush_arrow_ipc_record_if_full(plan, transaction, &mut builder, &mut records)?;
+    }
+    if !builder.is_empty() {
+        records.push(finish_arrow_ipc_record(plan, transaction, &mut builder)?);
+    }
+    Ok(records)
+}
+
+fn flush_arrow_ipc_record_if_full(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    builder: &mut ArrowIpcChangeBatchBuilder,
+    records: &mut Vec<CdcBufferRecord>,
+) -> anyhow::Result<()> {
+    if builder.len() >= REPLICATION_ARROW_IPC_ROWS_PER_RECORD {
+        records.push(finish_arrow_ipc_record(plan, transaction, builder)?);
+    }
+    Ok(())
+}
+
+fn finish_arrow_ipc_record(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    builder: &mut ArrowIpcChangeBatchBuilder,
+) -> anyhow::Result<CdcBufferRecord> {
+    let chunk_idx = builder.chunk_idx();
+    let batch = builder.finish()?;
+    let mut value = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut value, batch.schema().as_ref())
+            .context("create replication Arrow IPC writer")?;
+        writer
+            .write(&batch)
+            .context("write replication Arrow IPC batch")?;
+        writer
+            .finish()
+            .context("finish replication Arrow IPC batch")?;
+    }
+    let key = format!(
+        "{}/{}/{chunk_idx:020}",
+        plan.upstream_table,
+        source_position_key(transaction.commit_position())
+    )
+    .into_bytes();
+    Ok(CdcBufferRecord::new(Some(key), Some(value)))
+}
+
+fn key_only_row(schema: &CdcTableSchema, key: &CdcRowKey) -> anyhow::Result<Vec<Option<RowValue>>> {
+    key.validate_against_schema(schema)?;
+    let mut values = vec![None; schema.columns().len()];
+    for (value, column_idx) in key.values().iter().zip(schema.primary_key_indices()) {
+        values[column_idx] = Some(value.clone());
+    }
+    Ok(values)
+}
+
+fn source_position_key(position: &CdcSourcePosition) -> String {
+    match position {
+        CdcSourcePosition::Postgres {
+            commit_lsn,
+            event_lsn,
+        } => match event_lsn {
+            Some(event_lsn) => format!("pg/{commit_lsn}/{event_lsn}"),
+            None => format!("pg/{commit_lsn}"),
+        },
+        CdcSourcePosition::Opaque { value } => format!("opaque/{value}"),
+    }
+}
+
+enum ArrowIpcColumnBuilder {
+    Int64(Int64Builder),
+    Bool(BooleanBuilder),
+    Utf8(StringBuilder),
+    TimestampMillis(TimestampMillisecondBuilder),
+}
+
+impl ArrowIpcColumnBuilder {
+    fn new(data_type: &ColumnType, capacity: usize) -> Self {
+        match data_type {
+            ColumnType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            ColumnType::Bool => Self::Bool(BooleanBuilder::with_capacity(capacity)),
+            ColumnType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 16)),
+            ColumnType::TimestampMillis => {
+                Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(capacity))
+            }
+        }
+    }
+
+    fn append(&mut self, column: &CdcColumn, value: Option<&RowValue>) -> anyhow::Result<()> {
+        match (self, column.data_type(), value) {
+            (Self::Int64(builder), ColumnType::Int64, Some(RowValue::Int64(value))) => {
+                builder.append_value(*value);
+            }
+            (Self::Bool(builder), ColumnType::Bool, Some(RowValue::Bool(value))) => {
+                builder.append_value(*value);
+            }
+            (Self::Utf8(builder), ColumnType::Utf8, Some(RowValue::Utf8(value))) => {
+                builder.append_value(value);
+            }
+            (
+                Self::TimestampMillis(builder),
+                ColumnType::TimestampMillis,
+                Some(RowValue::TimestampMillis(value)),
+            ) => {
+                builder.append_value(*value);
+            }
+            (Self::Int64(builder), ColumnType::Int64, None) => builder.append_null(),
+            (Self::Bool(builder), ColumnType::Bool, None) => builder.append_null(),
+            (Self::Utf8(builder), ColumnType::Utf8, None) => builder.append_null(),
+            (Self::TimestampMillis(builder), ColumnType::TimestampMillis, None) => {
+                builder.append_null();
+            }
+            (_, _, Some(value)) => {
+                return Err(anyhow!(
+                    "CDC Arrow IPC value for column '{}' does not match type {:?}: {:?}",
+                    column.name(),
+                    column.data_type(),
+                    value
+                ));
+            }
+            _ => {
+                return Err(anyhow!(
+                    "CDC Arrow IPC builder for column '{}' does not match type {:?}",
+                    column.name(),
+                    column.data_type()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Int64(builder) => Arc::new(builder.finish()),
+            Self::Bool(builder) => Arc::new(builder.finish()),
+            Self::Utf8(builder) => Arc::new(builder.finish()),
+            Self::TimestampMillis(builder) => Arc::new(builder.finish()),
+        }
+    }
+}
+
+struct ArrowIpcChangeBatchBuilder {
+    schema: CdcTableSchema,
+    arrow_schema: Arc<ArrowSchema>,
+    columns: Vec<ArrowIpcColumnBuilder>,
+    operations: StringBuilder,
+    diffs: Int64Builder,
+    sequences: Int64Builder,
+    len: usize,
+    chunk_idx: usize,
+}
+
+impl ArrowIpcChangeBatchBuilder {
+    fn new(schema: &CdcTableSchema, capacity: usize) -> Self {
+        let mut fields = schema
+            .columns()
+            .iter()
+            .map(|column| {
+                ArrowField::new(
+                    column.name(),
+                    match column.data_type() {
+                        ColumnType::Int64 => DataType::Int64,
+                        ColumnType::Bool => DataType::Boolean,
+                        ColumnType::Utf8 => DataType::Utf8,
+                        ColumnType::TimestampMillis => {
+                            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+                        }
+                    },
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        fields.push(ArrowField::new("__op", DataType::Utf8, false));
+        fields.push(ArrowField::new("__diff", DataType::Int64, false));
+        fields.push(ArrowField::new("__sequence", DataType::Int64, false));
+        Self {
+            schema: schema.clone(),
+            arrow_schema: Arc::new(ArrowSchema::new(fields)),
+            columns: schema
+                .columns()
+                .iter()
+                .map(|column| ArrowIpcColumnBuilder::new(column.data_type(), capacity))
+                .collect(),
+            operations: StringBuilder::with_capacity(capacity, capacity * 2),
+            diffs: Int64Builder::with_capacity(capacity),
+            sequences: Int64Builder::with_capacity(capacity),
+            len: 0,
+            chunk_idx: 0,
+        }
+    }
+
+    fn append_row(
+        &mut self,
+        row: &CdcRow,
+        operation: &str,
+        diff: i64,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
+        self.append_values(row.values(), operation, diff, sequence)
+    }
+
+    fn append_values(
+        &mut self,
+        values: &[Option<RowValue>],
+        operation: &str,
+        diff: i64,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            values.len() == self.schema.columns().len(),
+            "CDC Arrow IPC row has {} values, expected {}",
+            values.len(),
+            self.schema.columns().len()
+        );
+        for ((builder, column), value) in self
+            .columns
+            .iter_mut()
+            .zip(self.schema.columns())
+            .zip(values)
+        {
+            builder.append(column, value.as_ref())?;
+        }
+        self.operations.append_value(operation);
+        self.diffs.append_value(diff);
+        self.sequences
+            .append_value(i64::try_from(sequence).unwrap_or(i64::MAX));
+        self.len += 1;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn chunk_idx(&self) -> usize {
+        self.chunk_idx
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        let mut arrays = self
+            .columns
+            .iter_mut()
+            .map(ArrowIpcColumnBuilder::finish)
+            .collect::<Vec<_>>();
+        arrays.push(Arc::new(self.operations.finish()));
+        arrays.push(Arc::new(self.diffs.finish()));
+        arrays.push(Arc::new(self.sequences.finish()));
+        let batch = RecordBatch::try_new(Arc::clone(&self.arrow_schema), arrays)
+            .context("build replication Arrow IPC batch")?;
+        self.columns = self
+            .schema
+            .columns()
+            .iter()
+            .map(|column| {
+                ArrowIpcColumnBuilder::new(
+                    column.data_type(),
+                    REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
+                )
+            })
+            .collect();
+        self.operations = StringBuilder::with_capacity(
+            REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
+            REPLICATION_ARROW_IPC_ROWS_PER_RECORD * 2,
+        );
+        self.diffs = Int64Builder::with_capacity(REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+        self.sequences = Int64Builder::with_capacity(REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+        self.len = 0;
+        self.chunk_idx += 1;
+        Ok(batch)
+    }
 }
 
 fn pending_target_state(
@@ -571,6 +918,7 @@ mod tests {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
             },
+            format: ReplicationPipelineRuntimeFormat::DebeziumJson,
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -591,10 +939,67 @@ mod tests {
         )
         .unwrap();
 
-        let records = encode_pipeline_records(&plan, &schema, &batch, &transaction).unwrap();
+        let records =
+            encode_debezium_pipeline_records(&plan, &schema, &batch, &transaction).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].value().unwrap()["op"], "r");
         assert_eq!(records[0].value().unwrap()["source"]["snapshot"], "true");
+    }
+
+    #[test]
+    fn pipeline_arrow_ipc_records_encode_batches_without_json() {
+        let plan = ReplicationPipelineRuntimePlan {
+            name: "p".to_string(),
+            source_name: "pg_main".to_string(),
+            upstream_table: "public.orders".to_string(),
+            table_id: CdcTableId::new("orders").unwrap(),
+            target: ReplicationPipelineRuntimeTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders".to_string(),
+            },
+            format: ReplicationPipelineRuntimeFormat::ArrowIpc,
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+        };
+        let schema = schema(plan.table_id.clone());
+        let batch = ChangeBatch::new(
+            plan.table_id.clone(),
+            vec![
+                CdcChange::Insert {
+                    row: row(1, "open"),
+                },
+                CdcChange::Update {
+                    key: None,
+                    before: Some(row(1, "open")),
+                    after: row(1, "paid"),
+                },
+            ],
+        )
+        .unwrap();
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("tx-1").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![batch.clone()],
+        )
+        .unwrap();
+
+        let records = encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction)
+            .expect("encode arrow records");
+        assert_eq!(records.len(), 1);
+        let payload = records[0].value().expect("payload");
+        assert!(!payload.starts_with(b"{"));
+
+        let mut reader =
+            arrow_ipc::reader::StreamReader::try_new(payload, None).expect("arrow reader");
+        let batch = reader
+            .next()
+            .expect("one record batch")
+            .expect("decode batch");
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        assert_eq!(batch.schema().field(2).name(), "__op");
     }
 
     fn schema(table_id: CdcTableId) -> CdcTableSchema {

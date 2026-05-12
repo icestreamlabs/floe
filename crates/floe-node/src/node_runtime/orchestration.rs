@@ -177,6 +177,14 @@ fn replication_pipeline_runtime_plan_from_catalog(
         upstream_table: pipeline.upstream_table().to_string(),
         table_id,
         target,
+        format: match pipeline.format() {
+            CatalogReplicationPipelineFormat::DebeziumJson => {
+                ReplicationPipelineRuntimeFormat::DebeziumJson
+            }
+            CatalogReplicationPipelineFormat::ArrowIpc => {
+                ReplicationPipelineRuntimeFormat::ArrowIpc
+            }
+        },
         emit_tombstones: pipeline.emit_tombstones(),
         include_transaction_metadata: pipeline.include_transaction_metadata(),
     })
@@ -295,13 +303,6 @@ fn validate_replication_pipelines(
         match pipeline.target() {
             CatalogReplicationPipelineTarget::Kafka { .. } => {}
             CatalogReplicationPipelineTarget::Postgres { .. } => {}
-        }
-        if pipeline.format() != CatalogReplicationPipelineFormat::DebeziumJson {
-            return Err(anyhow!(
-                "replication pipeline '{}' uses unsupported format {:?}",
-                pipeline.name(),
-                pipeline.format()
-            ));
         }
         if pipeline.delivery() != CatalogReplicationDelivery::AtLeastOnce {
             return Err(anyhow!(

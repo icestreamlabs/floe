@@ -141,6 +141,7 @@ pub enum ReplicationPipelineTarget {
 #[serde(rename_all = "snake_case")]
 pub enum ReplicationPipelineFormat {
     DebeziumJson,
+    ArrowIpc,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

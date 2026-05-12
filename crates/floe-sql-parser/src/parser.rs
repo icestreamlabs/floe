@@ -475,6 +475,7 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
         .as_str()
     {
         "debezium_json" => ReplicationPipelineFormat::DebeziumJson,
+        "arrow_ipc" => ReplicationPipelineFormat::ArrowIpc,
         other => return Err(anyhow!("unsupported replication pipeline format '{other}'")),
     };
     let delivery = match option_any(&options, &["delivery"])

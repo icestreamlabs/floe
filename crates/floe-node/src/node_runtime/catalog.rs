@@ -70,6 +70,7 @@ pub(super) fn replication_pipeline_definition_from_sql(
         SqlReplicationPipelineFormat::DebeziumJson => {
             CatalogReplicationPipelineFormat::DebeziumJson
         }
+        SqlReplicationPipelineFormat::ArrowIpc => CatalogReplicationPipelineFormat::ArrowIpc,
     };
     let delivery = match definition.delivery() {
         SqlReplicationDelivery::AtLeastOnce => CatalogReplicationDelivery::AtLeastOnce,

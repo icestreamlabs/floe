@@ -17,6 +17,8 @@ ROWS="${ROWS:-100000}"
 TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
+PIPELINE_FORMAT="${PIPELINE_FORMAT:-debezium-json}"
+ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-8192}"
 FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
@@ -96,6 +98,7 @@ echo "artifact_dir=${ARTIFACT_DIR}"
 echo "rows=${ROWS}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
+echo "pipeline_format=${PIPELINE_FORMAT}"
 
 echo "Pulling images..."
 docker pull "${POSTGRES_IMAGE}" >/dev/null
@@ -185,12 +188,27 @@ FROM pg_main TABLE 'public.orders'
 INTO KAFKA WITH (
   brokers = '${BROKERS}',
   topic = '${TOPIC}',
-  format = 'debezium-json',
+  format = '${PIPELINE_FORMAT}',
   delivery = 'at-least-once',
   tombstones = false,
   transaction_metadata = false
 );
 SQL
+
+normalized_pipeline_format="${PIPELINE_FORMAT//-/_}"
+case "${normalized_pipeline_format}" in
+  debezium_json)
+    expected_messages="${ROWS}"
+    ;;
+  arrow_ipc)
+    expected_messages="$(( (ROWS + ARROW_IPC_ROWS_PER_RECORD - 1) / ARROW_IPC_ROWS_PER_RECORD ))"
+    ;;
+  *)
+    echo "unsupported PIPELINE_FORMAT=${PIPELINE_FORMAT}" >&2
+    exit 1
+    ;;
+esac
+echo "expected_kafka_messages=${expected_messages}"
 
 echo "Starting Floe node"
 node_started_ns="$(date +%s%N)"
@@ -210,7 +228,7 @@ echo "Counting CDC records from Kafka"
 "${COUNTER_BIN}" \
   --brokers "${BROKERS}" \
   --topic "${TOPIC}" \
-  --expected "${ROWS}" \
+  --expected "${expected_messages}" \
   --timeout-secs "${TIMEOUT_SECS}" | tee "${COUNTER_LOG}"
 node_finished_ns="$(date +%s%N)"
 
@@ -219,6 +237,8 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${ROWS} / ${end_to_e
 
 {
   echo "benchmark.rows=${ROWS}"
+  echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
+  echo "benchmark.expected_kafka_messages=${expected_messages}"
   echo "benchmark.end_to_end_seconds=${end_to_end_seconds}"
   echo "benchmark.end_to_end_rows_per_second=${end_to_end_rows_per_second}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"

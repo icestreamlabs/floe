@@ -265,6 +265,7 @@ pub enum ReplicationPipelineTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationPipelineFormat {
     DebeziumJson,
+    ArrowIpc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

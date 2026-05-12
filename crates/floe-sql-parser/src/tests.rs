@@ -180,6 +180,22 @@ fn parse_create_replication_pipeline_defaults() {
 }
 
 #[test]
+fn parse_create_replication_pipeline_arrow_ipc_format() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc',
+            format = 'arrow-ipc'
+        )",
+    )
+    .expect("parse replication pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
+        panic!("expected replication pipeline");
+    };
+    assert_eq!(definition.format(), ReplicationPipelineFormat::ArrowIpc);
+}
+
+#[test]
 fn parse_create_replication_pipeline_rejects_unknown_format() {
     let err = parse_floe_statement(
         "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (

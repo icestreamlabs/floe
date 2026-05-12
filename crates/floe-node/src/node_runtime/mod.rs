@@ -150,6 +150,7 @@ struct ReplicationPipelineRuntimePlan {
     upstream_table: String,
     table_id: CdcTableId,
     target: ReplicationPipelineRuntimeTarget,
+    format: ReplicationPipelineRuntimeFormat,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
 }
@@ -157,6 +158,12 @@ struct ReplicationPipelineRuntimePlan {
 #[derive(Clone)]
 enum ReplicationPipelineRuntimeTarget {
     Kafka { brokers: String, topic: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicationPipelineRuntimeFormat {
+    DebeziumJson,
+    ArrowIpc,
 }
 
 #[derive(Clone)]
