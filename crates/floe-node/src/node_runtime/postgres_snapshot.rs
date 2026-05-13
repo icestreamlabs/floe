@@ -6,10 +6,24 @@ use floe_cdc_core::{
     TransactionBatch,
 };
 use futures::{TryStreamExt, pin_mut};
+use std::sync::LazyLock;
+use std::time::Instant;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
 
-const POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 8192;
+const DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
+static POSTGRES_SNAPSHOT_ROWS_PER_BATCH: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH)
+});
+static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("FLOE_CDC_PERF_LOG")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+});
 
 struct PostgresSnapshot {
     lsn: PostgresLsn,
@@ -704,6 +718,7 @@ async fn snapshot_table_change_batches(
     schema: &CdcTableSchema,
 ) -> Result<SnapshotTableChangeBatches> {
     let query = snapshot_table_query(schema);
+    let started_at = Instant::now();
     let params = std::iter::empty::<&(dyn ToSql + Sync)>();
     let stream = transaction
         .query_raw(&query, params)
@@ -719,7 +734,8 @@ async fn snapshot_table_change_batches(
 
     let mut change_batches = Vec::new();
     let mut row_count = 0_usize;
-    let mut builder = SnapshotColumnarBatchBuilder::new(schema, POSTGRES_SNAPSHOT_ROWS_PER_BATCH);
+    let rows_per_batch = *POSTGRES_SNAPSHOT_ROWS_PER_BATCH;
+    let mut builder = SnapshotColumnarBatchBuilder::new(schema, rows_per_batch);
     while let Some(row) = stream.try_next().await.with_context(|| {
         format!(
             "stream Postgres CDC snapshot table '{}.{}'",
@@ -729,12 +745,26 @@ async fn snapshot_table_change_batches(
     })? {
         builder.append_row(schema, &row)?;
         row_count = row_count.saturating_add(1);
-        if builder.len() >= POSTGRES_SNAPSHOT_ROWS_PER_BATCH {
+        if builder.len() >= rows_per_batch {
             change_batches.push(builder.finish_change_batch(schema)?);
         }
     }
     if !builder.is_empty() {
         change_batches.push(builder.finish_change_batch(schema)?);
+    }
+    if *CDC_PERF_LOGGING_ENABLED {
+        let elapsed = started_at.elapsed();
+        tracing::info!(
+            table = %schema.table_id().as_str(),
+            upstream_schema = %schema.upstream_table().schema(),
+            upstream_table = %schema.upstream_table().table(),
+            rows = row_count,
+            batches = change_batches.len(),
+            rows_per_batch,
+            elapsed_ms = elapsed.as_millis() as u64,
+            rows_per_second = (row_count as f64 / elapsed.as_secs_f64().max(0.001)) as u64,
+            "postgres cdc snapshot table streamed"
+        );
     }
 
     Ok(SnapshotTableChangeBatches {
@@ -943,24 +973,54 @@ impl SnapshotColumnBuilder {
 fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
     let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
     let value = value.trim();
-    let (negative, unsigned) = value
+    ensure!(!value.is_empty(), "decimal value cannot be empty");
+
+    let (negative, digits) = value
         .strip_prefix('-')
         .map(|rest| (true, rest))
-        .unwrap_or((false, value));
-    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    let mut digits = String::with_capacity(whole.len() + scale as usize);
-    digits.push_str(whole);
+        .unwrap_or_else(|| {
+            value
+                .strip_prefix('+')
+                .map(|rest| (false, rest))
+                .unwrap_or((false, value))
+        });
+
+    let mut parsed = 0_i128;
+    let mut saw_digit = false;
+    let mut saw_decimal = false;
+    let mut fraction_len = 0_usize;
     let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
-    ensure!(
-        fraction.len() <= scale_usize,
-        "decimal value '{value}' has more fractional digits than scale {scale}"
-    );
-    digits.push_str(fraction);
-    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
-    let parsed = digits
-        .parse::<i128>()
-        .with_context(|| format!("decode decimal value '{value}'"))?;
+
+    for byte in digits.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                if saw_decimal {
+                    fraction_len = fraction_len.saturating_add(1);
+                    ensure!(
+                        fraction_len <= scale_usize,
+                        "decimal value '{value}' has more fractional digits than scale {scale}"
+                    );
+                }
+                parsed = parsed
+                    .checked_mul(10)
+                    .and_then(|acc| acc.checked_add(i128::from(byte - b'0')))
+                    .with_context(|| format!("decimal value '{value}' exceeds i128 range"))?;
+            }
+            b'.' if !saw_decimal => {
+                saw_decimal = true;
+            }
+            _ => bail!("invalid decimal value '{value}'"),
+        }
+    }
+
+    ensure!(saw_digit, "decimal value '{value}' has no digits");
+    for _ in 0..scale_usize.saturating_sub(fraction_len) {
+        parsed = parsed
+            .checked_mul(10)
+            .with_context(|| format!("decimal value '{value}' exceeds i128 range"))?;
+    }
+
     Ok(if negative { -parsed } else { parsed })
 }
 
@@ -1045,4 +1105,27 @@ fn qualified_table_name(upstream: &UpstreamTableRef) -> String {
 
 fn quote_pg_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_decimal_text_without_allocation_sensitive_edge_cases() {
+        assert_eq!(parse_decimal_text_to_i128("123.45", 2).unwrap(), 12_345);
+        assert_eq!(parse_decimal_text_to_i128("123", 2).unwrap(), 12_300);
+        assert_eq!(parse_decimal_text_to_i128("-0.07", 2).unwrap(), -7);
+        assert_eq!(parse_decimal_text_to_i128("+42.1", 3).unwrap(), 42_100);
+        assert_eq!(parse_decimal_text_to_i128(" .5 ", 2).unwrap(), 50);
+    }
+
+    #[test]
+    fn rejects_decimal_text_that_cannot_match_scale() {
+        assert!(parse_decimal_text_to_i128("1.234", 2).is_err());
+        assert!(parse_decimal_text_to_i128("1.2.3", 2).is_err());
+        assert!(parse_decimal_text_to_i128("", 2).is_err());
+        assert!(parse_decimal_text_to_i128("abc", 2).is_err());
+        assert!(parse_decimal_text_to_i128("1.0", -1).is_err());
+    }
 }

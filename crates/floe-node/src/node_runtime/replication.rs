@@ -2,14 +2,15 @@ use super::*;
 
 use std::fmt;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::{
     BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder, StringBuilder,
     TimestampMillisecondBuilder,
 };
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow_ipc::{CompressionType, MetadataVersion};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourcePosition};
 use floe_core::RowValue;
@@ -35,7 +36,7 @@ const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 0;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
-const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 8192;
+const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 static REPLICATION_KAFKA_MESSAGE_MAX_BYTES: LazyLock<String> = LazyLock::new(|| {
     std::env::var("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES")
         .ok()
@@ -73,6 +74,17 @@ static REPLICATION_BUFFER_MAX_PENDING_AGE_MS: LazyLock<Option<u64>> = LazyLock::
         DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
     )
 });
+static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("FLOE_CDC_PERF_LOG")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+});
+static REPLICATION_ARROW_IPC_COMPRESSION: LazyLock<Option<ReplicationArrowIpcCompression>> =
+    LazyLock::new(|| {
+        std::env::var("FLOE_REPLICATION_ARROW_IPC_COMPRESSION")
+            .ok()
+            .and_then(|value| ReplicationArrowIpcCompression::parse(&value))
+    });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicationBufferLimits {
@@ -91,6 +103,33 @@ enum ReplicationBufferLimitViolation {
         oldest_pending_age_ms: u64,
         max_pending_age_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationArrowIpcCompression {
+    Lz4Frame,
+}
+
+impl ReplicationArrowIpcCompression {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "false" | "0" => None,
+            "lz4" | "lz4_frame" | "lz4-frame" => Some(Self::Lz4Frame),
+            other => {
+                tracing::warn!(
+                    compression = other,
+                    "unsupported replication Arrow IPC compression; falling back to uncompressed IPC"
+                );
+                None
+            }
+        }
+    }
+
+    fn arrow_type(self) -> CompressionType {
+        match self {
+            Self::Lz4Frame => CompressionType::LZ4_FRAME,
+        }
+    }
 }
 
 impl ReplicationBufferLimits {
@@ -261,10 +300,22 @@ impl ReplicationPipelineRuntime {
 
         let mut written = 0usize;
         for plan in plans {
+            let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
+            let perf_started_at = perf_enabled.then(Instant::now);
+            let encode_started_at = perf_enabled.then(Instant::now);
             let buffered_records = encode_pipeline_transaction_records(plan, schemas, transaction)?;
+            let encode_elapsed = encode_started_at
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or(Duration::ZERO);
             if buffered_records.is_empty() {
                 continue;
             }
+            let record_count = buffered_records.len();
+            let payload_bytes = if perf_enabled {
+                estimated_buffer_payload_bytes(&buffered_records)
+            } else {
+                0
+            };
             if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
                 match &plan.target {
                     ReplicationPipelineRuntimeTarget::Kafka { .. } => {
@@ -281,6 +332,16 @@ impl ReplicationPipelineRuntime {
                     }
                 }
                 written = written.saturating_add(buffered_records.len());
+                log_replication_pipeline_perf(
+                    plan,
+                    transaction,
+                    record_count,
+                    payload_bytes,
+                    encode_elapsed,
+                    perf_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
                 continue;
             }
             if let Some(storage) = storage {
@@ -353,18 +414,33 @@ impl ReplicationPipelineRuntime {
                     self.replay_pending_for_plan(plan, &buffer_store, storage)
                         .await?;
                     record_buffer_stats(&buffer_store, &plan.name).await?;
+                    log_replication_pipeline_perf(
+                        plan,
+                        transaction,
+                        manifest.record_count(),
+                        payload_bytes,
+                        encode_elapsed,
+                        perf_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or(Duration::ZERO),
+                    );
                     continue;
                 }
 
+                let append_send_started_at = perf_enabled.then(Instant::now);
                 let append_future = buffer_store.append_transaction(&append);
                 let target_future = self.send_records_to_target(plan, append.records());
                 let (manifest_result, target_result) = tokio::join!(append_future, target_future);
+                let append_send_elapsed = append_send_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 let manifest = manifest_result.with_context(|| {
                     format!(
                         "append replication pipeline '{}' transaction buffer",
                         plan.name
                     )
                 })?;
+                let checkpoint_started_at = perf_enabled.then(Instant::now);
                 storage
                     .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
                         &plan.name,
@@ -378,9 +454,13 @@ impl ReplicationPipelineRuntime {
                     .with_context(|| {
                         format!("persist replication pipeline '{}' checkpoint", plan.name)
                     })?;
+                let checkpoint_elapsed = checkpoint_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 written = written.saturating_add(manifest.record_count());
                 match target_result {
                     Ok(target_state) => {
+                        let delivery_started_at = perf_enabled.then(Instant::now);
                         let delivered = self
                             .mark_manifest_delivered(
                                 plan,
@@ -390,7 +470,17 @@ impl ReplicationPipelineRuntime {
                                 target_state,
                             )
                             .await?;
-                        if delivered > 0 {
+                        let delivery_elapsed = delivery_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        log_replication_durable_stage_perf(
+                            plan,
+                            manifest.record_count(),
+                            append_send_elapsed,
+                            checkpoint_elapsed,
+                            delivery_elapsed,
+                        );
+                        if delivered > 0 && *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
                             self.cleanup_delivered_if_due(plan, &buffer_store).await?;
                         }
                     }
@@ -399,6 +489,16 @@ impl ReplicationPipelineRuntime {
                     }
                 }
                 record_buffer_stats(&buffer_store, &plan.name).await?;
+                log_replication_pipeline_perf(
+                    plan,
+                    transaction,
+                    record_count,
+                    payload_bytes,
+                    encode_elapsed,
+                    perf_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
             } else {
                 match &plan.target {
                     ReplicationPipelineRuntimeTarget::Kafka { .. } => {
@@ -415,6 +515,16 @@ impl ReplicationPipelineRuntime {
                     }
                 }
                 written = written.saturating_add(buffered_records.len());
+                log_replication_pipeline_perf(
+                    plan,
+                    transaction,
+                    record_count,
+                    payload_bytes,
+                    encode_elapsed,
+                    perf_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
             }
         }
 
@@ -451,7 +561,9 @@ impl ReplicationPipelineRuntime {
                 break;
             }
             delivered_records = delivered_records.saturating_add(delivered);
-            self.cleanup_delivered_if_due(plan, buffer_store).await?;
+            if *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
+                self.cleanup_delivered_if_due(plan, buffer_store).await?;
+            }
         }
         record_buffer_stats(buffer_store, &plan.name).await?;
         Ok(delivered_records)
@@ -513,7 +625,7 @@ impl ReplicationPipelineRuntime {
         let delivered = self
             .replay_pending_for_plan(plan, buffer_store, storage)
             .await?;
-        if delivered > 0 {
+        if delivered > 0 && *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
             self.cleanup_delivered_if_due(plan, buffer_store).await?;
         }
         stats = buffer_store
@@ -589,7 +701,7 @@ impl ReplicationPipelineRuntime {
         target_state: std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<usize> {
         let delivered_at = current_unix_time_ms();
-        buffer_store
+        let delivered = buffer_store
             .mark_delivered(manifest, delivered_at)
             .await
             .with_context(|| {
@@ -602,11 +714,7 @@ impl ReplicationPipelineRuntime {
             .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
                 &plan.name,
                 &plan.source_name,
-                buffer_store
-                    .source_frontier(&plan.name)
-                    .await?
-                    .map(|frontier| frontier.source_position().clone())
-                    .unwrap_or_else(|| manifest.source_position().clone()),
+                manifest.source_position().clone(),
                 manifest.transaction_id().cloned(),
                 delivered_target_state(manifest, target_state),
                 delivered_at,
@@ -618,6 +726,24 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        if *REPLICATION_BUFFER_DELIVERED_RETENTION_MS == 0 {
+            let cleanup_store = buffer_store.clone();
+            let cleanup_manifest = delivered.clone();
+            let cleanup_pipeline = plan.name.clone();
+            tokio::spawn(async move {
+                if let Err(err) = cleanup_store
+                    .cleanup_delivered_manifest(&cleanup_manifest)
+                    .await
+                {
+                    tracing::warn!(
+                        pipeline = %cleanup_pipeline,
+                        transaction = %cleanup_manifest.transaction_key(),
+                        error = %err,
+                        "replication pipeline delivered buffer cleanup failed"
+                    );
+                }
+            });
+        }
         Ok(manifest.record_count())
     }
 
@@ -731,16 +857,21 @@ impl KafkaReplicationPipelineWriter {
         .into_iter()
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+        let mut offsets_by_partition = std::collections::BTreeMap::<i32, i64>::new();
+        for (partition, offset) in deliveries {
+            offsets_by_partition
+                .entry(partition)
+                .and_modify(|current| *current = (*current).max(offset))
+                .or_insert(offset);
+        }
+
         let mut target_state = std::collections::BTreeMap::new();
         target_state.insert("kafka.topic".to_string(), self.topic.clone());
-        for (partition, offset) in deliveries {
-            let key = format!("kafka.partition.{partition}.offset");
-            let entry = target_state
-                .entry(key)
-                .or_insert_with(|| offset.to_string());
-            if offset > entry.parse::<i64>().unwrap_or(i64::MIN) {
-                *entry = offset.to_string();
-            }
+        for (partition, offset) in offsets_by_partition {
+            target_state.insert(
+                format!("kafka.partition.{partition}.offset"),
+                offset.to_string(),
+            );
         }
         Ok(target_state)
     }
@@ -1034,7 +1165,7 @@ fn arrow_ipc_record_from_batch(
 ) -> anyhow::Result<CdcBufferRecord> {
     let mut value = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut value, batch.schema().as_ref())
+        let mut writer = arrow_ipc_stream_writer(&mut value, batch.schema().as_ref())
             .context("create replication Arrow IPC writer")?;
         writer
             .write(&batch)
@@ -1050,6 +1181,22 @@ fn arrow_ipc_record_from_batch(
     )
     .into_bytes();
     Ok(CdcBufferRecord::new(Some(key), Some(value)))
+}
+
+fn arrow_ipc_stream_writer<'a>(
+    value: &'a mut Vec<u8>,
+    schema: &ArrowSchema,
+) -> anyhow::Result<StreamWriter<&'a mut Vec<u8>>> {
+    let Some(compression) = *REPLICATION_ARROW_IPC_COMPRESSION else {
+        return StreamWriter::try_new(value, schema)
+            .context("create uncompressed Arrow IPC writer");
+    };
+    let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5)
+        .context("create Arrow IPC writer options")?
+        .try_with_compression(Some(compression.arrow_type()))
+        .context("configure Arrow IPC compression")?;
+    StreamWriter::try_new_with_options(value, schema, options)
+        .with_context(|| format!("create {compression:?} Arrow IPC writer"))
 }
 
 fn arrow_ipc_snapshot_record_batch(
@@ -1462,6 +1609,60 @@ async fn record_buffer_stats(
     Ok(())
 }
 
+fn log_replication_pipeline_perf(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    records: usize,
+    payload_bytes: usize,
+    encode_elapsed: Duration,
+    total_elapsed: Duration,
+) {
+    if !*CDC_PERF_LOGGING_ENABLED {
+        return;
+    }
+    let changes = transaction
+        .change_batches()
+        .iter()
+        .map(ChangeBatch::change_count)
+        .sum::<usize>();
+    tracing::info!(
+        pipeline = %plan.name,
+        source = %transaction.source_id().as_str(),
+        table = %plan.table_id.as_str(),
+        upstream_table = %plan.upstream_table,
+        format = ?plan.format,
+        buffer_mode = ?plan.buffer_mode,
+        change_batches = transaction.change_batches().len(),
+        changes,
+        records,
+        payload_bytes,
+        encode_ms = encode_elapsed.as_millis() as u64,
+        total_ms = total_elapsed.as_millis() as u64,
+        commit_position = ?transaction.commit_position(),
+        "postgres cdc replication pipeline transaction processed"
+    );
+}
+
+fn log_replication_durable_stage_perf(
+    plan: &ReplicationPipelineRuntimePlan,
+    records: usize,
+    append_send_elapsed: Duration,
+    checkpoint_elapsed: Duration,
+    delivery_elapsed: Duration,
+) {
+    if !*CDC_PERF_LOGGING_ENABLED {
+        return;
+    }
+    tracing::info!(
+        pipeline = %plan.name,
+        records,
+        append_and_target_send_ms = append_send_elapsed.as_millis() as u64,
+        pending_checkpoint_ms = checkpoint_elapsed.as_millis() as u64,
+        delivery_checkpoint_ms = delivery_elapsed.as_millis() as u64,
+        "postgres cdc durable replication pipeline stages processed"
+    );
+}
+
 fn estimated_buffer_payload_bytes(records: &[CdcBufferRecord]) -> usize {
     records.iter().fold(16usize, |bytes, record| {
         bytes.saturating_add(16).saturating_add(record.byte_len())
@@ -1855,6 +2056,20 @@ mod tests {
         assert_eq!(effective_u64_limit(Some(0), Some(100)), None);
         assert_eq!(effective_usize_limit(None, Some(100)), Some(100));
         assert_eq!(effective_u64_limit(None, Some(100)), Some(100));
+    }
+
+    #[test]
+    fn parses_arrow_ipc_compression_override() {
+        assert_eq!(
+            ReplicationArrowIpcCompression::parse("lz4"),
+            Some(ReplicationArrowIpcCompression::Lz4Frame)
+        );
+        assert_eq!(
+            ReplicationArrowIpcCompression::parse("lz4-frame"),
+            Some(ReplicationArrowIpcCompression::Lz4Frame)
+        );
+        assert_eq!(ReplicationArrowIpcCompression::parse("none"), None);
+        assert_eq!(ReplicationArrowIpcCompression::parse("bogus"), None);
     }
 
     fn schema(table_id: CdcTableId) -> CdcTableSchema {

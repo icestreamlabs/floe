@@ -395,6 +395,91 @@ impl CdcBufferStore {
         Ok(summary)
     }
 
+    pub async fn cleanup_delivered_manifest(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+    ) -> Result<CdcBufferCleanupSummary> {
+        let Some(delivered_at) = manifest.delivered_at_unix_ms() else {
+            return Ok(CdcBufferCleanupSummary {
+                deleted_transactions: 0,
+                deleted_records: 0,
+                deleted_bytes: 0,
+            });
+        };
+        let delivered_key = delivered_manifest_key(
+            manifest.pipeline_name(),
+            delivered_at,
+            manifest.transaction_key(),
+        );
+        let pending_key =
+            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+        let mut batch = WriteBatch::new();
+        let mut summary = CdcBufferCleanupSummary {
+            deleted_transactions: 0,
+            deleted_records: 0,
+            deleted_bytes: 0,
+        };
+
+        if self
+            .db
+            .get(pending_key)
+            .await
+            .map_err(map_slate_err)?
+            .is_some()
+        {
+            batch.delete(delivered_key);
+            summary.deleted_transactions = 1;
+            write_durable_batch(self.db.as_ref(), batch)
+                .await
+                .context("cleanup stale delivered CDC buffer transaction manifest")?;
+            return Ok(summary);
+        }
+
+        match manifest.payload_storage() {
+            CdcBufferPayloadStorage::ObjectStore => {
+                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+                    anyhow!(
+                        "delivered CDC buffer transaction '{}' is missing payload object key",
+                        manifest.transaction_key()
+                    )
+                })?;
+                self.delete_payload_object(payload_object_key).await?;
+                summary.deleted_records = manifest.record_count();
+                summary.deleted_bytes = manifest.payload_bytes();
+            }
+            CdcBufferPayloadStorage::SlateDbBlob => {
+                let blob_key =
+                    payload_blob_key(manifest.pipeline_name(), manifest.transaction_key());
+                let mut deleted_blob = false;
+                if let Some(payload) = self.db.get(blob_key.clone()).await.map_err(map_slate_err)? {
+                    batch.delete(blob_key);
+                    summary.deleted_records = manifest.record_count();
+                    summary.deleted_bytes = payload.len();
+                    deleted_blob = true;
+                }
+                for (payload_key, payload_value) in scan_prefix(
+                    &self.db,
+                    &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
+                )
+                .await?
+                {
+                    batch.delete(payload_key);
+                    if !deleted_blob {
+                        summary.deleted_records = summary.deleted_records.saturating_add(1);
+                    }
+                    summary.deleted_bytes =
+                        summary.deleted_bytes.saturating_add(payload_value.len());
+                }
+            }
+        }
+        batch.delete(delivered_key);
+        summary.deleted_transactions = 1;
+        write_durable_batch(self.db.as_ref(), batch)
+            .await
+            .context("cleanup delivered CDC buffer transaction manifest")?;
+        Ok(summary)
+    }
+
     fn payload_object_store(&self) -> Result<&Arc<dyn ObjectStore>> {
         self.object_store.as_ref().ok_or_else(|| {
             anyhow!(
@@ -1094,6 +1179,50 @@ mod tests {
         assert_eq!(summary.deleted_transactions(), 1);
         assert_eq!(summary.deleted_records(), 0);
         assert_eq!(store.records(&pending).await.unwrap(), vec![record(9)]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_delivered_manifest_deletes_one_delivered_payload() {
+        let store = test_store("cdc-buffer-cleanup-single-delivered").await;
+        let append = append("0/10", 1000, vec![record(1)]);
+        let manifest = store
+            .append_transaction(&append)
+            .await
+            .expect("append delivered");
+        let delivered = store
+            .mark_delivered(&manifest, 2000)
+            .await
+            .expect("mark delivered");
+        let payload_object_key = delivered
+            .payload_object_key()
+            .expect("payload object key")
+            .to_string();
+
+        let summary = store
+            .cleanup_delivered_manifest(&delivered)
+            .await
+            .expect("cleanup single delivered");
+
+        assert_eq!(summary.deleted_transactions(), 1);
+        assert_eq!(summary.deleted_records(), 1);
+        assert!(summary.deleted_bytes() > 0);
+        assert!(
+            store
+                .object_store
+                .as_ref()
+                .expect("object store")
+                .head(&ObjectPath::from(payload_object_key))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .cleanup_delivered("pipe", CdcBufferCleanupPolicy::new(0), 3000)
+                .await
+                .expect("cleanup remaining delivered")
+                .deleted_transactions()
+                == 0
+        );
     }
 
     #[tokio::test]

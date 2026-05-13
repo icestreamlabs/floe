@@ -23,7 +23,8 @@ SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
 PIPELINE_FORMAT="${PIPELINE_FORMAT:-debezium-json}"
 DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
-ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-8192}"
+ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-16384}"
+ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION:-none}"
 LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS:-0}"
 LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS:-0}"
 FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
@@ -32,6 +33,7 @@ BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
 TPCHGEN_BIN="${TPCHGEN_BIN:-tpchgen-cli}"
+SLATEDB_FLUSH_INTERVAL_MS="${FLOE_SLATEDB_FLUSH_INTERVAL_MS:-1}"
 
 RUN_ID="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-target/cdc_bench/${RUN_ID}}"
@@ -463,6 +465,24 @@ expected_insert_messages() {
   esac
 }
 
+expected_insert_messages_for_chunks() {
+  local rows="$1"
+  local chunk="$2"
+  if (( chunk <= 0 || chunk >= rows )); then
+    expected_insert_messages "${rows}"
+    return
+  fi
+  local full_chunks=$((rows / chunk))
+  local remainder=$((rows % chunk))
+  local per_full_chunk
+  per_full_chunk="$(expected_insert_messages "${chunk}")"
+  local total=$((full_chunks * per_full_chunk))
+  if (( remainder > 0 )); then
+    total=$((total + $(expected_insert_messages "${remainder}")))
+  fi
+  echo "${total}"
+}
+
 expected_update_messages() {
   local rows="$1"
   local normalized_format="${PIPELINE_FORMAT//-/_}"
@@ -478,6 +498,24 @@ expected_update_messages() {
       exit 1
       ;;
   esac
+}
+
+expected_update_messages_for_chunks() {
+  local rows="$1"
+  local chunk="$2"
+  if (( chunk <= 0 || chunk >= rows )); then
+    expected_update_messages "${rows}"
+    return
+  fi
+  local full_chunks=$((rows / chunk))
+  local remainder=$((rows % chunk))
+  local per_full_chunk
+  per_full_chunk="$(expected_update_messages "${chunk}")"
+  local total=$((full_chunks * per_full_chunk))
+  if (( remainder > 0 )); then
+    total=$((total + $(expected_update_messages "${remainder}")))
+  fi
+  echo "${total}"
 }
 
 require_cmd docker
@@ -522,10 +560,12 @@ echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
 echo "durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
+echo "arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"
 echo "redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
 echo "redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
 echo "live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
 echo "live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
+echo "slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
 
 echo "Pulling images..."
 docker pull "${POSTGRES_IMAGE}" >/dev/null
@@ -653,12 +693,17 @@ if (( initial_rows > 0 )); then
   expected_messages=$((expected_messages + $(expected_insert_messages "${initial_rows}")))
 fi
 if (( live_insert_rows > 0 )); then
-  expected_messages=$((expected_messages + $(expected_insert_messages "${live_insert_rows}")))
+  expected_messages=$((expected_messages + $(expected_insert_messages_for_chunks "${live_insert_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
 fi
 if (( live_update_rows > 0 )); then
-  expected_messages=$((expected_messages + $(expected_update_messages "${live_update_rows}")))
+  expected_messages=$((expected_messages + $(expected_update_messages_for_chunks "${live_update_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
 fi
 echo "expected_kafka_messages=${expected_messages}"
+
+SLATEDB_ARGS=(
+  --slatedb-await-durable=false
+  --slatedb-flush-interval-ms "${SLATEDB_FLUSH_INTERVAL_MS}"
+)
 
 echo "Starting Floe node"
 node_started_ns="$(date +%s%N)"
@@ -669,10 +714,11 @@ if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1
     FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
     FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
+    FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
-      --slatedb-await-durable=false \
+      "${SLATEDB_ARGS[@]}" \
       --ingest-batch-size 16384 \
       --ingest-batch-per-source 16384 \
       --ingest-batch-per-connector 16384 \
@@ -683,10 +729,11 @@ elif command -v setsid >/dev/null 2>&1; then
     FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
     FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
+    FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
-      --slatedb-await-durable=false \
+      "${SLATEDB_ARGS[@]}" \
       --ingest-batch-size 16384 \
       --ingest-batch-per-source 16384 \
       --ingest-batch-per-connector 16384 \
@@ -696,10 +743,11 @@ else
   FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
   FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
   FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
+  FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
   "${FLOE_BIN}" run \
     --config "${CONFIG_PATH}" \
     --mv-query "$(cat "${SQL_PATH}")" \
-    --slatedb-await-durable=false \
+    "${SLATEDB_ARGS[@]}" \
     --ingest-batch-size 16384 \
     --ingest-batch-per-source 16384 \
     --ingest-batch-per-connector 16384 \
@@ -762,10 +810,12 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
   echo "benchmark.durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
   echo "benchmark.arrow_ipc_rows_per_record=${ARROW_IPC_ROWS_PER_RECORD}"
+  echo "benchmark.arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"
   echo "benchmark.redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
   echo "benchmark.redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
   echo "benchmark.live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
+  echo "benchmark.slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
   echo "benchmark.expected_kafka_messages=${expected_messages}"
   echo "benchmark.postgres_load_seconds=${load_seconds}"
   echo "benchmark.postgres_live_write_seconds=${live_write_seconds}"
