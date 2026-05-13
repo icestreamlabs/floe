@@ -14,11 +14,14 @@ REDPANDA_PORT="${REDPANDA_PORT:-19092}"
 BROKERS="${BROKERS:-127.0.0.1:${REDPANDA_PORT}}"
 
 ROWS="${ROWS:-100000}"
+BENCH_MODE="${BENCH_MODE:-snapshot}"
 TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
 PIPELINE_FORMAT="${PIPELINE_FORMAT:-debezium-json}"
 ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-8192}"
+LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS:-0}"
+LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS:-0}"
 FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
@@ -30,18 +33,59 @@ CONFIG_PATH="${ARTIFACT_DIR}/empty_config.json"
 SQL_PATH="${ARTIFACT_DIR}/program.sql"
 NODE_STDOUT="${ARTIFACT_DIR}/floe-node.stdout.log"
 NODE_STDERR="${ARTIFACT_DIR}/floe-node.stderr.log"
+NODE_RESOURCE_LOG="${ARTIFACT_DIR}/floe-node.resources.log"
 COUNTER_LOG="${ARTIFACT_DIR}/kafka-counter.log"
+SYSTEM_LOG="${ARTIFACT_DIR}/system.txt"
+POSTGRES_SETTINGS_LOG="${ARTIFACT_DIR}/postgres-settings.txt"
+KAFKA_TOPIC_LOG="${ARTIFACT_DIR}/kafka-topic.txt"
+POSTGRES_SLOT_LOG="${ARTIFACT_DIR}/postgres-slot.log"
+DOCKER_STATS_LOG="${ARTIFACT_DIR}/docker-stats.log"
 
 mkdir -p "${ARTIFACT_DIR}"
 printf '{}\n' >"${CONFIG_PATH}"
 
 node_pid=""
+node_process_group=0
+
+stop_node() {
+  if [[ -z "${node_pid}" ]]; then
+    return
+  fi
+  if ! kill -0 "${node_pid}" >/dev/null 2>&1; then
+    wait "${node_pid}" >/dev/null 2>&1 || true
+    node_pid=""
+    node_process_group=0
+    return
+  fi
+
+  if [[ "${node_process_group}" == "1" ]]; then
+    kill -INT -- "-${node_pid}" >/dev/null 2>&1 || true
+  else
+    kill -INT "${node_pid}" >/dev/null 2>&1 || true
+  fi
+
+  for _ in $(seq 1 20); do
+    if ! kill -0 "${node_pid}" >/dev/null 2>&1; then
+      wait "${node_pid}" >/dev/null 2>&1 || true
+      node_pid=""
+      node_process_group=0
+      return
+    fi
+    sleep 0.5
+  done
+
+  if [[ "${node_process_group}" == "1" ]]; then
+    kill -TERM -- "-${node_pid}" >/dev/null 2>&1 || true
+  else
+    kill -TERM "${node_pid}" >/dev/null 2>&1 || true
+  fi
+  wait "${node_pid}" >/dev/null 2>&1 || true
+  node_pid=""
+  node_process_group=0
+}
 
 cleanup() {
-  if [[ -n "${node_pid}" ]] && kill -0 "${node_pid}" >/dev/null 2>&1; then
-    kill -INT "${node_pid}" >/dev/null 2>&1 || true
-    wait "${node_pid}" >/dev/null 2>&1 || true
-  fi
+  stop_node
   if [[ "${KEEP_CONTAINERS}" != "1" ]]; then
     docker rm -f "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
     docker rm -f "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || true
@@ -89,6 +133,191 @@ wait_for_redpanda() {
   fi
 }
 
+wait_for_postgres_slot_active() {
+  local ready=0
+  for _ in $(seq 1 120); do
+    if [[ "$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COALESCE((SELECT active FROM pg_replication_slots WHERE slot_name = '${SLOT}'), false)")" == "t" ]]; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${ready}" -ne 1 ]]; then
+    echo "Postgres CDC replication slot ${SLOT} did not become active in time." >&2
+    docker exec "${POSTGRES_CONTAINER}" psql -x -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots" >&2 || true
+    exit 1
+  fi
+}
+
+write_system_context() {
+  {
+    echo "benchmark.timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "benchmark.git_commit=$(git rev-parse HEAD 2>/dev/null || true)"
+    echo "benchmark.git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    echo "benchmark.host_uname=$(uname -a)"
+    echo "benchmark.cargo=$(cargo --version 2>/dev/null || true)"
+    echo "benchmark.rustc=$(rustc --version 2>/dev/null || true)"
+    echo
+    if command -v lscpu >/dev/null 2>&1; then
+      lscpu
+      echo
+    fi
+    if command -v free >/dev/null 2>&1; then
+      free -h
+      echo
+    fi
+    docker version
+  } >"${SYSTEM_LOG}" 2>&1 || true
+}
+
+write_postgres_settings() {
+  docker exec "${POSTGRES_CONTAINER}" psql -x -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "
+    SELECT name, setting, unit
+    FROM pg_settings
+    WHERE name IN (
+      'wal_level',
+      'max_replication_slots',
+      'max_wal_senders',
+      'max_slot_wal_keep_size',
+      'shared_buffers',
+      'work_mem',
+      'maintenance_work_mem',
+      'effective_cache_size',
+      'synchronous_commit'
+    )
+    ORDER BY name;
+  " >"${POSTGRES_SETTINGS_LOG}" 2>&1 || true
+}
+
+write_kafka_topic_info() {
+  docker exec "${REDPANDA_CONTAINER}" rpk topic describe "${TOPIC}" >"${KAFKA_TOPIC_LOG}" 2>&1 || true
+}
+
+write_postgres_slot_info() {
+  docker exec "${POSTGRES_CONTAINER}" psql -x -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "
+    SELECT
+      slot_name,
+      active,
+      restart_lsn,
+      confirmed_flush_lsn,
+      pg_current_wal_lsn() AS current_wal_lsn,
+      pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::BIGINT AS confirmed_lag_bytes,
+      pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::BIGINT AS restart_lag_bytes
+    FROM pg_replication_slots
+    WHERE slot_name = '${SLOT}';
+  " >"${POSTGRES_SLOT_LOG}" 2>&1 || true
+}
+
+write_docker_stats() {
+  docker stats --no-stream --format 'container={{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} block={{.BlockIO}} pids={{.PIDs}}' \
+    "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >"${DOCKER_STATS_LOG}" 2>&1 || true
+  if [[ -n "${node_pid}" ]] && kill -0 "${node_pid}" >/dev/null 2>&1; then
+    local observed_pid="${node_pid}"
+    if command -v pgrep >/dev/null 2>&1; then
+      observed_pid="$(pgrep -P "${node_pid}" -n floe-node 2>/dev/null || printf '%s' "${node_pid}")"
+    fi
+    {
+      echo
+      ps -p "${observed_pid}" -o pid=,pcpu=,pmem=,rss=,vsz=,etime=,command=
+    } >>"${DOCKER_STATS_LOG}" 2>&1 || true
+  fi
+}
+
+sleep_live_write_pause() {
+  if (( LIVE_WRITE_SLEEP_MS <= 0 )); then
+    return
+  fi
+  sleep "$(awk "BEGIN { printf \"%.3f\", ${LIVE_WRITE_SLEEP_MS} / 1000 }")"
+}
+
+write_live_inserts() {
+  local total="$1"
+  local chunk="${LIVE_WRITE_CHUNK_ROWS}"
+  if (( chunk <= 0 || chunk > total )); then
+    chunk="${total}"
+  fi
+  local start=1
+  while (( start <= total )); do
+    local end=$((start + chunk - 1))
+    if (( end > total )); then
+      end="${total}"
+    fi
+    docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+INSERT INTO public.orders
+SELECT
+  gs::BIGINT AS id,
+  (gs % 100000)::BIGINT AS customer_id,
+  (100 + (gs % 10000))::BIGINT AS amount,
+  CASE WHEN gs % 3 = 0 THEN 'paid' WHEN gs % 3 = 1 THEN 'open' ELSE 'cancelled' END AS status,
+  (1700000000000 + gs)::BIGINT AS created_at
+FROM generate_series(${start}, ${end}) AS gs;
+SQL
+    start=$((end + 1))
+    if (( start <= total )); then
+      sleep_live_write_pause
+    fi
+  done
+}
+
+write_live_updates() {
+  local total="$1"
+  local chunk="${LIVE_WRITE_CHUNK_ROWS}"
+  if (( chunk <= 0 || chunk > total )); then
+    chunk="${total}"
+  fi
+  local start=1
+  while (( start <= total )); do
+    local end=$((start + chunk - 1))
+    if (( end > total )); then
+      end="${total}"
+    fi
+    docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+UPDATE public.orders
+SET amount = amount + 1,
+    status = 'updated'
+WHERE id BETWEEN ${start} AND ${end};
+SQL
+    start=$((end + 1))
+    if (( start <= total )); then
+      sleep_live_write_pause
+    fi
+  done
+}
+
+expected_insert_messages() {
+  local rows="$1"
+  local normalized_format="${PIPELINE_FORMAT//-/_}"
+  case "${normalized_format}" in
+    debezium_json)
+      echo "${rows}"
+      ;;
+    arrow_ipc)
+      echo "$(( (rows + ARROW_IPC_ROWS_PER_RECORD - 1) / ARROW_IPC_ROWS_PER_RECORD ))"
+      ;;
+    *)
+      echo "unsupported PIPELINE_FORMAT=${PIPELINE_FORMAT}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+expected_update_messages() {
+  local rows="$1"
+  local normalized_format="${PIPELINE_FORMAT//-/_}"
+  case "${normalized_format}" in
+    debezium_json)
+      echo "${rows}"
+      ;;
+    arrow_ipc)
+      echo "$(( (rows * 2 + ARROW_IPC_ROWS_PER_RECORD - 1) / ARROW_IPC_ROWS_PER_RECORD ))"
+      ;;
+    *)
+      echo "unsupported PIPELINE_FORMAT=${PIPELINE_FORMAT}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 require_cmd docker
 require_cmd cargo
 
@@ -96,9 +325,12 @@ docker rm -f "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || 
 
 echo "artifact_dir=${ARTIFACT_DIR}"
 echo "rows=${ROWS}"
+echo "bench_mode=${BENCH_MODE}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
+echo "live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
+echo "live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
 
 echo "Pulling images..."
 docker pull "${POSTGRES_IMAGE}" >/dev/null
@@ -118,6 +350,7 @@ docker run -d \
     -c max_wal_senders=16 \
     -c max_slot_wal_keep_size=4096MB >/dev/null
 wait_for_postgres
+write_system_context
 
 echo "Starting Redpanda ${REDPANDA_IMAGE} on port ${REDPANDA_PORT}"
 docker run -d \
@@ -137,8 +370,32 @@ wait_for_redpanda
 
 echo "Creating Kafka topic ${TOPIC}"
 docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 >/dev/null 2>&1 || true
+write_kafka_topic_info
 
-echo "Loading Postgres snapshot table with ${ROWS} rows"
+case "${BENCH_MODE}" in
+  snapshot|live_insert|snapshot_live_update) ;;
+  *)
+    echo "unsupported BENCH_MODE=${BENCH_MODE} (expected snapshot|live_insert|snapshot_live_update)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${BENCH_MODE}" == "live_insert" ]]; then
+  initial_rows=0
+  live_insert_rows="${ROWS}"
+  live_update_rows=0
+else
+  initial_rows="${ROWS}"
+  live_insert_rows=0
+  if [[ "${BENCH_MODE}" == "snapshot_live_update" ]]; then
+    live_update_rows="${ROWS}"
+  else
+    live_update_rows=0
+  fi
+fi
+source_rows=$((initial_rows + live_insert_rows + live_update_rows))
+
+echo "Loading Postgres snapshot table with ${initial_rows} initial rows"
 load_started_ns="$(date +%s%N)"
 docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
 DROP PUBLICATION IF EXISTS ${PUBLICATION};
@@ -157,11 +414,12 @@ SELECT
   (100 + (gs % 10000))::BIGINT AS amount,
   CASE WHEN gs % 3 = 0 THEN 'paid' WHEN gs % 3 = 1 THEN 'open' ELSE 'cancelled' END AS status,
   (1700000000000 + gs)::BIGINT AS created_at
-FROM generate_series(1, ${ROWS}) AS gs;
+FROM generate_series(1, ${initial_rows}) AS gs;
 SQL
 load_finished_ns="$(date +%s%N)"
 load_seconds="$(awk "BEGIN { printf \"%.3f\", (${load_finished_ns} - ${load_started_ns}) / 1000000000 }")"
 echo "timing.postgres_load_seconds=${load_seconds}"
+write_postgres_settings
 
 if [[ "${BUILD_RELEASE}" == "1" ]]; then
   echo "Building release binaries"
@@ -195,61 +453,132 @@ INTO KAFKA WITH (
 );
 SQL
 
-normalized_pipeline_format="${PIPELINE_FORMAT//-/_}"
-case "${normalized_pipeline_format}" in
-  debezium_json)
-    expected_messages="${ROWS}"
-    ;;
-  arrow_ipc)
-    expected_messages="$(( (ROWS + ARROW_IPC_ROWS_PER_RECORD - 1) / ARROW_IPC_ROWS_PER_RECORD ))"
-    ;;
-  *)
-    echo "unsupported PIPELINE_FORMAT=${PIPELINE_FORMAT}" >&2
-    exit 1
-    ;;
-esac
+expected_messages=0
+if (( initial_rows > 0 )); then
+  expected_messages=$((expected_messages + $(expected_insert_messages "${initial_rows}")))
+fi
+if (( live_insert_rows > 0 )); then
+  expected_messages=$((expected_messages + $(expected_insert_messages "${live_insert_rows}")))
+fi
+if (( live_update_rows > 0 )); then
+  expected_messages=$((expected_messages + $(expected_update_messages "${live_update_rows}")))
+fi
 echo "expected_kafka_messages=${expected_messages}"
 
 echo "Starting Floe node"
 node_started_ns="$(date +%s%N)"
-FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
-FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-"${FLOE_BIN}" run \
-  --config "${CONFIG_PATH}" \
-  --mv-query "$(cat "${SQL_PATH}")" \
-  --slatedb-await-durable=false \
-  --ingest-batch-size 16384 \
-  --ingest-batch-per-source 16384 \
-  --ingest-batch-per-connector 16384 \
-  >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
+if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1; then
+  node_process_group=1
+  setsid /usr/bin/time -v -o "${NODE_RESOURCE_LOG}" \
+    env \
+    FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
+    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+    "${FLOE_BIN}" run \
+      --config "${CONFIG_PATH}" \
+      --mv-query "$(cat "${SQL_PATH}")" \
+      --slatedb-await-durable=false \
+      --ingest-batch-size 16384 \
+      --ingest-batch-per-source 16384 \
+      --ingest-batch-per-connector 16384 \
+      >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
+elif command -v setsid >/dev/null 2>&1; then
+  node_process_group=1
+  setsid env \
+    FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
+    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+    "${FLOE_BIN}" run \
+      --config "${CONFIG_PATH}" \
+      --mv-query "$(cat "${SQL_PATH}")" \
+      --slatedb-await-durable=false \
+      --ingest-batch-size 16384 \
+      --ingest-batch-per-source 16384 \
+      --ingest-batch-per-connector 16384 \
+      >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
+else
+  node_process_group=0
+  FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
+  FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+  "${FLOE_BIN}" run \
+    --config "${CONFIG_PATH}" \
+    --mv-query "$(cat "${SQL_PATH}")" \
+    --slatedb-await-durable=false \
+    --ingest-batch-size 16384 \
+    --ingest-batch-per-source 16384 \
+    --ingest-batch-per-connector 16384 \
+    >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
+fi
 node_pid="$!"
 
 echo "Counting CDC records from Kafka"
+counter_started_ns="$(date +%s%N)"
 "${COUNTER_BIN}" \
   --brokers "${BROKERS}" \
   --topic "${TOPIC}" \
   --expected "${expected_messages}" \
-  --timeout-secs "${TIMEOUT_SECS}" | tee "${COUNTER_LOG}"
+  --timeout-secs "${TIMEOUT_SECS}" >"${COUNTER_LOG}" 2>&1 &
+counter_pid="$!"
+
+live_write_seconds="0.000"
+if [[ "${BENCH_MODE}" == "live_insert" ]]; then
+  echo "Waiting for Postgres CDC replication slot ${SLOT} to become active"
+  wait_for_postgres_slot_active
+  echo "Writing ${live_insert_rows} live insert rows"
+  live_started_ns="$(date +%s%N)"
+  write_live_inserts "${live_insert_rows}"
+  live_finished_ns="$(date +%s%N)"
+  live_write_seconds="$(awk "BEGIN { printf \"%.3f\", (${live_finished_ns} - ${live_started_ns}) / 1000000000 }")"
+elif [[ "${BENCH_MODE}" == "snapshot_live_update" ]]; then
+  echo "Waiting for Postgres CDC replication slot ${SLOT} to become active"
+  wait_for_postgres_slot_active
+  echo "Writing ${live_update_rows} live update rows"
+  live_started_ns="$(date +%s%N)"
+  write_live_updates "${live_update_rows}"
+  live_finished_ns="$(date +%s%N)"
+  live_write_seconds="$(awk "BEGIN { printf \"%.3f\", (${live_finished_ns} - ${live_started_ns}) / 1000000000 }")"
+fi
+
+if ! wait "${counter_pid}"; then
+  cat "${COUNTER_LOG}" >&2 || true
+  exit 1
+fi
+cat "${COUNTER_LOG}"
 node_finished_ns="$(date +%s%N)"
+write_postgres_slot_info
+write_docker_stats
 
 end_to_end_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${node_started_ns}) / 1000000000 }")"
-end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${ROWS} / ${end_to_end_seconds} }")"
+counter_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${counter_started_ns}) / 1000000000 }")"
+end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${end_to_end_seconds} }")"
 
 {
   echo "benchmark.rows=${ROWS}"
+  echo "benchmark.mode=${BENCH_MODE}"
+  echo "benchmark.initial_rows=${initial_rows}"
+  echo "benchmark.live_insert_rows=${live_insert_rows}"
+  echo "benchmark.live_update_rows=${live_update_rows}"
+  echo "benchmark.source_rows=${source_rows}"
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
+  echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
+  echo "benchmark.live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
   echo "benchmark.expected_kafka_messages=${expected_messages}"
+  echo "benchmark.postgres_load_seconds=${load_seconds}"
+  echo "benchmark.postgres_live_write_seconds=${live_write_seconds}"
   echo "benchmark.end_to_end_seconds=${end_to_end_seconds}"
+  echo "benchmark.counter_seconds=${counter_seconds}"
   echo "benchmark.end_to_end_rows_per_second=${end_to_end_rows_per_second}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"
+  echo "benchmark.node_resource_log=${NODE_RESOURCE_LOG}"
   echo "benchmark.counter_log=${COUNTER_LOG}"
+  echo "benchmark.system_log=${SYSTEM_LOG}"
+  echo "benchmark.postgres_settings_log=${POSTGRES_SETTINGS_LOG}"
+  echo "benchmark.postgres_slot_log=${POSTGRES_SLOT_LOG}"
+  echo "benchmark.kafka_topic_log=${KAFKA_TOPIC_LOG}"
+  echo "benchmark.docker_stats_log=${DOCKER_STATS_LOG}"
 } | tee "${ARTIFACT_DIR}/summary.env"
 
 echo "Stopping Floe node"
-kill -INT "${node_pid}" >/dev/null 2>&1 || true
-wait "${node_pid}" >/dev/null 2>&1 || true
-node_pid=""
+stop_node
 
 echo "CDC benchmark complete."

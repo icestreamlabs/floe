@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
 
 fn main() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
@@ -59,6 +60,7 @@ fn main() -> Result<()> {
                     eprintln!("cdc_counter.messages={messages}");
                 }
             }
+            Some(Err(err)) if is_retryable_poll_error(&err) => {}
             Some(Err(err)) => return Err(anyhow!(err)).context("poll CDC benchmark topic"),
             None => {}
         }
@@ -95,6 +97,12 @@ fn main() -> Result<()> {
     println!("cdc_counter.stream_mb_per_second={stream_mb_per_s:.3}");
 
     Ok(())
+}
+
+fn is_retryable_poll_error(err: &KafkaError) -> bool {
+    let message = err.to_string();
+    message.contains("UnknownTopicOrPartition")
+        || message.contains("Broker: Unknown topic or partition")
 }
 
 struct Args {
