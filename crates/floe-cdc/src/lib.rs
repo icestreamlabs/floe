@@ -20,6 +20,8 @@ const CDC_ROW_VALUE_INT64: u8 = 1;
 const CDC_ROW_VALUE_BOOL: u8 = 2;
 const CDC_ROW_VALUE_UTF8: u8 = 3;
 const CDC_ROW_VALUE_TIMESTAMP_MILLIS: u8 = 4;
+const CDC_ROW_VALUE_DATE_DAYS: u8 = 5;
+const CDC_ROW_VALUE_NUMERIC: u8 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcRowDelta {
@@ -675,6 +677,15 @@ fn encode_cdc_row_value(out: &mut Vec<u8>, value: Option<&RowValue>) -> Result<(
             out.push(CDC_ROW_VALUE_TIMESTAMP_MILLIS);
             out.extend_from_slice(&value.to_le_bytes());
         }
+        Some(RowValue::DateDays(value)) => {
+            out.push(CDC_ROW_VALUE_DATE_DAYS);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(RowValue::Numeric(value)) => {
+            out.push(CDC_ROW_VALUE_NUMERIC);
+            push_u32(out, value.len(), "CDC numeric value length")?;
+            out.extend_from_slice(value.as_bytes());
+        }
     }
     Ok(())
 }
@@ -714,6 +725,23 @@ fn encode_cdc_columnar_row_value(
             Some(Some(value)) => {
                 out.push(CDC_ROW_VALUE_TIMESTAMP_MILLIS);
                 out.extend_from_slice(&value.to_le_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::DateDays(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_DATE_DAYS);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::Numeric(values) => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_NUMERIC);
+                push_u32(out, value.len(), "CDC numeric value length")?;
+                out.extend_from_slice(value.as_bytes());
             }
             Some(None) => out.push(CDC_ROW_VALUE_NULL),
             None => bail!("CDC columnar row index {row_idx} out of bounds"),
@@ -783,6 +811,15 @@ impl<'a> CdcRowStateCursor<'a> {
                 Ok(Some(RowValue::Utf8(value)))
             }
             CDC_ROW_VALUE_TIMESTAMP_MILLIS => Ok(Some(RowValue::TimestampMillis(self.read_i64()?))),
+            CDC_ROW_VALUE_DATE_DAYS => Ok(Some(RowValue::DateDays(self.read_i32()?))),
+            CDC_ROW_VALUE_NUMERIC => {
+                let len = self.read_u32()? as usize;
+                let bytes = self.take(len)?;
+                let value = std::str::from_utf8(bytes)
+                    .context("decode CDC numeric row value")?
+                    .to_string();
+                Ok(Some(RowValue::Numeric(value)))
+            }
             other => bail!("unknown CDC row value tag {other}"),
         }
     }
@@ -802,6 +839,13 @@ impl<'a> CdcRowStateCursor<'a> {
     fn read_i64(&mut self) -> Result<i64> {
         let bytes = self.take(8)?;
         Ok(i64::from_le_bytes(
+            bytes.try_into().expect("slice length checked"),
+        ))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        let bytes = self.take(4)?;
+        Ok(i32::from_le_bytes(
             bytes.try_into().expect("slice length checked"),
         ))
     }

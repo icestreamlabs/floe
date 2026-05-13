@@ -602,6 +602,8 @@ fn postgres_column_type(udt_name: &str, data_type: &str) -> Result<ColumnType> {
         "bool" => Ok(ColumnType::Bool),
         "text" | "varchar" | "bpchar" | "name" => Ok(ColumnType::Utf8),
         "timestamp" | "timestamptz" => Ok(ColumnType::TimestampMillis),
+        "date" => Ok(ColumnType::DateDays),
+        "numeric" => Ok(ColumnType::Numeric),
         _ if matches!(
             data_type.as_str(),
             "timestamp without time zone" | "timestamp with time zone"
@@ -630,6 +632,10 @@ fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &s
                     data_type.as_str(),
                     "timestamp without time zone" | "timestamp with time zone"
                 )
+        }
+        ColumnType::DateDays => udt_name == "date" || data_type == "date",
+        ColumnType::Numeric => {
+            udt_name == "numeric" || matches!(data_type.as_str(), "numeric" | "decimal")
         }
     }
 }
@@ -709,6 +715,8 @@ fn snapshot_select_expr(column: &CdcColumn) -> String {
         ColumnType::TimestampMillis => {
             format!("floor(extract(epoch from {quoted}) * 1000)::bigint AS {quoted}")
         }
+        ColumnType::DateDays => format!("({quoted} - DATE '1970-01-01')::int AS {quoted}"),
+        ColumnType::Numeric => format!("{quoted}::text AS {quoted}"),
         ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => quoted,
     }
 }
@@ -781,6 +789,8 @@ enum SnapshotColumnBuilder {
     Bool(Vec<Option<bool>>),
     Utf8(Vec<Option<String>>),
     TimestampMillis(Vec<Option<i64>>),
+    DateDays(Vec<Option<i32>>),
+    Numeric(Vec<Option<String>>),
 }
 
 impl SnapshotColumnBuilder {
@@ -790,6 +800,8 @@ impl SnapshotColumnBuilder {
             ColumnType::Bool => Self::Bool(Vec::with_capacity(capacity)),
             ColumnType::Utf8 => Self::Utf8(Vec::with_capacity(capacity)),
             ColumnType::TimestampMillis => Self::TimestampMillis(Vec::with_capacity(capacity)),
+            ColumnType::DateDays => Self::DateDays(Vec::with_capacity(capacity)),
+            ColumnType::Numeric => Self::Numeric(Vec::with_capacity(capacity)),
         }
     }
 
@@ -816,6 +828,16 @@ impl SnapshotColumnBuilder {
                     )
                 })?);
             }
+            (Self::DateDays(values), ColumnType::DateDays) => {
+                values.push(row.try_get::<_, Option<i32>>(idx).with_context(|| {
+                    format!("decode Postgres CDC snapshot date days '{}'", column.name())
+                })?);
+            }
+            (Self::Numeric(values), ColumnType::Numeric) => {
+                values.push(row.try_get::<_, Option<String>>(idx).with_context(|| {
+                    format!("decode Postgres CDC snapshot numeric '{}'", column.name())
+                })?);
+            }
             _ => bail!(
                 "Postgres CDC snapshot builder for column '{}' does not match type {:?}",
                 column.name(),
@@ -831,6 +853,8 @@ impl SnapshotColumnBuilder {
             Self::Bool(values) => CdcColumnarColumn::Bool(values),
             Self::Utf8(values) => CdcColumnarColumn::Utf8(values),
             Self::TimestampMillis(values) => CdcColumnarColumn::TimestampMillis(values),
+            Self::DateDays(values) => CdcColumnarColumn::DateDays(values),
+            Self::Numeric(values) => CdcColumnarColumn::Numeric(values),
         }
     }
 }

@@ -350,9 +350,16 @@ fn parse_table_column_type(
         DataType::Timestamp(_, _) | DataType::Datetime(_) | DataType::TimestampNtz => {
             SqlColumnType::TimestampMillis
         }
+        DataType::Date | DataType::Date32 => SqlColumnType::DateDays,
+        DataType::Numeric(_)
+        | DataType::Decimal(_)
+        | DataType::DecimalUnsigned(_)
+        | DataType::BigNumeric(_)
+        | DataType::BigDecimal(_)
+        | DataType::Dec(_) => SqlColumnType::Numeric,
         other => {
             return Err(anyhow!(
-                "unsupported type '{other}' for column '{}' in table '{}'; supported: INT64, BOOL, UTF8/TEXT, TIMESTAMP",
+                "unsupported type '{other}' for column '{}' in table '{}'; supported: INT64, BOOL, UTF8/TEXT, TIMESTAMP, DATE, NUMERIC",
                 column_name,
                 table_name
             ));

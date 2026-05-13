@@ -13,6 +13,8 @@ pub enum RowValue {
     Bool(bool),
     Utf8(String),
     TimestampMillis(i64),
+    DateDays(i32),
+    Numeric(String),
 }
 
 pub type RowValues = Vec<RowValue>;

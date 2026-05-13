@@ -249,7 +249,8 @@ impl DbspExpression {
                 DbspScalarType::Int64
                 | DbspScalarType::Utf8
                 | DbspScalarType::TimestampMillis
-                | DbspScalarType::Bool => Ok(()),
+                | DbspScalarType::Bool
+                | DbspScalarType::DateDays => Ok(()),
             }
         } else {
             bail!(

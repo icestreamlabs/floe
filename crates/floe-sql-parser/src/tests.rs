@@ -242,18 +242,23 @@ fn parse_create_postgres_cdc_source_from_connection_parts() {
 #[test]
 fn parse_create_table_statement() {
     let stmt = parse_floe_statement(
-        "CREATE TABLE bids (id BIGINT PRIMARY KEY, price BIGINT NOT NULL, channel TEXT)",
+        "CREATE TABLE bids (id BIGINT PRIMARY KEY, price NUMERIC(15,2) NOT NULL, channel TEXT, shipdate DATE)",
     )
     .expect("parse table");
     match stmt {
         FloeStatement::CreateTable(definition) => {
             assert_eq!(definition.name(), "bids");
-            assert_eq!(definition.columns().len(), 3);
+            assert_eq!(definition.columns().len(), 4);
             let id = &definition.columns()[0];
             assert_eq!(id.name(), "id");
             assert_eq!(id.data_type(), &SqlColumnType::Int64);
             assert!(!id.nullable());
             assert!(id.primary_key());
+            assert_eq!(definition.columns()[1].data_type(), &SqlColumnType::Numeric);
+            assert_eq!(
+                definition.columns()[3].data_type(),
+                &SqlColumnType::DateDays
+            );
         }
         other => panic!("expected CREATE TABLE statement, got {other:?}"),
     }

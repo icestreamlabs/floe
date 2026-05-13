@@ -1831,6 +1831,7 @@ fn compare_encoded_scalars(
         }
         (EncodedRowScalar::Utf8(l), EncodedRowScalar::Utf8(r)) => Some(l.cmp(r)),
         (EncodedRowScalar::Bool(l), EncodedRowScalar::Bool(r)) => Some(l.cmp(r)),
+        (EncodedRowScalar::DateDays(l), EncodedRowScalar::DateDays(r)) => Some(l.cmp(r)),
         _ => None,
     }
 }
@@ -1854,6 +1855,10 @@ fn append_encoded_scalar(value: &EncodedRowScalar, encoded: &mut Vec<u8>) -> Res
         EncodedRowScalar::Bool(value) => {
             encoded.push(0x04);
             encoded.push(if *value { 1 } else { 0 });
+        }
+        EncodedRowScalar::DateDays(value) => {
+            encoded.push(0x09);
+            encoded.extend_from_slice(&value.to_le_bytes());
         }
     }
     Ok(())
@@ -1934,7 +1939,7 @@ fn append_encoded_sum_like_value(
     match output_type {
         DbspScalarType::Int64 => append_encoded_i64(value, encoded),
         DbspScalarType::TimestampMillis => append_encoded_timestamp(value, encoded),
-        DbspScalarType::Utf8 | DbspScalarType::Bool => {
+        DbspScalarType::Utf8 | DbspScalarType::Bool | DbspScalarType::DateDays => {
             return Err(anyhow!(
                 "unsupported aggregate SUM output type for encoded output: {output_type:?}"
             ));
@@ -1950,7 +1955,7 @@ fn aggregate_value_type_from_dbsp_type(
         DbspScalarType::Int64 => Some(dbsp::AggregateValueType::Int64),
         DbspScalarType::TimestampMillis => Some(dbsp::AggregateValueType::TimestampMillis),
         DbspScalarType::Utf8 => Some(dbsp::AggregateValueType::Utf8),
-        DbspScalarType::Bool => None,
+        DbspScalarType::Bool | DbspScalarType::DateDays => None,
     }
 }
 
@@ -2073,6 +2078,10 @@ mod tests {
                 Some(EncodedRowScalar::Bool(value)) => {
                     encoded.push(0x04);
                     encoded.push(if *value { 1 } else { 0 });
+                }
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    encoded.push(0x09);
+                    encoded.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -2548,6 +2557,10 @@ mod aggregate_window_helper_tests {
                 Some(EncodedRowScalar::Bool(value)) => {
                     encoded.push(0x04);
                     encoded.push(if *value { 1 } else { 0 });
+                }
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    encoded.push(0x09);
+                    encoded.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }

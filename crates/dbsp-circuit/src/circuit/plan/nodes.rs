@@ -326,7 +326,10 @@ impl DbspAggregateFunction {
             DbspAggregateFunction::Min | DbspAggregateFunction::Max => {
                 if matches!(
                     input_type,
-                    DbspScalarType::Int64 | DbspScalarType::TimestampMillis | DbspScalarType::Utf8
+                    DbspScalarType::Int64
+                        | DbspScalarType::TimestampMillis
+                        | DbspScalarType::Utf8
+                        | DbspScalarType::DateDays
                 ) {
                     Ok(input_type.clone())
                 } else {

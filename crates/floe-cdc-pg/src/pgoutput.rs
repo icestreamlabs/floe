@@ -19,6 +19,8 @@ const PG_INT8_OID: u32 = 20;
 const PG_TEXT_OID: u32 = 25;
 const PG_BPCHAR_OID: u32 = 1042;
 const PG_VARCHAR_OID: u32 = 1043;
+const PG_DATE_OID: u32 = 1082;
+const PG_NUMERIC_OID: u32 = 1700;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PostgresRelationId(u32);
@@ -563,6 +565,8 @@ fn column_type_for_oid(type_oid: u32) -> Result<ColumnType> {
         PG_BOOL_OID => Ok(ColumnType::Bool),
         PG_INT2_OID | PG_INT4_OID | PG_INT8_OID => Ok(ColumnType::Int64),
         PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(ColumnType::Utf8),
+        PG_DATE_OID => Ok(ColumnType::DateDays),
+        PG_NUMERIC_OID => Ok(ColumnType::Numeric),
         _ => bail!("unsupported Postgres type OID {type_oid} in pgoutput relation metadata"),
     }
 }
@@ -610,12 +614,48 @@ fn parse_text_row_value(column: &PgOutputColumn, value: &str) -> Result<RowValue
             })
         }
         PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(RowValue::Utf8(value.to_string())),
+        PG_DATE_OID => parse_pg_date_days(value).map(RowValue::DateDays),
+        PG_NUMERIC_OID => Ok(RowValue::Numeric(value.to_string())),
         _ => bail!(
             "unsupported Postgres type OID {} for column '{}'",
             column.type_oid(),
             column.name()
         ),
     }
+}
+
+fn parse_pg_date_days(value: &str) -> Result<i32> {
+    let (year, rest) = value
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid Postgres date value '{value}'"))?;
+    let (month, day) = rest
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid Postgres date value '{value}'"))?;
+    let year = year
+        .parse::<i32>()
+        .with_context(|| format!("decode Postgres date year from '{value}'"))?;
+    let month = month
+        .parse::<u32>()
+        .with_context(|| format!("decode Postgres date month from '{value}'"))?;
+    let day = day
+        .parse::<u32>()
+        .with_context(|| format!("decode Postgres date day from '{value}'"))?;
+    ensure!(
+        (1..=12).contains(&month) && (1..=31).contains(&day),
+        "invalid Postgres date value '{value}'"
+    );
+    Ok(days_from_civil(year, month, day))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 struct PgOutputReader {
@@ -893,6 +933,35 @@ mod tests {
                 ])
                 .expect("row")
             }
+        );
+    }
+
+    #[test]
+    fn parses_date_and_numeric_text_values() {
+        let date_column = PgOutputColumn {
+            flags: 0,
+            name: "shipdate".to_string(),
+            type_oid: PG_DATE_OID,
+            type_modifier: -1,
+        };
+        let numeric_column = PgOutputColumn {
+            flags: 0,
+            name: "price".to_string(),
+            type_oid: PG_NUMERIC_OID,
+            type_modifier: -1,
+        };
+
+        assert_eq!(
+            parse_text_row_value(&date_column, "1970-01-01").expect("date"),
+            RowValue::DateDays(0)
+        );
+        assert_eq!(
+            parse_text_row_value(&date_column, "1969-12-31").expect("date"),
+            RowValue::DateDays(-1)
+        );
+        assert_eq!(
+            parse_text_row_value(&numeric_column, "123.45").expect("numeric"),
+            RowValue::Numeric("123.45".to_string())
         );
     }
 

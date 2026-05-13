@@ -668,6 +668,18 @@ fn encode_key_value(value: &RowValue) -> Result<Vec<u8>> {
             buf.push(0x04);
             buf.extend_from_slice(&value.to_be_bytes());
         }
+        RowValue::DateDays(value) => {
+            buf.push(0x05);
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+        RowValue::Numeric(value) => {
+            buf.push(0x06);
+            let bytes = value.as_bytes();
+            let len =
+                u32::try_from(bytes.len()).map_err(|_| anyhow!("numeric primary key too large"))?;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
     }
     Ok(buf)
 }

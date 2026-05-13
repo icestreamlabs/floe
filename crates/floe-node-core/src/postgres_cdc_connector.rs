@@ -313,6 +313,8 @@ fn row_value_to_json(value: &Option<RowValue>) -> Value {
         Some(RowValue::Bool(value)) => Value::from(*value),
         Some(RowValue::Utf8(value)) => Value::from(value.clone()),
         Some(RowValue::TimestampMillis(value)) => Value::from(*value),
+        Some(RowValue::DateDays(value)) => Value::from(*value),
+        Some(RowValue::Numeric(value)) => Value::from(value.clone()),
         None => Value::Null,
     }
 }

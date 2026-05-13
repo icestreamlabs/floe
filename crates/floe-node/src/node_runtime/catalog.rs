@@ -12,6 +12,8 @@ pub(super) fn table_definition_from_sql(
                 SqlColumnType::Bool => ColumnType::Bool,
                 SqlColumnType::Utf8 => ColumnType::Utf8,
                 SqlColumnType::TimestampMillis => ColumnType::TimestampMillis,
+                SqlColumnType::DateDays => ColumnType::DateDays,
+                SqlColumnType::Numeric => ColumnType::Numeric,
             };
             ColumnDefinition::new_typed_nullable(
                 column.name(),
@@ -99,6 +101,8 @@ pub(super) fn source_definition_from_table(
                 ColumnType::Bool => SourceDataType::Bool,
                 ColumnType::Utf8 => SourceDataType::Utf8,
                 ColumnType::TimestampMillis => SourceDataType::TimestampMillis,
+                ColumnType::DateDays => SourceDataType::DateDays,
+                ColumnType::Numeric => SourceDataType::Numeric,
             };
             SourceColumn::new_nullable(column.name(), data_type, column.nullable())
         })

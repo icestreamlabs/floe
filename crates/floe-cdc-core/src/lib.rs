@@ -554,6 +554,8 @@ pub enum CdcColumnarColumn {
     Bool(Vec<Option<bool>>),
     Utf8(Vec<Option<String>>),
     TimestampMillis(Vec<Option<i64>>),
+    DateDays(Vec<Option<i32>>),
+    Numeric(Vec<Option<String>>),
 }
 
 impl CdcColumnarColumn {
@@ -563,6 +565,8 @@ impl CdcColumnarColumn {
             Self::Bool(_) => ColumnType::Bool,
             Self::Utf8(_) => ColumnType::Utf8,
             Self::TimestampMillis(_) => ColumnType::TimestampMillis,
+            Self::DateDays(_) => ColumnType::DateDays,
+            Self::Numeric(_) => ColumnType::Numeric,
         }
     }
 
@@ -572,6 +576,8 @@ impl CdcColumnarColumn {
             Self::Bool(values) => values.len(),
             Self::Utf8(values) => values.len(),
             Self::TimestampMillis(values) => values.len(),
+            Self::DateDays(values) => values.len(),
+            Self::Numeric(values) => values.len(),
         }
     }
 
@@ -585,6 +591,8 @@ impl CdcColumnarColumn {
             Self::Bool(values) => values.iter().any(Option::is_none),
             Self::Utf8(values) => values.iter().any(Option::is_none),
             Self::TimestampMillis(values) => values.iter().any(Option::is_none),
+            Self::DateDays(values) => values.iter().any(Option::is_none),
+            Self::Numeric(values) => values.iter().any(Option::is_none),
         }
     }
 
@@ -609,6 +617,16 @@ impl CdcColumnarColumn {
                 .get(row_idx)
                 .cloned()
                 .map(|value| value.map(RowValue::TimestampMillis))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::DateDays(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::DateDays))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::Numeric(values) => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::Numeric))
                 .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
         }
     }

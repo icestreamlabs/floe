@@ -9,6 +9,7 @@ pub enum DbspScalarType {
     Utf8,
     TimestampMillis,
     Bool,
+    DateDays,
 }
 
 impl DbspScalarType {
@@ -18,6 +19,7 @@ impl DbspScalarType {
             Self::Utf8 => "Utf8",
             Self::TimestampMillis => "TimestampMillis",
             Self::Bool => "Bool",
+            Self::DateDays => "DateDays",
         }
     }
 
@@ -29,6 +31,7 @@ impl DbspScalarType {
                 arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
             }
             Self::Bool => arrow_schema::DataType::Boolean,
+            Self::DateDays => arrow_schema::DataType::Date32,
         }
     }
 
@@ -39,6 +42,7 @@ impl DbspScalarType {
             DataType::Utf8 => Ok(Self::Utf8),
             DataType::Boolean => Ok(Self::Bool),
             DataType::Timestamp(TimeUnit::Millisecond, None) => Ok(Self::TimestampMillis),
+            DataType::Date32 => Ok(Self::DateDays),
             other => bail!("unsupported DataFusion type {:?}", other),
         }
     }
@@ -65,6 +69,8 @@ mod tests {
 
         let ty = DbspScalarType::try_from_arrow(&DataType::Boolean).unwrap();
         assert_eq!(ty, DbspScalarType::Bool);
+        let ty = DbspScalarType::try_from_arrow(&DataType::Date32).unwrap();
+        assert_eq!(ty, DbspScalarType::DateDays);
 
         assert!(DbspScalarType::try_from_arrow(&DataType::Float64).is_err());
     }

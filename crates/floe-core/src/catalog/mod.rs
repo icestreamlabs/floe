@@ -11,6 +11,8 @@ pub enum ColumnType {
     Bool,
     Utf8,
     TimestampMillis,
+    DateDays,
+    Numeric,
 }
 
 impl ColumnType {
@@ -20,6 +22,8 @@ impl ColumnType {
             ColumnType::Bool => DataType::Boolean,
             ColumnType::Utf8 => DataType::Utf8,
             ColumnType::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+            ColumnType::DateDays => DataType::Date32,
+            ColumnType::Numeric => DataType::Utf8,
         }
     }
 
@@ -30,6 +34,8 @@ impl ColumnType {
                 | (ColumnType::Bool, RowValue::Bool(_))
                 | (ColumnType::Utf8, RowValue::Utf8(_))
                 | (ColumnType::TimestampMillis, RowValue::TimestampMillis(_))
+                | (ColumnType::DateDays, RowValue::DateDays(_))
+                | (ColumnType::Numeric, RowValue::Numeric(_))
         )
     }
 }

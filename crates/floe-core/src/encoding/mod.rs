@@ -42,6 +42,8 @@ mod tests {
             RowValue::Bool(true),
             RowValue::Utf8("hello".to_string()),
             RowValue::TimestampMillis(1_700_000_000_000),
+            RowValue::DateDays(19_000),
+            RowValue::Numeric("123.45".to_string()),
         ];
         let encoded = encode(&row).expect("encode");
         let decoded = decode(&encoded).expect("decode");

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{
-    Array, BooleanArray, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    Array, BooleanArray, Date32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray,
 };
 use floe_core::RowValue;
 use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
@@ -220,6 +221,8 @@ enum ArrowColumnValues<'a> {
     Bool(&'a BooleanArray),
     Utf8(&'a StringArray),
     TimestampMillis(&'a TimestampMillisecondArray),
+    DateDays(&'a Date32Array),
+    Numeric(&'a StringArray),
 }
 
 impl<'a> ArrowColumnValues<'a> {
@@ -240,6 +243,16 @@ impl<'a> ArrowColumnValues<'a> {
                 .downcast_ref::<TimestampMillisecondArray>()
                 .map(Self::TimestampMillis)
                 .with_context(|| format!("Arrow column '{column_name}' is not TimestampMillis")),
+            SourceDataType::DateDays => array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .map(Self::DateDays)
+                .with_context(|| format!("Arrow column '{column_name}' is not Date32")),
+            SourceDataType::Numeric => array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(Self::Numeric)
+                .with_context(|| format!("Arrow column '{column_name}' is not Numeric/Utf8")),
             SourceDataType::Bool => array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -254,6 +267,8 @@ impl<'a> ArrowColumnValues<'a> {
             Self::Bool(array) => array.is_null(row_idx),
             Self::Utf8(array) => array.is_null(row_idx),
             Self::TimestampMillis(array) => array.is_null(row_idx),
+            Self::DateDays(array) => array.is_null(row_idx),
+            Self::Numeric(array) => array.is_null(row_idx),
         }
     }
 }
@@ -304,6 +319,20 @@ fn encode_prepared_arrow_value_direct(
             buf.push(if array.value(row_idx) { 1 } else { 0 });
             Ok(())
         }
+        (SourceDataType::DateDays, ArrowColumnValues::DateDays(array)) => {
+            let days = array.value(row_idx);
+            buf.push(0x09);
+            buf.extend_from_slice(&days.to_le_bytes());
+            Ok(())
+        }
+        (SourceDataType::Numeric, ArrowColumnValues::Numeric(array)) => {
+            let bytes = array.value(row_idx).as_bytes();
+            buf.push(0x02);
+            let len = u32::try_from(bytes.len()).context("numeric value too large for MV key")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
+            Ok(())
+        }
         _ => bail!("prepared Arrow column '{column_name}' does not match type {data_type:?}"),
     }
 }
@@ -348,6 +377,19 @@ fn encode_row_value_direct(
         Some(RowValue::Bool(flag)) if matches!(data_type, SourceDataType::Bool) => {
             buf.push(0x04);
             buf.push(if *flag { 1 } else { 0 });
+            Ok(())
+        }
+        Some(RowValue::DateDays(days)) if matches!(data_type, SourceDataType::DateDays) => {
+            buf.push(0x09);
+            buf.extend_from_slice(&days.to_le_bytes());
+            Ok(())
+        }
+        Some(RowValue::Numeric(number)) if matches!(data_type, SourceDataType::Numeric) => {
+            buf.push(0x02);
+            let bytes = number.as_bytes();
+            let len = u32::try_from(bytes.len()).context("numeric value too large for MV key")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(bytes);
             Ok(())
         }
         Some(value) => bail!(
@@ -419,6 +461,30 @@ fn encode_value_direct(
                 buf.push(if flag { 1 } else { 0 });
                 Ok(())
             }
+            SourceDataType::DateDays => {
+                let days = value
+                    .as_i64()
+                    .with_context(|| format!("expected integer date days, found {value}"))?;
+                let days = i32::try_from(days)
+                    .with_context(|| format!("date days value out of range: {value}"))?;
+                buf.push(0x09);
+                buf.extend_from_slice(&days.to_le_bytes());
+                Ok(())
+            }
+            SourceDataType::Numeric => {
+                let number = match value {
+                    Value::String(value) => value.clone(),
+                    Value::Number(value) => value.to_string(),
+                    other => bail!("expected numeric string or JSON number, found {other}"),
+                };
+                buf.push(0x02);
+                let bytes = number.as_bytes();
+                let len =
+                    u32::try_from(bytes.len()).context("numeric value too large for MV key")?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+                Ok(())
+            }
         },
     }
 }
@@ -429,6 +495,8 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
         SourceDataType::Utf8 => buf.push(0x06),
         SourceDataType::TimestampMillis => buf.push(0x07),
         SourceDataType::Bool => buf.push(0x08),
+        SourceDataType::DateDays => buf.push(0x0A),
+        SourceDataType::Numeric => buf.push(0x06),
     }
 }
 
@@ -437,7 +505,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+        BooleanArray, Date32Array, Int64Array, StringArray, TimestampMillisecondArray,
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use floe_core::RowValue;
@@ -538,6 +606,53 @@ mod tests {
         assert_eq!(row[0], Some(EncodedRowScalar::Int64(1)));
         assert_eq!(row[1], Some(EncodedRowScalar::Bool(true)));
         assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn encodes_date_and_numeric_columns() {
+        let definition = SourceDefinition::new(
+            "lineitem",
+            vec![
+                SourceColumn::new_nullable("shipdate", SourceDataType::DateDays, false),
+                SourceColumn::new_nullable("extendedprice", SourceDataType::Numeric, false),
+            ],
+        )
+        .expect("definition");
+        let decoder = SourceRowDecoder::new(definition.clone());
+        let event = SourceEvent::new(
+            "lineitem",
+            json!({
+                "shipdate": 10471,
+                "extendedprice": "12345.67"
+            }),
+        );
+
+        let (encoded, ts) = decoder.encode_row_key(&event).expect("encode json");
+        assert_eq!(ts, None);
+        assert_eq!(
+            decode_test_row(&encoded),
+            vec![
+                Some(EncodedRowScalar::DateDays(10471)),
+                Some(EncodedRowScalar::Utf8("12345.67".to_string())),
+            ]
+        );
+
+        let batch = RecordBatch::try_new(
+            definition.to_arrow_schema(),
+            vec![
+                Arc::new(Date32Array::from(vec![10471])),
+                Arc::new(StringArray::from(vec!["12345.67"])),
+            ],
+        )
+        .expect("record batch");
+        let encoded = decoder.encode_arrow_batch(&batch).expect("encode arrow");
+        assert_eq!(
+            decode_test_row(&encoded[0].0),
+            vec![
+                Some(EncodedRowScalar::DateDays(10471)),
+                Some(EncodedRowScalar::Utf8("12345.67".to_string())),
+            ]
+        );
     }
 
     #[test]

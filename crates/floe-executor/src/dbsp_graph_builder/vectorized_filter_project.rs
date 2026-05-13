@@ -7,7 +7,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use datafusion::arrow::array::builder::BinaryDictionaryBuilder;
 use datafusion::arrow::array::{
-    Array, BinaryArray, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use datafusion::common::{Column, DFSchema};
@@ -1045,6 +1046,7 @@ enum CompiledValueType {
     Utf8,
     TimestampMillis,
     Bool,
+    DateDays,
 }
 
 impl CompiledValueType {
@@ -1054,6 +1056,7 @@ impl CompiledValueType {
             DataType::Utf8 => Some(Self::Utf8),
             DataType::Timestamp(TimeUnit::Millisecond, _) => Some(Self::TimestampMillis),
             DataType::Boolean => Some(Self::Bool),
+            DataType::Date32 => Some(Self::DateDays),
             _ => None,
         }
     }
@@ -1065,6 +1068,7 @@ enum CompiledValue {
     Utf8(Option<String>),
     TimestampMillis(Option<i64>),
     Bool(Option<bool>),
+    DateDays(Option<i32>),
 }
 
 impl CompiledValue {
@@ -1074,6 +1078,7 @@ impl CompiledValue {
             CompiledValueType::Utf8 => Self::Utf8(None),
             CompiledValueType::TimestampMillis => Self::TimestampMillis(None),
             CompiledValueType::Bool => Self::Bool(None),
+            CompiledValueType::DateDays => Self::DateDays(None),
         }
     }
 
@@ -1132,13 +1137,32 @@ impl CompiledValue {
                     })?;
                 Ok(Self::Bool((!values.is_null(0)).then(|| values.value(0))))
             }
+            CompiledValueType::DateDays => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unsupported literal array {:?} for compiled type {:?}",
+                            array.data_type(),
+                            data_type
+                        )
+                    })?;
+                Ok(Self::DateDays(
+                    (!values.is_null(0)).then(|| values.value(0)),
+                ))
+            }
         }
     }
 
     fn is_null(&self) -> bool {
         matches!(
             self,
-            Self::Int64(None) | Self::Utf8(None) | Self::TimestampMillis(None) | Self::Bool(None)
+            Self::Int64(None)
+                | Self::Utf8(None)
+                | Self::TimestampMillis(None)
+                | Self::Bool(None)
+                | Self::DateDays(None)
         )
     }
 
@@ -1177,6 +1201,7 @@ impl CompiledValue {
                 left == right
             }
             (Self::Bool(Some(left)), Self::Bool(Some(right))) => left == right,
+            (Self::DateDays(Some(left)), Self::DateDays(Some(right))) => left == right,
             _ => {
                 return Err(anyhow!(
                     "mismatched compiled comparison operands: {self:?} vs {other:?}"
@@ -1197,6 +1222,7 @@ impl CompiledValue {
                 left.cmp(right)
             }
             (Self::Bool(Some(left)), Self::Bool(Some(right))) => left.cmp(right),
+            (Self::DateDays(Some(left)), Self::DateDays(Some(right))) => left.cmp(right),
             _ => {
                 return Err(anyhow!(
                     "mismatched compiled comparison operands: {self:?} vs {other:?}"
@@ -2147,6 +2173,12 @@ fn cast_compiled_value(
         (CompiledValue::Bool(Some(value)), CompiledValueType::Utf8) => {
             Ok(CompiledValue::Utf8(Some(value.to_string())))
         }
+        (CompiledValue::DateDays(Some(value)), CompiledValueType::DateDays) => {
+            Ok(CompiledValue::DateDays(Some(*value)))
+        }
+        (CompiledValue::DateDays(Some(value)), CompiledValueType::Utf8) => {
+            Ok(CompiledValue::Utf8(Some(value.to_string())))
+        }
         (other, target_type) => Err(anyhow!(
             "unsupported compiled cast from {other:?} to {target_type:?}"
         )),
@@ -2435,6 +2467,7 @@ fn build_decoded_input_value_types(
                     CompiledValueType::TimestampMillis
                 }
                 dbsp::circuit::types::DbspScalarType::Bool => CompiledValueType::Bool,
+                dbsp::circuit::types::DbspScalarType::DateDays => CompiledValueType::DateDays,
             })
         })
         .collect()
@@ -2479,7 +2512,7 @@ fn encoded_field_end(bytes: &[u8], start: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
     let payload = start + 1;
     match tag {
-        0x00 | 0x05 | 0x06 | 0x07 | 0x08 => Ok(payload),
+        0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A => Ok(payload),
         0x01 | 0x03 => {
             let end = payload + 8;
             bytes
@@ -2503,6 +2536,13 @@ fn encoded_field_end(bytes: &[u8], start: usize) -> Result<usize> {
             bytes
                 .get(payload..end)
                 .ok_or_else(|| anyhow!("missing boolean payload"))?;
+            Ok(end)
+        }
+        0x09 => {
+            let end = payload + 4;
+            bytes
+                .get(payload..end)
+                .ok_or_else(|| anyhow!("truncated date32 value"))?;
             Ok(end)
         }
         _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
@@ -2550,10 +2590,19 @@ fn decode_encoded_field_as_encoded_scalar(
                 .ok_or_else(|| anyhow!("missing boolean payload"))?;
             Ok(Some(EncodedRowScalar::Bool(flag != 0)))
         }
+        (CompiledValueType::DateDays, 0x09) => {
+            let chunk = field
+                .get(1..5)
+                .ok_or_else(|| anyhow!("truncated date32 value"))?;
+            Ok(Some(EncodedRowScalar::DateDays(i32::from_le_bytes(
+                chunk.try_into().unwrap(),
+            ))))
+        }
         (CompiledValueType::Int64, 0x05)
         | (CompiledValueType::Utf8, 0x06)
         | (CompiledValueType::TimestampMillis, 0x07)
-        | (CompiledValueType::Bool, 0x08) => Ok(None),
+        | (CompiledValueType::Bool, 0x08)
+        | (CompiledValueType::DateDays, 0x0A) => Ok(None),
         _ => Err(anyhow!(
             "encoded field tag {tag:#x} did not match compiled type {data_type:?}"
         )),
@@ -2577,6 +2626,9 @@ fn compiled_value_from_encoded_scalar(
         }
         (CompiledValueType::Bool, Some(EncodedRowScalar::Bool(value))) => {
             Ok(CompiledValue::Bool(Some(*value)))
+        }
+        (CompiledValueType::DateDays, Some(EncodedRowScalar::DateDays(value))) => {
+            Ok(CompiledValue::DateDays(Some(*value)))
         }
         (_, Some(other)) => Err(anyhow!(
             "encoded scalar {other:?} did not match compiled type {data_type:?}"
@@ -2650,6 +2702,11 @@ fn encode_compiled_value(value: &CompiledValue, encoded: &mut Vec<u8>) -> Result
             encoded.push(if *flag { 1 } else { 0 });
         }
         CompiledValue::Bool(None) => encoded.push(0x08),
+        CompiledValue::DateDays(Some(v)) => {
+            encoded.push(0x09);
+            encoded.extend_from_slice(&v.to_le_bytes());
+        }
+        CompiledValue::DateDays(None) => encoded.push(0x0A),
     }
     Ok(())
 }
@@ -2735,6 +2792,10 @@ mod tests {
                 Some(EncodedRowScalar::Bool(value)) => {
                     encoded.push(0x04);
                     encoded.push(if *value { 1 } else { 0 });
+                }
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    encoded.push(0x09);
+                    encoded.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -3009,6 +3070,10 @@ mod helper_tests {
                 Some(EncodedRowScalar::Bool(value)) => {
                     encoded.push(0x04);
                     encoded.push(if *value { 1 } else { 0 });
+                }
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    encoded.push(0x09);
+                    encoded.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }

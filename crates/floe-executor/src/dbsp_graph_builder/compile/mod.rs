@@ -701,6 +701,10 @@ mod tests {
                     encoded.push(0x04);
                     encoded.push(if *value { 1 } else { 0 });
                 }
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    encoded.push(0x09);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
             }
         }
         encoded

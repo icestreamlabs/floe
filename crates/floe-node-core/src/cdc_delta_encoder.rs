@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, RecordBatch,
-    StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Int64Array,
+    Int64Builder, RecordBatch, StringArray, StringBuilder, TimestampMillisecondArray,
+    TimestampMillisecondBuilder,
 };
 use floe_cdc::CdcTableDeltas;
 use floe_cdc_core::{
@@ -175,6 +176,17 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
         CdcColumnarColumn::TimestampMillis(values) => {
             Arc::new(TimestampMillisecondArray::from(values.clone()))
         }
+        CdcColumnarColumn::DateDays(values) => Arc::new(Date32Array::from(values.clone())),
+        CdcColumnarColumn::Numeric(values) => {
+            let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 16);
+            for value in values {
+                match value {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
     };
     Ok(array)
 }
@@ -250,6 +262,8 @@ enum CdcArrowColumnBuilder {
     Bool(BooleanBuilder),
     Utf8(StringBuilder),
     TimestampMillis(TimestampMillisecondBuilder),
+    DateDays(Date32Builder),
+    Numeric(StringBuilder),
 }
 
 impl CdcArrowColumnBuilder {
@@ -264,6 +278,11 @@ impl CdcArrowColumnBuilder {
             SourceDataType::TimestampMillis => {
                 Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(row_capacity))
             }
+            SourceDataType::DateDays => Self::DateDays(Date32Builder::with_capacity(row_capacity)),
+            SourceDataType::Numeric => Self::Numeric(StringBuilder::with_capacity(
+                row_capacity,
+                row_capacity * 16,
+            )),
         }
     }
 
@@ -292,12 +311,24 @@ impl CdcArrowColumnBuilder {
             ) => {
                 builder.append_value(*value);
             }
+            (
+                Self::DateDays(builder),
+                SourceDataType::DateDays,
+                Some(RowValue::DateDays(value)),
+            ) => {
+                builder.append_value(*value);
+            }
+            (Self::Numeric(builder), SourceDataType::Numeric, Some(RowValue::Numeric(value))) => {
+                builder.append_value(value);
+            }
             (Self::Int64(builder), SourceDataType::Int64, None) => builder.append_null(),
             (Self::Bool(builder), SourceDataType::Bool, None) => builder.append_null(),
             (Self::Utf8(builder), SourceDataType::Utf8, None) => builder.append_null(),
             (Self::TimestampMillis(builder), SourceDataType::TimestampMillis, None) => {
                 builder.append_null();
             }
+            (Self::DateDays(builder), SourceDataType::DateDays, None) => builder.append_null(),
+            (Self::Numeric(builder), SourceDataType::Numeric, None) => builder.append_null(),
             (_, _, Some(value)) => {
                 bail!(
                     "source row value for column '{}' does not match type {:?}: {:?}",
@@ -321,6 +352,8 @@ impl CdcArrowColumnBuilder {
             Self::Bool(builder) => Arc::new(builder.finish()),
             Self::Utf8(builder) => Arc::new(builder.finish()),
             Self::TimestampMillis(builder) => Arc::new(builder.finish()),
+            Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Numeric(builder) => Arc::new(builder.finish()),
         };
         Ok(array)
     }
@@ -370,6 +403,20 @@ fn arrow_row_value(
                 .downcast_ref::<TimestampMillisecondArray>()
                 .context("CDC Arrow column is not TimestampMillis")?;
             Ok(Some(RowValue::TimestampMillis(array.value(row_idx))))
+        }
+        ColumnType::DateDays => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .context("CDC Arrow column is not Date32")?;
+            Ok(Some(RowValue::DateDays(array.value(row_idx))))
+        }
+        ColumnType::Numeric => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("CDC Arrow column is not Numeric/Utf8")?;
+            Ok(Some(RowValue::Numeric(array.value(row_idx).to_string())))
         }
     }
 }

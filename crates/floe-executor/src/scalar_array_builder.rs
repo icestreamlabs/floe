@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder, NullArray, StringBuilder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Int64Builder, NullArray, StringBuilder,
     TimestampMillisecondBuilder, UInt64Builder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -17,6 +17,7 @@ pub(crate) enum ScalarColumnBuilder {
         builder: TimestampMillisecondBuilder,
         data_type: DataType,
     },
+    DateDays(Date32Builder),
     Bool(BooleanBuilder),
     Binary(BinaryBuilder),
     UInt64(UInt64Builder),
@@ -41,6 +42,7 @@ impl ScalarColumnBuilder {
                     data_type,
                 })
             }
+            DataType::Date32 => Ok(Self::DateDays(Date32Builder::with_capacity(capacity))),
             DataType::Boolean => Ok(Self::Bool(BooleanBuilder::with_capacity(capacity))),
             DataType::Binary => Ok(Self::Binary(BinaryBuilder::with_capacity(
                 capacity,
@@ -77,6 +79,10 @@ impl ScalarColumnBuilder {
                     builder.append_value(v);
                     Ok(())
                 }
+                Some(RowValue::Numeric(v)) => {
+                    builder.append_value(v);
+                    Ok(())
+                }
                 Some(other) => Err(anyhow!(
                     "expected Utf8 row value for Utf8 column, found {other:?}"
                 )),
@@ -98,6 +104,18 @@ impl ScalarColumnBuilder {
                     )),
                 })?
             }
+            Self::DateDays(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
+                Some(RowValue::DateDays(v)) => {
+                    builder.append_value(*v);
+                    Ok(())
+                }
+                Some(other) => Err(anyhow!(
+                    "expected DateDays row value for Date32 column, found {other:?}"
+                )),
+                None => Err(anyhow!(
+                    "row missing column index {column_idx} for Date32 column"
+                )),
+            })?,
             Self::Bool(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
                 Some(RowValue::Bool(v)) => {
                     builder.append_value(*v);
@@ -186,6 +204,15 @@ impl ScalarColumnBuilder {
                 Some(other) => {
                     return Err(anyhow!(
                         "expected TimestampMillis encoded scalar for timestamp(ms) column, found {other:?}"
+                    ));
+                }
+            },
+            Self::DateDays(builder) => match value {
+                Some(EncodedRowScalar::DateDays(value)) => builder.append_value(*value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected DateDays encoded scalar for Date32 column, found {other:?}"
                     ));
                 }
             },
@@ -289,6 +316,23 @@ impl ScalarColumnBuilder {
                     ));
                 }
             },
+            Self::DateDays(builder) => match value {
+                Some(EncodedRowScalar::DateDays(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(*value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected DateDays encoded scalar for Date32 column, found {other:?}"
+                    ));
+                }
+            },
             Self::Bool(builder) => match value {
                 Some(EncodedRowScalar::Bool(value)) => {
                     for _ in 0..count {
@@ -348,6 +392,7 @@ impl ScalarColumnBuilder {
             Self::TimestampMillis { builder, data_type } => {
                 Arc::new(builder.finish().with_data_type(data_type.clone()))
             }
+            Self::DateDays(builder) => Arc::new(builder.finish()),
             Self::Bool(builder) => Arc::new(builder.finish()),
             Self::Binary(builder) => Arc::new(builder.finish()),
             Self::UInt64(builder) => Arc::new(builder.finish()),

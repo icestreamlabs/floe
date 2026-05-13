@@ -349,6 +349,46 @@ DROP TABLE public.lineitem_flat_stage;
 SQL
 }
 
+load_tpch_lineitem_dataset() {
+  if [[ "${BENCH_MODE}" != "snapshot" ]]; then
+    echo "DATASET=tpch-lineitem currently supports BENCH_MODE=snapshot only" >&2
+    exit 1
+  fi
+  require_cmd "${TPCHGEN_BIN}"
+  mkdir -p "${TPCH_DATA_DIR}"
+  "${TPCHGEN_BIN}" \
+    --scale-factor "${TPCH_SCALE_FACTOR}" \
+    --tables lineitem \
+    --format tbl \
+    --output-dir "${TPCH_DATA_DIR}" >/dev/null
+
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP PUBLICATION IF EXISTS ${PUBLICATION};
+DROP TABLE IF EXISTS public.lineitem;
+CREATE TABLE public.lineitem (
+  l_orderkey BIGINT NOT NULL,
+  l_partkey BIGINT NOT NULL,
+  l_suppkey BIGINT NOT NULL,
+  l_linenumber BIGINT NOT NULL,
+  l_quantity NUMERIC(15,2) NOT NULL,
+  l_extendedprice NUMERIC(15,2) NOT NULL,
+  l_discount NUMERIC(15,2) NOT NULL,
+  l_tax NUMERIC(15,2) NOT NULL,
+  l_returnflag CHAR(1) NOT NULL,
+  l_linestatus CHAR(1) NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_commitdate DATE NOT NULL,
+  l_receiptdate DATE NOT NULL,
+  l_shipinstruct CHAR(25) NOT NULL,
+  l_shipmode CHAR(10) NOT NULL,
+  l_comment VARCHAR(44) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+);
+SQL
+
+  copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
+}
+
 write_live_inserts() {
   local total="$1"
   local chunk="${LIVE_WRITE_CHUNK_ROWS}"
@@ -457,8 +497,19 @@ case "${DATASET}" in
       TOPIC="floe_cdc_bench_lineitem_flat"
     fi
     ;;
+  tpch-lineitem)
+    source_table="lineitem"
+    upstream_table="public.lineitem"
+    pipeline_name="pg_lineitem_to_kafka"
+    if [[ "${ARROW_IPC_ROWS_PER_RECORD}" == "8192" ]]; then
+      ARROW_IPC_ROWS_PER_RECORD="1024"
+    fi
+    if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
+      TOPIC="floe_cdc_bench_lineitem"
+    fi
+    ;;
   *)
-    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat)" >&2
+    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat|tpch-lineitem)" >&2
     exit 1
     ;;
 esac
@@ -547,6 +598,10 @@ case "${DATASET}" in
   tpch-lineitem-flat)
     load_tpch_lineitem_flat_dataset
     initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem_flat")"
+    ;;
+  tpch-lineitem)
+    load_tpch_lineitem_dataset
+    initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem")"
     ;;
 esac
 load_finished_ns="$(date +%s%N)"

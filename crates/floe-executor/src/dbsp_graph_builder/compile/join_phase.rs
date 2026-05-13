@@ -1482,6 +1482,7 @@ fn encode_null_row_template(schema: &RowSchema) -> Result<Vec<u8>> {
             DbspScalarType::Utf8 => encoded.push(0x06),
             DbspScalarType::TimestampMillis => encoded.push(0x07),
             DbspScalarType::Bool => encoded.push(0x08),
+            DbspScalarType::DateDays => encoded.push(0x0A),
         }
     }
     Ok(encoded)

@@ -15,6 +15,8 @@ pub enum SourceDataType {
     Bool,
     Utf8,
     TimestampMillis,
+    DateDays,
+    Numeric,
 }
 
 impl SourceDataType {
@@ -24,6 +26,8 @@ impl SourceDataType {
             SourceDataType::Bool => ColumnType::Bool,
             SourceDataType::Utf8 => ColumnType::Utf8,
             SourceDataType::TimestampMillis => ColumnType::TimestampMillis,
+            SourceDataType::DateDays => ColumnType::DateDays,
+            SourceDataType::Numeric => ColumnType::Numeric,
         }
     }
 

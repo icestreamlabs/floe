@@ -657,6 +657,8 @@ enum DirectColumnValue<'de> {
     TimestampMillis(i64),
     Utf8(Cow<'de, str>),
     Bool(bool),
+    DateDays(i32),
+    Numeric(Cow<'de, str>),
     Null,
 }
 
@@ -781,6 +783,28 @@ impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
                     ))),
                 }
             }
+            SourceDataType::DateDays => {
+                let value = Option::<i32>::deserialize(deserializer)?;
+                match value {
+                    Some(value) => Ok((DirectColumnValue::DateDays(value), None)),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.field_name
+                    ))),
+                }
+            }
+            SourceDataType::Numeric => {
+                let value = Option::<Cow<'de, str>>::deserialize(deserializer)?;
+                match value {
+                    Some(value) => Ok((DirectColumnValue::Numeric(value), None)),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.field_name
+                    ))),
+                }
+            }
         }
     }
 }
@@ -814,6 +838,18 @@ where
             row.push(0x04);
             row.push(if value { 1 } else { 0 });
         }
+        DirectColumnValue::DateDays(value) => {
+            row.push(0x09);
+            row.extend_from_slice(&value.to_le_bytes());
+        }
+        DirectColumnValue::Numeric(value) => {
+            let bytes = value.as_bytes();
+            let len = u32::try_from(bytes.len())
+                .map_err(|_| E::custom("numeric value too large for MV key"))?;
+            row.push(0x02);
+            row.extend_from_slice(&len.to_le_bytes());
+            row.extend_from_slice(bytes);
+        }
         DirectColumnValue::Null => encode_typed_null(row, data_type),
     }
     Ok(())
@@ -825,6 +861,8 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
         SourceDataType::Utf8 => buf.push(0x06),
         SourceDataType::TimestampMillis => buf.push(0x07),
         SourceDataType::Bool => buf.push(0x08),
+        SourceDataType::DateDays => buf.push(0x0A),
+        SourceDataType::Numeric => buf.push(0x06),
     }
 }
 

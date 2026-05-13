@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::{
-    BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+    BooleanBuilder, Date32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::writer::StreamWriter;
@@ -698,6 +698,19 @@ fn arrow_ipc_columnar_array(
         CdcColumnarColumn::TimestampMillis(values) => Arc::new(
             arrow_array::TimestampMillisecondArray::from(values[start..end].to_vec()),
         ),
+        CdcColumnarColumn::DateDays(values) => {
+            Arc::new(arrow_array::Date32Array::from(values[start..end].to_vec()))
+        }
+        CdcColumnarColumn::Numeric(values) => {
+            let mut builder = StringBuilder::with_capacity(end - start, (end - start) * 16);
+            for value in &values[start..end] {
+                match value {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
     };
     Ok(array)
 }
@@ -716,6 +729,8 @@ fn arrow_ipc_schema(schema: &CdcTableSchema) -> Arc<ArrowSchema> {
                     ColumnType::TimestampMillis => {
                         DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
                     }
+                    ColumnType::DateDays => DataType::Date32,
+                    ColumnType::Numeric => DataType::Utf8,
                 },
                 true,
             )
@@ -754,6 +769,8 @@ enum ArrowIpcColumnBuilder {
     Bool(BooleanBuilder),
     Utf8(StringBuilder),
     TimestampMillis(TimestampMillisecondBuilder),
+    DateDays(Date32Builder),
+    Numeric(StringBuilder),
 }
 
 impl ArrowIpcColumnBuilder {
@@ -764,6 +781,10 @@ impl ArrowIpcColumnBuilder {
             ColumnType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 16)),
             ColumnType::TimestampMillis => {
                 Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(capacity))
+            }
+            ColumnType::DateDays => Self::DateDays(Date32Builder::with_capacity(capacity)),
+            ColumnType::Numeric => {
+                Self::Numeric(StringBuilder::with_capacity(capacity, capacity * 16))
             }
         }
     }
@@ -786,12 +807,20 @@ impl ArrowIpcColumnBuilder {
             ) => {
                 builder.append_value(*value);
             }
+            (Self::DateDays(builder), ColumnType::DateDays, Some(RowValue::DateDays(value))) => {
+                builder.append_value(*value);
+            }
+            (Self::Numeric(builder), ColumnType::Numeric, Some(RowValue::Numeric(value))) => {
+                builder.append_value(value);
+            }
             (Self::Int64(builder), ColumnType::Int64, None) => builder.append_null(),
             (Self::Bool(builder), ColumnType::Bool, None) => builder.append_null(),
             (Self::Utf8(builder), ColumnType::Utf8, None) => builder.append_null(),
             (Self::TimestampMillis(builder), ColumnType::TimestampMillis, None) => {
                 builder.append_null();
             }
+            (Self::DateDays(builder), ColumnType::DateDays, None) => builder.append_null(),
+            (Self::Numeric(builder), ColumnType::Numeric, None) => builder.append_null(),
             (_, _, Some(value)) => {
                 return Err(anyhow!(
                     "CDC Arrow IPC value for column '{}' does not match type {:?}: {:?}",
@@ -817,6 +846,8 @@ impl ArrowIpcColumnBuilder {
             Self::Bool(builder) => Arc::new(builder.finish()),
             Self::Utf8(builder) => Arc::new(builder.finish()),
             Self::TimestampMillis(builder) => Arc::new(builder.finish()),
+            Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Numeric(builder) => Arc::new(builder.finish()),
         }
     }
 }

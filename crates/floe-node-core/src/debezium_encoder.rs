@@ -355,6 +355,8 @@ fn row_value_to_json(value: &RowValue) -> Value {
         RowValue::Bool(value) => json!(*value),
         RowValue::Utf8(value) => Value::String(value.clone()),
         RowValue::TimestampMillis(value) => json!(*value),
+        RowValue::DateDays(value) => json!(*value),
+        RowValue::Numeric(value) => Value::String(value.clone()),
     }
 }
 

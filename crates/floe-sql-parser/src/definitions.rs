@@ -41,6 +41,8 @@ pub enum SqlColumnType {
     Bool,
     Utf8,
     TimestampMillis,
+    DateDays,
+    Numeric,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
