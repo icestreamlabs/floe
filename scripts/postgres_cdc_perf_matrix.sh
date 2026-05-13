@@ -7,6 +7,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUN_ID="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-${REPO_ROOT}/target/cdc_bench_matrix/${RUN_ID}}"
 ROWS_LIST="${ROWS_LIST:-1000 100000 1000000}"
+DATASET="${DATASET:-synthetic-orders}"
+TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
 PIPELINE_FORMATS="${PIPELINE_FORMATS:-arrow-ipc debezium-json}"
 BENCH_MODES="${BENCH_MODES:-snapshot live_insert snapshot_live_update}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
@@ -43,6 +45,10 @@ CSV
 Run: \`${RUN_ID}\`
 
 Rows list: \`${ROWS_LIST}\`
+
+Dataset: \`${DATASET}\`
+
+TPC-H scale factor: \`${TPCH_SCALE_FACTOR}\`
 
 Formats: \`${PIPELINE_FORMATS}\`
 
@@ -123,6 +129,8 @@ for mode in ${BENCH_MODES}; do
       if (
         cd "${REPO_ROOT}"
         ARTIFACT_DIR="${run_dir}" \
+        DATASET="${DATASET}" \
+        TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR}" \
         BENCH_MODE="${mode}" \
         PIPELINE_FORMAT="${format}" \
         ROWS="${rows}" \

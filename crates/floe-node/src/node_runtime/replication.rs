@@ -1,5 +1,6 @@
 use super::*;
 
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::{
@@ -28,7 +29,14 @@ const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 const REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
-const REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 8192;
+const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 8192;
+static REPLICATION_ARROW_IPC_ROWS_PER_RECORD: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD)
+});
 
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
@@ -506,8 +514,8 @@ fn encode_arrow_ipc_pipeline_records(
     transaction: &TransactionBatch,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     let mut records = Vec::new();
-    let mut builder =
-        ArrowIpcChangeBatchBuilder::new(schema, REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+    let rows_per_record = *REPLICATION_ARROW_IPC_ROWS_PER_RECORD;
+    let mut builder = ArrowIpcChangeBatchBuilder::new(schema, rows_per_record);
     let is_snapshot = transaction
         .transaction_id()
         .is_some_and(|tx| tx.as_str().starts_with("snapshot:"));
@@ -560,16 +568,14 @@ fn encode_arrow_ipc_snapshot_pipeline_records(
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     schema.validate_columnar_rows(rows)?;
     let mut records = Vec::new();
-    for start in (0..rows.row_count()).step_by(REPLICATION_ARROW_IPC_ROWS_PER_RECORD) {
-        let len = rows
-            .row_count()
-            .saturating_sub(start)
-            .min(REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+    let rows_per_record = *REPLICATION_ARROW_IPC_ROWS_PER_RECORD;
+    for start in (0..rows.row_count()).step_by(rows_per_record) {
+        let len = rows.row_count().saturating_sub(start).min(rows_per_record);
         let batch = arrow_ipc_snapshot_record_batch(schema, rows, start, len)?;
         records.push(arrow_ipc_record_from_batch(
             plan,
             transaction,
-            start / REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
+            start / rows_per_record,
             batch,
         )?);
     }
@@ -582,7 +588,7 @@ fn flush_arrow_ipc_record_if_full(
     builder: &mut ArrowIpcChangeBatchBuilder,
     records: &mut Vec<CdcBufferRecord>,
 ) -> anyhow::Result<()> {
-    if builder.len() >= REPLICATION_ARROW_IPC_ROWS_PER_RECORD {
+    if builder.is_full() {
         records.push(finish_arrow_ipc_record(plan, transaction, builder)?);
     }
     Ok(())
@@ -823,6 +829,7 @@ struct ArrowIpcChangeBatchBuilder {
     diffs: Int64Builder,
     sequences: Int64Builder,
     len: usize,
+    capacity: usize,
     chunk_idx: usize,
 }
 
@@ -840,6 +847,7 @@ impl ArrowIpcChangeBatchBuilder {
             diffs: Int64Builder::with_capacity(capacity),
             sequences: Int64Builder::with_capacity(capacity),
             len: 0,
+            capacity,
             chunk_idx: 0,
         }
     }
@@ -883,12 +891,12 @@ impl ArrowIpcChangeBatchBuilder {
         Ok(())
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
     fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= self.capacity
     }
 
     fn chunk_idx(&self) -> usize {
@@ -910,19 +918,11 @@ impl ArrowIpcChangeBatchBuilder {
             .schema
             .columns()
             .iter()
-            .map(|column| {
-                ArrowIpcColumnBuilder::new(
-                    column.data_type(),
-                    REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
-                )
-            })
+            .map(|column| ArrowIpcColumnBuilder::new(column.data_type(), self.capacity))
             .collect();
-        self.operations = StringBuilder::with_capacity(
-            REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
-            REPLICATION_ARROW_IPC_ROWS_PER_RECORD * 2,
-        );
-        self.diffs = Int64Builder::with_capacity(REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
-        self.sequences = Int64Builder::with_capacity(REPLICATION_ARROW_IPC_ROWS_PER_RECORD);
+        self.operations = StringBuilder::with_capacity(self.capacity, self.capacity * 2);
+        self.diffs = Int64Builder::with_capacity(self.capacity);
+        self.sequences = Int64Builder::with_capacity(self.capacity);
         self.len = 0;
         self.chunk_idx += 1;
         Ok(batch)

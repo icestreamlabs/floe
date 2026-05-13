@@ -14,6 +14,7 @@ REDPANDA_PORT="${REDPANDA_PORT:-19092}"
 BROKERS="${BROKERS:-127.0.0.1:${REDPANDA_PORT}}"
 
 ROWS="${ROWS:-100000}"
+DATASET="${DATASET:-synthetic-orders}"
 BENCH_MODE="${BENCH_MODE:-snapshot}"
 TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
@@ -26,9 +27,12 @@ FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
+TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
+TPCHGEN_BIN="${TPCHGEN_BIN:-tpchgen-cli}"
 
 RUN_ID="$(date +%Y%m%dT%H%M%S)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-target/cdc_bench/${RUN_ID}}"
+TPCH_DATA_DIR="${TPCH_DATA_DIR:-${ARTIFACT_DIR}/tpch}"
 CONFIG_PATH="${ARTIFACT_DIR}/empty_config.json"
 SQL_PATH="${ARTIFACT_DIR}/program.sql"
 NODE_STDOUT="${ARTIFACT_DIR}/floe-node.stdout.log"
@@ -223,11 +227,126 @@ write_docker_stats() {
   fi
 }
 
+copy_pipe_delimited_file() {
+  local table="$1"
+  local file="$2"
+  sed 's/|$//' "${file}" | docker exec -i "${POSTGRES_CONTAINER}" psql \
+    -v ON_ERROR_STOP=1 \
+    -U "${POSTGRES_USER}" \
+    -d "${POSTGRES_DB}" \
+    -c "\\copy ${table} FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE E'\\b', ESCAPE E'\\b')" >/dev/null
+}
+
 sleep_live_write_pause() {
   if (( LIVE_WRITE_SLEEP_MS <= 0 )); then
     return
   fi
   sleep "$(awk "BEGIN { printf \"%.3f\", ${LIVE_WRITE_SLEEP_MS} / 1000 }")"
+}
+
+load_synthetic_orders_dataset() {
+  local initial_rows="$1"
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP PUBLICATION IF EXISTS ${PUBLICATION};
+DROP TABLE IF EXISTS public.orders;
+CREATE TABLE public.orders (
+  id BIGINT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  amount BIGINT NOT NULL,
+  status TEXT,
+  created_at BIGINT NOT NULL
+);
+INSERT INTO public.orders
+SELECT
+  gs::BIGINT AS id,
+  (gs % 100000)::BIGINT AS customer_id,
+  (100 + (gs % 10000))::BIGINT AS amount,
+  CASE WHEN gs % 3 = 0 THEN 'paid' WHEN gs % 3 = 1 THEN 'open' ELSE 'cancelled' END AS status,
+  (1700000000000 + gs)::BIGINT AS created_at
+FROM generate_series(1, ${initial_rows}) AS gs;
+SQL
+}
+
+load_tpch_lineitem_flat_dataset() {
+  if [[ "${BENCH_MODE}" != "snapshot" ]]; then
+    echo "DATASET=tpch-lineitem-flat currently supports BENCH_MODE=snapshot only" >&2
+    exit 1
+  fi
+  require_cmd "${TPCHGEN_BIN}"
+  mkdir -p "${TPCH_DATA_DIR}"
+  "${TPCHGEN_BIN}" \
+    --scale-factor "${TPCH_SCALE_FACTOR}" \
+    --tables lineitem \
+    --format tbl \
+    --output-dir "${TPCH_DATA_DIR}" >/dev/null
+
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP PUBLICATION IF EXISTS ${PUBLICATION};
+DROP TABLE IF EXISTS public.lineitem_flat_stage;
+DROP TABLE IF EXISTS public.lineitem_flat;
+CREATE TABLE public.lineitem_flat_stage (
+  l_orderkey TEXT NOT NULL,
+  l_partkey TEXT NOT NULL,
+  l_suppkey TEXT NOT NULL,
+  l_linenumber TEXT NOT NULL,
+  l_quantity TEXT NOT NULL,
+  l_extendedprice TEXT NOT NULL,
+  l_discount TEXT NOT NULL,
+  l_tax TEXT NOT NULL,
+  l_returnflag TEXT NOT NULL,
+  l_linestatus TEXT NOT NULL,
+  l_shipdate TEXT NOT NULL,
+  l_commitdate TEXT NOT NULL,
+  l_receiptdate TEXT NOT NULL,
+  l_shipinstruct TEXT NOT NULL,
+  l_shipmode TEXT NOT NULL,
+  l_comment TEXT NOT NULL
+);
+SQL
+
+  copy_pipe_delimited_file public.lineitem_flat_stage "${TPCH_DATA_DIR}/lineitem.tbl"
+
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+CREATE TABLE public.lineitem_flat (
+  l_orderkey BIGINT NOT NULL,
+  l_partkey BIGINT NOT NULL,
+  l_suppkey BIGINT NOT NULL,
+  l_linenumber BIGINT NOT NULL,
+  l_quantity BIGINT NOT NULL,
+  l_extendedprice_cents BIGINT NOT NULL,
+  l_discount_bps BIGINT NOT NULL,
+  l_tax_bps BIGINT NOT NULL,
+  l_returnflag TEXT NOT NULL,
+  l_linestatus TEXT NOT NULL,
+  l_shipdate_days BIGINT NOT NULL,
+  l_commitdate_days BIGINT NOT NULL,
+  l_receiptdate_days BIGINT NOT NULL,
+  l_shipinstruct TEXT NOT NULL,
+  l_shipmode TEXT NOT NULL,
+  l_comment TEXT NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+);
+INSERT INTO public.lineitem_flat
+SELECT
+  l_orderkey::BIGINT,
+  l_partkey::BIGINT,
+  l_suppkey::BIGINT,
+  l_linenumber::BIGINT,
+  ROUND(l_quantity::NUMERIC)::BIGINT,
+  ROUND(l_extendedprice::NUMERIC * 100)::BIGINT,
+  ROUND(l_discount::NUMERIC * 10000)::BIGINT,
+  ROUND(l_tax::NUMERIC * 10000)::BIGINT,
+  l_returnflag,
+  l_linestatus,
+  (l_shipdate::DATE - DATE '1970-01-01')::BIGINT,
+  (l_commitdate::DATE - DATE '1970-01-01')::BIGINT,
+  (l_receiptdate::DATE - DATE '1970-01-01')::BIGINT,
+  l_shipinstruct,
+  l_shipmode,
+  l_comment
+FROM public.lineitem_flat_stage;
+DROP TABLE public.lineitem_flat_stage;
+SQL
 }
 
 write_live_inserts() {
@@ -321,10 +440,35 @@ expected_update_messages() {
 require_cmd docker
 require_cmd cargo
 
+case "${DATASET}" in
+  synthetic-orders)
+    source_table="orders"
+    upstream_table="public.orders"
+    pipeline_name="pg_orders_to_kafka"
+    ;;
+  tpch-lineitem-flat)
+    source_table="lineitem_flat"
+    upstream_table="public.lineitem_flat"
+    pipeline_name="pg_lineitem_flat_to_kafka"
+    if [[ "${ARROW_IPC_ROWS_PER_RECORD}" == "8192" ]]; then
+      ARROW_IPC_ROWS_PER_RECORD="1024"
+    fi
+    if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
+      TOPIC="floe_cdc_bench_lineitem_flat"
+    fi
+    ;;
+  *)
+    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat)" >&2
+    exit 1
+    ;;
+esac
+
 docker rm -f "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || true
 
 echo "artifact_dir=${ARTIFACT_DIR}"
 echo "rows=${ROWS}"
+echo "dataset=${DATASET}"
+echo "tpch_scale_factor=${TPCH_SCALE_FACTOR}"
 echo "bench_mode=${BENCH_MODE}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
@@ -393,33 +537,23 @@ else
     live_update_rows=0
   fi
 fi
-source_rows=$((initial_rows + live_insert_rows + live_update_rows))
 
-echo "Loading Postgres snapshot table with ${initial_rows} initial rows"
+echo "Loading Postgres dataset ${DATASET} with ${initial_rows} requested initial rows"
 load_started_ns="$(date +%s%N)"
-docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
-DROP PUBLICATION IF EXISTS ${PUBLICATION};
-DROP TABLE IF EXISTS public.orders;
-CREATE TABLE public.orders (
-  id BIGINT PRIMARY KEY,
-  customer_id BIGINT NOT NULL,
-  amount BIGINT NOT NULL,
-  status TEXT,
-  created_at BIGINT NOT NULL
-);
-INSERT INTO public.orders
-SELECT
-  gs::BIGINT AS id,
-  (gs % 100000)::BIGINT AS customer_id,
-  (100 + (gs % 10000))::BIGINT AS amount,
-  CASE WHEN gs % 3 = 0 THEN 'paid' WHEN gs % 3 = 1 THEN 'open' ELSE 'cancelled' END AS status,
-  (1700000000000 + gs)::BIGINT AS created_at
-FROM generate_series(1, ${initial_rows}) AS gs;
-SQL
+case "${DATASET}" in
+  synthetic-orders)
+    load_synthetic_orders_dataset "${initial_rows}"
+    ;;
+  tpch-lineitem-flat)
+    load_tpch_lineitem_flat_dataset
+    initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem_flat")"
+    ;;
+esac
 load_finished_ns="$(date +%s%N)"
 load_seconds="$(awk "BEGIN { printf \"%.3f\", (${load_finished_ns} - ${load_started_ns}) / 1000000000 }")"
 echo "timing.postgres_load_seconds=${load_seconds}"
 write_postgres_settings
+source_rows=$((initial_rows + live_insert_rows + live_update_rows))
 
 if [[ "${BUILD_RELEASE}" == "1" ]]; then
   echo "Building release binaries"
@@ -441,8 +575,8 @@ CREATE SOURCE pg_main WITH (
   slot.name = '${SLOT}',
   publication.name = '${PUBLICATION}'
 );
-CREATE REPLICATION PIPELINE pg_orders_to_kafka
-FROM pg_main TABLE 'public.orders'
+CREATE REPLICATION PIPELINE ${pipeline_name}
+FROM pg_main TABLE '${upstream_table}'
 INTO KAFKA WITH (
   brokers = '${BROKERS}',
   topic = '${TOPIC}',
@@ -473,6 +607,7 @@ if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1
     env \
     FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+    FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
@@ -486,6 +621,7 @@ elif command -v setsid >/dev/null 2>&1; then
   setsid env \
     FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+    FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
@@ -498,6 +634,7 @@ else
   node_process_group=0
   FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
   FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
+  FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
   "${FLOE_BIN}" run \
     --config "${CONFIG_PATH}" \
     --mv-query "$(cat "${SQL_PATH}")" \
@@ -551,13 +688,18 @@ counter_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${counte
 end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${end_to_end_seconds} }")"
 
 {
+  echo "benchmark.dataset=${DATASET}"
+  echo "benchmark.tpch_scale_factor=${TPCH_SCALE_FACTOR}"
   echo "benchmark.rows=${ROWS}"
+  echo "benchmark.source_table=${source_table}"
+  echo "benchmark.upstream_table=${upstream_table}"
   echo "benchmark.mode=${BENCH_MODE}"
   echo "benchmark.initial_rows=${initial_rows}"
   echo "benchmark.live_insert_rows=${live_insert_rows}"
   echo "benchmark.live_update_rows=${live_update_rows}"
   echo "benchmark.source_rows=${source_rows}"
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
+  echo "benchmark.arrow_ipc_rows_per_record=${ARROW_IPC_ROWS_PER_RECORD}"
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
   echo "benchmark.live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
   echo "benchmark.expected_kafka_messages=${expected_messages}"
