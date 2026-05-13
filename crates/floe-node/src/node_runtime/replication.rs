@@ -102,22 +102,7 @@ impl ReplicationPipelineRuntime {
 
         let mut written = 0usize;
         for plan in plans {
-            let Some(change_batch) = transaction
-                .change_batches()
-                .iter()
-                .find(|batch| batch.table_id() == &plan.table_id)
-            else {
-                continue;
-            };
-            let schema = schemas.get(&plan.table_id).ok_or_else(|| {
-                anyhow!(
-                    "replication pipeline '{}' references missing CDC schema '{}'",
-                    plan.name,
-                    plan.table_id.as_str()
-                )
-            })?;
-            let buffered_records =
-                encode_pipeline_buffer_records(plan, schema, change_batch, transaction)?;
+            let buffered_records = encode_pipeline_transaction_records(plan, schemas, transaction)?;
             if buffered_records.is_empty() {
                 continue;
             }
@@ -381,6 +366,39 @@ impl KafkaReplicationPipelineWriter {
         }
         unreachable!("Kafka retry loop should return");
     }
+}
+
+fn encode_pipeline_transaction_records(
+    plan: &ReplicationPipelineRuntimePlan,
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    transaction: &TransactionBatch,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    let mut matching_batches = transaction
+        .change_batches()
+        .iter()
+        .filter(|batch| batch.table_id() == &plan.table_id)
+        .peekable();
+    if matching_batches.peek().is_none() {
+        return Ok(Vec::new());
+    }
+
+    let schema = schemas.get(&plan.table_id).ok_or_else(|| {
+        anyhow!(
+            "replication pipeline '{}' references missing CDC schema '{}'",
+            plan.name,
+            plan.table_id.as_str()
+        )
+    })?;
+    let mut records = Vec::new();
+    for change_batch in matching_batches {
+        records.extend(encode_pipeline_buffer_records(
+            plan,
+            schema,
+            change_batch,
+            transaction,
+        )?);
+    }
+    Ok(records)
 }
 
 fn encode_pipeline_buffer_records(
@@ -1201,6 +1219,67 @@ mod tests {
             .expect("op column");
         assert_eq!(ops.value(0), "r");
         assert_eq!(ops.value(1), "r");
+    }
+
+    #[test]
+    fn pipeline_transaction_records_include_all_matching_snapshot_chunks() {
+        let plan = ReplicationPipelineRuntimePlan {
+            name: "p".to_string(),
+            source_name: "pg_main".to_string(),
+            upstream_table: "public.orders".to_string(),
+            table_id: CdcTableId::new("orders").unwrap(),
+            target: ReplicationPipelineRuntimeTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders".to_string(),
+            },
+            format: ReplicationPipelineRuntimeFormat::ArrowIpc,
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+        };
+        let schema = schema(plan.table_id.clone());
+        let first_rows = CdcColumnarRowBatch::new(vec![
+            CdcColumnarColumn::Int64(vec![Some(1)]),
+            CdcColumnarColumn::Utf8(vec![Some("open".to_string())]),
+        ])
+        .unwrap();
+        let second_rows = CdcColumnarRowBatch::new(vec![
+            CdcColumnarColumn::Int64(vec![Some(2), Some(3)]),
+            CdcColumnarColumn::Utf8(vec![Some("paid".to_string()), Some("void".to_string())]),
+        ])
+        .unwrap();
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("snapshot:0/16B6C50").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new_snapshot_insert(plan.table_id.clone(), first_rows)
+                    .expect("first snapshot batch"),
+                ChangeBatch::new_snapshot_insert(plan.table_id.clone(), second_rows)
+                    .expect("second snapshot batch"),
+            ],
+        )
+        .unwrap();
+        let schemas = HashMap::from([(plan.table_id.clone(), schema)]);
+
+        let records = encode_pipeline_transaction_records(&plan, &schemas, &transaction)
+            .expect("encode transaction records");
+
+        assert_eq!(records.len(), 2);
+        let decoded_rows = records
+            .iter()
+            .map(|record| {
+                let payload = record.value().expect("payload");
+                let mut reader =
+                    arrow_ipc::reader::StreamReader::try_new(payload, None).expect("arrow reader");
+                reader
+                    .next()
+                    .expect("one record batch")
+                    .expect("decode batch")
+                    .num_rows()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_rows, vec![1, 2]);
     }
 
     fn schema(table_id: CdcTableId) -> CdcTableSchema {
