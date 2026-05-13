@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::cdc_buffer::CdcBufferStore;
 use anyhow::{Context, Result, anyhow, ensure};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
@@ -35,6 +36,7 @@ const REPLICATION_PIPELINE_CHECKPOINT_PREFIX: &str = "meta/replication_pipeline/
 #[derive(Clone)]
 pub struct SlateCatalog {
     db: Arc<Db>,
+    object_store: Arc<dyn ObjectStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,7 +192,7 @@ impl SlateCatalog {
         object_store: Arc<dyn ObjectStore>,
         settings: Option<Settings>,
     ) -> Result<Self> {
-        let builder = Db::builder(name.into(), object_store);
+        let builder = Db::builder(name.into(), Arc::clone(&object_store));
         let db = match settings {
             Some(settings) => builder
                 .with_settings(settings)
@@ -202,7 +204,10 @@ impl SlateCatalog {
                 .await
                 .map_err(|err| anyhow!("unable to open SlateDB: {err}"))?,
         };
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            object_store,
+        })
     }
 
     pub async fn register_table(&self, definition: TableDefinition) -> Result<()> {
@@ -569,6 +574,14 @@ impl SlateCatalog {
         self.db.clone()
     }
 
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.object_store.clone()
+    }
+
+    pub fn cdc_buffer_store(&self) -> CdcBufferStore {
+        CdcBufferStore::with_object_store(self.db(), self.object_store())
+    }
+
     pub async fn close(&self) -> Result<()> {
         match self.db.close().await {
             Ok(()) => Ok(()),
@@ -672,6 +685,10 @@ fn encode_key_value(value: &RowValue) -> Result<Vec<u8>> {
             buf.push(0x05);
             buf.extend_from_slice(&value.to_be_bytes());
         }
+        RowValue::Decimal128(value) => {
+            buf.push(0x07);
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
         RowValue::Numeric(value) => {
             buf.push(0x06);
             let bytes = value.as_bytes();
@@ -695,7 +712,7 @@ mod tests {
     use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
     use floe_core::catalog::{
         CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
-        PostgresCdcSourceDefinition, ReplicationDelivery, ReplicationPipelineDefinition,
+        PostgresCdcSourceDefinition, ReplicationBufferMode, ReplicationPipelineDefinition,
         ReplicationPipelineFormat, ReplicationPipelineTarget, SourceBackedTableDefinition,
         TableDefinition,
     };
@@ -817,7 +834,8 @@ mod tests {
                 topic: "orders_cdc".to_string(),
             },
             ReplicationPipelineFormat::DebeziumJson,
-            ReplicationDelivery::AtLeastOnce,
+            ReplicationBufferMode::Durable,
+            floe_core::catalog::ReplicationBufferPolicy::default(),
             true,
             true,
         )

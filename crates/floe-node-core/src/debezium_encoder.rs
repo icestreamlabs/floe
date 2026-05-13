@@ -332,7 +332,17 @@ fn row_key_to_json(schema: &CdcTableSchema, key: &CdcRowKey) -> Result<Value> {
     key.validate_against_schema(schema)?;
     let mut object = Map::new();
     for (column, value) in schema.primary_key().columns().iter().zip(key.values()) {
-        object.insert(column.clone(), row_value_to_json(value));
+        let column_definition = schema
+            .columns()
+            .iter()
+            .find(|definition| definition.name() == column)
+            .ok_or_else(|| {
+                anyhow::anyhow!("CDC primary-key column '{column}' missing from schema")
+            })?;
+        object.insert(
+            column.clone(),
+            row_value_to_json(value, column_definition.data_type()),
+        );
     }
     Ok(Value::Object(object))
 }
@@ -343,21 +353,43 @@ fn row_to_json(schema: &CdcTableSchema, row: &CdcRow) -> Result<Value> {
     for (column, value) in schema.columns().iter().zip(row.values()) {
         object.insert(
             column.name().to_string(),
-            value.as_ref().map(row_value_to_json).unwrap_or(Value::Null),
+            value
+                .as_ref()
+                .map(|value| row_value_to_json(value, column.data_type()))
+                .unwrap_or(Value::Null),
         );
     }
     Ok(Value::Object(object))
 }
 
-fn row_value_to_json(value: &RowValue) -> Value {
+fn row_value_to_json(value: &RowValue, data_type: &floe_core::catalog::ColumnType) -> Value {
     match value {
         RowValue::Int64(value) => json!(*value),
         RowValue::Bool(value) => json!(*value),
         RowValue::Utf8(value) => Value::String(value.clone()),
         RowValue::TimestampMillis(value) => json!(*value),
         RowValue::DateDays(value) => json!(*value),
+        RowValue::Decimal128(value) => match data_type {
+            floe_core::catalog::ColumnType::Decimal128 { scale, .. } => {
+                Value::String(format_decimal128(*value, *scale))
+            }
+            _ => Value::String(value.to_string()),
+        },
         RowValue::Numeric(value) => Value::String(value.clone()),
     }
+}
+
+fn format_decimal128(value: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return value.to_string();
+    }
+    let scale = scale as u32;
+    let factor = 10_i128.pow(scale);
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.abs();
+    let whole = magnitude / factor;
+    let fraction = magnitude % factor;
+    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
 
 fn current_unix_time_ms() -> i64 {

@@ -14,6 +14,7 @@ pub enum RowValue {
     Utf8(String),
     TimestampMillis(i64),
     DateDays(i32),
+    Decimal128(i128),
     Numeric(String),
 }
 

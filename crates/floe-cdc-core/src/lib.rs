@@ -555,6 +555,11 @@ pub enum CdcColumnarColumn {
     Utf8(Vec<Option<String>>),
     TimestampMillis(Vec<Option<i64>>),
     DateDays(Vec<Option<i32>>),
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+        values: Vec<Option<i128>>,
+    },
     Numeric(Vec<Option<String>>),
 }
 
@@ -566,6 +571,12 @@ impl CdcColumnarColumn {
             Self::Utf8(_) => ColumnType::Utf8,
             Self::TimestampMillis(_) => ColumnType::TimestampMillis,
             Self::DateDays(_) => ColumnType::DateDays,
+            Self::Decimal128 {
+                precision, scale, ..
+            } => ColumnType::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
             Self::Numeric(_) => ColumnType::Numeric,
         }
     }
@@ -577,6 +588,7 @@ impl CdcColumnarColumn {
             Self::Utf8(values) => values.len(),
             Self::TimestampMillis(values) => values.len(),
             Self::DateDays(values) => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
             Self::Numeric(values) => values.len(),
         }
     }
@@ -592,6 +604,7 @@ impl CdcColumnarColumn {
             Self::Utf8(values) => values.iter().any(Option::is_none),
             Self::TimestampMillis(values) => values.iter().any(Option::is_none),
             Self::DateDays(values) => values.iter().any(Option::is_none),
+            Self::Decimal128 { values, .. } => values.iter().any(Option::is_none),
             Self::Numeric(values) => values.iter().any(Option::is_none),
         }
     }
@@ -622,6 +635,11 @@ impl CdcColumnarColumn {
                 .get(row_idx)
                 .cloned()
                 .map(|value| value.map(RowValue::DateDays))
+                .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
+            Self::Decimal128 { values, .. } => values
+                .get(row_idx)
+                .cloned()
+                .map(|value| value.map(RowValue::Decimal128))
                 .ok_or_else(|| anyhow::anyhow!("CDC columnar row index {row_idx} out of bounds")),
             Self::Numeric(values) => values
                 .get(row_idx)

@@ -12,10 +12,23 @@ pub enum ColumnType {
     Utf8,
     TimestampMillis,
     DateDays,
+    Decimal128 { precision: u8, scale: i8 },
     Numeric,
 }
 
 impl ColumnType {
+    pub fn decimal128(precision: u8, scale: i8) -> Result<Self> {
+        ensure!(
+            (1..=38).contains(&precision),
+            "Decimal128 precision must be between 1 and 38, got {precision}"
+        );
+        ensure!(
+            scale >= 0 && scale <= precision as i8,
+            "Decimal128 scale must be between 0 and precision {precision}, got {scale}"
+        );
+        Ok(Self::Decimal128 { precision, scale })
+    }
+
     pub fn arrow_type(&self) -> DataType {
         match self {
             ColumnType::Int64 => DataType::Int64,
@@ -23,6 +36,7 @@ impl ColumnType {
             ColumnType::Utf8 => DataType::Utf8,
             ColumnType::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
             ColumnType::DateDays => DataType::Date32,
+            ColumnType::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
             ColumnType::Numeric => DataType::Utf8,
         }
     }
@@ -35,6 +49,7 @@ impl ColumnType {
                 | (ColumnType::Utf8, RowValue::Utf8(_))
                 | (ColumnType::TimestampMillis, RowValue::TimestampMillis(_))
                 | (ColumnType::DateDays, RowValue::DateDays(_))
+                | (ColumnType::Decimal128 { .. }, RowValue::Decimal128(_))
                 | (ColumnType::Numeric, RowValue::Numeric(_))
         )
     }
@@ -129,11 +144,22 @@ pub struct ReplicationPipelineDefinition {
     upstream_table: String,
     target: ReplicationPipelineTarget,
     format: ReplicationPipelineFormat,
-    delivery: ReplicationDelivery,
+    #[serde(default = "default_replication_buffer_mode")]
+    buffer_mode: ReplicationBufferMode,
+    #[serde(default)]
+    buffer_policy: ReplicationBufferPolicy,
     #[serde(default)]
     emit_tombstones: bool,
     #[serde(default)]
     include_transaction_metadata: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReplicationBufferPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_pending_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_pending_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,8 +178,13 @@ pub enum ReplicationPipelineFormat {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ReplicationDelivery {
-    AtLeastOnce,
+pub enum ReplicationBufferMode {
+    Durable,
+    NoBuffer,
+}
+
+fn default_replication_buffer_mode() -> ReplicationBufferMode {
+    ReplicationBufferMode::Durable
 }
 
 impl<'de> Deserialize<'de> for TableDefinition {
@@ -348,7 +379,8 @@ impl ReplicationPipelineDefinition {
         upstream_table: impl Into<String>,
         target: ReplicationPipelineTarget,
         format: ReplicationPipelineFormat,
-        delivery: ReplicationDelivery,
+        buffer_mode: ReplicationBufferMode,
+        buffer_policy: ReplicationBufferPolicy,
         emit_tombstones: bool,
         include_transaction_metadata: bool,
     ) -> Result<Self> {
@@ -374,7 +406,8 @@ impl ReplicationPipelineDefinition {
             upstream_table,
             target,
             format,
-            delivery,
+            buffer_mode,
+            buffer_policy,
             emit_tombstones,
             include_transaction_metadata,
         })
@@ -400,8 +433,12 @@ impl ReplicationPipelineDefinition {
         self.format
     }
 
-    pub fn delivery(&self) -> ReplicationDelivery {
-        self.delivery
+    pub fn buffer_mode(&self) -> ReplicationBufferMode {
+        self.buffer_mode
+    }
+
+    pub fn buffer_policy(&self) -> ReplicationBufferPolicy {
+        self.buffer_policy
     }
 
     pub fn emit_tombstones(&self) -> bool {
@@ -410,6 +447,23 @@ impl ReplicationPipelineDefinition {
 
     pub fn include_transaction_metadata(&self) -> bool {
         self.include_transaction_metadata
+    }
+}
+
+impl ReplicationBufferPolicy {
+    pub fn new(max_pending_bytes: Option<usize>, max_pending_age_ms: Option<u64>) -> Self {
+        Self {
+            max_pending_bytes,
+            max_pending_age_ms,
+        }
+    }
+
+    pub fn max_pending_bytes(&self) -> Option<usize> {
+        self.max_pending_bytes
+    }
+
+    pub fn max_pending_age_ms(&self) -> Option<u64> {
+        self.max_pending_age_ms
     }
 }
 

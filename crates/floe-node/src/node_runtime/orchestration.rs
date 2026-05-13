@@ -185,6 +185,13 @@ fn replication_pipeline_runtime_plan_from_catalog(
                 ReplicationPipelineRuntimeFormat::ArrowIpc
             }
         },
+        buffer_mode: match pipeline.buffer_mode() {
+            CatalogReplicationBufferMode::Durable => ReplicationPipelineRuntimeBufferMode::Durable,
+            CatalogReplicationBufferMode::NoBuffer => {
+                ReplicationPipelineRuntimeBufferMode::NoBuffer
+            }
+        },
+        buffer_policy: pipeline.buffer_policy(),
         emit_tombstones: pipeline.emit_tombstones(),
         include_transaction_metadata: pipeline.include_transaction_metadata(),
     })
@@ -303,13 +310,6 @@ fn validate_replication_pipelines(
         match pipeline.target() {
             CatalogReplicationPipelineTarget::Kafka { .. } => {}
             CatalogReplicationPipelineTarget::Postgres { .. } => {}
-        }
-        if pipeline.delivery() != CatalogReplicationDelivery::AtLeastOnce {
-            return Err(anyhow!(
-                "replication pipeline '{}' uses unsupported delivery {:?}",
-                pipeline.name(),
-                pipeline.delivery()
-            ));
         }
     }
     Ok(())
@@ -2777,7 +2777,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .persist_snapshot(final_frontier, mv_for_task.as_ref(), &outer_registry)
             .await
         {
-            tracing::warn!(error = %err, "best-effort final checkpoint persistence failed");
+            tracing::warn!(error = %err, "final checkpoint persistence failed");
         }
         executor_running_for_task.store(false, Ordering::Relaxed);
     });

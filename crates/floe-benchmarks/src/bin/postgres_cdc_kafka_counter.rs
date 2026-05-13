@@ -3,9 +3,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rdkafka::ClientConfig;
-use rdkafka::Message;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
+use rdkafka::{Message, Offset, TopicPartitionList};
 
 fn main() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
@@ -25,9 +25,18 @@ fn main() -> Result<()> {
         .set("fetch.min.bytes", "1")
         .create()
         .context("create Kafka CDC benchmark consumer")?;
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(&args.topic, 0, Offset::Beginning)
+        .with_context(|| {
+            format!(
+                "build direct assignment for CDC benchmark topic '{}'",
+                args.topic
+            )
+        })?;
     consumer
-        .subscribe(&[args.topic.as_str()])
-        .with_context(|| format!("subscribe to CDC benchmark topic '{}'", args.topic))?;
+        .assign(&assignment)
+        .with_context(|| format!("assign CDC benchmark topic '{}' partition 0", args.topic))?;
 
     let started_at = Instant::now();
     let deadline = started_at + args.timeout;

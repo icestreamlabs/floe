@@ -59,6 +59,7 @@ pub enum EncodedRowScalar {
     TimestampMillis(i64),
     Bool(bool),
     DateDays(i32),
+    Decimal128(i128),
 }
 
 pub fn extract_encoded_row_columns(
@@ -327,7 +328,7 @@ fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
 
 fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
     match tag {
-        0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A => Ok(cursor),
+        0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Ok(cursor),
         0x01 | 0x03 => {
             let end = cursor + 8;
             bytes
@@ -359,13 +360,20 @@ fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
                 .ok_or_else(|| anyhow!("truncated date32 value"))?;
             Ok(end)
         }
+        0x0B => {
+            let end = cursor + 16;
+            bytes
+                .get(cursor..end)
+                .ok_or_else(|| anyhow!("truncated decimal128 value"))?;
+            Ok(end)
+        }
         _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
     }
 }
 
 fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<EncodedRowScalar>> {
     match tag {
-        0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A => Ok(None),
+        0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Ok(None),
         0x01 => {
             let end = cursor + 8;
             let chunk = bytes
@@ -410,12 +418,20 @@ fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<
             let value = i32::from_le_bytes(chunk.try_into().unwrap());
             Ok(Some(EncodedRowScalar::DateDays(value)))
         }
+        0x0B => {
+            let end = cursor + 16;
+            let chunk = bytes
+                .get(cursor..end)
+                .ok_or_else(|| anyhow!("truncated decimal128 value"))?;
+            let value = i128::from_le_bytes(chunk.try_into().unwrap());
+            Ok(Some(EncodedRowScalar::Decimal128(value)))
+        }
         _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
     }
 }
 
 fn is_null_field_tag(tag: u8) -> bool {
-    matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A)
+    matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C)
 }
 
 fn collect_encoded_field_spans_into(

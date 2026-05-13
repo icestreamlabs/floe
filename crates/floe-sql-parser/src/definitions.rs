@@ -254,7 +254,8 @@ pub struct ReplicationPipelineDefinition {
     upstream_table: String,
     target: ReplicationPipelineTarget,
     format: ReplicationPipelineFormat,
-    delivery: ReplicationDelivery,
+    buffer_mode: ReplicationBufferMode,
+    buffer_policy: ReplicationBufferPolicy,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
 }
@@ -271,8 +272,15 @@ pub enum ReplicationPipelineFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicationDelivery {
-    AtLeastOnce,
+pub enum ReplicationBufferMode {
+    Durable,
+    NoBuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplicationBufferPolicy {
+    max_pending_bytes: Option<usize>,
+    max_pending_age_ms: Option<u64>,
 }
 
 impl SinkDefinition {
@@ -321,7 +329,8 @@ impl ReplicationPipelineDefinition {
         upstream_table: impl Into<String>,
         target: ReplicationPipelineTarget,
         format: ReplicationPipelineFormat,
-        delivery: ReplicationDelivery,
+        buffer_mode: ReplicationBufferMode,
+        buffer_policy: ReplicationBufferPolicy,
         emit_tombstones: bool,
         include_transaction_metadata: bool,
     ) -> Result<Self> {
@@ -346,7 +355,8 @@ impl ReplicationPipelineDefinition {
             upstream_table,
             target,
             format,
-            delivery,
+            buffer_mode,
+            buffer_policy,
             emit_tombstones,
             include_transaction_metadata,
         })
@@ -372,8 +382,12 @@ impl ReplicationPipelineDefinition {
         self.format
     }
 
-    pub fn delivery(&self) -> ReplicationDelivery {
-        self.delivery
+    pub fn buffer_mode(&self) -> ReplicationBufferMode {
+        self.buffer_mode
+    }
+
+    pub fn buffer_policy(&self) -> ReplicationBufferPolicy {
+        self.buffer_policy
     }
 
     pub fn emit_tombstones(&self) -> bool {
@@ -382,6 +396,23 @@ impl ReplicationPipelineDefinition {
 
     pub fn include_transaction_metadata(&self) -> bool {
         self.include_transaction_metadata
+    }
+}
+
+impl ReplicationBufferPolicy {
+    pub fn new(max_pending_bytes: Option<usize>, max_pending_age_ms: Option<u64>) -> Self {
+        Self {
+            max_pending_bytes,
+            max_pending_age_ms,
+        }
+    }
+
+    pub fn max_pending_bytes(&self) -> Option<usize> {
+        self.max_pending_bytes
+    }
+
+    pub fn max_pending_age_ms(&self) -> Option<u64> {
+        self.max_pending_age_ms
     }
 }
 

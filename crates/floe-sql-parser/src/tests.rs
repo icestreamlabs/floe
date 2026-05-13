@@ -134,7 +134,9 @@ fn parse_create_replication_pipeline_statement() {
             brokers = 'localhost:9092',
             topic = 'orders_cdc',
             format = 'debezium-json',
-            delivery = 'at-least-once',
+            durable_buffer = true,
+            buffer.max_pending_bytes = 1048576,
+            buffer.max_pending_age_ms = 60000,
             tombstones = true,
             transaction_metadata = true
          )",
@@ -146,7 +148,15 @@ fn parse_create_replication_pipeline_statement() {
             assert_eq!(definition.source_name(), "pg_main");
             assert_eq!(definition.upstream_table(), "public.orders");
             assert_eq!(definition.format(), ReplicationPipelineFormat::DebeziumJson);
-            assert_eq!(definition.delivery(), ReplicationDelivery::AtLeastOnce);
+            assert_eq!(definition.buffer_mode(), ReplicationBufferMode::Durable);
+            assert_eq!(
+                definition.buffer_policy().max_pending_bytes(),
+                Some(1_048_576)
+            );
+            assert_eq!(
+                definition.buffer_policy().max_pending_age_ms(),
+                Some(60_000)
+            );
             assert!(definition.emit_tombstones());
             assert!(definition.include_transaction_metadata());
             assert_eq!(
@@ -174,7 +184,7 @@ fn parse_create_replication_pipeline_defaults() {
         panic!("expected replication pipeline");
     };
     assert_eq!(definition.format(), ReplicationPipelineFormat::DebeziumJson);
-    assert_eq!(definition.delivery(), ReplicationDelivery::AtLeastOnce);
+    assert_eq!(definition.buffer_mode(), ReplicationBufferMode::Durable);
     assert!(!definition.emit_tombstones());
     assert!(!definition.include_transaction_metadata());
 }
@@ -193,6 +203,22 @@ fn parse_create_replication_pipeline_arrow_ipc_format() {
         panic!("expected replication pipeline");
     };
     assert_eq!(definition.format(), ReplicationPipelineFormat::ArrowIpc);
+}
+
+#[test]
+fn parse_create_replication_pipeline_without_durable_buffer() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc',
+            durable_buffer = false
+        )",
+    )
+    .expect("parse replication pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
+        panic!("expected replication pipeline");
+    };
+    assert_eq!(definition.buffer_mode(), ReplicationBufferMode::NoBuffer);
 }
 
 #[test]

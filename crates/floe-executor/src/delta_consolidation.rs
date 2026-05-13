@@ -3,8 +3,8 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Date32Array, Int64Array,
-    StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array,
+    Int64Array, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
@@ -213,6 +213,7 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
             DataType::Timestamp(TimeUnit::Millisecond, _) => payload.push(0x07),
             DataType::Boolean => payload.push(0x08),
             DataType::Date32 => payload.push(0x0A),
+            DataType::Decimal128(_, _) => payload.push(0x0C),
             DataType::Null => payload.push(0x00),
             other => {
                 return internal_err!(
@@ -264,6 +265,13 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
                 return internal_err!("expected Date32 payload array");
             };
             payload.push(0x09);
+            payload.extend_from_slice(&values.value(row).to_le_bytes());
+        }
+        DataType::Decimal128(_, _) => {
+            let Some(values) = column.as_any().downcast_ref::<Decimal128Array>() else {
+                return internal_err!("expected Decimal128 payload array");
+            };
+            payload.push(0x0B);
             payload.extend_from_slice(&values.value(row).to_le_bytes());
         }
         DataType::Null => {

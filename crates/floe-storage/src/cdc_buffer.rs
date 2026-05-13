@@ -3,14 +3,20 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
+use object_store::path::Path as ObjectPath;
+use object_store::{Error as ObjectStoreError, ObjectStore};
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, Error as SlateError, WriteBatch};
 
 const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
+const CDC_BUFFER_PAYLOAD_MAGIC: &[u8; 8] = b"FCDCBUF1";
+const CDC_BUFFER_NONE_LEN: u64 = u64::MAX;
+
 #[derive(Clone)]
 pub struct CdcBufferStore {
     db: Arc<Db>,
+    object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,9 +50,21 @@ pub struct CdcBufferedTransactionManifest {
     transaction_id: Option<CdcTransactionId>,
     record_count: usize,
     payload_bytes: usize,
+    #[serde(default)]
+    payload_storage: CdcBufferPayloadStorage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_object_key: Option<String>,
     buffered_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivered_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcBufferPayloadStorage {
+    #[default]
+    SlateDbBlob,
+    ObjectStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,16 +98,37 @@ pub struct CdcBufferCleanupSummary {
 
 impl CdcBufferStore {
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self {
+            db,
+            object_store: None,
+        }
+    }
+
+    pub fn with_object_store(db: Arc<Db>, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            db,
+            object_store: Some(object_store),
+        }
     }
 
     pub async fn append_transaction(
         &self,
-        append: CdcBufferAppend,
+        append: &CdcBufferAppend,
     ) -> Result<CdcBufferedTransactionManifest> {
         append.validate()?;
         let transaction_key =
             transaction_key(&append.source_position, append.transaction_id.as_ref())?;
+        let payload = encode_payload_records(&append.records)?;
+        let payload_bytes = payload.len();
+        let payload_object_key = payload_object_key(&append.pipeline_name, &transaction_key);
+        let object_store = self.payload_object_store()?;
+        object_store
+            .put(
+                &ObjectPath::from(payload_object_key.clone()),
+                payload.into(),
+            )
+            .await
+            .with_context(|| format!("write CDC buffer payload object '{payload_object_key}'"))?;
         let manifest = CdcBufferedTransactionManifest {
             pipeline_name: append.pipeline_name.clone(),
             source_name: append.source_name.clone(),
@@ -98,7 +137,9 @@ impl CdcBufferStore {
             source_position: append.source_position.clone(),
             transaction_id: append.transaction_id.clone(),
             record_count: append.records.len(),
-            payload_bytes: append.records.iter().map(CdcBufferRecord::byte_len).sum(),
+            payload_bytes,
+            payload_storage: CdcBufferPayloadStorage::ObjectStore,
+            payload_object_key: Some(payload_object_key),
             buffered_at_unix_ms: append.buffered_at_unix_ms,
             delivered_at_unix_ms: None,
         };
@@ -107,16 +148,10 @@ impl CdcBufferStore {
             pending_manifest_key(&append.pipeline_name, &transaction_key),
             serde_json::to_vec(&manifest).context("encode CDC buffer transaction manifest")?,
         );
-        for (idx, record) in append.records.iter().enumerate() {
-            batch.put(
-                payload_key(&append.pipeline_name, &transaction_key, idx),
-                serde_json::to_vec(record).context("encode CDC buffer record")?,
-            );
-        }
         let frontier = CdcBufferFrontier {
-            pipeline_name: append.pipeline_name,
-            source_position: append.source_position,
-            transaction_id: append.transaction_id,
+            pipeline_name: append.pipeline_name.clone(),
+            source_position: append.source_position.clone(),
+            transaction_id: append.transaction_id.clone(),
             updated_at_unix_ms: append.buffered_at_unix_ms,
         };
         batch.put(
@@ -149,17 +184,35 @@ impl CdcBufferStore {
         &self,
         manifest: &CdcBufferedTransactionManifest,
     ) -> Result<Vec<CdcBufferRecord>> {
-        let records = scan_prefix(
-            &self.db,
-            &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
-        )
-        .await?
-        .into_iter()
-        .map(|(_, value)| {
-            serde_json::from_slice::<CdcBufferRecord>(&value)
-                .context("decode CDC buffer payload record")
-        })
-        .collect::<Result<Vec<_>>>()?;
+        let records = match manifest.payload_storage() {
+            CdcBufferPayloadStorage::ObjectStore => {
+                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+                    anyhow!(
+                        "CDC buffer transaction '{}' is missing payload object key",
+                        manifest.transaction_key()
+                    )
+                })?;
+                let object_store = self.payload_object_store()?;
+                let payload = object_store
+                    .get(&ObjectPath::from(payload_object_key.to_string()))
+                    .await
+                    .with_context(|| {
+                        format!("load CDC buffer payload object '{payload_object_key}'")
+                    })?
+                    .bytes()
+                    .await
+                    .with_context(|| {
+                        format!("read CDC buffer payload object '{payload_object_key}'")
+                    })?;
+                decode_payload_records(&payload).with_context(|| {
+                    format!(
+                        "decode CDC buffer payload object '{}'",
+                        manifest.transaction_key(),
+                    )
+                })?
+            }
+            CdcBufferPayloadStorage::SlateDbBlob => self.legacy_slate_records(manifest).await?,
+        };
         ensure!(
             records.len() == manifest.record_count(),
             "CDC buffer transaction '{}' expected {} records, found {}",
@@ -272,15 +325,63 @@ impl CdcBufferStore {
             if now_unix_ms.saturating_sub(delivered_at) < policy.delivered_retention_ms() {
                 continue;
             }
-            for (payload_key, payload_value) in scan_prefix(
-                &self.db,
-                &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
-            )
-            .await?
+            let pending_key =
+                pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+            if self
+                .db
+                .get(pending_key)
+                .await
+                .map_err(map_slate_err)?
+                .is_some()
             {
-                batch.delete(payload_key);
-                summary.deleted_records = summary.deleted_records.saturating_add(1);
-                summary.deleted_bytes = summary.deleted_bytes.saturating_add(payload_value.len());
+                batch.delete(key);
+                summary.deleted_transactions = summary.deleted_transactions.saturating_add(1);
+                continue;
+            }
+            match manifest.payload_storage() {
+                CdcBufferPayloadStorage::ObjectStore => {
+                    let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+                        anyhow!(
+                            "delivered CDC buffer transaction '{}' is missing payload object key",
+                            manifest.transaction_key()
+                        )
+                    })?;
+                    self.delete_payload_object(payload_object_key).await?;
+                    summary.deleted_records = summary
+                        .deleted_records
+                        .saturating_add(manifest.record_count());
+                    summary.deleted_bytes = summary
+                        .deleted_bytes
+                        .saturating_add(manifest.payload_bytes());
+                }
+                CdcBufferPayloadStorage::SlateDbBlob => {
+                    let blob_key =
+                        payload_blob_key(manifest.pipeline_name(), manifest.transaction_key());
+                    let mut deleted_blob = false;
+                    if let Some(payload) =
+                        self.db.get(blob_key.clone()).await.map_err(map_slate_err)?
+                    {
+                        batch.delete(blob_key);
+                        summary.deleted_records = summary
+                            .deleted_records
+                            .saturating_add(manifest.record_count());
+                        summary.deleted_bytes = summary.deleted_bytes.saturating_add(payload.len());
+                        deleted_blob = true;
+                    }
+                    for (payload_key, payload_value) in scan_prefix(
+                        &self.db,
+                        &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
+                    )
+                    .await?
+                    {
+                        batch.delete(payload_key);
+                        if !deleted_blob {
+                            summary.deleted_records = summary.deleted_records.saturating_add(1);
+                        }
+                        summary.deleted_bytes =
+                            summary.deleted_bytes.saturating_add(payload_value.len());
+                    }
+                }
             }
             batch.delete(key);
             summary.deleted_transactions = summary.deleted_transactions.saturating_add(1);
@@ -292,6 +393,62 @@ impl CdcBufferStore {
                 .context("cleanup delivered CDC buffer transactions")?;
         }
         Ok(summary)
+    }
+
+    fn payload_object_store(&self) -> Result<&Arc<dyn ObjectStore>> {
+        self.object_store.as_ref().ok_or_else(|| {
+            anyhow!(
+                "CDC buffer payload object store is not configured; use CdcBufferStore::with_object_store"
+            )
+        })
+    }
+
+    async fn legacy_slate_records(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+    ) -> Result<Vec<CdcBufferRecord>> {
+        if let Some(value) = self
+            .db
+            .get(payload_blob_key(
+                manifest.pipeline_name(),
+                manifest.transaction_key(),
+            ))
+            .await
+            .map_err(map_slate_err)?
+        {
+            return decode_payload_records(&value).with_context(|| {
+                format!(
+                    "decode legacy CDC buffer payload blob '{}'",
+                    manifest.transaction_key()
+                )
+            });
+        }
+
+        scan_prefix(
+            &self.db,
+            &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
+        )
+        .await?
+        .into_iter()
+        .map(|(_, value)| {
+            serde_json::from_slice::<CdcBufferRecord>(&value)
+                .context("decode legacy CDC buffer payload record")
+        })
+        .collect::<Result<Vec<_>>>()
+    }
+
+    async fn delete_payload_object(&self, payload_object_key: &str) -> Result<()> {
+        let object_store = self.payload_object_store()?;
+        match object_store
+            .delete(&ObjectPath::from(payload_object_key.to_string()))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err).with_context(|| {
+                format!("delete CDC buffer payload object '{payload_object_key}'")
+            }),
+        }
     }
 }
 
@@ -336,6 +493,34 @@ impl CdcBufferAppend {
             "CDC buffer append must contain at least one record"
         );
         Ok(())
+    }
+
+    pub fn pipeline_name(&self) -> &str {
+        &self.pipeline_name
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn table_id(&self) -> &str {
+        &self.table_id
+    }
+
+    pub fn source_position(&self) -> &CdcSourcePosition {
+        &self.source_position
+    }
+
+    pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.transaction_id.as_ref()
+    }
+
+    pub fn records(&self) -> &[CdcBufferRecord] {
+        &self.records
+    }
+
+    pub fn buffered_at_unix_ms(&self) -> u64 {
+        self.buffered_at_unix_ms
     }
 }
 
@@ -388,6 +573,14 @@ impl CdcBufferedTransactionManifest {
 
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes
+    }
+
+    pub fn payload_storage(&self) -> CdcBufferPayloadStorage {
+        self.payload_storage
+    }
+
+    pub fn payload_object_key(&self) -> Option<&str> {
+        self.payload_object_key.as_deref()
     }
 
     pub fn buffered_at_unix_ms(&self) -> u64 {
@@ -569,6 +762,22 @@ fn payload_prefix(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
     key
 }
 
+fn payload_blob_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
+    let mut key = pipeline_prefix(pipeline_name);
+    key.extend_from_slice(b"payload_blob/");
+    key.extend_from_slice(transaction_key.as_bytes());
+    key
+}
+
+fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> String {
+    format!(
+        "floe_cdc_buffer_blobs/v1/pipeline/{}/{}.bin",
+        hex(pipeline_name.as_bytes()),
+        transaction_key
+    )
+}
+
+#[cfg(test)]
 fn payload_key(pipeline_name: &str, transaction_key: &str, record_idx: usize) -> Vec<u8> {
     let mut key = payload_prefix(pipeline_name, transaction_key);
     key.extend_from_slice(format!("{record_idx:020}").as_bytes());
@@ -632,6 +841,101 @@ fn push_component(out: &mut Vec<u8>, component: &[u8]) {
     out.extend_from_slice(component);
 }
 
+fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
+    let record_count =
+        u64::try_from(records.len()).context("CDC buffer record count exceeds u64")?;
+    let mut out = Vec::with_capacity(
+        CDC_BUFFER_PAYLOAD_MAGIC.len()
+            + std::mem::size_of::<u64>()
+            + records
+                .iter()
+                .map(|record| {
+                    std::mem::size_of::<u64>() * 2
+                        + record.key.as_ref().map_or(0, Vec::len)
+                        + record.value.as_ref().map_or(0, Vec::len)
+                })
+                .sum::<usize>(),
+    );
+    out.extend_from_slice(CDC_BUFFER_PAYLOAD_MAGIC);
+    out.extend_from_slice(&record_count.to_be_bytes());
+    for record in records {
+        encode_optional_bytes(&mut out, record.key.as_deref())?;
+        encode_optional_bytes(&mut out, record.value.as_deref())?;
+    }
+    Ok(out)
+}
+
+fn encode_optional_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<()> {
+    match value {
+        Some(value) => {
+            let len = u64::try_from(value.len()).context("CDC buffer payload field exceeds u64")?;
+            ensure!(
+                len != CDC_BUFFER_NONE_LEN,
+                "CDC buffer payload field length uses reserved sentinel"
+            );
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        None => out.extend_from_slice(&CDC_BUFFER_NONE_LEN.to_be_bytes()),
+    }
+    Ok(())
+}
+
+fn decode_payload_records(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
+    ensure!(
+        payload.len() >= CDC_BUFFER_PAYLOAD_MAGIC.len() + std::mem::size_of::<u64>(),
+        "CDC buffer payload blob is too short"
+    );
+    ensure!(
+        &payload[..CDC_BUFFER_PAYLOAD_MAGIC.len()] == CDC_BUFFER_PAYLOAD_MAGIC,
+        "CDC buffer payload blob has invalid magic"
+    );
+    let mut cursor = CDC_BUFFER_PAYLOAD_MAGIC.len();
+    let record_count = read_u64(payload, &mut cursor)?;
+    let record_count =
+        usize::try_from(record_count).context("CDC buffer record count exceeds usize")?;
+    let mut records = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        let key = decode_optional_bytes(payload, &mut cursor)?;
+        let value = decode_optional_bytes(payload, &mut cursor)?;
+        records.push(CdcBufferRecord::new(key, value));
+    }
+    ensure!(
+        cursor == payload.len(),
+        "CDC buffer payload blob has trailing bytes"
+    );
+    Ok(records)
+}
+
+fn decode_optional_bytes(payload: &[u8], cursor: &mut usize) -> Result<Option<Vec<u8>>> {
+    let len = read_u64(payload, cursor)?;
+    if len == CDC_BUFFER_NONE_LEN {
+        return Ok(None);
+    }
+    let len = usize::try_from(len).context("CDC buffer payload field length exceeds usize")?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("CDC buffer payload field length overflow"))?;
+    ensure!(
+        end <= payload.len(),
+        "CDC buffer payload field extends past blob end"
+    );
+    let value = payload[*cursor..end].to_vec();
+    *cursor = end;
+    Ok(Some(value))
+}
+
+fn read_u64(payload: &[u8], cursor: &mut usize) -> Result<u64> {
+    let end = cursor
+        .checked_add(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow!("CDC buffer payload cursor overflow"))?;
+    ensure!(end <= payload.len(), "CDC buffer payload ended early");
+    let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+    bytes.copy_from_slice(&payload[*cursor..end]);
+    *cursor = end;
+    Ok(u64::from_be_bytes(bytes))
+}
+
 fn map_slate_err(err: SlateError) -> anyhow::Error {
     anyhow::Error::new(err)
 }
@@ -643,15 +947,19 @@ mod tests {
 
     async fn test_store(name: &str) -> CdcBufferStore {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open(name, object_store).await.expect("open SlateDB"));
-        CdcBufferStore::new(db)
+        let db = Arc::new(
+            Db::open(name, Arc::clone(&object_store))
+                .await
+                .expect("open SlateDB"),
+        );
+        CdcBufferStore::with_object_store(db, object_store)
     }
 
     #[tokio::test]
     async fn appends_and_replays_pending_transactions() {
         let store = test_store("cdc-buffer-append").await;
         let append = append("0/10", 1000, vec![record(1), record(2)]);
-        let manifest = store.append_transaction(append).await.expect("append");
+        let manifest = store.append_transaction(&append).await.expect("append");
 
         let pending = store
             .pending_transactions("pipe", 10)
@@ -661,6 +969,33 @@ mod tests {
         assert_eq!(
             store.records(&manifest).await.unwrap(),
             vec![record(1), record(2)]
+        );
+        let payload_object_key = manifest.payload_object_key().expect("payload object key");
+        assert!(
+            store
+                .object_store
+                .as_ref()
+                .expect("object store")
+                .head(&ObjectPath::from(payload_object_key.to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .db
+                .get(payload_blob_key("pipe", manifest.transaction_key()))
+                .await
+                .expect("load legacy payload blob")
+                .is_none()
+        );
+        assert!(
+            scan_prefix(
+                &store.db,
+                &payload_prefix("pipe", manifest.transaction_key())
+            )
+            .await
+            .expect("legacy payload records")
+            .is_empty()
         );
 
         let frontier = store
@@ -677,12 +1012,14 @@ mod tests {
     #[tokio::test]
     async fn delivery_frontier_and_cleanup_only_delete_delivered_transactions() {
         let store = test_store("cdc-buffer-cleanup").await;
+        let delivered_append = append("0/10", 1000, vec![record(1)]);
         let delivered = store
-            .append_transaction(append("0/10", 1000, vec![record(1)]))
+            .append_transaction(&delivered_append)
             .await
             .expect("append delivered");
+        let pending_append = append("0/20", 2000, vec![record(2)]);
         let pending = store
-            .append_transaction(append("0/20", 2000, vec![record(2)]))
+            .append_transaction(&pending_append)
             .await
             .expect("append pending");
 
@@ -708,6 +1045,21 @@ mod tests {
             .expect("cleanup");
         assert_eq!(summary.deleted_transactions(), 1);
         assert_eq!(summary.deleted_records(), 1);
+        assert!(summary.deleted_bytes() > 0);
+        assert!(
+            store
+                .object_store
+                .as_ref()
+                .expect("object store")
+                .head(&ObjectPath::from(
+                    delivered
+                        .payload_object_key()
+                        .expect("delivered payload object key")
+                        .to_string()
+                ))
+                .await
+                .is_err()
+        );
 
         let pending_after = store
             .pending_transactions("pipe", 10)
@@ -717,14 +1069,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_does_not_delete_replayed_pending_payload() {
+        let store = test_store("cdc-buffer-cleanup-replayed-pending").await;
+        let delivered_append = append("0/10", 1000, vec![record(1)]);
+        let delivered = store
+            .append_transaction(&delivered_append)
+            .await
+            .expect("append delivered");
+        store
+            .mark_delivered(&delivered, 2000)
+            .await
+            .expect("mark delivered");
+
+        let replayed_append = append("0/10", 3000, vec![record(9)]);
+        let pending = store
+            .append_transaction(&replayed_append)
+            .await
+            .expect("append replayed pending");
+        let summary = store
+            .cleanup_delivered("pipe", CdcBufferCleanupPolicy::new(0), 4000)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(summary.deleted_transactions(), 1);
+        assert_eq!(summary.deleted_records(), 0);
+        assert_eq!(store.records(&pending).await.unwrap(), vec![record(9)]);
+    }
+
+    #[tokio::test]
     async fn stats_report_size_and_oldest_age() {
         let store = test_store("cdc-buffer-stats").await;
+        let append_one = append("0/10", 1000, vec![record(1), record(2)]);
         store
-            .append_transaction(append("0/10", 1000, vec![record(1), record(2)]))
+            .append_transaction(&append_one)
             .await
             .expect("append one");
+        let append_two = append("0/20", 1500, vec![record(3)]);
         store
-            .append_transaction(append("0/20", 1500, vec![record(3)]))
+            .append_transaction(&append_two)
             .await
             .expect("append two");
 
@@ -733,6 +1115,84 @@ mod tests {
         assert_eq!(stats.pending_records(), 3);
         assert_eq!(stats.oldest_pending_age_ms(), Some(1500));
         assert!(stats.pending_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn replays_legacy_json_payload_records() {
+        let store = test_store("cdc-buffer-legacy-records").await;
+        let append = append("0/10", 1000, vec![record(1), record(2)]);
+        let transaction_key =
+            transaction_key(append.source_position(), append.transaction_id()).unwrap();
+        let manifest = CdcBufferedTransactionManifest {
+            pipeline_name: append.pipeline_name().to_string(),
+            source_name: append.source_name().to_string(),
+            table_id: append.table_id().to_string(),
+            transaction_key: transaction_key.clone(),
+            source_position: append.source_position().clone(),
+            transaction_id: append.transaction_id().cloned(),
+            record_count: append.records().len(),
+            payload_bytes: append.records().iter().map(CdcBufferRecord::byte_len).sum(),
+            payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
+            payload_object_key: None,
+            buffered_at_unix_ms: append.buffered_at_unix_ms(),
+            delivered_at_unix_ms: None,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            pending_manifest_key("pipe", &transaction_key),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        for (idx, record) in append.records().iter().enumerate() {
+            batch.put(
+                payload_key("pipe", &transaction_key, idx),
+                serde_json::to_vec(record).unwrap(),
+            );
+        }
+        write_durable_batch(store.db.as_ref(), batch)
+            .await
+            .expect("write legacy payload");
+
+        assert_eq!(
+            store.records(&manifest).await.unwrap(),
+            vec![record(1), record(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn replays_legacy_slatedb_payload_blob() {
+        let store = test_store("cdc-buffer-legacy-blob").await;
+        let append = append("0/10", 1000, vec![record(1), record(2)]);
+        let transaction_key =
+            transaction_key(append.source_position(), append.transaction_id()).unwrap();
+        let payload = encode_payload_records(append.records()).expect("encode payload");
+        let manifest = CdcBufferedTransactionManifest {
+            pipeline_name: append.pipeline_name().to_string(),
+            source_name: append.source_name().to_string(),
+            table_id: append.table_id().to_string(),
+            transaction_key: transaction_key.clone(),
+            source_position: append.source_position().clone(),
+            transaction_id: append.transaction_id().cloned(),
+            record_count: append.records().len(),
+            payload_bytes: payload.len(),
+            payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
+            payload_object_key: None,
+            buffered_at_unix_ms: append.buffered_at_unix_ms(),
+            delivered_at_unix_ms: None,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            pending_manifest_key("pipe", &transaction_key),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        batch.put(payload_blob_key("pipe", &transaction_key), payload);
+        write_durable_batch(store.db.as_ref(), batch)
+            .await
+            .expect("write legacy payload blob");
+
+        assert_eq!(
+            store.records(&manifest).await.unwrap(),
+            vec![record(1), record(2)]
+        );
     }
 
     fn append(

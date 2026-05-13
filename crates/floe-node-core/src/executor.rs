@@ -153,6 +153,10 @@ fn source_type_to_dbsp(data_type: &SourceDataType) -> DbspScalarType {
         SourceDataType::Utf8 => DbspScalarType::Utf8,
         SourceDataType::TimestampMillis => DbspScalarType::TimestampMillis,
         SourceDataType::DateDays => DbspScalarType::DateDays,
+        SourceDataType::Decimal128 { precision, scale } => DbspScalarType::Decimal128 {
+            precision: *precision,
+            scale: *scale,
+        },
         SourceDataType::Numeric => DbspScalarType::Utf8,
     }
 }

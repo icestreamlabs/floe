@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Int64Array,
-    Int64Builder, RecordBatch, StringArray, StringBuilder, TimestampMillisecondArray,
-    TimestampMillisecondBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
+    Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringArray, StringBuilder,
+    TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
+use datafusion::arrow::datatypes::DataType;
 use floe_cdc::CdcTableDeltas;
 use floe_cdc_core::{
     CdcColumnarColumn, CdcColumnarRowBatch, CdcRowKey, CdcTableId, CdcTableSchema,
@@ -177,6 +178,15 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
             Arc::new(TimestampMillisecondArray::from(values.clone()))
         }
         CdcColumnarColumn::DateDays(values) => Arc::new(Date32Array::from(values.clone())),
+        CdcColumnarColumn::Decimal128 {
+            precision,
+            scale,
+            values,
+        } => Arc::new(
+            Decimal128Array::from(values.clone())
+                .with_precision_and_scale(*precision, *scale)
+                .context("build Decimal128 CDC snapshot Arrow column")?,
+        ),
         CdcColumnarColumn::Numeric(values) => {
             let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 16);
             for value in values {
@@ -263,6 +273,7 @@ enum CdcArrowColumnBuilder {
     Utf8(StringBuilder),
     TimestampMillis(TimestampMillisecondBuilder),
     DateDays(Date32Builder),
+    Decimal128 { builder: Decimal128Builder },
     Numeric(StringBuilder),
 }
 
@@ -279,6 +290,10 @@ impl CdcArrowColumnBuilder {
                 Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(row_capacity))
             }
             SourceDataType::DateDays => Self::DateDays(Date32Builder::with_capacity(row_capacity)),
+            SourceDataType::Decimal128 { precision, scale } => Self::Decimal128 {
+                builder: Decimal128Builder::with_capacity(row_capacity)
+                    .with_data_type(DataType::Decimal128(*precision, *scale)),
+            },
             SourceDataType::Numeric => Self::Numeric(StringBuilder::with_capacity(
                 row_capacity,
                 row_capacity * 16,
@@ -318,6 +333,13 @@ impl CdcArrowColumnBuilder {
             ) => {
                 builder.append_value(*value);
             }
+            (
+                Self::Decimal128 { builder, .. },
+                SourceDataType::Decimal128 { .. },
+                Some(RowValue::Decimal128(value)),
+            ) => {
+                builder.append_value(*value);
+            }
             (Self::Numeric(builder), SourceDataType::Numeric, Some(RowValue::Numeric(value))) => {
                 builder.append_value(value);
             }
@@ -328,6 +350,9 @@ impl CdcArrowColumnBuilder {
                 builder.append_null();
             }
             (Self::DateDays(builder), SourceDataType::DateDays, None) => builder.append_null(),
+            (Self::Decimal128 { builder, .. }, SourceDataType::Decimal128 { .. }, None) => {
+                builder.append_null();
+            }
             (Self::Numeric(builder), SourceDataType::Numeric, None) => builder.append_null(),
             (_, _, Some(value)) => {
                 bail!(
@@ -353,6 +378,7 @@ impl CdcArrowColumnBuilder {
             Self::Utf8(builder) => Arc::new(builder.finish()),
             Self::TimestampMillis(builder) => Arc::new(builder.finish()),
             Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Decimal128 { builder, .. } => Arc::new(builder.finish()),
             Self::Numeric(builder) => Arc::new(builder.finish()),
         };
         Ok(array)
@@ -410,6 +436,13 @@ fn arrow_row_value(
                 .downcast_ref::<Date32Array>()
                 .context("CDC Arrow column is not Date32")?;
             Ok(Some(RowValue::DateDays(array.value(row_idx))))
+        }
+        ColumnType::Decimal128 { .. } => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .context("CDC Arrow column is not Decimal128")?;
+            Ok(Some(RowValue::Decimal128(array.value(row_idx))))
         }
         ColumnType::Numeric => {
             let array = array

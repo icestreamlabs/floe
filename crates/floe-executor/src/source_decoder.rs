@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::array::{
-    Array, BooleanArray, Date32Array, Int64Array, RecordBatch, StringArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray,
 };
 use floe_core::RowValue;
@@ -222,6 +222,7 @@ enum ArrowColumnValues<'a> {
     Utf8(&'a StringArray),
     TimestampMillis(&'a TimestampMillisecondArray),
     DateDays(&'a Date32Array),
+    Decimal128(&'a Decimal128Array),
     Numeric(&'a StringArray),
 }
 
@@ -248,6 +249,11 @@ impl<'a> ArrowColumnValues<'a> {
                 .downcast_ref::<Date32Array>()
                 .map(Self::DateDays)
                 .with_context(|| format!("Arrow column '{column_name}' is not Date32")),
+            SourceDataType::Decimal128 { .. } => array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .map(Self::Decimal128)
+                .with_context(|| format!("Arrow column '{column_name}' is not Decimal128")),
             SourceDataType::Numeric => array
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -268,6 +274,7 @@ impl<'a> ArrowColumnValues<'a> {
             Self::Utf8(array) => array.is_null(row_idx),
             Self::TimestampMillis(array) => array.is_null(row_idx),
             Self::DateDays(array) => array.is_null(row_idx),
+            Self::Decimal128(array) => array.is_null(row_idx),
             Self::Numeric(array) => array.is_null(row_idx),
         }
     }
@@ -323,6 +330,12 @@ fn encode_prepared_arrow_value_direct(
             let days = array.value(row_idx);
             buf.push(0x09);
             buf.extend_from_slice(&days.to_le_bytes());
+            Ok(())
+        }
+        (SourceDataType::Decimal128 { .. }, ArrowColumnValues::Decimal128(array)) => {
+            let number = array.value(row_idx);
+            buf.push(0x0B);
+            buf.extend_from_slice(&number.to_le_bytes());
             Ok(())
         }
         (SourceDataType::Numeric, ArrowColumnValues::Numeric(array)) => {
@@ -382,6 +395,13 @@ fn encode_row_value_direct(
         Some(RowValue::DateDays(days)) if matches!(data_type, SourceDataType::DateDays) => {
             buf.push(0x09);
             buf.extend_from_slice(&days.to_le_bytes());
+            Ok(())
+        }
+        Some(RowValue::Decimal128(number))
+            if matches!(data_type, SourceDataType::Decimal128 { .. }) =>
+        {
+            buf.push(0x0B);
+            buf.extend_from_slice(&number.to_le_bytes());
             Ok(())
         }
         Some(RowValue::Numeric(number)) if matches!(data_type, SourceDataType::Numeric) => {
@@ -471,6 +491,16 @@ fn encode_value_direct(
                 buf.extend_from_slice(&days.to_le_bytes());
                 Ok(())
             }
+            SourceDataType::Decimal128 { scale, .. } => {
+                let number = match value {
+                    Value::String(value) => parse_decimal_text_to_i128(value, *scale)?,
+                    Value::Number(value) => parse_decimal_text_to_i128(&value.to_string(), *scale)?,
+                    other => bail!("expected decimal string or JSON number, found {other}"),
+                };
+                buf.push(0x0B);
+                buf.extend_from_slice(&number.to_le_bytes());
+                Ok(())
+            }
             SourceDataType::Numeric => {
                 let number = match value {
                     Value::String(value) => value.clone(),
@@ -496,8 +526,33 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
         SourceDataType::TimestampMillis => buf.push(0x07),
         SourceDataType::Bool => buf.push(0x08),
         SourceDataType::DateDays => buf.push(0x0A),
+        SourceDataType::Decimal128 { .. } => buf.push(0x0C),
         SourceDataType::Numeric => buf.push(0x06),
     }
+}
+
+fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
+    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
+    let value = value.trim();
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, value));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + scale as usize);
+    digits.push_str(whole);
+    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
+    ensure!(
+        fraction.len() <= scale_usize,
+        "decimal value '{value}' has more fractional digits than scale {scale}"
+    );
+    digits.push_str(fraction);
+    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
+    let parsed = digits
+        .parse::<i128>()
+        .with_context(|| format!("decode decimal value '{value}'"))?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 #[cfg(test)]
@@ -505,7 +560,8 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        BooleanArray, Date32Array, Int64Array, StringArray, TimestampMillisecondArray,
+        BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+        TimestampMillisecondArray,
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use floe_core::RowValue;
@@ -615,6 +671,14 @@ mod tests {
             vec![
                 SourceColumn::new_nullable("shipdate", SourceDataType::DateDays, false),
                 SourceColumn::new_nullable("extendedprice", SourceDataType::Numeric, false),
+                SourceColumn::new_nullable(
+                    "discount",
+                    SourceDataType::Decimal128 {
+                        precision: 15,
+                        scale: 2,
+                    },
+                    false,
+                ),
             ],
         )
         .expect("definition");
@@ -623,7 +687,8 @@ mod tests {
             "lineitem",
             json!({
                 "shipdate": 10471,
-                "extendedprice": "12345.67"
+                "extendedprice": "12345.67",
+                "discount": "123.45"
             }),
         );
 
@@ -634,6 +699,7 @@ mod tests {
             vec![
                 Some(EncodedRowScalar::DateDays(10471)),
                 Some(EncodedRowScalar::Utf8("12345.67".to_string())),
+                Some(EncodedRowScalar::Decimal128(12_345)),
             ]
         );
 
@@ -642,6 +708,11 @@ mod tests {
             vec![
                 Arc::new(Date32Array::from(vec![10471])),
                 Arc::new(StringArray::from(vec!["12345.67"])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345)])
+                        .with_precision_and_scale(15, 2)
+                        .expect("decimal type"),
+                ),
             ],
         )
         .expect("record batch");
@@ -651,6 +722,7 @@ mod tests {
             vec![
                 Some(EncodedRowScalar::DateDays(10471)),
                 Some(EncodedRowScalar::Utf8("12345.67".to_string())),
+                Some(EncodedRowScalar::Decimal128(12_345)),
             ]
         );
     }

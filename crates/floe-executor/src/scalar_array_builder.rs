@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Int64Builder, NullArray, StringBuilder,
-    TimestampMillisecondBuilder, UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder,
+    NullArray, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use floe_core::RowValue;
@@ -18,6 +18,7 @@ pub(crate) enum ScalarColumnBuilder {
         data_type: DataType,
     },
     DateDays(Date32Builder),
+    Decimal128(Decimal128Builder),
     Bool(BooleanBuilder),
     Binary(BinaryBuilder),
     UInt64(UInt64Builder),
@@ -43,6 +44,10 @@ impl ScalarColumnBuilder {
                 })
             }
             DataType::Date32 => Ok(Self::DateDays(Date32Builder::with_capacity(capacity))),
+            DataType::Decimal128(precision, scale) => Ok(Self::Decimal128(
+                Decimal128Builder::with_capacity(capacity)
+                    .with_data_type(DataType::Decimal128(*precision, *scale)),
+            )),
             DataType::Boolean => Ok(Self::Bool(BooleanBuilder::with_capacity(capacity))),
             DataType::Binary => Ok(Self::Binary(BinaryBuilder::with_capacity(
                 capacity,
@@ -116,6 +121,20 @@ impl ScalarColumnBuilder {
                     "row missing column index {column_idx} for Date32 column"
                 )),
             })?,
+            Self::Decimal128(builder) => {
+                rows.iter().try_for_each(|row| match row.get(column_idx) {
+                    Some(RowValue::Decimal128(v)) => {
+                        builder.append_value(*v);
+                        Ok(())
+                    }
+                    Some(other) => Err(anyhow!(
+                        "expected Decimal128 row value for Decimal128 column, found {other:?}"
+                    )),
+                    None => Err(anyhow!(
+                        "row missing column index {column_idx} for Decimal128 column"
+                    )),
+                })?
+            }
             Self::Bool(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
                 Some(RowValue::Bool(v)) => {
                     builder.append_value(*v);
@@ -213,6 +232,15 @@ impl ScalarColumnBuilder {
                 Some(other) => {
                     return Err(anyhow!(
                         "expected DateDays encoded scalar for Date32 column, found {other:?}"
+                    ));
+                }
+            },
+            Self::Decimal128(builder) => match value {
+                Some(EncodedRowScalar::Decimal128(value)) => builder.append_value(*value),
+                None => builder.append_null(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Decimal128 encoded scalar for Decimal128 column, found {other:?}"
                     ));
                 }
             },
@@ -333,6 +361,23 @@ impl ScalarColumnBuilder {
                     ));
                 }
             },
+            Self::Decimal128(builder) => match value {
+                Some(EncodedRowScalar::Decimal128(value)) => {
+                    for _ in 0..count {
+                        builder.append_value(*value);
+                    }
+                }
+                None => {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "expected Decimal128 encoded scalar for Decimal128 column, found {other:?}"
+                    ));
+                }
+            },
             Self::Bool(builder) => match value {
                 Some(EncodedRowScalar::Bool(value)) => {
                     for _ in 0..count {
@@ -393,6 +438,7 @@ impl ScalarColumnBuilder {
                 Arc::new(builder.finish().with_data_type(data_type.clone()))
             }
             Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Decimal128(builder) => Arc::new(builder.finish()),
             Self::Bool(builder) => Arc::new(builder.finish()),
             Self::Binary(builder) => Arc::new(builder.finish()),
             Self::UInt64(builder) => Arc::new(builder.finish()),

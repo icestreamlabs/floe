@@ -24,7 +24,8 @@ use floe_cdc_pg::{
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
-    PostgresCdcSourceDefinition, ReplicationDelivery as CatalogReplicationDelivery,
+    PostgresCdcSourceDefinition, ReplicationBufferMode as CatalogReplicationBufferMode,
+    ReplicationBufferPolicy as CatalogReplicationBufferPolicy,
     ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
     ReplicationPipelineFormat as CatalogReplicationPipelineFormat,
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
@@ -61,7 +62,7 @@ use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
     CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
-    ReplicationDelivery as SqlReplicationDelivery,
+    ReplicationBufferMode as SqlReplicationBufferMode,
     ReplicationPipelineDefinition as SqlReplicationPipelineDefinition,
     ReplicationPipelineFormat as SqlReplicationPipelineFormat,
     ReplicationPipelineTarget as SqlReplicationPipelineTarget, SourceConnector, SqlColumnType,
@@ -151,6 +152,8 @@ struct ReplicationPipelineRuntimePlan {
     table_id: CdcTableId,
     target: ReplicationPipelineRuntimeTarget,
     format: ReplicationPipelineRuntimeFormat,
+    buffer_mode: ReplicationPipelineRuntimeBufferMode,
+    buffer_policy: CatalogReplicationBufferPolicy,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
 }
@@ -164,6 +167,12 @@ enum ReplicationPipelineRuntimeTarget {
 enum ReplicationPipelineRuntimeFormat {
     DebeziumJson,
     ArrowIpc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicationPipelineRuntimeBufferMode {
+    Durable,
+    NoBuffer,
 }
 
 #[derive(Clone)]

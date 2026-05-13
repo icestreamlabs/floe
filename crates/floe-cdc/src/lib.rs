@@ -22,6 +22,7 @@ const CDC_ROW_VALUE_UTF8: u8 = 3;
 const CDC_ROW_VALUE_TIMESTAMP_MILLIS: u8 = 4;
 const CDC_ROW_VALUE_DATE_DAYS: u8 = 5;
 const CDC_ROW_VALUE_NUMERIC: u8 = 6;
+const CDC_ROW_VALUE_DECIMAL128: u8 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcRowDelta {
@@ -681,6 +682,10 @@ fn encode_cdc_row_value(out: &mut Vec<u8>, value: Option<&RowValue>) -> Result<(
             out.push(CDC_ROW_VALUE_DATE_DAYS);
             out.extend_from_slice(&value.to_le_bytes());
         }
+        Some(RowValue::Decimal128(value)) => {
+            out.push(CDC_ROW_VALUE_DECIMAL128);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
         Some(RowValue::Numeric(value)) => {
             out.push(CDC_ROW_VALUE_NUMERIC);
             push_u32(out, value.len(), "CDC numeric value length")?;
@@ -732,6 +737,14 @@ fn encode_cdc_columnar_row_value(
         CdcColumnarColumn::DateDays(values) => match values.get(row_idx) {
             Some(Some(value)) => {
                 out.push(CDC_ROW_VALUE_DATE_DAYS);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Some(None) => out.push(CDC_ROW_VALUE_NULL),
+            None => bail!("CDC columnar row index {row_idx} out of bounds"),
+        },
+        CdcColumnarColumn::Decimal128 { values, .. } => match values.get(row_idx) {
+            Some(Some(value)) => {
+                out.push(CDC_ROW_VALUE_DECIMAL128);
                 out.extend_from_slice(&value.to_le_bytes());
             }
             Some(None) => out.push(CDC_ROW_VALUE_NULL),
@@ -812,6 +825,7 @@ impl<'a> CdcRowStateCursor<'a> {
             }
             CDC_ROW_VALUE_TIMESTAMP_MILLIS => Ok(Some(RowValue::TimestampMillis(self.read_i64()?))),
             CDC_ROW_VALUE_DATE_DAYS => Ok(Some(RowValue::DateDays(self.read_i32()?))),
+            CDC_ROW_VALUE_DECIMAL128 => Ok(Some(RowValue::Decimal128(self.read_i128()?))),
             CDC_ROW_VALUE_NUMERIC => {
                 let len = self.read_u32()? as usize;
                 let bytes = self.take(len)?;
@@ -846,6 +860,13 @@ impl<'a> CdcRowStateCursor<'a> {
     fn read_i32(&mut self) -> Result<i32> {
         let bytes = self.take(4)?;
         Ok(i32::from_le_bytes(
+            bytes.try_into().expect("slice length checked"),
+        ))
+    }
+
+    fn read_i128(&mut self) -> Result<i128> {
+        let bytes = self.take(16)?;
+        Ok(i128::from_le_bytes(
             bytes.try_into().expect("slice length checked"),
         ))
     }

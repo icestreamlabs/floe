@@ -330,6 +330,7 @@ impl DbspAggregateFunction {
                         | DbspScalarType::TimestampMillis
                         | DbspScalarType::Utf8
                         | DbspScalarType::DateDays
+                        | DbspScalarType::Decimal128 { .. }
                 ) {
                     Ok(input_type.clone())
                 } else {

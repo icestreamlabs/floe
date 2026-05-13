@@ -705,6 +705,10 @@ mod tests {
                     encoded.push(0x09);
                     encoded.extend_from_slice(&value.to_le_bytes());
                 }
+                Some(EncodedRowScalar::Decimal128(value)) => {
+                    encoded.push(0x0B);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
             }
         }
         encoded

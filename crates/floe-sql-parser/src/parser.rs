@@ -8,9 +8,9 @@ use sqlparser::parser::Parser;
 use crate::definitions::{
     CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
     CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
-    PostgresCdcSourceOptions, ReplicationDelivery, ReplicationPipelineDefinition,
-    ReplicationPipelineFormat, ReplicationPipelineTarget, SinkConnector, SinkDefinition,
-    SourceConnector, SqlColumnType,
+    PostgresCdcSourceOptions, ReplicationBufferMode, ReplicationBufferPolicy,
+    ReplicationPipelineDefinition, ReplicationPipelineFormat, ReplicationPipelineTarget,
+    SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
 };
 
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
@@ -485,19 +485,29 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
         "arrow_ipc" => ReplicationPipelineFormat::ArrowIpc,
         other => return Err(anyhow!("unsupported replication pipeline format '{other}'")),
     };
-    let delivery = match option_any(&options, &["delivery"])
-        .unwrap_or("at_least_once")
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
+    let buffer_mode = if option_any(&options, &["durable_buffer"])
+        .map(|value| parse_bool_option("durable_buffer", value))
+        .transpose()?
+        .unwrap_or(true)
     {
-        "at_least_once" => ReplicationDelivery::AtLeastOnce,
-        other => {
-            return Err(anyhow!(
-                "unsupported replication pipeline delivery guarantee '{other}'"
-            ));
-        }
+        ReplicationBufferMode::Durable
+    } else {
+        ReplicationBufferMode::NoBuffer
     };
+    let buffer_policy = ReplicationBufferPolicy::new(
+        option_any(
+            &options,
+            &["buffer.max_pending_bytes", "buffer_max_pending_bytes"],
+        )
+        .map(|value| parse_usize_option("buffer.max_pending_bytes", value))
+        .transpose()?,
+        option_any(
+            &options,
+            &["buffer.max_pending_age_ms", "buffer_max_pending_age_ms"],
+        )
+        .map(|value| parse_u64_option("buffer.max_pending_age_ms", value))
+        .transpose()?,
+    );
     let emit_tombstones = option_any(
         &options,
         &["emit_tombstones", "tombstones", "delete.tombstones"],
@@ -527,7 +537,8 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
         upstream_table,
         target,
         format,
-        delivery,
+        buffer_mode,
+        buffer_policy,
         emit_tombstones,
         include_transaction_metadata,
     )
@@ -925,6 +936,12 @@ fn parse_i64_option(name: &str, value: &str) -> Result<i64> {
 fn parse_usize_option(name: &str, value: &str) -> Result<usize> {
     value
         .parse::<usize>()
+        .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
+}
+
+fn parse_u64_option(name: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
 }
 

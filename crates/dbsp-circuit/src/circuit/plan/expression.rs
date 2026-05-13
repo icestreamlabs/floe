@@ -250,7 +250,8 @@ impl DbspExpression {
                 | DbspScalarType::Utf8
                 | DbspScalarType::TimestampMillis
                 | DbspScalarType::Bool
-                | DbspScalarType::DateDays => Ok(()),
+                | DbspScalarType::DateDays
+                | DbspScalarType::Decimal128 { .. } => Ok(()),
             }
         } else {
             bail!(

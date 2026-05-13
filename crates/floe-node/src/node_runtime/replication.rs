@@ -1,12 +1,14 @@
 use super::*;
 
-use std::sync::LazyLock;
+use std::fmt;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+    BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder, StringBuilder,
+    TimestampMillisecondBuilder,
 };
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourcePosition};
@@ -26,10 +28,20 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;
 const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
+const DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES: &str = "10485760";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
-const REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
+const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
+const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 0;
+const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
+const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 8192;
+static REPLICATION_KAFKA_MESSAGE_MAX_BYTES: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES")
+        .ok()
+        .filter(|value| value.parse::<usize>().is_ok_and(|bytes| bytes > 0))
+        .unwrap_or_else(|| DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES.to_string())
+});
 static REPLICATION_ARROW_IPC_ROWS_PER_RECORD: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD")
         .ok()
@@ -37,10 +49,143 @@ static REPLICATION_ARROW_IPC_ROWS_PER_RECORD: LazyLock<usize> = LazyLock::new(||
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD)
 });
+static REPLICATION_BUFFER_DELIVERED_RETENTION_MS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("FLOE_REPLICATION_BUFFER_DELIVERED_RETENTION_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS)
+});
+static REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("FLOE_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS)
+});
+static REPLICATION_BUFFER_MAX_PENDING_BYTES: LazyLock<Option<usize>> = LazyLock::new(|| {
+    env_usize_limit(
+        "FLOE_REPLICATION_BUFFER_MAX_PENDING_BYTES",
+        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES,
+    )
+});
+static REPLICATION_BUFFER_MAX_PENDING_AGE_MS: LazyLock<Option<u64>> = LazyLock::new(|| {
+    env_u64_limit(
+        "FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS",
+        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
+    )
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplicationBufferLimits {
+    max_pending_bytes: Option<usize>,
+    max_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationBufferLimitViolation {
+    PendingBytes {
+        pending_bytes: usize,
+        incoming_bytes: usize,
+        max_pending_bytes: usize,
+    },
+    PendingAge {
+        oldest_pending_age_ms: u64,
+        max_pending_age_ms: u64,
+    },
+}
+
+impl ReplicationBufferLimits {
+    fn enabled(self) -> bool {
+        self.max_pending_bytes.is_some() || self.max_pending_age_ms.is_some()
+    }
+}
+
+impl fmt::Display for ReplicationBufferLimitViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PendingBytes {
+                pending_bytes,
+                incoming_bytes,
+                max_pending_bytes,
+            } => write!(
+                f,
+                "pending buffer bytes would be {} with incoming {} bytes, above max {} bytes",
+                pending_bytes.saturating_add(*incoming_bytes),
+                incoming_bytes,
+                max_pending_bytes
+            ),
+            Self::PendingAge {
+                oldest_pending_age_ms,
+                max_pending_age_ms,
+            } => write!(
+                f,
+                "oldest pending transaction age is {oldest_pending_age_ms} ms, above max {max_pending_age_ms} ms"
+            ),
+        }
+    }
+}
+
+fn replication_buffer_limits() -> ReplicationBufferLimits {
+    ReplicationBufferLimits {
+        max_pending_bytes: *REPLICATION_BUFFER_MAX_PENDING_BYTES,
+        max_pending_age_ms: *REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
+    }
+}
+
+fn effective_replication_buffer_limits(
+    plan: &ReplicationPipelineRuntimePlan,
+) -> ReplicationBufferLimits {
+    let defaults = replication_buffer_limits();
+    ReplicationBufferLimits {
+        max_pending_bytes: effective_usize_limit(
+            plan.buffer_policy.max_pending_bytes(),
+            defaults.max_pending_bytes,
+        ),
+        max_pending_age_ms: effective_u64_limit(
+            plan.buffer_policy.max_pending_age_ms(),
+            defaults.max_pending_age_ms,
+        ),
+    }
+}
+
+fn effective_usize_limit(
+    override_value: Option<usize>,
+    default_value: Option<usize>,
+) -> Option<usize> {
+    match override_value {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => default_value,
+    }
+}
+
+fn effective_u64_limit(override_value: Option<u64>, default_value: Option<u64>) -> Option<u64> {
+    match override_value {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => default_value,
+    }
+}
+
+fn env_usize_limit(name: &str, default_value: usize) -> Option<usize> {
+    let value = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default_value);
+    (value > 0).then_some(value)
+}
+
+fn env_u64_limit(name: &str, default_value: u64) -> Option<u64> {
+    let value = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_value);
+    (value > 0).then_some(value)
+}
 
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<KafkaReplicationPipelineWriter>>,
+    buffer_cleanup_last_by_pipeline: Mutex<HashMap<String, u64>>,
 }
 
 struct KafkaReplicationPipelineWriter {
@@ -61,7 +206,11 @@ impl ReplicationPipelineRuntime {
                 ReplicationPipelineRuntimeTarget::Kafka { brokers, topic } => {
                     kafka_writers_by_pipeline.insert(
                         plan.name.clone(),
-                        Arc::new(KafkaReplicationPipelineWriter::new(brokers, topic)?),
+                        Arc::new(KafkaReplicationPipelineWriter::new(
+                            brokers,
+                            topic,
+                            plan.buffer_mode,
+                        )?),
                     );
                 }
             }
@@ -74,6 +223,7 @@ impl ReplicationPipelineRuntime {
         Ok(Self {
             pipelines_by_source,
             kafka_writers_by_pipeline,
+            buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
         })
     }
 
@@ -84,7 +234,7 @@ impl ReplicationPipelineRuntime {
     }
 
     pub(super) async fn replay_buffered(&self, storage: &SlateCatalog) -> anyhow::Result<usize> {
-        let buffer_store = CdcBufferStore::new(storage.db());
+        let buffer_store = storage.cdc_buffer_store();
         let mut delivered = 0usize;
         for plans in self.pipelines_by_source.values() {
             for plan in plans {
@@ -92,6 +242,7 @@ impl ReplicationPipelineRuntime {
                     self.replay_pending_for_plan(plan, &buffer_store, storage)
                         .await?,
                 );
+                self.cleanup_delivered_if_due(plan, &buffer_store).await?;
             }
         }
         Ok(delivered)
@@ -114,25 +265,106 @@ impl ReplicationPipelineRuntime {
             if buffered_records.is_empty() {
                 continue;
             }
+            if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
+                match &plan.target {
+                    ReplicationPipelineRuntimeTarget::Kafka { .. } => {
+                        let writer =
+                            self.kafka_writers_by_pipeline
+                                .get(&plan.name)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "replication pipeline '{}' has no Kafka writer",
+                                        plan.name
+                                    )
+                                })?;
+                        writer.send_records(&buffered_records).await?;
+                    }
+                }
+                written = written.saturating_add(buffered_records.len());
+                continue;
+            }
             if let Some(storage) = storage {
-                let buffer_store = CdcBufferStore::new(storage.db());
-                let manifest = buffer_store
-                    .append_transaction(CdcBufferAppend::new(
-                        &plan.name,
-                        &plan.source_name,
-                        plan.table_id.as_str(),
-                        transaction.commit_position().clone(),
-                        transaction.transaction_id().cloned(),
-                        buffered_records,
-                        current_unix_time_ms(),
-                    )?)
+                let buffer_store = storage.cdc_buffer_store();
+                let had_pending = !buffer_store
+                    .pending_transactions(&plan.name, 1)
                     .await
                     .with_context(|| {
                         format!(
-                            "append replication pipeline '{}' transaction buffer",
+                            "check pending replication pipeline '{}' buffer transactions",
                             plan.name
                         )
-                    })?;
+                    })?
+                    .is_empty();
+                let append = CdcBufferAppend::new(
+                    &plan.name,
+                    &plan.source_name,
+                    plan.table_id.as_str(),
+                    transaction.commit_position().clone(),
+                    transaction.transaction_id().cloned(),
+                    buffered_records,
+                    current_unix_time_ms(),
+                )?;
+                self.enforce_buffer_limits_before_append(
+                    plan,
+                    &buffer_store,
+                    storage,
+                    append.records(),
+                    had_pending,
+                )
+                .await?;
+                let has_pending_after_guardrail = if had_pending {
+                    !buffer_store
+                        .pending_transactions(&plan.name, 1)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "check pending replication pipeline '{}' buffer transactions after guardrail drain",
+                                plan.name
+                            )
+                        })?
+                        .is_empty()
+                } else {
+                    false
+                };
+                if has_pending_after_guardrail {
+                    let manifest = buffer_store
+                        .append_transaction(&append)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "append replication pipeline '{}' transaction buffer",
+                                plan.name
+                            )
+                        })?;
+                    storage
+                        .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                            &plan.name,
+                            &plan.source_name,
+                            transaction.commit_position().clone(),
+                            transaction.transaction_id().cloned(),
+                            pending_target_state(plan, &manifest),
+                            current_unix_time_ms(),
+                        )?)
+                        .await
+                        .with_context(|| {
+                            format!("persist replication pipeline '{}' checkpoint", plan.name)
+                        })?;
+                    written = written.saturating_add(manifest.record_count());
+                    self.replay_pending_for_plan(plan, &buffer_store, storage)
+                        .await?;
+                    record_buffer_stats(&buffer_store, &plan.name).await?;
+                    continue;
+                }
+
+                let append_future = buffer_store.append_transaction(&append);
+                let target_future = self.send_records_to_target(plan, append.records());
+                let (manifest_result, target_result) = tokio::join!(append_future, target_future);
+                let manifest = manifest_result.with_context(|| {
+                    format!(
+                        "append replication pipeline '{}' transaction buffer",
+                        plan.name
+                    )
+                })?;
                 storage
                     .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
                         &plan.name,
@@ -147,8 +379,25 @@ impl ReplicationPipelineRuntime {
                         format!("persist replication pipeline '{}' checkpoint", plan.name)
                     })?;
                 written = written.saturating_add(manifest.record_count());
-                self.replay_pending_for_plan(plan, &buffer_store, storage)
-                    .await?;
+                match target_result {
+                    Ok(target_state) => {
+                        let delivered = self
+                            .mark_manifest_delivered(
+                                plan,
+                                &buffer_store,
+                                storage,
+                                &manifest,
+                                target_state,
+                            )
+                            .await?;
+                        if delivered > 0 {
+                            self.cleanup_delivered_if_due(plan, &buffer_store).await?;
+                        }
+                    }
+                    Err(err) => {
+                        self.record_target_write_failure(plan, err);
+                    }
+                }
                 record_buffer_stats(&buffer_store, &plan.name).await?;
             } else {
                 match &plan.target {
@@ -195,84 +444,247 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
-            let target_state = match &plan.target {
-                ReplicationPipelineRuntimeTarget::Kafka { .. } => {
-                    let writer =
-                        self.kafka_writers_by_pipeline
-                            .get(&plan.name)
-                            .ok_or_else(|| {
-                                anyhow!("replication pipeline '{}' has no Kafka writer", plan.name)
-                            })?;
-                    match writer.send_records(&records).await {
-                        Ok(mut target_state) => {
-                            target_state
-                                .insert("source.table".to_string(), plan.upstream_table.clone());
-                            target_state
-                        }
-                        Err(err) => {
-                            crate::metrics::inc_sink_failure(&plan.name, "kafka_replication");
-                            tracing::warn!(
-                                pipeline = %plan.name,
-                                error = %err,
-                                "replication pipeline target write failed; buffered transaction remains pending"
-                            );
-                            break;
-                        }
-                    }
-                }
-            };
-            let delivered_at = current_unix_time_ms();
-            buffer_store
-                .mark_delivered(&manifest, delivered_at)
-                .await
-                .with_context(|| {
-                    format!(
-                        "mark replication pipeline '{}' buffered transaction delivered",
-                        plan.name
-                    )
-                })?;
-            storage
-                .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
-                    &plan.name,
-                    &plan.source_name,
-                    buffer_store
-                        .source_frontier(&plan.name)
-                        .await?
-                        .map(|frontier| frontier.source_position().clone())
-                        .unwrap_or_else(|| manifest.source_position().clone()),
-                    manifest.transaction_id().cloned(),
-                    delivered_target_state(&manifest, target_state),
-                    delivered_at,
-                )?)
-                .await
-                .with_context(|| {
-                    format!(
-                        "persist replication pipeline '{}' delivery checkpoint",
-                        plan.name
-                    )
-                })?;
-            delivered_records = delivered_records.saturating_add(records.len());
-            buffer_store
-                .cleanup_delivered(
-                    &plan.name,
-                    CdcBufferCleanupPolicy::new(REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
-                    current_unix_time_ms(),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "cleanup replication pipeline '{}' delivered buffer",
-                        plan.name
-                    )
-                })?;
+            let delivered = self
+                .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
+                .await?;
+            if delivered == 0 {
+                break;
+            }
+            delivered_records = delivered_records.saturating_add(delivered);
+            self.cleanup_delivered_if_due(plan, buffer_store).await?;
         }
         record_buffer_stats(buffer_store, &plan.name).await?;
         Ok(delivered_records)
     }
+
+    async fn enforce_buffer_limits_before_append(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+        storage: &SlateCatalog,
+        incoming_records: &[CdcBufferRecord],
+        has_pending: bool,
+    ) -> anyhow::Result<()> {
+        let limits = effective_replication_buffer_limits(plan);
+        if !limits.enabled() {
+            return Ok(());
+        }
+
+        let incoming_bytes = estimated_buffer_payload_bytes(incoming_records);
+        if !has_pending {
+            if let Some(violation) = buffer_limit_violation(0, None, incoming_bytes, limits) {
+                return Err(anyhow!(
+                    "replication pipeline '{}' durable buffer limit exceeded: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
+                    plan.name
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut stats = buffer_store
+            .stats(&plan.name, current_unix_time_ms())
+            .await
+            .with_context(|| {
+                format!(
+                    "load CDC buffer stats before appending replication pipeline '{}'",
+                    plan.name
+                )
+            })?;
+        let Some(mut violation) = buffer_limit_violation(
+            stats.pending_bytes(),
+            stats.oldest_pending_age_ms(),
+            incoming_bytes,
+            limits,
+        ) else {
+            return Ok(());
+        };
+
+        tracing::warn!(
+            pipeline = %plan.name,
+            pending_transactions = stats.pending_transactions(),
+            pending_records = stats.pending_records(),
+            pending_bytes = stats.pending_bytes(),
+            oldest_pending_age_ms = stats.oldest_pending_age_ms(),
+            incoming_bytes,
+            violation = %violation,
+            "replication pipeline durable buffer limit reached; attempting to drain before accepting more CDC data"
+        );
+
+        let delivered = self
+            .replay_pending_for_plan(plan, buffer_store, storage)
+            .await?;
+        if delivered > 0 {
+            self.cleanup_delivered_if_due(plan, buffer_store).await?;
+        }
+        stats = buffer_store
+            .stats(&plan.name, current_unix_time_ms())
+            .await
+            .with_context(|| {
+                format!(
+                    "load CDC buffer stats after guardrail drain for replication pipeline '{}'",
+                    plan.name
+                )
+            })?;
+        if let Some(current_violation) = buffer_limit_violation(
+            stats.pending_bytes(),
+            stats.oldest_pending_age_ms(),
+            incoming_bytes,
+            limits,
+        ) {
+            violation = current_violation;
+            return Err(anyhow!(
+                "replication pipeline '{}' durable buffer limit exceeded after draining: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
+                plan.name
+            ));
+        }
+        Ok(())
+    }
+
+    async fn deliver_manifest_records(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+        storage: &SlateCatalog,
+        manifest: &CdcBufferedTransactionManifest,
+        records: &[CdcBufferRecord],
+    ) -> anyhow::Result<usize> {
+        match self.send_records_to_target(plan, records).await {
+            Ok(target_state) => {
+                self.mark_manifest_delivered(plan, buffer_store, storage, manifest, target_state)
+                    .await
+            }
+            Err(err) => {
+                self.record_target_write_failure(plan, err);
+                Ok(0)
+            }
+        }
+    }
+
+    async fn send_records_to_target(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        records: &[CdcBufferRecord],
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        match &plan.target {
+            ReplicationPipelineRuntimeTarget::Kafka { .. } => {
+                let writer = self
+                    .kafka_writers_by_pipeline
+                    .get(&plan.name)
+                    .ok_or_else(|| {
+                        anyhow!("replication pipeline '{}' has no Kafka writer", plan.name)
+                    })?;
+                let mut target_state = writer.send_records(records).await?;
+                target_state.insert("source.table".to_string(), plan.upstream_table.clone());
+                Ok(target_state)
+            }
+        }
+    }
+
+    async fn mark_manifest_delivered(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+        storage: &SlateCatalog,
+        manifest: &CdcBufferedTransactionManifest,
+        target_state: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<usize> {
+        let delivered_at = current_unix_time_ms();
+        buffer_store
+            .mark_delivered(manifest, delivered_at)
+            .await
+            .with_context(|| {
+                format!(
+                    "mark replication pipeline '{}' buffered transaction delivered",
+                    plan.name
+                )
+            })?;
+        storage
+            .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                &plan.name,
+                &plan.source_name,
+                buffer_store
+                    .source_frontier(&plan.name)
+                    .await?
+                    .map(|frontier| frontier.source_position().clone())
+                    .unwrap_or_else(|| manifest.source_position().clone()),
+                manifest.transaction_id().cloned(),
+                delivered_target_state(manifest, target_state),
+                delivered_at,
+            )?)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist replication pipeline '{}' delivery checkpoint",
+                    plan.name
+                )
+            })?;
+        Ok(manifest.record_count())
+    }
+
+    fn record_target_write_failure(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        err: anyhow::Error,
+    ) {
+        match &plan.target {
+            ReplicationPipelineRuntimeTarget::Kafka { .. } => {
+                crate::metrics::inc_sink_failure(&plan.name, "kafka_replication");
+                tracing::warn!(
+                    pipeline = %plan.name,
+                    error = %err,
+                    "replication pipeline target write failed; buffered transaction remains pending"
+                );
+            }
+        }
+    }
+
+    async fn cleanup_delivered_if_due(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+    ) -> anyhow::Result<()> {
+        let now = current_unix_time_ms();
+        let cleanup_interval_ms = *REPLICATION_BUFFER_CLEANUP_INTERVAL_MS;
+        let should_cleanup = {
+            let mut last_by_pipeline = self
+                .buffer_cleanup_last_by_pipeline
+                .lock()
+                .map_err(|_| anyhow!("replication buffer cleanup tracker lock poisoned"))?;
+            let should_cleanup = cleanup_interval_ms == 0
+                || last_by_pipeline
+                    .get(&plan.name)
+                    .is_none_or(|last| now.saturating_sub(*last) >= cleanup_interval_ms);
+            if should_cleanup {
+                last_by_pipeline.insert(plan.name.clone(), now);
+            }
+            should_cleanup
+        };
+        if !should_cleanup {
+            return Ok(());
+        }
+        buffer_store
+            .cleanup_delivered(
+                &plan.name,
+                CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
+                now,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "cleanup replication pipeline '{}' delivered buffer",
+                    plan.name
+                )
+            })?;
+        Ok(())
+    }
 }
 
 impl KafkaReplicationPipelineWriter {
-    fn new(brokers: &str, topic: &str) -> anyhow::Result<Self> {
+    fn new(
+        brokers: &str,
+        topic: &str,
+        buffer_mode: ReplicationPipelineRuntimeBufferMode,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !brokers.trim().is_empty(),
             "replication Kafka brokers cannot be empty"
@@ -284,9 +696,19 @@ impl KafkaReplicationPipelineWriter {
         let mut config = ClientConfig::new();
         config
             .set("bootstrap.servers", brokers)
-            .set("acks", "all")
-            .set("enable.idempotence", "true")
-            .set("message.timeout.ms", REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS);
+            .set("message.timeout.ms", REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS)
+            .set(
+                "message.max.bytes",
+                REPLICATION_KAFKA_MESSAGE_MAX_BYTES.as_str(),
+            );
+        match buffer_mode {
+            ReplicationPipelineRuntimeBufferMode::Durable => {
+                config.set("acks", "all").set("enable.idempotence", "true");
+            }
+            ReplicationPipelineRuntimeBufferMode::NoBuffer => {
+                config.set("acks", "1").set("enable.idempotence", "false");
+            }
+        }
         let producer: FutureProducer = config
             .create()
             .context("create replication pipeline Kafka producer")?;
@@ -701,6 +1123,15 @@ fn arrow_ipc_columnar_array(
         CdcColumnarColumn::DateDays(values) => {
             Arc::new(arrow_array::Date32Array::from(values[start..end].to_vec()))
         }
+        CdcColumnarColumn::Decimal128 {
+            precision,
+            scale,
+            values,
+        } => Arc::new(
+            Decimal128Array::from(values[start..end].to_vec())
+                .with_precision_and_scale(*precision, *scale)
+                .context("build Decimal128 Arrow IPC snapshot column")?,
+        ),
         CdcColumnarColumn::Numeric(values) => {
             let mut builder = StringBuilder::with_capacity(end - start, (end - start) * 16);
             for value in &values[start..end] {
@@ -730,6 +1161,9 @@ fn arrow_ipc_schema(schema: &CdcTableSchema) -> Arc<ArrowSchema> {
                         DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
                     }
                     ColumnType::DateDays => DataType::Date32,
+                    ColumnType::Decimal128 { precision, scale } => {
+                        DataType::Decimal128(*precision, *scale)
+                    }
                     ColumnType::Numeric => DataType::Utf8,
                 },
                 true,
@@ -770,6 +1204,7 @@ enum ArrowIpcColumnBuilder {
     Utf8(StringBuilder),
     TimestampMillis(TimestampMillisecondBuilder),
     DateDays(Date32Builder),
+    Decimal128(Decimal128Builder),
     Numeric(StringBuilder),
 }
 
@@ -783,6 +1218,10 @@ impl ArrowIpcColumnBuilder {
                 Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(capacity))
             }
             ColumnType::DateDays => Self::DateDays(Date32Builder::with_capacity(capacity)),
+            ColumnType::Decimal128 { precision, scale } => Self::Decimal128(
+                Decimal128Builder::with_capacity(capacity)
+                    .with_data_type(DataType::Decimal128(*precision, *scale)),
+            ),
             ColumnType::Numeric => {
                 Self::Numeric(StringBuilder::with_capacity(capacity, capacity * 16))
             }
@@ -810,6 +1249,13 @@ impl ArrowIpcColumnBuilder {
             (Self::DateDays(builder), ColumnType::DateDays, Some(RowValue::DateDays(value))) => {
                 builder.append_value(*value);
             }
+            (
+                Self::Decimal128(builder),
+                ColumnType::Decimal128 { .. },
+                Some(RowValue::Decimal128(value)),
+            ) => {
+                builder.append_value(*value);
+            }
             (Self::Numeric(builder), ColumnType::Numeric, Some(RowValue::Numeric(value))) => {
                 builder.append_value(value);
             }
@@ -820,6 +1266,9 @@ impl ArrowIpcColumnBuilder {
                 builder.append_null();
             }
             (Self::DateDays(builder), ColumnType::DateDays, None) => builder.append_null(),
+            (Self::Decimal128(builder), ColumnType::Decimal128 { .. }, None) => {
+                builder.append_null();
+            }
             (Self::Numeric(builder), ColumnType::Numeric, None) => builder.append_null(),
             (_, _, Some(value)) => {
                 return Err(anyhow!(
@@ -847,6 +1296,7 @@ impl ArrowIpcColumnBuilder {
             Self::Utf8(builder) => Arc::new(builder.finish()),
             Self::TimestampMillis(builder) => Arc::new(builder.finish()),
             Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Decimal128(builder) => Arc::new(builder.finish()),
             Self::Numeric(builder) => Arc::new(builder.finish()),
         }
     }
@@ -1012,6 +1462,39 @@ async fn record_buffer_stats(
     Ok(())
 }
 
+fn estimated_buffer_payload_bytes(records: &[CdcBufferRecord]) -> usize {
+    records.iter().fold(16usize, |bytes, record| {
+        bytes.saturating_add(16).saturating_add(record.byte_len())
+    })
+}
+
+fn buffer_limit_violation(
+    pending_bytes: usize,
+    oldest_pending_age_ms: Option<u64>,
+    incoming_bytes: usize,
+    limits: ReplicationBufferLimits,
+) -> Option<ReplicationBufferLimitViolation> {
+    if let Some(max_pending_bytes) = limits.max_pending_bytes
+        && pending_bytes.saturating_add(incoming_bytes) > max_pending_bytes
+    {
+        return Some(ReplicationBufferLimitViolation::PendingBytes {
+            pending_bytes,
+            incoming_bytes,
+            max_pending_bytes,
+        });
+    }
+    if let Some(max_pending_age_ms) = limits.max_pending_age_ms
+        && let Some(oldest_pending_age_ms) = oldest_pending_age_ms
+        && oldest_pending_age_ms > max_pending_age_ms
+    {
+        return Some(ReplicationBufferLimitViolation::PendingAge {
+            oldest_pending_age_ms,
+            max_pending_age_ms,
+        });
+    }
+    None
+}
+
 pub(super) fn replication_pipeline_table_id(
     source_name: &str,
     upstream_table: &str,
@@ -1115,6 +1598,8 @@ mod tests {
                 topic: "orders".to_string(),
             },
             format: ReplicationPipelineRuntimeFormat::DebeziumJson,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -1154,6 +1639,8 @@ mod tests {
                 topic: "orders".to_string(),
             },
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -1210,6 +1697,8 @@ mod tests {
                 topic: "orders".to_string(),
             },
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -1264,6 +1753,8 @@ mod tests {
                 topic: "orders".to_string(),
             },
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -1311,6 +1802,59 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(decoded_rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn buffer_limit_violation_accounts_for_incoming_payload_bytes() {
+        let limits = ReplicationBufferLimits {
+            max_pending_bytes: Some(100),
+            max_pending_age_ms: None,
+        };
+
+        assert_eq!(
+            buffer_limit_violation(70, None, 31, limits),
+            Some(ReplicationBufferLimitViolation::PendingBytes {
+                pending_bytes: 70,
+                incoming_bytes: 31,
+                max_pending_bytes: 100,
+            })
+        );
+        assert_eq!(buffer_limit_violation(70, None, 30, limits), None);
+    }
+
+    #[test]
+    fn buffer_limit_violation_checks_oldest_pending_age() {
+        let limits = ReplicationBufferLimits {
+            max_pending_bytes: None,
+            max_pending_age_ms: Some(1_000),
+        };
+
+        assert_eq!(
+            buffer_limit_violation(0, Some(1_001), 0, limits),
+            Some(ReplicationBufferLimitViolation::PendingAge {
+                oldest_pending_age_ms: 1_001,
+                max_pending_age_ms: 1_000,
+            })
+        );
+        assert_eq!(buffer_limit_violation(0, Some(1_000), 0, limits), None);
+    }
+
+    #[test]
+    fn estimated_buffer_payload_bytes_includes_record_framing() {
+        let records = vec![
+            CdcBufferRecord::new(Some(vec![1, 2, 3]), Some(vec![4])),
+            CdcBufferRecord::new(None, Some(vec![5, 6])),
+        ];
+
+        assert_eq!(estimated_buffer_payload_bytes(&records), 54);
+    }
+
+    #[test]
+    fn zero_buffer_limit_override_disables_default_limit() {
+        assert_eq!(effective_usize_limit(Some(0), Some(100)), None);
+        assert_eq!(effective_u64_limit(Some(0), Some(100)), None);
+        assert_eq!(effective_usize_limit(None, Some(100)), Some(100));
+        assert_eq!(effective_u64_limit(None, Some(100)), Some(100));
     }
 
     fn schema(table_id: CdcTableId) -> CdcTableSchema {

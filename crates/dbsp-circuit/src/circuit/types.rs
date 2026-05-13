@@ -10,6 +10,7 @@ pub enum DbspScalarType {
     TimestampMillis,
     Bool,
     DateDays,
+    Decimal128 { precision: u8, scale: i8 },
 }
 
 impl DbspScalarType {
@@ -20,6 +21,7 @@ impl DbspScalarType {
             Self::TimestampMillis => "TimestampMillis",
             Self::Bool => "Bool",
             Self::DateDays => "DateDays",
+            Self::Decimal128 { .. } => "Decimal128",
         }
     }
 
@@ -32,6 +34,9 @@ impl DbspScalarType {
             }
             Self::Bool => arrow_schema::DataType::Boolean,
             Self::DateDays => arrow_schema::DataType::Date32,
+            Self::Decimal128 { precision, scale } => {
+                arrow_schema::DataType::Decimal128(*precision, *scale)
+            }
         }
     }
 
@@ -43,6 +48,10 @@ impl DbspScalarType {
             DataType::Boolean => Ok(Self::Bool),
             DataType::Timestamp(TimeUnit::Millisecond, None) => Ok(Self::TimestampMillis),
             DataType::Date32 => Ok(Self::DateDays),
+            DataType::Decimal128(precision, scale) => Ok(Self::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            }),
             other => bail!("unsupported DataFusion type {:?}", other),
         }
     }

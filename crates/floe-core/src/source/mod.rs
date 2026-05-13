@@ -16,6 +16,7 @@ pub enum SourceDataType {
     Utf8,
     TimestampMillis,
     DateDays,
+    Decimal128 { precision: u8, scale: i8 },
     Numeric,
 }
 
@@ -27,6 +28,10 @@ impl SourceDataType {
             SourceDataType::Utf8 => ColumnType::Utf8,
             SourceDataType::TimestampMillis => ColumnType::TimestampMillis,
             SourceDataType::DateDays => ColumnType::DateDays,
+            SourceDataType::Decimal128 { precision, scale } => ColumnType::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
             SourceDataType::Numeric => ColumnType::Numeric,
         }
     }

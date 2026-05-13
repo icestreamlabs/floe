@@ -84,6 +84,13 @@ impl PgOutputColumn {
     pub fn type_modifier(&self) -> i32 {
         self.type_modifier
     }
+
+    pub fn decimal_scale(&self) -> Option<i8> {
+        match numeric_type_from_typmod(self.type_modifier) {
+            Some(Ok(ColumnType::Decimal128 { scale, .. })) => Some(scale),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +134,7 @@ impl PgOutputRelation {
             .map(|column| {
                 CdcColumn::new(
                     column.name(),
-                    column_type_for_oid(column.type_oid())?,
+                    column_type_for_oid(column.type_oid(), column.type_modifier())?,
                     !column.is_key(),
                 )
             })
@@ -560,13 +567,15 @@ fn change_to_cdc(relation: &PgOutputRelation, change: RelationChange<'_>) -> Res
     }
 }
 
-fn column_type_for_oid(type_oid: u32) -> Result<ColumnType> {
+fn column_type_for_oid(type_oid: u32, type_modifier: i32) -> Result<ColumnType> {
     match type_oid {
         PG_BOOL_OID => Ok(ColumnType::Bool),
         PG_INT2_OID | PG_INT4_OID | PG_INT8_OID => Ok(ColumnType::Int64),
         PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(ColumnType::Utf8),
         PG_DATE_OID => Ok(ColumnType::DateDays),
-        PG_NUMERIC_OID => Ok(ColumnType::Numeric),
+        PG_NUMERIC_OID => {
+            numeric_type_from_typmod(type_modifier).unwrap_or(Ok(ColumnType::Numeric))
+        }
         _ => bail!("unsupported Postgres type OID {type_oid} in pgoutput relation metadata"),
     }
 }
@@ -615,13 +624,59 @@ fn parse_text_row_value(column: &PgOutputColumn, value: &str) -> Result<RowValue
         }
         PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(RowValue::Utf8(value.to_string())),
         PG_DATE_OID => parse_pg_date_days(value).map(RowValue::DateDays),
-        PG_NUMERIC_OID => Ok(RowValue::Numeric(value.to_string())),
+        PG_NUMERIC_OID => match numeric_type_from_typmod(column.type_modifier()) {
+            Some(Ok(ColumnType::Decimal128 { scale, .. })) => {
+                parse_decimal_text_to_i128(value, scale).map(RowValue::Decimal128)
+            }
+            Some(Ok(_)) | None => Ok(RowValue::Numeric(value.to_string())),
+            Some(Err(err)) => Err(err),
+        },
         _ => bail!(
             "unsupported Postgres type OID {} for column '{}'",
             column.type_oid(),
             column.name()
         ),
     }
+}
+
+fn numeric_type_from_typmod(type_modifier: i32) -> Option<Result<ColumnType>> {
+    if type_modifier < 4 {
+        return None;
+    }
+    let typmod = type_modifier - 4;
+    let precision = (typmod >> 16) & 0xffff;
+    let scale = typmod & 0xffff;
+    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
+        return None;
+    }
+    Some(ColumnType::decimal128(
+        precision as u8,
+        i8::try_from(scale).expect("scale <= 38 fits i8"),
+    ))
+}
+
+fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
+    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
+    let value = value.trim();
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, value));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + scale as usize);
+    digits.push_str(whole);
+    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
+    ensure!(
+        fraction.len() <= scale_usize,
+        "decimal value '{value}' has more fractional digits than scale {scale}"
+    );
+    digits.push_str(fraction);
+    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
+    let parsed = digits
+        .parse::<i128>()
+        .with_context(|| format!("decode decimal value '{value}'"))?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn parse_pg_date_days(value: &str) -> Result<i32> {
@@ -950,6 +1005,12 @@ mod tests {
             type_oid: PG_NUMERIC_OID,
             type_modifier: -1,
         };
+        let decimal_column = PgOutputColumn {
+            flags: 0,
+            name: "discount".to_string(),
+            type_oid: PG_NUMERIC_OID,
+            type_modifier: 4 + (15 << 16) + 2,
+        };
 
         assert_eq!(
             parse_text_row_value(&date_column, "1970-01-01").expect("date"),
@@ -962,6 +1023,17 @@ mod tests {
         assert_eq!(
             parse_text_row_value(&numeric_column, "123.45").expect("numeric"),
             RowValue::Numeric("123.45".to_string())
+        );
+        assert_eq!(
+            column_type_for_oid(PG_NUMERIC_OID, decimal_column.type_modifier).expect("type"),
+            ColumnType::Decimal128 {
+                precision: 15,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            parse_text_row_value(&decimal_column, "123.45").expect("decimal"),
+            RowValue::Decimal128(12_345)
         );
     }
 

@@ -354,7 +354,7 @@ async fn validate_upstream_table_schema(
     let upstream = schema.upstream_table();
     let column_rows = transaction
         .query(
-            "SELECT column_name, is_nullable, data_type, udt_name
+            "SELECT column_name, is_nullable, data_type, udt_name, numeric_precision, numeric_scale
              FROM information_schema.columns
              WHERE table_schema = $1 AND table_name = $2
              ORDER BY ordinal_position",
@@ -381,11 +381,24 @@ async fn validate_upstream_table_schema(
         let is_nullable: String = row.get("is_nullable");
         let data_type: String = row.get("data_type");
         let udt_name: String = row.get("udt_name");
-        columns.insert(name, (is_nullable == "YES", data_type, udt_name));
+        let numeric_precision: Option<i32> = row.get("numeric_precision");
+        let numeric_scale: Option<i32> = row.get("numeric_scale");
+        columns.insert(
+            name,
+            (
+                is_nullable == "YES",
+                data_type,
+                udt_name,
+                numeric_precision,
+                numeric_scale,
+            ),
+        );
     }
 
     for column in schema.columns() {
-        let Some((nullable, data_type, udt_name)) = columns.get(column.name()) else {
+        let Some((nullable, data_type, udt_name, numeric_precision, numeric_scale)) =
+            columns.get(column.name())
+        else {
             bail!(
                 "Postgres CDC table '{}.{}' is missing configured column '{}'",
                 upstream.schema(),
@@ -401,7 +414,13 @@ async fn validate_upstream_table_schema(
             column.name()
         );
         ensure!(
-            postgres_type_compatible(column.data_type(), udt_name, data_type),
+            postgres_type_compatible(
+                column.data_type(),
+                udt_name,
+                data_type,
+                *numeric_precision,
+                *numeric_scale
+            ),
             "Postgres CDC column '{}.{}' type '{}' is not compatible with Floe type {:?}",
             upstream.schema(),
             upstream.table(),
@@ -489,7 +508,7 @@ async fn discover_postgres_cdc_table_schema_from_transaction(
 ) -> Result<CdcTableSchema> {
     let rows = transaction
         .query(
-            "SELECT column_name, is_nullable, data_type, udt_name
+            "SELECT column_name, is_nullable, data_type, udt_name, numeric_precision, numeric_scale
              FROM information_schema.columns
              WHERE table_schema = $1 AND table_name = $2
              ORDER BY ordinal_position",
@@ -516,9 +535,11 @@ async fn discover_postgres_cdc_table_schema_from_transaction(
         let is_nullable: String = row.get("is_nullable");
         let data_type: String = row.get("data_type");
         let udt_name: String = row.get("udt_name");
+        let numeric_precision: Option<i32> = row.get("numeric_precision");
+        let numeric_scale: Option<i32> = row.get("numeric_scale");
         columns.push(CdcColumn::new(
             name,
-            postgres_column_type(&udt_name, &data_type)?,
+            postgres_column_type(&udt_name, &data_type, numeric_precision, numeric_scale)?,
             is_nullable == "YES",
         )?);
     }
@@ -594,7 +615,12 @@ async fn discover_primary_key(
         .collect())
 }
 
-fn postgres_column_type(udt_name: &str, data_type: &str) -> Result<ColumnType> {
+fn postgres_column_type(
+    udt_name: &str,
+    data_type: &str,
+    numeric_precision: Option<i32>,
+    numeric_scale: Option<i32>,
+) -> Result<ColumnType> {
     let udt_name = udt_name.to_ascii_lowercase();
     let data_type = data_type.to_ascii_lowercase();
     match udt_name.as_str() {
@@ -603,7 +629,8 @@ fn postgres_column_type(udt_name: &str, data_type: &str) -> Result<ColumnType> {
         "text" | "varchar" | "bpchar" | "name" => Ok(ColumnType::Utf8),
         "timestamp" | "timestamptz" => Ok(ColumnType::TimestampMillis),
         "date" => Ok(ColumnType::DateDays),
-        "numeric" => Ok(ColumnType::Numeric),
+        "numeric" => decimal128_type_from_precision_scale(numeric_precision, numeric_scale)
+            .unwrap_or(Ok(ColumnType::Numeric)),
         _ if matches!(
             data_type.as_str(),
             "timestamp without time zone" | "timestamp with time zone"
@@ -619,7 +646,13 @@ fn postgres_column_type(udt_name: &str, data_type: &str) -> Result<ColumnType> {
     }
 }
 
-fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &str) -> bool {
+fn postgres_type_compatible(
+    expected: &ColumnType,
+    udt_name: &str,
+    data_type: &str,
+    numeric_precision: Option<i32>,
+    numeric_scale: Option<i32>,
+) -> bool {
     let udt_name = udt_name.to_ascii_lowercase();
     let data_type = data_type.to_ascii_lowercase();
     match expected {
@@ -634,10 +667,31 @@ fn postgres_type_compatible(expected: &ColumnType, udt_name: &str, data_type: &s
                 )
         }
         ColumnType::DateDays => udt_name == "date" || data_type == "date",
+        ColumnType::Decimal128 { precision, scale } => {
+            (udt_name == "numeric" || matches!(data_type.as_str(), "numeric" | "decimal"))
+                && numeric_precision == Some(i32::from(*precision))
+                && numeric_scale == Some(i32::from(*scale))
+        }
         ColumnType::Numeric => {
             udt_name == "numeric" || matches!(data_type.as_str(), "numeric" | "decimal")
         }
     }
+}
+
+fn decimal128_type_from_precision_scale(
+    precision: Option<i32>,
+    scale: Option<i32>,
+) -> Option<Result<ColumnType>> {
+    let (Some(precision), Some(scale)) = (precision, scale) else {
+        return None;
+    };
+    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
+        return None;
+    }
+    Some(ColumnType::decimal128(
+        precision as u8,
+        i8::try_from(scale).expect("scale <= 38 fits i8"),
+    ))
 }
 
 struct SnapshotTableChangeBatches {
@@ -696,15 +750,8 @@ fn snapshot_table_query(schema: &CdcTableSchema) -> String {
         .map(snapshot_select_expr)
         .collect::<Vec<_>>()
         .join(", ");
-    let order_by = schema
-        .primary_key()
-        .columns()
-        .iter()
-        .map(|column| quote_pg_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
-        "SELECT {select_list} FROM {} ORDER BY {order_by}",
+        "SELECT {select_list} FROM {}",
         qualified_table_name(schema.upstream_table())
     )
 }
@@ -716,6 +763,7 @@ fn snapshot_select_expr(column: &CdcColumn) -> String {
             format!("floor(extract(epoch from {quoted}) * 1000)::bigint AS {quoted}")
         }
         ColumnType::DateDays => format!("({quoted} - DATE '1970-01-01')::int AS {quoted}"),
+        ColumnType::Decimal128 { .. } => format!("{quoted}::text AS {quoted}"),
         ColumnType::Numeric => format!("{quoted}::text AS {quoted}"),
         ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => quoted,
     }
@@ -790,6 +838,11 @@ enum SnapshotColumnBuilder {
     Utf8(Vec<Option<String>>),
     TimestampMillis(Vec<Option<i64>>),
     DateDays(Vec<Option<i32>>),
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+        values: Vec<Option<i128>>,
+    },
     Numeric(Vec<Option<String>>),
 }
 
@@ -801,6 +854,11 @@ impl SnapshotColumnBuilder {
             ColumnType::Utf8 => Self::Utf8(Vec::with_capacity(capacity)),
             ColumnType::TimestampMillis => Self::TimestampMillis(Vec::with_capacity(capacity)),
             ColumnType::DateDays => Self::DateDays(Vec::with_capacity(capacity)),
+            ColumnType::Decimal128 { precision, scale } => Self::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+                values: Vec::with_capacity(capacity),
+            },
             ColumnType::Numeric => Self::Numeric(Vec::with_capacity(capacity)),
         }
     }
@@ -833,6 +891,20 @@ impl SnapshotColumnBuilder {
                     format!("decode Postgres CDC snapshot date days '{}'", column.name())
                 })?);
             }
+            (Self::Decimal128 { scale, values, .. }, ColumnType::Decimal128 { .. }) => {
+                let value = row.try_get::<_, Option<String>>(idx).with_context(|| {
+                    format!(
+                        "decode Postgres CDC snapshot decimal128 '{}'",
+                        column.name()
+                    )
+                })?;
+                values.push(
+                    value
+                        .as_deref()
+                        .map(|value| parse_decimal_text_to_i128(value, *scale))
+                        .transpose()?,
+                );
+            }
             (Self::Numeric(values), ColumnType::Numeric) => {
                 values.push(row.try_get::<_, Option<String>>(idx).with_context(|| {
                     format!("decode Postgres CDC snapshot numeric '{}'", column.name())
@@ -854,9 +926,42 @@ impl SnapshotColumnBuilder {
             Self::Utf8(values) => CdcColumnarColumn::Utf8(values),
             Self::TimestampMillis(values) => CdcColumnarColumn::TimestampMillis(values),
             Self::DateDays(values) => CdcColumnarColumn::DateDays(values),
+            Self::Decimal128 {
+                precision,
+                scale,
+                values,
+            } => CdcColumnarColumn::Decimal128 {
+                precision,
+                scale,
+                values,
+            },
             Self::Numeric(values) => CdcColumnarColumn::Numeric(values),
         }
     }
+}
+
+fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
+    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
+    let value = value.trim();
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, value));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + scale as usize);
+    digits.push_str(whole);
+    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
+    ensure!(
+        fraction.len() <= scale_usize,
+        "decimal value '{value}' has more fractional digits than scale {scale}"
+    );
+    digits.push_str(fraction);
+    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
+    let parsed = digits
+        .parse::<i128>()
+        .with_context(|| format!("decode decimal value '{value}'"))?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn snapshot_int64_value(

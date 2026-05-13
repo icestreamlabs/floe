@@ -74,8 +74,9 @@ pub(super) fn replication_pipeline_definition_from_sql(
         }
         SqlReplicationPipelineFormat::ArrowIpc => CatalogReplicationPipelineFormat::ArrowIpc,
     };
-    let delivery = match definition.delivery() {
-        SqlReplicationDelivery::AtLeastOnce => CatalogReplicationDelivery::AtLeastOnce,
+    let buffer_mode = match definition.buffer_mode() {
+        SqlReplicationBufferMode::Durable => CatalogReplicationBufferMode::Durable,
+        SqlReplicationBufferMode::NoBuffer => CatalogReplicationBufferMode::NoBuffer,
     };
     CatalogReplicationPipelineDefinition::new(
         definition.name(),
@@ -83,7 +84,11 @@ pub(super) fn replication_pipeline_definition_from_sql(
         definition.upstream_table(),
         target,
         format,
-        delivery,
+        buffer_mode,
+        CatalogReplicationBufferPolicy::new(
+            definition.buffer_policy().max_pending_bytes(),
+            definition.buffer_policy().max_pending_age_ms(),
+        ),
         definition.emit_tombstones(),
         definition.include_transaction_metadata(),
     )
@@ -102,6 +107,10 @@ pub(super) fn source_definition_from_table(
                 ColumnType::Utf8 => SourceDataType::Utf8,
                 ColumnType::TimestampMillis => SourceDataType::TimestampMillis,
                 ColumnType::DateDays => SourceDataType::DateDays,
+                ColumnType::Decimal128 { precision, scale } => SourceDataType::Decimal128 {
+                    precision: *precision,
+                    scale: *scale,
+                },
                 ColumnType::Numeric => SourceDataType::Numeric,
             };
             SourceColumn::new_nullable(column.name(), data_type, column.nullable())

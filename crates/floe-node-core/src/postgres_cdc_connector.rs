@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use floe_cdc_core::{CdcChange, CdcRow};
 use floe_cdc_pg::{
-    PgOutputCdcChange, PgOutputDecoder, PgOutputRelation, PostgresCdcConfig, PostgresLsn,
-    PostgresReplicationClient, PostgresReplicationEvent,
+    PgOutputCdcChange, PgOutputColumn, PgOutputDecoder, PgOutputRelation, PostgresCdcConfig,
+    PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,
 };
 use floe_core::RowValue;
 use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
@@ -302,21 +302,38 @@ fn cdc_row_to_json(relation: &PgOutputRelation, row: &CdcRow) -> Result<Value> {
 
     let mut payload = serde_json::Map::with_capacity(relation.columns().len());
     for (column, value) in relation.columns().iter().zip(row.values()) {
-        payload.insert(column.name().to_string(), row_value_to_json(value));
+        payload.insert(column.name().to_string(), row_value_to_json(column, value));
     }
     Ok(Value::Object(payload))
 }
 
-fn row_value_to_json(value: &Option<RowValue>) -> Value {
+fn row_value_to_json(column: &PgOutputColumn, value: &Option<RowValue>) -> Value {
     match value {
         Some(RowValue::Int64(value)) => Value::from(*value),
         Some(RowValue::Bool(value)) => Value::from(*value),
         Some(RowValue::Utf8(value)) => Value::from(value.clone()),
         Some(RowValue::TimestampMillis(value)) => Value::from(*value),
         Some(RowValue::DateDays(value)) => Value::from(*value),
+        Some(RowValue::Decimal128(value)) => column
+            .decimal_scale()
+            .map(|scale| Value::from(format_decimal128(*value, scale)))
+            .unwrap_or_else(|| Value::from(value.to_string())),
         Some(RowValue::Numeric(value)) => Value::from(value.clone()),
         None => Value::Null,
     }
+}
+
+fn format_decimal128(value: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return value.to_string();
+    }
+    let scale = scale as u32;
+    let factor = 10_i128.pow(scale);
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.abs();
+    let whole = magnitude / factor;
+    let fraction = magnitude % factor;
+    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
 
 pub async fn stored_slot_start_lsn(connection_string: &str, slot: &str) -> Result<PostgresLsn> {
@@ -477,8 +494,30 @@ mod tests {
     fn schema_row_to_json_for_test(schema: &CdcTableSchema, row: &CdcRow) -> Result<Value> {
         let mut payload = serde_json::Map::with_capacity(schema.columns().len());
         for (column, value) in schema.columns().iter().zip(row.values()) {
-            payload.insert(column.name().to_string(), row_value_to_json(value));
+            payload.insert(
+                column.name().to_string(),
+                schema_row_value_to_json_for_test(column, value),
+            );
         }
         Ok(Value::Object(payload))
+    }
+
+    fn schema_row_value_to_json_for_test(column: &CdcColumn, value: &Option<RowValue>) -> Value {
+        match value {
+            Some(RowValue::Int64(value)) => Value::from(*value),
+            Some(RowValue::Bool(value)) => Value::from(*value),
+            Some(RowValue::Utf8(value)) | Some(RowValue::Numeric(value)) => {
+                Value::from(value.clone())
+            }
+            Some(RowValue::TimestampMillis(value)) => Value::from(*value),
+            Some(RowValue::DateDays(value)) => Value::from(*value),
+            Some(RowValue::Decimal128(value)) => match column.data_type() {
+                ColumnType::Decimal128 { scale, .. } => {
+                    Value::from(format_decimal128(*value, *scale))
+                }
+                _ => Value::from(value.to_string()),
+            },
+            None => Value::Null,
+        }
     }
 }

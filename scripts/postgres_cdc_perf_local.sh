@@ -11,6 +11,8 @@ POSTGRES_DB="${POSTGRES_DB:-postgres}"
 REDPANDA_CONTAINER="${REDPANDA_CONTAINER:-floe-cdc-bench-redpanda}"
 REDPANDA_IMAGE="${REDPANDA_IMAGE:-docker.redpanda.com/redpandadata/redpanda:latest}"
 REDPANDA_PORT="${REDPANDA_PORT:-19092}"
+REDPANDA_KAFKA_BATCH_MAX_BYTES="${REDPANDA_KAFKA_BATCH_MAX_BYTES:-10485760}"
+REDPANDA_TOPIC_MAX_MESSAGE_BYTES="${REDPANDA_TOPIC_MAX_MESSAGE_BYTES:-10485760}"
 BROKERS="${BROKERS:-127.0.0.1:${REDPANDA_PORT}}"
 
 ROWS="${ROWS:-100000}"
@@ -20,6 +22,7 @@ TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
 PIPELINE_FORMAT="${PIPELINE_FORMAT:-debezium-json}"
+DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
 ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-8192}"
 LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS:-0}"
 LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS:-0}"
@@ -490,9 +493,6 @@ case "${DATASET}" in
     source_table="lineitem_flat"
     upstream_table="public.lineitem_flat"
     pipeline_name="pg_lineitem_flat_to_kafka"
-    if [[ "${ARROW_IPC_ROWS_PER_RECORD}" == "8192" ]]; then
-      ARROW_IPC_ROWS_PER_RECORD="1024"
-    fi
     if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
       TOPIC="floe_cdc_bench_lineitem_flat"
     fi
@@ -501,9 +501,6 @@ case "${DATASET}" in
     source_table="lineitem"
     upstream_table="public.lineitem"
     pipeline_name="pg_lineitem_to_kafka"
-    if [[ "${ARROW_IPC_ROWS_PER_RECORD}" == "8192" ]]; then
-      ARROW_IPC_ROWS_PER_RECORD="1024"
-    fi
     if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
       TOPIC="floe_cdc_bench_lineitem"
     fi
@@ -524,6 +521,9 @@ echo "bench_mode=${BENCH_MODE}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
+echo "durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
+echo "redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
+echo "redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
 echo "live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
 echo "live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
 
@@ -559,12 +559,18 @@ docker run -d \
     --reserve-memory 0M \
     --node-id 0 \
     --check=false \
+    --set "redpanda.kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}" \
     --kafka-addr PLAINTEXT://0.0.0.0:9092 \
     --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${REDPANDA_PORT}" >/dev/null
 wait_for_redpanda
 
 echo "Creating Kafka topic ${TOPIC}"
-docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 >/dev/null 2>&1 || true
+if ! docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 \
+  -c "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1; then
+  docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 >/dev/null 2>&1 || true
+fi
+docker exec "${REDPANDA_CONTAINER}" rpk topic alter-config "${TOPIC}" \
+  --set "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1 || true
 write_kafka_topic_info
 
 case "${BENCH_MODE}" in
@@ -636,7 +642,7 @@ INTO KAFKA WITH (
   brokers = '${BROKERS}',
   topic = '${TOPIC}',
   format = '${PIPELINE_FORMAT}',
-  delivery = 'at-least-once',
+  durable_buffer = ${DURABLE_REPLICATION_BUFFER},
   tombstones = false,
   transaction_metadata = false
 );
@@ -754,7 +760,10 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.live_update_rows=${live_update_rows}"
   echo "benchmark.source_rows=${source_rows}"
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
+  echo "benchmark.durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
   echo "benchmark.arrow_ipc_rows_per_record=${ARROW_IPC_ROWS_PER_RECORD}"
+  echo "benchmark.redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
+  echo "benchmark.redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
   echo "benchmark.live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
   echo "benchmark.expected_kafka_messages=${expected_messages}"

@@ -659,6 +659,7 @@ enum DirectColumnValue<'de> {
     Bool(bool),
     DateDays(i32),
     Numeric(Cow<'de, str>),
+    Decimal128(i128),
     Null,
 }
 
@@ -805,6 +806,28 @@ impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
                     ))),
                 }
             }
+            SourceDataType::Decimal128 { scale, .. } => {
+                let value = Option::<Value>::deserialize(deserializer)?;
+                match value {
+                    Some(Value::String(value)) => parse_decimal_text_to_i128(&value, *scale)
+                        .map(|value| (DirectColumnValue::Decimal128(value), None))
+                        .map_err(de::Error::custom),
+                    Some(Value::Number(value)) => {
+                        parse_decimal_text_to_i128(&value.to_string(), *scale)
+                            .map(|value| (DirectColumnValue::Decimal128(value), None))
+                            .map_err(de::Error::custom)
+                    }
+                    Some(other) => Err(de::Error::custom(format!(
+                        "expected numeric string or JSON number for column '{}', found {other}",
+                        self.field_name
+                    ))),
+                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
+                    None => Err(de::Error::custom(format!(
+                        "null value violates non-nullable column '{}'",
+                        self.field_name
+                    ))),
+                }
+            }
         }
     }
 }
@@ -850,6 +873,10 @@ where
             row.extend_from_slice(&len.to_le_bytes());
             row.extend_from_slice(bytes);
         }
+        DirectColumnValue::Decimal128(value) => {
+            row.push(0x0B);
+            row.extend_from_slice(&value.to_le_bytes());
+        }
         DirectColumnValue::Null => encode_typed_null(row, data_type),
     }
     Ok(())
@@ -863,7 +890,32 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
         SourceDataType::Bool => buf.push(0x08),
         SourceDataType::DateDays => buf.push(0x0A),
         SourceDataType::Numeric => buf.push(0x06),
+        SourceDataType::Decimal128 { .. } => buf.push(0x0C),
     }
+}
+
+fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
+    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
+    let value = value.trim();
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, value));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + scale as usize);
+    digits.push_str(whole);
+    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
+    ensure!(
+        fraction.len() <= scale_usize,
+        "decimal value '{value}' has more fractional digits than scale {scale}"
+    );
+    digits.push_str(fraction);
+    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
+    let parsed = digits
+        .parse::<i128>()
+        .with_context(|| format!("decode decimal value '{value}'"))?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn column_required(required_columns: Option<&[bool]>, idx: usize) -> bool {

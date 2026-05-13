@@ -749,7 +749,8 @@ fn catalog_postgres_source_connector_merges_pipeline_tables() {
             topic: "orders_cdc".to_string(),
         },
         CatalogReplicationPipelineFormat::DebeziumJson,
-        CatalogReplicationDelivery::AtLeastOnce,
+        CatalogReplicationBufferMode::Durable,
+        CatalogReplicationBufferPolicy::default(),
         false,
         false,
     )
