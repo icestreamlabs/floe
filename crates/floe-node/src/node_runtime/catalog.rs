@@ -69,6 +69,7 @@ pub(super) fn replication_pipeline_definition_from_sql(
         }
     };
     let format = match definition.format() {
+        SqlReplicationPipelineFormat::FloeJson => CatalogReplicationPipelineFormat::FloeJson,
         SqlReplicationPipelineFormat::DebeziumJson => {
             CatalogReplicationPipelineFormat::DebeziumJson
         }

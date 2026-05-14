@@ -150,6 +150,7 @@ struct ReplicationPipelineRuntimePlan {
     source_name: String,
     upstream_table: String,
     table_id: CdcTableId,
+    schema: CdcTableSchema,
     target: ReplicationPipelineRuntimeTarget,
     format: ReplicationPipelineRuntimeFormat,
     buffer_mode: ReplicationPipelineRuntimeBufferMode,
@@ -165,6 +166,7 @@ enum ReplicationPipelineRuntimeTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplicationPipelineRuntimeFormat {
+    FloeJson,
     DebeziumJson,
     ArrowIpc,
 }

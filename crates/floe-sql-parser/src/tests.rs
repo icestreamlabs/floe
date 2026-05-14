@@ -183,10 +183,26 @@ fn parse_create_replication_pipeline_defaults() {
     let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
         panic!("expected replication pipeline");
     };
-    assert_eq!(definition.format(), ReplicationPipelineFormat::DebeziumJson);
+    assert_eq!(definition.format(), ReplicationPipelineFormat::FloeJson);
     assert_eq!(definition.buffer_mode(), ReplicationBufferMode::Durable);
     assert!(!definition.emit_tombstones());
     assert!(!definition.include_transaction_metadata());
+}
+
+#[test]
+fn parse_create_replication_pipeline_floe_json_format() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (
+            brokers = 'localhost:9092',
+            topic = 'orders_cdc',
+            format = 'floe-json'
+        )",
+    )
+    .expect("parse replication pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
+        panic!("expected replication pipeline");
+    };
+    assert_eq!(definition.format(), ReplicationPipelineFormat::FloeJson);
 }
 
 #[test]

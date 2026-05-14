@@ -136,8 +136,15 @@ pub(super) async fn postgres_cdc_runtime_plan(
             schemas.insert(table_id.clone(), schema);
             table_id
         };
+        let schema = schemas.get(&table_id).cloned().ok_or_else(|| {
+            anyhow!(
+                "replication pipeline '{}' has no CDC schema for table '{}'",
+                pipeline.name(),
+                pipeline.upstream_table()
+            )
+        })?;
         pipeline_plans.push(replication_pipeline_runtime_plan_from_catalog(
-            pipeline, table_id,
+            pipeline, schema,
         )?);
     }
 
@@ -155,8 +162,9 @@ pub(super) async fn postgres_cdc_runtime_plan(
 
 fn replication_pipeline_runtime_plan_from_catalog(
     pipeline: &CatalogReplicationPipelineDefinition,
-    table_id: CdcTableId,
+    schema: CdcTableSchema,
 ) -> anyhow::Result<ReplicationPipelineRuntimePlan> {
+    let table_id = schema.table_id().clone();
     let target = match pipeline.target() {
         CatalogReplicationPipelineTarget::Kafka { brokers, topic } => {
             ReplicationPipelineRuntimeTarget::Kafka {
@@ -176,8 +184,12 @@ fn replication_pipeline_runtime_plan_from_catalog(
         source_name: pipeline.source_name().to_string(),
         upstream_table: pipeline.upstream_table().to_string(),
         table_id,
+        schema,
         target,
         format: match pipeline.format() {
+            CatalogReplicationPipelineFormat::FloeJson => {
+                ReplicationPipelineRuntimeFormat::FloeJson
+            }
             CatalogReplicationPipelineFormat::DebeziumJson => {
                 ReplicationPipelineRuntimeFormat::DebeziumJson
             }

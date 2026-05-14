@@ -21,7 +21,7 @@ BENCH_MODE="${BENCH_MODE:-snapshot}"
 TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
-PIPELINE_FORMAT="${PIPELINE_FORMAT:-debezium-json}"
+PIPELINE_FORMAT="${PIPELINE_FORMAT:-floe-json}"
 DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
 ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-16384}"
 ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION:-none}"
@@ -455,6 +455,9 @@ expected_insert_messages() {
     debezium_json)
       echo "${rows}"
       ;;
+    floe_json|compact_json)
+      echo "${rows}"
+      ;;
     arrow_ipc)
       echo "$(( (rows + ARROW_IPC_ROWS_PER_RECORD - 1) / ARROW_IPC_ROWS_PER_RECORD ))"
       ;;
@@ -488,6 +491,9 @@ expected_update_messages() {
   local normalized_format="${PIPELINE_FORMAT//-/_}"
   case "${normalized_format}" in
     debezium_json)
+      echo "${rows}"
+      ;;
+    floe_json|compact_json)
       echo "${rows}"
       ;;
     arrow_ipc)

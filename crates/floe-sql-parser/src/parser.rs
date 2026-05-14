@@ -476,11 +476,12 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
     }
 
     let format = match option_any(&options, &["format"])
-        .unwrap_or("debezium_json")
+        .unwrap_or("floe_json")
         .to_ascii_lowercase()
         .replace('-', "_")
         .as_str()
     {
+        "floe_json" | "compact_json" => ReplicationPipelineFormat::FloeJson,
         "debezium_json" => ReplicationPipelineFormat::DebeziumJson,
         "arrow_ipc" => ReplicationPipelineFormat::ArrowIpc,
         other => return Err(anyhow!("unsupported replication pipeline format '{other}'")),

@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
+use floe_cdc_core::{CdcSourcePosition, CdcTransactionId, ChangeBatch};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use slatedb::{Db, Error as SlateError, WriteBatch};
 
 const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
 const CDC_BUFFER_PAYLOAD_MAGIC: &[u8; 8] = b"FCDCBUF1";
+const CDC_BUFFER_CHANGE_BATCHES_MAGIC: &[u8; 8] = b"FCDCBCH1";
 const CDC_BUFFER_NONE_LEN: u64 = u64::MAX;
 
 #[derive(Clone)]
@@ -28,6 +29,8 @@ pub struct CdcBufferAppend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transaction_id: Option<CdcTransactionId>,
     records: Vec<CdcBufferRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    change_batches: Vec<ChangeBatch>,
     buffered_at_unix_ms: u64,
 }
 
@@ -52,6 +55,8 @@ pub struct CdcBufferedTransactionManifest {
     payload_bytes: usize,
     #[serde(default)]
     payload_storage: CdcBufferPayloadStorage,
+    #[serde(default)]
+    payload_format: CdcBufferPayloadFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload_object_key: Option<String>,
     buffered_at_unix_ms: u64,
@@ -65,6 +70,14 @@ pub enum CdcBufferPayloadStorage {
     #[default]
     SlateDbBlob,
     ObjectStore,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcBufferPayloadFormat {
+    #[default]
+    KafkaRecords,
+    ChangeBatches,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,11 +128,30 @@ impl CdcBufferStore {
         &self,
         append: &CdcBufferAppend,
     ) -> Result<CdcBufferedTransactionManifest> {
+        self.append_transaction_with_durable_wait(append, true)
+            .await
+    }
+
+    pub async fn append_transaction_without_durable_wait(
+        &self,
+        append: &CdcBufferAppend,
+    ) -> Result<CdcBufferedTransactionManifest> {
+        self.append_transaction_with_durable_wait(append, false)
+            .await
+    }
+
+    async fn append_transaction_with_durable_wait(
+        &self,
+        append: &CdcBufferAppend,
+        await_durable: bool,
+    ) -> Result<CdcBufferedTransactionManifest> {
         append.validate()?;
         let transaction_key =
             transaction_key(&append.source_position, append.transaction_id.as_ref())?;
-        let payload = encode_payload_records(&append.records)?;
+        let payload = append.encode_payload()?;
         let payload_bytes = payload.len();
+        let record_count = append.record_count();
+        let payload_format = append.payload_format();
         let payload_object_key = payload_object_key(&append.pipeline_name, &transaction_key);
         let object_store = self.payload_object_store()?;
         object_store
@@ -136,9 +168,10 @@ impl CdcBufferStore {
             transaction_key: transaction_key.clone(),
             source_position: append.source_position.clone(),
             transaction_id: append.transaction_id.clone(),
-            record_count: append.records.len(),
+            record_count,
             payload_bytes,
             payload_storage: CdcBufferPayloadStorage::ObjectStore,
+            payload_format,
             payload_object_key: Some(payload_object_key),
             buffered_at_unix_ms: append.buffered_at_unix_ms,
             delivered_at_unix_ms: None,
@@ -158,10 +191,14 @@ impl CdcBufferStore {
             source_frontier_key(&frontier.pipeline_name),
             serde_json::to_vec(&frontier).context("encode CDC buffer source frontier")?,
         );
-        write_durable_batch(self.db.as_ref(), batch)
+        write_batch(self.db.as_ref(), batch, await_durable)
             .await
             .context("append CDC buffer transaction")?;
         Ok(manifest)
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        self.db.flush().await.map_err(map_slate_err)
     }
 
     pub async fn pending_transactions(
@@ -184,6 +221,12 @@ impl CdcBufferStore {
         &self,
         manifest: &CdcBufferedTransactionManifest,
     ) -> Result<Vec<CdcBufferRecord>> {
+        ensure!(
+            manifest.payload_format() == CdcBufferPayloadFormat::KafkaRecords,
+            "CDC buffer transaction '{}' stores {:?}, not Kafka records",
+            manifest.transaction_key(),
+            manifest.payload_format()
+        );
         let records = match manifest.payload_storage() {
             CdcBufferPayloadStorage::ObjectStore => {
                 let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
@@ -221,6 +264,61 @@ impl CdcBufferStore {
             records.len()
         );
         Ok(records)
+    }
+
+    pub async fn change_batches(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+    ) -> Result<Vec<ChangeBatch>> {
+        ensure!(
+            manifest.payload_format() == CdcBufferPayloadFormat::ChangeBatches,
+            "CDC buffer transaction '{}' stores {:?}, not change batches",
+            manifest.transaction_key(),
+            manifest.payload_format()
+        );
+        let batches = match manifest.payload_storage() {
+            CdcBufferPayloadStorage::ObjectStore => {
+                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+                    anyhow!(
+                        "CDC buffer transaction '{}' is missing payload object key",
+                        manifest.transaction_key()
+                    )
+                })?;
+                let object_store = self.payload_object_store()?;
+                let payload = object_store
+                    .get(&ObjectPath::from(payload_object_key.to_string()))
+                    .await
+                    .with_context(|| {
+                        format!("load CDC buffer payload object '{payload_object_key}'")
+                    })?
+                    .bytes()
+                    .await
+                    .with_context(|| {
+                        format!("read CDC buffer payload object '{payload_object_key}'")
+                    })?;
+                decode_payload_change_batches(&payload).with_context(|| {
+                    format!(
+                        "decode CDC buffer change batch payload '{}'",
+                        manifest.transaction_key(),
+                    )
+                })?
+            }
+            CdcBufferPayloadStorage::SlateDbBlob => {
+                anyhow::bail!(
+                    "CDC buffer transaction '{}' stores change batches in unsupported legacy SlateDB payload storage",
+                    manifest.transaction_key()
+                )
+            }
+        };
+        let change_count = batches.iter().map(ChangeBatch::change_count).sum::<usize>();
+        ensure!(
+            change_count == manifest.record_count(),
+            "CDC buffer transaction '{}' expected {} changes, found {}",
+            manifest.transaction_key(),
+            manifest.record_count(),
+            change_count
+        );
+        Ok(batches)
     }
 
     pub async fn mark_delivered(
@@ -586,6 +684,30 @@ impl CdcBufferAppend {
             source_position,
             transaction_id,
             records,
+            change_batches: Vec::new(),
+            buffered_at_unix_ms,
+        };
+        append.validate()?;
+        Ok(append)
+    }
+
+    pub fn new_change_batches(
+        pipeline_name: impl Into<String>,
+        source_name: impl Into<String>,
+        table_id: impl Into<String>,
+        source_position: CdcSourcePosition,
+        transaction_id: Option<CdcTransactionId>,
+        change_batches: Vec<ChangeBatch>,
+        buffered_at_unix_ms: u64,
+    ) -> Result<Self> {
+        let append = Self {
+            pipeline_name: pipeline_name.into(),
+            source_name: source_name.into(),
+            table_id: table_id.into(),
+            source_position,
+            transaction_id,
+            records: Vec::new(),
+            change_batches,
             buffered_at_unix_ms,
         };
         append.validate()?;
@@ -605,9 +727,11 @@ impl CdcBufferAppend {
             !self.table_id.trim().is_empty(),
             "CDC buffer table id cannot be empty"
         );
+        let has_records = !self.records.is_empty();
+        let has_change_batches = !self.change_batches.is_empty();
         ensure!(
-            !self.records.is_empty(),
-            "CDC buffer append must contain at least one record"
+            has_records != has_change_batches,
+            "CDC buffer append must contain exactly one payload kind"
         );
         Ok(())
     }
@@ -636,8 +760,44 @@ impl CdcBufferAppend {
         &self.records
     }
 
+    pub fn change_batches(&self) -> &[ChangeBatch] {
+        &self.change_batches
+    }
+
+    pub fn record_count(&self) -> usize {
+        match self.payload_format() {
+            CdcBufferPayloadFormat::KafkaRecords => self.records.len(),
+            CdcBufferPayloadFormat::ChangeBatches => self
+                .change_batches
+                .iter()
+                .map(ChangeBatch::change_count)
+                .sum(),
+        }
+    }
+
+    pub fn payload_format(&self) -> CdcBufferPayloadFormat {
+        if self.change_batches.is_empty() {
+            CdcBufferPayloadFormat::KafkaRecords
+        } else {
+            CdcBufferPayloadFormat::ChangeBatches
+        }
+    }
+
+    pub fn estimated_payload_bytes(&self) -> Result<usize> {
+        Ok(self.encode_payload()?.len())
+    }
+
     pub fn buffered_at_unix_ms(&self) -> u64 {
         self.buffered_at_unix_ms
+    }
+
+    fn encode_payload(&self) -> Result<Vec<u8>> {
+        match self.payload_format() {
+            CdcBufferPayloadFormat::KafkaRecords => encode_payload_records(&self.records),
+            CdcBufferPayloadFormat::ChangeBatches => {
+                encode_payload_change_batches(&self.change_batches)
+            }
+        }
     }
 }
 
@@ -694,6 +854,10 @@ impl CdcBufferedTransactionManifest {
 
     pub fn payload_storage(&self) -> CdcBufferPayloadStorage {
         self.payload_storage
+    }
+
+    pub fn payload_format(&self) -> CdcBufferPayloadFormat {
+        self.payload_format
     }
 
     pub fn payload_object_key(&self) -> Option<&str> {
@@ -789,6 +953,7 @@ async fn load_json<T: for<'de> Deserialize<'de>>(
         .map(Some)
 }
 
+#[cfg(test)]
 async fn write_durable_batch(db: &Db, batch: WriteBatch) -> Result<()> {
     write_batch(db, batch, true).await
 }
@@ -981,6 +1146,18 @@ fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn encode_payload_change_batches(change_batches: &[ChangeBatch]) -> Result<Vec<u8>> {
+    ensure!(
+        !change_batches.is_empty(),
+        "CDC buffer change batch payload cannot be empty"
+    );
+    let payload = serde_json::to_vec(change_batches).context("encode CDC buffer change batches")?;
+    let mut out = Vec::with_capacity(CDC_BUFFER_CHANGE_BATCHES_MAGIC.len() + payload.len());
+    out.extend_from_slice(CDC_BUFFER_CHANGE_BATCHES_MAGIC);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
 fn encode_optional_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<()> {
     match value {
         Some(value) => {
@@ -1023,6 +1200,26 @@ fn decode_payload_records(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
     Ok(records)
 }
 
+fn decode_payload_change_batches(payload: &[u8]) -> Result<Vec<ChangeBatch>> {
+    ensure!(
+        payload.len() >= CDC_BUFFER_CHANGE_BATCHES_MAGIC.len(),
+        "CDC buffer change batch payload blob is too short"
+    );
+    ensure!(
+        &payload[..CDC_BUFFER_CHANGE_BATCHES_MAGIC.len()] == CDC_BUFFER_CHANGE_BATCHES_MAGIC,
+        "CDC buffer change batch payload blob has invalid magic"
+    );
+    let batches = serde_json::from_slice::<Vec<ChangeBatch>>(
+        &payload[CDC_BUFFER_CHANGE_BATCHES_MAGIC.len()..],
+    )
+    .context("decode CDC buffer change batches")?;
+    ensure!(
+        !batches.is_empty(),
+        "CDC buffer change batch payload cannot be empty"
+    );
+    Ok(batches)
+}
+
 fn decode_optional_bytes(payload: &[u8], cursor: &mut usize) -> Result<Option<Vec<u8>>> {
     let len = read_u64(payload, cursor)?;
     if len == CDC_BUFFER_NONE_LEN {
@@ -1059,6 +1256,7 @@ fn map_slate_err(err: SlateError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcTableId};
     use object_store::memory::InMemory;
 
     async fn test_store(name: &str) -> CdcBufferStore {
@@ -1123,6 +1321,35 @@ mod tests {
             frontier.source_position(),
             &CdcSourcePosition::postgres("0/10", None).expect("position")
         );
+    }
+
+    #[tokio::test]
+    async fn appends_and_replays_change_batch_payloads() {
+        let store = test_store("cdc-buffer-change-batches").await;
+        let table_id = CdcTableId::new("orders").unwrap();
+        let rows = CdcColumnarRowBatch::new(vec![CdcColumnarColumn::Int64(vec![Some(1), Some(2)])])
+            .unwrap();
+        let batch =
+            ChangeBatch::new_snapshot_insert(table_id.clone(), rows).expect("snapshot batch");
+        let append = CdcBufferAppend::new_change_batches(
+            "pipe",
+            "pg_main",
+            table_id.as_str(),
+            CdcSourcePosition::postgres("0/10", None).unwrap(),
+            None,
+            vec![batch.clone()],
+            1000,
+        )
+        .unwrap();
+        let manifest = store.append_transaction(&append).await.expect("append");
+
+        assert_eq!(
+            manifest.payload_format(),
+            CdcBufferPayloadFormat::ChangeBatches
+        );
+        assert_eq!(manifest.record_count(), 2);
+        assert!(store.records(&manifest).await.is_err());
+        assert_eq!(store.change_batches(&manifest).await.unwrap(), vec![batch]);
     }
 
     #[tokio::test]
@@ -1293,6 +1520,7 @@ mod tests {
             record_count: append.records().len(),
             payload_bytes: append.records().iter().map(CdcBufferRecord::byte_len).sum(),
             payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
+            payload_format: CdcBufferPayloadFormat::KafkaRecords,
             payload_object_key: None,
             buffered_at_unix_ms: append.buffered_at_unix_ms(),
             delivered_at_unix_ms: None,
@@ -1335,6 +1563,7 @@ mod tests {
             record_count: append.records().len(),
             payload_bytes: payload.len(),
             payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
+            payload_format: CdcBufferPayloadFormat::KafkaRecords,
             payload_object_key: None,
             buffered_at_unix_ms: append.buffered_at_unix_ms(),
             delivered_at_unix_ms: None,
