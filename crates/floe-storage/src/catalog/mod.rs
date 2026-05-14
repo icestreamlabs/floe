@@ -20,8 +20,8 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use serde::{Deserialize, Serialize};
-use slatedb::config::{ScanOptions, Settings};
-use slatedb::{CloseReason, Db, Error as SlateError, ErrorKind};
+use slatedb::config::{ScanOptions, Settings, WriteOptions};
+use slatedb::{CloseReason, Db, Error as SlateError, ErrorKind, WriteBatch};
 use tokio::fs;
 
 const TABLE_DEF_PREFIX: &str = "meta/table/";
@@ -500,6 +500,23 @@ impl SlateCatalog {
         &self,
         checkpoint: ReplicationPipelineCheckpoint,
     ) -> Result<()> {
+        self.put_replication_pipeline_checkpoint_with_durable_wait(checkpoint, true)
+            .await
+    }
+
+    pub async fn put_replication_pipeline_checkpoint_without_durable_wait(
+        &self,
+        checkpoint: ReplicationPipelineCheckpoint,
+    ) -> Result<()> {
+        self.put_replication_pipeline_checkpoint_with_durable_wait(checkpoint, false)
+            .await
+    }
+
+    async fn put_replication_pipeline_checkpoint_with_durable_wait(
+        &self,
+        checkpoint: ReplicationPipelineCheckpoint,
+        await_durable: bool,
+    ) -> Result<()> {
         let key = replication_pipeline_checkpoint_key(checkpoint.pipeline_name());
         let encoded = serde_json::to_vec(&checkpoint).with_context(|| {
             format!(
@@ -507,8 +524,10 @@ impl SlateCatalog {
                 checkpoint.pipeline_name()
             )
         })?;
+        let mut batch = WriteBatch::new();
+        batch.put(&key, encoded);
         self.db
-            .put(&key, encoded)
+            .write_with_options(batch, &WriteOptions { await_durable })
             .await
             .map(|_| ())
             .map_err(map_slate_err)

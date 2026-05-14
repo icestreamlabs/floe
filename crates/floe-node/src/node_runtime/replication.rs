@@ -32,8 +32,8 @@ const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
 const DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES: &str = "10485760";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
-const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 0;
-const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 0;
+const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
+const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
@@ -398,14 +398,16 @@ impl ReplicationPipelineRuntime {
                             )
                         })?;
                     storage
-                        .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
-                            &plan.name,
-                            &plan.source_name,
-                            transaction.commit_position().clone(),
-                            transaction.transaction_id().cloned(),
-                            pending_target_state(plan, &manifest),
-                            current_unix_time_ms(),
-                        )?)
+                        .put_replication_pipeline_checkpoint_without_durable_wait(
+                            ReplicationPipelineCheckpoint::new(
+                                &plan.name,
+                                &plan.source_name,
+                                transaction.commit_position().clone(),
+                                transaction.transaction_id().cloned(),
+                                pending_target_state(plan, &manifest),
+                                current_unix_time_ms(),
+                            )?,
+                        )
                         .await
                         .with_context(|| {
                             format!("persist replication pipeline '{}' checkpoint", plan.name)
@@ -442,14 +444,16 @@ impl ReplicationPipelineRuntime {
                 })?;
                 let checkpoint_started_at = perf_enabled.then(Instant::now);
                 storage
-                    .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
-                        &plan.name,
-                        &plan.source_name,
-                        transaction.commit_position().clone(),
-                        transaction.transaction_id().cloned(),
-                        pending_target_state(plan, &manifest),
-                        current_unix_time_ms(),
-                    )?)
+                    .put_replication_pipeline_checkpoint_without_durable_wait(
+                        ReplicationPipelineCheckpoint::new(
+                            &plan.name,
+                            &plan.source_name,
+                            transaction.commit_position().clone(),
+                            transaction.transaction_id().cloned(),
+                            pending_target_state(plan, &manifest),
+                            current_unix_time_ms(),
+                        )?,
+                    )
                     .await
                     .with_context(|| {
                         format!("persist replication pipeline '{}' checkpoint", plan.name)
@@ -480,8 +484,8 @@ impl ReplicationPipelineRuntime {
                             checkpoint_elapsed,
                             delivery_elapsed,
                         );
-                        if delivered > 0 && *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
-                            self.cleanup_delivered_if_due(plan, &buffer_store).await?;
+                        if delivered > 0 {
+                            self.spawn_cleanup_delivered_if_due(plan, &buffer_store);
                         }
                     }
                     Err(err) => {
@@ -561,9 +565,7 @@ impl ReplicationPipelineRuntime {
                 break;
             }
             delivered_records = delivered_records.saturating_add(delivered);
-            if *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
-                self.cleanup_delivered_if_due(plan, buffer_store).await?;
-            }
+            self.spawn_cleanup_delivered_if_due(plan, buffer_store);
         }
         record_buffer_stats(buffer_store, &plan.name).await?;
         Ok(delivered_records)
@@ -625,8 +627,8 @@ impl ReplicationPipelineRuntime {
         let delivered = self
             .replay_pending_for_plan(plan, buffer_store, storage)
             .await?;
-        if delivered > 0 && *REPLICATION_BUFFER_DELIVERED_RETENTION_MS > 0 {
-            self.cleanup_delivered_if_due(plan, buffer_store).await?;
+        if delivered > 0 {
+            self.spawn_cleanup_delivered_if_due(plan, buffer_store);
         }
         stats = buffer_store
             .stats(&plan.name, current_unix_time_ms())
@@ -701,8 +703,8 @@ impl ReplicationPipelineRuntime {
         target_state: std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<usize> {
         let delivered_at = current_unix_time_ms();
-        let delivered = buffer_store
-            .mark_delivered(manifest, delivered_at)
+        buffer_store
+            .mark_delivered_without_durable_wait(manifest, delivered_at)
             .await
             .with_context(|| {
                 format!(
@@ -711,14 +713,16 @@ impl ReplicationPipelineRuntime {
                 )
             })?;
         storage
-            .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
-                &plan.name,
-                &plan.source_name,
-                manifest.source_position().clone(),
-                manifest.transaction_id().cloned(),
-                delivered_target_state(manifest, target_state),
-                delivered_at,
-            )?)
+            .put_replication_pipeline_checkpoint_without_durable_wait(
+                ReplicationPipelineCheckpoint::new(
+                    &plan.name,
+                    &plan.source_name,
+                    manifest.source_position().clone(),
+                    manifest.transaction_id().cloned(),
+                    delivered_target_state(manifest, target_state),
+                    delivered_at,
+                )?,
+            )
             .await
             .with_context(|| {
                 format!(
@@ -726,24 +730,6 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
-        if *REPLICATION_BUFFER_DELIVERED_RETENTION_MS == 0 {
-            let cleanup_store = buffer_store.clone();
-            let cleanup_manifest = delivered.clone();
-            let cleanup_pipeline = plan.name.clone();
-            tokio::spawn(async move {
-                if let Err(err) = cleanup_store
-                    .cleanup_delivered_manifest(&cleanup_manifest)
-                    .await
-                {
-                    tracing::warn!(
-                        pipeline = %cleanup_pipeline,
-                        transaction = %cleanup_manifest.transaction_key(),
-                        error = %err,
-                        "replication pipeline delivered buffer cleanup failed"
-                    );
-                }
-            });
-        }
         Ok(manifest.record_count())
     }
 
@@ -770,22 +756,7 @@ impl ReplicationPipelineRuntime {
         buffer_store: &CdcBufferStore,
     ) -> anyhow::Result<()> {
         let now = current_unix_time_ms();
-        let cleanup_interval_ms = *REPLICATION_BUFFER_CLEANUP_INTERVAL_MS;
-        let should_cleanup = {
-            let mut last_by_pipeline = self
-                .buffer_cleanup_last_by_pipeline
-                .lock()
-                .map_err(|_| anyhow!("replication buffer cleanup tracker lock poisoned"))?;
-            let should_cleanup = cleanup_interval_ms == 0
-                || last_by_pipeline
-                    .get(&plan.name)
-                    .is_none_or(|last| now.saturating_sub(*last) >= cleanup_interval_ms);
-            if should_cleanup {
-                last_by_pipeline.insert(plan.name.clone(), now);
-            }
-            should_cleanup
-        };
-        if !should_cleanup {
+        if !self.claim_cleanup_due(&plan.name, now)? {
             return Ok(());
         }
         buffer_store
@@ -802,6 +773,60 @@ impl ReplicationPipelineRuntime {
                 )
             })?;
         Ok(())
+    }
+
+    fn spawn_cleanup_delivered_if_due(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+    ) {
+        let now = current_unix_time_ms();
+        match self.claim_cleanup_due(&plan.name, now) {
+            Ok(true) => {
+                let cleanup_store = buffer_store.clone();
+                let pipeline_name = plan.name.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = cleanup_store
+                        .cleanup_delivered(
+                            &pipeline_name,
+                            CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
+                            now,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            pipeline = %pipeline_name,
+                            error = %err,
+                            "replication pipeline delivered buffer cleanup failed"
+                        );
+                    }
+                });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    pipeline = %plan.name,
+                    error = %err,
+                    "replication pipeline delivered buffer cleanup scheduling failed"
+                );
+            }
+        }
+    }
+
+    fn claim_cleanup_due(&self, pipeline_name: &str, now: u64) -> anyhow::Result<bool> {
+        let cleanup_interval_ms = *REPLICATION_BUFFER_CLEANUP_INTERVAL_MS;
+        let mut last_by_pipeline = self
+            .buffer_cleanup_last_by_pipeline
+            .lock()
+            .map_err(|_| anyhow!("replication buffer cleanup tracker lock poisoned"))?;
+        let should_cleanup = cleanup_interval_ms == 0
+            || last_by_pipeline
+                .get(pipeline_name)
+                .is_none_or(|last| now.saturating_sub(*last) >= cleanup_interval_ms);
+        if should_cleanup {
+            last_by_pipeline.insert(pipeline_name.to_string(), now);
+        }
+        Ok(should_cleanup)
     }
 }
 

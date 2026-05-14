@@ -228,6 +228,25 @@ impl CdcBufferStore {
         manifest: &CdcBufferedTransactionManifest,
         delivered_at_unix_ms: u64,
     ) -> Result<CdcBufferedTransactionManifest> {
+        self.mark_delivered_with_durable_wait(manifest, delivered_at_unix_ms, true)
+            .await
+    }
+
+    pub async fn mark_delivered_without_durable_wait(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+        delivered_at_unix_ms: u64,
+    ) -> Result<CdcBufferedTransactionManifest> {
+        self.mark_delivered_with_durable_wait(manifest, delivered_at_unix_ms, false)
+            .await
+    }
+
+    async fn mark_delivered_with_durable_wait(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+        delivered_at_unix_ms: u64,
+        await_durable: bool,
+    ) -> Result<CdcBufferedTransactionManifest> {
         let delivered = manifest.clone().with_delivered_at(delivered_at_unix_ms);
         let mut batch = WriteBatch::new();
         batch.delete(pending_manifest_key(
@@ -252,7 +271,7 @@ impl CdcBufferStore {
             delivery_frontier_key(manifest.pipeline_name()),
             serde_json::to_vec(&frontier).context("encode CDC buffer delivery frontier")?,
         );
-        write_durable_batch(self.db.as_ref(), batch)
+        write_batch(self.db.as_ref(), batch, await_durable)
             .await
             .context("mark CDC buffer transaction delivered")?;
         Ok(delivered)
@@ -309,6 +328,13 @@ impl CdcBufferStore {
         now_unix_ms: u64,
     ) -> Result<CdcBufferCleanupSummary> {
         let delivered = scan_prefix(&self.db, &delivered_manifest_prefix(pipeline_name)).await?;
+        if !delivered.is_empty() {
+            self.db
+                .flush()
+                .await
+                .map_err(map_slate_err)
+                .context("flush CDC buffer delivery markers before payload cleanup")?;
+        }
         let mut batch = WriteBatch::new();
         let mut summary = CdcBufferCleanupSummary {
             deleted_transactions: 0,
@@ -388,7 +414,7 @@ impl CdcBufferStore {
         }
 
         if summary.deleted_transactions > 0 {
-            write_durable_batch(self.db.as_ref(), batch)
+            write_batch(self.db.as_ref(), batch, false)
                 .await
                 .context("cleanup delivered CDC buffer transactions")?;
         }
@@ -420,6 +446,12 @@ impl CdcBufferStore {
             deleted_bytes: 0,
         };
 
+        self.db
+            .flush()
+            .await
+            .map_err(map_slate_err)
+            .context("flush CDC buffer delivery marker before payload cleanup")?;
+
         if self
             .db
             .get(pending_key)
@@ -429,7 +461,7 @@ impl CdcBufferStore {
         {
             batch.delete(delivered_key);
             summary.deleted_transactions = 1;
-            write_durable_batch(self.db.as_ref(), batch)
+            write_batch(self.db.as_ref(), batch, false)
                 .await
                 .context("cleanup stale delivered CDC buffer transaction manifest")?;
             return Ok(summary);
@@ -474,7 +506,7 @@ impl CdcBufferStore {
         }
         batch.delete(delivered_key);
         summary.deleted_transactions = 1;
-        write_durable_batch(self.db.as_ref(), batch)
+        write_batch(self.db.as_ref(), batch, false)
             .await
             .context("cleanup delivered CDC buffer transaction manifest")?;
         Ok(summary)
@@ -758,15 +790,14 @@ async fn load_json<T: for<'de> Deserialize<'de>>(
 }
 
 async fn write_durable_batch(db: &Db, batch: WriteBatch) -> Result<()> {
-    db.write_with_options(
-        batch,
-        &WriteOptions {
-            await_durable: true,
-        },
-    )
-    .await
-    .map(|_| ())
-    .map_err(map_slate_err)
+    write_batch(db, batch, true).await
+}
+
+async fn write_batch(db: &Db, batch: WriteBatch, await_durable: bool) -> Result<()> {
+    db.write_with_options(batch, &WriteOptions { await_durable })
+        .await
+        .map(|_| ())
+        .map_err(map_slate_err)
 }
 
 async fn scan_prefix(db: &Db, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
