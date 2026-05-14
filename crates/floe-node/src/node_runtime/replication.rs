@@ -30,7 +30,7 @@ use rdkafka::ClientConfig;
 use rdkafka::client::ClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::Message;
-use rdkafka::producer::{BaseRecord, DeliveryResult, ProducerContext, ThreadedProducer};
+use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
 
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;
@@ -45,6 +45,7 @@ const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: &str = "1000000";
 const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: &str = "1048576";
 const DEFAULT_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES: &str = "0";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT: Duration = Duration::from_millis(500);
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 const FLOE_JSON_VERSION: i64 = 1;
 const FLOE_JSON_DELETED_FIELD: &str = "__floe_deleted";
@@ -1220,6 +1221,16 @@ impl KafkaReplicationPipelineWriter {
         let producer: ThreadedProducer<KafkaReplicationPipelineContext> = config
             .create_with_context(KafkaReplicationPipelineContext)
             .context("create replication pipeline Kafka producer")?;
+        if let Err(err) = producer
+            .client()
+            .fetch_metadata(Some(topic), REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT)
+        {
+            tracing::debug!(
+                topic,
+                error = %err,
+                "replication pipeline Kafka metadata warm-up failed; first send will retry metadata"
+            );
+        }
         Ok(Self {
             producer,
             topic: topic.to_string(),
@@ -1557,11 +1568,10 @@ fn encode_floe_json_snapshot_pipeline_records(
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     validate_floe_json_schema(schema)?;
     schema.validate_columnar_rows(rows)?;
+    let encoder = FloeJsonColumnarEncoder::new(schema)?;
     let mut records = Vec::with_capacity(rows.row_count());
     for row_idx in 0..rows.row_count() {
-        let row = rows.row(row_idx)?;
-        let key = schema.primary_key_from_row(&row)?;
-        records.push(floe_json_record_from_row(schema, &key, &row, false)?);
+        records.push(floe_json_record_from_columnar_row(rows, row_idx, &encoder)?);
     }
     Ok(records)
 }
@@ -1615,6 +1625,121 @@ fn floe_json_record_from_row(
         Some(floe_json_key_bytes(schema, key)?),
         Some(floe_json_value_bytes_from_row(schema, row, deleted)?),
     ))
+}
+
+struct FloeJsonColumnarEncoder {
+    value_fields: Vec<FloeJsonColumnarField>,
+    key_fields: Vec<FloeJsonColumnarField>,
+}
+
+struct FloeJsonColumnarField {
+    column_idx: usize,
+    name: String,
+    prefix: Vec<u8>,
+    data_type: ColumnType,
+}
+
+impl FloeJsonColumnarEncoder {
+    fn new(schema: &CdcTableSchema) -> anyhow::Result<Self> {
+        let value_fields = schema
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(column_idx, column)| {
+                Ok(FloeJsonColumnarField {
+                    column_idx,
+                    name: column.name().to_string(),
+                    prefix: encoded_json_field_prefix(column.name(), column_idx == 0)?,
+                    data_type: column.data_type().clone(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let primary_key_indices = schema.primary_key_indices();
+        let key_fields = schema
+            .primary_key()
+            .columns()
+            .iter()
+            .zip(primary_key_indices)
+            .enumerate()
+            .map(|(key_idx, (column_name, column_idx))| {
+                let column = &schema.columns()[column_idx];
+                Ok(FloeJsonColumnarField {
+                    column_idx,
+                    name: column_name.clone(),
+                    prefix: encoded_json_field_prefix(column_name, key_idx == 0)?,
+                    data_type: column.data_type().clone(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            value_fields,
+            key_fields,
+        })
+    }
+}
+
+fn encoded_json_field_prefix(field_name: &str, first: bool) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(field_name.len() + 4);
+    if !first {
+        out.push(b',');
+    }
+    serde_json::to_writer(&mut out, field_name)?;
+    out.push(b':');
+    Ok(out)
+}
+
+fn floe_json_record_from_columnar_row(
+    rows: &CdcColumnarRowBatch,
+    row_idx: usize,
+    encoder: &FloeJsonColumnarEncoder,
+) -> anyhow::Result<CdcBufferRecord> {
+    Ok(CdcBufferRecord::new(
+        Some(floe_json_columnar_key_bytes(rows, row_idx, encoder)?),
+        Some(floe_json_columnar_value_bytes(
+            rows, row_idx, encoder, false,
+        )?),
+    ))
+}
+
+fn floe_json_columnar_key_bytes(
+    rows: &CdcColumnarRowBatch,
+    row_idx: usize,
+    encoder: &FloeJsonColumnarEncoder,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoder.key_fields.len() * 24);
+    out.push(b'{');
+    for field in &encoder.key_fields {
+        out.extend_from_slice(&field.prefix);
+        let column = rows
+            .columns()
+            .get(field.column_idx)
+            .ok_or_else(|| anyhow!("CDC column index {} out of bounds", field.column_idx))?;
+        append_floe_json_columnar_value(&mut out, column, row_idx, field, false)?;
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+fn floe_json_columnar_value_bytes(
+    rows: &CdcColumnarRowBatch,
+    row_idx: usize,
+    encoder: &FloeJsonColumnarEncoder,
+    deleted: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoder.value_fields.len() * 32 + 64);
+    out.push(b'{');
+    for field in &encoder.value_fields {
+        out.extend_from_slice(&field.prefix);
+        let column = rows
+            .columns()
+            .get(field.column_idx)
+            .ok_or_else(|| anyhow!("CDC column index {} out of bounds", field.column_idx))?;
+        append_floe_json_columnar_value(&mut out, column, row_idx, field, true)?;
+    }
+    let mut first = encoder.value_fields.is_empty();
+    append_floe_json_metadata(&mut out, &mut first, deleted)?;
+    out.push(b'}');
+    Ok(out)
 }
 
 fn floe_json_key_bytes(schema: &CdcTableSchema, key: &CdcRowKey) -> anyhow::Result<Vec<u8>> {
@@ -1731,6 +1856,72 @@ fn append_floe_json_value(
         },
         RowValue::Numeric(value) => serde_json::to_writer(out, value)?,
     }
+    Ok(())
+}
+
+fn append_floe_json_columnar_value(
+    out: &mut Vec<u8>,
+    column: &CdcColumnarColumn,
+    row_idx: usize,
+    field: &FloeJsonColumnarField,
+    allow_null: bool,
+) -> anyhow::Result<()> {
+    match column {
+        CdcColumnarColumn::Int64(values) => match columnar_value(values, row_idx)? {
+            Some(value) => write!(out, "{value}")?,
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::Bool(values) => match columnar_value(values, row_idx)? {
+            Some(value) => out.extend_from_slice(if *value { b"true" } else { b"false" }),
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::Utf8(values) => match columnar_value(values, row_idx)? {
+            Some(value) => serde_json::to_writer(out, value)?,
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::TimestampMillis(values) => match columnar_value(values, row_idx)? {
+            Some(value) => write!(out, "{value}")?,
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::DateDays(values) => match columnar_value(values, row_idx)? {
+            Some(value) => write!(out, "{value}")?,
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::Decimal128 { values, .. } => match columnar_value(values, row_idx)? {
+            Some(value) => match &field.data_type {
+                ColumnType::Decimal128 { scale, .. } => {
+                    serde_json::to_writer(out, &format_decimal128_for_json(*value, *scale))?;
+                }
+                _ => serde_json::to_writer(out, &value.to_string())?,
+            },
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+        CdcColumnarColumn::Numeric(values) => match columnar_value(values, row_idx)? {
+            Some(value) => serde_json::to_writer(out, value)?,
+            None => append_floe_json_columnar_null(out, field, allow_null)?,
+        },
+    }
+    Ok(())
+}
+
+fn columnar_value<T>(values: &[Option<T>], row_idx: usize) -> anyhow::Result<Option<&T>> {
+    values
+        .get(row_idx)
+        .map(Option::as_ref)
+        .ok_or_else(|| anyhow!("CDC columnar row index {row_idx} out of bounds"))
+}
+
+fn append_floe_json_columnar_null(
+    out: &mut Vec<u8>,
+    field: &FloeJsonColumnarField,
+    allow_null: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        allow_null,
+        "CDC primary key column '{}' cannot be NULL",
+        field.name
+    );
+    out.extend_from_slice(b"null");
     Ok(())
 }
 
