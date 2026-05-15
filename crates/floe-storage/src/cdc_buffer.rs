@@ -1289,6 +1289,13 @@ mod tests {
         CdcBufferStore::with_object_store(db, object_store)
     }
 
+    fn reopened_store(store: &CdcBufferStore) -> CdcBufferStore {
+        CdcBufferStore::with_object_store(
+            Arc::clone(&store.db),
+            Arc::clone(store.object_store.as_ref().expect("object store")),
+        )
+    }
+
     #[tokio::test]
     async fn appends_and_replays_pending_transactions() {
         let store = test_store("cdc-buffer-append").await;
@@ -1342,6 +1349,73 @@ mod tests {
         assert_eq!(
             frontier.source_position(),
             &CdcSourcePosition::postgres("0/10", None).expect("position")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_after_durable_append_before_target_delivery() {
+        let store = test_store("cdc-buffer-recovery-before-delivery").await;
+        let append = append("0/10", 1000, vec![record(1), record(2)]);
+        let manifest = store.append_transaction(&append).await.expect("append");
+
+        let recovered = reopened_store(&store);
+        let pending = recovered
+            .pending_transactions("pipe", 10)
+            .await
+            .expect("pending after recovery");
+
+        assert_eq!(pending, vec![manifest.clone()]);
+        assert_eq!(
+            recovered.records(&manifest).await.expect("records"),
+            vec![record(1), record(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_after_target_delivery_before_delivery_checkpoint() {
+        let store = test_store("cdc-buffer-recovery-before-checkpoint").await;
+        let append = append("0/10", 1000, vec![record(1)]);
+        let manifest = store.append_transaction(&append).await.expect("append");
+
+        let recovered = reopened_store(&store);
+        let pending = recovered
+            .pending_transactions("pipe", 10)
+            .await
+            .expect("pending after target-only delivery");
+
+        assert_eq!(pending, vec![manifest.clone()]);
+        assert_eq!(recovered.records(&manifest).await.unwrap(), vec![record(1)]);
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_after_delivery_checkpoint() {
+        let store = test_store("cdc-buffer-recovery-after-checkpoint").await;
+        let append = append("0/10", 1000, vec![record(1)]);
+        let manifest = store.append_transaction(&append).await.expect("append");
+        let delivered = store
+            .mark_delivered(&manifest, 2000)
+            .await
+            .expect("mark delivered");
+
+        let recovered = reopened_store(&store);
+        let pending = recovered
+            .pending_transactions("pipe", 10)
+            .await
+            .expect("pending after delivery checkpoint");
+        let delivery = recovered
+            .delivery_frontier("pipe")
+            .await
+            .expect("delivery frontier")
+            .expect("frontier");
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            delivery.source_position(),
+            &CdcSourcePosition::postgres("0/10", None).unwrap()
+        );
+        assert_eq!(
+            recovered.records(&delivered).await.unwrap(),
+            vec![record(1)]
         );
     }
 

@@ -313,6 +313,76 @@ pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<KafkaReplicationPipelineWriter>>,
     buffer_cleanup_last_by_pipeline: Mutex<HashMap<String, u64>>,
+    replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
+    last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReplicationPipelineStatusSnapshot {
+    pipeline_name: String,
+    source_name: String,
+    target_kind: String,
+    checkpoint_position: Option<CdcSourcePosition>,
+    checkpoint_transaction_id: Option<CdcTransactionId>,
+    target_state: std::collections::BTreeMap<String, String>,
+    pending_transactions: usize,
+    pending_records: usize,
+    pending_bytes: usize,
+    oldest_pending_age_ms: Option<u64>,
+    replaying: bool,
+    last_error: Option<String>,
+}
+
+#[allow(dead_code)]
+impl ReplicationPipelineStatusSnapshot {
+    pub(super) fn pipeline_name(&self) -> &str {
+        &self.pipeline_name
+    }
+
+    pub(super) fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub(super) fn target_kind(&self) -> &str {
+        &self.target_kind
+    }
+
+    pub(super) fn checkpoint_position(&self) -> Option<&CdcSourcePosition> {
+        self.checkpoint_position.as_ref()
+    }
+
+    pub(super) fn checkpoint_transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.checkpoint_transaction_id.as_ref()
+    }
+
+    pub(super) fn target_state(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.target_state
+    }
+
+    pub(super) fn pending_transactions(&self) -> usize {
+        self.pending_transactions
+    }
+
+    pub(super) fn pending_records(&self) -> usize {
+        self.pending_records
+    }
+
+    pub(super) fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    pub(super) fn oldest_pending_age_ms(&self) -> Option<u64> {
+        self.oldest_pending_age_ms
+    }
+
+    pub(super) fn replaying(&self) -> bool {
+        self.replaying
+    }
+
+    pub(super) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
 }
 
 struct KafkaReplicationPipelineWriter {
@@ -440,6 +510,27 @@ impl PreparedReplicationBufferAppend {
     }
 }
 
+struct ReplicationReplayStateGuard<'a> {
+    runtime: &'a ReplicationPipelineRuntime,
+    pipeline_name: String,
+}
+
+impl<'a> ReplicationReplayStateGuard<'a> {
+    fn new(runtime: &'a ReplicationPipelineRuntime, pipeline_name: &str) -> Self {
+        runtime.set_replay_state(pipeline_name, true);
+        Self {
+            runtime,
+            pipeline_name: pipeline_name.to_string(),
+        }
+    }
+}
+
+impl Drop for ReplicationReplayStateGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.set_replay_state(&self.pipeline_name, false);
+    }
+}
+
 impl ReplicationPipelineRuntime {
     pub(super) fn new(
         plans: impl IntoIterator<Item = ReplicationPipelineRuntimePlan>,
@@ -471,6 +562,8 @@ impl ReplicationPipelineRuntime {
             pipelines_by_source,
             kafka_writers_by_pipeline,
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
+            replay_state_by_pipeline: Mutex::new(HashMap::new()),
+            last_target_error_by_pipeline: Mutex::new(HashMap::new()),
         })
     }
 
@@ -493,6 +586,72 @@ impl ReplicationPipelineRuntime {
             }
         }
         Ok(delivered)
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn status_snapshots(
+        &self,
+        storage: &SlateCatalog,
+    ) -> anyhow::Result<Vec<ReplicationPipelineStatusSnapshot>> {
+        let buffer_store = storage.cdc_buffer_store();
+        let replaying_by_pipeline = self
+            .replay_state_by_pipeline
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| anyhow!("replication replay state lock poisoned"))?;
+        let last_error_by_pipeline = self
+            .last_target_error_by_pipeline
+            .lock()
+            .map(|errors| errors.clone())
+            .map_err(|_| anyhow!("replication target error state lock poisoned"))?;
+        let mut snapshots = Vec::new();
+        for plans in self.pipelines_by_source.values() {
+            for plan in plans {
+                let stats = buffer_store
+                    .stats(&plan.name, current_unix_time_ms())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "load CDC buffer stats for replication pipeline '{}'",
+                            plan.name
+                        )
+                    })?;
+                let checkpoint = storage
+                    .replication_pipeline_checkpoint(&plan.name)
+                    .await
+                    .with_context(|| {
+                        format!("load replication pipeline '{}' checkpoint", plan.name)
+                    })?;
+                let (checkpoint_position, checkpoint_transaction_id, target_state) = checkpoint
+                    .map(|checkpoint| {
+                        (
+                            Some(checkpoint.source_position().clone()),
+                            checkpoint.transaction_id().cloned(),
+                            checkpoint.target_state().clone(),
+                        )
+                    })
+                    .unwrap_or((None, None, std::collections::BTreeMap::new()));
+                snapshots.push(ReplicationPipelineStatusSnapshot {
+                    pipeline_name: plan.name.clone(),
+                    source_name: plan.source_name.clone(),
+                    target_kind: target_kind(plan).to_string(),
+                    checkpoint_position,
+                    checkpoint_transaction_id,
+                    target_state,
+                    pending_transactions: stats.pending_transactions(),
+                    pending_records: stats.pending_records(),
+                    pending_bytes: stats.pending_bytes(),
+                    oldest_pending_age_ms: stats.oldest_pending_age_ms(),
+                    replaying: replaying_by_pipeline
+                        .get(&plan.name)
+                        .copied()
+                        .unwrap_or(false),
+                    last_error: last_error_by_pipeline.get(&plan.name).cloned(),
+                });
+            }
+        }
+        snapshots.sort_by(|left, right| left.pipeline_name.cmp(&right.pipeline_name));
+        Ok(snapshots)
     }
 
     pub(super) async fn run_transaction(
@@ -775,7 +934,8 @@ impl ReplicationPipelineRuntime {
                         }
                     }
                     Err(err) => {
-                        self.record_target_write_failure(plan, err);
+                        self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
+                            .await?;
                     }
                 }
                 record_buffer_stats(&buffer_store, &plan.name).await?;
@@ -801,7 +961,10 @@ impl ReplicationPipelineRuntime {
                                         plan.name
                                     )
                                 })?;
-                        writer.send_records(&buffered_records).await?;
+                        if let Err(err) = writer.send_records(&buffered_records).await {
+                            self.record_target_write_failure(plan, &err);
+                            return Err(err);
+                        }
                     }
                 }
                 written = written.saturating_add(buffered_records.len());
@@ -827,6 +990,7 @@ impl ReplicationPipelineRuntime {
         buffer_store: &CdcBufferStore,
         storage: &SlateCatalog,
     ) -> anyhow::Result<usize> {
+        let _replay_guard = ReplicationReplayStateGuard::new(self, &plan.name);
         let mut delivered_records = 0usize;
         let pending = buffer_store
             .pending_transactions(&plan.name, REPLICATION_BUFFER_REPLAY_LIMIT)
@@ -1010,7 +1174,8 @@ impl ReplicationPipelineRuntime {
                     .await
             }
             Err(err) => {
-                self.record_target_write_failure(plan, err);
+                self.mark_manifest_delivery_failed(plan, storage, manifest, err)
+                    .await?;
                 Ok(0)
             }
         }
@@ -1054,6 +1219,7 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        self.clear_last_target_error(&plan.name);
         storage
             .put_replication_pipeline_checkpoint_without_durable_wait(
                 ReplicationPipelineCheckpoint::new(
@@ -1061,7 +1227,7 @@ impl ReplicationPipelineRuntime {
                     &plan.source_name,
                     manifest.source_position().clone(),
                     manifest.transaction_id().cloned(),
-                    delivered_target_state(manifest, target_state),
+                    delivered_target_state(plan, manifest, target_state),
                     delivered_at,
                 )?,
             )
@@ -1075,11 +1241,41 @@ impl ReplicationPipelineRuntime {
         Ok(manifest.record_count())
     }
 
+    async fn mark_manifest_delivery_failed(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        storage: &SlateCatalog,
+        manifest: &CdcBufferedTransactionManifest,
+        err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        self.record_target_write_failure(plan, &err);
+        storage
+            .put_replication_pipeline_checkpoint_without_durable_wait(
+                ReplicationPipelineCheckpoint::new(
+                    &plan.name,
+                    &plan.source_name,
+                    manifest.source_position().clone(),
+                    manifest.transaction_id().cloned(),
+                    failed_target_state(plan, manifest, &err),
+                    current_unix_time_ms(),
+                )?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "persist replication pipeline '{}' failed delivery checkpoint",
+                    plan.name
+                )
+            })?;
+        Ok(())
+    }
+
     fn record_target_write_failure(
         &self,
         plan: &ReplicationPipelineRuntimePlan,
-        err: anyhow::Error,
+        err: &anyhow::Error,
     ) {
+        self.set_last_target_error(&plan.name, format!("{err:#}"));
         match &plan.target {
             ReplicationPipelineRuntimeTarget::Kafka { .. } => {
                 crate::metrics::inc_sink_failure(&plan.name, "kafka_replication");
@@ -1089,6 +1285,41 @@ impl ReplicationPipelineRuntime {
                     "replication pipeline target write failed; buffered transaction remains pending"
                 );
             }
+        }
+    }
+
+    fn set_replay_state(&self, pipeline_name: &str, replaying: bool) {
+        match self.replay_state_by_pipeline.lock() {
+            Ok(mut state) => {
+                state.insert(pipeline_name.to_string(), replaying);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pipeline = %pipeline_name,
+                    replaying,
+                    "replication pipeline replay state lock poisoned"
+                );
+            }
+        }
+    }
+
+    fn set_last_target_error(&self, pipeline_name: &str, error: String) {
+        match self.last_target_error_by_pipeline.lock() {
+            Ok(mut errors) => {
+                errors.insert(pipeline_name.to_string(), truncate_target_error(&error));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pipeline = %pipeline_name,
+                    "replication pipeline target error state lock poisoned"
+                );
+            }
+        }
+    }
+
+    fn clear_last_target_error(&self, pipeline_name: &str) {
+        if let Ok(mut errors) = self.last_target_error_by_pipeline.lock() {
+            errors.remove(pipeline_name);
         }
     }
 
@@ -2511,34 +2742,118 @@ fn pending_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
 ) -> std::collections::BTreeMap<String, String> {
-    let mut state = std::collections::BTreeMap::new();
-    state.insert("source.table".to_string(), plan.upstream_table.clone());
-    state.insert("buffer.status".to_string(), "pending".to_string());
+    let mut state = base_target_state(plan, manifest);
+    state.insert("buffer.status".to_string(), "durable".to_string());
+    state.insert("target.delivery.status".to_string(), "pending".to_string());
     state.insert(
-        "buffer.transaction_key".to_string(),
-        manifest.transaction_key().to_string(),
-    );
-    state.insert(
-        "buffer.record_count".to_string(),
-        manifest.record_count().to_string(),
+        "target.delivery.replay_may_duplicate".to_string(),
+        "true".to_string(),
     );
     state
 }
 
 fn delivered_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
     mut target_state: std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
+    target_state.extend(base_target_state(plan, manifest));
     target_state.insert("buffer.status".to_string(), "delivered".to_string());
     target_state.insert(
+        "target.delivery.status".to_string(),
+        "delivered".to_string(),
+    );
+    target_state.insert(
+        "target.delivery.replay_may_duplicate".to_string(),
+        "false".to_string(),
+    );
+    target_state
+}
+
+fn failed_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    manifest: &CdcBufferedTransactionManifest,
+    err: &anyhow::Error,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = base_target_state(plan, manifest);
+    state.insert("buffer.status".to_string(), "durable".to_string());
+    state.insert("target.delivery.status".to_string(), "failed".to_string());
+    state.insert(
+        "target.delivery.replay_may_duplicate".to_string(),
+        "true".to_string(),
+    );
+    state.insert(
+        "target.last_error".to_string(),
+        truncate_target_error(&format!("{err:#}")),
+    );
+    state
+}
+
+fn base_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    manifest: &CdcBufferedTransactionManifest,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = std::collections::BTreeMap::new();
+    state.insert("source.table".to_string(), plan.upstream_table.clone());
+    state.insert("target.kind".to_string(), target_kind(plan).to_string());
+    state.insert(
         "buffer.transaction_key".to_string(),
         manifest.transaction_key().to_string(),
     );
-    target_state.insert(
+    state.insert(
         "buffer.record_count".to_string(),
         manifest.record_count().to_string(),
     );
-    target_state
+    state.insert(
+        "buffer.payload_format".to_string(),
+        format!("{:?}", manifest.payload_format()),
+    );
+    if let Some(transaction_id) = manifest.transaction_id() {
+        state.insert(
+            "source.transaction_id".to_string(),
+            transaction_id.as_str().to_string(),
+        );
+    }
+    match manifest.source_position() {
+        CdcSourcePosition::Postgres {
+            commit_lsn,
+            event_lsn,
+        } => {
+            state.insert(
+                "source.position.postgres.commit_lsn".to_string(),
+                commit_lsn.clone(),
+            );
+            if let Some(event_lsn) = event_lsn {
+                state.insert(
+                    "source.position.postgres.event_lsn".to_string(),
+                    event_lsn.clone(),
+                );
+            }
+        }
+        CdcSourcePosition::Opaque { value } => {
+            state.insert("source.position".to_string(), value.clone());
+        }
+    }
+    state
+}
+
+fn target_kind(plan: &ReplicationPipelineRuntimePlan) -> &'static str {
+    match &plan.target {
+        ReplicationPipelineRuntimeTarget::Kafka { .. } => "kafka",
+    }
+}
+
+fn truncate_target_error(message: &str) -> String {
+    const MAX_ERROR_LEN: usize = 512;
+    if message.len() <= MAX_ERROR_LEN {
+        return message.to_string();
+    }
+    let mut truncated = message
+        .chars()
+        .take(MAX_ERROR_LEN.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn record_buffer_stats(
@@ -3239,6 +3554,137 @@ mod tests {
         assert_eq!(checkpoint.schema_versions().get("orders"), Some(&42));
     }
 
+    #[tokio::test]
+    async fn target_checkpoint_state_makes_partial_delivery_explicit() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let records = vec![CdcBufferRecord::new(Some(vec![1]), Some(vec![2]))];
+        let prepared = prepare_replication_buffer_append(&plan, &transaction, records).unwrap();
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let buffer_store = storage.cdc_buffer_store();
+        let manifest = buffer_store
+            .append_transaction(&prepared.append)
+            .await
+            .unwrap();
+
+        let pending = pending_target_state(&plan, &manifest);
+        assert_eq!(pending["buffer.status"], "durable");
+        assert_eq!(pending["target.delivery.status"], "pending");
+        assert_eq!(pending["target.delivery.replay_may_duplicate"], "true");
+        assert_eq!(pending["target.kind"], "kafka");
+        assert_eq!(pending["source.position.postgres.commit_lsn"], "0/16B6C50");
+
+        let delivered = delivered_target_state(
+            &plan,
+            &manifest,
+            std::collections::BTreeMap::from([
+                ("kafka.topic".to_string(), "orders".to_string()),
+                ("kafka.partition.0.offset".to_string(), "42".to_string()),
+            ]),
+        );
+        assert_eq!(delivered["buffer.status"], "delivered");
+        assert_eq!(delivered["target.delivery.status"], "delivered");
+        assert_eq!(delivered["target.delivery.replay_may_duplicate"], "false");
+        assert_eq!(delivered["kafka.partition.0.offset"], "42");
+
+        let failed = failed_target_state(&plan, &manifest, &anyhow!("kafka unavailable"));
+        assert_eq!(failed["buffer.status"], "durable");
+        assert_eq!(failed["target.delivery.status"], "failed");
+        assert_eq!(failed["target.delivery.replay_may_duplicate"], "true");
+        assert!(failed["target.last_error"].contains("kafka unavailable"));
+    }
+
+    #[tokio::test]
+    async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let runtime = test_runtime_with_plan(plan.clone());
+        runtime.set_replay_state(&plan.name, true);
+        runtime.set_last_target_error(&plan.name, "kafka unavailable".to_string());
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let prepared = prepare_replication_buffer_append(
+            &plan,
+            &transaction,
+            vec![CdcBufferRecord::new(Some(vec![1]), Some(vec![2]))],
+        )
+        .unwrap();
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let buffer_store = storage.cdc_buffer_store();
+        let manifest = buffer_store
+            .append_transaction(&prepared.append)
+            .await
+            .unwrap();
+        storage
+            .put_replication_pipeline_checkpoint(
+                ReplicationPipelineCheckpoint::new(
+                    &plan.name,
+                    &plan.source_name,
+                    manifest.source_position().clone(),
+                    manifest.transaction_id().cloned(),
+                    pending_target_state(&plan, &manifest),
+                    current_unix_time_ms(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let snapshots = runtime.status_snapshots(&storage).await.unwrap();
+        let snapshot = snapshots.first().expect("snapshot");
+
+        assert_eq!(snapshot.pipeline_name(), "orders_pipe");
+        assert_eq!(snapshot.source_name(), "pg_main");
+        assert_eq!(snapshot.target_kind(), "kafka");
+        assert_eq!(snapshot.pending_transactions(), 1);
+        assert_eq!(snapshot.pending_records(), manifest.record_count());
+        assert!(snapshot.pending_bytes() > 0);
+        assert!(snapshot.oldest_pending_age_ms().is_some());
+        assert!(snapshot.replaying());
+        assert_eq!(snapshot.last_error(), Some("kafka unavailable"));
+        assert_eq!(
+            snapshot.checkpoint_position(),
+            Some(manifest.source_position())
+        );
+        assert_eq!(
+            snapshot
+                .checkpoint_transaction_id()
+                .map(CdcTransactionId::as_str),
+            Some("pg-xid-77")
+        );
+        assert_eq!(snapshot.target_state()["target.delivery.status"], "pending");
+    }
+
     #[test]
     fn buffer_limit_violation_accounts_for_incoming_payload_bytes() {
         let limits = ReplicationBufferLimits {
@@ -3344,6 +3790,19 @@ mod tests {
             buffer_policy: CatalogReplicationBufferPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
+        }
+    }
+
+    fn test_runtime_with_plan(plan: ReplicationPipelineRuntimePlan) -> ReplicationPipelineRuntime {
+        ReplicationPipelineRuntime {
+            pipelines_by_source: HashMap::from([(
+                CdcSourceId::new(plan.source_name.clone()).unwrap(),
+                vec![plan],
+            )]),
+            kafka_writers_by_pipeline: HashMap::new(),
+            buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
+            replay_state_by_pipeline: Mutex::new(HashMap::new()),
+            last_target_error_by_pipeline: Mutex::new(HashMap::new()),
         }
     }
 
