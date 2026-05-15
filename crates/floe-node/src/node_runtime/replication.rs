@@ -3921,6 +3921,120 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_snapshots_track_target_outage_replay_and_recovery() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let runtime = test_runtime_with_plan(plan.clone());
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-88").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6D00", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(2, "pending"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let prepared = prepare_replication_buffer_append(
+            &plan,
+            &transaction,
+            vec![CdcBufferRecord::new(Some(vec![2]), Some(vec![4]))],
+        )
+        .unwrap();
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let buffer_store = storage.cdc_buffer_store();
+        let manifest = buffer_store
+            .append_transaction(&prepared.append)
+            .await
+            .unwrap();
+
+        runtime
+            .mark_manifest_delivery_failed(&plan, &storage, &manifest, anyhow!("kafka outage"))
+            .await
+            .unwrap();
+        let failed = runtime.status_snapshots(&storage).await.unwrap();
+        let failed = failed.first().expect("failed snapshot");
+        assert_eq!(failed.pending_transactions(), 1);
+        assert_eq!(failed.pending_records(), manifest.record_count());
+        assert_eq!(failed.last_error(), Some("kafka outage"));
+        assert!(!failed.replaying());
+        assert_eq!(failed.target_state()["target.delivery.status"], "failed");
+        assert_eq!(
+            failed.target_state()["target.delivery.replay_may_duplicate"],
+            "true"
+        );
+
+        runtime.set_replay_state(&plan.name, true);
+        let replaying = runtime.status_snapshots(&storage).await.unwrap();
+        let replaying = replaying.first().expect("replaying snapshot");
+        assert!(replaying.replaying());
+        assert_eq!(replaying.last_error(), Some("kafka outage"));
+
+        runtime
+            .mark_manifest_delivered(
+                &plan,
+                &buffer_store,
+                &storage,
+                &manifest,
+                std::collections::BTreeMap::from([
+                    ("kafka.topic".to_string(), "orders".to_string()),
+                    ("kafka.partition.0.offset".to_string(), "99".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        runtime.set_replay_state(&plan.name, false);
+
+        let recovered = runtime.status_snapshots(&storage).await.unwrap();
+        let recovered = recovered.first().expect("recovered snapshot");
+        assert_eq!(recovered.pending_transactions(), 0);
+        assert_eq!(recovered.pending_records(), 0);
+        assert_eq!(recovered.pending_bytes(), 0);
+        assert_eq!(recovered.oldest_pending_age_ms(), None);
+        assert!(!recovered.replaying());
+        assert_eq!(recovered.last_error(), None);
+        assert_eq!(
+            recovered.checkpoint_position(),
+            Some(manifest.source_position())
+        );
+        assert_eq!(
+            recovered
+                .checkpoint_transaction_id()
+                .map(CdcTransactionId::as_str),
+            Some("pg-xid-88")
+        );
+        assert_eq!(
+            recovered.target_state()["target.delivery.status"],
+            "delivered"
+        );
+        assert_eq!(
+            recovered.target_state()["target.delivery.replay_may_duplicate"],
+            "false"
+        );
+        assert_eq!(recovered.target_state()["kafka.partition.0.offset"], "99");
+
+        let debug_state = Arc::new(tokio::sync::RwLock::new(
+            http_ingest::CdcReplicationDebugState::default(),
+        ));
+        runtime
+            .refresh_debug_state(&storage, &debug_state)
+            .await
+            .unwrap();
+        let debug_state = debug_state.read().await;
+        let pipeline = debug_state.pipelines.first().expect("debug pipeline");
+        assert_eq!(pipeline.pending_transactions, 0);
+        assert!(!pipeline.replaying);
+        assert_eq!(pipeline.last_error, None);
+        assert_eq!(pipeline.target_state["target.delivery.status"], "delivered");
+    }
+
     #[test]
     fn buffer_limit_violation_accounts_for_incoming_payload_bytes() {
         let limits = ReplicationBufferLimits {
