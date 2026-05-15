@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,6 +42,7 @@ pub struct HttpIngestHealth {
     pub storage_reachable: Arc<AtomicBool>,
     pub runtime_ready: Arc<AtomicBool>,
     pub watermark_debug: Option<Arc<RwLock<WatermarkDebugState>>>,
+    pub cdc_replication_debug: Option<Arc<RwLock<CdcReplicationDebugState>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -56,6 +58,29 @@ pub struct WatermarkDebugState {
     pub policy: String,
     pub updated_at_unix_ms: u64,
     pub sources: Vec<WatermarkDebugSourceState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CdcReplicationDebugState {
+    pub updated_at_unix_ms: u64,
+    pub refresh_error: Option<String>,
+    pub pipelines: Vec<CdcReplicationDebugPipelineState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CdcReplicationDebugPipelineState {
+    pub pipeline: String,
+    pub source: String,
+    pub target_kind: String,
+    pub checkpoint_position: Option<String>,
+    pub checkpoint_transaction_id: Option<String>,
+    pub target_state: BTreeMap<String, String>,
+    pub pending_transactions: usize,
+    pub pending_records: usize,
+    pub pending_bytes: usize,
+    pub oldest_pending_age_ms: Option<u64>,
+    pub replaying: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -120,6 +145,7 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route("/healthz", get(admin_healthz))
         .route("/readyz", get(admin_readyz))
         .route("/debug/watermarks", get(debug_watermarks_admin))
+        .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
         .route("/debug/storage/flush", post(debug_storage_flush_admin))
         .route("/metrics", get(metrics))
         .with_state(state);
@@ -280,6 +306,18 @@ async fn debug_watermarks_admin(State(state): State<HttpAdminState>) -> impl Int
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "watermark debug state unavailable"})),
+        )
+            .into_response();
+    };
+    let snapshot = shared.read().await.clone();
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
+async fn debug_cdc_replication_admin(State(state): State<HttpAdminState>) -> impl IntoResponse {
+    let Some(shared) = &state.health.cdc_replication_debug else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "CDC replication debug state unavailable"})),
         )
             .into_response();
     };
@@ -476,6 +514,7 @@ mod tests {
                 storage_reachable: Arc::new(AtomicBool::new(true)),
                 runtime_ready: Arc::new(AtomicBool::new(true)),
                 watermark_debug: None,
+                cdc_replication_debug: None,
             }),
         };
         let app = Router::new()
@@ -523,6 +562,7 @@ mod tests {
                 storage_reachable: Arc::new(AtomicBool::new(true)),
                 runtime_ready: Arc::new(AtomicBool::new(true)),
                 watermark_debug: Some(snapshot),
+                cdc_replication_debug: None,
             }),
         };
         let app = Router::new()
@@ -531,6 +571,52 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/debug/watermarks")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn debug_cdc_replication_admin_returns_snapshot() {
+        let snapshot = Arc::new(RwLock::new(CdcReplicationDebugState {
+            updated_at_unix_ms: 9,
+            refresh_error: None,
+            pipelines: vec![CdcReplicationDebugPipelineState {
+                pipeline: "orders_pipe".to_string(),
+                source: "pg_main".to_string(),
+                target_kind: "kafka".to_string(),
+                checkpoint_position: Some("pg/0/16B6C50".to_string()),
+                checkpoint_transaction_id: Some("pg-xid-77".to_string()),
+                target_state: BTreeMap::from([(
+                    "target.delivery.status".to_string(),
+                    "pending".to_string(),
+                )]),
+                pending_transactions: 1,
+                pending_records: 2,
+                pending_bytes: 3,
+                oldest_pending_age_ms: Some(4),
+                replaying: true,
+                last_error: Some("kafka unavailable".to_string()),
+            }],
+        }));
+        let state = HttpAdminState {
+            cancel: CancellationToken::new(),
+            health: HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
+                cdc_replication_debug: Some(snapshot),
+            },
+            storage_db: None,
+        };
+        let app = Router::new()
+            .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
+            .with_state(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/debug/cdc/replication")
             .body(Body::empty())
             .expect("request");
         let response = app.oneshot(request).await.expect("response");

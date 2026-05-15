@@ -654,6 +654,26 @@ impl ReplicationPipelineRuntime {
         Ok(snapshots)
     }
 
+    pub(super) async fn refresh_debug_state(
+        &self,
+        storage: &SlateCatalog,
+        shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    ) -> anyhow::Result<()> {
+        match self.status_snapshots(storage).await {
+            Ok(snapshots) => {
+                *shared.write().await = cdc_replication_debug_state_from_snapshots(snapshots);
+                Ok(())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let mut state = shared.write().await;
+                state.updated_at_unix_ms = current_unix_time_ms();
+                state.refresh_error = Some(message);
+                Err(err)
+            }
+        }
+    }
+
     pub(super) async fn run_transaction(
         &self,
         source_id: &CdcSourceId,
@@ -2529,6 +2549,34 @@ fn source_position_key(position: &CdcSourcePosition) -> String {
     }
 }
 
+fn cdc_replication_debug_state_from_snapshots(
+    snapshots: Vec<ReplicationPipelineStatusSnapshot>,
+) -> http_ingest::CdcReplicationDebugState {
+    http_ingest::CdcReplicationDebugState {
+        updated_at_unix_ms: current_unix_time_ms(),
+        refresh_error: None,
+        pipelines: snapshots
+            .into_iter()
+            .map(|snapshot| http_ingest::CdcReplicationDebugPipelineState {
+                pipeline: snapshot.pipeline_name().to_string(),
+                source: snapshot.source_name().to_string(),
+                target_kind: snapshot.target_kind().to_string(),
+                checkpoint_position: snapshot.checkpoint_position().map(source_position_key),
+                checkpoint_transaction_id: snapshot
+                    .checkpoint_transaction_id()
+                    .map(|transaction_id| transaction_id.as_str().to_string()),
+                target_state: snapshot.target_state().clone(),
+                pending_transactions: snapshot.pending_transactions(),
+                pending_records: snapshot.pending_records(),
+                pending_bytes: snapshot.pending_bytes(),
+                oldest_pending_age_ms: snapshot.oldest_pending_age_ms(),
+                replaying: snapshot.replaying(),
+                last_error: snapshot.last_error().map(str::to_string),
+            })
+            .collect(),
+    }
+}
+
 enum ArrowIpcColumnBuilder {
     Int64(Int64Builder),
     Bool(BooleanBuilder),
@@ -3686,6 +3734,41 @@ mod tests {
             Some("pg-xid-77")
         );
         assert_eq!(snapshot.target_state()["target.delivery.status"], "pending");
+
+        let debug_state = Arc::new(tokio::sync::RwLock::new(
+            http_ingest::CdcReplicationDebugState::default(),
+        ));
+        runtime
+            .refresh_debug_state(&storage, &debug_state)
+            .await
+            .unwrap();
+        let debug_state = debug_state.read().await;
+        let debug_pipeline = debug_state.pipelines.first().expect("debug pipeline");
+        assert_eq!(debug_state.refresh_error, None);
+        assert_eq!(debug_pipeline.pipeline, "orders_pipe");
+        assert_eq!(debug_pipeline.source, "pg_main");
+        assert_eq!(debug_pipeline.target_kind, "kafka");
+        assert_eq!(
+            debug_pipeline.checkpoint_position.as_deref(),
+            Some("pg/0/16B6C50")
+        );
+        assert_eq!(
+            debug_pipeline.checkpoint_transaction_id.as_deref(),
+            Some("pg-xid-77")
+        );
+        assert_eq!(debug_pipeline.pending_transactions, 1);
+        assert_eq!(debug_pipeline.pending_records, manifest.record_count());
+        assert!(debug_pipeline.pending_bytes > 0);
+        assert!(debug_pipeline.oldest_pending_age_ms.is_some());
+        assert!(debug_pipeline.replaying);
+        assert_eq!(
+            debug_pipeline.last_error.as_deref(),
+            Some("kafka unavailable")
+        );
+        assert_eq!(
+            debug_pipeline.target_state["target.delivery.status"],
+            "pending"
+        );
     }
 
     #[test]

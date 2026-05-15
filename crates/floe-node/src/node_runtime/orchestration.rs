@@ -1355,11 +1355,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         policy: "min_active_sources".to_string(),
         ..http_ingest::WatermarkDebugState::default()
     }));
+    let cdc_replication_debug = Arc::new(tokio::sync::RwLock::new(
+        http_ingest::CdcReplicationDebugState::default(),
+    ));
     let admin_health = HttpIngestHealth {
         executor_running: Arc::clone(&executor_running),
         storage_reachable: Arc::clone(&storage_reachable),
         runtime_ready: Arc::clone(&runtime_ready),
         watermark_debug: Some(Arc::clone(&watermark_debug)),
+        cdc_replication_debug: Some(Arc::clone(&cdc_replication_debug)),
     };
     let admin_config = HttpAdminConfig {
         host: run_args.http_host.clone(),
@@ -1429,21 +1433,56 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             postgres_cdc_runtime_plans_by_connector.insert(connector.name.clone(), plan);
         }
     }
-    let replication_pipeline_runtime = ReplicationPipelineRuntime::new(
+    let replication_pipeline_runtime = Arc::new(ReplicationPipelineRuntime::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
             .flat_map(|plan| plan.replication_pipelines.iter().cloned()),
-    )?;
+    )?);
+    replication_pipeline_runtime
+        .refresh_debug_state(&storage, &cdc_replication_debug)
+        .await
+        .context("refresh initial CDC replication debug state")?;
     let replayed_replication_records = replication_pipeline_runtime
         .replay_buffered(&storage)
         .await
         .context("replay buffered replication pipeline records")?;
+    replication_pipeline_runtime
+        .refresh_debug_state(&storage, &cdc_replication_debug)
+        .await
+        .context("refresh CDC replication debug state after replay")?;
     if replayed_replication_records > 0 {
         tracing::info!(
             records = replayed_replication_records,
             "replayed buffered replication pipeline records during startup"
         );
     }
+    let cdc_replication_debug_cancel = service_cancel.clone();
+    let cdc_replication_debug_for_refresh = Arc::clone(&cdc_replication_debug);
+    let storage_for_replication_debug = storage.clone();
+    let replication_pipeline_runtime_for_debug = Arc::clone(&replication_pipeline_runtime);
+    let cdc_replication_debug_handle: JoinHandle<()> = tokio::spawn(async move {
+        let mut refresh_interval = tokio::time::interval(Duration::from_secs(1));
+        refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cdc_replication_debug_cancel.cancelled() => break,
+                _ = refresh_interval.tick() => {
+                    if let Err(err) = replication_pipeline_runtime_for_debug
+                        .refresh_debug_state(
+                            &storage_for_replication_debug,
+                            &cdc_replication_debug_for_refresh,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to refresh CDC replication debug state"
+                        );
+                    }
+                }
+            }
+        }
+    });
     let source_names_by_id = Arc::new(
         definitions
             .iter()
@@ -1538,6 +1577,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         storage_reachable: Arc::clone(&storage_reachable),
                         runtime_ready: Arc::clone(&runtime_ready),
                         watermark_debug: Some(Arc::clone(&watermark_debug)),
+                        cdc_replication_debug: Some(Arc::clone(&cdc_replication_debug)),
                     }),
                 };
                 let failure_state = Arc::clone(&failure_state);
@@ -1826,7 +1866,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
     let source_id_by_name_for_task = source_id_by_name;
     let storage_for_replication_task = storage.clone();
-    let replication_pipeline_runtime_for_task = replication_pipeline_runtime;
+    let replication_pipeline_runtime_for_task = Arc::clone(&replication_pipeline_runtime);
     let mut connector_receiver_for_task = connector_receiver;
     let mut cdc_transaction_receiver_for_task = cdc_transaction_receiver;
     let tracked_mv_names: Vec<String> = planned_materialized_views
@@ -2903,6 +2943,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         && !err.is_cancelled()
     {
         tracing::error!(error = %err, "admin HTTP server task joined with error");
+    }
+
+    if let Err(err) = cdc_replication_debug_handle.await
+        && !err.is_cancelled()
+    {
+        tracing::error!(error = %err, "CDC replication debug task joined with error");
     }
 
     if let Some(handle) = executor_handle.take()
