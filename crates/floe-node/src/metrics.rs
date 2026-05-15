@@ -234,6 +234,24 @@ static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|
     .expect("register floe_cdc_buffer_oldest_pending_age_ms")
 });
 
+static CDC_REPLICATION_REPLAYING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_replication_replaying",
+        "Whether a CDC replication pipeline is actively replaying buffered records",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_replication_replaying")
+});
+
+static CDC_REPLICATION_TARGET_ERROR: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_replication_target_error",
+        "Whether the last CDC replication target delivery attempt failed",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_replication_target_error")
+});
+
 static POSTGRES_CDC_METRIC_STATE: LazyLock<Mutex<PostgresCdcMetricState>> =
     LazyLock::new(|| Mutex::new(PostgresCdcMetricState::default()));
 
@@ -441,6 +459,18 @@ pub(crate) fn record_cdc_buffer_pending(
         .set(oldest_age_ms.map(i64_from_u64).unwrap_or(0));
 }
 
+pub(crate) fn record_cdc_replication_replaying(pipeline: &str, replaying: bool) {
+    CDC_REPLICATION_REPLAYING
+        .with_label_values(&[pipeline])
+        .set(if replaying { 1 } else { 0 });
+}
+
+pub(crate) fn record_cdc_replication_target_error(pipeline: &str, failed: bool) {
+    CDC_REPLICATION_TARGET_ERROR
+        .with_label_values(&[pipeline])
+        .set(if failed { 1 } else { 0 });
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
@@ -468,6 +498,8 @@ pub(crate) fn init() {
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
     let _ = &*CDC_BUFFER_PENDING_BYTES;
     let _ = &*CDC_BUFFER_OLDEST_PENDING_AGE_MS;
+    let _ = &*CDC_REPLICATION_REPLAYING;
+    let _ = &*CDC_REPLICATION_TARGET_ERROR;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
 }
 
@@ -513,5 +545,28 @@ mod tests {
         assert!(body.contains(
             "floe_postgres_cdc_table_lag_bytes{slot=\"slot_metrics_test\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 60"
         ));
+    }
+
+    #[test]
+    fn cdc_replication_metrics_record_replay_and_target_error_state() {
+        let pipeline = "pipe_metrics_test";
+
+        record_cdc_replication_replaying(pipeline, true);
+        record_cdc_replication_target_error(pipeline, true);
+
+        let encoder = TextEncoder::new();
+        let mut buffer = Vec::new();
+        encoder
+            .encode(&prometheus::gather(), &mut buffer)
+            .expect("encode metrics");
+        let body = String::from_utf8(buffer).expect("metrics utf8");
+
+        assert!(body.contains("floe_cdc_replication_replaying{pipeline=\"pipe_metrics_test\"} 1"));
+        assert!(
+            body.contains("floe_cdc_replication_target_error{pipeline=\"pipe_metrics_test\"} 1")
+        );
+
+        record_cdc_replication_replaying(pipeline, false);
+        record_cdc_replication_target_error(pipeline, false);
     }
 }
