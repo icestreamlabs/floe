@@ -24,7 +24,8 @@ use floe_node_core::debezium_encoder::{
 };
 use floe_storage::{
     CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferRecord,
-    CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, SlateCatalog,
+    CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
+    SlateCatalog,
 };
 use rdkafka::ClientConfig;
 use rdkafka::client::ClientContext;
@@ -1021,7 +1022,21 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        let pending_transactions = pending.len();
+        if pending_transactions > 0 {
+            tracing::info!(
+                pipeline = %plan.name,
+                source = %plan.source_name,
+                target_kind = target_kind(plan),
+                pending_transactions,
+                replay_limit = REPLICATION_BUFFER_REPLAY_LIMIT,
+                "replication pipeline durable buffer replay started"
+            );
+        }
+        let mut attempted_transactions = 0usize;
+        let mut delivered_transactions = 0usize;
         for manifest in pending {
+            attempted_transactions = attempted_transactions.saturating_add(1);
             let payload_load_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
             let records = match manifest.payload_format() {
                 CdcBufferPayloadFormat::KafkaRecords => {
@@ -1089,10 +1104,35 @@ impl ReplicationPipelineRuntime {
                 .unwrap_or(Duration::ZERO);
             log_replication_replay_delivery_perf(plan, &manifest, delivery_elapsed, delivered);
             if delivered == 0 {
+                tracing::warn!(
+                    pipeline = %plan.name,
+                    source = %plan.source_name,
+                    target_kind = target_kind(plan),
+                    transaction_key = %manifest.transaction_key(),
+                    records = manifest.record_count(),
+                    payload_bytes = manifest.payload_bytes(),
+                    source_position = %source_position_key(manifest.source_position()),
+                    transaction_id = manifest.transaction_id().map(CdcTransactionId::as_str),
+                    "replication pipeline durable buffer replay paused because target delivery made no progress"
+                );
                 break;
             }
+            delivered_transactions = delivered_transactions.saturating_add(1);
             delivered_records = delivered_records.saturating_add(delivered);
             self.spawn_cleanup_delivered_if_due(plan, buffer_store);
+        }
+        if pending_transactions > 0 {
+            tracing::info!(
+                pipeline = %plan.name,
+                source = %plan.source_name,
+                target_kind = target_kind(plan),
+                pending_transactions,
+                attempted_transactions,
+                delivered_transactions,
+                delivered_records,
+                replay_exhausted = attempted_transactions == pending_transactions,
+                "replication pipeline durable buffer replay finished"
+            );
         }
         record_buffer_stats(buffer_store, &plan.name).await?;
         Ok(delivered_records)
@@ -1113,6 +1153,15 @@ impl ReplicationPipelineRuntime {
 
         if !has_pending {
             if let Some(violation) = buffer_limit_violation(0, None, incoming_bytes, limits) {
+                log_replication_buffer_backpressure(
+                    plan,
+                    "incoming_transaction",
+                    None,
+                    incoming_bytes,
+                    limits,
+                    violation,
+                    None,
+                );
                 return Err(anyhow!(
                     "replication pipeline '{}' durable buffer limit exceeded: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
                     plan.name
@@ -1165,6 +1214,20 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        tracing::info!(
+            pipeline = %plan.name,
+            source = %plan.source_name,
+            target_kind = target_kind(plan),
+            delivered_records = delivered,
+            pending_transactions = stats.pending_transactions(),
+            pending_records = stats.pending_records(),
+            pending_bytes = stats.pending_bytes(),
+            oldest_pending_age_ms = stats.oldest_pending_age_ms(),
+            incoming_bytes,
+            max_pending_bytes = limits.max_pending_bytes,
+            max_pending_age_ms = limits.max_pending_age_ms,
+            "replication pipeline durable buffer guardrail drain completed"
+        );
         if let Some(current_violation) = buffer_limit_violation(
             stats.pending_bytes(),
             stats.oldest_pending_age_ms(),
@@ -1172,6 +1235,15 @@ impl ReplicationPipelineRuntime {
             limits,
         ) {
             violation = current_violation;
+            log_replication_buffer_backpressure(
+                plan,
+                "after_guardrail_drain",
+                Some(&stats),
+                incoming_bytes,
+                limits,
+                violation,
+                Some(delivered),
+            );
             return Err(anyhow!(
                 "replication pipeline '{}' durable buffer limit exceeded after draining: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
                 plan.name
@@ -1500,7 +1572,19 @@ impl KafkaReplicationPipelineWriter {
             self.enqueue_record_with_retry(record, Arc::clone(&delivery_state))
                 .await?;
         }
-        let offsets_by_partition = delivery_state.wait(REPLICATION_KAFKA_SEND_TIMEOUT).await?;
+        let offsets_by_partition = match delivery_state.wait(REPLICATION_KAFKA_SEND_TIMEOUT).await {
+            Ok(offsets) => offsets,
+            Err(err) => {
+                tracing::warn!(
+                    topic = %self.topic,
+                    records = records.len(),
+                    timeout_ms = REPLICATION_KAFKA_SEND_TIMEOUT.as_millis() as u64,
+                    error = %err,
+                    "replication pipeline Kafka delivery wait failed"
+                );
+                return Err(err);
+            }
+        };
 
         let mut target_state = std::collections::BTreeMap::new();
         target_state.insert("kafka.topic".to_string(), self.topic.clone());
@@ -1519,6 +1603,7 @@ impl KafkaReplicationPipelineWriter {
         delivery_state: Arc<KafkaDeliveryBatchState>,
     ) -> anyhow::Result<()> {
         for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
+            let attempt_number = attempt + 1;
             let mut kafka_record =
                 BaseRecord::<[u8], [u8], Arc<KafkaDeliveryBatchState>>::with_opaque_to(
                     &self.topic,
@@ -1535,21 +1620,51 @@ impl KafkaReplicationPipelineWriter {
                 Ok(()) => return Ok(()),
                 Err((err, _record))
                     if is_kafka_queue_full(&err)
-                        && attempt + 1 < REPLICATION_KAFKA_RETRY_ATTEMPTS =>
+                        && attempt_number < REPLICATION_KAFKA_RETRY_ATTEMPTS =>
                 {
                     let delay_ms = REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(
                         1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16),
                     );
                     tracing::warn!(
                         topic = %self.topic,
-                        attempt = attempt + 1,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        retry_delay_ms = delay_ms,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
                         error = %err,
                         "replication pipeline Kafka producer queue is full; retrying"
                     );
                     self.producer.poll(Duration::from_millis(0));
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
+                Err((err, _record)) if is_kafka_queue_full(&err) => {
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
+                        error = %err,
+                        "replication pipeline Kafka producer queue remained full after retries"
+                    );
+                    return Err(anyhow!(
+                        "replication pipeline Kafka enqueue failed after retries: {err}"
+                    ));
+                }
                 Err((err, _record)) => {
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
+                        error = %err,
+                        "replication pipeline Kafka enqueue failed without retry"
+                    );
                     return Err(anyhow!(
                         "replication pipeline Kafka enqueue failed after retries: {err}"
                     ));
@@ -2546,6 +2661,41 @@ fn source_position_key(position: &CdcSourcePosition) -> String {
             None => format!("pg/{commit_lsn}"),
         },
         CdcSourcePosition::Opaque { value } => format!("opaque/{value}"),
+    }
+}
+
+fn log_replication_buffer_backpressure(
+    plan: &ReplicationPipelineRuntimePlan,
+    phase: &str,
+    stats: Option<&CdcBufferStats>,
+    incoming_bytes: usize,
+    limits: ReplicationBufferLimits,
+    violation: ReplicationBufferLimitViolation,
+    delivered_records: Option<usize>,
+) {
+    tracing::warn!(
+        pipeline = %plan.name,
+        source = %plan.source_name,
+        target_kind = target_kind(plan),
+        phase,
+        violation_kind = buffer_limit_violation_kind(violation),
+        violation = %violation,
+        pending_transactions = stats.map(CdcBufferStats::pending_transactions).unwrap_or(0),
+        pending_records = stats.map(CdcBufferStats::pending_records).unwrap_or(0),
+        pending_bytes = stats.map(CdcBufferStats::pending_bytes).unwrap_or(0),
+        oldest_pending_age_ms = stats.and_then(CdcBufferStats::oldest_pending_age_ms),
+        incoming_bytes,
+        delivered_records,
+        max_pending_bytes = limits.max_pending_bytes,
+        max_pending_age_ms = limits.max_pending_age_ms,
+        "replication pipeline durable buffer guardrail applying CDC source backpressure"
+    );
+}
+
+fn buffer_limit_violation_kind(violation: ReplicationBufferLimitViolation) -> &'static str {
+    match violation {
+        ReplicationBufferLimitViolation::PendingBytes { .. } => "pending_bytes",
+        ReplicationBufferLimitViolation::PendingAge { .. } => "pending_age",
     }
 }
 

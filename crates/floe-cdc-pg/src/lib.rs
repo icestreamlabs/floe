@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use floe_cdc::CdcTableStore;
-use floe_cdc_core::{CdcCheckpoint, CdcSourceId, CdcSourcePosition};
+use floe_cdc_core::{CdcCheckpoint, CdcSourceId, CdcSourcePosition, CdcTransactionId};
 use pgwire_replication::{
     Lsn as PgWireLsn, ReplicationClient, ReplicationConfig,
     ReplicationEvent as PgWireReplicationEvent, TlsConfig,
@@ -320,9 +320,28 @@ pub async fn config_with_stored_cdc_checkpoint(
     source_id: &CdcSourceId,
 ) -> Result<PostgresCdcConfig> {
     let Some(checkpoint) = table_store.load_checkpoint(source_id).await? else {
+        tracing::debug!(
+            source = %source_id.as_str(),
+            slot = %config.slot(),
+            configured_start_lsn = ?config.start_lsn(),
+            "Postgres CDC has no durable checkpoint; using configured start LSN"
+        );
         return Ok(config);
     };
-    config.with_start_checkpoint(&checkpoint)
+    let slot = config.slot().to_string();
+    let configured_start_lsn = config.start_lsn();
+    let resumed = config.with_start_checkpoint(&checkpoint)?;
+    tracing::info!(
+        source = %source_id.as_str(),
+        slot = %slot,
+        configured_start_lsn = ?configured_start_lsn,
+        durable_start_lsn = ?resumed.start_lsn(),
+        checkpoint_position = ?checkpoint.position(),
+        checkpoint_transaction_id = checkpoint.transaction_id().map(CdcTransactionId::as_str),
+        schema_versions = checkpoint.schema_versions().len(),
+        "Postgres CDC configured to resume from durable checkpoint"
+    );
+    Ok(resumed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

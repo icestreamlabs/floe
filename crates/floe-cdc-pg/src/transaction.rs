@@ -176,8 +176,19 @@ impl PostgresTransactionAssembler {
                 );
                 Ok(())
             }
-            SchemaEvolution::CompatibleAddition => match self.schema_policy {
+            SchemaEvolution::CompatibleAddition { added_columns } => match self.schema_policy {
                 PostgresSchemaEvolutionPolicy::FailFast => {
+                    tracing::warn!(
+                        source = %self.source_id.as_str(),
+                        table = %table_id.as_str(),
+                        upstream_table = %format!("{}.{}", upstream_table.schema(), upstream_table.table()),
+                        policy = ?self.schema_policy,
+                        added_column_count = added_columns.len(),
+                        added_columns = ?added_columns,
+                        catalog_schema_version = catalog_schema.stable_fingerprint(),
+                        observed_schema_version = observed_schema.stable_fingerprint(),
+                        "Postgres CDC relation schema has compatible additions but fail-fast policy rejects schema evolution"
+                    );
                     bail!(
                         "Postgres CDC schema for table '{}' has compatible column additions but policy is fail-fast",
                         table_id.as_str()
@@ -186,9 +197,14 @@ impl PostgresTransactionAssembler {
                 PostgresSchemaEvolutionPolicy::IgnoreCompatible
                 | PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
                     tracing::info!(
+                        source = %self.source_id.as_str(),
                         table = %table_id.as_str(),
                         upstream_table = %format!("{}.{}", upstream_table.schema(), upstream_table.table()),
                         policy = ?self.schema_policy,
+                        added_column_count = added_columns.len(),
+                        added_columns = ?added_columns,
+                        catalog_schema_version = catalog_schema.stable_fingerprint(),
+                        observed_schema_version = observed_schema.stable_fingerprint(),
                         "Postgres CDC relation schema has compatible additions; projecting to catalog schema"
                     );
                     self.schema_versions.insert(
@@ -199,6 +215,18 @@ impl PostgresTransactionAssembler {
                 }
             },
             SchemaEvolution::Incompatible(reason) => {
+                tracing::warn!(
+                    source = %self.source_id.as_str(),
+                    table = %table_id.as_str(),
+                    upstream_table = %format!("{}.{}", upstream_table.schema(), upstream_table.table()),
+                    policy = ?self.schema_policy,
+                    reason = %reason,
+                    catalog_column_count = catalog_schema.columns().len(),
+                    observed_column_count = observed_schema.columns().len(),
+                    catalog_schema_version = catalog_schema.stable_fingerprint(),
+                    observed_schema_version = observed_schema.stable_fingerprint(),
+                    "Postgres CDC relation schema is incompatible with catalog schema"
+                );
                 bail!(
                     "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
                     table_id.as_str()
@@ -630,15 +658,17 @@ where
             Err(err) if reconnects < policy.max_reconnects => {
                 reconnects += 1;
                 applier.reset_stream_state();
-                if !policy.retry_delay.is_zero() {
-                    tokio::time::sleep(policy.retry_delay).await;
-                }
                 tracing::warn!(
                     error = %err,
                     reconnects,
                     max_reconnects = policy.max_reconnects,
+                    retry_delay_ms = policy.retry_delay.as_millis() as u64,
+                    start_lsn = ?config.start_lsn(),
                     "Postgres CDC stream failed; reconnecting from durable checkpoint"
                 );
+                if !policy.retry_delay.is_zero() {
+                    tokio::time::sleep(policy.retry_delay).await;
+                }
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -654,7 +684,7 @@ where
 
 enum SchemaEvolution {
     Unchanged,
-    CompatibleAddition,
+    CompatibleAddition { added_columns: Vec<String> },
     Incompatible(String),
 }
 
@@ -706,7 +736,12 @@ fn classify_schema_evolution(
     if observed_schema.columns().len() == catalog_schema.columns().len() {
         SchemaEvolution::Unchanged
     } else {
-        SchemaEvolution::CompatibleAddition
+        SchemaEvolution::CompatibleAddition {
+            added_columns: observed_schema.columns()[catalog_schema.columns().len()..]
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect(),
+        }
     }
 }
 
