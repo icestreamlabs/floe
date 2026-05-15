@@ -1351,7 +1351,8 @@ fn prepare_replication_buffer_append(
                 transaction.transaction_id().cloned(),
                 change_batches,
                 buffered_at_unix_ms,
-            )?,
+            )?
+            .with_schema_versions(transaction.schema_versions().clone()),
             target_records: Some(target_records),
         });
     }
@@ -1365,7 +1366,8 @@ fn prepare_replication_buffer_append(
             transaction.transaction_id().cloned(),
             target_records,
             buffered_at_unix_ms,
-        )?,
+        )?
+        .with_schema_versions(transaction.schema_versions().clone()),
         target_records: None,
     })
 }
@@ -1945,6 +1947,7 @@ fn encode_debezium_pipeline_records(
     transaction: &TransactionBatch,
 ) -> anyhow::Result<Vec<DebeziumEncodedRecord>> {
     let config = DebeziumEnvelopeConfig::new(&plan.source_name)?
+        .with_database_name(&plan.database_name)
         .with_emit_tombstones(plan.emit_tombstones)
         .with_transaction_metadata(plan.include_transaction_metadata);
     let is_snapshot = transaction
@@ -1974,6 +1977,7 @@ fn encode_debezium_snapshot_pipeline_records(
     transaction: &TransactionBatch,
 ) -> anyhow::Result<Vec<DebeziumEncodedRecord>> {
     let config = DebeziumEnvelopeConfig::new(&plan.source_name)?
+        .with_database_name(&plan.database_name)
         .with_emit_tombstones(plan.emit_tombstones)
         .with_transaction_metadata(plan.include_transaction_metadata);
     let mut records = Vec::with_capacity(rows.row_count());
@@ -2745,6 +2749,7 @@ pub(super) fn pipeline_checkpoint_from_transaction(
         transaction.commit_position().clone(),
         transaction.transaction_id().cloned(),
     )
+    .with_schema_versions(transaction.schema_versions().clone())
 }
 
 fn current_unix_time_ms() -> u64 {
@@ -2803,6 +2808,7 @@ mod tests {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
             source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
@@ -2836,8 +2842,63 @@ mod tests {
         let records =
             encode_debezium_pipeline_records(&plan, &schema, &batch, &transaction).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value().unwrap()["op"], "r");
-        assert_eq!(records[0].value().unwrap()["source"]["snapshot"], "true");
+        let payload = &records[0].value().unwrap()["payload"];
+        assert_eq!(payload["op"], "r");
+        assert_eq!(payload["source"]["snapshot"], "true");
+        assert_eq!(payload["source"]["db"], "postgres");
+    }
+
+    #[test]
+    fn pipeline_debezium_records_are_buffered_as_encoded_kafka_payloads() {
+        let plan = ReplicationPipelineRuntimePlan {
+            name: "p".to_string(),
+            source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
+            upstream_table: "public.orders".to_string(),
+            table_id: CdcTableId::new("orders").unwrap(),
+            schema: schema(CdcTableId::new("orders").unwrap()),
+            target: ReplicationPipelineRuntimeTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders".to_string(),
+            },
+            format: ReplicationPipelineRuntimeFormat::DebeziumJson,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
+            emit_tombstones: false,
+            include_transaction_metadata: true,
+        };
+        let schema = schema(plan.table_id.clone());
+        let batch = ChangeBatch::new(
+            plan.table_id.clone(),
+            vec![CdcChange::Insert {
+                row: row(1, "open"),
+            }],
+        )
+        .unwrap();
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-55").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![batch.clone()],
+        )
+        .unwrap();
+
+        let records = encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction)
+            .expect("encode debezium records");
+        let value: serde_json::Value =
+            serde_json::from_slice(records[0].value().expect("value")).unwrap();
+        assert_eq!(value["schema"]["name"], "pg_main.public.orders.Envelope");
+        assert_eq!(value["payload"]["source"]["txId"], 55);
+
+        let prepared =
+            prepare_replication_buffer_append(&plan, &transaction, records.clone()).unwrap();
+        assert_eq!(
+            prepared.append.payload_format(),
+            CdcBufferPayloadFormat::KafkaRecords
+        );
+        assert_eq!(prepared.append.records(), records.as_slice());
+        assert!(prepared.target_records.is_none());
     }
 
     #[test]
@@ -2845,6 +2906,7 @@ mod tests {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
             source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
@@ -2906,6 +2968,7 @@ mod tests {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
             source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
@@ -2965,6 +3028,7 @@ mod tests {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
             source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
@@ -3022,6 +3086,7 @@ mod tests {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
             source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
@@ -3079,6 +3144,99 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(decoded_rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn pipeline_transaction_records_filter_multi_table_transactions_per_target() {
+        let orders_id = CdcTableId::new("orders").unwrap();
+        let customers_id = CdcTableId::new("customers").unwrap();
+        let orders_plan = test_plan("orders_pipe", orders_id.clone(), "public.orders");
+        let customers_plan = test_plan("customers_pipe", customers_id.clone(), "public.customers");
+        let schemas = HashMap::from([
+            (
+                orders_id.clone(),
+                schema_for_table(orders_id.clone(), "orders"),
+            ),
+            (
+                customers_id.clone(),
+                schema_for_table(customers_id.clone(), "customers"),
+            ),
+        ]);
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    orders_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+                ChangeBatch::new(
+                    customers_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(9, "active"),
+                    }],
+                )
+                .unwrap(),
+                ChangeBatch::new(
+                    orders_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(2, "paid"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let orders_records =
+            encode_pipeline_transaction_records(&orders_plan, &schemas, &transaction).unwrap();
+        let customers_records =
+            encode_pipeline_transaction_records(&customers_plan, &schemas, &transaction).unwrap();
+
+        assert_eq!(orders_records.len(), 2);
+        assert_eq!(customers_records.len(), 1);
+        let first_order: serde_json::Value =
+            serde_json::from_slice(orders_records[0].value().expect("first order")).unwrap();
+        let second_order: serde_json::Value =
+            serde_json::from_slice(orders_records[1].value().expect("second order")).unwrap();
+        let customer: serde_json::Value =
+            serde_json::from_slice(customers_records[0].value().expect("customer")).unwrap();
+        assert_eq!(first_order["id"], 1);
+        assert_eq!(second_order["id"], 2);
+        assert_eq!(customer["id"], 9);
+    }
+
+    #[test]
+    fn pipeline_checkpoint_preserves_transaction_schema_versions() {
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    CdcTableId::new("orders").unwrap(),
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .with_schema_versions(floe_cdc_core::CdcSchemaVersionMap::from([(
+            "orders".to_string(),
+            42,
+        )]));
+
+        let checkpoint = pipeline_checkpoint_from_transaction(&transaction);
+
+        assert_eq!(checkpoint.schema_versions().get("orders"), Some(&42));
     }
 
     #[test]
@@ -3149,9 +3307,13 @@ mod tests {
     }
 
     fn schema(table_id: CdcTableId) -> CdcTableSchema {
+        schema_for_table(table_id, "orders")
+    }
+
+    fn schema_for_table(table_id: CdcTableId, upstream_table: &str) -> CdcTableSchema {
         CdcTableSchema::new(
             table_id,
-            UpstreamTableRef::new("public", "orders").unwrap(),
+            UpstreamTableRef::new("public", upstream_table).unwrap(),
             vec![
                 CdcColumn::new("id", ColumnType::Int64, false).unwrap(),
                 CdcColumn::new("status", ColumnType::Utf8, true).unwrap(),
@@ -3159,6 +3321,30 @@ mod tests {
             CdcPrimaryKey::new(["id"]).unwrap(),
         )
         .unwrap()
+    }
+
+    fn test_plan(
+        name: &str,
+        table_id: CdcTableId,
+        upstream_table: &str,
+    ) -> ReplicationPipelineRuntimePlan {
+        ReplicationPipelineRuntimePlan {
+            name: name.to_string(),
+            source_name: "pg_main".to_string(),
+            database_name: "postgres".to_string(),
+            upstream_table: upstream_table.to_string(),
+            table_id: table_id.clone(),
+            schema: schema_for_table(table_id, upstream_table.strip_prefix("public.").unwrap()),
+            target: ReplicationPipelineRuntimeTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: upstream_table.to_string(),
+            },
+            format: ReplicationPipelineRuntimeFormat::FloeJson,
+            buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+        }
     }
 
     fn row(id: i64, status: &str) -> CdcRow {

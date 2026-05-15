@@ -45,6 +45,7 @@ pub(super) async fn postgres_cdc_runtime_plan(
     if include_tables.is_empty() && !has_source_tables && !has_replication_pipelines {
         return Ok(None);
     };
+    let database_name = postgres_database_name(connection_string, connector_name);
 
     let mut schemas = HashMap::new();
     let mut materialized_table_ids = HashSet::new();
@@ -144,7 +145,9 @@ pub(super) async fn postgres_cdc_runtime_plan(
             )
         })?;
         pipeline_plans.push(replication_pipeline_runtime_plan_from_catalog(
-            pipeline, schema,
+            pipeline,
+            schema,
+            database_name.clone(),
         )?);
     }
 
@@ -163,6 +166,7 @@ pub(super) async fn postgres_cdc_runtime_plan(
 fn replication_pipeline_runtime_plan_from_catalog(
     pipeline: &CatalogReplicationPipelineDefinition,
     schema: CdcTableSchema,
+    database_name: String,
 ) -> anyhow::Result<ReplicationPipelineRuntimePlan> {
     let table_id = schema.table_id().clone();
     let target = match pipeline.target() {
@@ -182,6 +186,7 @@ fn replication_pipeline_runtime_plan_from_catalog(
     Ok(ReplicationPipelineRuntimePlan {
         name: pipeline.name().to_string(),
         source_name: pipeline.source_name().to_string(),
+        database_name,
         upstream_table: pipeline.upstream_table().to_string(),
         table_id,
         schema,
@@ -207,6 +212,15 @@ fn replication_pipeline_runtime_plan_from_catalog(
         emit_tombstones: pipeline.emit_tombstones(),
         include_transaction_metadata: pipeline.include_transaction_metadata(),
     })
+}
+
+fn postgres_database_name(connection_string: &str, fallback: &str) -> String {
+    connection_string
+        .parse::<tokio_postgres::Config>()
+        .ok()
+        .and_then(|config| config.get_dbname().map(ToString::to_string))
+        .filter(|database| !database.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn source_name_for_postgres_include_table(table: &str, registry: &SourceRegistry) -> String {
@@ -465,7 +479,12 @@ async fn run_native_postgres_cdc_connector(
         replication.update_applied_lsn(lsn);
     }
     let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
-    let mut assembler = PostgresTransactionAssembler::new(runtime_plan.source_id.clone(), router);
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        runtime_plan.source_id.clone(),
+        router,
+        runtime_plan.schemas.clone(),
+        PostgresSchemaEvolutionPolicy::FailFast,
+    );
     let mut last_committed_tick_id = 0_u64;
 
     let result = async {

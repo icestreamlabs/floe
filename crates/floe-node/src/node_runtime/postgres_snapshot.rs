@@ -5,19 +5,27 @@ use floe_cdc_core::{
     CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcTransactionId, ChangeBatch,
     TransactionBatch,
 };
-use futures::{TryStreamExt, pin_mut};
+use futures::{StreamExt, TryStreamExt, pin_mut};
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
 
 const DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
+const DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS: usize = 1;
 static POSTGRES_SNAPSHOT_ROWS_PER_BATCH: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH)
+});
+static POSTGRES_SNAPSHOT_MAX_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS)
 });
 static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("FLOE_CDC_PERF_LOG")
@@ -210,6 +218,7 @@ async fn load_postgres_initial_snapshot(
     });
 
     let snapshot = load_postgres_initial_snapshot_from_client(
+        connection_string,
         &mut client,
         publication,
         &runtime_plan.source_id,
@@ -222,16 +231,30 @@ async fn load_postgres_initial_snapshot(
 }
 
 async fn load_postgres_initial_snapshot_from_client(
+    connection_string: &str,
     client: &mut tokio_postgres::Client,
     publication: &str,
     source_id: &CdcSourceId,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
 ) -> Result<PostgresSnapshot> {
+    let sorted_schemas = sorted_snapshot_schemas(schemas);
+    let max_workers = *POSTGRES_SNAPSHOT_MAX_WORKERS;
+    if max_workers > 1 && sorted_schemas.len() > 1 {
+        return load_parallel_postgres_initial_snapshot_from_client(
+            connection_string,
+            client,
+            publication,
+            source_id,
+            sorted_schemas,
+            max_workers,
+        )
+        .await;
+    }
+
     let transaction = client
         .transaction()
         .await
         .context("begin initial Postgres CDC snapshot transaction")?;
-    let sorted_schemas = sorted_snapshot_schemas(schemas);
 
     if !sorted_schemas.is_empty() {
         transaction
@@ -264,24 +287,120 @@ async fn load_postgres_initial_snapshot_from_client(
         .await
         .context("commit initial Postgres CDC snapshot transaction")?;
 
-    let transaction = if change_batches.is_empty() {
-        None
-    } else {
-        let position = snapshot_lsn.to_source_position()?;
-        Some(TransactionBatch::new(
-            source_id.clone(),
-            Some(snapshot_transaction_id(snapshot_lsn)?),
-            Some(position.clone()),
-            position,
-            change_batches,
-        )?)
-    };
+    let transaction = snapshot_transaction_batch(source_id, snapshot_lsn, change_batches)?;
 
     Ok(PostgresSnapshot {
         lsn: snapshot_lsn,
         transaction,
         row_count,
     })
+}
+
+async fn load_parallel_postgres_initial_snapshot_from_client(
+    connection_string: &str,
+    client: &mut tokio_postgres::Client,
+    publication: &str,
+    source_id: &CdcSourceId,
+    sorted_schemas: Vec<&CdcTableSchema>,
+    max_workers: usize,
+) -> Result<PostgresSnapshot> {
+    let transaction = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .context("begin exported initial Postgres CDC snapshot transaction")?;
+
+    if !sorted_schemas.is_empty() {
+        transaction
+            .batch_execute(&snapshot_lock_sql(&sorted_schemas))
+            .await
+            .context("lock Postgres CDC snapshot tables")?;
+    }
+
+    validate_publication_tables(&transaction, publication, &sorted_schemas).await?;
+    for schema in &sorted_schemas {
+        validate_upstream_table_schema(&transaction, schema).await?;
+    }
+
+    let lsn_row = transaction
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .context("capture Postgres CDC snapshot LSN")?;
+    let lsn_text: String = lsn_row.get(0);
+    let snapshot_lsn = PostgresLsn::parse(&lsn_text)?;
+    let exported_snapshot_row = transaction
+        .query_one("SELECT pg_export_snapshot()", &[])
+        .await
+        .context("export Postgres CDC snapshot for parallel table reads")?;
+    let exported_snapshot: String = exported_snapshot_row.get(0);
+
+    let schemas = sorted_schemas.into_iter().cloned().collect::<Vec<_>>();
+    let mut table_snapshots =
+        futures::stream::iter(schemas.into_iter().enumerate().map(|(idx, schema)| {
+            let connection_string = connection_string.to_string();
+            let exported_snapshot = exported_snapshot.clone();
+            async move {
+                snapshot_table_change_batches_from_exported_snapshot(
+                    &connection_string,
+                    &exported_snapshot,
+                    &schema,
+                )
+                .await
+                .map(|snapshot| (idx, snapshot))
+            }
+        }))
+        .buffer_unordered(max_workers)
+        .try_collect::<Vec<_>>()
+        .await?;
+    table_snapshots.sort_by_key(|(idx, _)| *idx);
+
+    transaction
+        .commit()
+        .await
+        .context("commit exported initial Postgres CDC snapshot transaction")?;
+
+    let mut change_batches = Vec::new();
+    let mut row_count = 0_usize;
+    let table_count = table_snapshots.len();
+    for (_, table_snapshot) in table_snapshots {
+        row_count = row_count.saturating_add(table_snapshot.row_count);
+        change_batches.extend(table_snapshot.change_batches);
+    }
+    let transaction = snapshot_transaction_batch(source_id, snapshot_lsn, change_batches)?;
+
+    tracing::info!(
+        source = %source_id.as_str(),
+        tables = table_count,
+        max_workers,
+        rows = row_count,
+        "loaded initial Postgres CDC snapshot with parallel table workers"
+    );
+
+    Ok(PostgresSnapshot {
+        lsn: snapshot_lsn,
+        transaction,
+        row_count,
+    })
+}
+
+fn snapshot_transaction_batch(
+    source_id: &CdcSourceId,
+    snapshot_lsn: PostgresLsn,
+    change_batches: Vec<ChangeBatch>,
+) -> Result<Option<TransactionBatch>> {
+    if change_batches.is_empty() {
+        return Ok(None);
+    }
+    let position = snapshot_lsn.to_source_position()?;
+    Ok(Some(TransactionBatch::new(
+        source_id.clone(),
+        Some(snapshot_transaction_id(snapshot_lsn)?),
+        Some(position.clone()),
+        position,
+        change_batches,
+    )?))
 }
 
 fn sorted_snapshot_schemas(schemas: &HashMap<CdcTableId, CdcTableSchema>) -> Vec<&CdcTableSchema> {
@@ -773,6 +892,56 @@ async fn snapshot_table_change_batches(
     })
 }
 
+async fn snapshot_table_change_batches_from_exported_snapshot(
+    connection_string: &str,
+    exported_snapshot: &str,
+    schema: &CdcTableSchema,
+) -> Result<SnapshotTableChangeBatches> {
+    let (mut client, connection) =
+        tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
+            .await
+            .with_context(|| {
+                format!(
+                    "connect Postgres snapshot worker for '{}.{}'",
+                    schema.upstream_table().schema(),
+                    schema.upstream_table().table()
+                )
+            })?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(error = %err, "Postgres snapshot worker connection closed");
+        }
+    });
+
+    let result = async {
+        let transaction = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .context("begin Postgres snapshot worker transaction")?;
+        transaction
+            .batch_execute(&format!(
+                "SET TRANSACTION SNAPSHOT {}",
+                quote_pg_literal(exported_snapshot)
+            ))
+            .await
+            .context("bind Postgres snapshot worker to exported snapshot")?;
+        let snapshot = snapshot_table_change_batches(&transaction, schema).await;
+        transaction
+            .commit()
+            .await
+            .context("commit Postgres snapshot worker transaction")?;
+        snapshot
+    }
+    .await;
+
+    drop(client);
+    connection_task.abort();
+    result
+}
+
 fn snapshot_table_query(schema: &CdcTableSchema) -> String {
     let select_list = schema
         .columns()
@@ -1107,6 +1276,10 @@ fn quote_pg_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn quote_pg_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1291,15 @@ mod tests {
         assert_eq!(parse_decimal_text_to_i128("-0.07", 2).unwrap(), -7);
         assert_eq!(parse_decimal_text_to_i128("+42.1", 3).unwrap(), 42_100);
         assert_eq!(parse_decimal_text_to_i128(" .5 ", 2).unwrap(), 50);
+    }
+
+    #[test]
+    fn quotes_exported_snapshot_literal() {
+        assert_eq!(
+            quote_pg_literal("00000003-0000001B-1"),
+            "'00000003-0000001B-1'"
+        );
+        assert_eq!(quote_pg_literal("snap'shot"), "'snap''shot'");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use floe_cdc_core::{CdcSourcePosition, CdcTransactionId, ChangeBatch};
+use floe_cdc_core::{CdcSchemaVersionMap, CdcSourcePosition, CdcTransactionId, ChangeBatch};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ pub struct CdcBufferAppend {
     records: Vec<CdcBufferRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     change_batches: Vec<ChangeBatch>,
+    #[serde(default, skip_serializing_if = "CdcSchemaVersionMap::is_empty")]
+    schema_versions: CdcSchemaVersionMap,
     buffered_at_unix_ms: u64,
 }
 
@@ -57,6 +59,8 @@ pub struct CdcBufferedTransactionManifest {
     payload_storage: CdcBufferPayloadStorage,
     #[serde(default)]
     payload_format: CdcBufferPayloadFormat,
+    #[serde(default, skip_serializing_if = "CdcSchemaVersionMap::is_empty")]
+    schema_versions: CdcSchemaVersionMap,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload_object_key: Option<String>,
     buffered_at_unix_ms: u64,
@@ -172,6 +176,7 @@ impl CdcBufferStore {
             payload_bytes,
             payload_storage: CdcBufferPayloadStorage::ObjectStore,
             payload_format,
+            schema_versions: append.schema_versions.clone(),
             payload_object_key: Some(payload_object_key),
             buffered_at_unix_ms: append.buffered_at_unix_ms,
             delivered_at_unix_ms: None,
@@ -685,6 +690,7 @@ impl CdcBufferAppend {
             transaction_id,
             records,
             change_batches: Vec::new(),
+            schema_versions: CdcSchemaVersionMap::new(),
             buffered_at_unix_ms,
         };
         append.validate()?;
@@ -708,6 +714,7 @@ impl CdcBufferAppend {
             transaction_id,
             records: Vec::new(),
             change_batches,
+            schema_versions: CdcSchemaVersionMap::new(),
             buffered_at_unix_ms,
         };
         append.validate()?;
@@ -758,6 +765,15 @@ impl CdcBufferAppend {
 
     pub fn records(&self) -> &[CdcBufferRecord] {
         &self.records
+    }
+
+    pub fn with_schema_versions(mut self, schema_versions: CdcSchemaVersionMap) -> Self {
+        self.schema_versions = schema_versions;
+        self
+    }
+
+    pub fn schema_versions(&self) -> &CdcSchemaVersionMap {
+        &self.schema_versions
     }
 
     pub fn change_batches(&self) -> &[ChangeBatch] {
@@ -858,6 +874,10 @@ impl CdcBufferedTransactionManifest {
 
     pub fn payload_format(&self) -> CdcBufferPayloadFormat {
         self.payload_format
+    }
+
+    pub fn schema_versions(&self) -> &CdcSchemaVersionMap {
+        &self.schema_versions
     }
 
     pub fn payload_object_key(&self) -> Option<&str> {
@@ -1272,7 +1292,8 @@ mod tests {
     #[tokio::test]
     async fn appends_and_replays_pending_transactions() {
         let store = test_store("cdc-buffer-append").await;
-        let append = append("0/10", 1000, vec![record(1), record(2)]);
+        let append = append("0/10", 1000, vec![record(1), record(2)])
+            .with_schema_versions(CdcSchemaVersionMap::from([("orders".to_string(), 42)]));
         let manifest = store.append_transaction(&append).await.expect("append");
 
         let pending = store
@@ -1280,6 +1301,7 @@ mod tests {
             .await
             .expect("pending");
         assert_eq!(pending, vec![manifest.clone()]);
+        assert_eq!(manifest.schema_versions().get("orders"), Some(&42));
         assert_eq!(
             store.records(&manifest).await.unwrap(),
             vec![record(1), record(2)]
@@ -1521,6 +1543,7 @@ mod tests {
             payload_bytes: append.records().iter().map(CdcBufferRecord::byte_len).sum(),
             payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
             payload_format: CdcBufferPayloadFormat::KafkaRecords,
+            schema_versions: CdcSchemaVersionMap::new(),
             payload_object_key: None,
             buffered_at_unix_ms: append.buffered_at_unix_ms(),
             delivered_at_unix_ms: None,
@@ -1564,6 +1587,7 @@ mod tests {
             payload_bytes: payload.len(),
             payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
             payload_format: CdcBufferPayloadFormat::KafkaRecords,
+            schema_versions: CdcSchemaVersionMap::new(),
             payload_object_key: None,
             buffered_at_unix_ms: append.buffered_at_unix_ms(),
             delivered_at_unix_ms: None,

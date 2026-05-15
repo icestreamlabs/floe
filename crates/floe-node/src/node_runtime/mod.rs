@@ -19,8 +19,9 @@ use floe_cdc_core::{
     ChangeBatch, TransactionBatch, UpstreamTableRef,
 };
 use floe_cdc_pg::{
-    PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent, PostgresTableRouter,
-    PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
+    PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,
+    PostgresSchemaEvolutionPolicy, PostgresTableRouter, PostgresTransactionAssembler,
+    config_with_stored_cdc_checkpoint,
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
@@ -148,6 +149,7 @@ struct QueuedCdcTransaction {
 struct ReplicationPipelineRuntimePlan {
     name: String,
     source_name: String,
+    database_name: String,
     upstream_table: String,
     table_id: CdcTableId,
     schema: CdcTableSchema,

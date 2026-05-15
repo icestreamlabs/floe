@@ -5,6 +5,11 @@ use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use serde::{Deserialize, Serialize};
 
+pub type CdcSchemaVersionMap = BTreeMap<String, u64>;
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CdcSourceId(String);
 
@@ -405,6 +410,22 @@ impl CdcTableSchema {
 
     pub fn primary_key(&self) -> &CdcPrimaryKey {
         &self.primary_key
+    }
+
+    pub fn stable_fingerprint(&self) -> u64 {
+        let mut hash = FNV_OFFSET_BASIS;
+        fnv_hash_str(&mut hash, self.table_id.as_str());
+        fnv_hash_str(&mut hash, self.upstream_table.schema());
+        fnv_hash_str(&mut hash, self.upstream_table.table());
+        for column in &self.columns {
+            fnv_hash_str(&mut hash, column.name());
+            fnv_hash_column_type(&mut hash, column.data_type());
+            fnv_hash_u8(&mut hash, u8::from(column.nullable()));
+        }
+        for key_column in self.primary_key.columns() {
+            fnv_hash_str(&mut hash, key_column);
+        }
+        hash
     }
 
     pub fn column_index(&self, column_name: &str) -> Option<usize> {
@@ -921,6 +942,8 @@ pub struct TransactionBatch {
     start_position: Option<CdcSourcePosition>,
     commit_position: CdcSourcePosition,
     change_batches: Vec<ChangeBatch>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    schema_versions: CdcSchemaVersionMap,
 }
 
 impl TransactionBatch {
@@ -941,7 +964,13 @@ impl TransactionBatch {
             start_position,
             commit_position,
             change_batches,
+            schema_versions: BTreeMap::new(),
         })
+    }
+
+    pub fn with_schema_versions(mut self, schema_versions: CdcSchemaVersionMap) -> Self {
+        self.schema_versions = schema_versions;
+        self
     }
 
     pub fn source_id(&self) -> &CdcSourceId {
@@ -962,6 +991,10 @@ impl TransactionBatch {
 
     pub fn change_batches(&self) -> &[ChangeBatch] {
         &self.change_batches
+    }
+
+    pub fn schema_versions(&self) -> &CdcSchemaVersionMap {
+        &self.schema_versions
     }
 
     pub fn validate_against_schemas(
@@ -987,6 +1020,8 @@ pub struct CdcCheckpoint {
     position: CdcSourcePosition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transaction_id: Option<CdcTransactionId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    schema_versions: CdcSchemaVersionMap,
 }
 
 impl CdcCheckpoint {
@@ -999,7 +1034,13 @@ impl CdcCheckpoint {
             source_id,
             position,
             transaction_id,
+            schema_versions: BTreeMap::new(),
         }
+    }
+
+    pub fn with_schema_versions(mut self, schema_versions: CdcSchemaVersionMap) -> Self {
+        self.schema_versions = schema_versions;
+        self
     }
 
     pub fn from_transaction(transaction: &TransactionBatch) -> Self {
@@ -1007,6 +1048,7 @@ impl CdcCheckpoint {
             source_id: transaction.source_id().clone(),
             position: transaction.commit_position().clone(),
             transaction_id: transaction.transaction_id().cloned(),
+            schema_versions: transaction.schema_versions().clone(),
         }
     }
 
@@ -1022,6 +1064,10 @@ impl CdcCheckpoint {
         self.transaction_id.as_ref()
     }
 
+    pub fn schema_versions(&self) -> &CdcSchemaVersionMap {
+        &self.schema_versions
+    }
+
     pub fn covers(&self, other: &Self) -> Result<bool> {
         ensure!(
             self.source_id == other.source_id,
@@ -1030,6 +1076,38 @@ impl CdcCheckpoint {
             other.source_id.as_str()
         );
         self.position.covers(&other.position)
+    }
+}
+
+fn fnv_hash_u8(hash: &mut u64, value: u8) {
+    *hash ^= u64::from(value);
+    *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+fn fnv_hash_i8(hash: &mut u64, value: i8) {
+    fnv_hash_u8(hash, value as u8);
+}
+
+fn fnv_hash_str(hash: &mut u64, value: &str) {
+    for byte in value.as_bytes() {
+        fnv_hash_u8(hash, *byte);
+    }
+    fnv_hash_u8(hash, 0xff);
+}
+
+fn fnv_hash_column_type(hash: &mut u64, data_type: &ColumnType) {
+    match data_type {
+        ColumnType::Int64 => fnv_hash_u8(hash, 1),
+        ColumnType::Bool => fnv_hash_u8(hash, 2),
+        ColumnType::Utf8 => fnv_hash_u8(hash, 3),
+        ColumnType::TimestampMillis => fnv_hash_u8(hash, 4),
+        ColumnType::DateDays => fnv_hash_u8(hash, 5),
+        ColumnType::Decimal128 { precision, scale } => {
+            fnv_hash_u8(hash, 6);
+            fnv_hash_u8(hash, *precision);
+            fnv_hash_i8(hash, *scale);
+        }
+        ColumnType::Numeric => fnv_hash_u8(hash, 7),
     }
 }
 

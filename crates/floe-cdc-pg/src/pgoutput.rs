@@ -294,6 +294,26 @@ impl PgOutputCdcChange {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgOutputDecodedChanges {
+    relation: Option<PgOutputRelation>,
+    changes: Vec<PgOutputCdcChange>,
+}
+
+impl PgOutputDecodedChanges {
+    pub fn relation(&self) -> Option<&PgOutputRelation> {
+        self.relation.as_ref()
+    }
+
+    pub fn changes(&self) -> &[PgOutputCdcChange] {
+        &self.changes
+    }
+
+    pub fn into_changes(self) -> Vec<PgOutputCdcChange> {
+        self.changes
+    }
+}
+
 #[derive(Default)]
 pub struct PgOutputDecoder {
     relations: HashMap<PostgresRelationId, PgOutputRelation>,
@@ -322,8 +342,19 @@ impl PgOutputDecoder {
     }
 
     pub fn decode_cdc_changes(&mut self, data: Bytes) -> Result<Vec<PgOutputCdcChange>> {
+        Ok(self.decode_cdc_changes_with_metadata(data)?.into_changes())
+    }
+
+    pub fn decode_cdc_changes_with_metadata(
+        &mut self,
+        data: Bytes,
+    ) -> Result<PgOutputDecodedChanges> {
         let message = self.decode_message(data)?;
-        message_relation_changes(&message)
+        let relation = match &message {
+            PgOutputMessage::Relation(relation) => Some(relation.clone()),
+            _ => None,
+        };
+        let changes = message_relation_changes(&message)
             .into_iter()
             .map(|(relation_id, change)| {
                 let relation = self.relations.get(&relation_id).ok_or_else(|| {
@@ -337,7 +368,8 @@ impl PgOutputDecoder {
                     change: change_to_cdc(relation, change)?,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PgOutputDecodedChanges { relation, changes })
     }
 }
 

@@ -5,14 +5,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use floe_cdc::{CdcApplyResult, CdcTableStore};
 use floe_cdc_core::{
-    CdcChange, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId,
-    ChangeBatch, TransactionBatch, UpstreamTableRef,
+    CdcChange, CdcRow, CdcSchemaVersionMap, CdcSourceId, CdcSourcePosition, CdcTableId,
+    CdcTableSchema, CdcTransactionId, ChangeBatch, TransactionBatch, UpstreamTableRef,
 };
 
 use crate::{
     PgOutputCdcChange, PgOutputDecoder, PostgresCdcConfig, PostgresLsn, PostgresReplicationClient,
     PostgresReplicationEvent, config_with_stored_cdc_checkpoint,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresSchemaEvolutionPolicy {
+    FailFast,
+    IgnoreCompatible,
+    ApplyCompatibleAdditions,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PostgresTableRouter {
@@ -46,6 +53,9 @@ pub struct PostgresTransactionAssembler {
     router: PostgresTableRouter,
     decoder: PgOutputDecoder,
     current: Option<InFlightTransaction>,
+    schemas: HashMap<CdcTableId, CdcTableSchema>,
+    schema_policy: PostgresSchemaEvolutionPolicy,
+    schema_versions: CdcSchemaVersionMap,
 }
 
 impl PostgresTransactionAssembler {
@@ -55,6 +65,27 @@ impl PostgresTransactionAssembler {
             router,
             decoder: PgOutputDecoder::new(),
             current: None,
+            schemas: HashMap::new(),
+            schema_policy: PostgresSchemaEvolutionPolicy::FailFast,
+            schema_versions: CdcSchemaVersionMap::new(),
+        }
+    }
+
+    pub fn with_schemas(
+        source_id: CdcSourceId,
+        router: PostgresTableRouter,
+        schemas: HashMap<CdcTableId, CdcTableSchema>,
+        schema_policy: PostgresSchemaEvolutionPolicy,
+    ) -> Self {
+        let schema_versions = schema_versions_for_schemas(&schemas);
+        Self {
+            source_id,
+            router,
+            decoder: PgOutputDecoder::new(),
+            current: None,
+            schemas,
+            schema_policy,
+            schema_versions,
         }
     }
 
@@ -96,15 +127,18 @@ impl PostgresTransactionAssembler {
     }
 
     fn accept_xlog_data(&mut self, data: bytes::Bytes) -> Result<()> {
-        let routed_changes = self
-            .decoder
-            .decode_cdc_changes(data)?
+        let decoded = self.decoder.decode_cdc_changes_with_metadata(data)?;
+        if let Some(relation) = decoded.relation() {
+            self.accept_relation(relation)?;
+        }
+        let routed_changes = decoded
+            .changes()
+            .iter()
+            .map(|change| self.route_change(change))
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .map(|change| {
-                let table_id = self.route_change(&change)?;
-                Ok((table_id, change.into_change()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .flatten()
+            .collect::<Vec<_>>();
         if routed_changes.is_empty() {
             return Ok(());
         }
@@ -113,14 +147,77 @@ impl PostgresTransactionAssembler {
             .as_mut()
             .ok_or_else(|| anyhow!("Postgres CDC change arrived outside a transaction boundary"))?;
         for (table_id, change) in routed_changes {
-            current.push(table_id, change);
+            current.push(
+                table_id.clone(),
+                change,
+                self.schema_versions
+                    .get(table_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            );
         }
         Ok(())
     }
 
-    fn route_change(&self, change: &PgOutputCdcChange) -> Result<Option<CdcTableId>> {
+    fn accept_relation(&mut self, relation: &crate::PgOutputRelation) -> Result<()> {
+        let upstream_table = relation.upstream_table_ref()?;
+        let Some(table_id) = self.router.get(&upstream_table).cloned() else {
+            return Ok(());
+        };
+        let Some(catalog_schema) = self.schemas.get(&table_id) else {
+            return Ok(());
+        };
+        let observed_schema = relation.to_cdc_schema(table_id.clone())?;
+        match classify_schema_evolution(catalog_schema, &observed_schema) {
+            SchemaEvolution::Unchanged => {
+                self.schema_versions.insert(
+                    table_id.as_str().to_string(),
+                    catalog_schema.stable_fingerprint(),
+                );
+                Ok(())
+            }
+            SchemaEvolution::CompatibleAddition => match self.schema_policy {
+                PostgresSchemaEvolutionPolicy::FailFast => {
+                    bail!(
+                        "Postgres CDC schema for table '{}' has compatible column additions but policy is fail-fast",
+                        table_id.as_str()
+                    )
+                }
+                PostgresSchemaEvolutionPolicy::IgnoreCompatible
+                | PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
+                    tracing::info!(
+                        table = %table_id.as_str(),
+                        upstream_table = %format!("{}.{}", upstream_table.schema(), upstream_table.table()),
+                        policy = ?self.schema_policy,
+                        "Postgres CDC relation schema has compatible additions; projecting to catalog schema"
+                    );
+                    self.schema_versions.insert(
+                        table_id.as_str().to_string(),
+                        observed_schema.stable_fingerprint(),
+                    );
+                    Ok(())
+                }
+            },
+            SchemaEvolution::Incompatible(reason) => {
+                bail!(
+                    "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
+                    table_id.as_str()
+                )
+            }
+        }
+    }
+
+    fn route_change(&self, change: &PgOutputCdcChange) -> Result<Option<(CdcTableId, CdcChange)>> {
         let upstream_table = change.relation().upstream_table_ref()?;
-        Ok(self.router.get(&upstream_table).cloned())
+        let Some(table_id) = self.router.get(&upstream_table).cloned() else {
+            return Ok(None);
+        };
+        let change = if let Some(schema) = self.schemas.get(&table_id) {
+            project_change_to_schema(change, schema)?
+        } else {
+            change.change().clone()
+        };
+        Ok(Some((table_id, change)))
     }
 
     fn commit(&mut self, end_lsn: PostgresLsn) -> Result<Option<TransactionBatch>> {
@@ -136,13 +233,16 @@ impl PostgresTransactionAssembler {
             .into_iter()
             .map(|table_changes| ChangeBatch::new(table_changes.table_id, table_changes.changes))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Some(TransactionBatch::new(
-            self.source_id.clone(),
-            Some(current.transaction_id),
-            None,
-            CdcSourcePosition::postgres(end_lsn.to_pg_string(), None)?,
-            change_batches,
-        )?))
+        Ok(Some(
+            TransactionBatch::new(
+                self.source_id.clone(),
+                Some(current.transaction_id),
+                None,
+                CdcSourcePosition::postgres(end_lsn.to_pg_string(), None)?,
+                change_batches,
+            )?
+            .with_schema_versions(current.schema_versions),
+        ))
     }
 }
 
@@ -175,8 +275,13 @@ impl PostgresCdcEventApplier {
         Self {
             source_id: source_id.clone(),
             table_store,
-            schemas,
-            assembler: PostgresTransactionAssembler::new(source_id, router),
+            schemas: schemas.clone(),
+            assembler: PostgresTransactionAssembler::with_schemas(
+                source_id,
+                router,
+                schemas,
+                PostgresSchemaEvolutionPolicy::FailFast,
+            ),
             upstream_wal_end: None,
             durable_lsn: None,
             table_applied_lsns: HashMap::new(),
@@ -547,9 +652,145 @@ where
     }
 }
 
+enum SchemaEvolution {
+    Unchanged,
+    CompatibleAddition,
+    Incompatible(String),
+}
+
+fn classify_schema_evolution(
+    catalog_schema: &CdcTableSchema,
+    observed_schema: &CdcTableSchema,
+) -> SchemaEvolution {
+    if catalog_schema.primary_key().columns() != observed_schema.primary_key().columns() {
+        return SchemaEvolution::Incompatible(format!(
+            "primary key changed from {:?} to {:?}",
+            catalog_schema.primary_key().columns(),
+            observed_schema.primary_key().columns()
+        ));
+    }
+
+    if observed_schema.columns().len() < catalog_schema.columns().len() {
+        return SchemaEvolution::Incompatible(format!(
+            "column count decreased from {} to {}",
+            catalog_schema.columns().len(),
+            observed_schema.columns().len()
+        ));
+    }
+
+    for (idx, catalog_column) in catalog_schema.columns().iter().enumerate() {
+        let Some(observed_column) = observed_schema.columns().get(idx) else {
+            return SchemaEvolution::Incompatible(format!(
+                "column '{}' is missing from observed schema",
+                catalog_column.name()
+            ));
+        };
+        if catalog_column.name() != observed_column.name() {
+            return SchemaEvolution::Incompatible(format!(
+                "column {} changed from '{}' to '{}'",
+                idx,
+                catalog_column.name(),
+                observed_column.name()
+            ));
+        }
+        if catalog_column.data_type() != observed_column.data_type() {
+            return SchemaEvolution::Incompatible(format!(
+                "column '{}' type changed from {:?} to {:?}",
+                catalog_column.name(),
+                catalog_column.data_type(),
+                observed_column.data_type()
+            ));
+        }
+    }
+
+    if observed_schema.columns().len() == catalog_schema.columns().len() {
+        SchemaEvolution::Unchanged
+    } else {
+        SchemaEvolution::CompatibleAddition
+    }
+}
+
+fn project_change_to_schema(
+    change: &PgOutputCdcChange,
+    schema: &CdcTableSchema,
+) -> Result<CdcChange> {
+    match change.change() {
+        CdcChange::Insert { row } => Ok(CdcChange::Insert {
+            row: project_row_to_schema(change.relation(), schema, row)?,
+        }),
+        CdcChange::Update { key, before, after } => Ok(CdcChange::Update {
+            key: key.clone(),
+            before: before
+                .as_ref()
+                .map(|row| project_row_to_schema(change.relation(), schema, row))
+                .transpose()?,
+            after: project_row_to_schema(change.relation(), schema, after)?,
+        }),
+        CdcChange::Delete { key, before } => Ok(CdcChange::Delete {
+            key: key.clone(),
+            before: before
+                .as_ref()
+                .map(|row| project_row_to_schema(change.relation(), schema, row))
+                .transpose()?,
+        }),
+        CdcChange::Truncate => Ok(CdcChange::Truncate),
+    }
+}
+
+fn project_row_to_schema(
+    relation: &crate::PgOutputRelation,
+    schema: &CdcTableSchema,
+    row: &CdcRow,
+) -> Result<CdcRow> {
+    if relation.columns().len() == schema.columns().len()
+        && relation
+            .columns()
+            .iter()
+            .zip(schema.columns())
+            .all(|(relation_column, schema_column)| relation_column.name() == schema_column.name())
+    {
+        return Ok(row.clone());
+    }
+    anyhow::ensure!(
+        row.values().len() == relation.columns().len(),
+        "Postgres CDC row for relation '{}.{}' has {} values but relation metadata has {} columns",
+        relation.namespace(),
+        relation.name(),
+        row.values().len(),
+        relation.columns().len()
+    );
+    let mut values = Vec::with_capacity(schema.columns().len());
+    for schema_column in schema.columns() {
+        let index = relation
+            .columns()
+            .iter()
+            .position(|relation_column| relation_column.name() == schema_column.name())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Postgres CDC relation '{}.{}' no longer contains catalog column '{}'",
+                    relation.namespace(),
+                    relation.name(),
+                    schema_column.name()
+                )
+            })?;
+        values.push(row.values()[index].clone());
+    }
+    CdcRow::new(values)
+}
+
+fn schema_versions_for_schemas(
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+) -> CdcSchemaVersionMap {
+    schemas
+        .iter()
+        .map(|(table_id, schema)| (table_id.as_str().to_string(), schema.stable_fingerprint()))
+        .collect()
+}
+
 struct InFlightTransaction {
     transaction_id: CdcTransactionId,
     table_changes: Vec<TableChanges>,
+    schema_versions: CdcSchemaVersionMap,
 }
 
 impl InFlightTransaction {
@@ -557,13 +798,13 @@ impl InFlightTransaction {
         Ok(Self {
             transaction_id: CdcTransactionId::new(format!("pg-xid-{xid}"))?,
             table_changes: Vec::new(),
+            schema_versions: CdcSchemaVersionMap::new(),
         })
     }
 
-    fn push(&mut self, table_id: Option<CdcTableId>, change: CdcChange) {
-        let Some(table_id) = table_id else {
-            return;
-        };
+    fn push(&mut self, table_id: CdcTableId, change: CdcChange, schema_version: u64) {
+        self.schema_versions
+            .insert(table_id.as_str().to_string(), schema_version);
         if let Some(existing) = self
             .table_changes
             .iter_mut()
@@ -633,35 +874,49 @@ mod tests {
     }
 
     fn relation_message(relation_id: u32, table: &str) -> Bytes {
+        relation_message_with_columns(
+            relation_id,
+            table,
+            &[("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)],
+        )
+    }
+
+    fn relation_message_with_columns(
+        relation_id: u32,
+        table: &str,
+        columns: &[(&str, u32, bool)],
+    ) -> Bytes {
         let mut out = Vec::new();
         put_u8(&mut out, b'R');
         put_u32(&mut out, relation_id);
         put_cstring(&mut out, "public");
         put_cstring(&mut out, table);
         put_u8(&mut out, b'd');
-        put_u16(&mut out, 2);
+        put_u16(&mut out, columns.len() as u16);
 
-        put_u8(&mut out, 1);
-        put_cstring(&mut out, "id");
-        put_u32(&mut out, PG_INT8_OID);
-        put_i32(&mut out, -1);
-
-        put_u8(&mut out, 0);
-        put_cstring(&mut out, "status");
-        put_u32(&mut out, PG_TEXT_OID);
-        put_i32(&mut out, -1);
+        for (name, oid, is_key) in columns {
+            put_u8(&mut out, u8::from(*is_key));
+            put_cstring(&mut out, name);
+            put_u32(&mut out, *oid);
+            put_i32(&mut out, -1);
+        }
 
         Bytes::from(out)
     }
 
     fn insert_message(relation_id: u32, id: i64, status: &str) -> Bytes {
+        insert_message_with_values(relation_id, &[id.to_string(), status.to_string()])
+    }
+
+    fn insert_message_with_values(relation_id: u32, values: &[String]) -> Bytes {
         let mut out = Vec::new();
         put_u8(&mut out, b'I');
         put_u32(&mut out, relation_id);
         put_u8(&mut out, b'N');
-        put_u16(&mut out, 2);
-        put_text_value(&mut out, &id.to_string());
-        put_text_value(&mut out, status);
+        put_u16(&mut out, values.len() as u16);
+        for value in values {
+            put_text_value(&mut out, value);
+        }
         Bytes::from(out)
     }
 
@@ -860,6 +1115,144 @@ mod tests {
                 .expect("row")
             }]
         );
+    }
+
+    #[test]
+    fn compatible_column_additions_can_be_projected_to_catalog_schema() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let mut assembler = PostgresTransactionAssembler::with_schemas(
+            source_id,
+            router(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        );
+        let relation = relation_message_with_columns(
+            RELATION_ID,
+            "orders",
+            &[
+                ("id", PG_INT8_OID, true),
+                ("status", PG_TEXT_OID, false),
+                ("note", PG_TEXT_OID, false),
+            ],
+        );
+
+        assembler
+            .accept_event(xlog(relation.clone()))
+            .expect("compatible relation");
+        assembler.accept_event(begin(57)).expect("begin");
+        assembler
+            .accept_event(xlog(insert_message_with_values(
+                RELATION_ID,
+                &["7".to_string(), "open".to_string(), "ignored".to_string()],
+            )))
+            .expect("insert");
+        let transaction = assembler
+            .accept_event(commit(41))
+            .expect("commit")
+            .expect("transaction");
+
+        assert_eq!(
+            transaction.change_batches()[0].changes(),
+            &[CdcChange::Insert {
+                row: CdcRow::new([
+                    Some(RowValue::Int64(7)),
+                    Some(RowValue::Utf8("open".to_string())),
+                ])
+                .expect("row")
+            }]
+        );
+        let PgOutputMessage::Relation(observed_relation) =
+            decode_pgoutput_message(relation).expect("decode relation")
+        else {
+            panic!("expected relation");
+        };
+        let observed_schema = observed_relation
+            .to_cdc_schema(CdcTableId::new("orders").expect("table id"))
+            .expect("observed schema");
+        assert_eq!(
+            transaction.schema_versions().get("orders").copied(),
+            Some(observed_schema.stable_fingerprint())
+        );
+    }
+
+    #[test]
+    fn fail_fast_schema_policy_rejects_compatible_additions() {
+        let mut assembler = PostgresTransactionAssembler::with_schemas(
+            CdcSourceId::new("pg_main").expect("source id"),
+            router(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::FailFast,
+        );
+        let err = assembler
+            .accept_event(xlog(relation_message_with_columns(
+                RELATION_ID,
+                "orders",
+                &[
+                    ("id", PG_INT8_OID, true),
+                    ("status", PG_TEXT_OID, false),
+                    ("note", PG_TEXT_OID, false),
+                ],
+            )))
+            .expect_err("compatible addition should fail under fail-fast");
+
+        assert!(format!("{err:#}").contains("compatible column additions"));
+    }
+
+    #[test]
+    fn schema_policy_rejects_incompatible_type_changes() {
+        let mut assembler = PostgresTransactionAssembler::with_schemas(
+            CdcSourceId::new("pg_main").expect("source id"),
+            router(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        );
+        let err = assembler
+            .accept_event(xlog(relation_message_with_columns(
+                RELATION_ID,
+                "orders",
+                &[("id", PG_INT8_OID, true), ("status", PG_INT8_OID, false)],
+            )))
+            .expect_err("type change should fail");
+
+        assert!(format!("{err:#}").contains("type changed"));
+    }
+
+    #[test]
+    fn schema_policy_rejects_dropped_columns() {
+        let mut assembler = PostgresTransactionAssembler::with_schemas(
+            CdcSourceId::new("pg_main").expect("source id"),
+            router(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        );
+        let err = assembler
+            .accept_event(xlog(relation_message_with_columns(
+                RELATION_ID,
+                "orders",
+                &[("id", PG_INT8_OID, true)],
+            )))
+            .expect_err("dropped column should fail");
+
+        assert!(format!("{err:#}").contains("column count decreased"));
+    }
+
+    #[test]
+    fn schema_policy_rejects_reordered_columns() {
+        let mut assembler = PostgresTransactionAssembler::with_schemas(
+            CdcSourceId::new("pg_main").expect("source id"),
+            router(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        );
+        let err = assembler
+            .accept_event(xlog(relation_message_with_columns(
+                RELATION_ID,
+                "orders",
+                &[("status", PG_TEXT_OID, false), ("id", PG_INT8_OID, true)],
+            )))
+            .expect_err("reordered columns should fail");
+
+        assert!(format!("{err:#}").contains("column 0 changed"));
     }
 
     #[test]

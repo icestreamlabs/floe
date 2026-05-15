@@ -4,12 +4,13 @@ use anyhow::{Context, Result};
 use floe_cdc_core::{
     CdcChange, CdcRow, CdcRowKey, CdcSourcePosition, CdcTableSchema, CdcTransactionId, ChangeBatch,
 };
-use floe_core::RowValue;
+use floe_core::{RowValue, catalog::ColumnType};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebeziumEnvelopeConfig {
     source_name: String,
+    database_name: String,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
 }
@@ -36,10 +37,19 @@ impl DebeziumEnvelopeConfig {
             "Debezium source name cannot be empty"
         );
         Ok(Self {
+            database_name: source_name.clone(),
             source_name,
             emit_tombstones: false,
             include_transaction_metadata: false,
         })
+    }
+
+    pub fn with_database_name(mut self, database_name: impl Into<String>) -> Self {
+        let database_name = database_name.into();
+        if !database_name.trim().is_empty() {
+            self.database_name = database_name;
+        }
+        self
     }
 
     pub fn with_emit_tombstones(mut self, emit_tombstones: bool) -> Self {
@@ -54,6 +64,10 @@ impl DebeziumEnvelopeConfig {
 
     pub fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    pub fn database_name(&self) -> &str {
+        &self.database_name
     }
 
     pub fn emit_tombstones(&self) -> bool {
@@ -153,7 +167,7 @@ pub fn encode_debezium_change(
 ) -> Result<Vec<DebeziumEncodedRecord>> {
     change.validate_against_schema(schema)?;
     let ts_ms = context.ts_ms.unwrap_or_else(current_unix_time_ms);
-    let source = source_metadata(schema, config, context.source_position, false);
+    let source = source_metadata(schema, config, context, ts_ms, false);
     let (key, before, after, op) = match change {
         CdcChange::Insert { row } => (
             Some(schema.primary_key_from_row(row)?),
@@ -190,14 +204,19 @@ pub fn encode_debezium_change(
         CdcChange::Truncate => (None, Value::Null, Value::Null, "t"),
     };
 
-    let key_json = key
+    let key_payload = key
         .as_ref()
         .map(|key| row_key_to_json(schema, key))
         .transpose()?;
-    let value = envelope(before, after, source, op, ts_ms, config, context);
-    let mut records = vec![DebeziumEncodedRecord::new(key_json.clone(), Some(value))];
+    let key_record = key_payload.map(|payload| wrap_debezium_key(schema, config, payload));
+    let value = wrap_debezium_value(
+        schema,
+        config,
+        envelope(before, after, source, op, ts_ms, config, context),
+    );
+    let mut records = vec![DebeziumEncodedRecord::new(key_record.clone(), Some(value))];
     if matches!(change, CdcChange::Delete { .. }) && config.emit_tombstones {
-        records.push(DebeziumEncodedRecord::new(key_json, None));
+        records.push(DebeziumEncodedRecord::new(key_record, None));
     }
     Ok(records)
 }
@@ -212,15 +231,23 @@ pub fn encode_debezium_snapshot_row(
     let key = schema.primary_key_from_row(row)?;
     let ts_ms = context.ts_ms.unwrap_or_else(current_unix_time_ms);
     Ok(DebeziumEncodedRecord::new(
-        Some(row_key_to_json(schema, &key)?),
-        Some(envelope(
-            Value::Null,
-            row_to_json(schema, row)?,
-            source_metadata(schema, config, context.source_position, true),
-            "r",
-            ts_ms,
+        Some(wrap_debezium_key(
+            schema,
             config,
-            context,
+            row_key_to_json(schema, &key)?,
+        )),
+        Some(wrap_debezium_value(
+            schema,
+            config,
+            envelope(
+                Value::Null,
+                row_to_json(schema, row)?,
+                source_metadata(schema, config, context, ts_ms, true),
+                "r",
+                ts_ms,
+                config,
+                context,
+            ),
         )),
     ))
 }
@@ -240,6 +267,8 @@ fn envelope(
     object.insert("source".to_string(), source);
     object.insert("op".to_string(), Value::String(op.to_string()));
     object.insert("ts_ms".to_string(), json!(ts_ms));
+    object.insert("ts_us".to_string(), json!(ts_ms.saturating_mul(1_000)));
+    object.insert("ts_ns".to_string(), json!(ts_ms.saturating_mul(1_000_000)));
     if config.include_transaction_metadata {
         let transaction = context.transaction_id.map_or(Value::Null, |tx| {
             json!({
@@ -256,7 +285,8 @@ fn envelope(
 fn source_metadata(
     schema: &CdcTableSchema,
     config: &DebeziumEnvelopeConfig,
-    position: Option<&CdcSourcePosition>,
+    context: DebeziumEncodeContext<'_>,
+    ts_ms: i64,
     snapshot: bool,
 ) -> Value {
     let mut source = Map::new();
@@ -269,6 +299,18 @@ fn source_metadata(
         "name".to_string(),
         Value::String(config.source_name().to_string()),
     );
+    source.insert("ts_ms".to_string(), json!(ts_ms));
+    source.insert("ts_us".to_string(), json!(ts_ms.saturating_mul(1_000)));
+    source.insert("ts_ns".to_string(), json!(ts_ms.saturating_mul(1_000_000)));
+    source.insert(
+        "snapshot".to_string(),
+        Value::String(if snapshot { "true" } else { "false" }.to_string()),
+    );
+    source.insert(
+        "db".to_string(),
+        Value::String(config.database_name().to_string()),
+    );
+    source.insert("sequence".to_string(), Value::Null);
     source.insert(
         "schema".to_string(),
         Value::String(schema.upstream_table().schema().to_string()),
@@ -278,20 +320,37 @@ fn source_metadata(
         Value::String(schema.upstream_table().table().to_string()),
     );
     source.insert(
-        "snapshot".to_string(),
-        Value::String(if snapshot { "true" } else { "false" }.to_string()),
+        "txId".to_string(),
+        transaction_id_to_debezium_txid(context.transaction_id).unwrap_or(Value::Null),
     );
-    if let Some(position) = position {
+    source.insert("lsn".to_string(), Value::Null);
+    source.insert("xmin".to_string(), Value::Null);
+    if let Some(position) = context.source_position {
         match position {
             CdcSourcePosition::Postgres {
                 commit_lsn,
                 event_lsn,
             } => {
-                source.insert("lsn".to_string(), Value::String(commit_lsn.clone()));
-                source.insert("commit_lsn".to_string(), Value::String(commit_lsn.clone()));
-                if let Some(event_lsn) = event_lsn {
-                    source.insert("event_lsn".to_string(), Value::String(event_lsn.clone()));
+                let commit_lsn_u64 = postgres_lsn_to_u64(commit_lsn);
+                let event_lsn_u64 = event_lsn.as_deref().and_then(postgres_lsn_to_u64);
+                if let Some(commit_lsn_u64) = commit_lsn_u64 {
+                    source.insert(
+                        "lsn".to_string(),
+                        json!(event_lsn_u64.unwrap_or(commit_lsn_u64)),
+                    );
                 }
+                source.insert(
+                    "sequence".to_string(),
+                    Value::String(format!(
+                        "[{},{}]",
+                        commit_lsn_u64
+                            .map(|lsn| format!("\"{lsn}\""))
+                            .unwrap_or_else(|| "null".to_string()),
+                        event_lsn_u64
+                            .map(|lsn| format!("\"{lsn}\""))
+                            .unwrap_or_else(|| "null".to_string())
+                    )),
+                );
             }
             CdcSourcePosition::Opaque { value } => {
                 source.insert("position".to_string(), Value::String(value.clone()));
@@ -299,6 +358,211 @@ fn source_metadata(
         }
     }
     Value::Object(source)
+}
+
+fn wrap_debezium_key(
+    schema: &CdcTableSchema,
+    config: &DebeziumEnvelopeConfig,
+    payload: Value,
+) -> Value {
+    wrap_debezium_message(debezium_key_schema(schema, config), payload)
+}
+
+fn wrap_debezium_value(
+    schema: &CdcTableSchema,
+    config: &DebeziumEnvelopeConfig,
+    payload: Value,
+) -> Value {
+    wrap_debezium_message(debezium_envelope_schema(schema, config), payload)
+}
+
+fn wrap_debezium_message(schema: Value, payload: Value) -> Value {
+    json!({
+        "schema": schema,
+        "payload": payload,
+    })
+}
+
+fn debezium_key_schema(schema: &CdcTableSchema, config: &DebeziumEnvelopeConfig) -> Value {
+    let fields = schema
+        .primary_key()
+        .columns()
+        .iter()
+        .filter_map(|column_name| {
+            schema
+                .columns()
+                .iter()
+                .find(|column| column.name() == column_name)
+                .map(|column| debezium_column_schema(column.name(), column.data_type(), false))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "struct",
+        "fields": fields,
+        "optional": false,
+        "name": format!("{}.{}.{}.Key", config.source_name(), schema.upstream_table().schema(), schema.upstream_table().table()),
+    })
+}
+
+fn debezium_envelope_schema(schema: &CdcTableSchema, config: &DebeziumEnvelopeConfig) -> Value {
+    let mut fields = Vec::with_capacity(if config.include_transaction_metadata() {
+        7
+    } else {
+        6
+    });
+    fields.push(debezium_named_schema(
+        row_struct_schema(schema, config, true),
+        "before",
+        true,
+    ));
+    fields.push(debezium_named_schema(
+        row_struct_schema(schema, config, true),
+        "after",
+        true,
+    ));
+    fields.push(debezium_named_schema(
+        debezium_source_schema(),
+        "source",
+        false,
+    ));
+    fields.push(debezium_primitive_schema("op", "string", false));
+    fields.push(debezium_primitive_schema("ts_ms", "int64", true));
+    fields.push(debezium_primitive_schema("ts_us", "int64", true));
+    fields.push(debezium_primitive_schema("ts_ns", "int64", true));
+    if config.include_transaction_metadata() {
+        fields.push(debezium_named_schema(
+            debezium_transaction_schema(),
+            "transaction",
+            true,
+        ));
+    }
+    json!({
+        "type": "struct",
+        "fields": fields,
+        "optional": false,
+        "name": format!("{}.{}.{}.Envelope", config.source_name(), schema.upstream_table().schema(), schema.upstream_table().table()),
+    })
+}
+
+fn row_struct_schema(
+    schema: &CdcTableSchema,
+    config: &DebeziumEnvelopeConfig,
+    optional: bool,
+) -> Value {
+    let fields = schema
+        .columns()
+        .iter()
+        .map(|column| debezium_column_schema(column.name(), column.data_type(), column.nullable()))
+        .collect::<Vec<_>>();
+    json!({
+        "type": "struct",
+        "fields": fields,
+        "optional": optional,
+        "name": format!("{}.{}.{}.Value", config.source_name(), schema.upstream_table().schema(), schema.upstream_table().table()),
+    })
+}
+
+fn debezium_source_schema() -> Value {
+    json!({
+        "type": "struct",
+        "fields": [
+            debezium_primitive_schema("version", "string", false),
+            debezium_primitive_schema("connector", "string", false),
+            debezium_primitive_schema("name", "string", false),
+            debezium_primitive_schema("ts_ms", "int64", true),
+            debezium_primitive_schema("ts_us", "int64", true),
+            debezium_primitive_schema("ts_ns", "int64", true),
+            debezium_primitive_schema("snapshot", "string", true),
+            debezium_primitive_schema("db", "string", false),
+            debezium_primitive_schema("sequence", "string", true),
+            debezium_primitive_schema("schema", "string", false),
+            debezium_primitive_schema("table", "string", false),
+            debezium_primitive_schema("txId", "int64", true),
+            debezium_primitive_schema("lsn", "int64", true),
+            debezium_primitive_schema("xmin", "int64", true),
+        ],
+        "optional": false,
+        "name": "io.debezium.connector.postgresql.Source",
+    })
+}
+
+fn debezium_transaction_schema() -> Value {
+    json!({
+        "type": "struct",
+        "fields": [
+            debezium_primitive_schema("id", "string", false),
+            debezium_primitive_schema("total_order", "int64", false),
+            debezium_primitive_schema("data_collection_order", "int64", false),
+        ],
+        "optional": true,
+        "name": "event.block",
+        "version": 1,
+    })
+}
+
+fn debezium_column_schema(name: &str, data_type: &ColumnType, optional: bool) -> Value {
+    match data_type {
+        ColumnType::Int64 => debezium_primitive_schema(name, "int64", optional),
+        ColumnType::Bool => debezium_primitive_schema(name, "boolean", optional),
+        ColumnType::Utf8 | ColumnType::Numeric | ColumnType::Decimal128 { .. } => {
+            debezium_primitive_schema(name, "string", optional)
+        }
+        ColumnType::TimestampMillis => {
+            let mut schema = debezium_primitive_schema(name, "int64", optional);
+            if let Value::Object(object) = &mut schema {
+                object.insert(
+                    "name".to_string(),
+                    Value::String("io.debezium.time.Timestamp".to_string()),
+                );
+                object.insert("version".to_string(), json!(1));
+            }
+            schema
+        }
+        ColumnType::DateDays => {
+            let mut schema = debezium_primitive_schema(name, "int32", optional);
+            if let Value::Object(object) = &mut schema {
+                object.insert(
+                    "name".to_string(),
+                    Value::String("io.debezium.time.Date".to_string()),
+                );
+                object.insert("version".to_string(), json!(1));
+            }
+            schema
+        }
+    }
+}
+
+fn debezium_primitive_schema(field: &str, schema_type: &str, optional: bool) -> Value {
+    json!({
+        "type": schema_type,
+        "optional": optional,
+        "field": field,
+    })
+}
+
+fn debezium_named_schema(mut schema: Value, field: &str, optional: bool) -> Value {
+    if let Value::Object(object) = &mut schema {
+        object.insert("field".to_string(), Value::String(field.to_string()));
+        object.insert("optional".to_string(), Value::Bool(optional));
+    }
+    schema
+}
+
+fn postgres_lsn_to_u64(lsn: &str) -> Option<u64> {
+    let (upper, lower) = lsn.split_once('/')?;
+    let upper = u64::from_str_radix(upper, 16).ok()?;
+    let lower = u64::from_str_radix(lower, 16).ok()?;
+    Some((upper << 32) | lower)
+}
+
+fn transaction_id_to_debezium_txid(transaction_id: Option<&CdcTransactionId>) -> Option<Value> {
+    let value = transaction_id?.as_str();
+    let xid = value
+        .strip_prefix("pg-xid-")
+        .unwrap_or(value)
+        .parse::<i64>()
+        .ok()?;
+    Some(json!(xid))
 }
 
 fn key_for_update(
@@ -411,8 +675,9 @@ mod tests {
         let schema = orders_schema();
         let config = DebeziumEnvelopeConfig::new("pg_main")
             .unwrap()
+            .with_database_name("inventory")
             .with_transaction_metadata(true);
-        let tx = CdcTransactionId::new("tx-7").unwrap();
+        let tx = CdcTransactionId::new("pg-xid-7").unwrap();
         let position =
             CdcSourcePosition::postgres("0/16B6C50", Some("0/16B6C40".to_string())).unwrap();
         let records = encode_debezium_change(
@@ -431,19 +696,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].key(), Some(&json!({"tenant_id": 7, "id": 42})));
-        let value = records[0].value().unwrap();
+        assert_eq!(key_payload(&records[0]), &json!({"tenant_id": 7, "id": 42}));
+        assert_eq!(
+            records[0].key().unwrap()["schema"]["name"],
+            "pg_main.public.orders.Key"
+        );
+        let value = value_payload(&records[0]);
         assert_eq!(value["op"], "c");
         assert_eq!(value["ts_ms"], 1234);
+        assert_eq!(value["ts_us"], 1_234_000);
+        assert_eq!(value["ts_ns"], 1_234_000_000);
         assert_eq!(value["before"], Value::Null);
         assert_eq!(value["after"]["amount"], 99);
         assert_eq!(value["source"]["name"], "pg_main");
+        assert_eq!(value["source"]["db"], "inventory");
         assert_eq!(value["source"]["schema"], "public");
         assert_eq!(value["source"]["table"], "orders");
-        assert_eq!(value["source"]["commit_lsn"], "0/16B6C50");
-        assert_eq!(value["source"]["event_lsn"], "0/16B6C40");
-        assert_eq!(value["transaction"]["id"], "tx-7");
+        assert_eq!(value["source"]["lsn"], 23_817_280);
+        assert_eq!(value["source"]["txId"], 7);
+        assert_eq!(value["source"]["xmin"], Value::Null);
+        assert_eq!(value["transaction"]["id"], "pg-xid-7");
         assert_eq!(value["transaction"]["total_order"], 3);
+        assert_eq!(
+            records[0].value().unwrap()["schema"]["name"],
+            "pg_main.public.orders.Envelope"
+        );
     }
 
     #[test]
@@ -465,8 +742,8 @@ mod tests {
         )
         .unwrap();
 
-        let value = records[0].value().unwrap();
-        assert_eq!(records[0].key(), Some(&json!({"tenant_id": 7, "id": 42})));
+        let value = value_payload(&records[0]);
+        assert_eq!(key_payload(&records[0]), &json!({"tenant_id": 7, "id": 42}));
         assert_eq!(value["op"], "u");
         assert_eq!(value["before"]["status"], "new");
         assert_eq!(value["after"]["status"], "paid");
@@ -493,11 +770,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].key(), Some(&json!({"tenant_id": 7, "id": 42})));
-        assert_eq!(records[0].value().unwrap()["op"], "d");
-        assert_eq!(records[0].value().unwrap()["before"]["amount"], 99);
-        assert_eq!(records[0].value().unwrap()["after"], Value::Null);
-        assert_eq!(records[1].key(), Some(&json!({"tenant_id": 7, "id": 42})));
+        assert_eq!(key_payload(&records[0]), &json!({"tenant_id": 7, "id": 42}));
+        assert_eq!(value_payload(&records[0])["op"], "d");
+        assert_eq!(value_payload(&records[0])["before"]["amount"], 99);
+        assert_eq!(value_payload(&records[0])["after"], Value::Null);
+        assert_eq!(key_payload(&records[1]), &json!({"tenant_id": 7, "id": 42}));
         assert_eq!(records[1].value(), None);
     }
 
@@ -515,9 +792,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(snapshot.key(), Some(&json!({"tenant_id": 7, "id": 42})));
-        assert_eq!(snapshot.value().unwrap()["op"], "r");
-        assert_eq!(snapshot.value().unwrap()["source"]["snapshot"], "true");
+        assert_eq!(key_payload(&snapshot), &json!({"tenant_id": 7, "id": 42}));
+        assert_eq!(value_payload(&snapshot)["op"], "r");
+        assert_eq!(value_payload(&snapshot)["source"]["snapshot"], "true");
 
         let truncate = encode_debezium_change(
             &schema,
@@ -530,7 +807,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(truncate[0].key(), None);
-        assert_eq!(truncate[0].value().unwrap()["op"], "t");
+        assert_eq!(value_payload(&truncate[0])["op"], "t");
     }
 
     #[test]
@@ -566,14 +843,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(records.len(), 2);
+        assert_eq!(value_payload(&records[0])["transaction"]["total_order"], 10);
+        assert_eq!(value_payload(&records[1])["transaction"]["total_order"], 11);
+    }
+
+    #[test]
+    fn connect_schema_carries_debezium_field_shapes() {
+        let schema = orders_schema();
+        let config = DebeziumEnvelopeConfig::new("pg_main")
+            .unwrap()
+            .with_database_name("inventory")
+            .with_transaction_metadata(true);
+        let record = encode_debezium_snapshot_row(
+            &schema,
+            &row(7, 42, 99, Some("open")),
+            &config,
+            DebeziumEncodeContext {
+                ts_ms: Some(1234),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let key = record.key().unwrap();
+        assert_eq!(key["schema"]["name"], "pg_main.public.orders.Key");
+        assert_eq!(key["schema"]["fields"][0]["field"], "tenant_id");
+        assert_eq!(key["payload"], json!({"tenant_id": 7, "id": 42}));
+
+        let value = record.value().unwrap();
+        assert_eq!(value["schema"]["name"], "pg_main.public.orders.Envelope");
+        assert_eq!(value["schema"]["fields"][0]["field"], "before");
         assert_eq!(
-            records[0].value().unwrap()["transaction"]["total_order"],
-            10
+            value["schema"]["fields"][2]["name"],
+            "io.debezium.connector.postgresql.Source"
         );
-        assert_eq!(
-            records[1].value().unwrap()["transaction"]["total_order"],
-            11
-        );
+        assert_eq!(value["schema"]["fields"][3]["field"], "op");
+        assert_eq!(value["schema"]["fields"][7]["field"], "transaction");
+        assert_eq!(value["payload"]["source"]["db"], "inventory");
+        assert_eq!(value["payload"]["after"]["status"], "open");
     }
 
     fn orders_schema() -> CdcTableSchema {
@@ -599,5 +906,13 @@ mod tests {
             status.map(|status| RowValue::Utf8(status.to_string())),
         ])
         .unwrap()
+    }
+
+    fn key_payload(record: &DebeziumEncodedRecord) -> &Value {
+        &record.key().expect("key")["payload"]
+    }
+
+    fn value_payload(record: &DebeziumEncodedRecord) -> &Value {
+        &record.value().expect("value")["payload"]
     }
 }
