@@ -291,7 +291,23 @@ impl PostgresCdcEventApplier {
         schemas: HashMap<CdcTableId, CdcTableSchema>,
     ) -> Self {
         let router = PostgresTableRouter::from_schemas(schemas.values());
-        Self::with_router(source_id, table_store, schemas, router)
+        Self::with_router_and_schema_policy(
+            source_id,
+            table_store,
+            schemas,
+            router,
+            PostgresSchemaEvolutionPolicy::FailFast,
+        )
+    }
+
+    pub fn with_schema_policy(
+        source_id: CdcSourceId,
+        table_store: CdcTableStore,
+        schemas: HashMap<CdcTableId, CdcTableSchema>,
+        schema_policy: PostgresSchemaEvolutionPolicy,
+    ) -> Self {
+        let router = PostgresTableRouter::from_schemas(schemas.values());
+        Self::with_router_and_schema_policy(source_id, table_store, schemas, router, schema_policy)
     }
 
     pub fn with_router(
@@ -299,6 +315,22 @@ impl PostgresCdcEventApplier {
         table_store: CdcTableStore,
         schemas: HashMap<CdcTableId, CdcTableSchema>,
         router: PostgresTableRouter,
+    ) -> Self {
+        Self::with_router_and_schema_policy(
+            source_id,
+            table_store,
+            schemas,
+            router,
+            PostgresSchemaEvolutionPolicy::FailFast,
+        )
+    }
+
+    pub fn with_router_and_schema_policy(
+        source_id: CdcSourceId,
+        table_store: CdcTableStore,
+        schemas: HashMap<CdcTableId, CdcTableSchema>,
+        router: PostgresTableRouter,
+        schema_policy: PostgresSchemaEvolutionPolicy,
     ) -> Self {
         Self {
             source_id: source_id.clone(),
@@ -308,7 +340,7 @@ impl PostgresCdcEventApplier {
                 source_id,
                 router,
                 schemas,
-                PostgresSchemaEvolutionPolicy::FailFast,
+                schema_policy,
             ),
             upstream_wal_end: None,
             durable_lsn: None,
@@ -1651,6 +1683,97 @@ mod tests {
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].start_lsn(), None);
         assert_eq!(configs[1].start_lsn(), Some(PostgresLsn::from_u64(90)));
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_resumes_after_compatible_schema_change() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_store = test_store("pg-cdc-loop-schema-reconnect").await;
+        let relation = relation_message_with_columns(
+            RELATION_ID,
+            "orders",
+            &[
+                ("id", PG_INT8_OID, true),
+                ("status", PG_TEXT_OID, false),
+                ("note", PG_TEXT_OID, false),
+            ],
+        );
+        let PgOutputMessage::Relation(observed_relation) =
+            decode_pgoutput_message(relation.clone()).expect("decode relation")
+        else {
+            panic!("expected relation");
+        };
+        let observed_schema = observed_relation
+            .to_cdc_schema(CdcTableId::new("orders").expect("table id"))
+            .expect("observed schema");
+        let mut applier = PostgresCdcEventApplier::with_schema_policy(
+            source_id.clone(),
+            table_store.clone(),
+            orders_schemas(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        );
+        let feedbacks = Arc::new(Mutex::new(Vec::new()));
+        let first_stream = FakeStream::new(
+            [
+                FakeStep::Event(xlog(relation)),
+                FakeStep::Event(begin(62)),
+                FakeStep::Event(xlog(insert_message_with_values(
+                    RELATION_ID,
+                    &["13".to_string(), "open".to_string(), "ignored".to_string()],
+                ))),
+                FakeStep::Event(commit(120)),
+                FakeStep::Error("disconnect after schema change"),
+            ],
+            Arc::clone(&feedbacks),
+        );
+        let second_stream = FakeStream::new([FakeStep::End], Arc::clone(&feedbacks));
+        let factory = FakeFactory::new([first_stream, second_stream]);
+
+        run_postgres_cdc_apply_loop_with_reconnect(
+            PostgresCdcConfig::new("localhost", "floe", "secret", "app", "slot", "pub")
+                .expect("config"),
+            &source_id,
+            &table_store,
+            &mut applier,
+            &factory,
+            PostgresCdcReconnectPolicy::new(1, Duration::ZERO),
+        )
+        .await
+        .expect("run reconnect loop");
+
+        assert_eq!(
+            *feedbacks.lock().expect("feedback lock"),
+            vec![PostgresLsn::from_u64(120)]
+        );
+        let configs = factory.configs();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].start_lsn(), None);
+        assert_eq!(configs[1].start_lsn(), Some(PostgresLsn::from_u64(120)));
+        let checkpoint = table_store
+            .load_checkpoint(&source_id)
+            .await
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(
+            checkpoint.schema_versions().get("orders").copied(),
+            Some(observed_schema.stable_fingerprint())
+        );
+        assert_eq!(
+            table_store
+                .load_row(
+                    &CdcTableId::new("orders").expect("table id"),
+                    &CdcRowKey::new([RowValue::Int64(13)]).expect("key")
+                )
+                .await
+                .expect("load row"),
+            Some(
+                CdcRow::new([
+                    Some(RowValue::Int64(13)),
+                    Some(RowValue::Utf8("open".to_string())),
+                ])
+                .expect("row")
+            )
+        );
     }
 
     #[tokio::test]
