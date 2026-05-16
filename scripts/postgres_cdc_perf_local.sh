@@ -49,6 +49,7 @@ NODE_STDOUT="${ARTIFACT_DIR}/floe-node.stdout.log"
 NODE_STDERR="${ARTIFACT_DIR}/floe-node.stderr.log"
 NODE_RESOURCE_LOG="${ARTIFACT_DIR}/floe-node.resources.log"
 COUNTER_LOG="${ARTIFACT_DIR}/kafka-counter.log"
+REPRODUCE_LOG="${ARTIFACT_DIR}/reproduce.sh"
 SYSTEM_LOG="${ARTIFACT_DIR}/system.txt"
 POSTGRES_SETTINGS_LOG="${ARTIFACT_DIR}/postgres-settings.txt"
 KAFKA_TOPIC_LOG="${ARTIFACT_DIR}/kafka-topic.txt"
@@ -113,6 +114,35 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 1
   fi
+}
+
+write_reproduce_command() {
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    printf 'ARTIFACT_DIR=%q \\\n' "${ARTIFACT_DIR}"
+    printf 'ROWS=%q \\\n' "${ROWS}"
+    printf 'DATASET=%q \\\n' "${DATASET}"
+    printf 'TPCH_SCALE_FACTOR=%q \\\n' "${TPCH_SCALE_FACTOR}"
+    printf 'BENCH_MODE=%q \\\n' "${BENCH_MODE}"
+    printf 'TOPIC=%q \\\n' "${TOPIC}"
+    printf 'PIPELINE_FORMAT=%q \\\n' "${PIPELINE_FORMAT}"
+    printf 'DURABLE_REPLICATION_BUFFER=%q \\\n' "${DURABLE_REPLICATION_BUFFER}"
+    printf 'BUFFER_MAX_PENDING_BYTES=%q \\\n' "${BUFFER_MAX_PENDING_BYTES}"
+    printf 'BUFFER_MAX_PENDING_AGE_MS=%q \\\n' "${BUFFER_MAX_PENDING_AGE_MS}"
+    printf 'ARROW_IPC_ROWS_PER_RECORD=%q \\\n' "${ARROW_IPC_ROWS_PER_RECORD}"
+    printf 'ARROW_IPC_COMPRESSION=%q \\\n' "${ARROW_IPC_COMPRESSION}"
+    printf 'LIVE_WRITE_CHUNK_ROWS=%q \\\n' "${LIVE_WRITE_CHUNK_ROWS}"
+    printf 'LIVE_WRITE_SLEEP_MS=%q \\\n' "${LIVE_WRITE_SLEEP_MS}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
+    printf 'FLOE_SLATEDB_FLUSH_INTERVAL_MS=%q \\\n' "${SLATEDB_FLUSH_INTERVAL_MS}"
+    printf 'TIMEOUT_SECS=%q \\\n' "${TIMEOUT_SECS}"
+    printf 'BUILD_RELEASE=%q \\\n' "${BUILD_RELEASE}"
+    printf 'scripts/postgres_cdc_perf_local.sh\n'
+  } >"${REPRODUCE_LOG}"
+  chmod +x "${REPRODUCE_LOG}"
 }
 
 wait_for_postgres() {
@@ -766,6 +796,7 @@ echo "postgres_snapshot_rows_per_batch=${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BAT
 echo "postgres_snapshot_max_workers=${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
 echo "postgres_snapshot_intra_table_chunks=${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
 echo "slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
+write_reproduce_command
 
 echo "Pulling images..."
 docker pull "${POSTGRES_IMAGE}" >/dev/null
@@ -1064,6 +1095,7 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.node_stderr=${NODE_STDERR}"
   echo "benchmark.node_resource_log=${NODE_RESOURCE_LOG}"
   echo "benchmark.counter_log=${COUNTER_LOG}"
+  echo "benchmark.reproduce_log=${REPRODUCE_LOG}"
   echo "benchmark.system_log=${SYSTEM_LOG}"
   echo "benchmark.postgres_settings_log=${POSTGRES_SETTINGS_LOG}"
   echo "benchmark.postgres_slot_log=${POSTGRES_SLOT_LOG}"

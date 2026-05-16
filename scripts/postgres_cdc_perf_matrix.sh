@@ -28,6 +28,7 @@ STOP_ON_FAIL="${STOP_ON_FAIL:-0}"
 
 SUMMARY_CSV="${ARTIFACT_ROOT}/summary.csv"
 SUMMARY_MD="${ARTIFACT_ROOT}/summary.md"
+REPRODUCE_LOG="${ARTIFACT_ROOT}/reproduce.sh"
 
 mkdir -p "${ARTIFACT_ROOT}"
 
@@ -80,6 +81,31 @@ Postgres snapshot intra-table chunks: \`${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE
 | Status | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | End-to-End (s) | Source Rows/s | Total Bytes | Wall MB/s | Artifacts |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 MD
+}
+
+write_reproduce_command() {
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    printf 'ARTIFACT_ROOT=%q \\\n' "${ARTIFACT_ROOT}"
+    printf 'ROWS_LIST=%q \\\n' "${ROWS_LIST}"
+    printf 'DATASET=%q \\\n' "${DATASET}"
+    printf 'TPCH_SCALE_FACTOR=%q \\\n' "${TPCH_SCALE_FACTOR}"
+    printf 'PIPELINE_FORMATS=%q \\\n' "${PIPELINE_FORMATS}"
+    printf 'BENCH_MODES=%q \\\n' "${BENCH_MODES}"
+    printf 'TIMEOUT_SECS=%q \\\n' "${TIMEOUT_SECS}"
+    printf 'BUILD_RELEASE=%q \\\n' "${BUILD_RELEASE}"
+    printf 'LIVE_WRITE_CHUNK_ROWS=%q \\\n' "${LIVE_WRITE_CHUNK_ROWS}"
+    printf 'LIVE_WRITE_SLEEP_MS=%q \\\n' "${LIVE_WRITE_SLEEP_MS}"
+    printf 'BUFFER_MAX_PENDING_BYTES=%q \\\n' "${BUFFER_MAX_PENDING_BYTES}"
+    printf 'BUFFER_MAX_PENDING_AGE_MS=%q \\\n' "${BUFFER_MAX_PENDING_AGE_MS}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
+    printf 'FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
+    printf 'STOP_ON_FAIL=%q \\\n' "${STOP_ON_FAIL}"
+    printf 'scripts/postgres_cdc_perf_matrix.sh\n'
+  } >"${REPRODUCE_LOG}"
+  chmod +x "${REPRODUCE_LOG}"
 }
 
 append_result() {
@@ -138,6 +164,7 @@ append_result() {
 }
 
 write_headers
+write_reproduce_command
 
 for mode in ${BENCH_MODES}; do
   for format in ${PIPELINE_FORMATS}; do
