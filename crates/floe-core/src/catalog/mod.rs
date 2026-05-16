@@ -159,6 +159,10 @@ pub struct ReplicationBufferPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_pending_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_pending_records: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_pending_transactions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     max_pending_age_ms: Option<u64>,
 }
 
@@ -452,15 +456,30 @@ impl ReplicationPipelineDefinition {
 }
 
 impl ReplicationBufferPolicy {
-    pub fn new(max_pending_bytes: Option<usize>, max_pending_age_ms: Option<u64>) -> Self {
+    pub fn new(
+        max_pending_bytes: Option<usize>,
+        max_pending_records: Option<usize>,
+        max_pending_transactions: Option<usize>,
+        max_pending_age_ms: Option<u64>,
+    ) -> Self {
         Self {
             max_pending_bytes,
+            max_pending_records,
+            max_pending_transactions,
             max_pending_age_ms,
         }
     }
 
     pub fn max_pending_bytes(&self) -> Option<usize> {
         self.max_pending_bytes
+    }
+
+    pub fn max_pending_records(&self) -> Option<usize> {
+        self.max_pending_records
+    }
+
+    pub fn max_pending_transactions(&self) -> Option<usize> {
+        self.max_pending_transactions
     }
 
     pub fn max_pending_age_ms(&self) -> Option<u64> {

@@ -136,6 +136,8 @@ fn parse_create_replication_pipeline_statement() {
             format = 'debezium-json',
             durable_buffer = true,
             buffer.max_pending_bytes = 1048576,
+            buffer.max_pending_records = 100000,
+            buffer.max_pending_objects = 64,
             buffer.max_pending_age_ms = 60000,
             tombstones = true,
             transaction_metadata = true
@@ -152,6 +154,14 @@ fn parse_create_replication_pipeline_statement() {
             assert_eq!(
                 definition.buffer_policy().max_pending_bytes(),
                 Some(1_048_576)
+            );
+            assert_eq!(
+                definition.buffer_policy().max_pending_records(),
+                Some(100_000)
+            );
+            assert_eq!(
+                definition.buffer_policy().max_pending_transactions(),
+                Some(64)
             );
             assert_eq!(
                 definition.buffer_policy().max_pending_age_ms(),

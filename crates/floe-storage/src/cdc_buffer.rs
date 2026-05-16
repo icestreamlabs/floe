@@ -974,6 +974,10 @@ impl CdcBufferStats {
         self.pending_transactions
     }
 
+    pub fn pending_objects(&self) -> usize {
+        self.pending_transactions
+    }
+
     pub fn pending_records(&self) -> usize {
         self.pending_records
     }

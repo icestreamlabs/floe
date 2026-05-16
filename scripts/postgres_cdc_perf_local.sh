@@ -24,6 +24,8 @@ PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
 PIPELINE_FORMAT="${PIPELINE_FORMAT:-floe-json}"
 DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
 BUFFER_MAX_PENDING_BYTES="${BUFFER_MAX_PENDING_BYTES:-}"
+BUFFER_MAX_PENDING_RECORDS="${BUFFER_MAX_PENDING_RECORDS:-}"
+BUFFER_MAX_PENDING_OBJECTS="${BUFFER_MAX_PENDING_OBJECTS:-}"
 BUFFER_MAX_PENDING_AGE_MS="${BUFFER_MAX_PENDING_AGE_MS:-}"
 ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-16384}"
 ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION:-none}"
@@ -129,6 +131,8 @@ write_reproduce_command() {
     printf 'PIPELINE_FORMAT=%q \\\n' "${PIPELINE_FORMAT}"
     printf 'DURABLE_REPLICATION_BUFFER=%q \\\n' "${DURABLE_REPLICATION_BUFFER}"
     printf 'BUFFER_MAX_PENDING_BYTES=%q \\\n' "${BUFFER_MAX_PENDING_BYTES}"
+    printf 'BUFFER_MAX_PENDING_RECORDS=%q \\\n' "${BUFFER_MAX_PENDING_RECORDS}"
+    printf 'BUFFER_MAX_PENDING_OBJECTS=%q \\\n' "${BUFFER_MAX_PENDING_OBJECTS}"
     printf 'BUFFER_MAX_PENDING_AGE_MS=%q \\\n' "${BUFFER_MAX_PENDING_AGE_MS}"
     printf 'ARROW_IPC_ROWS_PER_RECORD=%q \\\n' "${ARROW_IPC_ROWS_PER_RECORD}"
     printf 'ARROW_IPC_COMPRESSION=%q \\\n' "${ARROW_IPC_COMPRESSION}"
@@ -872,6 +876,12 @@ write_replication_pipeline_sql() {
     if [[ -n "${BUFFER_MAX_PENDING_BYTES}" ]]; then
       echo "  buffer.max_pending_bytes = ${BUFFER_MAX_PENDING_BYTES},"
     fi
+    if [[ -n "${BUFFER_MAX_PENDING_RECORDS}" ]]; then
+      echo "  buffer.max_pending_records = ${BUFFER_MAX_PENDING_RECORDS},"
+    fi
+    if [[ -n "${BUFFER_MAX_PENDING_OBJECTS}" ]]; then
+      echo "  buffer.max_pending_objects = ${BUFFER_MAX_PENDING_OBJECTS},"
+    fi
     if [[ -n "${BUFFER_MAX_PENDING_AGE_MS}" ]]; then
       echo "  buffer.max_pending_age_ms = ${BUFFER_MAX_PENDING_AGE_MS},"
     fi
@@ -962,6 +972,8 @@ echo "topics=${topic_list}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
 echo "durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
 echo "buffer_max_pending_bytes=${BUFFER_MAX_PENDING_BYTES:-unset}"
+echo "buffer_max_pending_records=${BUFFER_MAX_PENDING_RECORDS:-unset}"
+echo "buffer_max_pending_objects=${BUFFER_MAX_PENDING_OBJECTS:-unset}"
 echo "buffer_max_pending_age_ms=${BUFFER_MAX_PENDING_AGE_MS:-unset}"
 echo "arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"
 echo "redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
@@ -1277,6 +1289,8 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
   echo "benchmark.durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
   echo "benchmark.buffer_max_pending_bytes=${BUFFER_MAX_PENDING_BYTES}"
+  echo "benchmark.buffer_max_pending_records=${BUFFER_MAX_PENDING_RECORDS}"
+  echo "benchmark.buffer_max_pending_objects=${BUFFER_MAX_PENDING_OBJECTS}"
   echo "benchmark.buffer_max_pending_age_ms=${BUFFER_MAX_PENDING_AGE_MS}"
   echo "benchmark.arrow_ipc_rows_per_record=${ARROW_IPC_ROWS_PER_RECORD}"
   echo "benchmark.arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"

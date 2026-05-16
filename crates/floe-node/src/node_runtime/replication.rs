@@ -23,9 +23,9 @@ use floe_node_core::debezium_encoder::{
     encode_debezium_snapshot_row,
 };
 use floe_storage::{
-    CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferRecord,
-    CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
-    SlateCatalog,
+    CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage,
+    CdcBufferRecord, CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest,
+    ReplicationPipelineCheckpoint, SlateCatalog,
 };
 use rdkafka::ClientConfig;
 use rdkafka::client::ClientContext;
@@ -62,6 +62,8 @@ const FLOE_HEADER_RECORD_SEQUENCE: &str = "floe-record-sequence";
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
+const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS: usize = 0;
+const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: usize = 0;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
@@ -151,6 +153,24 @@ static REPLICATION_BUFFER_MAX_PENDING_BYTES: LazyLock<Option<usize>> = LazyLock:
         DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES,
     )
 });
+static REPLICATION_BUFFER_MAX_PENDING_RECORDS: LazyLock<Option<usize>> = LazyLock::new(|| {
+    env_usize_limit(
+        "FLOE_REPLICATION_BUFFER_MAX_PENDING_RECORDS",
+        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS,
+    )
+});
+static REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: LazyLock<Option<usize>> = LazyLock::new(|| {
+    env_usize_limit(
+        "FLOE_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS",
+        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
+    )
+    .or_else(|| {
+        env_usize_limit(
+            "FLOE_REPLICATION_BUFFER_MAX_PENDING_OBJECTS",
+            DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
+        )
+    })
+});
 static REPLICATION_BUFFER_MAX_PENDING_AGE_MS: LazyLock<Option<u64>> = LazyLock::new(|| {
     env_u64_limit(
         "FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS",
@@ -172,17 +192,29 @@ static REPLICATION_ARROW_IPC_COMPRESSION: LazyLock<Option<ReplicationArrowIpcCom
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicationBufferLimits {
     max_pending_bytes: Option<usize>,
+    max_pending_records: Option<usize>,
+    max_pending_transactions: Option<usize>,
     max_pending_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationBufferLimitViolation {
-    PendingBytes {
+    Bytes {
         pending_bytes: usize,
         incoming_bytes: usize,
         max_pending_bytes: usize,
     },
-    PendingAge {
+    Records {
+        pending_records: usize,
+        incoming_records: usize,
+        max_pending_records: usize,
+    },
+    Objects {
+        pending_transactions: usize,
+        incoming_transactions: usize,
+        max_pending_transactions: usize,
+    },
+    Age {
         oldest_pending_age_ms: u64,
         max_pending_age_ms: u64,
     },
@@ -217,14 +249,17 @@ impl ReplicationArrowIpcCompression {
 
 impl ReplicationBufferLimits {
     fn enabled(self) -> bool {
-        self.max_pending_bytes.is_some() || self.max_pending_age_ms.is_some()
+        self.max_pending_bytes.is_some()
+            || self.max_pending_records.is_some()
+            || self.max_pending_transactions.is_some()
+            || self.max_pending_age_ms.is_some()
     }
 }
 
 impl fmt::Display for ReplicationBufferLimitViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PendingBytes {
+            Self::Bytes {
                 pending_bytes,
                 incoming_bytes,
                 max_pending_bytes,
@@ -235,7 +270,29 @@ impl fmt::Display for ReplicationBufferLimitViolation {
                 incoming_bytes,
                 max_pending_bytes
             ),
-            Self::PendingAge {
+            Self::Records {
+                pending_records,
+                incoming_records,
+                max_pending_records,
+            } => write!(
+                f,
+                "pending buffer records would be {} with incoming {} records, above max {} records",
+                pending_records.saturating_add(*incoming_records),
+                incoming_records,
+                max_pending_records
+            ),
+            Self::Objects {
+                pending_transactions,
+                incoming_transactions,
+                max_pending_transactions,
+            } => write!(
+                f,
+                "pending buffer objects would be {} with incoming {} object, above max {} objects",
+                pending_transactions.saturating_add(*incoming_transactions),
+                incoming_transactions,
+                max_pending_transactions
+            ),
+            Self::Age {
                 oldest_pending_age_ms,
                 max_pending_age_ms,
             } => write!(
@@ -249,6 +306,8 @@ impl fmt::Display for ReplicationBufferLimitViolation {
 fn replication_buffer_limits() -> ReplicationBufferLimits {
     ReplicationBufferLimits {
         max_pending_bytes: *REPLICATION_BUFFER_MAX_PENDING_BYTES,
+        max_pending_records: *REPLICATION_BUFFER_MAX_PENDING_RECORDS,
+        max_pending_transactions: *REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
         max_pending_age_ms: *REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
     }
 }
@@ -261,6 +320,14 @@ fn effective_replication_buffer_limits(
         max_pending_bytes: effective_usize_limit(
             plan.buffer_policy.max_pending_bytes(),
             defaults.max_pending_bytes,
+        ),
+        max_pending_records: effective_usize_limit(
+            plan.buffer_policy.max_pending_records(),
+            defaults.max_pending_records,
+        ),
+        max_pending_transactions: effective_usize_limit(
+            plan.buffer_policy.max_pending_transactions(),
+            defaults.max_pending_transactions,
         ),
         max_pending_age_ms: effective_u64_limit(
             plan.buffer_policy.max_pending_age_ms(),
@@ -324,6 +391,7 @@ pub(super) struct ReplicationPipelineRuntime {
     postgres_writers_by_pipeline: HashMap<String, Arc<PostgresReplicationPipelineWriter>>,
     buffer_cleanup_last_by_pipeline: Mutex<HashMap<String, u64>>,
     replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
+    backpressure_state_by_pipeline: Mutex<HashMap<String, bool>>,
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
 }
 
@@ -341,6 +409,7 @@ pub(super) struct ReplicationPipelineStatusSnapshot {
     pending_bytes: usize,
     oldest_pending_age_ms: Option<u64>,
     replaying: bool,
+    source_backpressure_active: bool,
     last_error: Option<String>,
 }
 
@@ -388,6 +457,10 @@ impl ReplicationPipelineStatusSnapshot {
 
     pub(super) fn replaying(&self) -> bool {
         self.replaying
+    }
+
+    pub(super) fn source_backpressure_active(&self) -> bool {
+        self.source_backpressure_active
     }
 
     pub(super) fn last_error(&self) -> Option<&str> {
@@ -598,6 +671,7 @@ impl ReplicationPipelineRuntime {
             postgres_writers_by_pipeline,
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
+            backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),
         })
     }
@@ -639,6 +713,11 @@ impl ReplicationPipelineRuntime {
             .lock()
             .map(|errors| errors.clone())
             .map_err(|_| anyhow!("replication target error state lock poisoned"))?;
+        let backpressure_by_pipeline = self
+            .backpressure_state_by_pipeline
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| anyhow!("replication backpressure state lock poisoned"))?;
         let mut snapshots = Vec::new();
         for plans in self.pipelines_by_source.values() {
             for plan in plans {
@@ -678,6 +757,10 @@ impl ReplicationPipelineRuntime {
                     pending_bytes: stats.pending_bytes(),
                     oldest_pending_age_ms: stats.oldest_pending_age_ms(),
                     replaying: replaying_by_pipeline
+                        .get(&plan.name)
+                        .copied()
+                        .unwrap_or(false),
+                    source_backpressure_active: backpressure_by_pipeline
                         .get(&plan.name)
                         .copied()
                         .unwrap_or(false),
@@ -744,6 +827,11 @@ impl ReplicationPipelineRuntime {
                     .flush()
                     .await
                     .context("flush chunked replication buffer appends")?;
+                for plan in plans.iter().filter(|plan| {
+                    plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable
+                }) {
+                    crate::metrics::inc_cdc_buffer_forced_flush(&plan.name);
+                }
                 if let Some(started_at) = flush_started_at {
                     tracing::info!(
                         source = %source_id.as_str(),
@@ -770,6 +858,12 @@ impl ReplicationPipelineRuntime {
                 .flush()
                 .await
                 .context("flush replication buffer appends")?;
+            for plan in plans
+                .iter()
+                .filter(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
+            {
+                crate::metrics::inc_cdc_buffer_forced_flush(&plan.name);
+            }
             if let Some(started_at) = flush_started_at {
                 tracing::info!(
                     source = %source_id.as_str(),
@@ -842,11 +936,13 @@ impl ReplicationPipelineRuntime {
                     prepare_replication_buffer_append(plan, transaction, buffered_records)?;
                 let incoming_bytes =
                     estimated_buffer_payload_bytes(prepared_append.target_records());
+                let incoming_records = prepared_append.append.record_count();
                 self.enforce_buffer_limits_before_append(
                     plan,
                     &buffer_store,
                     storage,
                     incoming_bytes,
+                    incoming_records,
                     had_pending,
                 )
                 .await?;
@@ -1073,12 +1169,16 @@ impl ReplicationPipelineRuntime {
             let payload_load_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
             let records = match manifest.payload_format() {
                 CdcBufferPayloadFormat::KafkaRecords => {
-                    buffer_store.records(&manifest).await.with_context(|| {
+                    let records = buffer_store.records(&manifest).await.with_context(|| {
                         format!(
                             "load replication pipeline '{}' buffered payloads",
                             plan.name
                         )
-                    })?
+                    })?;
+                    if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
+                        crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
+                    }
+                    records
                 }
                 CdcBufferPayloadFormat::ChangeBatches => {
                     anyhow::ensure!(
@@ -1097,6 +1197,9 @@ impl ReplicationPipelineRuntime {
                                     plan.name
                                 )
                             })?;
+                    if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
+                        crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
+                    }
                     let payload_load_elapsed = payload_load_started_at
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
@@ -1184,29 +1287,36 @@ impl ReplicationPipelineRuntime {
         buffer_store: &CdcBufferStore,
         storage: &SlateCatalog,
         incoming_bytes: usize,
+        incoming_records: usize,
         has_pending: bool,
     ) -> anyhow::Result<()> {
         let limits = effective_replication_buffer_limits(plan);
         if !limits.enabled() {
+            self.set_source_backpressure_state(&plan.name, false);
             return Ok(());
         }
 
         if !has_pending {
-            if let Some(violation) = buffer_limit_violation(0, None, incoming_bytes, limits) {
+            if let Some(violation) =
+                buffer_limit_violation(0, 0, 0, None, incoming_bytes, incoming_records, limits)
+            {
                 log_replication_buffer_backpressure(
                     plan,
                     "incoming_transaction",
                     None,
                     incoming_bytes,
+                    incoming_records,
                     limits,
                     violation,
                     None,
                 );
+                self.set_source_backpressure_state(&plan.name, true);
                 return Err(anyhow!(
                     "replication pipeline '{}' durable buffer limit exceeded: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
                     plan.name
                 ));
             }
+            self.set_source_backpressure_state(&plan.name, false);
             return Ok(());
         }
 
@@ -1220,14 +1330,19 @@ impl ReplicationPipelineRuntime {
                 )
             })?;
         let Some(mut violation) = buffer_limit_violation(
+            stats.pending_transactions(),
+            stats.pending_records(),
             stats.pending_bytes(),
             stats.oldest_pending_age_ms(),
             incoming_bytes,
+            incoming_records,
             limits,
         ) else {
+            self.set_source_backpressure_state(&plan.name, false);
             return Ok(());
         };
 
+        crate::metrics::inc_cdc_buffer_drain_attempt(&plan.name);
         tracing::warn!(
             pipeline = %plan.name,
             pending_transactions = stats.pending_transactions(),
@@ -1235,6 +1350,7 @@ impl ReplicationPipelineRuntime {
             pending_bytes = stats.pending_bytes(),
             oldest_pending_age_ms = stats.oldest_pending_age_ms(),
             incoming_bytes,
+            incoming_records,
             violation = %violation,
             "replication pipeline durable buffer limit reached; attempting to drain before accepting more CDC data"
         );
@@ -1264,14 +1380,20 @@ impl ReplicationPipelineRuntime {
             pending_bytes = stats.pending_bytes(),
             oldest_pending_age_ms = stats.oldest_pending_age_ms(),
             incoming_bytes,
+            incoming_records,
             max_pending_bytes = limits.max_pending_bytes,
+            max_pending_records = limits.max_pending_records,
+            max_pending_transactions = limits.max_pending_transactions,
             max_pending_age_ms = limits.max_pending_age_ms,
             "replication pipeline durable buffer guardrail drain completed"
         );
         if let Some(current_violation) = buffer_limit_violation(
+            stats.pending_transactions(),
+            stats.pending_records(),
             stats.pending_bytes(),
             stats.oldest_pending_age_ms(),
             incoming_bytes,
+            incoming_records,
             limits,
         ) {
             violation = current_violation;
@@ -1280,15 +1402,18 @@ impl ReplicationPipelineRuntime {
                 "after_guardrail_drain",
                 Some(&stats),
                 incoming_bytes,
+                incoming_records,
                 limits,
                 violation,
                 Some(delivered),
             );
+            self.set_source_backpressure_state(&plan.name, true);
             return Err(anyhow!(
                 "replication pipeline '{}' durable buffer limit exceeded after draining: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
                 plan.name
             ));
         }
+        self.set_source_backpressure_state(&plan.name, false);
         Ok(())
     }
 
@@ -1458,6 +1583,22 @@ impl ReplicationPipelineRuntime {
         }
     }
 
+    fn set_source_backpressure_state(&self, pipeline_name: &str, active: bool) {
+        crate::metrics::record_cdc_buffer_source_backpressure_active(pipeline_name, active);
+        match self.backpressure_state_by_pipeline.lock() {
+            Ok(mut state) => {
+                state.insert(pipeline_name.to_string(), active);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pipeline = %pipeline_name,
+                    active,
+                    "replication pipeline backpressure state lock poisoned"
+                );
+            }
+        }
+    }
+
     fn set_last_target_error(&self, pipeline_name: &str, error: String) {
         crate::metrics::record_cdc_replication_target_error(pipeline_name, true);
         match self.last_target_error_by_pipeline.lock() {
@@ -1489,7 +1630,7 @@ impl ReplicationPipelineRuntime {
         if !self.claim_cleanup_due(&plan.name, now)? {
             return Ok(());
         }
-        buffer_store
+        let summary = buffer_store
             .cleanup_delivered(
                 &plan.name,
                 CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
@@ -1502,6 +1643,11 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        crate::metrics::inc_cdc_buffer_object_op(
+            &plan.name,
+            "delete",
+            summary.deleted_transactions(),
+        );
         Ok(())
     }
 
@@ -1516,7 +1662,7 @@ impl ReplicationPipelineRuntime {
                 let cleanup_store = buffer_store.clone();
                 let pipeline_name = plan.name.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = cleanup_store
+                    match cleanup_store
                         .cleanup_delivered(
                             &pipeline_name,
                             CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
@@ -1524,11 +1670,20 @@ impl ReplicationPipelineRuntime {
                         )
                         .await
                     {
-                        tracing::warn!(
-                            pipeline = %pipeline_name,
-                            error = %err,
-                            "replication pipeline delivered buffer cleanup failed"
-                        );
+                        Ok(summary) => {
+                            crate::metrics::inc_cdc_buffer_object_op(
+                                &pipeline_name,
+                                "delete",
+                                summary.deleted_transactions(),
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                pipeline = %pipeline_name,
+                                error = %err,
+                                "replication pipeline delivered buffer cleanup failed"
+                            );
+                        }
                     }
                 });
             }
@@ -2165,13 +2320,15 @@ async fn append_buffer_transaction(
     append: &CdcBufferAppend,
     await_durable: bool,
 ) -> anyhow::Result<CdcBufferedTransactionManifest> {
-    if await_durable {
+    let manifest = if await_durable {
         buffer_store.append_transaction(append).await
     } else {
         buffer_store
             .append_transaction_without_durable_wait(append)
             .await
-    }
+    }?;
+    crate::metrics::inc_cdc_buffer_object_op(append.pipeline_name(), "create", 1);
+    Ok(manifest)
 }
 
 fn prepare_replication_buffer_append(
@@ -3213,6 +3370,7 @@ fn log_replication_buffer_backpressure(
     phase: &str,
     stats: Option<&CdcBufferStats>,
     incoming_bytes: usize,
+    incoming_records: usize,
     limits: ReplicationBufferLimits,
     violation: ReplicationBufferLimitViolation,
     delivered_records: Option<usize>,
@@ -3229,8 +3387,11 @@ fn log_replication_buffer_backpressure(
         pending_bytes = stats.map(CdcBufferStats::pending_bytes).unwrap_or(0),
         oldest_pending_age_ms = stats.and_then(CdcBufferStats::oldest_pending_age_ms),
         incoming_bytes,
+        incoming_records,
         delivered_records,
         max_pending_bytes = limits.max_pending_bytes,
+        max_pending_records = limits.max_pending_records,
+        max_pending_transactions = limits.max_pending_transactions,
         max_pending_age_ms = limits.max_pending_age_ms,
         "replication pipeline durable buffer guardrail applying CDC source backpressure"
     );
@@ -3238,8 +3399,10 @@ fn log_replication_buffer_backpressure(
 
 fn buffer_limit_violation_kind(violation: ReplicationBufferLimitViolation) -> &'static str {
     match violation {
-        ReplicationBufferLimitViolation::PendingBytes { .. } => "pending_bytes",
-        ReplicationBufferLimitViolation::PendingAge { .. } => "pending_age",
+        ReplicationBufferLimitViolation::Bytes { .. } => "pending_bytes",
+        ReplicationBufferLimitViolation::Records { .. } => "pending_records",
+        ReplicationBufferLimitViolation::Objects { .. } => "pending_objects",
+        ReplicationBufferLimitViolation::Age { .. } => "pending_age",
     }
 }
 
@@ -3261,10 +3424,12 @@ fn cdc_replication_debug_state_from_snapshots(
                     .map(|transaction_id| transaction_id.as_str().to_string()),
                 target_state: snapshot.target_state().clone(),
                 pending_transactions: snapshot.pending_transactions(),
+                pending_objects: snapshot.pending_transactions(),
                 pending_records: snapshot.pending_records(),
                 pending_bytes: snapshot.pending_bytes(),
                 oldest_pending_age_ms: snapshot.oldest_pending_age_ms(),
                 replaying: snapshot.replaying(),
+                source_backpressure_active: snapshot.source_backpressure_active(),
                 last_error: snapshot.last_error().map(str::to_string),
             })
             .collect(),
@@ -3749,25 +3914,46 @@ fn estimated_buffer_payload_bytes(records: &[CdcBufferRecord]) -> usize {
 }
 
 fn buffer_limit_violation(
+    pending_transactions: usize,
+    pending_records: usize,
     pending_bytes: usize,
     oldest_pending_age_ms: Option<u64>,
     incoming_bytes: usize,
+    incoming_records: usize,
     limits: ReplicationBufferLimits,
 ) -> Option<ReplicationBufferLimitViolation> {
     if let Some(max_pending_bytes) = limits.max_pending_bytes
         && pending_bytes.saturating_add(incoming_bytes) > max_pending_bytes
     {
-        return Some(ReplicationBufferLimitViolation::PendingBytes {
+        return Some(ReplicationBufferLimitViolation::Bytes {
             pending_bytes,
             incoming_bytes,
             max_pending_bytes,
+        });
+    }
+    if let Some(max_pending_records) = limits.max_pending_records
+        && pending_records.saturating_add(incoming_records) > max_pending_records
+    {
+        return Some(ReplicationBufferLimitViolation::Records {
+            pending_records,
+            incoming_records,
+            max_pending_records,
+        });
+    }
+    if let Some(max_pending_transactions) = limits.max_pending_transactions
+        && pending_transactions.saturating_add(1) > max_pending_transactions
+    {
+        return Some(ReplicationBufferLimitViolation::Objects {
+            pending_transactions,
+            incoming_transactions: 1,
+            max_pending_transactions,
         });
     }
     if let Some(max_pending_age_ms) = limits.max_pending_age_ms
         && let Some(oldest_pending_age_ms) = oldest_pending_age_ms
         && oldest_pending_age_ms > max_pending_age_ms
     {
-        return Some(ReplicationBufferLimitViolation::PendingAge {
+        return Some(ReplicationBufferLimitViolation::Age {
             oldest_pending_age_ms,
             max_pending_age_ms,
         });
@@ -4659,6 +4845,11 @@ mod tests {
         let replaying = replaying.first().expect("replaying snapshot");
         assert!(replaying.replaying());
         assert_eq!(replaying.last_error(), Some("kafka outage"));
+        runtime.set_source_backpressure_state(&plan.name, true);
+        let backpressured = runtime.status_snapshots(&storage).await.unwrap();
+        let backpressured = backpressured.first().expect("backpressured snapshot");
+        assert!(backpressured.source_backpressure_active());
+        runtime.set_source_backpressure_state(&plan.name, false);
 
         runtime
             .mark_manifest_delivered(
@@ -4713,7 +4904,9 @@ mod tests {
         let debug_state = debug_state.read().await;
         let pipeline = debug_state.pipelines.first().expect("debug pipeline");
         assert_eq!(pipeline.pending_transactions, 0);
+        assert_eq!(pipeline.pending_objects, 0);
         assert!(!pipeline.replaying);
+        assert!(!pipeline.source_backpressure_active);
         assert_eq!(pipeline.last_error, None);
         assert_eq!(pipeline.target_state["target.delivery.status"], "delivered");
     }
@@ -4833,39 +5026,182 @@ mod tests {
         assert_eq!(still_pending.len(), 2);
     }
 
+    #[tokio::test]
+    async fn durable_pipeline_stops_source_progress_when_buffer_cap_remains_exceeded() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        plan.buffer_policy = CatalogReplicationBufferPolicy::new(None, None, Some(1), None);
+        let runtime = test_runtime_with_plan(plan.clone());
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
+        let source_id = CdcSourceId::new("pg_main").unwrap();
+        let first = TransactionBatch::new(
+            source_id.clone(),
+            Some(CdcTransactionId::new("pg-xid-201").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let second = TransactionBatch::new(
+            source_id.clone(),
+            Some(CdcTransactionId::new("pg-xid-202").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6D00", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(2, "paid"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .run_transaction(&source_id, &schemas, &first, Some(&storage))
+                .await
+                .expect("buffer first transaction"),
+            1
+        );
+        let error = runtime
+            .run_transaction(&source_id, &schemas, &second, Some(&storage))
+            .await
+            .expect_err("second transaction should trip the pending object cap");
+        assert!(error.to_string().contains("durable buffer limit exceeded"));
+
+        let buffer_store = storage.cdc_buffer_store();
+        let pending = buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending transactions");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].transaction_id().map(CdcTransactionId::as_str),
+            Some("pg-xid-201")
+        );
+        let source_frontier = buffer_store
+            .source_frontier(&plan.name)
+            .await
+            .expect("source frontier")
+            .expect("source frontier");
+        assert_eq!(source_frontier.source_position(), first.commit_position());
+        assert_eq!(
+            source_frontier
+                .transaction_id()
+                .map(CdcTransactionId::as_str),
+            Some("pg-xid-201")
+        );
+
+        let checkpoint = storage
+            .replication_pipeline_checkpoint(&plan.name)
+            .await
+            .expect("checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.source_position(), first.commit_position());
+        assert_eq!(
+            checkpoint.transaction_id().map(CdcTransactionId::as_str),
+            Some("pg-xid-201")
+        );
+
+        let snapshots = runtime.status_snapshots(&storage).await.unwrap();
+        let snapshot = snapshots.first().expect("snapshot");
+        assert_eq!(snapshot.pending_transactions(), 1);
+        assert_eq!(snapshot.pending_records(), pending[0].record_count());
+        assert!(snapshot.source_backpressure_active());
+    }
+
     #[test]
     fn buffer_limit_violation_accounts_for_incoming_payload_bytes() {
         let limits = ReplicationBufferLimits {
             max_pending_bytes: Some(100),
+            max_pending_records: None,
+            max_pending_transactions: None,
             max_pending_age_ms: None,
         };
 
         assert_eq!(
-            buffer_limit_violation(70, None, 31, limits),
-            Some(ReplicationBufferLimitViolation::PendingBytes {
+            buffer_limit_violation(0, 0, 70, None, 31, 0, limits),
+            Some(ReplicationBufferLimitViolation::Bytes {
                 pending_bytes: 70,
                 incoming_bytes: 31,
                 max_pending_bytes: 100,
             })
         );
-        assert_eq!(buffer_limit_violation(70, None, 30, limits), None);
+        assert_eq!(buffer_limit_violation(0, 0, 70, None, 30, 0, limits), None);
+    }
+
+    #[test]
+    fn buffer_limit_violation_accounts_for_pending_records() {
+        let limits = ReplicationBufferLimits {
+            max_pending_bytes: None,
+            max_pending_records: Some(10),
+            max_pending_transactions: None,
+            max_pending_age_ms: None,
+        };
+
+        assert_eq!(
+            buffer_limit_violation(0, 8, 0, None, 0, 3, limits),
+            Some(ReplicationBufferLimitViolation::Records {
+                pending_records: 8,
+                incoming_records: 3,
+                max_pending_records: 10,
+            })
+        );
+        assert_eq!(buffer_limit_violation(0, 8, 0, None, 0, 2, limits), None);
+    }
+
+    #[test]
+    fn buffer_limit_violation_accounts_for_pending_objects() {
+        let limits = ReplicationBufferLimits {
+            max_pending_bytes: None,
+            max_pending_records: None,
+            max_pending_transactions: Some(2),
+            max_pending_age_ms: None,
+        };
+
+        assert_eq!(
+            buffer_limit_violation(2, 0, 0, None, 0, 1, limits),
+            Some(ReplicationBufferLimitViolation::Objects {
+                pending_transactions: 2,
+                incoming_transactions: 1,
+                max_pending_transactions: 2,
+            })
+        );
+        assert_eq!(buffer_limit_violation(1, 0, 0, None, 0, 1, limits), None);
     }
 
     #[test]
     fn buffer_limit_violation_checks_oldest_pending_age() {
         let limits = ReplicationBufferLimits {
             max_pending_bytes: None,
+            max_pending_records: None,
+            max_pending_transactions: None,
             max_pending_age_ms: Some(1_000),
         };
 
         assert_eq!(
-            buffer_limit_violation(0, Some(1_001), 0, limits),
-            Some(ReplicationBufferLimitViolation::PendingAge {
+            buffer_limit_violation(0, 0, 0, Some(1_001), 0, 0, limits),
+            Some(ReplicationBufferLimitViolation::Age {
                 oldest_pending_age_ms: 1_001,
                 max_pending_age_ms: 1_000,
             })
         );
-        assert_eq!(buffer_limit_violation(0, Some(1_000), 0, limits), None);
+        assert_eq!(
+            buffer_limit_violation(0, 0, 0, Some(1_000), 0, 0, limits),
+            None
+        );
     }
 
     #[test]
@@ -4951,6 +5287,7 @@ mod tests {
             postgres_writers_by_pipeline: HashMap::new(),
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
+            backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),
         }
     }

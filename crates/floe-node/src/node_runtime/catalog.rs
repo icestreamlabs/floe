@@ -94,6 +94,8 @@ pub(super) fn replication_pipeline_definition_from_sql(
         buffer_mode,
         CatalogReplicationBufferPolicy::new(
             definition.buffer_policy().max_pending_bytes(),
+            definition.buffer_policy().max_pending_records(),
+            definition.buffer_policy().max_pending_transactions(),
             definition.buffer_policy().max_pending_age_ms(),
         ),
         definition.emit_tombstones(),

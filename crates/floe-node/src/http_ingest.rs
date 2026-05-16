@@ -76,10 +76,12 @@ pub struct CdcReplicationDebugPipelineState {
     pub checkpoint_transaction_id: Option<String>,
     pub target_state: BTreeMap<String, String>,
     pub pending_transactions: usize,
+    pub pending_objects: usize,
     pub pending_records: usize,
     pub pending_bytes: usize,
     pub oldest_pending_age_ms: Option<u64>,
     pub replaying: bool,
+    pub source_backpressure_active: bool,
     pub last_error: Option<String>,
 }
 
@@ -593,10 +595,12 @@ mod tests {
                     "pending".to_string(),
                 )]),
                 pending_transactions: 1,
+                pending_objects: 1,
                 pending_records: 2,
                 pending_bytes: 3,
                 oldest_pending_age_ms: Some(4),
                 replaying: true,
+                source_backpressure_active: true,
                 last_error: Some("kafka unavailable".to_string()),
             }],
         }));

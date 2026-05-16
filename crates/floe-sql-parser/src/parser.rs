@@ -642,6 +642,23 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
         .transpose()?,
         option_any(
             &options,
+            &["buffer.max_pending_records", "buffer_max_pending_records"],
+        )
+        .map(|value| parse_usize_option("buffer.max_pending_records", value))
+        .transpose()?,
+        option_any(
+            &options,
+            &[
+                "buffer.max_pending_transactions",
+                "buffer.max_pending_objects",
+                "buffer_max_pending_transactions",
+                "buffer_max_pending_objects",
+            ],
+        )
+        .map(|value| parse_usize_option("buffer.max_pending_transactions", value))
+        .transpose()?,
+        option_any(
+            &options,
             &["buffer.max_pending_age_ms", "buffer_max_pending_age_ms"],
         )
         .map(|value| parse_u64_option("buffer.max_pending_age_ms", value))

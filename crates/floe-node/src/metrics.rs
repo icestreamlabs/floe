@@ -207,6 +207,15 @@ static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(||
     .expect("register floe_cdc_buffer_pending_transactions")
 });
 
+static CDC_BUFFER_PENDING_OBJECTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_pending_objects",
+        "Number of pending payload objects in each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_pending_objects")
+});
+
 static CDC_BUFFER_PENDING_RECORDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_records",
@@ -232,6 +241,42 @@ static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|
         &["pipeline"]
     )
     .expect("register floe_cdc_buffer_oldest_pending_age_ms")
+});
+
+static CDC_BUFFER_OBJECT_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_object_ops_total",
+        "CDC replication buffer object-store operations",
+        &["pipeline", "operation"]
+    )
+    .expect("register floe_cdc_buffer_object_ops_total")
+});
+
+static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_forced_flushes_total",
+        "Number of explicit CDC replication buffer flushes",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_forced_flushes_total")
+});
+
+static CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_drain_attempts_total",
+        "Number of CDC replication buffer drain attempts before accepting more source data",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_drain_attempts_total")
+});
+
+static CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_source_backpressure_active",
+        "Whether a CDC replication buffer is applying source backpressure because pending limits remain exceeded",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_source_backpressure_active")
 });
 
 static CDC_REPLICATION_REPLAYING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -448,6 +493,9 @@ pub(crate) fn record_cdc_buffer_pending(
     CDC_BUFFER_PENDING_TRANSACTIONS
         .with_label_values(&[pipeline])
         .set(i64::try_from(transactions).unwrap_or(i64::MAX));
+    CDC_BUFFER_PENDING_OBJECTS
+        .with_label_values(&[pipeline])
+        .set(i64::try_from(transactions).unwrap_or(i64::MAX));
     CDC_BUFFER_PENDING_RECORDS
         .with_label_values(&[pipeline])
         .set(i64::try_from(records).unwrap_or(i64::MAX));
@@ -457,6 +505,33 @@ pub(crate) fn record_cdc_buffer_pending(
     CDC_BUFFER_OLDEST_PENDING_AGE_MS
         .with_label_values(&[pipeline])
         .set(oldest_age_ms.map(i64_from_u64).unwrap_or(0));
+}
+
+pub(crate) fn inc_cdc_buffer_object_op(pipeline: &str, operation: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    CDC_BUFFER_OBJECT_OPS_TOTAL
+        .with_label_values(&[pipeline, operation])
+        .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+}
+
+pub(crate) fn inc_cdc_buffer_forced_flush(pipeline: &str) {
+    CDC_BUFFER_FORCED_FLUSHES_TOTAL
+        .with_label_values(&[pipeline])
+        .inc();
+}
+
+pub(crate) fn inc_cdc_buffer_drain_attempt(pipeline: &str) {
+    CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL
+        .with_label_values(&[pipeline])
+        .inc();
+}
+
+pub(crate) fn record_cdc_buffer_source_backpressure_active(pipeline: &str, active: bool) {
+    CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE
+        .with_label_values(&[pipeline])
+        .set(if active { 1 } else { 0 });
 }
 
 pub(crate) fn record_cdc_replication_replaying(pipeline: &str, replaying: bool) {
@@ -495,9 +570,14 @@ pub(crate) fn init() {
     let _ = &*POSTGRES_CDC_TABLE_LAST_APPLIED_LSN;
     let _ = &*POSTGRES_CDC_TABLE_LAG_BYTES;
     let _ = &*CDC_BUFFER_PENDING_TRANSACTIONS;
+    let _ = &*CDC_BUFFER_PENDING_OBJECTS;
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
     let _ = &*CDC_BUFFER_PENDING_BYTES;
     let _ = &*CDC_BUFFER_OLDEST_PENDING_AGE_MS;
+    let _ = &*CDC_BUFFER_OBJECT_OPS_TOTAL;
+    let _ = &*CDC_BUFFER_FORCED_FLUSHES_TOTAL;
+    let _ = &*CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL;
+    let _ = &*CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE;
     let _ = &*CDC_REPLICATION_REPLAYING;
     let _ = &*CDC_REPLICATION_TARGET_ERROR;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
@@ -551,6 +631,13 @@ mod tests {
     fn cdc_replication_metrics_record_replay_and_target_error_state() {
         let pipeline = "pipe_metrics_test";
 
+        record_cdc_buffer_pending(pipeline, 2, 10, 2048, Some(100));
+        inc_cdc_buffer_object_op(pipeline, "create", 2);
+        inc_cdc_buffer_object_op(pipeline, "get", 1);
+        inc_cdc_buffer_object_op(pipeline, "delete", 1);
+        inc_cdc_buffer_forced_flush(pipeline);
+        inc_cdc_buffer_drain_attempt(pipeline);
+        record_cdc_buffer_source_backpressure_active(pipeline, true);
         record_cdc_replication_replaying(pipeline, true);
         record_cdc_replication_target_error(pipeline, true);
 
@@ -565,8 +652,28 @@ mod tests {
         assert!(
             body.contains("floe_cdc_replication_target_error{pipeline=\"pipe_metrics_test\"} 1")
         );
+        assert!(body.contains("floe_cdc_buffer_pending_objects{pipeline=\"pipe_metrics_test\"} 2"));
+        assert!(body.contains(
+            "floe_cdc_buffer_object_ops_total{operation=\"create\",pipeline=\"pipe_metrics_test\"} 2"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_object_ops_total{operation=\"get\",pipeline=\"pipe_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_object_ops_total{operation=\"delete\",pipeline=\"pipe_metrics_test\"} 1"
+        ));
+        assert!(
+            body.contains("floe_cdc_buffer_forced_flushes_total{pipeline=\"pipe_metrics_test\"} 1")
+        );
+        assert!(
+            body.contains("floe_cdc_buffer_drain_attempts_total{pipeline=\"pipe_metrics_test\"} 1")
+        );
+        assert!(body.contains(
+            "floe_cdc_buffer_source_backpressure_active{pipeline=\"pipe_metrics_test\"} 1"
+        ));
 
         record_cdc_replication_replaying(pipeline, false);
         record_cdc_replication_target_error(pipeline, false);
+        record_cdc_buffer_source_backpressure_active(pipeline, false);
     }
 }
