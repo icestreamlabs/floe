@@ -329,6 +329,44 @@ fn parse_source_backed_create_table_statement() {
 }
 
 #[test]
+fn parse_source_backed_create_table_requires_primary_key() {
+    let err = parse_floe_statement(
+        "CREATE TABLE orders (
+            id BIGINT,
+            amount BIGINT NOT NULL
+        ) FROM pg_main TABLE 'public.orders'",
+    )
+    .expect_err("source-backed table without primary key should fail");
+
+    assert!(
+        err.to_string()
+            .contains("table orders must declare exactly one primary key column")
+    );
+}
+
+#[test]
+fn query_table_reference_extraction_handles_joins_subqueries_and_ctes() {
+    let refs = referenced_table_names_in_query(
+        "WITH recent AS (
+            SELECT * FROM public.orders
+        )
+        SELECT *
+        FROM recent r
+        JOIN customers c ON r.customer_id = c.id
+        JOIN (SELECT * FROM public.payments) p ON p.order_id = r.id",
+    )
+    .expect("table refs");
+
+    assert_eq!(
+        refs,
+        ["customers", "public.orders", "public.payments"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect()
+    );
+}
+
+#[test]
 fn parse_create_table_rejects_unsupported_type() {
     let err = parse_floe_statement("CREATE TABLE bids (id UUID PRIMARY KEY)").expect_err("error");
     assert!(

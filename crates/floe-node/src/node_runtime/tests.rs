@@ -1,6 +1,7 @@
 use super::*;
 use crate::node_runtime::orchestration::{
     merge_catalog_source_connectors, postgres_cdc_runtime_plan, source_journal_required_sources,
+    validate_materialized_views_do_not_query_raw_cdc_sources,
 };
 use floe_sql_parser::parse_floe_statement;
 use serde_json::json;
@@ -645,6 +646,67 @@ fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
     );
     assert_eq!(postgres.slot(), "floe_slot");
     assert_eq!(postgres.publication(), Some("floe_pub"));
+}
+
+#[test]
+fn materialized_view_validation_rejects_raw_cdc_source_references() {
+    let source = CatalogSourceDefinition::new(
+        "pg_main",
+        CatalogSourceConnector::PostgresCdc(
+            PostgresCdcSourceDefinition::new(
+                "postgres://postgres:postgres@localhost/postgres",
+                "floe_slot",
+                Some("floe_pub".to_string()),
+                Some(false),
+            )
+            .expect("postgres source"),
+        ),
+    )
+    .expect("source");
+    let views = vec![
+        MaterializedViewDefinition::new("mv_orders", "SELECT * FROM pg_main", false),
+        MaterializedViewDefinition::new("mv_join", "SELECT * FROM orders", false),
+    ];
+
+    let err = validate_materialized_views_do_not_query_raw_cdc_sources(
+        &HashMap::from([(source.name().to_string(), source)]),
+        &views,
+    )
+    .expect_err("raw CDC source should be rejected");
+
+    assert!(err.to_string().contains("reads raw CDC source 'pg_main'"));
+    assert!(
+        err.to_string()
+            .contains("CREATE TABLE ... FROM pg_main TABLE")
+    );
+}
+
+#[test]
+fn materialized_view_validation_accepts_cdc_table_references() {
+    let source = CatalogSourceDefinition::new(
+        "pg_main",
+        CatalogSourceConnector::PostgresCdc(
+            PostgresCdcSourceDefinition::new(
+                "postgres://postgres:postgres@localhost/postgres",
+                "floe_slot",
+                Some("floe_pub".to_string()),
+                Some(false),
+            )
+            .expect("postgres source"),
+        ),
+    )
+    .expect("source");
+    let views = vec![MaterializedViewDefinition::new(
+        "mv_orders",
+        "SELECT * FROM orders",
+        false,
+    )];
+
+    validate_materialized_views_do_not_query_raw_cdc_sources(
+        &HashMap::from([(source.name().to_string(), source)]),
+        &views,
+    )
+    .expect("CDC table reference should be allowed");
 }
 
 #[test]

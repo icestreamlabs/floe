@@ -1355,8 +1355,16 @@ mod tests {
     #[tokio::test]
     async fn recovery_replays_after_durable_append_before_target_delivery() {
         let store = test_store("cdc-buffer-recovery-before-delivery").await;
-        let append = append("0/10", 1000, vec![record(1), record(2)]);
-        let manifest = store.append_transaction(&append).await.expect("append");
+        let first_append = append("0/10", 1000, vec![record(1), record(2)]);
+        let manifest = store
+            .append_transaction(&first_append)
+            .await
+            .expect("append");
+        let later_append = append("0/20", 1001, vec![record(3)]);
+        let later_manifest = store
+            .append_transaction(&later_append)
+            .await
+            .expect("append later transaction");
 
         let recovered = reopened_store(&store);
         let pending = recovered
@@ -1364,18 +1372,34 @@ mod tests {
             .await
             .expect("pending after recovery");
 
-        assert_eq!(pending, vec![manifest.clone()]);
+        assert_eq!(pending, vec![manifest.clone(), later_manifest.clone()]);
+        assert_transaction_ids(&pending, &["tx-0/10", "tx-0/20"]);
         assert_eq!(
             recovered.records(&manifest).await.expect("records"),
             vec![record(1), record(2)]
+        );
+        assert_eq!(
+            recovered
+                .records(&later_manifest)
+                .await
+                .expect("later records"),
+            vec![record(3)]
         );
     }
 
     #[tokio::test]
     async fn recovery_replays_after_target_delivery_before_delivery_checkpoint() {
         let store = test_store("cdc-buffer-recovery-before-checkpoint").await;
-        let append = append("0/10", 1000, vec![record(1)]);
-        let manifest = store.append_transaction(&append).await.expect("append");
+        let first_append = append("0/10", 1000, vec![record(1)]);
+        let manifest = store
+            .append_transaction(&first_append)
+            .await
+            .expect("append");
+        let later_append = append("0/20", 1001, vec![record(2)]);
+        let later_manifest = store
+            .append_transaction(&later_append)
+            .await
+            .expect("append later transaction");
 
         let recovered = reopened_store(&store);
         let pending = recovered
@@ -1383,15 +1407,24 @@ mod tests {
             .await
             .expect("pending after target-only delivery");
 
-        assert_eq!(pending, vec![manifest.clone()]);
+        assert_eq!(pending, vec![manifest.clone(), later_manifest]);
+        assert_transaction_ids(&pending, &["tx-0/10", "tx-0/20"]);
         assert_eq!(recovered.records(&manifest).await.unwrap(), vec![record(1)]);
     }
 
     #[tokio::test]
     async fn recovery_skips_after_delivery_checkpoint() {
         let store = test_store("cdc-buffer-recovery-after-checkpoint").await;
-        let append = append("0/10", 1000, vec![record(1)]);
-        let manifest = store.append_transaction(&append).await.expect("append");
+        let first_append = append("0/10", 1000, vec![record(1)]);
+        let manifest = store
+            .append_transaction(&first_append)
+            .await
+            .expect("append");
+        let later_append = append("0/20", 1001, vec![record(2)]);
+        let later_manifest = store
+            .append_transaction(&later_append)
+            .await
+            .expect("append later transaction");
         let delivered = store
             .mark_delivered(&manifest, 2000)
             .await
@@ -1408,7 +1441,8 @@ mod tests {
             .expect("delivery frontier")
             .expect("frontier");
 
-        assert!(pending.is_empty());
+        assert_eq!(pending, vec![later_manifest.clone()]);
+        assert_transaction_ids(&pending, &["tx-0/20"]);
         assert_eq!(
             delivery.source_position(),
             &CdcSourcePosition::postgres("0/10", None).unwrap()
@@ -1416,6 +1450,10 @@ mod tests {
         assert_eq!(
             recovered.records(&delivered).await.unwrap(),
             vec![record(1)]
+        );
+        assert_eq!(
+            recovered.records(&later_manifest).await.unwrap(),
+            vec![record(2)]
         );
     }
 
@@ -1704,5 +1742,18 @@ mod tests {
             Some(format!(r#"{{"id":{id}}}"#).into_bytes()),
             Some(format!(r#"{{"after":{{"id":{id}}}}}"#).into_bytes()),
         )
+    }
+
+    fn assert_transaction_ids(manifests: &[CdcBufferedTransactionManifest], expected: &[&str]) {
+        let actual = manifests
+            .iter()
+            .map(|manifest| {
+                manifest
+                    .transaction_id()
+                    .map(CdcTransactionId::as_str)
+                    .unwrap_or("<none>")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

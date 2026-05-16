@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    ColumnOption, DataType, Expr, ObjectName, OrderByExpr, Statement, TableConstraint,
+    ColumnOption, DataType, Expr, ObjectName, OrderByExpr, Query, Select, SetExpr, Statement,
+    TableConstraint, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -175,6 +178,128 @@ pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> 
         }
         _ => Err(anyhow!("expected CREATE MATERIALIZED VIEW statement")),
     }
+}
+
+pub fn referenced_table_names_in_query(query_sql: &str) -> Result<BTreeSet<String>> {
+    let normalized = normalize_sql(query_sql)?;
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, normalized)
+        .map_err(|err| anyhow!("failed to parse query table references: {err}"))?;
+    if statements.len() != 1 {
+        return Err(anyhow!("query must contain exactly one statement"));
+    }
+    let Statement::Query(query) = statements.remove(0) else {
+        return Err(anyhow!("expected SELECT query"));
+    };
+
+    let mut references = BTreeSet::new();
+    collect_query_table_references(&query, &mut references)?;
+    Ok(references)
+}
+
+fn collect_query_table_references(query: &Query, references: &mut BTreeSet<String>) -> Result<()> {
+    let mut cte_names = BTreeSet::new();
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            collect_query_table_references(&cte.query, references)?;
+            cte_names.insert(cte.alias.name.value.clone());
+        }
+    }
+    collect_set_expr_table_references(&query.body, references, &cte_names)
+}
+
+fn collect_set_expr_table_references(
+    expr: &SetExpr,
+    references: &mut BTreeSet<String>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match expr {
+        SetExpr::Select(select) => collect_select_table_references(select, references, cte_names),
+        SetExpr::Query(query) => collect_query_table_references(query, references),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_table_references(left, references, cte_names)?;
+            collect_set_expr_table_references(right, references, cte_names)
+        }
+        SetExpr::Table(table) => {
+            let Some(table_name) = table.table_name.as_ref() else {
+                return Ok(());
+            };
+            let reference = table
+                .schema_name
+                .as_ref()
+                .map(|schema| format!("{schema}.{table_name}"))
+                .unwrap_or_else(|| table_name.clone());
+            if !cte_names.contains(&reference) {
+                references.insert(reference);
+            }
+            Ok(())
+        }
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_) => Ok(()),
+    }
+}
+
+fn collect_select_table_references(
+    select: &Select,
+    references: &mut BTreeSet<String>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    for table in &select.from {
+        collect_table_with_joins_references(table, references, cte_names)?;
+    }
+    Ok(())
+}
+
+fn collect_table_with_joins_references(
+    table: &TableWithJoins,
+    references: &mut BTreeSet<String>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    collect_table_factor_references(&table.relation, references, cte_names)?;
+    for join in &table.joins {
+        collect_table_factor_references(&join.relation, references, cte_names)?;
+    }
+    Ok(())
+}
+
+fn collect_table_factor_references(
+    table: &TableFactor,
+    references: &mut BTreeSet<String>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match table {
+        TableFactor::Table { name, args, .. } => {
+            if args.is_none() {
+                let reference = object_name_to_string(name)?;
+                if !cte_names.contains(&reference) {
+                    references.insert(reference);
+                }
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_query_table_references(subquery, references)?;
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_with_joins_references(table_with_joins, references, cte_names)?;
+        }
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            collect_table_factor_references(table, references, cte_names)?;
+        }
+        TableFactor::TableFunction { .. }
+        | TableFactor::Function { .. }
+        | TableFactor::UNNEST { .. }
+        | TableFactor::JsonTable { .. }
+        | TableFactor::OpenJsonTable { .. }
+        | TableFactor::MatchRecognize { .. }
+        | TableFactor::XmlTable { .. }
+        | TableFactor::SemanticView { .. } => {}
+    }
+    Ok(())
 }
 
 pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {

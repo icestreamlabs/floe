@@ -13,6 +13,7 @@ use tokio_postgres::types::Type;
 
 const DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
 const DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS: usize = 1;
+const DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: usize = 1;
 static POSTGRES_SNAPSHOT_ROWS_PER_BATCH: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH")
         .ok()
@@ -27,6 +28,13 @@ static POSTGRES_SNAPSHOT_MAX_WORKERS: LazyLock<usize> = LazyLock::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS)
 });
+static POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS)
+});
 static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("FLOE_CDC_PERF_LOG")
         .ok()
@@ -37,6 +45,16 @@ struct PostgresSnapshot {
     lsn: PostgresLsn,
     transaction: Option<TransactionBatch>,
     row_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotTableChunk {
+    Full,
+    Int64Range {
+        column: String,
+        lower_inclusive: i64,
+        upper_exclusive: Option<i64>,
+    },
 }
 
 pub(super) async fn ensure_postgres_cdc_publication_and_slot(
@@ -262,7 +280,7 @@ async fn load_postgres_initial_snapshot_from_client(
 ) -> Result<PostgresSnapshot> {
     let sorted_schemas = sorted_snapshot_schemas(schemas);
     let max_workers = *POSTGRES_SNAPSHOT_MAX_WORKERS;
-    if max_workers > 1 && sorted_schemas.len() > 1 {
+    if max_workers > 1 && (sorted_schemas.len() > 1 || *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS > 1) {
         return load_parallel_postgres_initial_snapshot_from_client(
             connection_string,
             client,
@@ -359,9 +377,17 @@ async fn load_parallel_postgres_initial_snapshot_from_client(
         .context("export Postgres CDC snapshot for parallel table reads")?;
     let exported_snapshot: String = exported_snapshot_row.get(0);
 
-    let schemas = sorted_schemas.into_iter().cloned().collect::<Vec<_>>();
-    let mut table_snapshots =
-        futures::stream::iter(schemas.into_iter().enumerate().map(|(idx, schema)| {
+    let mut snapshot_tasks = Vec::new();
+    for (table_idx, schema) in sorted_schemas.iter().enumerate() {
+        let chunks = snapshot_table_chunks(&transaction, schema).await?;
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            snapshot_tasks.push((table_idx, chunk_idx, (*schema).clone(), chunk));
+        }
+    }
+    let task_count = snapshot_tasks.len();
+
+    let mut table_snapshots = futures::stream::iter(snapshot_tasks.into_iter().map(
+        |(table_idx, chunk_idx, schema, chunk)| {
             let connection_string = connection_string.to_string();
             let exported_snapshot = exported_snapshot.clone();
             async move {
@@ -369,15 +395,17 @@ async fn load_parallel_postgres_initial_snapshot_from_client(
                     &connection_string,
                     &exported_snapshot,
                     &schema,
+                    &chunk,
                 )
                 .await
-                .map(|snapshot| (idx, snapshot))
+                .map(|snapshot| (table_idx, chunk_idx, snapshot))
             }
-        }))
-        .buffer_unordered(max_workers)
-        .try_collect::<Vec<_>>()
-        .await?;
-    table_snapshots.sort_by_key(|(idx, _)| *idx);
+        },
+    ))
+    .buffer_unordered(max_workers)
+    .try_collect::<Vec<_>>()
+    .await?;
+    table_snapshots.sort_by_key(|(table_idx, chunk_idx, _)| (*table_idx, *chunk_idx));
 
     transaction
         .commit()
@@ -386,8 +414,8 @@ async fn load_parallel_postgres_initial_snapshot_from_client(
 
     let mut change_batches = Vec::new();
     let mut row_count = 0_usize;
-    let table_count = table_snapshots.len();
-    for (_, table_snapshot) in table_snapshots {
+    let table_count = sorted_schemas.len();
+    for (_, _, table_snapshot) in table_snapshots {
         row_count = row_count.saturating_add(table_snapshot.row_count);
         change_batches.extend(table_snapshot.change_batches);
     }
@@ -396,9 +424,10 @@ async fn load_parallel_postgres_initial_snapshot_from_client(
     tracing::info!(
         source = %source_id.as_str(),
         tables = table_count,
+        tasks = task_count,
         max_workers,
         rows = row_count,
-        "loaded initial Postgres CDC snapshot with parallel table workers"
+        "loaded initial Postgres CDC snapshot with parallel workers"
     );
 
     Ok(PostgresSnapshot {
@@ -855,11 +884,120 @@ struct SnapshotTableChangeBatches {
     row_count: usize,
 }
 
+async fn snapshot_table_chunks(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &CdcTableSchema,
+) -> Result<Vec<SnapshotTableChunk>> {
+    let requested_chunks = *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS;
+    if requested_chunks <= 1 {
+        return Ok(vec![SnapshotTableChunk::Full]);
+    }
+
+    let Some(key_column) = single_int64_primary_key_column(schema) else {
+        tracing::debug!(
+            table = %schema.table_id().as_str(),
+            upstream_schema = %schema.upstream_table().schema(),
+            upstream_table = %schema.upstream_table().table(),
+            requested_chunks,
+            "Postgres CDC snapshot intra-table chunking skipped because the primary key is not a single Int64 column"
+        );
+        return Ok(vec![SnapshotTableChunk::Full]);
+    };
+
+    let Some((min_key, max_key)) =
+        snapshot_int64_primary_key_bounds(transaction, schema, key_column.name()).await?
+    else {
+        return Ok(vec![SnapshotTableChunk::Full]);
+    };
+
+    Ok(int64_snapshot_range_chunks(
+        key_column.name(),
+        min_key,
+        max_key,
+        requested_chunks,
+    ))
+}
+
+async fn snapshot_int64_primary_key_bounds(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &CdcTableSchema,
+    key_column: &str,
+) -> Result<Option<(i64, i64)>> {
+    let quoted_key = quote_pg_ident(key_column);
+    let query = format!(
+        "SELECT min({quoted_key})::bigint, max({quoted_key})::bigint FROM {}",
+        qualified_table_name(schema.upstream_table())
+    );
+    let row = transaction.query_one(&query, &[]).await.with_context(|| {
+        format!(
+            "discover Postgres CDC snapshot key bounds for '{}.{}'",
+            schema.upstream_table().schema(),
+            schema.upstream_table().table()
+        )
+    })?;
+    let min_key: Option<i64> = row.get(0);
+    let max_key: Option<i64> = row.get(1);
+    Ok(min_key.zip(max_key))
+}
+
+fn single_int64_primary_key_column(schema: &CdcTableSchema) -> Option<&CdcColumn> {
+    let [primary_key_column] = schema.primary_key().columns() else {
+        return None;
+    };
+    let column_idx = schema.column_index(primary_key_column)?;
+    let column = &schema.columns()[column_idx];
+    (column.data_type() == &ColumnType::Int64).then_some(column)
+}
+
+fn int64_snapshot_range_chunks(
+    column: &str,
+    min_key: i64,
+    max_key: i64,
+    requested_chunks: usize,
+) -> Vec<SnapshotTableChunk> {
+    if requested_chunks <= 1 || min_key >= max_key {
+        return vec![SnapshotTableChunk::Full];
+    }
+
+    let value_count = i128::from(max_key) - i128::from(min_key) + 1;
+    let chunk_count = (requested_chunks as i128).min(value_count).max(1);
+    if chunk_count <= 1 {
+        return vec![SnapshotTableChunk::Full];
+    }
+
+    let width = (value_count + chunk_count - 1) / chunk_count;
+    let mut chunks = Vec::with_capacity(usize::try_from(chunk_count).unwrap_or(usize::MAX));
+    for idx in 0..chunk_count {
+        let lower = i128::from(min_key) + idx * width;
+        if lower > i128::from(max_key) {
+            break;
+        }
+        let next = lower + width;
+        let upper_exclusive = (next <= i128::from(max_key))
+            .then(|| i64::try_from(next).expect("chunk upper bound remains in i64 range"));
+        chunks.push(SnapshotTableChunk::Int64Range {
+            column: column.to_string(),
+            lower_inclusive: i64::try_from(lower).expect("chunk lower bound remains in i64 range"),
+            upper_exclusive,
+        });
+    }
+    chunks
+}
+
 async fn snapshot_table_change_batches(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
 ) -> Result<SnapshotTableChangeBatches> {
-    let query = snapshot_table_query(schema);
+    let chunk = SnapshotTableChunk::Full;
+    snapshot_table_change_batches_for_chunk(transaction, schema, &chunk).await
+}
+
+async fn snapshot_table_change_batches_for_chunk(
+    transaction: &tokio_postgres::Transaction<'_>,
+    schema: &CdcTableSchema,
+    chunk: &SnapshotTableChunk,
+) -> Result<SnapshotTableChangeBatches> {
+    let query = snapshot_table_query(schema, chunk);
     let started_at = Instant::now();
     let params = std::iter::empty::<&(dyn ToSql + Sync)>();
     let stream = transaction
@@ -900,6 +1038,7 @@ async fn snapshot_table_change_batches(
             table = %schema.table_id().as_str(),
             upstream_schema = %schema.upstream_table().schema(),
             upstream_table = %schema.upstream_table().table(),
+            chunk = ?chunk,
             rows = row_count,
             batches = change_batches.len(),
             rows_per_batch,
@@ -919,6 +1058,7 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
     connection_string: &str,
     exported_snapshot: &str,
     schema: &CdcTableSchema,
+    chunk: &SnapshotTableChunk,
 ) -> Result<SnapshotTableChangeBatches> {
     let (mut client, connection) =
         tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
@@ -951,7 +1091,7 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
             ))
             .await
             .context("bind Postgres snapshot worker to exported snapshot")?;
-        let snapshot = snapshot_table_change_batches(&transaction, schema).await;
+        let snapshot = snapshot_table_change_batches_for_chunk(&transaction, schema, chunk).await;
         transaction
             .commit()
             .await
@@ -965,17 +1105,31 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
     result
 }
 
-fn snapshot_table_query(schema: &CdcTableSchema) -> String {
+fn snapshot_table_query(schema: &CdcTableSchema, chunk: &SnapshotTableChunk) -> String {
     let select_list = schema
         .columns()
         .iter()
         .map(snapshot_select_expr)
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let base = format!(
         "SELECT {select_list} FROM {}",
         qualified_table_name(schema.upstream_table())
-    )
+    );
+    match chunk {
+        SnapshotTableChunk::Full => base,
+        SnapshotTableChunk::Int64Range {
+            column,
+            lower_inclusive,
+            upper_exclusive,
+        } => {
+            let quoted_column = quote_pg_ident(column);
+            let upper = upper_exclusive
+                .map(|upper| format!(" AND {quoted_column} < {upper}"))
+                .unwrap_or_default();
+            format!("{base} WHERE {quoted_column} >= {lower_inclusive}{upper}")
+        }
+    }
 }
 
 fn snapshot_select_expr(column: &CdcColumn) -> String {
@@ -1306,7 +1460,9 @@ fn quote_pg_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_cdc_core::{CdcColumn, CdcPrimaryKey, UpstreamTableRef};
     use floe_core::RowValue;
+    use floe_core::catalog::ColumnType;
     use std::sync::Arc;
 
     #[test]
@@ -1334,6 +1490,73 @@ mod tests {
         assert!(parse_decimal_text_to_i128("", 2).is_err());
         assert!(parse_decimal_text_to_i128("abc", 2).is_err());
         assert!(parse_decimal_text_to_i128("1.0", -1).is_err());
+    }
+
+    #[test]
+    fn int64_primary_key_chunks_cover_range_without_overlap() {
+        let chunks = int64_snapshot_range_chunks("id", 1, 10, 3);
+
+        assert_eq!(
+            chunks,
+            vec![
+                SnapshotTableChunk::Int64Range {
+                    column: "id".to_string(),
+                    lower_inclusive: 1,
+                    upper_exclusive: Some(5),
+                },
+                SnapshotTableChunk::Int64Range {
+                    column: "id".to_string(),
+                    lower_inclusive: 5,
+                    upper_exclusive: Some(9),
+                },
+                SnapshotTableChunk::Int64Range {
+                    column: "id".to_string(),
+                    lower_inclusive: 9,
+                    upper_exclusive: None,
+                },
+            ]
+        );
+        assert_eq!(
+            snapshot_table_query(&snapshot_test_schema(), &chunks[0]),
+            r#"SELECT "id", "status" FROM "public"."orders" WHERE "id" >= 1 AND "id" < 5"#
+        );
+        assert_eq!(
+            snapshot_table_query(&snapshot_test_schema(), &chunks[2]),
+            r#"SELECT "id", "status" FROM "public"."orders" WHERE "id" >= 9"#
+        );
+    }
+
+    #[test]
+    fn snapshot_chunking_requires_single_int64_primary_key() {
+        let int64_schema = snapshot_test_schema();
+        assert_eq!(
+            single_int64_primary_key_column(&int64_schema).map(CdcColumn::name),
+            Some("id")
+        );
+
+        let text_pk_schema = CdcTableSchema::new(
+            CdcTableId::new("orders_by_status").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).expect("id"),
+                CdcColumn::new("status", ColumnType::Utf8, false).expect("status"),
+            ],
+            CdcPrimaryKey::new(["status"]).expect("primary key"),
+        )
+        .expect("schema");
+        assert!(single_int64_primary_key_column(&text_pk_schema).is_none());
+
+        let composite_schema = CdcTableSchema::new(
+            CdcTableId::new("orders_composite").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).expect("id"),
+                CdcColumn::new("status", ColumnType::Utf8, false).expect("status"),
+            ],
+            CdcPrimaryKey::new(["id", "status"]).expect("primary key"),
+        )
+        .expect("schema");
+        assert!(single_int64_primary_key_column(&composite_schema).is_none());
     }
 
     #[tokio::test]
@@ -1412,5 +1635,22 @@ mod tests {
                 .expect("load checkpoint"),
             None
         );
+        assert!(
+            receiver.try_recv().is_err(),
+            "cancelled snapshot finalization should enqueue at most one retryable snapshot transaction"
+        );
+    }
+
+    fn snapshot_test_schema() -> CdcTableSchema {
+        CdcTableSchema::new(
+            CdcTableId::new("orders").expect("table id"),
+            UpstreamTableRef::new("public", "orders").expect("upstream"),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).expect("id"),
+                CdcColumn::new("status", ColumnType::Utf8, true).expect("status"),
+            ],
+            CdcPrimaryKey::new(["id"]).expect("primary key"),
+        )
+        .expect("schema")
     }
 }

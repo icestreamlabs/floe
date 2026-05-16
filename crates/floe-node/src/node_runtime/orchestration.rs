@@ -341,6 +341,51 @@ fn validate_replication_pipelines(
     Ok(())
 }
 
+pub(super) fn validate_materialized_views_do_not_query_raw_cdc_sources(
+    catalog_sources: &HashMap<String, CatalogSourceDefinition>,
+    materialized_views: &[MaterializedViewDefinition],
+) -> anyhow::Result<()> {
+    let raw_cdc_sources = catalog_sources
+        .values()
+        .map(|source| match source.connector() {
+            CatalogSourceConnector::PostgresCdc(_) => source.name().to_string(),
+        })
+        .collect::<BTreeSet<_>>();
+    if raw_cdc_sources.is_empty() {
+        return Ok(());
+    }
+
+    for view in materialized_views {
+        let references = floe_sql_parser::referenced_table_names_in_query(view.query())
+            .with_context(|| {
+                format!(
+                    "inspect source references for materialized view '{}'",
+                    view.name()
+                )
+            })?;
+        if let Some(source) = references.iter().find_map(|reference| {
+            raw_cdc_sources
+                .iter()
+                .find(|source| raw_cdc_reference_matches(reference, source))
+        }) {
+            return Err(anyhow!(
+                "materialized view '{}' reads raw CDC source '{}'; create a CDC table with CREATE TABLE ... FROM {} TABLE ... or use CREATE REPLICATION PIPELINE for passthrough",
+                view.name(),
+                source,
+                source
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn raw_cdc_reference_matches(reference: &str, source: &str) -> bool {
+    reference == source
+        || reference
+            .strip_prefix(source)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 pub(super) fn merge_catalog_source_connectors(
     connector_specs: &mut Vec<config::ConnectorSpec>,
     catalog_sources: &HashMap<String, CatalogSourceDefinition>,
@@ -863,6 +908,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut materialized_views: Vec<MaterializedViewDefinition> =
         materialized_view_map.into_values().collect();
     materialized_views.sort_by(|a, b| a.name().cmp(b.name()));
+    validate_materialized_views_do_not_query_raw_cdc_sources(
+        &catalog_sources,
+        &materialized_views,
+    )?;
     log_operator_hints(
         &connector_specs,
         &available_sources,
