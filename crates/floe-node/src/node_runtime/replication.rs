@@ -756,6 +756,31 @@ impl ReplicationPipelineRuntime {
             return Ok(written);
         }
 
+        if let Some(storage) = storage
+            && plans
+                .iter()
+                .any(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
+        {
+            let written = self
+                .run_transaction_for_plans(plans, schemas, transaction, Some(storage), false)
+                .await?;
+            let flush_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+            storage
+                .cdc_buffer_store()
+                .flush()
+                .await
+                .context("flush replication buffer appends")?;
+            if let Some(started_at) = flush_started_at {
+                tracing::info!(
+                    source = %source_id.as_str(),
+                    records = written,
+                    flush_ms = started_at.elapsed().as_millis() as u64,
+                    "postgres cdc replication buffer flush completed"
+                );
+            }
+            return Ok(written);
+        }
+
         self.run_transaction_for_plans(plans, schemas, transaction, storage, true)
             .await
     }
