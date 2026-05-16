@@ -50,6 +50,11 @@ pub(super) async fn postgres_cdc_runtime_plan(
     let mut schemas = HashMap::new();
     let mut materialized_table_ids = HashSet::new();
     let mut table_id_by_upstream = HashMap::<String, CdcTableId>::new();
+    let pipeline_upstreams = replication_pipelines
+        .values()
+        .filter(|pipeline| pipeline.source_name() == connector_name)
+        .map(|pipeline| pipeline.upstream_table().to_string())
+        .collect::<HashSet<_>>();
 
     for binding in source_tables
         .values()
@@ -81,6 +86,14 @@ pub(super) async fn postgres_cdc_runtime_plan(
 
     for include_table in include_tables {
         if table_id_by_upstream.contains_key(include_table) {
+            continue;
+        }
+        if pipeline_upstreams.contains(include_table) {
+            tracing::debug!(
+                connector = %connector_name,
+                table = %include_table,
+                "Postgres CDC table is included for a replication pipeline; skipping hidden CDC table materialization"
+            );
             continue;
         }
         let source_name = source_name_for_postgres_include_table(include_table, registry);
@@ -117,6 +130,12 @@ pub(super) async fn postgres_cdc_runtime_plan(
     {
         let table_id = if let Some(table_id) = table_id_by_upstream.get(pipeline.upstream_table()) {
             table_id.clone()
+        } else if let Some((table_id, schema)) =
+            replication_pipeline_schema_from_registry(pipeline.upstream_table(), registry)?
+        {
+            table_id_by_upstream.insert(pipeline.upstream_table().to_string(), table_id.clone());
+            schemas.insert(table_id.clone(), schema);
+            table_id
         } else {
             let table_id =
                 replication_pipeline_table_id(connector_name, pipeline.upstream_table())?;
@@ -161,6 +180,29 @@ pub(super) async fn postgres_cdc_runtime_plan(
         materialized_table_ids,
         replication_pipelines: pipeline_plans,
     }))
+}
+
+fn replication_pipeline_schema_from_registry(
+    upstream_table: &str,
+    registry: &SourceRegistry,
+) -> anyhow::Result<Option<(CdcTableId, CdcTableSchema)>> {
+    let source_name = source_name_for_postgres_include_table(upstream_table, registry);
+    let Some(definition) = registry.get(&source_name) else {
+        return Ok(None);
+    };
+    if !source_definition_has_primary_key(definition) {
+        tracing::warn!(
+            source = %definition.name(),
+            table = %upstream_table,
+            "Postgres CDC replication pipeline source definition has no primary key; falling back to live schema discovery"
+        );
+        return Ok(None);
+    }
+    let schema = cdc_table_schema_from_source_definition(
+        definition,
+        upstream_table_ref_for_postgres_include_table(upstream_table)?,
+    )?;
+    Ok(Some((schema.table_id().clone(), schema)))
 }
 
 fn replication_pipeline_runtime_plan_from_catalog(

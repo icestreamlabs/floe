@@ -962,6 +962,63 @@ async fn postgres_cdc_runtime_plan_accepts_postgres_replication_target() {
 }
 
 #[tokio::test]
+async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
+    let statement = parse_floe_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, note TEXT)",
+    )
+    .expect("parse create table");
+    let FloeStatement::CreateTable(definition) = statement else {
+        panic!("expected create table statement");
+    };
+    let table = table_definition_from_sql(&definition).expect("table definition");
+    let source = source_definition_from_table(&table).expect("source definition");
+    let mut registry = SourceRegistry::new();
+    registry.register(source);
+    let include_tables = vec!["public.orders".to_string()];
+    let pipeline = CatalogReplicationPipelineDefinition::new(
+        "pg_orders_to_kafka",
+        "pg_main",
+        "public.orders",
+        CatalogReplicationPipelineTarget::Kafka {
+            brokers: "localhost:9092".to_string(),
+            topic: "orders_cdc".to_string(),
+        },
+        CatalogReplicationPipelineFormat::DebeziumJson,
+        CatalogReplicationBufferMode::Durable,
+        CatalogReplicationBufferPolicy::default(),
+        false,
+        false,
+    )
+    .expect("pipeline");
+
+    let plan = postgres_cdc_runtime_plan(
+        "pg_main",
+        "postgres://postgres:postgres@localhost/postgres",
+        Some(&include_tables),
+        &registry,
+        &HashMap::new(),
+        &HashMap::from([(pipeline.name().to_string(), pipeline)]),
+    )
+    .await
+    .expect("runtime plan")
+    .expect("native runtime plan");
+
+    assert!(plan.materialized_table_ids.is_empty());
+    assert_eq!(plan.replication_pipelines.len(), 1);
+    let pipeline_plan = &plan.replication_pipelines[0];
+    assert_eq!(pipeline_plan.table_id.as_str(), "orders");
+    assert_eq!(
+        pipeline_plan.format,
+        ReplicationPipelineRuntimeFormat::DebeziumJson
+    );
+    assert!(matches!(
+        pipeline_plan.target,
+        ReplicationPipelineRuntimeTarget::Kafka { .. }
+    ));
+    assert!(plan.schemas.contains_key(&pipeline_plan.table_id));
+}
+
+#[tokio::test]
 async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
     let source = SourceDefinition::new(
         "orders",
