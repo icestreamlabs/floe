@@ -10,8 +10,18 @@ ROWS_LIST="${ROWS_LIST:-1000 100000 1000000}"
 DATASET="${DATASET:-synthetic-orders}"
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
 PIPELINE_FORMATS="${PIPELINE_FORMATS:-floe-json debezium-json arrow-ipc}"
-if [[ -z "${BENCH_MODES+x}" && "${DATASET}" == "tpch-all" ]]; then
-  BENCH_MODES="snapshot"
+if [[ -z "${BENCH_MODES+x}" ]]; then
+  case "${DATASET}" in
+    tpch-all)
+      BENCH_MODES="snapshot"
+      ;;
+    tpch-top2)
+      BENCH_MODES="snapshot live_insert"
+      ;;
+    *)
+      BENCH_MODES="snapshot live_insert snapshot_live_update"
+      ;;
+  esac
 else
   BENCH_MODES="${BENCH_MODES:-snapshot live_insert snapshot_live_update}"
 fi

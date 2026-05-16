@@ -443,6 +443,69 @@ SQL
   copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
 }
 
+create_tpch_top2_tables() {
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP PUBLICATION IF EXISTS ${PUBLICATION};
+DROP TABLE IF EXISTS public.lineitem;
+DROP TABLE IF EXISTS public.orders;
+
+CREATE TABLE public.orders (
+  o_orderkey BIGINT PRIMARY KEY,
+  o_custkey BIGINT NOT NULL,
+  o_orderstatus CHAR(1) NOT NULL,
+  o_totalprice NUMERIC(15,2) NOT NULL,
+  o_orderdate DATE NOT NULL,
+  o_orderpriority CHAR(15) NOT NULL,
+  o_clerk CHAR(15) NOT NULL,
+  o_shippriority BIGINT NOT NULL,
+  o_comment VARCHAR(79) NOT NULL
+);
+
+CREATE TABLE public.lineitem (
+  l_orderkey BIGINT NOT NULL,
+  l_partkey BIGINT NOT NULL,
+  l_suppkey BIGINT NOT NULL,
+  l_linenumber BIGINT NOT NULL,
+  l_quantity NUMERIC(15,2) NOT NULL,
+  l_extendedprice NUMERIC(15,2) NOT NULL,
+  l_discount NUMERIC(15,2) NOT NULL,
+  l_tax NUMERIC(15,2) NOT NULL,
+  l_returnflag CHAR(1) NOT NULL,
+  l_linestatus CHAR(1) NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_commitdate DATE NOT NULL,
+  l_receiptdate DATE NOT NULL,
+  l_shipinstruct CHAR(25) NOT NULL,
+  l_shipmode CHAR(10) NOT NULL,
+  l_comment VARCHAR(44) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+);
+SQL
+}
+
+load_tpch_top2_dataset() {
+  if [[ "${BENCH_MODE}" == "snapshot_live_update" ]]; then
+    echo "DATASET=tpch-top2 currently supports BENCH_MODE=snapshot or live_insert" >&2
+    exit 1
+  fi
+
+  create_tpch_top2_tables
+  if [[ "${BENCH_MODE}" == "live_insert" ]]; then
+    return
+  fi
+
+  require_cmd "${TPCHGEN_BIN}"
+  prepare_tpch_data_dir orders lineitem
+  "${TPCHGEN_BIN}" \
+    --scale-factor "${TPCH_SCALE_FACTOR}" \
+    --tables orders,lineitem \
+    --format tbl \
+    --output-dir "${TPCH_DATA_DIR}" >/dev/null
+
+  copy_pipe_delimited_file public.orders "${TPCH_DATA_DIR}/orders.tbl"
+  copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
+}
+
 load_tpch_all_dataset() {
   if [[ "${BENCH_MODE}" != "snapshot" ]]; then
     echo "DATASET=tpch-all currently supports BENCH_MODE=snapshot only" >&2
@@ -564,6 +627,15 @@ SQL
   copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
 }
 
+tpch_top2_chunk_orders() {
+  local chunk_rows="$1"
+  local orders=$(((chunk_rows + 4) / 5))
+  if (( orders > chunk_rows )); then
+    orders="${chunk_rows}"
+  fi
+  echo "${orders}"
+}
+
 write_live_inserts() {
   local total="$1"
   local chunk="${LIVE_WRITE_CHUNK_ROWS}"
@@ -588,6 +660,74 @@ FROM generate_series(${start}, ${end}) AS gs;
 SQL
     start=$((end + 1))
     if (( start <= total )); then
+      sleep_live_write_pause
+    fi
+  done
+}
+
+write_live_tpch_top2_inserts() {
+  local total="$1"
+  local chunk="${LIVE_WRITE_CHUNK_ROWS}"
+  if (( chunk <= 0 || chunk > total )); then
+    chunk="${total}"
+  fi
+  local remaining="${total}"
+  local next_order_key=1
+  local next_lineitem_idx=1
+  while (( remaining > 0 )); do
+    local chunk_rows="${chunk}"
+    if (( chunk_rows > remaining )); then
+      chunk_rows="${remaining}"
+    fi
+    local order_rows
+    order_rows="$(tpch_top2_chunk_orders "${chunk_rows}")"
+    local lineitem_rows=$((chunk_rows - order_rows))
+    local order_start="${next_order_key}"
+    local order_end=$((order_start + order_rows - 1))
+    local lineitem_start="${next_lineitem_idx}"
+    local lineitem_end=$((lineitem_start + lineitem_rows - 1))
+
+    docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+BEGIN;
+INSERT INTO public.orders
+SELECT
+  gs::BIGINT AS o_orderkey,
+  ((gs % 150000) + 1)::BIGINT AS o_custkey,
+  'O'::CHAR(1) AS o_orderstatus,
+  ((100000 + (gs % 100000))::NUMERIC / 100)::NUMERIC(15,2) AS o_totalprice,
+  (DATE '1992-01-01' + ((gs % 2500)::INT))::DATE AS o_orderdate,
+  '5-LOW'::CHAR(15) AS o_orderpriority,
+  ('Clerk#' || LPAD((gs % 1000)::TEXT, 9, '0'))::CHAR(15) AS o_clerk,
+  0::BIGINT AS o_shippriority,
+  ('live order ' || gs)::VARCHAR(79) AS o_comment
+FROM generate_series(${order_start}, ${order_end}) AS gs;
+
+INSERT INTO public.lineitem
+SELECT
+  (((gs - 1) / 4) + 1)::BIGINT AS l_orderkey,
+  ((gs % 200000) + 1)::BIGINT AS l_partkey,
+  ((gs % 10000) + 1)::BIGINT AS l_suppkey,
+  (((gs - 1) % 4) + 1)::BIGINT AS l_linenumber,
+  ((1 + (gs % 50))::NUMERIC)::NUMERIC(15,2) AS l_quantity,
+  ((10000 + (gs % 100000))::NUMERIC / 100)::NUMERIC(15,2) AS l_extendedprice,
+  ((gs % 10)::NUMERIC / 100)::NUMERIC(15,2) AS l_discount,
+  ((gs % 8)::NUMERIC / 100)::NUMERIC(15,2) AS l_tax,
+  'N'::CHAR(1) AS l_returnflag,
+  'O'::CHAR(1) AS l_linestatus,
+  (DATE '1992-01-01' + ((gs % 2500)::INT))::DATE AS l_shipdate,
+  (DATE '1992-01-02' + ((gs % 2500)::INT))::DATE AS l_commitdate,
+  (DATE '1992-01-03' + ((gs % 2500)::INT))::DATE AS l_receiptdate,
+  'DELIVER IN PERSON'::CHAR(25) AS l_shipinstruct,
+  'AIR'::CHAR(10) AS l_shipmode,
+  ('live lineitem ' || gs)::VARCHAR(44) AS l_comment
+FROM generate_series(${lineitem_start}, ${lineitem_end}) AS gs;
+COMMIT;
+SQL
+
+    next_order_key=$((order_end + 1))
+    next_lineitem_idx=$((lineitem_end + 1))
+    remaining=$((remaining - chunk_rows))
+    if (( remaining > 0 )); then
       sleep_live_write_pause
     fi
   done
@@ -653,6 +793,31 @@ expected_insert_messages_for_chunks() {
   if (( remainder > 0 )); then
     total=$((total + $(expected_insert_messages "${remainder}")))
   fi
+  echo "${total}"
+}
+
+expected_tpch_top2_live_insert_messages() {
+  local rows="$1"
+  local chunk="${2}"
+  if (( chunk <= 0 || chunk > rows )); then
+    chunk="${rows}"
+  fi
+  local remaining="${rows}"
+  local total=0
+  while (( remaining > 0 )); do
+    local chunk_rows="${chunk}"
+    if (( chunk_rows > remaining )); then
+      chunk_rows="${remaining}"
+    fi
+    local order_rows
+    order_rows="$(tpch_top2_chunk_orders "${chunk_rows}")"
+    local lineitem_rows=$((chunk_rows - order_rows))
+    total=$((total + $(expected_insert_messages "${order_rows}")))
+    if (( lineitem_rows > 0 )); then
+      total=$((total + $(expected_insert_messages "${lineitem_rows}")))
+    fi
+    remaining=$((remaining - chunk_rows))
+  done
   echo "${total}"
 }
 
@@ -755,6 +920,17 @@ case "${DATASET}" in
     pipeline_names=("pg_lineitem_to_kafka")
     topics=("${TOPIC}")
     ;;
+  tpch-top2)
+    source_table="orders,lineitem"
+    upstream_table="public.orders,public.lineitem"
+    pipeline_name="pg_orders_to_kafka,pg_lineitem_to_kafka"
+    if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
+      TOPIC="floe_cdc_bench_tpch_top2"
+    fi
+    upstream_tables=(public.orders public.lineitem)
+    pipeline_names=(pg_orders_to_kafka pg_lineitem_to_kafka)
+    topics=("${TOPIC}_orders" "${TOPIC}_lineitem")
+    ;;
   tpch-all)
     source_table="region,nation,supplier,customer,part,partsupp,orders,lineitem"
     upstream_table="public.region,public.nation,public.supplier,public.customer,public.part,public.partsupp,public.orders,public.lineitem"
@@ -767,7 +943,7 @@ case "${DATASET}" in
     topics=("${TOPIC}_region" "${TOPIC}_nation" "${TOPIC}_supplier" "${TOPIC}_customer" "${TOPIC}_part" "${TOPIC}_partsupp" "${TOPIC}_orders" "${TOPIC}_lineitem")
     ;;
   *)
-    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat|tpch-lineitem|tpch-all)" >&2
+    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat|tpch-lineitem|tpch-top2|tpch-all)" >&2
     exit 1
     ;;
 esac
@@ -885,6 +1061,26 @@ case "${DATASET}" in
     initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem")"
     table_row_counts=("${initial_rows}")
     ;;
+  tpch-top2)
+    load_tpch_top2_dataset
+    if [[ "${BENCH_MODE}" == "live_insert" ]]; then
+      table_row_counts=(0 0)
+    else
+      mapfile -t table_row_counts < <(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "
+        SELECT row_count
+        FROM (
+          VALUES
+            (1, (SELECT COUNT(*)::BIGINT FROM public.orders)),
+            (2, (SELECT COUNT(*)::BIGINT FROM public.lineitem))
+        ) AS counts(table_order, row_count)
+        ORDER BY table_order;
+      ")
+      initial_rows=0
+      for row_count in "${table_row_counts[@]}"; do
+        initial_rows=$((initial_rows + row_count))
+      done
+    fi
+    ;;
   tpch-all)
     load_tpch_all_dataset
     mapfile -t table_row_counts < <(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "
@@ -946,7 +1142,11 @@ for row_count in "${table_row_counts[@]}"; do
   fi
 done
 if (( live_insert_rows > 0 )); then
-  expected_messages=$((expected_messages + $(expected_insert_messages_for_chunks "${live_insert_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
+  if [[ "${DATASET}" == "tpch-top2" ]]; then
+    expected_messages=$((expected_messages + $(expected_tpch_top2_live_insert_messages "${live_insert_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
+  else
+    expected_messages=$((expected_messages + $(expected_insert_messages_for_chunks "${live_insert_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
+  fi
 fi
 if (( live_update_rows > 0 )); then
   expected_messages=$((expected_messages + $(expected_update_messages_for_chunks "${live_update_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
@@ -1032,7 +1232,11 @@ if [[ "${BENCH_MODE}" == "live_insert" ]]; then
   wait_for_postgres_slot_active
   echo "Writing ${live_insert_rows} live insert rows"
   live_started_ns="$(date +%s%N)"
-  write_live_inserts "${live_insert_rows}"
+  if [[ "${DATASET}" == "tpch-top2" ]]; then
+    write_live_tpch_top2_inserts "${live_insert_rows}"
+  else
+    write_live_inserts "${live_insert_rows}"
+  fi
   live_finished_ns="$(date +%s%N)"
   live_write_seconds="$(awk "BEGIN { printf \"%.3f\", (${live_finished_ns} - ${live_started_ns}) / 1000000000 }")"
 elif [[ "${BENCH_MODE}" == "snapshot_live_update" ]]; then
