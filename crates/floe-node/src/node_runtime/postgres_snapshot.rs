@@ -173,6 +173,29 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
 
     let snapshot =
         load_postgres_initial_snapshot(connection_string, publication, runtime_plan).await?;
+    finish_loaded_postgres_snapshot(
+        slot,
+        publication,
+        runtime_plan,
+        table_store,
+        sender,
+        commit_lsn_rx,
+        cancel,
+        snapshot,
+    )
+    .await
+}
+
+async fn finish_loaded_postgres_snapshot(
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    table_store: &CdcTableStore,
+    sender: &mpsc::Sender<QueuedCdcTransaction>,
+    commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    cancel: &CancellationToken,
+    snapshot: PostgresSnapshot,
+) -> Result<Option<PostgresLsn>> {
     match snapshot.transaction {
         Some(transaction) => {
             sender
@@ -1283,6 +1306,8 @@ fn quote_pg_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floe_core::RowValue;
+    use std::sync::Arc;
 
     #[test]
     fn parses_decimal_text_without_allocation_sensitive_edge_cases() {
@@ -1309,5 +1334,83 @@ mod tests {
         assert!(parse_decimal_text_to_i128("", 2).is_err());
         assert!(parse_decimal_text_to_i128("abc", 2).is_err());
         assert!(parse_decimal_text_to_i128("1.0", -1).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_snapshot_before_commit_leaves_no_checkpoint_for_retry() {
+        let source_id = CdcSourceId::new("pg_main").expect("source id");
+        let table_id = CdcTableId::new("orders").expect("table id");
+        let catalog = floe_storage::SlateCatalog::in_memory()
+            .await
+            .expect("catalog");
+        let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(catalog.db()));
+        let table_store = CdcTableStore::new(table);
+        let runtime_plan = PostgresCdcRuntimePlan {
+            source_id: source_id.clone(),
+            schemas: HashMap::new(),
+            materialized_table_ids: HashSet::new(),
+            replication_pipelines: Vec::new(),
+        };
+        let lsn = PostgresLsn::from_u64(120);
+        let snapshot = PostgresSnapshot {
+            lsn,
+            transaction: snapshot_transaction_batch(
+                &source_id,
+                lsn,
+                vec![
+                    ChangeBatch::new(
+                        table_id,
+                        vec![CdcChange::Insert {
+                            row: floe_cdc_core::CdcRow::new([
+                                Some(RowValue::Int64(1)),
+                                Some(RowValue::Utf8("snapshot".to_string())),
+                            ])
+                            .expect("row"),
+                        }],
+                    )
+                    .expect("snapshot change batch"),
+                ],
+            )
+            .expect("snapshot transaction"),
+            row_count: 1,
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (_commit_sender, mut commit_receiver) = watch::channel(PostgresCdcCommit::default());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = finish_loaded_postgres_snapshot(
+            "slot",
+            "publication",
+            &runtime_plan,
+            &table_store,
+            &sender,
+            Some(&mut commit_receiver),
+            &cancel,
+            snapshot,
+        )
+        .await
+        .expect_err("cancelled snapshot should not finish");
+
+        assert!(
+            format!("{err:#}").contains("cancelled while waiting for initial Postgres snapshot")
+        );
+        let queued = receiver.recv().await.expect("queued snapshot transaction");
+        assert_eq!(queued.slot, "slot");
+        assert_eq!(queued.source_id, source_id);
+        assert_eq!(
+            queued
+                .transaction
+                .transaction_id()
+                .map(CdcTransactionId::as_str),
+            Some("snapshot:0/78")
+        );
+        assert_eq!(
+            table_store
+                .load_checkpoint(&queued.source_id)
+                .await
+                .expect("load checkpoint"),
+            None
+        );
     }
 }
