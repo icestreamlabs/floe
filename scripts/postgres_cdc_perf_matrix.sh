@@ -10,11 +10,20 @@ ROWS_LIST="${ROWS_LIST:-1000 100000 1000000}"
 DATASET="${DATASET:-synthetic-orders}"
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
 PIPELINE_FORMATS="${PIPELINE_FORMATS:-floe-json debezium-json arrow-ipc}"
-BENCH_MODES="${BENCH_MODES:-snapshot live_insert snapshot_live_update}"
+if [[ -z "${BENCH_MODES+x}" && "${DATASET}" == "tpch-all" ]]; then
+  BENCH_MODES="snapshot"
+else
+  BENCH_MODES="${BENCH_MODES:-snapshot live_insert snapshot_live_update}"
+fi
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS:-0}"
 LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS:-0}"
+BUFFER_MAX_PENDING_BYTES="${BUFFER_MAX_PENDING_BYTES:-}"
+BUFFER_MAX_PENDING_AGE_MS="${BUFFER_MAX_PENDING_AGE_MS:-}"
+FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH:-16384}"
+FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS:-1}"
+FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS:-1}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-0}"
 
 SUMMARY_CSV="${ARTIFACT_ROOT}/summary.csv"
@@ -57,6 +66,16 @@ Modes: \`${BENCH_MODES}\`
 Live write chunk rows: \`${LIVE_WRITE_CHUNK_ROWS}\`
 
 Live write sleep ms: \`${LIVE_WRITE_SLEEP_MS}\`
+
+Buffer max pending bytes: \`${BUFFER_MAX_PENDING_BYTES:-unset}\`
+
+Buffer max pending age ms: \`${BUFFER_MAX_PENDING_AGE_MS:-unset}\`
+
+Postgres snapshot rows per batch: \`${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}\`
+
+Postgres snapshot max workers: \`${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}\`
+
+Postgres snapshot intra-table chunks: \`${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}\`
 
 | Status | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | End-to-End (s) | Source Rows/s | Total Bytes | Wall MB/s | Artifacts |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -138,6 +157,11 @@ for mode in ${BENCH_MODES}; do
         BUILD_RELEASE="${BUILD_RELEASE}" \
         LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS}" \
         LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS}" \
+        BUFFER_MAX_PENDING_BYTES="${BUFFER_MAX_PENDING_BYTES}" \
+        BUFFER_MAX_PENDING_AGE_MS="${BUFFER_MAX_PENDING_AGE_MS}" \
+        FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
+        FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
+        FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
         scripts/postgres_cdc_perf_local.sh
       ) >"${run_dir}/matrix-run.log" 2>&1; then
         append_result "ok" "${run_dir}" "${mode}" "${format}" "${rows}"

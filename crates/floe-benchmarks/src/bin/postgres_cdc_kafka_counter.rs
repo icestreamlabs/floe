@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,17 +27,16 @@ fn main() -> Result<()> {
         .create()
         .context("create Kafka CDC benchmark consumer")?;
     let mut assignment = TopicPartitionList::new();
-    assignment
-        .add_partition_offset(&args.topic, 0, Offset::Beginning)
-        .with_context(|| {
-            format!(
-                "build direct assignment for CDC benchmark topic '{}'",
-                args.topic
-            )
-        })?;
+    for topic in &args.topics {
+        assignment
+            .add_partition_offset(topic, 0, Offset::Beginning)
+            .with_context(|| {
+                format!("build direct assignment for CDC benchmark topic '{topic}'")
+            })?;
+    }
     consumer
         .assign(&assignment)
-        .with_context(|| format!("assign CDC benchmark topic '{}' partition 0", args.topic))?;
+        .with_context(|| format!("assign CDC benchmark topics {:?}", args.topics))?;
 
     let started_at = Instant::now();
     let deadline = started_at + args.timeout;
@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     let mut messages = 0_u64;
     let mut key_bytes = 0_u64;
     let mut value_bytes = 0_u64;
+    let mut messages_by_topic = BTreeMap::<String, u64>::new();
 
     while Instant::now() < deadline && messages < args.expected {
         match consumer.poll(Duration::from_millis(50)) {
@@ -53,6 +54,9 @@ fn main() -> Result<()> {
                 first_message_at.get_or_insert(now);
                 last_message_at = Some(now);
                 messages = messages.saturating_add(1);
+                *messages_by_topic
+                    .entry(message.topic().to_string())
+                    .or_insert(0) += 1;
                 key_bytes = key_bytes.saturating_add(
                     message
                         .key()
@@ -95,6 +99,13 @@ fn main() -> Result<()> {
 
     println!("cdc_counter.expected_messages={}", args.expected);
     println!("cdc_counter.observed_messages={messages}");
+    for topic in &args.topics {
+        let topic_messages = messages_by_topic.get(topic).copied().unwrap_or(0);
+        println!(
+            "cdc_counter.topic.{}.observed_messages={topic_messages}",
+            topic_env_key(topic)
+        );
+    }
     println!("cdc_counter.key_bytes={key_bytes}");
     println!("cdc_counter.value_bytes={value_bytes}");
     println!("cdc_counter.total_bytes={total_bytes}");
@@ -116,7 +127,7 @@ fn is_retryable_poll_error(err: &KafkaError) -> bool {
 
 struct Args {
     brokers: String,
-    topic: String,
+    topics: Vec<String>,
     expected: u64,
     timeout: Duration,
 }
@@ -124,7 +135,16 @@ struct Args {
 impl Args {
     fn parse(args: Vec<String>) -> Result<Self> {
         let brokers = arg_value(&args, "--brokers")?;
-        let topic = arg_value(&args, "--topic")?;
+        let topic_arg = arg_value(&args, "--topics").or_else(|_| arg_value(&args, "--topic"))?;
+        let topics = topic_arg
+            .split(',')
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if topics.is_empty() {
+            bail!("--topic/--topics must contain at least one topic");
+        }
         let expected = arg_value(&args, "--expected")?
             .parse::<u64>()
             .context("--expected must be a positive integer")?;
@@ -140,11 +160,18 @@ impl Args {
         }
         Ok(Self {
             brokers,
-            topic,
+            topics,
             expected,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
+}
+
+fn topic_env_key(topic: &str) -> String {
+    topic
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
 }
 
 fn arg_value(args: &[String], name: &str) -> Result<String> {

@@ -23,10 +23,15 @@ SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
 PIPELINE_FORMAT="${PIPELINE_FORMAT:-floe-json}"
 DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
+BUFFER_MAX_PENDING_BYTES="${BUFFER_MAX_PENDING_BYTES:-}"
+BUFFER_MAX_PENDING_AGE_MS="${BUFFER_MAX_PENDING_AGE_MS:-}"
 ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD:-16384}"
 ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION:-none}"
 LIVE_WRITE_CHUNK_ROWS="${LIVE_WRITE_CHUNK_ROWS:-0}"
 LIVE_WRITE_SLEEP_MS="${LIVE_WRITE_SLEEP_MS:-0}"
+FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH:-16384}"
+FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS:-1}"
+FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS:-1}"
 FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
@@ -199,7 +204,14 @@ write_postgres_settings() {
 }
 
 write_kafka_topic_info() {
-  docker exec "${REDPANDA_CONTAINER}" rpk topic describe "${TOPIC}" >"${KAFKA_TOPIC_LOG}" 2>&1 || true
+  : >"${KAFKA_TOPIC_LOG}"
+  for topic in "${topics[@]}"; do
+    {
+      echo "topic=${topic}"
+      docker exec "${REDPANDA_CONTAINER}" rpk topic describe "${topic}"
+      echo
+    } >>"${KAFKA_TOPIC_LOG}" 2>&1 || true
+  done
 }
 
 write_postgres_slot_info() {
@@ -242,6 +254,13 @@ copy_pipe_delimited_file() {
     -c "\\copy ${table} FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE E'\\b', ESCAPE E'\\b')" >/dev/null
 }
 
+prepare_tpch_data_dir() {
+  mkdir -p "${TPCH_DATA_DIR}"
+  for table in "$@"; do
+    rm -f "${TPCH_DATA_DIR}/${table}.tbl"
+  done
+}
+
 sleep_live_write_pause() {
   if (( LIVE_WRITE_SLEEP_MS <= 0 )); then
     return
@@ -278,7 +297,7 @@ load_tpch_lineitem_flat_dataset() {
     exit 1
   fi
   require_cmd "${TPCHGEN_BIN}"
-  mkdir -p "${TPCH_DATA_DIR}"
+  prepare_tpch_data_dir lineitem
   "${TPCHGEN_BIN}" \
     --scale-factor "${TPCH_SCALE_FACTOR}" \
     --tables lineitem \
@@ -360,7 +379,7 @@ load_tpch_lineitem_dataset() {
     exit 1
   fi
   require_cmd "${TPCHGEN_BIN}"
-  mkdir -p "${TPCH_DATA_DIR}"
+  prepare_tpch_data_dir lineitem
   "${TPCHGEN_BIN}" \
     --scale-factor "${TPCH_SCALE_FACTOR}" \
     --tables lineitem \
@@ -391,6 +410,127 @@ CREATE TABLE public.lineitem (
 );
 SQL
 
+  copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
+}
+
+load_tpch_all_dataset() {
+  if [[ "${BENCH_MODE}" != "snapshot" ]]; then
+    echo "DATASET=tpch-all currently supports BENCH_MODE=snapshot only" >&2
+    exit 1
+  fi
+  require_cmd "${TPCHGEN_BIN}"
+  prepare_tpch_data_dir region nation supplier customer part partsupp orders lineitem
+  "${TPCHGEN_BIN}" \
+    --scale-factor "${TPCH_SCALE_FACTOR}" \
+    --format tbl \
+    --output-dir "${TPCH_DATA_DIR}" >/dev/null
+
+  docker exec -i "${POSTGRES_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP PUBLICATION IF EXISTS ${PUBLICATION};
+DROP TABLE IF EXISTS public.lineitem;
+DROP TABLE IF EXISTS public.orders;
+DROP TABLE IF EXISTS public.partsupp;
+DROP TABLE IF EXISTS public.part;
+DROP TABLE IF EXISTS public.customer;
+DROP TABLE IF EXISTS public.supplier;
+DROP TABLE IF EXISTS public.nation;
+DROP TABLE IF EXISTS public.region;
+
+CREATE TABLE public.region (
+  r_regionkey BIGINT PRIMARY KEY,
+  r_name CHAR(25) NOT NULL,
+  r_comment VARCHAR(152) NOT NULL
+);
+
+CREATE TABLE public.nation (
+  n_nationkey BIGINT PRIMARY KEY,
+  n_name CHAR(25) NOT NULL,
+  n_regionkey BIGINT NOT NULL,
+  n_comment VARCHAR(152) NOT NULL
+);
+
+CREATE TABLE public.supplier (
+  s_suppkey BIGINT PRIMARY KEY,
+  s_name CHAR(25) NOT NULL,
+  s_address VARCHAR(40) NOT NULL,
+  s_nationkey BIGINT NOT NULL,
+  s_phone CHAR(15) NOT NULL,
+  s_acctbal NUMERIC(15,2) NOT NULL,
+  s_comment VARCHAR(101) NOT NULL
+);
+
+CREATE TABLE public.customer (
+  c_custkey BIGINT PRIMARY KEY,
+  c_name VARCHAR(25) NOT NULL,
+  c_address VARCHAR(40) NOT NULL,
+  c_nationkey BIGINT NOT NULL,
+  c_phone CHAR(15) NOT NULL,
+  c_acctbal NUMERIC(15,2) NOT NULL,
+  c_mktsegment CHAR(10) NOT NULL,
+  c_comment VARCHAR(117) NOT NULL
+);
+
+CREATE TABLE public.part (
+  p_partkey BIGINT PRIMARY KEY,
+  p_name VARCHAR(55) NOT NULL,
+  p_mfgr CHAR(25) NOT NULL,
+  p_brand CHAR(10) NOT NULL,
+  p_type VARCHAR(25) NOT NULL,
+  p_size BIGINT NOT NULL,
+  p_container CHAR(10) NOT NULL,
+  p_retailprice NUMERIC(15,2) NOT NULL,
+  p_comment VARCHAR(23) NOT NULL
+);
+
+CREATE TABLE public.partsupp (
+  ps_partkey BIGINT NOT NULL,
+  ps_suppkey BIGINT NOT NULL,
+  ps_availqty BIGINT NOT NULL,
+  ps_supplycost NUMERIC(15,2) NOT NULL,
+  ps_comment VARCHAR(199) NOT NULL,
+  PRIMARY KEY (ps_partkey, ps_suppkey)
+);
+
+CREATE TABLE public.orders (
+  o_orderkey BIGINT PRIMARY KEY,
+  o_custkey BIGINT NOT NULL,
+  o_orderstatus CHAR(1) NOT NULL,
+  o_totalprice NUMERIC(15,2) NOT NULL,
+  o_orderdate DATE NOT NULL,
+  o_orderpriority CHAR(15) NOT NULL,
+  o_clerk CHAR(15) NOT NULL,
+  o_shippriority BIGINT NOT NULL,
+  o_comment VARCHAR(79) NOT NULL
+);
+
+CREATE TABLE public.lineitem (
+  l_orderkey BIGINT NOT NULL,
+  l_partkey BIGINT NOT NULL,
+  l_suppkey BIGINT NOT NULL,
+  l_linenumber BIGINT NOT NULL,
+  l_quantity NUMERIC(15,2) NOT NULL,
+  l_extendedprice NUMERIC(15,2) NOT NULL,
+  l_discount NUMERIC(15,2) NOT NULL,
+  l_tax NUMERIC(15,2) NOT NULL,
+  l_returnflag CHAR(1) NOT NULL,
+  l_linestatus CHAR(1) NOT NULL,
+  l_shipdate DATE NOT NULL,
+  l_commitdate DATE NOT NULL,
+  l_receiptdate DATE NOT NULL,
+  l_shipinstruct CHAR(25) NOT NULL,
+  l_shipmode CHAR(10) NOT NULL,
+  l_comment VARCHAR(44) NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber)
+);
+SQL
+
+  copy_pipe_delimited_file public.region "${TPCH_DATA_DIR}/region.tbl"
+  copy_pipe_delimited_file public.nation "${TPCH_DATA_DIR}/nation.tbl"
+  copy_pipe_delimited_file public.supplier "${TPCH_DATA_DIR}/supplier.tbl"
+  copy_pipe_delimited_file public.customer "${TPCH_DATA_DIR}/customer.tbl"
+  copy_pipe_delimited_file public.part "${TPCH_DATA_DIR}/part.tbl"
+  copy_pipe_delimited_file public.partsupp "${TPCH_DATA_DIR}/partsupp.tbl"
+  copy_pipe_delimited_file public.orders "${TPCH_DATA_DIR}/orders.tbl"
   copy_pipe_delimited_file public.lineitem "${TPCH_DATA_DIR}/lineitem.tbl"
 }
 
@@ -524,14 +664,44 @@ expected_update_messages_for_chunks() {
   echo "${total}"
 }
 
+write_replication_pipeline_sql() {
+  local idx="$1"
+  {
+    echo "CREATE REPLICATION PIPELINE ${pipeline_names[$idx]}"
+    echo "FROM pg_main TABLE '${upstream_tables[$idx]}'"
+    echo "INTO KAFKA WITH ("
+    echo "  brokers = '${BROKERS}',"
+    echo "  topic = '${topics[$idx]}',"
+    echo "  format = '${PIPELINE_FORMAT}',"
+    echo "  durable_buffer = ${DURABLE_REPLICATION_BUFFER},"
+    if [[ -n "${BUFFER_MAX_PENDING_BYTES}" ]]; then
+      echo "  buffer.max_pending_bytes = ${BUFFER_MAX_PENDING_BYTES},"
+    fi
+    if [[ -n "${BUFFER_MAX_PENDING_AGE_MS}" ]]; then
+      echo "  buffer.max_pending_age_ms = ${BUFFER_MAX_PENDING_AGE_MS},"
+    fi
+    echo "  tombstones = false,"
+    echo "  transaction_metadata = false"
+    echo ");"
+  } >>"${SQL_PATH}"
+}
+
 require_cmd docker
 require_cmd cargo
+
+upstream_tables=()
+pipeline_names=()
+topics=()
+table_row_counts=()
 
 case "${DATASET}" in
   synthetic-orders)
     source_table="orders"
     upstream_table="public.orders"
     pipeline_name="pg_orders_to_kafka"
+    upstream_tables=("public.orders")
+    pipeline_names=("pg_orders_to_kafka")
+    topics=("${TOPIC}")
     ;;
   tpch-lineitem-flat)
     source_table="lineitem_flat"
@@ -540,6 +710,9 @@ case "${DATASET}" in
     if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
       TOPIC="floe_cdc_bench_lineitem_flat"
     fi
+    upstream_tables=("public.lineitem_flat")
+    pipeline_names=("pg_lineitem_flat_to_kafka")
+    topics=("${TOPIC}")
     ;;
   tpch-lineitem)
     source_table="lineitem"
@@ -548,12 +721,27 @@ case "${DATASET}" in
     if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
       TOPIC="floe_cdc_bench_lineitem"
     fi
+    upstream_tables=("public.lineitem")
+    pipeline_names=("pg_lineitem_to_kafka")
+    topics=("${TOPIC}")
+    ;;
+  tpch-all)
+    source_table="region,nation,supplier,customer,part,partsupp,orders,lineitem"
+    upstream_table="public.region,public.nation,public.supplier,public.customer,public.part,public.partsupp,public.orders,public.lineitem"
+    pipeline_name="pg_region_to_kafka,pg_nation_to_kafka,pg_supplier_to_kafka,pg_customer_to_kafka,pg_part_to_kafka,pg_partsupp_to_kafka,pg_orders_to_kafka,pg_lineitem_to_kafka"
+    if [[ "${TOPIC}" == "floe_cdc_bench_orders" ]]; then
+      TOPIC="floe_cdc_bench_tpch"
+    fi
+    upstream_tables=(public.region public.nation public.supplier public.customer public.part public.partsupp public.orders public.lineitem)
+    pipeline_names=(pg_region_to_kafka pg_nation_to_kafka pg_supplier_to_kafka pg_customer_to_kafka pg_part_to_kafka pg_partsupp_to_kafka pg_orders_to_kafka pg_lineitem_to_kafka)
+    topics=("${TOPIC}_region" "${TOPIC}_nation" "${TOPIC}_supplier" "${TOPIC}_customer" "${TOPIC}_part" "${TOPIC}_partsupp" "${TOPIC}_orders" "${TOPIC}_lineitem")
     ;;
   *)
-    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat|tpch-lineitem)" >&2
+    echo "unsupported DATASET=${DATASET} (expected synthetic-orders|tpch-lineitem-flat|tpch-lineitem|tpch-all)" >&2
     exit 1
     ;;
 esac
+topic_list="$(IFS=,; echo "${topics[*]}")"
 
 docker rm -f "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || true
 
@@ -564,13 +752,19 @@ echo "tpch_scale_factor=${TPCH_SCALE_FACTOR}"
 echo "bench_mode=${BENCH_MODE}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
+echo "topics=${topic_list}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
 echo "durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
+echo "buffer_max_pending_bytes=${BUFFER_MAX_PENDING_BYTES:-unset}"
+echo "buffer_max_pending_age_ms=${BUFFER_MAX_PENDING_AGE_MS:-unset}"
 echo "arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"
 echo "redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
 echo "redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
 echo "live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
 echo "live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
+echo "postgres_snapshot_rows_per_batch=${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
+echo "postgres_snapshot_max_workers=${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
+echo "postgres_snapshot_intra_table_chunks=${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
 echo "slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
 
 echo "Pulling images..."
@@ -610,13 +804,15 @@ docker run -d \
     --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${REDPANDA_PORT}" >/dev/null
 wait_for_redpanda
 
-echo "Creating Kafka topic ${TOPIC}"
-if ! docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 \
-  -c "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1; then
-  docker exec "${REDPANDA_CONTAINER}" rpk topic create "${TOPIC}" -p 1 -r 1 >/dev/null 2>&1 || true
-fi
-docker exec "${REDPANDA_CONTAINER}" rpk topic alter-config "${TOPIC}" \
-  --set "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1 || true
+echo "Creating Kafka topics ${topic_list}"
+for topic in "${topics[@]}"; do
+  if ! docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 \
+    -c "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1; then
+    docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 >/dev/null 2>&1 || true
+  fi
+  docker exec "${REDPANDA_CONTAINER}" rpk topic alter-config "${topic}" \
+    --set "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1 || true
+done
 write_kafka_topic_info
 
 case "${BENCH_MODE}" in
@@ -646,14 +842,39 @@ load_started_ns="$(date +%s%N)"
 case "${DATASET}" in
   synthetic-orders)
     load_synthetic_orders_dataset "${initial_rows}"
+    table_row_counts=("${initial_rows}")
     ;;
   tpch-lineitem-flat)
     load_tpch_lineitem_flat_dataset
     initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem_flat")"
+    table_row_counts=("${initial_rows}")
     ;;
   tpch-lineitem)
     load_tpch_lineitem_dataset
     initial_rows="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.lineitem")"
+    table_row_counts=("${initial_rows}")
+    ;;
+  tpch-all)
+    load_tpch_all_dataset
+    mapfile -t table_row_counts < <(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "
+      SELECT row_count
+      FROM (
+        VALUES
+          (1, (SELECT COUNT(*)::BIGINT FROM public.region)),
+          (2, (SELECT COUNT(*)::BIGINT FROM public.nation)),
+          (3, (SELECT COUNT(*)::BIGINT FROM public.supplier)),
+          (4, (SELECT COUNT(*)::BIGINT FROM public.customer)),
+          (5, (SELECT COUNT(*)::BIGINT FROM public.part)),
+          (6, (SELECT COUNT(*)::BIGINT FROM public.partsupp)),
+          (7, (SELECT COUNT(*)::BIGINT FROM public.orders)),
+          (8, (SELECT COUNT(*)::BIGINT FROM public.lineitem))
+      ) AS counts(table_order, row_count)
+      ORDER BY table_order;
+    ")
+    initial_rows=0
+    for row_count in "${table_row_counts[@]}"; do
+      initial_rows=$((initial_rows + row_count))
+    done
     ;;
 esac
 load_finished_ns="$(date +%s%N)"
@@ -682,22 +903,17 @@ CREATE SOURCE pg_main WITH (
   slot.name = '${SLOT}',
   publication.name = '${PUBLICATION}'
 );
-CREATE REPLICATION PIPELINE ${pipeline_name}
-FROM pg_main TABLE '${upstream_table}'
-INTO KAFKA WITH (
-  brokers = '${BROKERS}',
-  topic = '${TOPIC}',
-  format = '${PIPELINE_FORMAT}',
-  durable_buffer = ${DURABLE_REPLICATION_BUFFER},
-  tombstones = false,
-  transaction_metadata = false
-);
 SQL
+for idx in "${!pipeline_names[@]}"; do
+  write_replication_pipeline_sql "${idx}"
+done
 
 expected_messages=0
-if (( initial_rows > 0 )); then
-  expected_messages=$((expected_messages + $(expected_insert_messages "${initial_rows}")))
-fi
+for row_count in "${table_row_counts[@]}"; do
+  if (( row_count > 0 )); then
+    expected_messages=$((expected_messages + $(expected_insert_messages "${row_count}")))
+  fi
+done
 if (( live_insert_rows > 0 )); then
   expected_messages=$((expected_messages + $(expected_insert_messages_for_chunks "${live_insert_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
 fi
@@ -721,6 +937,9 @@ if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
     FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
     FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
@@ -736,6 +955,9 @@ elif command -v setsid >/dev/null 2>&1; then
     FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
     FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
     FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
+    FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
     "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
@@ -750,6 +972,9 @@ else
   FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
   FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
   FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
+  FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
+  FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
+  FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
   "${FLOE_BIN}" run \
     --config "${CONFIG_PATH}" \
     --mv-query "$(cat "${SQL_PATH}")" \
@@ -765,7 +990,7 @@ echo "Counting CDC records from Kafka"
 counter_started_ns="$(date +%s%N)"
 "${COUNTER_BIN}" \
   --brokers "${BROKERS}" \
-  --topic "${TOPIC}" \
+  --topics "${topic_list}" \
   --expected "${expected_messages}" \
   --timeout-secs "${TIMEOUT_SECS}" >"${COUNTER_LOG}" 2>&1 &
 counter_pid="$!"
@@ -808,6 +1033,7 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.rows=${ROWS}"
   echo "benchmark.source_table=${source_table}"
   echo "benchmark.upstream_table=${upstream_table}"
+  echo "benchmark.kafka_topics=${topic_list}"
   echo "benchmark.mode=${BENCH_MODE}"
   echo "benchmark.initial_rows=${initial_rows}"
   echo "benchmark.live_insert_rows=${live_insert_rows}"
@@ -815,8 +1041,13 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.source_rows=${source_rows}"
   echo "benchmark.pipeline_format=${PIPELINE_FORMAT}"
   echo "benchmark.durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
+  echo "benchmark.buffer_max_pending_bytes=${BUFFER_MAX_PENDING_BYTES}"
+  echo "benchmark.buffer_max_pending_age_ms=${BUFFER_MAX_PENDING_AGE_MS}"
   echo "benchmark.arrow_ipc_rows_per_record=${ARROW_IPC_ROWS_PER_RECORD}"
   echo "benchmark.arrow_ipc_compression=${ARROW_IPC_COMPRESSION}"
+  echo "benchmark.postgres_snapshot_rows_per_batch=${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
+  echo "benchmark.postgres_snapshot_max_workers=${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
+  echo "benchmark.postgres_snapshot_intra_table_chunks=${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
   echo "benchmark.redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
   echo "benchmark.redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
