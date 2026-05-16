@@ -900,6 +900,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_postgres_replication_pipeline_target() {
+        let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+        let pipeline = ReplicationPipelineDefinition::new(
+            "pg_orders_to_postgres",
+            "pg_main",
+            "public.orders",
+            ReplicationPipelineTarget::Postgres {
+                connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+                table: "public.orders_copy".to_string(),
+            },
+            ReplicationPipelineFormat::FloeJson,
+            ReplicationBufferMode::Durable,
+            floe_core::catalog::ReplicationBufferPolicy::default(),
+            false,
+            false,
+        )
+        .expect("pipeline");
+
+        catalog
+            .upsert_replication_pipeline(pipeline.clone())
+            .await
+            .expect("persist pipeline");
+
+        let loaded = catalog
+            .replication_pipeline("pg_orders_to_postgres")
+            .await
+            .expect("load pipeline")
+            .expect("pipeline exists");
+        assert_eq!(loaded, pipeline);
+    }
+
+    #[tokio::test]
     async fn roundtrip_table_definitions() {
         let catalog = SlateCatalog::in_memory().await.expect("open catalog");
 

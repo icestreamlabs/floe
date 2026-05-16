@@ -222,6 +222,28 @@ fn parse_create_replication_pipeline_arrow_ipc_format() {
 }
 
 #[test]
+fn parse_create_replication_pipeline_postgres_target() {
+    let stmt = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO POSTGRES WITH (
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            table = 'public.orders_copy'
+        )",
+    )
+    .expect("parse replication pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = stmt else {
+        panic!("expected replication pipeline");
+    };
+    assert_eq!(
+        definition.target(),
+        &ReplicationPipelineTarget::Postgres {
+            connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+            table: "public.orders_copy".to_string(),
+        }
+    );
+    assert_eq!(definition.format(), ReplicationPipelineFormat::FloeJson);
+}
+
+#[test]
 fn parse_create_replication_pipeline_without_durable_buffer() {
     let stmt = parse_floe_statement(
         "CREATE REPLICATION PIPELINE p FROM pg_main TABLE public.orders INTO KAFKA WITH (

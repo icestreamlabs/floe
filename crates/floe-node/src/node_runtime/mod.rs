@@ -164,6 +164,7 @@ struct ReplicationPipelineRuntimePlan {
 #[derive(Clone)]
 enum ReplicationPipelineRuntimeTarget {
     Kafka { brokers: String, topic: String },
+    Postgres { connection: String, table: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

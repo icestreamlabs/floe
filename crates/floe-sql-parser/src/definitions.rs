@@ -263,6 +263,7 @@ pub struct ReplicationPipelineDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicationPipelineTarget {
     Kafka { brokers: String, topic: String },
+    Postgres { connection: String, table: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +429,18 @@ impl ReplicationPipelineTarget {
                 }
                 if topic.trim().is_empty() {
                     return Err(anyhow!("replication pipeline Kafka topic cannot be empty"));
+                }
+            }
+            Self::Postgres { connection, table } => {
+                if connection.trim().is_empty() {
+                    return Err(anyhow!(
+                        "replication pipeline Postgres connection cannot be empty"
+                    ));
+                }
+                if table.trim().is_empty() {
+                    return Err(anyhow!(
+                        "replication pipeline Postgres target table cannot be empty"
+                    ));
                 }
             }
         }

@@ -728,6 +728,39 @@ fn source_backed_table_definition_from_sql_preserves_binding() {
 }
 
 #[test]
+fn replication_pipeline_definition_from_sql_preserves_postgres_target() {
+    let statement = parse_floe_statement(
+        "CREATE REPLICATION PIPELINE pg_orders_to_postgres
+         FROM pg_main TABLE public.orders
+         INTO POSTGRES WITH (
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            table = 'public.orders_copy'
+         )",
+    )
+    .expect("parse pipeline");
+    let FloeStatement::CreateReplicationPipeline(definition) = statement else {
+        panic!("expected replication pipeline statement");
+    };
+
+    let pipeline = replication_pipeline_definition_from_sql(&definition).expect("catalog pipeline");
+
+    assert_eq!(pipeline.name(), "pg_orders_to_postgres");
+    assert_eq!(pipeline.source_name(), "pg_main");
+    assert_eq!(pipeline.upstream_table(), "public.orders");
+    assert_eq!(
+        pipeline.format(),
+        CatalogReplicationPipelineFormat::FloeJson
+    );
+    assert_eq!(
+        pipeline.target(),
+        &CatalogReplicationPipelineTarget::Postgres {
+            connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+            table: "public.orders_copy".to_string(),
+        }
+    );
+}
+
+#[test]
 fn catalog_postgres_source_connector_merges_include_tables() {
     let mut connector_specs = Vec::new();
     let mut catalog_sources = HashMap::new();
@@ -874,6 +907,58 @@ async fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     assert_eq!(schema.primary_key().columns(), &["id".to_string()]);
     assert_eq!(schema.columns().len(), 3);
     assert!(!schema.columns()[0].nullable());
+}
+
+#[tokio::test]
+async fn postgres_cdc_runtime_plan_accepts_postgres_replication_target() {
+    let statement = parse_floe_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, note TEXT)",
+    )
+    .expect("parse create table");
+    let FloeStatement::CreateTable(definition) = statement else {
+        panic!("expected create table statement");
+    };
+    let table = table_definition_from_sql(&definition).expect("table definition");
+    let source = source_definition_from_table(&table).expect("source definition");
+    let mut registry = SourceRegistry::new();
+    registry.register(source);
+    let include_tables = vec!["public.orders".to_string()];
+    let pipeline = CatalogReplicationPipelineDefinition::new(
+        "pg_orders_to_postgres",
+        "pg_main",
+        "public.orders",
+        CatalogReplicationPipelineTarget::Postgres {
+            connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+            table: "public.orders_copy".to_string(),
+        },
+        CatalogReplicationPipelineFormat::FloeJson,
+        CatalogReplicationBufferMode::Durable,
+        CatalogReplicationBufferPolicy::default(),
+        false,
+        false,
+    )
+    .expect("pipeline");
+
+    let plan = postgres_cdc_runtime_plan(
+        "pg_main",
+        "postgres://postgres:postgres@localhost/postgres",
+        Some(&include_tables),
+        &registry,
+        &HashMap::new(),
+        &HashMap::from([(pipeline.name().to_string(), pipeline)]),
+    )
+    .await
+    .expect("runtime plan")
+    .expect("native runtime plan");
+
+    assert_eq!(plan.replication_pipelines.len(), 1);
+    let target = &plan.replication_pipelines[0].target;
+    assert!(matches!(
+        target,
+        ReplicationPipelineRuntimeTarget::Postgres { connection, table }
+            if connection == "postgres://postgres:postgres@localhost/postgres"
+                && table == "public.orders_copy"
+    ));
 }
 
 #[tokio::test]

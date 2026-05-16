@@ -654,6 +654,22 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
             brokers: required_replication_option(&options, "brokers")?.to_string(),
             topic: required_replication_option(&options, "topic")?.to_string(),
         },
+        "postgres" | "postgresql" => ReplicationPipelineTarget::Postgres {
+            connection: option_any(&options, &["connection", "connection_string", "url"])
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CREATE REPLICATION PIPELINE requires 'connection' option for Postgres target"
+                    )
+                })?
+                .to_string(),
+            table: option_any(&options, &["table", "target.table", "target_table"])
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CREATE REPLICATION PIPELINE requires 'table' option for Postgres target"
+                    )
+                })?
+                .to_string(),
+        },
         other => return Err(anyhow!("unsupported replication pipeline target '{other}'")),
     };
 

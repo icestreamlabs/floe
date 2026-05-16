@@ -10,7 +10,8 @@ use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, Error as SlateError, WriteBatch};
 
 const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
-const CDC_BUFFER_PAYLOAD_MAGIC: &[u8; 8] = b"FCDCBUF1";
+const CDC_BUFFER_PAYLOAD_MAGIC_V1: &[u8; 8] = b"FCDCBUF1";
+const CDC_BUFFER_PAYLOAD_MAGIC: &[u8; 8] = b"FCDCBUF2";
 const CDC_BUFFER_CHANGE_BATCHES_MAGIC: &[u8; 8] = b"FCDCBCH1";
 const CDC_BUFFER_NONE_LEN: u64 = u64::MAX;
 
@@ -42,6 +43,14 @@ pub struct CdcBufferRecord {
     key: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     value: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    headers: Vec<CdcBufferRecordHeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcBufferRecordHeader {
+    key: String,
+    value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -819,7 +828,19 @@ impl CdcBufferAppend {
 
 impl CdcBufferRecord {
     pub fn new(key: Option<Vec<u8>>, value: Option<Vec<u8>>) -> Self {
-        Self { key, value }
+        Self {
+            key,
+            value,
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.headers.push(CdcBufferRecordHeader {
+            key: key.into(),
+            value: value.into(),
+        });
+        self
     }
 
     pub fn key(&self) -> Option<&[u8]> {
@@ -830,8 +851,28 @@ impl CdcBufferRecord {
         self.value.as_deref()
     }
 
+    pub fn headers(&self) -> &[CdcBufferRecordHeader] {
+        &self.headers
+    }
+
     pub fn byte_len(&self) -> usize {
-        self.key.as_ref().map_or(0, Vec::len) + self.value.as_ref().map_or(0, Vec::len)
+        self.key.as_ref().map_or(0, Vec::len)
+            + self.value.as_ref().map_or(0, Vec::len)
+            + self
+                .headers
+                .iter()
+                .map(|header| header.key.len() + header.value.len())
+                .sum::<usize>()
+    }
+}
+
+impl CdcBufferRecordHeader {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
     }
 }
 
@@ -1154,6 +1195,16 @@ fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
                     std::mem::size_of::<u64>() * 2
                         + record.key.as_ref().map_or(0, Vec::len)
                         + record.value.as_ref().map_or(0, Vec::len)
+                        + std::mem::size_of::<u64>()
+                        + record
+                            .headers
+                            .iter()
+                            .map(|header| {
+                                std::mem::size_of::<u64>() * 2
+                                    + header.key.len()
+                                    + header.value.len()
+                            })
+                            .sum::<usize>()
                 })
                 .sum::<usize>(),
     );
@@ -1162,6 +1213,13 @@ fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
     for record in records {
         encode_optional_bytes(&mut out, record.key.as_deref())?;
         encode_optional_bytes(&mut out, record.value.as_deref())?;
+        let header_count = u64::try_from(record.headers.len())
+            .context("CDC buffer record header count exceeds u64")?;
+        out.extend_from_slice(&header_count.to_be_bytes());
+        for header in &record.headers {
+            encode_required_bytes(&mut out, header.key.as_bytes())?;
+            encode_required_bytes(&mut out, &header.value)?;
+        }
     }
     Ok(out)
 }
@@ -1194,15 +1252,28 @@ fn encode_optional_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<()> 
     Ok(())
 }
 
+fn encode_required_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u64::try_from(value.len()).context("CDC buffer payload field exceeds u64")?;
+    ensure!(
+        len != CDC_BUFFER_NONE_LEN,
+        "CDC buffer payload field length uses reserved sentinel"
+    );
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
 fn decode_payload_records(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
     ensure!(
         payload.len() >= CDC_BUFFER_PAYLOAD_MAGIC.len() + std::mem::size_of::<u64>(),
         "CDC buffer payload blob is too short"
     );
+    let magic = &payload[..CDC_BUFFER_PAYLOAD_MAGIC.len()];
     ensure!(
-        &payload[..CDC_BUFFER_PAYLOAD_MAGIC.len()] == CDC_BUFFER_PAYLOAD_MAGIC,
+        magic == CDC_BUFFER_PAYLOAD_MAGIC || magic == CDC_BUFFER_PAYLOAD_MAGIC_V1,
         "CDC buffer payload blob has invalid magic"
     );
+    let has_headers = magic == CDC_BUFFER_PAYLOAD_MAGIC;
     let mut cursor = CDC_BUFFER_PAYLOAD_MAGIC.len();
     let record_count = read_u64(payload, &mut cursor)?;
     let record_count =
@@ -1211,7 +1282,20 @@ fn decode_payload_records(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
     for _ in 0..record_count {
         let key = decode_optional_bytes(payload, &mut cursor)?;
         let value = decode_optional_bytes(payload, &mut cursor)?;
-        records.push(CdcBufferRecord::new(key, value));
+        let mut record = CdcBufferRecord::new(key, value);
+        if has_headers {
+            let header_count = read_u64(payload, &mut cursor)?;
+            let header_count = usize::try_from(header_count)
+                .context("CDC buffer record header count exceeds usize")?;
+            for _ in 0..header_count {
+                let key = decode_required_bytes(payload, &mut cursor)?;
+                let key = String::from_utf8(key)
+                    .context("CDC buffer record header key is not valid UTF-8")?;
+                let value = decode_required_bytes(payload, &mut cursor)?;
+                record = record.with_header(key, value);
+            }
+        }
+        records.push(record);
     }
     ensure!(
         cursor == payload.len(),
@@ -1256,6 +1340,11 @@ fn decode_optional_bytes(payload: &[u8], cursor: &mut usize) -> Result<Option<Ve
     let value = payload[*cursor..end].to_vec();
     *cursor = end;
     Ok(Some(value))
+}
+
+fn decode_required_bytes(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+    let value = decode_optional_bytes(payload, cursor)?;
+    value.ok_or_else(|| anyhow!("CDC buffer payload field unexpectedly used null sentinel"))
 }
 
 fn read_u64(payload: &[u8], cursor: &mut usize) -> Result<u64> {
@@ -1639,6 +1728,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn appends_and_replays_record_headers() {
+        let store = test_store("cdc-buffer-record-headers").await;
+        let record = record(1)
+            .with_header("floe-idempotency-key", b"pipe/0/10/0".to_vec())
+            .with_header("floe-source-position", b"pg/0/10".to_vec());
+        let append = append("0/10", 1000, vec![record.clone()]);
+        let manifest = store.append_transaction(&append).await.expect("append");
+
+        let records = store.records(&manifest).await.expect("records");
+
+        assert_eq!(records, vec![record]);
+        assert_eq!(records[0].headers()[0].key(), "floe-idempotency-key");
+        assert_eq!(records[0].headers()[0].value(), b"pipe/0/10/0");
+        assert_eq!(records[0].headers()[1].key(), "floe-source-position");
+        assert_eq!(records[0].headers()[1].value(), b"pg/0/10");
+    }
+
+    #[test]
+    fn decodes_v1_payload_blob_without_headers() {
+        let records = vec![record(1), record(2)];
+        let payload = encode_payload_records_v1(&records).expect("encode v1 payload");
+
+        let decoded = decode_payload_records(&payload).expect("decode v1 payload");
+
+        assert_eq!(decoded, records);
+        assert!(decoded.iter().all(|record| record.headers().is_empty()));
+    }
+
+    #[tokio::test]
     async fn replays_legacy_json_payload_records() {
         let store = test_store("cdc-buffer-legacy-records").await;
         let append = append("0/10", 1000, vec![record(1), record(2)]);
@@ -1742,6 +1860,19 @@ mod tests {
             Some(format!(r#"{{"id":{id}}}"#).into_bytes()),
             Some(format!(r#"{{"after":{{"id":{id}}}}}"#).into_bytes()),
         )
+    }
+
+    fn encode_payload_records_v1(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
+        let record_count =
+            u64::try_from(records.len()).context("CDC buffer record count exceeds u64")?;
+        let mut out = Vec::new();
+        out.extend_from_slice(CDC_BUFFER_PAYLOAD_MAGIC_V1);
+        out.extend_from_slice(&record_count.to_be_bytes());
+        for record in records {
+            encode_optional_bytes(&mut out, record.key())?;
+            encode_optional_bytes(&mut out, record.value())?;
+        }
+        Ok(out)
     }
 
     fn assert_transaction_ids(manifests: &[CdcBufferedTransactionManifest], expected: &[&str]) {

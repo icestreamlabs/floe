@@ -176,11 +176,11 @@ fn replication_pipeline_runtime_plan_from_catalog(
                 topic: topic.clone(),
             }
         }
-        CatalogReplicationPipelineTarget::Postgres { .. } => {
-            return Err(anyhow!(
-                "replication pipeline '{}' uses Postgres target, which is not implemented yet",
-                pipeline.name()
-            ));
+        CatalogReplicationPipelineTarget::Postgres { connection, table } => {
+            ReplicationPipelineRuntimeTarget::Postgres {
+                connection: connection.clone(),
+                table: table.clone(),
+            }
         }
     };
     Ok(ReplicationPipelineRuntimePlan {

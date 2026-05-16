@@ -67,6 +67,12 @@ pub(super) fn replication_pipeline_definition_from_sql(
                 topic: topic.clone(),
             }
         }
+        SqlReplicationPipelineTarget::Postgres { connection, table } => {
+            CatalogReplicationPipelineTarget::Postgres {
+                connection: connection.clone(),
+                table: table.clone(),
+            }
+        }
     };
     let format = match definition.format() {
         SqlReplicationPipelineFormat::FloeJson => CatalogReplicationPipelineFormat::FloeJson,

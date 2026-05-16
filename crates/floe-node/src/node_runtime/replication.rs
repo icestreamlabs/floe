@@ -30,8 +30,9 @@ use floe_storage::{
 use rdkafka::ClientConfig;
 use rdkafka::client::ClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::Message;
+use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
+use tokio_postgres::types::ToSql;
 
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;
@@ -51,6 +52,13 @@ const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 const FLOE_JSON_VERSION: i64 = 1;
 const FLOE_JSON_DELETED_FIELD: &str = "__floe_deleted";
 const FLOE_JSON_VERSION_FIELD: &str = "__floe_version";
+const FLOE_HEADER_IDEMPOTENCY_KEY: &str = "floe-idempotency-key";
+const FLOE_HEADER_PIPELINE: &str = "floe-pipeline";
+const FLOE_HEADER_SOURCE: &str = "floe-source";
+const FLOE_HEADER_SOURCE_TABLE: &str = "floe-source-table";
+const FLOE_HEADER_SOURCE_POSITION: &str = "floe-source-position";
+const FLOE_HEADER_TRANSACTION_ID: &str = "floe-transaction-id";
+const FLOE_HEADER_RECORD_SEQUENCE: &str = "floe-record-sequence";
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
@@ -313,6 +321,7 @@ fn env_u64_limit(name: &str, default_value: u64) -> Option<u64> {
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<KafkaReplicationPipelineWriter>>,
+    postgres_writers_by_pipeline: HashMap<String, Arc<PostgresReplicationPipelineWriter>>,
     buffer_cleanup_last_by_pipeline: Mutex<HashMap<String, u64>>,
     replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
@@ -389,6 +398,14 @@ impl ReplicationPipelineStatusSnapshot {
 struct KafkaReplicationPipelineWriter {
     producer: ThreadedProducer<KafkaReplicationPipelineContext>,
     topic: String,
+}
+
+struct PostgresReplicationPipelineWriter {
+    connection: String,
+    target_table: String,
+    insert_sql: String,
+    delete_sql: String,
+    schema: CdcTableSchema,
 }
 
 #[derive(Clone)]
@@ -539,6 +556,7 @@ impl ReplicationPipelineRuntime {
         let mut pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>> =
             HashMap::new();
         let mut kafka_writers_by_pipeline = HashMap::new();
+        let mut postgres_writers_by_pipeline = HashMap::new();
 
         for plan in plans {
             match &plan.target {
@@ -552,6 +570,21 @@ impl ReplicationPipelineRuntime {
                         )?),
                     );
                 }
+                ReplicationPipelineRuntimeTarget::Postgres { connection, table } => {
+                    anyhow::ensure!(
+                        plan.format == ReplicationPipelineRuntimeFormat::FloeJson,
+                        "replication pipeline '{}' uses a Postgres target, which currently requires format = 'floe_json'",
+                        plan.name
+                    );
+                    postgres_writers_by_pipeline.insert(
+                        plan.name.clone(),
+                        Arc::new(PostgresReplicationPipelineWriter::new(
+                            connection,
+                            table,
+                            plan.schema.clone(),
+                        )?),
+                    );
+                }
             }
             pipelines_by_source
                 .entry(CdcSourceId::new(plan.source_name.clone())?)
@@ -562,6 +595,7 @@ impl ReplicationPipelineRuntime {
         Ok(Self {
             pipelines_by_source,
             kafka_writers_by_pipeline,
+            postgres_writers_by_pipeline,
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),
@@ -753,20 +787,7 @@ impl ReplicationPipelineRuntime {
                 0
             };
             if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
-                match &plan.target {
-                    ReplicationPipelineRuntimeTarget::Kafka { .. } => {
-                        let writer =
-                            self.kafka_writers_by_pipeline
-                                .get(&plan.name)
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "replication pipeline '{}' has no Kafka writer",
-                                        plan.name
-                                    )
-                                })?;
-                        writer.send_records(&buffered_records).await?;
-                    }
-                }
+                self.send_records_to_target(plan, &buffered_records).await?;
                 written = written.saturating_add(buffered_records.len());
                 log_replication_pipeline_perf(
                     plan,
@@ -971,22 +992,9 @@ impl ReplicationPipelineRuntime {
                         .unwrap_or(Duration::ZERO),
                 );
             } else {
-                match &plan.target {
-                    ReplicationPipelineRuntimeTarget::Kafka { .. } => {
-                        let writer =
-                            self.kafka_writers_by_pipeline
-                                .get(&plan.name)
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "replication pipeline '{}' has no Kafka writer",
-                                        plan.name
-                                    )
-                                })?;
-                        if let Err(err) = writer.send_records(&buffered_records).await {
-                            self.record_target_write_failure(plan, &err);
-                            return Err(err);
-                        }
-                    }
+                if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
+                    self.record_target_write_failure(plan, &err);
+                    return Err(err);
                 }
                 written = written.saturating_add(buffered_records.len());
                 log_replication_pipeline_perf(
@@ -1068,8 +1076,15 @@ impl ReplicationPipelineRuntime {
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
                     let encode_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
-                    let records =
+                    let mut records =
                         encode_floe_json_buffered_change_batches(plan, &plan.schema, &batches)?;
+                    add_replication_record_metadata(
+                        plan,
+                        manifest.source_position(),
+                        manifest.transaction_id(),
+                        &mut records,
+                        0,
+                    );
                     let encode_elapsed = encode_started_at
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
@@ -1290,6 +1305,20 @@ impl ReplicationPipelineRuntime {
                 target_state.insert("source.table".to_string(), plan.upstream_table.clone());
                 Ok(target_state)
             }
+            ReplicationPipelineRuntimeTarget::Postgres { .. } => {
+                let writer = self
+                    .postgres_writers_by_pipeline
+                    .get(&plan.name)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "replication pipeline '{}' has no Postgres writer",
+                            plan.name
+                        )
+                    })?;
+                let mut target_state = writer.send_records(records).await?;
+                target_state.insert("source.table".to_string(), plan.upstream_table.clone());
+                Ok(target_state)
+            }
         }
     }
 
@@ -1375,6 +1404,14 @@ impl ReplicationPipelineRuntime {
                     pipeline = %plan.name,
                     error = %err,
                     "replication pipeline target write failed; buffered transaction remains pending"
+                );
+            }
+            ReplicationPipelineRuntimeTarget::Postgres { .. } => {
+                crate::metrics::inc_sink_failure(&plan.name, "postgres_replication");
+                tracing::warn!(
+                    pipeline = %plan.name,
+                    error = %err,
+                    "replication pipeline Postgres target write failed; buffered transaction remains pending"
                 );
             }
         }
@@ -1615,6 +1652,19 @@ impl KafkaReplicationPipelineWriter {
             if let Some(value) = record.value() {
                 kafka_record = kafka_record.payload(value);
             }
+            if !record.headers().is_empty() {
+                let headers =
+                    record
+                        .headers()
+                        .iter()
+                        .fold(OwnedHeaders::new(), |headers, header| {
+                            headers.insert(Header {
+                                key: header.key(),
+                                value: Some(header.value()),
+                            })
+                        });
+                kafka_record = kafka_record.headers(headers);
+            }
 
             match self.producer.send(kafka_record) {
                 Ok(()) => return Ok(()),
@@ -1677,11 +1727,412 @@ impl KafkaReplicationPipelineWriter {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum PostgresParamValue {
+    Int64(Option<i64>),
+    Bool(Option<bool>),
+    Text(Option<String>),
+    Float64(Option<f64>),
+    Int32(Option<i32>),
+}
+
+impl PostgresParamValue {
+    fn null(data_type: &ColumnType) -> Self {
+        match data_type {
+            ColumnType::Int64 => Self::Int64(None),
+            ColumnType::Bool => Self::Bool(None),
+            ColumnType::Utf8 => Self::Text(None),
+            ColumnType::TimestampMillis => Self::Float64(None),
+            ColumnType::DateDays => Self::Int32(None),
+            ColumnType::Decimal128 { .. } | ColumnType::Numeric => Self::Text(None),
+        }
+    }
+
+    fn as_tosql(&self) -> &(dyn ToSql + Sync) {
+        match self {
+            Self::Int64(value) => value,
+            Self::Bool(value) => value,
+            Self::Text(value) => value,
+            Self::Float64(value) => value,
+            Self::Int32(value) => value,
+        }
+    }
+}
+
+impl PostgresReplicationPipelineWriter {
+    fn new(connection: &str, table: &str, schema: CdcTableSchema) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !connection.trim().is_empty(),
+            "replication Postgres connection cannot be empty"
+        );
+        let target_table = quote_postgres_qualified_name(table)?;
+        validate_floe_json_schema(&schema)?;
+        Ok(Self {
+            connection: connection.to_string(),
+            target_table,
+            insert_sql: postgres_upsert_sql(&schema, table)?,
+            delete_sql: postgres_delete_sql(&schema, table)?,
+            schema,
+        })
+    }
+
+    async fn send_records(
+        &self,
+        records: &[CdcBufferRecord],
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        if records.is_empty() {
+            return Ok(self.target_state(0));
+        }
+
+        let (mut client, connection) =
+            tokio_postgres::connect(self.connection.as_str(), tokio_postgres::NoTls)
+                .await
+                .context("connect replication pipeline Postgres target")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(
+                    error = %err,
+                    "replication pipeline Postgres target connection failed"
+                );
+            }
+        });
+
+        let transaction = client
+            .transaction()
+            .await
+            .context("start replication pipeline Postgres target transaction")?;
+        for record in records {
+            self.apply_record(&transaction, record).await?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit replication pipeline Postgres target transaction")?;
+        Ok(self.target_state(records.len()))
+    }
+
+    async fn apply_record(
+        &self,
+        transaction: &tokio_postgres::Transaction<'_>,
+        record: &CdcBufferRecord,
+    ) -> anyhow::Result<()> {
+        let value = parse_floe_json_record_value(record)?;
+        let deleted = value
+            .get(FLOE_JSON_DELETED_FIELD)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if deleted {
+            let key = parse_floe_json_record_key(record).unwrap_or_else(|_| value.clone());
+            let params = postgres_key_params_from_json(&self.schema, &key)?;
+            let refs = params
+                .iter()
+                .map(PostgresParamValue::as_tosql)
+                .collect::<Vec<_>>();
+            transaction
+                .execute(&self.delete_sql, &refs)
+                .await
+                .with_context(|| {
+                    format!(
+                        "delete CDC row from replication pipeline Postgres target {}",
+                        self.target_table
+                    )
+                })?;
+            return Ok(());
+        }
+
+        let params = postgres_row_params_from_json(&self.schema, &value)?;
+        let refs = params
+            .iter()
+            .map(PostgresParamValue::as_tosql)
+            .collect::<Vec<_>>();
+        transaction
+            .execute(&self.insert_sql, &refs)
+            .await
+            .with_context(|| {
+                format!(
+                    "upsert CDC row into replication pipeline Postgres target {}",
+                    self.target_table
+                )
+            })?;
+        Ok(())
+    }
+
+    fn target_state(&self, records: usize) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("postgres.table".to_string(), self.target_table.clone()),
+            ("postgres.records_applied".to_string(), records.to_string()),
+        ])
+    }
+}
+
 fn is_kafka_queue_full(err: &KafkaError) -> bool {
     matches!(
         err,
         KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull)
     )
+}
+
+fn parse_floe_json_record_value(
+    record: &CdcBufferRecord,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let value = record
+        .value()
+        .ok_or_else(|| anyhow!("Floe JSON Postgres target record is missing a value"))?;
+    let value = serde_json::from_slice::<serde_json::Value>(value)
+        .context("parse Floe JSON Postgres target record value")?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("Floe JSON Postgres target record value must be an object"))
+}
+
+fn parse_floe_json_record_key(
+    record: &CdcBufferRecord,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let key = record
+        .key()
+        .ok_or_else(|| anyhow!("Floe JSON Postgres target record is missing a key"))?;
+    let key = serde_json::from_slice::<serde_json::Value>(key)
+        .context("parse Floe JSON Postgres target record key")?;
+    key.as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("Floe JSON Postgres target record key must be an object"))
+}
+
+fn postgres_row_params_from_json(
+    schema: &CdcTableSchema,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Vec<PostgresParamValue>> {
+    schema
+        .columns()
+        .iter()
+        .map(|column| postgres_param_from_json(column, object.get(column.name())))
+        .collect()
+}
+
+fn postgres_key_params_from_json(
+    schema: &CdcTableSchema,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Vec<PostgresParamValue>> {
+    schema
+        .primary_key()
+        .columns()
+        .iter()
+        .map(|column_name| {
+            let column = schema
+                .columns()
+                .iter()
+                .find(|column| column.name() == column_name)
+                .ok_or_else(|| {
+                    anyhow!("CDC primary-key column '{column_name}' missing from schema")
+                })?;
+            postgres_param_from_json(column, object.get(column.name()))
+        })
+        .collect()
+}
+
+fn postgres_param_from_json(
+    column: &CdcColumn,
+    value: Option<&serde_json::Value>,
+) -> anyhow::Result<PostgresParamValue> {
+    let Some(value) = value else {
+        anyhow::ensure!(
+            column.nullable(),
+            "CDC column '{}' is required for Postgres target",
+            column.name()
+        );
+        return Ok(PostgresParamValue::null(column.data_type()));
+    };
+    if value.is_null() {
+        anyhow::ensure!(
+            column.nullable(),
+            "CDC column '{}' cannot be NULL for Postgres target",
+            column.name()
+        );
+        return Ok(PostgresParamValue::null(column.data_type()));
+    }
+    match column.data_type() {
+        ColumnType::Int64 => Ok(PostgresParamValue::Int64(Some(json_i64(
+            column.name(),
+            value,
+        )?))),
+        ColumnType::Bool => Ok(PostgresParamValue::Bool(Some(json_bool(
+            column.name(),
+            value,
+        )?))),
+        ColumnType::Utf8 => Ok(PostgresParamValue::Text(Some(json_string(
+            column.name(),
+            value,
+        )?))),
+        ColumnType::TimestampMillis => Ok(PostgresParamValue::Float64(Some(json_i64(
+            column.name(),
+            value,
+        )? as f64))),
+        ColumnType::DateDays => Ok(PostgresParamValue::Int32(Some(json_i32(
+            column.name(),
+            value,
+        )?))),
+        ColumnType::Decimal128 { scale, .. } => {
+            let text = if let Some(value) = value.as_str() {
+                value.to_string()
+            } else {
+                format_decimal128_for_json(i128::from(json_i64(column.name(), value)?), *scale)
+            };
+            Ok(PostgresParamValue::Text(Some(text)))
+        }
+        ColumnType::Numeric => Ok(PostgresParamValue::Text(Some(json_scalar_string(
+            column.name(),
+            value,
+        )?))),
+    }
+}
+
+fn json_i64(column: &str, value: &serde_json::Value) -> anyhow::Result<i64> {
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .parse::<i64>()
+            .with_context(|| format!("parse CDC column '{column}' as i64"));
+    }
+    Err(anyhow!("CDC column '{column}' must be an integer"))
+}
+
+fn json_i32(column: &str, value: &serde_json::Value) -> anyhow::Result<i32> {
+    let value = json_i64(column, value)?;
+    i32::try_from(value).with_context(|| format!("CDC column '{column}' exceeds i32 range"))
+}
+
+fn json_bool(column: &str, value: &serde_json::Value) -> anyhow::Result<bool> {
+    if let Some(value) = value.as_bool() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .parse::<bool>()
+            .with_context(|| format!("parse CDC column '{column}' as bool"));
+    }
+    Err(anyhow!("CDC column '{column}' must be a boolean"))
+}
+
+fn json_string(column: &str, value: &serde_json::Value) -> anyhow::Result<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("CDC column '{column}' must be a string"))
+}
+
+fn json_scalar_string(column: &str, value: &serde_json::Value) -> anyhow::Result<String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        _ => Err(anyhow!("CDC column '{column}' must be a scalar value")),
+    }
+}
+
+fn postgres_upsert_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<String> {
+    let table = quote_postgres_qualified_name(table)?;
+    let columns = schema
+        .columns()
+        .iter()
+        .map(|column| quote_postgres_ident(column.name()))
+        .collect::<Vec<_>>();
+    let values = schema
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| postgres_value_expr(idx + 1, column.data_type()))
+        .collect::<Vec<_>>();
+    let primary_keys = schema
+        .primary_key()
+        .columns()
+        .iter()
+        .map(|column| quote_postgres_ident(column))
+        .collect::<Vec<_>>();
+    let primary_key_names = schema
+        .primary_key()
+        .columns()
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let updates = schema
+        .columns()
+        .iter()
+        .filter(|column| !primary_key_names.contains(column.name()))
+        .map(|column| {
+            let quoted = quote_postgres_ident(column.name());
+            format!("{quoted} = EXCLUDED.{quoted}")
+        })
+        .collect::<Vec<_>>();
+    let conflict_action = if updates.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        format!("DO UPDATE SET {}", updates.join(", "))
+    };
+    Ok(format!(
+        "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT ({}) {conflict_action}",
+        columns.join(", "),
+        values.join(", "),
+        primary_keys.join(", ")
+    ))
+}
+
+fn postgres_delete_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<String> {
+    let table = quote_postgres_qualified_name(table)?;
+    let predicates = schema
+        .primary_key()
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, column_name)| {
+            let column = schema
+                .columns()
+                .iter()
+                .find(|column| column.name() == column_name)
+                .ok_or_else(|| {
+                    anyhow!("CDC primary-key column '{column_name}' missing from schema")
+                })?;
+            Ok(format!(
+                "{} = {}",
+                quote_postgres_ident(column.name()),
+                postgres_value_expr(idx + 1, column.data_type())
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(format!(
+        "DELETE FROM {table} WHERE {}",
+        predicates.join(" AND ")
+    ))
+}
+
+fn postgres_value_expr(param_idx: usize, data_type: &ColumnType) -> String {
+    match data_type {
+        ColumnType::TimestampMillis => {
+            format!("to_timestamp(${param_idx}::double precision / 1000.0)")
+        }
+        ColumnType::DateDays => format!("DATE '1970-01-01' + ${param_idx}::integer"),
+        ColumnType::Decimal128 { .. } | ColumnType::Numeric => {
+            format!("${param_idx}::numeric")
+        }
+        ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => format!("${param_idx}"),
+    }
+}
+
+fn quote_postgres_qualified_name(name: &str) -> anyhow::Result<String> {
+    let parts = name
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(quote_postgres_ident)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!parts.is_empty(), "Postgres target table cannot be empty");
+    Ok(parts.join("."))
+}
+
+fn quote_postgres_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 async fn append_buffer_transaction(
@@ -1775,15 +2226,83 @@ fn encode_pipeline_transaction_records(
         )
     })?;
     let mut records = Vec::new();
+    let mut next_sequence = 0usize;
     for change_batch in matching_batches {
-        records.extend(encode_pipeline_buffer_records(
+        let mut batch_records =
+            encode_pipeline_buffer_records(plan, schema, change_batch, transaction)?;
+        add_replication_record_metadata(
             plan,
-            schema,
-            change_batch,
-            transaction,
-        )?);
+            transaction.commit_position(),
+            transaction.transaction_id(),
+            &mut batch_records,
+            next_sequence,
+        );
+        next_sequence = next_sequence.saturating_add(batch_records.len());
+        records.extend(batch_records);
     }
     Ok(records)
+}
+
+fn add_replication_record_metadata(
+    plan: &ReplicationPipelineRuntimePlan,
+    source_position: &CdcSourcePosition,
+    transaction_id: Option<&CdcTransactionId>,
+    records: &mut [CdcBufferRecord],
+    start_sequence: usize,
+) {
+    let source_position = source_position_key(source_position);
+    let transaction_id = transaction_id.map(|id| id.as_str().to_string());
+    for (idx, record) in records.iter_mut().enumerate() {
+        let sequence = start_sequence.saturating_add(idx);
+        let idempotency_key = replication_record_idempotency_key(
+            plan,
+            &source_position,
+            transaction_id.as_deref(),
+            sequence,
+        );
+        let mut enriched = std::mem::replace(record, CdcBufferRecord::new(None, None));
+        enriched = enriched
+            .with_header(FLOE_HEADER_IDEMPOTENCY_KEY, idempotency_key.into_bytes())
+            .with_header(FLOE_HEADER_PIPELINE, plan.name.as_bytes().to_vec())
+            .with_header(FLOE_HEADER_SOURCE, plan.source_name.as_bytes().to_vec())
+            .with_header(
+                FLOE_HEADER_SOURCE_TABLE,
+                plan.upstream_table.as_bytes().to_vec(),
+            )
+            .with_header(
+                FLOE_HEADER_SOURCE_POSITION,
+                source_position.as_bytes().to_vec(),
+            )
+            .with_header(
+                FLOE_HEADER_RECORD_SEQUENCE,
+                sequence.to_string().into_bytes(),
+            );
+        if let Some(transaction_id) = transaction_id.as_deref() {
+            enriched = enriched.with_header(
+                FLOE_HEADER_TRANSACTION_ID,
+                transaction_id.as_bytes().to_vec(),
+            );
+        }
+        *record = enriched;
+    }
+}
+
+fn replication_record_idempotency_key(
+    plan: &ReplicationPipelineRuntimePlan,
+    source_position: &str,
+    transaction_id: Option<&str>,
+    sequence: usize,
+) -> String {
+    match transaction_id {
+        Some(transaction_id) => format!(
+            "{}/{}/{}/{sequence}",
+            plan.name, plan.upstream_table, transaction_id
+        ),
+        None => format!(
+            "{}/{}/{source_position}/{sequence}",
+            plan.name, plan.upstream_table
+        ),
+    }
 }
 
 fn chunk_snapshot_transaction(
@@ -3041,6 +3560,7 @@ fn base_target_state(
 fn target_kind(plan: &ReplicationPipelineRuntimePlan) -> &'static str {
     match &plan.target {
         ReplicationPipelineRuntimeTarget::Kafka { .. } => "kafka",
+        ReplicationPipelineRuntimeTarget::Postgres { .. } => "postgres",
     }
 }
 
@@ -3196,7 +3716,10 @@ fn log_replication_replay_delivery_perf(
 
 fn estimated_buffer_payload_bytes(records: &[CdcBufferRecord]) -> usize {
     records.iter().fold(16usize, |bytes, record| {
-        bytes.saturating_add(16).saturating_add(record.byte_len())
+        bytes
+            .saturating_add(24)
+            .saturating_add(record.byte_len())
+            .saturating_add(record.headers().len().saturating_mul(16))
     })
 }
 
@@ -3480,6 +4003,86 @@ mod tests {
     }
 
     #[test]
+    fn postgres_target_writer_builds_upsert_and_delete_sql() {
+        let schema = CdcTableSchema::new(
+            CdcTableId::new("orders").unwrap(),
+            UpstreamTableRef::new("public", "orders").unwrap(),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).unwrap(),
+                CdcColumn::new("status", ColumnType::Utf8, true).unwrap(),
+                CdcColumn::new("order_date", ColumnType::DateDays, true).unwrap(),
+                CdcColumn::new(
+                    "amount",
+                    ColumnType::decimal128(12, 2).expect("decimal type"),
+                    true,
+                )
+                .unwrap(),
+            ],
+            CdcPrimaryKey::new(["id"]).unwrap(),
+        )
+        .unwrap();
+        let writer = PostgresReplicationPipelineWriter::new(
+            "postgres://postgres:postgres@localhost/postgres",
+            "public.orders_copy",
+            schema,
+        )
+        .expect("writer");
+
+        assert_eq!(
+            writer.insert_sql,
+            "INSERT INTO \"public\".\"orders_copy\" (\"id\", \"status\", \"order_date\", \"amount\") VALUES ($1, $2, DATE '1970-01-01' + $3::integer, $4::numeric) ON CONFLICT (\"id\") DO UPDATE SET \"status\" = EXCLUDED.\"status\", \"order_date\" = EXCLUDED.\"order_date\", \"amount\" = EXCLUDED.\"amount\""
+        );
+        assert_eq!(
+            writer.delete_sql,
+            "DELETE FROM \"public\".\"orders_copy\" WHERE \"id\" = $1"
+        );
+    }
+
+    #[test]
+    fn postgres_target_params_decode_floe_json_records() {
+        let schema = CdcTableSchema::new(
+            CdcTableId::new("orders").unwrap(),
+            UpstreamTableRef::new("public", "orders").unwrap(),
+            vec![
+                CdcColumn::new("id", ColumnType::Int64, false).unwrap(),
+                CdcColumn::new("status", ColumnType::Utf8, true).unwrap(),
+                CdcColumn::new("order_date", ColumnType::DateDays, true).unwrap(),
+                CdcColumn::new(
+                    "amount",
+                    ColumnType::decimal128(12, 2).expect("decimal type"),
+                    true,
+                )
+                .unwrap(),
+            ],
+            CdcPrimaryKey::new(["id"]).unwrap(),
+        )
+        .unwrap();
+        let record = CdcBufferRecord::new(
+            Some(br#"{"id":7}"#.to_vec()),
+            Some(
+                br#"{"id":7,"status":"open","order_date":19358,"amount":"123.45","__floe_deleted":false,"__floe_version":1}"#
+                    .to_vec(),
+            ),
+        );
+        let value = parse_floe_json_record_value(&record).expect("value");
+        let key = parse_floe_json_record_key(&record).expect("key");
+
+        assert_eq!(
+            postgres_row_params_from_json(&schema, &value).expect("row params"),
+            vec![
+                PostgresParamValue::Int64(Some(7)),
+                PostgresParamValue::Text(Some("open".to_string())),
+                PostgresParamValue::Int32(Some(19358)),
+                PostgresParamValue::Text(Some("123.45".to_string())),
+            ]
+        );
+        assert_eq!(
+            postgres_key_params_from_json(&schema, &key).expect("key params"),
+            vec![PostgresParamValue::Int64(Some(7))]
+        );
+    }
+
+    #[test]
     fn pipeline_arrow_ipc_records_encode_batches_without_json() {
         let plan = ReplicationPipelineRuntimePlan {
             name: "p".to_string(),
@@ -3725,6 +4328,61 @@ mod tests {
         assert_eq!(first_order["id"], 1);
         assert_eq!(second_order["id"], 2);
         assert_eq!(customer["id"], 9);
+    }
+
+    #[test]
+    fn pipeline_transaction_records_include_idempotency_headers() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let schemas = HashMap::from([(table_id.clone(), schema(table_id.clone()))]);
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![
+                        CdcChange::Insert {
+                            row: row(1, "open"),
+                        },
+                        CdcChange::Insert {
+                            row: row(2, "paid"),
+                        },
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let records = encode_pipeline_transaction_records(&plan, &schemas, &transaction).unwrap();
+
+        assert_eq!(
+            header_value(&records[0], FLOE_HEADER_IDEMPOTENCY_KEY),
+            Some("orders_pipe/public.orders/pg-xid-77/0")
+        );
+        assert_eq!(
+            header_value(&records[1], FLOE_HEADER_IDEMPOTENCY_KEY),
+            Some("orders_pipe/public.orders/pg-xid-77/1")
+        );
+        assert_eq!(
+            header_value(&records[0], FLOE_HEADER_SOURCE_POSITION),
+            Some("pg/0/16B6C50")
+        );
+        assert_eq!(
+            header_value(&records[0], FLOE_HEADER_TRANSACTION_ID),
+            Some("pg-xid-77")
+        );
+        assert_eq!(
+            header_value(&records[0], FLOE_HEADER_RECORD_SEQUENCE),
+            Some("0")
+        );
+        assert_eq!(
+            header_value(&records[0], FLOE_HEADER_SOURCE_TABLE),
+            Some("public.orders")
+        );
     }
 
     #[test]
@@ -4077,7 +4735,7 @@ mod tests {
             CdcBufferRecord::new(None, Some(vec![5, 6])),
         ];
 
-        assert_eq!(estimated_buffer_payload_bytes(&records), 54);
+        assert_eq!(estimated_buffer_payload_bytes(&records), 70);
     }
 
     #[test]
@@ -4150,6 +4808,7 @@ mod tests {
                 vec![plan],
             )]),
             kafka_writers_by_pipeline: HashMap::new(),
+            postgres_writers_by_pipeline: HashMap::new(),
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),
@@ -4162,5 +4821,13 @@ mod tests {
             Some(RowValue::Utf8(status.to_string())),
         ])
         .unwrap()
+    }
+
+    fn header_value<'a>(record: &'a CdcBufferRecord, key: &str) -> Option<&'a str> {
+        record
+            .headers()
+            .iter()
+            .find(|header| header.key() == key)
+            .and_then(|header| std::str::from_utf8(header.value()).ok())
     }
 }
