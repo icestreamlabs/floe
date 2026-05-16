@@ -4693,6 +4693,121 @@ mod tests {
         assert_eq!(pipeline.target_state["target.delivery.status"], "delivered");
     }
 
+    #[tokio::test]
+    async fn durable_pipeline_buffers_source_progress_when_target_is_down() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let runtime = test_runtime_with_plan(plan.clone());
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
+        let source_id = CdcSourceId::new("pg_main").unwrap();
+        let first = TransactionBatch::new(
+            source_id.clone(),
+            Some(CdcTransactionId::new("pg-xid-101").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let second = TransactionBatch::new(
+            source_id.clone(),
+            Some(CdcTransactionId::new("pg-xid-102").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6D00", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(2, "paid"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .run_transaction(&source_id, &schemas, &first, Some(&storage))
+                .await
+                .expect("buffer first transaction"),
+            1
+        );
+        assert_eq!(
+            runtime
+                .run_transaction(&source_id, &schemas, &second, Some(&storage))
+                .await
+                .expect("buffer second transaction"),
+            1
+        );
+
+        let buffer_store = storage.cdc_buffer_store();
+        let pending = buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending transactions");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].source_position(), first.commit_position());
+        assert_eq!(pending[1].source_position(), second.commit_position());
+
+        let source_frontier = buffer_store
+            .source_frontier(&plan.name)
+            .await
+            .expect("source frontier")
+            .expect("source frontier");
+        assert_eq!(source_frontier.source_position(), second.commit_position());
+        assert_eq!(
+            source_frontier
+                .transaction_id()
+                .map(CdcTransactionId::as_str),
+            Some("pg-xid-102")
+        );
+        assert_eq!(
+            buffer_store
+                .delivery_frontier(&plan.name)
+                .await
+                .expect("delivery frontier"),
+            None
+        );
+
+        let checkpoint = storage
+            .replication_pipeline_checkpoint(&plan.name)
+            .await
+            .expect("checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.source_position(), first.commit_position());
+        assert_eq!(
+            checkpoint.target_state()["target.delivery.status"],
+            "failed"
+        );
+        assert_eq!(
+            checkpoint.target_state()["target.delivery.replay_may_duplicate"],
+            "true"
+        );
+
+        let restarted = test_runtime_with_plan(plan.clone());
+        assert_eq!(
+            restarted
+                .replay_buffered(&storage)
+                .await
+                .expect("replay buffered transactions"),
+            0
+        );
+        let still_pending = buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending after restart replay");
+        assert_eq!(still_pending.len(), 2);
+    }
+
     #[test]
     fn buffer_limit_violation_accounts_for_incoming_payload_bytes() {
         let limits = ReplicationBufferLimits {
