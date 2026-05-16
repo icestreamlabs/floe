@@ -6,16 +6,24 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use floe_cdc_core::{
+    CdcChange, CdcColumn, CdcPrimaryKey, CdcRow, CdcSourcePosition, CdcTableId, CdcTableSchema,
+    CdcTransactionId, UpstreamTableRef,
+};
+use floe_core::{RowValue, catalog::ColumnType};
 use floe_executor::FloeQueryContext;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::checkpoint::SinkCursor;
 use floe_executor::tail::{TailBatch, TailParams, execute_tail, is_tail_canceled_error};
+use floe_node_core::debezium_encoder::{
+    DebeziumEncodeContext, DebeziumEnvelopeConfig, encode_debezium_change,
+};
 use futures::StreamExt;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -171,9 +179,25 @@ impl SinkQueueTracker {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SinkEncoding {
+    Json,
+    Debezium(DebeziumSinkEncoding),
+}
+
+#[derive(Debug, Clone)]
+struct DebeziumSinkEncoding {
+    source_name: String,
+    database_name: String,
+    schema_name: String,
+    table_name: String,
+    key_columns: Vec<String>,
+}
+
 struct SinkRecord {
     version: i64,
     row_idx: u64,
+    key: Option<String>,
     json: serde_json::Value,
     payload: String,
     byte_len: usize,
@@ -257,6 +281,8 @@ async fn run_sink(
             brokers,
             topic,
             mv,
+            format,
+            key_columns,
             with_snapshot,
             as_of,
             batch_rows,
@@ -270,6 +296,8 @@ async fn run_sink(
             checkpoint_partition,
             ..
         } => {
+            let encoding =
+                kafka_sink_encoding(&sink.name, &mv, format.as_deref(), key_columns.as_deref())?;
             let batch_policy = BatchPolicy::new(
                 batch_rows.unwrap_or(DEFAULT_BATCH_ROWS),
                 batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES),
@@ -297,6 +325,7 @@ async fn run_sink(
                 transactional_id,
                 checkpoint_topic,
                 checkpoint_partition,
+                encoding,
             )
             .await
         }
@@ -376,9 +405,18 @@ async fn run_sink(
     }
 }
 async fn stream_tail_into_queue(
+    stream: impl futures::Stream<Item = Result<TailBatch>> + Unpin,
+    sender: mpsc::Sender<SinkEvent>,
+    tracker: Arc<SinkQueueTracker>,
+) -> Result<()> {
+    stream_tail_into_queue_with_encoding(stream, sender, tracker, SinkEncoding::Json).await
+}
+
+async fn stream_tail_into_queue_with_encoding(
     mut stream: impl futures::Stream<Item = Result<TailBatch>> + Unpin,
     sender: mpsc::Sender<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
+    encoding: SinkEncoding,
 ) -> Result<()> {
     while let Some(batch) = stream.next().await {
         let batch_start = Instant::now();
@@ -396,18 +434,7 @@ async fn stream_tail_into_queue(
             );
         }
         let convert_start = Instant::now();
-        let mut rows = Vec::with_capacity(batch.batch.num_rows());
-        for row_idx in 0..batch.batch.num_rows() {
-            let json = tail_row_to_json(&batch, row_idx, &schema)?;
-            let payload = serde_json::to_string(&json).context("serialize sink row")?;
-            rows.push(SinkRecord {
-                version,
-                row_idx: u64::try_from(row_idx).unwrap_or(u64::MAX),
-                json,
-                byte_len: payload.len(),
-                payload,
-            });
-        }
+        let rows = encode_tail_batch_for_sink(&batch, &schema, &encoding)?;
         let convert_latency_ms = convert_start.elapsed().as_millis() as u64;
         let enqueue_start = Instant::now();
         if !rows.is_empty() {
@@ -441,6 +468,122 @@ async fn stream_tail_into_queue(
     Ok(())
 }
 
+fn kafka_sink_encoding(
+    sink_name: &str,
+    mv_name: &str,
+    format: Option<&str>,
+    key_columns: Option<&[String]>,
+) -> Result<SinkEncoding> {
+    let Some(format) = format else {
+        return Ok(SinkEncoding::Json);
+    };
+    match format.to_ascii_lowercase().replace('-', "_").as_str() {
+        "json" => Ok(SinkEncoding::Json),
+        "debezium_json" => {
+            let key_columns = key_columns
+                .filter(|columns| !columns.is_empty())
+                .ok_or_else(|| anyhow!("Kafka Debezium sink '{sink_name}' requires key_columns"))?
+                .to_vec();
+            Ok(SinkEncoding::Debezium(DebeziumSinkEncoding {
+                source_name: sink_name.to_string(),
+                database_name: "floe".to_string(),
+                schema_name: "public".to_string(),
+                table_name: mv_name.to_string(),
+                key_columns,
+            }))
+        }
+        other => bail!("unsupported Kafka sink format '{other}'"),
+    }
+}
+
+fn encode_tail_batch_for_sink(
+    batch: &TailBatch,
+    schema: &SchemaRef,
+    encoding: &SinkEncoding,
+) -> Result<Vec<SinkRecord>> {
+    match encoding {
+        SinkEncoding::Json => encode_tail_batch_as_json(batch, schema),
+        SinkEncoding::Debezium(config) => encode_tail_batch_as_debezium(batch, schema, config),
+    }
+}
+
+fn encode_tail_batch_as_json(batch: &TailBatch, schema: &SchemaRef) -> Result<Vec<SinkRecord>> {
+    let mut rows = Vec::with_capacity(batch.batch.num_rows());
+    for row_idx in 0..batch.batch.num_rows() {
+        let json = tail_row_to_json(batch, row_idx, schema)?;
+        let payload = serde_json::to_string(&json).context("serialize sink row")?;
+        rows.push(SinkRecord {
+            version: batch.version,
+            row_idx: u64::try_from(row_idx).unwrap_or(u64::MAX),
+            key: None,
+            json,
+            byte_len: payload.len(),
+            payload,
+        });
+    }
+    Ok(rows)
+}
+
+fn encode_tail_batch_as_debezium(
+    batch: &TailBatch,
+    schema: &SchemaRef,
+    config: &DebeziumSinkEncoding,
+) -> Result<Vec<SinkRecord>> {
+    let cdc_schema = cdc_schema_from_tail_schema(schema, config)?;
+    let envelope_config =
+        DebeziumEnvelopeConfig::new(&config.source_name)?.with_database_name(&config.database_name);
+    let source_position =
+        CdcSourcePosition::opaque(format!("mv/{}/{}", config.table_name, batch.version))?;
+    let transaction_id =
+        CdcTransactionId::new(format!("mv-{}-{}", config.table_name, batch.version))?;
+    let mut rows = Vec::with_capacity(batch.batch.num_rows());
+    for row_idx in 0..batch.batch.num_rows() {
+        let row = cdc_row_from_tail_batch(batch, row_idx, &cdc_schema)?;
+        let op = batch.ops.get(row_idx).copied().unwrap_or(1);
+        let change = if op < 0 {
+            CdcChange::Delete {
+                key: None,
+                before: Some(row),
+            }
+        } else {
+            CdcChange::Insert { row }
+        };
+        let records = encode_debezium_change(
+            &cdc_schema,
+            &change,
+            &envelope_config,
+            DebeziumEncodeContext {
+                source_position: Some(&source_position),
+                transaction_id: Some(&transaction_id),
+                sequence: Some(u64::try_from(row_idx).unwrap_or(u64::MAX)),
+                ts_ms: tail_row_time_ms(batch, row_idx),
+            },
+        )?;
+        for record in records {
+            let Some(value_bytes) = record.value_json_bytes()? else {
+                continue;
+            };
+            let key = record
+                .key_json_bytes()?
+                .map(String::from_utf8)
+                .transpose()
+                .context("Debezium Kafka key must be UTF-8 JSON")?;
+            let payload = String::from_utf8(value_bytes)
+                .context("Debezium Kafka value must be UTF-8 JSON")?;
+            let byte_len = payload.len() + key.as_ref().map(String::len).unwrap_or(0);
+            rows.push(SinkRecord {
+                version: batch.version,
+                row_idx: u64::try_from(row_idx).unwrap_or(u64::MAX),
+                key,
+                json: record.value().cloned().unwrap_or(serde_json::Value::Null),
+                byte_len,
+                payload,
+            });
+        }
+    }
+    Ok(rows)
+}
+
 fn publish_sink_cursor(
     checkpoint_tx: &Option<mpsc::UnboundedSender<SinkCursor>>,
     cursor: SinkCursor,
@@ -455,6 +598,217 @@ fn current_unix_time_ms() -> u64 {
         Ok(duration) => duration.as_millis().try_into().unwrap_or(u64::MAX),
         Err(_) => 0,
     }
+}
+
+fn tail_row_time_ms(batch: &TailBatch, row_idx: usize) -> Option<i64> {
+    batch
+        .times
+        .get(row_idx)
+        .copied()
+        .flatten()
+        .map(|micros| micros / 1_000)
+}
+
+fn cdc_schema_from_tail_schema(
+    schema: &SchemaRef,
+    config: &DebeziumSinkEncoding,
+) -> Result<CdcTableSchema> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let is_key = config
+                .key_columns
+                .iter()
+                .any(|column| column == field.name());
+            CdcColumn::new(
+                field.name().clone(),
+                column_type_from_arrow(field.data_type())?,
+                field.is_nullable() && !is_key,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    CdcTableSchema::new(
+        CdcTableId::new(&config.table_name)?,
+        UpstreamTableRef::new(&config.schema_name, &config.table_name)?,
+        columns,
+        CdcPrimaryKey::new(config.key_columns.clone())?,
+    )
+}
+
+fn column_type_from_arrow(data_type: &DataType) -> Result<ColumnType> {
+    match data_type {
+        DataType::Boolean => Ok(ColumnType::Bool),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Ok(ColumnType::Int64),
+        DataType::Float32 | DataType::Float64 => Ok(ColumnType::Numeric),
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(ColumnType::Utf8),
+        DataType::Timestamp(_, _) => Ok(ColumnType::TimestampMillis),
+        DataType::Date32 => Ok(ColumnType::DateDays),
+        DataType::Decimal128(precision, scale) => ColumnType::decimal128(*precision, *scale),
+        other => bail!("unsupported Debezium Kafka sink column type: {other:?}"),
+    }
+}
+
+fn cdc_row_from_tail_batch(
+    batch: &TailBatch,
+    row_idx: usize,
+    schema: &CdcTableSchema,
+) -> Result<CdcRow> {
+    let mut values = Vec::with_capacity(schema.columns().len());
+    for (column_idx, column) in schema.columns().iter().enumerate() {
+        values.push(arrow_value_to_row_value(
+            batch.batch.column(column_idx).as_ref(),
+            row_idx,
+            column.data_type(),
+        )?);
+    }
+    CdcRow::new(values)
+}
+
+fn arrow_value_to_row_value(
+    array: &dyn Array,
+    row_idx: usize,
+    data_type: &ColumnType,
+) -> Result<Option<RowValue>> {
+    if array.is_null(row_idx) {
+        return Ok(None);
+    }
+    match data_type {
+        ColumnType::Int64 => Ok(Some(RowValue::Int64(arrow_i64_value(array, row_idx)?))),
+        ColumnType::Bool => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("Debezium sink Boolean column has incompatible Arrow type")?;
+            Ok(Some(RowValue::Bool(values.value(row_idx))))
+        }
+        ColumnType::Utf8 => Ok(Some(RowValue::Utf8(arrow_string_value(array, row_idx)?))),
+        ColumnType::TimestampMillis => Ok(Some(RowValue::TimestampMillis(
+            arrow_timestamp_millis_value(array, row_idx)?,
+        ))),
+        ColumnType::DateDays => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .context("Debezium sink DateDays column has incompatible Arrow type")?;
+            Ok(Some(RowValue::DateDays(values.value(row_idx))))
+        }
+        ColumnType::Decimal128 { .. } => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .context("Debezium sink Decimal128 column has incompatible Arrow type")?;
+            Ok(Some(RowValue::Decimal128(values.value(row_idx))))
+        }
+        ColumnType::Numeric => Ok(Some(RowValue::Numeric(arrow_numeric_string_value(
+            array, row_idx,
+        )?))),
+    }
+}
+
+fn arrow_i64_value(array: &dyn Array, row_idx: usize) -> Result<i64> {
+    if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(values.value(row_idx));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(i64::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return i64::try_from(values.value(row_idx))
+            .context("Debezium sink UInt64 value does not fit in Int64");
+    }
+    bail!(
+        "Debezium sink Int64 column has incompatible Arrow type: {:?}",
+        array.data_type()
+    )
+}
+
+fn arrow_string_value(array: &dyn Array, row_idx: usize) -> Result<String> {
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    bail!(
+        "Debezium sink Utf8 column has incompatible Arrow type: {:?}",
+        array.data_type()
+    )
+}
+
+fn arrow_timestamp_millis_value(array: &dyn Array, row_idx: usize) -> Result<i64> {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .context("Debezium sink timestamp column has incompatible Arrow type")?;
+            Ok(values.value(row_idx).saturating_mul(1_000))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .context("Debezium sink timestamp column has incompatible Arrow type")?;
+            Ok(values.value(row_idx))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("Debezium sink timestamp column has incompatible Arrow type")?;
+            Ok(values.value(row_idx) / 1_000)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context("Debezium sink timestamp column has incompatible Arrow type")?;
+            Ok(values.value(row_idx) / 1_000_000)
+        }
+        other => bail!("Debezium sink timestamp column has incompatible Arrow type: {other:?}"),
+    }
+}
+
+fn arrow_numeric_string_value(array: &dyn Array, row_idx: usize) -> Result<String> {
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(values.value(row_idx).to_string());
+    }
+    bail!(
+        "Debezium sink Numeric column has incompatible Arrow type: {:?}",
+        array.data_type()
+    )
 }
 
 fn tail_row_to_json(
@@ -543,11 +897,37 @@ fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
     if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
         return Ok(serde_json::Value::from(values.value(row_idx)));
     }
+    if let Some(values) = array.as_any().downcast_ref::<Date32Array>() {
+        return Ok(serde_json::Value::from(values.value(row_idx)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+        let scale = match values.data_type() {
+            DataType::Decimal128(_, scale) => *scale,
+            _ => 0,
+        };
+        return Ok(serde_json::Value::String(format_decimal128(
+            values.value(row_idx),
+            scale,
+        )));
+    }
 
     bail!(
         "unsupported sink column type for JSON conversion: {:?}",
         array.data_type()
     )
+}
+
+fn format_decimal128(value: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return value.to_string();
+    }
+    let scale = scale as u32;
+    let factor = 10_i128.pow(scale);
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.abs();
+    let whole = magnitude / factor;
+    let fraction = magnitude % factor;
+    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
 #[cfg(test)]
 mod tests {
@@ -556,6 +936,8 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -582,11 +964,74 @@ mod tests {
     }
 
     #[test]
+    fn debezium_mv_sink_encoding_builds_kafka_key_and_envelope() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("open"), Some("closed")])),
+            ],
+        )
+        .expect("record batch");
+        let tail = TailBatch {
+            version: 42,
+            batch,
+            ops: vec![1, -1],
+            times: vec![Some(1_234_000), Some(1_235_000)],
+        };
+        let rows = encode_tail_batch_as_debezium(
+            &tail,
+            &schema,
+            &DebeziumSinkEncoding {
+                source_name: "orders_sink".to_string(),
+                database_name: "floe".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "mv_orders".to_string(),
+                key_columns: vec!["id".to_string()],
+            },
+        )
+        .expect("encode Debezium sink rows");
+
+        assert_eq!(rows.len(), 2);
+        let first_key: serde_json::Value =
+            serde_json::from_str(rows[0].key.as_deref().expect("key")).expect("key JSON");
+        let first_value: serde_json::Value =
+            serde_json::from_str(&rows[0].payload).expect("value JSON");
+        assert_eq!(first_key["payload"]["id"], 1);
+        assert_eq!(first_value["payload"]["op"], "c");
+        assert_eq!(first_value["payload"]["after"]["status"], "open");
+        assert_eq!(first_value["payload"]["before"], serde_json::Value::Null);
+        assert_eq!(first_value["payload"]["source"]["name"], "orders_sink");
+        assert_eq!(first_value["payload"]["source"]["db"], "floe");
+        assert_eq!(first_value["payload"]["source"]["table"], "mv_orders");
+        assert_eq!(
+            first_value["payload"]["source"]["position"],
+            "mv/mv_orders/42"
+        );
+        assert_eq!(first_value["payload"]["ts_ms"], 1234);
+
+        let second_key: serde_json::Value =
+            serde_json::from_str(rows[1].key.as_deref().expect("key")).expect("key JSON");
+        let second_value: serde_json::Value =
+            serde_json::from_str(&rows[1].payload).expect("value JSON");
+        assert_eq!(second_key["payload"]["id"], 2);
+        assert_eq!(second_value["payload"]["op"], "d");
+        assert_eq!(second_value["payload"]["before"]["status"], "closed");
+        assert_eq!(second_value["payload"]["after"], serde_json::Value::Null);
+        assert_eq!(second_value["payload"]["ts_ms"], 1235);
+    }
+
+    #[test]
     fn http_idempotency_keys_include_mv_version_and_row_index() {
         let rows = vec![
             SinkRecord {
                 version: 7,
                 row_idx: 0,
+                key: None,
                 json: serde_json::json!({"k": 1}),
                 payload: "{\"k\":1}".to_string(),
                 byte_len: 7,
@@ -594,6 +1039,7 @@ mod tests {
             SinkRecord {
                 version: 7,
                 row_idx: 1,
+                key: None,
                 json: serde_json::json!({"k": 2}),
                 payload: "{\"k\":2}".to_string(),
                 byte_len: 7,
@@ -612,6 +1058,7 @@ mod tests {
         let rows = vec![SinkRecord {
             version: 5,
             row_idx: 0,
+            key: None,
             json: serde_json::json!({"auction": 1}),
             payload: "{\"auction\":1}".to_string(),
             byte_len: 13,
@@ -654,6 +1101,7 @@ mod tests {
         tx.send(SinkEvent::Rows(vec![SinkRecord {
             version: 9,
             row_idx: 0,
+            key: None,
             json: serde_json::json!({"auction": 9}),
             payload: "{\"auction\":9}".to_string(),
             byte_len: 13,
@@ -677,6 +1125,7 @@ mod tests {
         let rows = vec![SinkRecord {
             version: 3,
             row_idx: 0,
+            key: None,
             json: serde_json::json!({"auction": 3}),
             payload: "{\"auction\":3}".to_string(),
             byte_len: 13,
@@ -737,6 +1186,7 @@ mod tests {
         let rows = vec![SinkRecord {
             version: 11,
             row_idx: 4,
+            key: None,
             json: serde_json::json!({"auction": 11}),
             payload: "{\"auction\":11}".to_string(),
             byte_len: 14,
@@ -804,6 +1254,7 @@ mod tests {
         tx.send(SinkEvent::Rows(vec![SinkRecord {
             version: 12,
             row_idx: 0,
+            key: None,
             json: serde_json::json!({"auction": 12}),
             payload: "{\"auction\":12}".to_string(),
             byte_len: 14,

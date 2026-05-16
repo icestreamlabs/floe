@@ -236,6 +236,8 @@ pub enum SinkConnector {
     Kafka {
         brokers: String,
         topic: String,
+        format: Option<String>,
+        key_columns: Vec<String>,
     },
     File {
         path: String,

@@ -537,7 +537,20 @@ fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
         "kafka" => {
             let brokers = required_option(&options, "brokers")?.to_string();
             let topic = required_option(&options, "topic")?.to_string();
-            SinkConnector::Kafka { brokers, topic }
+            let format = option_any(&options, &["format"]).map(normalize_sink_format);
+            let key_columns = option_any(
+                &options,
+                &["key_columns", "key.columns", "primary_key", "primary.key"],
+            )
+            .map(parse_column_list_option)
+            .transpose()?
+            .unwrap_or_default();
+            SinkConnector::Kafka {
+                brokers,
+                topic,
+                format,
+                key_columns,
+            }
         }
         "file" => {
             let path = required_option(&options, "path")?.to_string();
@@ -1087,6 +1100,25 @@ fn parse_u64_option(name: &str, value: &str) -> Result<u64> {
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
 }
 
+fn normalize_sink_format(value: &str) -> String {
+    value.to_ascii_lowercase().replace('-', "_")
+}
+
+fn parse_column_list_option(value: &str) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    for raw in value.split(',') {
+        let column = raw.trim();
+        if column.is_empty() {
+            return Err(anyhow!("key column list cannot contain empty columns"));
+        }
+        columns.push(column.to_string());
+    }
+    if columns.is_empty() {
+        return Err(anyhow!("key column list cannot be empty"));
+    }
+    Ok(columns)
+}
+
 fn required_option<'a>(
     options: &'a std::collections::HashMap<String, String>,
     key: &str,
@@ -1169,4 +1201,48 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
         statements.push(statement.to_string());
     }
     Ok(statements)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kafka_sink_debezium_options() {
+        let statement = parse_floe_statement(
+            "CREATE SINK out_orders FROM mv_orders WITH (
+                type = 'kafka',
+                brokers = 'localhost:9092',
+                topic = 'orders',
+                format = 'debezium-json',
+                key.columns = 'tenant_id,id',
+                with_snapshot = true
+            )",
+        )
+        .expect("parse sink");
+
+        let FloeStatement::CreateSink(definition) = statement else {
+            panic!("expected CREATE SINK statement");
+        };
+        assert_eq!(definition.name(), "out_orders");
+        assert_eq!(definition.mv_name(), "mv_orders");
+        assert!(definition.with_snapshot());
+        match definition.connector() {
+            SinkConnector::Kafka {
+                brokers,
+                topic,
+                format,
+                key_columns,
+            } => {
+                assert_eq!(brokers, "localhost:9092");
+                assert_eq!(topic, "orders");
+                assert_eq!(format.as_deref(), Some("debezium_json"));
+                assert_eq!(
+                    key_columns,
+                    &vec!["tenant_id".to_string(), "id".to_string()]
+                );
+            }
+            other => panic!("expected Kafka sink, got {other:?}"),
+        }
+    }
 }

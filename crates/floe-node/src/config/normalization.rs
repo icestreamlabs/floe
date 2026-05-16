@@ -61,11 +61,18 @@ pub fn normalize_sinks(sinks: Vec<SinkConfig>) -> Result<Vec<SinkSpec>> {
 
 pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
     let config = match definition.connector() {
-        SinkConnector::Kafka { brokers, topic } => SinkConfig::Kafka {
+        SinkConnector::Kafka {
+            brokers,
+            topic,
+            format,
+            key_columns,
+        } => SinkConfig::Kafka {
             name: Some(definition.name().to_string()),
             brokers: brokers.clone(),
             topic: topic.clone(),
             mv: definition.mv_name().to_string(),
+            format: format.clone(),
+            key_columns: (!key_columns.is_empty()).then(|| key_columns.clone()),
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
             batch_rows: None,

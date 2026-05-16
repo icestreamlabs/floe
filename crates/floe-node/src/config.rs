@@ -235,6 +235,10 @@ pub enum SinkConfig {
         topic: String,
         mv: String,
         #[serde(default)]
+        format: Option<String>,
+        #[serde(default)]
+        key_columns: Option<Vec<String>>,
+        #[serde(default)]
         with_snapshot: Option<bool>,
         #[serde(default)]
         as_of: Option<i64>,
@@ -407,6 +411,45 @@ mod tests {
     }
 
     #[test]
+    fn maps_sql_kafka_debezium_sink_options_to_runtime_config() {
+        let definition = SinkDefinition::new(
+            "out_orders",
+            "mv_orders",
+            SinkConnector::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders".to_string(),
+                format: Some("debezium_json".to_string()),
+                key_columns: vec!["tenant_id".to_string(), "id".to_string()],
+            },
+            false,
+            None,
+        );
+        let spec = sink_spec_from_sql(&definition).expect("map sink");
+        match spec.config {
+            SinkConfig::Kafka {
+                name,
+                brokers,
+                topic,
+                mv,
+                format,
+                key_columns,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("out_orders"));
+                assert_eq!(brokers, "localhost:9092");
+                assert_eq!(topic, "orders");
+                assert_eq!(mv, "mv_orders");
+                assert_eq!(format.as_deref(), Some("debezium_json"));
+                assert_eq!(
+                    key_columns,
+                    Some(vec!["tenant_id".to_string(), "id".to_string()])
+                );
+            }
+            other => panic!("expected Kafka sink config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validation_rejects_empty_kafka_topics() {
         let config = NodeConfig {
             connectors: vec![ConnectorConfig::Kafka {
@@ -543,6 +586,8 @@ mod tests {
                 brokers: "localhost:9092".to_string(),
                 topic: "out".to_string(),
                 mv: "mv_bid".to_string(),
+                format: None,
+                key_columns: None,
                 with_snapshot: Some(false),
                 as_of: None,
                 batch_rows: Some(1),
@@ -562,6 +607,39 @@ mod tests {
             err.to_string()
                 .contains("sinks[0].checkpoint_partition must be >= 0")
         );
+    }
+
+    #[test]
+    fn validation_requires_key_columns_for_debezium_kafka_sink() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Generator {
+                name: None,
+                events_per_second: Some(1.0),
+                max_events: None,
+            }],
+            sinks: vec![SinkConfig::Kafka {
+                name: Some("sink_kafka".to_string()),
+                brokers: "localhost:9092".to_string(),
+                topic: "out".to_string(),
+                mv: "mv_bid".to_string(),
+                format: Some("debezium_json".to_string()),
+                key_columns: None,
+                with_snapshot: Some(false),
+                as_of: None,
+                batch_rows: Some(1),
+                batch_bytes: None,
+                queue_capacity: None,
+                retry_max_attempts: None,
+                retry_base_ms: None,
+                retry_max_backoff_ms: None,
+                transactional_id: None,
+                checkpoint_topic: None,
+                checkpoint_partition: None,
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(err.to_string().contains("sinks[0].key_columns is required"));
     }
 
     #[test]

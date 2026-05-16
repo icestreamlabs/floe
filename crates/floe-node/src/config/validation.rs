@@ -279,6 +279,8 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
             brokers,
             topic,
             mv,
+            format,
+            key_columns,
             with_snapshot: _,
             as_of: _,
             batch_rows,
@@ -295,6 +297,20 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
             ensure_non_empty(brokers, &format!("sinks[{index}].brokers"))?;
             ensure_non_empty(topic, &format!("sinks[{index}].topic"))?;
             ensure_non_empty(mv, &format!("sinks[{index}].mv"))?;
+            if let Some(format) = format {
+                let normalized = normalize_sink_format(format);
+                if !matches!(normalized.as_str(), "json" | "debezium_json") {
+                    bail!(
+                        "sinks[{index}].format must be one of json, debezium_json (found '{format}')"
+                    );
+                }
+                if normalized == "debezium_json" && key_columns.as_ref().is_none_or(Vec::is_empty) {
+                    bail!("sinks[{index}].key_columns is required for Debezium Kafka sinks");
+                }
+            }
+            if let Some(key_columns) = key_columns {
+                validate_key_columns(key_columns, &format!("sinks[{index}].key_columns"))?;
+            }
             ensure_optional_positive_usize(*batch_rows, &format!("sinks[{index}].batch_rows"))?;
             ensure_optional_positive_usize(*batch_bytes, &format!("sinks[{index}].batch_bytes"))?;
             ensure_optional_positive_usize(
@@ -397,6 +413,24 @@ fn ensure_non_empty(value: &str, field_path: &str) -> Result<()> {
 fn ensure_optional_non_empty(value: Option<&str>, field_path: &str) -> Result<()> {
     if let Some(value) = value {
         ensure_non_empty(value, field_path)?;
+    }
+    Ok(())
+}
+
+fn normalize_sink_format(value: &str) -> String {
+    value.to_ascii_lowercase().replace('-', "_")
+}
+
+fn validate_key_columns(columns: &[String], field_path: &str) -> Result<()> {
+    if columns.is_empty() {
+        bail!("{field_path} must not be empty");
+    }
+    let mut seen = HashSet::new();
+    for (index, column) in columns.iter().enumerate() {
+        ensure_non_empty(column, &format!("{field_path}[{index}]"))?;
+        if !seen.insert(column.as_str()) {
+            bail!("{field_path} contains duplicate column '{column}'");
+        }
     }
     Ok(())
 }

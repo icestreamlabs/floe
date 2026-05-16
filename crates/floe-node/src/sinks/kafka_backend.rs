@@ -40,6 +40,7 @@ pub(super) async fn run_kafka_sink(
     transactional_id: Option<String>,
     checkpoint_topic: Option<String>,
     checkpoint_partition: Option<i32>,
+    encoding: SinkEncoding,
 ) -> Result<()> {
     if queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
@@ -99,7 +100,12 @@ pub(super) async fn run_kafka_sink(
 
     let (tx, rx) = mpsc::channel(queue_capacity);
     let tracker = SinkQueueTracker::new(sink_name);
-    let producer_task = tokio::spawn(stream_tail_into_queue(stream, tx, Arc::clone(&tracker)));
+    let producer_task = tokio::spawn(stream_tail_into_queue_with_encoding(
+        stream,
+        tx,
+        Arc::clone(&tracker),
+        encoding,
+    ));
     let consumer_result = run_kafka_worker(
         sink_name,
         mv,
@@ -302,7 +308,7 @@ pub(super) async fn send_kafka_transactional_batch_with_retry(
 
         let mut step_error: Option<anyhow::Error> = None;
         for row in rows {
-            let record = FutureRecord::<(), _>::to(topic).payload(&row.payload);
+            let record = kafka_record(topic, row);
             if let Err((err, _message)) = producer.send(record, Duration::from_secs(0)).await {
                 step_error = Some(anyhow!(
                     "kafka sink transactional row publish failed: {err}"
@@ -478,7 +484,7 @@ pub(super) async fn send_kafka_batch_with_retry(
             let mut deliveries = Vec::with_capacity(chunk.len());
             for row_idx in chunk {
                 let row = &rows[*row_idx];
-                let record = FutureRecord::<(), _>::to(topic).payload(&row.payload);
+                let record = kafka_record(topic, row);
                 match producer.send_result(record) {
                     Ok(delivery_future) => deliveries.push((*row_idx, delivery_future)),
                     Err((err, _message)) => {
@@ -524,4 +530,13 @@ pub(super) async fn send_kafka_batch_with_retry(
         tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
     }
     unreachable!("retry loop should return or fail");
+}
+
+fn kafka_record<'a>(topic: &'a str, row: &'a SinkRecord) -> FutureRecord<'a, str, str> {
+    let record = FutureRecord::<str, str>::to(topic).payload(row.payload.as_str());
+    if let Some(key) = row.key.as_deref() {
+        record.key(key)
+    } else {
+        record
+    }
 }
