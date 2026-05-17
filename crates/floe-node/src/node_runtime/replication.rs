@@ -1,7 +1,9 @@
 use super::*;
 
+use std::ffi::{CString, c_void};
 use std::fmt;
 use std::io::Write as _;
+use std::ptr;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,12 +29,15 @@ use floe_storage::{
     CdcBufferRecord, CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest,
     ReplicationPipelineCheckpoint, SlateCatalog,
 };
+use futures::future::join_all;
 use rayon::prelude::*;
 use rdkafka::ClientConfig;
+use rdkafka::bindings as rdsys;
 use rdkafka::client::ClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
+use rdkafka::types::RDKafkaTopic;
 use tokio_postgres::types::ToSql;
 
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
@@ -491,8 +496,47 @@ impl ReplicationPipelineStatusSnapshot {
 
 struct KafkaReplicationPipelineWriter {
     producer: ThreadedProducer<KafkaReplicationPipelineContext>,
+    native_topic: KafkaNativeTopic,
     topic: String,
     partition_offsets: usize,
+}
+
+struct KafkaNativeTopic {
+    ptr: *mut RDKafkaTopic,
+}
+
+unsafe impl Send for KafkaNativeTopic {}
+unsafe impl Sync for KafkaNativeTopic {}
+
+impl KafkaNativeTopic {
+    fn new(
+        producer: &ThreadedProducer<KafkaReplicationPipelineContext>,
+        topic: &str,
+    ) -> anyhow::Result<Self> {
+        let topic_cstring =
+            CString::new(topic).context("replication pipeline Kafka topic contains null byte")?;
+        let ptr = unsafe {
+            rdsys::rd_kafka_topic_new(
+                producer.client().native_ptr(),
+                topic_cstring.as_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        if ptr.is_null() {
+            return Err(anyhow!(
+                "create replication pipeline Kafka native topic handle for {topic}"
+            ));
+        }
+        Ok(Self { ptr })
+    }
+}
+
+impl Drop for KafkaNativeTopic {
+    fn drop(&mut self) {
+        unsafe {
+            rdsys::rd_kafka_topic_destroy(self.ptr);
+        }
+    }
 }
 
 struct PostgresReplicationPipelineWriter {
@@ -932,81 +976,225 @@ impl ReplicationPipelineRuntime {
         storage: Option<&SlateCatalog>,
         await_durable_buffer_append: bool,
     ) -> anyhow::Result<usize> {
-        let mut written = 0usize;
         let ordered_plans = ordered_replication_plans_for_transaction(plans, transaction);
-        for plan in ordered_plans {
-            let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
-            let perf_started_at = perf_enabled.then(Instant::now);
-            let encode_started_at = perf_enabled.then(Instant::now);
-            let buffered_records = encode_pipeline_transaction_records(plan, schemas, transaction)?;
-            let encode_elapsed = encode_started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if buffered_records.is_empty() {
-                continue;
+        if ordered_plans.len() > 1 && replication_pipeline_targets_are_distinct(plans) {
+            let results = join_all(ordered_plans.into_iter().map(|plan| {
+                self.run_transaction_for_plan(
+                    plan,
+                    schemas,
+                    transaction,
+                    storage,
+                    await_durable_buffer_append,
+                )
+            }))
+            .await;
+            let mut written = 0usize;
+            for result in results {
+                written = written.saturating_add(result?);
             }
-            let record_count = buffered_records.len();
-            let payload_bytes = if perf_enabled {
-                estimated_buffer_payload_bytes(&buffered_records)
+            return Ok(written);
+        }
+
+        let mut written = 0usize;
+        for plan in ordered_plans {
+            written = written.saturating_add(
+                self.run_transaction_for_plan(
+                    plan,
+                    schemas,
+                    transaction,
+                    storage,
+                    await_durable_buffer_append,
+                )
+                .await?,
+            );
+        }
+
+        Ok(written)
+    }
+
+    async fn run_transaction_for_plan(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        schemas: &HashMap<CdcTableId, CdcTableSchema>,
+        transaction: &TransactionBatch,
+        storage: Option<&SlateCatalog>,
+        await_durable_buffer_append: bool,
+    ) -> anyhow::Result<usize> {
+        let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
+        let perf_started_at = perf_enabled.then(Instant::now);
+        let encode_started_at = perf_enabled.then(Instant::now);
+        let buffered_records = encode_pipeline_transaction_records(plan, schemas, transaction)?;
+        let encode_elapsed = encode_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if buffered_records.is_empty() {
+            return Ok(0);
+        }
+        let record_count = buffered_records.len();
+        let payload_bytes = if perf_enabled {
+            estimated_buffer_payload_bytes(&buffered_records)
+        } else {
+            0
+        };
+        if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
+            self.send_records_to_target(plan, &buffered_records).await?;
+            log_replication_pipeline_perf(
+                plan,
+                transaction,
+                record_count,
+                payload_bytes,
+                encode_elapsed,
+                perf_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or(Duration::ZERO),
+            );
+            return Ok(buffered_records.len());
+        }
+        if let Some(storage) = storage {
+            let buffer_store = storage.cdc_buffer_store();
+            let had_pending = !buffer_store
+                .pending_transactions(&plan.name, 1)
+                .await
+                .with_context(|| {
+                    format!(
+                        "check pending replication pipeline '{}' buffer transactions",
+                        plan.name
+                    )
+                })?
+                .is_empty();
+            let prepared_append =
+                prepare_replication_buffer_append(plan, transaction, buffered_records)?;
+            let incoming_bytes = estimated_buffer_payload_bytes(prepared_append.target_records());
+            let incoming_records = prepared_append.append.record_count();
+            self.enforce_buffer_limits_before_append(
+                plan,
+                &buffer_store,
+                storage,
+                incoming_bytes,
+                incoming_records,
+                had_pending,
+            )
+            .await?;
+            let has_pending_after_guardrail = if had_pending {
+                !buffer_store
+                    .pending_transactions(&plan.name, 1)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "check pending replication pipeline '{}' buffer transactions after guardrail drain",
+                            plan.name
+                        )
+                    })?
+                    .is_empty()
             } else {
-                0
+                false
             };
-            if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
-                self.send_records_to_target(plan, &buffered_records).await?;
-                written = written.saturating_add(buffered_records.len());
+            if has_pending_after_guardrail {
+                let append_started_at = perf_enabled.then(Instant::now);
+                let manifest = append_buffer_transaction(
+                    &buffer_store,
+                    &prepared_append.append,
+                    await_durable_buffer_append,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "append replication pipeline '{}' transaction buffer",
+                        plan.name
+                    )
+                })?;
+                let append_elapsed = append_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
+                storage
+                    .put_replication_pipeline_checkpoint_without_durable_wait(
+                        ReplicationPipelineCheckpoint::new(
+                            &plan.name,
+                            &plan.source_name,
+                            transaction.commit_position().clone(),
+                            transaction.transaction_id().cloned(),
+                            pending_target_state(plan, &manifest),
+                            current_unix_time_ms(),
+                        )?,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("persist replication pipeline '{}' checkpoint", plan.name)
+                    })?;
+                self.replay_pending_for_plan(plan, &buffer_store, storage)
+                    .await?;
+                record_buffer_stats(&buffer_store, &plan.name).await?;
                 log_replication_pipeline_perf(
                     plan,
                     transaction,
-                    record_count,
+                    manifest.record_count(),
                     payload_bytes,
                     encode_elapsed,
                     perf_started_at
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO),
                 );
-                continue;
+                return Ok(manifest.record_count());
             }
-            if let Some(storage) = storage {
-                let buffer_store = storage.cdc_buffer_store();
-                let had_pending = !buffer_store
-                    .pending_transactions(&plan.name, 1)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "check pending replication pipeline '{}' buffer transactions",
-                            plan.name
+
+            let target_send_started_at = perf_enabled.then(Instant::now);
+            match self
+                .send_records_to_target(plan, prepared_append.target_records())
+                .await
+            {
+                Ok(target_state) => {
+                    let target_send_elapsed = target_send_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    let checkpoint_started_at = perf_enabled.then(Instant::now);
+                    storage
+                        .put_replication_pipeline_checkpoint_without_durable_wait(
+                            ReplicationPipelineCheckpoint::new(
+                                &plan.name,
+                                &plan.source_name,
+                                transaction.commit_position().clone(),
+                                transaction.transaction_id().cloned(),
+                                direct_delivered_target_state(
+                                    plan,
+                                    transaction,
+                                    record_count,
+                                    prepared_append.append.payload_format(),
+                                    target_state,
+                                ),
+                                current_unix_time_ms(),
+                            )?,
                         )
-                    })?
-                    .is_empty();
-                let prepared_append =
-                    prepare_replication_buffer_append(plan, transaction, buffered_records)?;
-                let incoming_bytes =
-                    estimated_buffer_payload_bytes(prepared_append.target_records());
-                let incoming_records = prepared_append.append.record_count();
-                self.enforce_buffer_limits_before_append(
-                    plan,
-                    &buffer_store,
-                    storage,
-                    incoming_bytes,
-                    incoming_records,
-                    had_pending,
-                )
-                .await?;
-                let has_pending_after_guardrail = if had_pending {
-                    !buffer_store
-                        .pending_transactions(&plan.name, 1)
                         .await
                         .with_context(|| {
-                            format!(
-                                "check pending replication pipeline '{}' buffer transactions after guardrail drain",
-                                plan.name
-                            )
-                        })?
-                        .is_empty()
-                } else {
-                    false
-                };
-                if has_pending_after_guardrail {
+                            format!("persist replication pipeline '{}' checkpoint", plan.name)
+                        })?;
+                    let checkpoint_elapsed = checkpoint_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    log_replication_direct_delivery_perf(
+                        plan,
+                        record_count,
+                        prepared_append.append.payload_format(),
+                        incoming_bytes,
+                        target_send_elapsed,
+                        checkpoint_elapsed,
+                    );
+                    record_buffer_stats(&buffer_store, &plan.name).await?;
+                    log_replication_pipeline_perf(
+                        plan,
+                        transaction,
+                        record_count,
+                        payload_bytes,
+                        encode_elapsed,
+                        perf_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or(Duration::ZERO),
+                    );
+                    Ok(record_count)
+                }
+                Err(err) => {
+                    self.record_target_write_failure(plan, &err);
                     let append_started_at = perf_enabled.then(Instant::now);
                     let manifest = append_buffer_transaction(
                         &buffer_store,
@@ -1016,7 +1204,7 @@ impl ReplicationPipelineRuntime {
                     .await
                     .with_context(|| {
                         format!(
-                            "append replication pipeline '{}' transaction buffer",
+                            "append replication pipeline '{}' transaction buffer after target failure",
                             plan.name
                         )
                     })?;
@@ -1024,137 +1212,39 @@ impl ReplicationPipelineRuntime {
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
                     log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
-                    storage
-                        .put_replication_pipeline_checkpoint_without_durable_wait(
-                            ReplicationPipelineCheckpoint::new(
-                                &plan.name,
-                                &plan.source_name,
-                                transaction.commit_position().clone(),
-                                transaction.transaction_id().cloned(),
-                                pending_target_state(plan, &manifest),
-                                current_unix_time_ms(),
-                            )?,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("persist replication pipeline '{}' checkpoint", plan.name)
-                        })?;
-                    written = written.saturating_add(manifest.record_count());
-                    self.replay_pending_for_plan(plan, &buffer_store, storage)
+                    self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
                         .await?;
                     record_buffer_stats(&buffer_store, &plan.name).await?;
                     log_replication_pipeline_perf(
                         plan,
                         transaction,
-                        manifest.record_count(),
+                        record_count,
                         payload_bytes,
                         encode_elapsed,
                         perf_started_at
                             .map(|started_at| started_at.elapsed())
                             .unwrap_or(Duration::ZERO),
                     );
-                    continue;
+                    Ok(manifest.record_count())
                 }
-
-                let target_send_started_at = perf_enabled.then(Instant::now);
-                match self
-                    .send_records_to_target(plan, prepared_append.target_records())
-                    .await
-                {
-                    Ok(target_state) => {
-                        let target_send_elapsed = target_send_started_at
-                            .map(|started_at| started_at.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        let checkpoint_started_at = perf_enabled.then(Instant::now);
-                        storage
-                            .put_replication_pipeline_checkpoint_without_durable_wait(
-                                ReplicationPipelineCheckpoint::new(
-                                    &plan.name,
-                                    &plan.source_name,
-                                    transaction.commit_position().clone(),
-                                    transaction.transaction_id().cloned(),
-                                    direct_delivered_target_state(
-                                        plan,
-                                        transaction,
-                                        record_count,
-                                        prepared_append.append.payload_format(),
-                                        target_state,
-                                    ),
-                                    current_unix_time_ms(),
-                                )?,
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("persist replication pipeline '{}' checkpoint", plan.name)
-                            })?;
-                        let checkpoint_elapsed = checkpoint_started_at
-                            .map(|started_at| started_at.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        log_replication_direct_delivery_perf(
-                            plan,
-                            record_count,
-                            prepared_append.append.payload_format(),
-                            incoming_bytes,
-                            target_send_elapsed,
-                            checkpoint_elapsed,
-                        );
-                        written = written.saturating_add(record_count);
-                    }
-                    Err(err) => {
-                        self.record_target_write_failure(plan, &err);
-                        let append_started_at = perf_enabled.then(Instant::now);
-                        let manifest = append_buffer_transaction(
-                            &buffer_store,
-                            &prepared_append.append,
-                            await_durable_buffer_append,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "append replication pipeline '{}' transaction buffer after target failure",
-                                plan.name
-                            )
-                        })?;
-                        let append_elapsed = append_started_at
-                            .map(|started_at| started_at.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
-                        self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
-                            .await?;
-                        written = written.saturating_add(manifest.record_count());
-                    }
-                }
-                record_buffer_stats(&buffer_store, &plan.name).await?;
-                log_replication_pipeline_perf(
-                    plan,
-                    transaction,
-                    record_count,
-                    payload_bytes,
-                    encode_elapsed,
-                    perf_started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO),
-                );
-            } else {
-                if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
-                    self.record_target_write_failure(plan, &err);
-                    return Err(err);
-                }
-                written = written.saturating_add(buffered_records.len());
-                log_replication_pipeline_perf(
-                    plan,
-                    transaction,
-                    record_count,
-                    payload_bytes,
-                    encode_elapsed,
-                    perf_started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO),
-                );
             }
+        } else {
+            if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
+                self.record_target_write_failure(plan, &err);
+                return Err(err);
+            }
+            log_replication_pipeline_perf(
+                plan,
+                transaction,
+                record_count,
+                payload_bytes,
+                encode_elapsed,
+                perf_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or(Duration::ZERO),
+            );
+            Ok(buffered_records.len())
         }
-
-        Ok(written)
     }
 
     async fn replay_pending_for_plan(
@@ -1787,6 +1877,7 @@ impl KafkaReplicationPipelineWriter {
         let producer: ThreadedProducer<KafkaReplicationPipelineContext> = config
             .create_with_context(KafkaReplicationPipelineContext)
             .context("create replication pipeline Kafka producer")?;
+        let native_topic = KafkaNativeTopic::new(&producer, topic)?;
         let partition_offsets = match producer
             .client()
             .fetch_metadata(Some(topic), REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT)
@@ -1808,6 +1899,7 @@ impl KafkaReplicationPipelineWriter {
         };
         Ok(Self {
             producer,
+            native_topic,
             topic: topic.to_string(),
             partition_offsets,
         })
@@ -1872,6 +1964,12 @@ impl KafkaReplicationPipelineWriter {
         record: &CdcBufferRecord,
         delivery_state: Arc<KafkaDeliveryBatchState>,
     ) -> anyhow::Result<()> {
+        if record.headers().is_empty() {
+            return self
+                .enqueue_record_direct_with_retry(record, delivery_state)
+                .await;
+        }
+
         for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
             let attempt_number = attempt + 1;
             let mut kafka_record =
@@ -1957,6 +2055,113 @@ impl KafkaReplicationPipelineWriter {
         Err(anyhow!(
             "replication pipeline Kafka enqueue failed after retries"
         ))
+    }
+
+    async fn enqueue_record_direct_with_retry(
+        &self,
+        record: &CdcBufferRecord,
+        delivery_state: Arc<KafkaDeliveryBatchState>,
+    ) -> anyhow::Result<()> {
+        for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
+            let attempt_number = attempt + 1;
+            match self.enqueue_record_direct(record, Arc::clone(&delivery_state)) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if is_kafka_queue_full(&err)
+                        && attempt_number < REPLICATION_KAFKA_RETRY_ATTEMPTS =>
+                {
+                    let delay_ms = REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(
+                        1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16),
+                    );
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        retry_delay_ms = delay_ms,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
+                        error = %err,
+                        "replication pipeline Kafka producer queue is full; retrying"
+                    );
+                    self.producer.poll(Duration::from_millis(0));
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(err) if is_kafka_queue_full(&err) => {
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
+                        error = %err,
+                        "replication pipeline Kafka producer queue remained full after retries"
+                    );
+                    return Err(anyhow!(
+                        "replication pipeline Kafka enqueue failed after retries: {err}"
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        topic = %self.topic,
+                        attempt = attempt_number,
+                        max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
+                        record_bytes = record.byte_len(),
+                        key_bytes = record.key().map(|key| key.len()),
+                        value_bytes = record.value().map(|value| value.len()),
+                        error = %err,
+                        "replication pipeline Kafka enqueue failed without retry"
+                    );
+                    return Err(anyhow!(
+                        "replication pipeline Kafka enqueue failed after retries: {err}"
+                    ));
+                }
+            }
+        }
+        Err(anyhow!(
+            "replication pipeline Kafka enqueue failed after retries"
+        ))
+    }
+
+    fn enqueue_record_direct(
+        &self,
+        record: &CdcBufferRecord,
+        delivery_state: Arc<KafkaDeliveryBatchState>,
+    ) -> Result<(), KafkaError> {
+        let payload = record.value();
+        let payload_ptr = payload.map_or(ptr::null_mut(), |payload| {
+            payload.as_ptr().cast::<c_void>().cast_mut()
+        });
+        let payload_len = payload.map_or(0, <[u8]>::len);
+        let key = record.key();
+        let key_ptr = key.map_or(ptr::null(), |key| key.as_ptr().cast::<c_void>());
+        let key_len = key.map_or(0, <[u8]>::len);
+        let opaque_ptr = Arc::into_raw(delivery_state).cast::<c_void>().cast_mut();
+        let produce_result = unsafe {
+            rdsys::rd_kafka_produce(
+                self.native_topic.ptr,
+                -1,
+                rdsys::RD_KAFKA_MSG_F_COPY,
+                payload_ptr,
+                payload_len,
+                key_ptr,
+                key_len,
+                opaque_ptr,
+            )
+        };
+        if produce_result == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                drop(Arc::from_raw(
+                    opaque_ptr.cast::<KafkaDeliveryBatchState>().cast_const(),
+                ));
+            }
+            Err(KafkaError::MessageProduction(RDKafkaErrorCode::from(
+                unsafe { rdsys::rd_kafka_last_error() },
+            )))
+        }
     }
 }
 
