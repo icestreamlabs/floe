@@ -228,6 +228,27 @@ impl MaterializedViewHandle {
         true
     }
 
+    pub fn seed_cached_row_count_if_latest(&self, version: u64, row_count: usize) -> bool {
+        let Ok(version) = i64::try_from(version) else {
+            return false;
+        };
+        if self.latest_version() != Some(version) {
+            return false;
+        }
+        let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
+        *self.state_row_count.write().expect("mutex poisoned") = row_count;
+        *self.published_row_count.write().expect("mutex poisoned") = row_count;
+        self.staged_row_count_versions
+            .write()
+            .expect("mutex poisoned")
+            .retain(|candidate, _| *candidate > version);
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = Some(version);
+        true
+    }
+
     pub fn authoritative_row_count(&self) -> Option<usize> {
         if !*self.state_authoritative.read().expect("mutex poisoned") {
             return None;
@@ -898,6 +919,18 @@ mod tests {
         view.mark_state_non_authoritative();
         assert!(!view.seed_authoritative_row_count_if_latest(6, 2));
         assert_eq!(view.authoritative_row_count(), None);
+    }
+
+    #[test]
+    fn cached_row_count_does_not_mark_state_authoritative() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_cached_count");
+        view.publish_logical_version(3);
+
+        assert!(view.seed_cached_row_count_if_latest(3, 4));
+        assert_eq!(view.authoritative_row_count_for(3), Some(4));
+        assert_eq!(view.authoritative_row_count(), None);
+        assert!(!view.seed_cached_row_count_if_latest(2, 1));
     }
 
     #[test]

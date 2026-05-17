@@ -366,7 +366,13 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_latest
         .await
         .expect("build recovered snapshot");
     assert_eq!(batches[0].num_rows(), 3);
-    assert_eq!(view.authoritative_row_count(), Some(3));
+    assert_eq!(view.authoritative_row_count_for(handle_version), Some(3));
+    assert_eq!(view.authoritative_row_count(), None);
+    let second = provider
+        .build_batches_for_test()
+        .await
+        .expect("build recovered snapshot again");
+    assert_eq!(second[0].num_rows(), 3);
 }
 
 #[tokio::test]
@@ -419,7 +425,16 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_overla
         .await
         .expect("build recovered overlay snapshot");
     assert_eq!(batches[0].num_rows(), 3);
-    assert_eq!(view.authoritative_row_count(), Some(3));
+    assert_eq!(
+        view.authoritative_row_count_for(handle_version.saturating_add(1)),
+        Some(3)
+    );
+    assert_eq!(view.authoritative_row_count(), None);
+    let second = provider
+        .build_batches_for_test()
+        .await
+        .expect("build recovered overlay snapshot again");
+    assert_eq!(second[0].num_rows(), 3);
 }
 
 #[tokio::test]
@@ -445,6 +460,11 @@ async fn materialized_view_provider_invalidates_stale_authoritative_count_after_
         .expect("build stale-count recovery snapshot");
     assert_eq!(batches[0].num_rows(), 1);
     assert_eq!(view.authoritative_row_count_for(1), Some(1));
+    let second = provider
+        .build_batches_for_test()
+        .await
+        .expect("build stale-count recovery snapshot again");
+    assert_eq!(second[0].num_rows(), 1);
 }
 
 #[tokio::test]

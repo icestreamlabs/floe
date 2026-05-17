@@ -87,10 +87,14 @@ fn main() -> Result<()> {
     }
 
     let wall_s = started_at.elapsed().as_secs_f64();
+    let pre_stream_wait_s = first_message_at
+        .map(|first| (first - started_at).as_secs_f64())
+        .unwrap_or(wall_s);
     let stream_s = first_message_at
         .zip(last_message_at)
         .map(|(first, last)| (last - first).as_secs_f64().max(0.001))
         .unwrap_or(wall_s.max(0.001));
+    let post_stream_wait_s = (wall_s - pre_stream_wait_s - stream_s).max(0.0);
     let total_bytes = key_bytes.saturating_add(value_bytes);
     let wall_rows_per_s = messages as f64 / wall_s.max(0.001);
     let stream_rows_per_s = messages as f64 / stream_s;
@@ -110,7 +114,9 @@ fn main() -> Result<()> {
     println!("cdc_counter.value_bytes={value_bytes}");
     println!("cdc_counter.total_bytes={total_bytes}");
     println!("cdc_counter.wall_seconds={wall_s:.3}");
+    println!("cdc_counter.pre_stream_wait_seconds={pre_stream_wait_s:.3}");
     println!("cdc_counter.stream_seconds={stream_s:.3}");
+    println!("cdc_counter.post_stream_wait_seconds={post_stream_wait_s:.3}");
     println!("cdc_counter.wall_rows_per_second={wall_rows_per_s:.0}");
     println!("cdc_counter.stream_rows_per_second={stream_rows_per_s:.0}");
     println!("cdc_counter.wall_mb_per_second={wall_mb_per_s:.3}");

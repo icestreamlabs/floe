@@ -147,6 +147,89 @@ async fn postgres_pgoutput_stream_updates_cdc_table_state() -> Result<()> {
     test_result
 }
 
+#[tokio::test]
+#[ignore = "requires logical-replication Postgres; run scripts/run_postgres_cdc_pgoutput_e2e.sh"]
+async fn postgres_pgoutput_survives_idle_before_wal() -> Result<()> {
+    let env = PgEnv::from_env()?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let table_name = format!("floe_cdc_idle_orders_{run_id}");
+    let slot = format!("floe_cdc_idle_slot_{run_id}");
+    let publication = format!("floe_cdc_idle_pub_{run_id}");
+    let source_id = CdcSourceId::new("pg_idle")?;
+    let table_id = CdcTableId::new("orders")?;
+    let schema = orders_schema(table_id.clone(), &table_name)?;
+    let store = test_store(&format!("pgoutput-idle-e2e-{run_id}")).await?;
+
+    let (client, connection) = tokio_postgres::connect(&env.dsn(), NoTls)
+        .await
+        .context("connect Postgres control plane for idle test")?;
+    let _connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    setup_publication_and_slot(&client, &table_name, &publication, &slot).await?;
+    let start_lsn = create_slot(&client, &slot).await?;
+
+    let config = PostgresCdcConfig::new(
+        env.host.clone(),
+        env.user.clone(),
+        env.password.clone(),
+        env.database.clone(),
+        slot.clone(),
+        publication.clone(),
+    )?
+    .with_port(env.port)?
+    .with_start_lsn(start_lsn)
+    .with_status_interval(Duration::from_millis(100))?
+    .with_idle_wakeup_interval(Duration::from_millis(200))?;
+    let mut replication = PostgresReplicationClient::connect(&config).await?;
+    let mut applier = PostgresCdcEventApplier::new(
+        source_id.clone(),
+        store.clone(),
+        HashMap::from([(table_id.clone(), schema)]),
+    );
+
+    let test_result = async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        anyhow::ensure!(
+            store.load_checkpoint(&source_id).await?.is_none(),
+            "idle replication should not create a durable checkpoint before WAL data"
+        );
+        anyhow::ensure!(
+            replication.is_running(),
+            "replication client should still be running after an idle interval"
+        );
+
+        client
+            .execute(
+                &format!("INSERT INTO {table_name} (id, amount, note) VALUES ($1, $2, $3)"),
+                &[&7_i64, &700_i64, &"after_idle"],
+            )
+            .await
+            .context("insert source row after idle interval")?;
+        process_until_row(
+            &store,
+            &mut replication,
+            &mut applier,
+            &table_id,
+            key(7),
+            Some(row(7, 700, "after_idle")?),
+            "row after idle",
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    replication.stop();
+    let _ = replication.shutdown().await;
+    cleanup_postgres(&client, &publication, &slot, &table_name).await;
+    test_result
+}
+
 #[derive(Debug)]
 struct PgEnv {
     host: String,

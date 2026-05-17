@@ -137,15 +137,30 @@ impl MaterializedViewTableProvider {
             && view.authoritative_row_count() == Some(visible_row_count)
         {
             let snapshot = view.snapshot_encoded();
-            tracing::info!(
-                view = %self.view_name,
-                version = target_version,
-                rows = snapshot.len(),
-                storage = "authoritative_state",
-                total_ms = total_start.elapsed().as_millis() as u64,
-                "materialized view loaded rows"
-            );
-            return Ok((snapshot, target_version));
+            let snapshot_row_count = snapshot
+                .values()
+                .copied()
+                .map(|diff| diff.max(0) as usize)
+                .sum::<usize>();
+            if snapshot_row_count != visible_row_count {
+                tracing::debug!(
+                    view = %self.view_name,
+                    version = target_version,
+                    cached_rows = visible_row_count,
+                    snapshot_rows = snapshot_row_count,
+                    "materialized view authoritative state cache row count mismatch"
+                );
+            } else {
+                tracing::info!(
+                    view = %self.view_name,
+                    version = target_version,
+                    rows = snapshot.len(),
+                    storage = "authoritative_state",
+                    total_ms = total_start.elapsed().as_millis() as u64,
+                    "materialized view loaded rows"
+                );
+                return Ok((snapshot, target_version));
+            }
         }
 
         if let Some((base_version, target_version, overlay)) =
@@ -284,12 +299,12 @@ impl MaterializedViewTableProvider {
             .copied()
             .map(|diff| diff.max(0) as usize)
             .sum();
-        if view.seed_authoritative_row_count_if_latest(version, row_count) {
+        if view.seed_cached_row_count_if_latest(version, row_count) {
             tracing::debug!(
                 view = %self.view_name,
                 version,
                 rows = row_count,
-                "materialized view authoritative row count recovered"
+                "materialized view row count recovered"
             );
         }
     }

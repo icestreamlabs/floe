@@ -1279,6 +1279,17 @@ write_docker_stats
 end_to_end_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${node_started_ns}) / 1000000000 }")"
 counter_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${counter_started_ns}) / 1000000000 }")"
 end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${end_to_end_seconds} }")"
+kafka_counter_wall_seconds="$(awk -F= '$1 == "cdc_counter.wall_seconds" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_pre_stream_wait_seconds="$(awk -F= '$1 == "cdc_counter.pre_stream_wait_seconds" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_stream_seconds="$(awk -F= '$1 == "cdc_counter.stream_seconds" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_post_stream_wait_seconds="$(awk -F= '$1 == "cdc_counter.post_stream_wait_seconds" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_stream_rows_per_second="$(awk -F= '$1 == "cdc_counter.stream_rows_per_second" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_stream_mb_per_second="$(awk -F= '$1 == "cdc_counter.stream_mb_per_second" { print $2; exit }' "${COUNTER_LOG}")"
+if [[ -n "${kafka_stream_seconds}" ]]; then
+  harness_overhead_seconds="$(awk "BEGIN { value = ${end_to_end_seconds} - ${kafka_stream_seconds}; if (value < 0) value = 0; printf \"%.3f\", value }")"
+else
+  harness_overhead_seconds=""
+fi
 
 {
   echo "benchmark.dataset=${DATASET}"
@@ -1315,6 +1326,13 @@ end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${e
   echo "benchmark.end_to_end_seconds=${end_to_end_seconds}"
   echo "benchmark.counter_seconds=${counter_seconds}"
   echo "benchmark.end_to_end_rows_per_second=${end_to_end_rows_per_second}"
+  echo "benchmark.kafka_counter_wall_seconds=${kafka_counter_wall_seconds}"
+  echo "benchmark.kafka_pre_stream_wait_seconds=${kafka_pre_stream_wait_seconds}"
+  echo "benchmark.kafka_stream_seconds=${kafka_stream_seconds}"
+  echo "benchmark.kafka_post_stream_wait_seconds=${kafka_post_stream_wait_seconds}"
+  echo "benchmark.kafka_stream_rows_per_second=${kafka_stream_rows_per_second}"
+  echo "benchmark.kafka_stream_mb_per_second=${kafka_stream_mb_per_second}"
+  echo "benchmark.harness_overhead_seconds=${harness_overhead_seconds}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"

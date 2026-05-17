@@ -1897,6 +1897,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         )
                         .await
                         {
+                            if cancel.is_cancelled() {
+                                tracing::debug!(
+                                    error = %err,
+                                    "native Postgres CDC connector stopped during shutdown"
+                                );
+                                return;
+                            }
                             tracing::error!(error = %err, "native Postgres CDC connector failed");
                             record_runtime_failure(
                                 &failure_state,

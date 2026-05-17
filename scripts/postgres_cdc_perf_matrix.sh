@@ -60,7 +60,7 @@ env_value() {
 
 write_headers() {
   cat >"${SUMMARY_CSV}" <<CSV
-status,mode,format,rows,source_rows,expected_messages,observed_messages,end_to_end_seconds,end_to_end_rows_per_second,total_bytes,wall_mb_per_second,artifact_dir
+status,mode,format,rows,source_rows,expected_messages,observed_messages,end_to_end_seconds,end_to_end_rows_per_second,kafka_stream_seconds,kafka_stream_rows_per_second,kafka_pre_stream_wait_seconds,harness_overhead_seconds,total_bytes,wall_mb_per_second,stream_mb_per_second,artifact_dir
 CSV
   cat >"${SUMMARY_MD}" <<MD
 # Postgres CDC Benchmark Matrix
@@ -97,8 +97,8 @@ Postgres snapshot max workers: \`${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}\`
 
 Postgres snapshot intra-table chunks: \`${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}\`
 
-| Status | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | End-to-End (s) | Source Rows/s | Total Bytes | Wall MB/s | Artifacts |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Status | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | End-to-End (s) | E2E Rows/s | Kafka Stream (s) | Kafka Stream Rows/s | Pre-Stream Wait (s) | Harness Overhead (s) | Total Bytes | Wall MB/s | Stream MB/s | Artifacts |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 MD
 }
 
@@ -139,24 +139,34 @@ append_result() {
   local summary="${run_dir}/summary.env"
   local counter="${run_dir}/kafka-counter.log"
 
-  local source_rows expected observed seconds rows_per_second total_bytes mb_per_second
+  local source_rows expected observed seconds rows_per_second stream_seconds stream_rows_per_second pre_stream_wait harness_overhead total_bytes wall_mb_per_second stream_mb_per_second
   source_rows="$(env_value "${summary}" benchmark.source_rows)"
   expected="$(env_value "${summary}" benchmark.expected_kafka_messages)"
   observed="$(env_value "${counter}" cdc_counter.observed_messages)"
   seconds="$(env_value "${summary}" benchmark.end_to_end_seconds)"
   rows_per_second="$(env_value "${summary}" benchmark.end_to_end_rows_per_second)"
+  stream_seconds="$(env_value "${summary}" benchmark.kafka_stream_seconds)"
+  stream_rows_per_second="$(env_value "${summary}" benchmark.kafka_stream_rows_per_second)"
+  pre_stream_wait="$(env_value "${summary}" benchmark.kafka_pre_stream_wait_seconds)"
+  harness_overhead="$(env_value "${summary}" benchmark.harness_overhead_seconds)"
   total_bytes="$(env_value "${counter}" cdc_counter.total_bytes)"
-  mb_per_second="$(env_value "${counter}" cdc_counter.wall_mb_per_second)"
+  wall_mb_per_second="$(env_value "${counter}" cdc_counter.wall_mb_per_second)"
+  stream_mb_per_second="$(env_value "${summary}" benchmark.kafka_stream_mb_per_second)"
 
   source_rows="${source_rows:-}"
   expected="${expected:-}"
   observed="${observed:-}"
   seconds="${seconds:-}"
   rows_per_second="${rows_per_second:-}"
+  stream_seconds="${stream_seconds:-}"
+  stream_rows_per_second="${stream_rows_per_second:-}"
+  pre_stream_wait="${pre_stream_wait:-}"
+  harness_overhead="${harness_overhead:-}"
   total_bytes="${total_bytes:-}"
-  mb_per_second="${mb_per_second:-}"
+  wall_mb_per_second="${wall_mb_per_second:-}"
+  stream_mb_per_second="${stream_mb_per_second:-}"
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${status}" \
     "${mode}" \
     "${format}" \
@@ -166,11 +176,16 @@ append_result() {
     "${observed}" \
     "${seconds}" \
     "${rows_per_second}" \
+    "${stream_seconds}" \
+    "${stream_rows_per_second}" \
+    "${pre_stream_wait}" \
+    "${harness_overhead}" \
     "${total_bytes}" \
-    "${mb_per_second}" \
+    "${wall_mb_per_second}" \
+    "${stream_mb_per_second}" \
     "${run_dir}" >>"${SUMMARY_CSV}"
 
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
+  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
     "${status}" \
     "${mode}" \
     "${format}" \
@@ -180,8 +195,13 @@ append_result() {
     "${observed:-n/a}" \
     "${seconds:-n/a}" \
     "${rows_per_second:-n/a}" \
+    "${stream_seconds:-n/a}" \
+    "${stream_rows_per_second:-n/a}" \
+    "${pre_stream_wait:-n/a}" \
+    "${harness_overhead:-n/a}" \
     "${total_bytes:-n/a}" \
-    "${mb_per_second:-n/a}" \
+    "${wall_mb_per_second:-n/a}" \
+    "${stream_mb_per_second:-n/a}" \
     "${run_dir}" >>"${SUMMARY_MD}"
 }
 
