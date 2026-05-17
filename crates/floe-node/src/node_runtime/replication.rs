@@ -2,7 +2,7 @@ use super::*;
 
 use std::fmt;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,7 @@ use floe_storage::{
     CdcBufferRecord, CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest,
     ReplicationPipelineCheckpoint, SlateCatalog,
 };
+use rayon::prelude::*;
 use rdkafka::ClientConfig;
 use rdkafka::client::ClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -67,6 +68,8 @@ const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: usize = 0;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
+const DEFAULT_REPLICATION_KAFKA_METADATA_HEADERS: bool = false;
+const FLOE_JSON_PARALLEL_RECORD_THRESHOLD: usize = 4_096;
 static REPLICATION_KAFKA_MESSAGE_MAX_BYTES: LazyLock<String> = LazyLock::new(|| {
     std::env::var("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES")
         .ok()
@@ -188,6 +191,12 @@ static REPLICATION_ARROW_IPC_COMPRESSION: LazyLock<Option<ReplicationArrowIpcCom
             .ok()
             .and_then(|value| ReplicationArrowIpcCompression::parse(&value))
     });
+static REPLICATION_KAFKA_METADATA_HEADERS: LazyLock<bool> = LazyLock::new(|| {
+    env_bool(
+        "FLOE_REPLICATION_KAFKA_METADATA_HEADERS",
+        DEFAULT_REPLICATION_KAFKA_METADATA_HEADERS,
+    )
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicationBufferLimits {
@@ -385,6 +394,18 @@ fn env_u64_limit(name: &str, default_value: u64) -> Option<u64> {
     (value > 0).then_some(value)
 }
 
+fn env_bool(name: &str, default_value: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default_value)
+}
+
 pub(super) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<KafkaReplicationPipelineWriter>>,
@@ -471,6 +492,7 @@ impl ReplicationPipelineStatusSnapshot {
 struct KafkaReplicationPipelineWriter {
     producer: ThreadedProducer<KafkaReplicationPipelineContext>,
     topic: String,
+    partition_offsets: usize,
 }
 
 struct PostgresReplicationPipelineWriter {
@@ -502,18 +524,20 @@ struct KafkaDeliveryBatchState {
     expected: usize,
     completed: AtomicUsize,
     failed: AtomicUsize,
-    offsets_by_partition: Mutex<std::collections::BTreeMap<i32, i64>>,
+    partition_offsets: Vec<AtomicI64>,
+    overflow_offsets_by_partition: Mutex<std::collections::BTreeMap<i32, i64>>,
     first_error: Mutex<Option<String>>,
     notify: tokio::sync::Notify,
 }
 
 impl KafkaDeliveryBatchState {
-    fn new(expected: usize) -> Arc<Self> {
+    fn new(expected: usize, partition_offsets: usize) -> Arc<Self> {
         Arc::new(Self {
             expected,
             completed: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
-            offsets_by_partition: Mutex::new(std::collections::BTreeMap::new()),
+            partition_offsets: (0..partition_offsets).map(|_| AtomicI64::new(-1)).collect(),
+            overflow_offsets_by_partition: Mutex::new(std::collections::BTreeMap::new()),
             first_error: Mutex::new(None),
             notify: tokio::sync::Notify::new(),
         })
@@ -522,9 +546,16 @@ impl KafkaDeliveryBatchState {
     fn record(&self, delivery_result: &DeliveryResult<'_>) {
         match delivery_result {
             Ok(message) => {
-                if let Ok(mut offsets_by_partition) = self.offsets_by_partition.lock() {
+                let partition = message.partition();
+                if let Ok(partition_idx) = usize::try_from(partition)
+                    && let Some(offset) = self.partition_offsets.get(partition_idx)
+                {
+                    offset.fetch_max(message.offset(), Ordering::AcqRel);
+                } else if let Ok(mut offsets_by_partition) =
+                    self.overflow_offsets_by_partition.lock()
+                {
                     offsets_by_partition
-                        .entry(message.partition())
+                        .entry(partition)
                         .and_modify(|current| *current = (*current).max(message.offset()))
                         .or_insert(message.offset());
                 }
@@ -581,10 +612,24 @@ impl KafkaDeliveryBatchState {
                 self.expected
             ));
         }
-        self.offsets_by_partition
+        let mut offsets_by_partition = std::collections::BTreeMap::new();
+        for (partition, offset) in self.partition_offsets.iter().enumerate() {
+            let offset = offset.load(Ordering::Acquire);
+            if offset >= 0 {
+                offsets_by_partition.insert(partition as i32, offset);
+            }
+        }
+        let overflow_offsets = self
+            .overflow_offsets_by_partition
             .lock()
-            .map(|offsets| offsets.clone())
-            .map_err(|_| anyhow!("replication pipeline Kafka delivery offsets lock poisoned"))
+            .map_err(|_| anyhow!("replication pipeline Kafka delivery offsets lock poisoned"))?;
+        for (partition, offset) in overflow_offsets.iter() {
+            offsets_by_partition
+                .entry(*partition)
+                .and_modify(|current| *current = (*current).max(*offset))
+                .or_insert(*offset);
+        }
+        Ok(offsets_by_partition)
     }
 }
 
@@ -888,7 +933,8 @@ impl ReplicationPipelineRuntime {
         await_durable_buffer_append: bool,
     ) -> anyhow::Result<usize> {
         let mut written = 0usize;
-        for plan in plans {
+        let ordered_plans = ordered_replication_plans_for_transaction(plans, transaction);
+        for plan in ordered_plans {
             let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
             let perf_started_at = perf_enabled.then(Instant::now);
             let encode_started_at = perf_enabled.then(Instant::now);
@@ -1010,95 +1056,72 @@ impl ReplicationPipelineRuntime {
                     continue;
                 }
 
-                let append_send_started_at = perf_enabled.then(Instant::now);
-                let append_future = async {
-                    let started_at = perf_enabled.then(Instant::now);
-                    let result = append_buffer_transaction(
-                        &buffer_store,
-                        &prepared_append.append,
-                        await_durable_buffer_append,
-                    )
-                    .await;
-                    let elapsed = started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    (result, elapsed)
-                };
-                let target_future = async {
-                    let started_at = perf_enabled.then(Instant::now);
-                    let result = self
-                        .send_records_to_target(plan, prepared_append.target_records())
-                        .await;
-                    let elapsed = started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    (result, elapsed)
-                };
-                let (
-                    (manifest_result, buffer_append_elapsed),
-                    (target_result, target_send_elapsed),
-                ) = tokio::join!(append_future, target_future);
-                let append_send_elapsed = append_send_started_at
-                    .map(|started_at| started_at.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                let manifest = manifest_result.with_context(|| {
-                    format!(
-                        "append replication pipeline '{}' transaction buffer",
-                        plan.name
-                    )
-                })?;
-                let checkpoint_started_at = perf_enabled.then(Instant::now);
-                storage
-                    .put_replication_pipeline_checkpoint_without_durable_wait(
-                        ReplicationPipelineCheckpoint::new(
-                            &plan.name,
-                            &plan.source_name,
-                            transaction.commit_position().clone(),
-                            transaction.transaction_id().cloned(),
-                            pending_target_state(plan, &manifest),
-                            current_unix_time_ms(),
-                        )?,
-                    )
+                let target_send_started_at = perf_enabled.then(Instant::now);
+                match self
+                    .send_records_to_target(plan, prepared_append.target_records())
                     .await
-                    .with_context(|| {
-                        format!("persist replication pipeline '{}' checkpoint", plan.name)
-                    })?;
-                let checkpoint_elapsed = checkpoint_started_at
-                    .map(|started_at| started_at.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                written = written.saturating_add(manifest.record_count());
-                match target_result {
+                {
                     Ok(target_state) => {
-                        let delivery_started_at = perf_enabled.then(Instant::now);
-                        let delivered = self
-                            .mark_manifest_delivered(
-                                plan,
-                                &buffer_store,
-                                storage,
-                                &manifest,
-                                target_state,
-                            )
-                            .await?;
-                        let delivery_elapsed = delivery_started_at
+                        let target_send_elapsed = target_send_started_at
                             .map(|started_at| started_at.elapsed())
                             .unwrap_or(Duration::ZERO);
-                        log_replication_durable_stage_perf(
+                        let checkpoint_started_at = perf_enabled.then(Instant::now);
+                        storage
+                            .put_replication_pipeline_checkpoint_without_durable_wait(
+                                ReplicationPipelineCheckpoint::new(
+                                    &plan.name,
+                                    &plan.source_name,
+                                    transaction.commit_position().clone(),
+                                    transaction.transaction_id().cloned(),
+                                    direct_delivered_target_state(
+                                        plan,
+                                        transaction,
+                                        record_count,
+                                        prepared_append.append.payload_format(),
+                                        target_state,
+                                    ),
+                                    current_unix_time_ms(),
+                                )?,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("persist replication pipeline '{}' checkpoint", plan.name)
+                            })?;
+                        let checkpoint_elapsed = checkpoint_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        log_replication_direct_delivery_perf(
                             plan,
-                            &manifest,
-                            manifest.record_count(),
-                            append_send_elapsed,
-                            buffer_append_elapsed,
+                            record_count,
+                            prepared_append.append.payload_format(),
+                            incoming_bytes,
                             target_send_elapsed,
                             checkpoint_elapsed,
-                            delivery_elapsed,
                         );
-                        if delivered > 0 {
-                            self.spawn_cleanup_delivered_if_due(plan, &buffer_store);
-                        }
+                        written = written.saturating_add(record_count);
                     }
                     Err(err) => {
+                        self.record_target_write_failure(plan, &err);
+                        let append_started_at = perf_enabled.then(Instant::now);
+                        let manifest = append_buffer_transaction(
+                            &buffer_store,
+                            &prepared_append.append,
+                            await_durable_buffer_append,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "append replication pipeline '{}' transaction buffer after target failure",
+                                plan.name
+                            )
+                        })?;
+                        let append_elapsed = append_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
                         self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
                             .await?;
+                        written = written.saturating_add(manifest.record_count());
                     }
                 }
                 record_buffer_stats(&buffer_store, &plan.name).await?;
@@ -1764,19 +1787,29 @@ impl KafkaReplicationPipelineWriter {
         let producer: ThreadedProducer<KafkaReplicationPipelineContext> = config
             .create_with_context(KafkaReplicationPipelineContext)
             .context("create replication pipeline Kafka producer")?;
-        if let Err(err) = producer
+        let partition_offsets = match producer
             .client()
             .fetch_metadata(Some(topic), REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT)
         {
-            tracing::debug!(
-                topic,
-                error = %err,
-                "replication pipeline Kafka metadata warm-up failed; first send will retry metadata"
-            );
-        }
+            Ok(metadata) => metadata
+                .topics()
+                .iter()
+                .find(|metadata_topic| metadata_topic.name() == topic)
+                .map(|metadata_topic| metadata_topic.partitions().len())
+                .unwrap_or(0),
+            Err(err) => {
+                tracing::debug!(
+                    topic,
+                    error = %err,
+                    "replication pipeline Kafka metadata warm-up failed; first send will retry metadata"
+                );
+                0
+            }
+        };
         Ok(Self {
             producer,
             topic: topic.to_string(),
+            partition_offsets,
         })
     }
 
@@ -1784,11 +1817,18 @@ impl KafkaReplicationPipelineWriter {
         &self,
         records: &[CdcBufferRecord],
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-        let delivery_state = KafkaDeliveryBatchState::new(records.len());
+        let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
+        let perf_started_at = perf_enabled.then(Instant::now);
+        let enqueue_started_at = perf_enabled.then(Instant::now);
+        let delivery_state = KafkaDeliveryBatchState::new(records.len(), self.partition_offsets);
         for record in records {
             self.enqueue_record_with_retry(record, Arc::clone(&delivery_state))
                 .await?;
         }
+        let enqueue_elapsed = enqueue_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let delivery_wait_started_at = perf_enabled.then(Instant::now);
         let offsets_by_partition = match delivery_state.wait(REPLICATION_KAFKA_SEND_TIMEOUT).await {
             Ok(offsets) => offsets,
             Err(err) => {
@@ -1802,6 +1842,19 @@ impl KafkaReplicationPipelineWriter {
                 return Err(err);
             }
         };
+        let delivery_wait_elapsed = delivery_wait_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        log_replication_kafka_send_perf(
+            &self.topic,
+            records,
+            self.partition_offsets,
+            enqueue_elapsed,
+            delivery_wait_elapsed,
+            perf_started_at
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or(Duration::ZERO),
+        );
 
         let mut target_state = std::collections::BTreeMap::new();
         target_state.insert("kafka.topic".to_string(), self.topic.clone());
@@ -2331,34 +2384,58 @@ async fn append_buffer_transaction(
     Ok(manifest)
 }
 
+fn ordered_replication_plans_for_transaction<'a>(
+    plans: &'a [ReplicationPipelineRuntimePlan],
+    transaction: &TransactionBatch,
+) -> Vec<&'a ReplicationPipelineRuntimePlan> {
+    let mut ordered = plans.iter().collect::<Vec<_>>();
+    if ordered.len() <= 1 || !replication_pipeline_targets_are_distinct(plans) {
+        return ordered;
+    }
+    ordered.sort_by(|left, right| {
+        transaction_change_count_for_table(transaction, &right.table_id).cmp(
+            &transaction_change_count_for_table(transaction, &left.table_id),
+        )
+    });
+    ordered
+}
+
+fn replication_pipeline_targets_are_distinct(plans: &[ReplicationPipelineRuntimePlan]) -> bool {
+    let mut targets = HashSet::with_capacity(plans.len());
+    plans
+        .iter()
+        .all(|plan| targets.insert(replication_pipeline_target_identity(plan)))
+}
+
+fn replication_pipeline_target_identity(plan: &ReplicationPipelineRuntimePlan) -> String {
+    match &plan.target {
+        ReplicationPipelineRuntimeTarget::Kafka { brokers, topic } => {
+            format!("kafka\0{brokers}\0{topic}")
+        }
+        ReplicationPipelineRuntimeTarget::Postgres { connection, table } => {
+            format!("postgres\0{connection}\0{table}")
+        }
+    }
+}
+
+fn transaction_change_count_for_table(
+    transaction: &TransactionBatch,
+    table_id: &CdcTableId,
+) -> usize {
+    transaction
+        .change_batches()
+        .iter()
+        .filter(|batch| batch.table_id() == table_id)
+        .map(ChangeBatch::change_count)
+        .sum()
+}
+
 fn prepare_replication_buffer_append(
     plan: &ReplicationPipelineRuntimePlan,
     transaction: &TransactionBatch,
     target_records: Vec<CdcBufferRecord>,
 ) -> anyhow::Result<PreparedReplicationBufferAppend> {
     let buffered_at_unix_ms = current_unix_time_ms();
-    if plan.format == ReplicationPipelineRuntimeFormat::FloeJson {
-        let change_batches = matching_change_batches(plan, transaction);
-        anyhow::ensure!(
-            !change_batches.is_empty(),
-            "replication pipeline '{}' has target records but no matching CDC change batches",
-            plan.name
-        );
-        return Ok(PreparedReplicationBufferAppend {
-            append: CdcBufferAppend::new_change_batches(
-                &plan.name,
-                &plan.source_name,
-                plan.table_id.as_str(),
-                transaction.commit_position().clone(),
-                transaction.transaction_id().cloned(),
-                change_batches,
-                buffered_at_unix_ms,
-            )?
-            .with_schema_versions(transaction.schema_versions().clone()),
-            target_records: Some(target_records),
-        });
-    }
-
     Ok(PreparedReplicationBufferAppend {
         append: CdcBufferAppend::new(
             &plan.name,
@@ -2374,22 +2451,24 @@ fn prepare_replication_buffer_append(
     })
 }
 
-fn matching_change_batches(
-    plan: &ReplicationPipelineRuntimePlan,
-    transaction: &TransactionBatch,
-) -> Vec<ChangeBatch> {
-    transaction
-        .change_batches()
-        .iter()
-        .filter(|batch| batch.table_id() == &plan.table_id)
-        .cloned()
-        .collect()
-}
-
 fn encode_pipeline_transaction_records(
     plan: &ReplicationPipelineRuntimePlan,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
     transaction: &TransactionBatch,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    encode_pipeline_transaction_records_with_metadata(
+        plan,
+        schemas,
+        transaction,
+        *REPLICATION_KAFKA_METADATA_HEADERS,
+    )
+}
+
+fn encode_pipeline_transaction_records_with_metadata(
+    plan: &ReplicationPipelineRuntimePlan,
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    transaction: &TransactionBatch,
+    include_metadata_headers: bool,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     let mut matching_batches = transaction
         .change_batches()
@@ -2412,13 +2491,15 @@ fn encode_pipeline_transaction_records(
     for change_batch in matching_batches {
         let mut batch_records =
             encode_pipeline_buffer_records(plan, schema, change_batch, transaction)?;
-        add_replication_record_metadata(
-            plan,
-            transaction.commit_position(),
-            transaction.transaction_id(),
-            &mut batch_records,
-            next_sequence,
-        );
+        if include_metadata_headers {
+            add_replication_record_metadata(
+                plan,
+                transaction.commit_position(),
+                transaction.transaction_id(),
+                &mut batch_records,
+                next_sequence,
+            );
+        }
         next_sequence = next_sequence.saturating_add(batch_records.len());
         records.extend(batch_records);
     }
@@ -2574,37 +2655,66 @@ fn encode_floe_json_pipeline_records(
     batch: &ChangeBatch,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     validate_floe_json_schema(schema)?;
-    let mut records = Vec::with_capacity(batch.changes().len());
-    for change in batch.changes() {
-        match change {
-            CdcChange::Insert { row } => {
-                let key = schema.primary_key_from_row(row)?;
-                records.push(floe_json_record_from_row(schema, &key, row, false)?);
-            }
-            CdcChange::Update { key, before, after } => {
-                let key = cdc_key_for_update(schema, key.as_ref(), before.as_ref(), after)?;
-                records.push(floe_json_record_from_row(schema, &key, after, false)?);
-            }
-            CdcChange::Delete { key, before } => {
-                let key = cdc_key_for_delete(schema, key.as_ref(), before.as_ref())?;
-                let value = match before {
-                    Some(row) => floe_json_value_bytes_from_row(schema, row, true)?,
-                    None => floe_json_value_bytes_from_key(schema, &key)?,
-                };
-                records.push(CdcBufferRecord::new(
-                    Some(floe_json_key_bytes(schema, &key)?),
-                    Some(value),
-                ));
-            }
-            CdcChange::Truncate => {
-                return Err(anyhow!(
-                    "Floe JSON replication for table '{}' does not support truncate",
-                    schema.table_id().as_str()
-                ));
-            }
-        }
+    let encoder = FloeJsonRowEncoder::new(schema)?;
+    if batch.changes().len() >= FLOE_JSON_PARALLEL_RECORD_THRESHOLD {
+        return batch
+            .changes()
+            .par_iter()
+            .map(|change| encode_floe_json_change_record(change, &encoder, schema))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
     }
-    Ok(records)
+    batch
+        .changes()
+        .iter()
+        .map(|change| encode_floe_json_change_record(change, &encoder, schema))
+        .collect()
+}
+
+fn encode_floe_json_change_record(
+    change: &CdcChange,
+    encoder: &FloeJsonRowEncoder,
+    schema: &CdcTableSchema,
+) -> anyhow::Result<CdcBufferRecord> {
+    match change {
+        CdcChange::Insert { row } => floe_json_record_from_row(row, row, encoder, false),
+        CdcChange::Update { key, before, after } => {
+            let key = match (key.as_ref(), before.as_ref()) {
+                (Some(key), _) => floe_json_key_bytes_from_key(key, encoder)?,
+                (None, Some(before)) => floe_json_key_bytes_from_row(before, encoder)?,
+                (None, None) => floe_json_key_bytes_from_row(after, encoder)?,
+            };
+            Ok(CdcBufferRecord::new(
+                Some(key),
+                Some(floe_json_value_bytes_from_row(after, encoder, false)?),
+            ))
+        }
+        CdcChange::Delete { key, before } => {
+            let (key, value) = match (key.as_ref(), before.as_ref()) {
+                (Some(key), Some(row)) => (
+                    floe_json_key_bytes_from_key(key, encoder)?,
+                    floe_json_value_bytes_from_row(row, encoder, true)?,
+                ),
+                (Some(key), None) => (
+                    floe_json_key_bytes_from_key(key, encoder)?,
+                    floe_json_value_bytes_from_key(key, encoder)?,
+                ),
+                (None, Some(row)) => (
+                    floe_json_key_bytes_from_row(row, encoder)?,
+                    floe_json_value_bytes_from_row(row, encoder, true)?,
+                ),
+                (None, None) => {
+                    return Err(anyhow!("CDC delete requires a key or before row"));
+                }
+            };
+            Ok(CdcBufferRecord::new(Some(key), Some(value)))
+        }
+        CdcChange::Truncate => Err(anyhow!(
+            "Floe JSON replication for table '{}' does not support truncate",
+            schema.table_id().as_str()
+        )),
+    }
 }
 
 fn encode_floe_json_buffered_change_batches(
@@ -2648,33 +2758,6 @@ fn encode_floe_json_snapshot_pipeline_records(
     Ok(records)
 }
 
-fn cdc_key_for_update(
-    schema: &CdcTableSchema,
-    explicit_key: Option<&CdcRowKey>,
-    before: Option<&CdcRow>,
-    after: &CdcRow,
-) -> anyhow::Result<CdcRowKey> {
-    if let Some(key) = explicit_key {
-        return Ok(key.clone());
-    }
-    if let Some(before) = before {
-        return schema.primary_key_from_row(before);
-    }
-    schema.primary_key_from_row(after)
-}
-
-fn cdc_key_for_delete(
-    schema: &CdcTableSchema,
-    explicit_key: Option<&CdcRowKey>,
-    before: Option<&CdcRow>,
-) -> anyhow::Result<CdcRowKey> {
-    if let Some(key) = explicit_key {
-        return Ok(key.clone());
-    }
-    let before = before.ok_or_else(|| anyhow!("CDC delete requires a key or before row"))?;
-    schema.primary_key_from_row(before)
-}
-
 fn validate_floe_json_schema(schema: &CdcTableSchema) -> anyhow::Result<()> {
     for column in schema.columns() {
         anyhow::ensure!(
@@ -2687,23 +2770,6 @@ fn validate_floe_json_schema(schema: &CdcTableSchema) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn floe_json_record_from_row(
-    schema: &CdcTableSchema,
-    key: &CdcRowKey,
-    row: &CdcRow,
-    deleted: bool,
-) -> anyhow::Result<CdcBufferRecord> {
-    Ok(CdcBufferRecord::new(
-        Some(floe_json_key_bytes(schema, key)?),
-        Some(floe_json_value_bytes_from_row(schema, row, deleted)?),
-    ))
-}
-
-struct FloeJsonColumnarEncoder {
-    value_fields: Vec<FloeJsonColumnarField>,
-    key_fields: Vec<FloeJsonColumnarField>,
-}
-
 struct FloeJsonColumnarField {
     column_idx: usize,
     name: String,
@@ -2711,43 +2777,70 @@ struct FloeJsonColumnarField {
     data_type: ColumnType,
 }
 
+struct FloeJsonRowEncoder {
+    value_fields: Vec<FloeJsonColumnarField>,
+    key_fields: Vec<FloeJsonColumnarField>,
+}
+
+struct FloeJsonColumnarEncoder {
+    value_fields: Vec<FloeJsonColumnarField>,
+    key_fields: Vec<FloeJsonColumnarField>,
+}
+
+impl FloeJsonRowEncoder {
+    fn new(schema: &CdcTableSchema) -> anyhow::Result<Self> {
+        Ok(Self {
+            value_fields: floe_json_value_fields(schema)?,
+            key_fields: floe_json_key_fields(schema)?,
+        })
+    }
+}
+
 impl FloeJsonColumnarEncoder {
     fn new(schema: &CdcTableSchema) -> anyhow::Result<Self> {
-        let value_fields = schema
-            .columns()
-            .iter()
-            .enumerate()
-            .map(|(column_idx, column)| {
-                Ok(FloeJsonColumnarField {
-                    column_idx,
-                    name: column.name().to_string(),
-                    prefix: encoded_json_field_prefix(column.name(), column_idx == 0)?,
-                    data_type: column.data_type().clone(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let primary_key_indices = schema.primary_key_indices();
-        let key_fields = schema
-            .primary_key()
-            .columns()
-            .iter()
-            .zip(primary_key_indices)
-            .enumerate()
-            .map(|(key_idx, (column_name, column_idx))| {
-                let column = &schema.columns()[column_idx];
-                Ok(FloeJsonColumnarField {
-                    column_idx,
-                    name: column_name.clone(),
-                    prefix: encoded_json_field_prefix(column_name, key_idx == 0)?,
-                    data_type: column.data_type().clone(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let value_fields = floe_json_value_fields(schema)?;
+        let key_fields = floe_json_key_fields(schema)?;
         Ok(Self {
             value_fields,
             key_fields,
         })
     }
+}
+
+fn floe_json_value_fields(schema: &CdcTableSchema) -> anyhow::Result<Vec<FloeJsonColumnarField>> {
+    schema
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(column_idx, column)| {
+            Ok(FloeJsonColumnarField {
+                column_idx,
+                name: column.name().to_string(),
+                prefix: encoded_json_field_prefix(column.name(), column_idx == 0)?,
+                data_type: column.data_type().clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+}
+
+fn floe_json_key_fields(schema: &CdcTableSchema) -> anyhow::Result<Vec<FloeJsonColumnarField>> {
+    let primary_key_indices = schema.primary_key_indices();
+    schema
+        .primary_key()
+        .columns()
+        .iter()
+        .zip(primary_key_indices)
+        .enumerate()
+        .map(|(key_idx, (column_name, column_idx))| {
+            let column = &schema.columns()[column_idx];
+            Ok(FloeJsonColumnarField {
+                column_idx,
+                name: column_name.clone(),
+                prefix: encoded_json_field_prefix(column_name, key_idx == 0)?,
+                data_type: column.data_type().clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 fn encoded_json_field_prefix(field_name: &str, first: bool) -> anyhow::Result<Vec<u8>> {
@@ -2814,81 +2907,109 @@ fn floe_json_columnar_value_bytes(
     Ok(out)
 }
 
-fn floe_json_key_bytes(schema: &CdcTableSchema, key: &CdcRowKey) -> anyhow::Result<Vec<u8>> {
-    key.validate_against_schema(schema)?;
-    let mut out = Vec::with_capacity(schema.primary_key().columns().len() * 24);
+fn floe_json_record_from_row(
+    key_row: &CdcRow,
+    row: &CdcRow,
+    encoder: &FloeJsonRowEncoder,
+    deleted: bool,
+) -> anyhow::Result<CdcBufferRecord> {
+    Ok(CdcBufferRecord::new(
+        Some(floe_json_key_bytes_from_row(key_row, encoder)?),
+        Some(floe_json_value_bytes_from_row(row, encoder, deleted)?),
+    ))
+}
+
+fn floe_json_key_bytes_from_row(
+    row: &CdcRow,
+    encoder: &FloeJsonRowEncoder,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoder.key_fields.len() * 24);
     out.push(b'{');
-    let mut first = true;
-    for (column, value) in schema.primary_key().columns().iter().zip(key.values()) {
-        let column_definition = schema
-            .columns()
-            .iter()
-            .find(|definition| definition.name() == column)
-            .ok_or_else(|| anyhow!("CDC primary-key column '{column}' missing from schema"))?;
-        append_json_field_name(&mut out, &mut first, column)?;
-        append_floe_json_value(&mut out, value, column_definition.data_type())?;
+    for field in &encoder.key_fields {
+        out.extend_from_slice(&field.prefix);
+        let value = row
+            .values()
+            .get(field.column_idx)
+            .ok_or_else(|| anyhow!("CDC row missing primary-key column '{}'", field.name))?
+            .as_ref()
+            .ok_or_else(|| anyhow!("CDC primary-key column '{}' cannot be NULL", field.name))?;
+        append_floe_json_value(&mut out, value, &field.data_type)?;
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+fn floe_json_key_bytes_from_key(
+    key: &CdcRowKey,
+    encoder: &FloeJsonRowEncoder,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        key.values().len() == encoder.key_fields.len(),
+        "CDC row key has {} values but schema expects {}",
+        key.values().len(),
+        encoder.key_fields.len()
+    );
+    let mut out = Vec::with_capacity(encoder.key_fields.len() * 24);
+    out.push(b'{');
+    for (field, value) in encoder.key_fields.iter().zip(key.values()) {
+        out.extend_from_slice(&field.prefix);
+        append_floe_json_value(&mut out, value, &field.data_type)?;
     }
     out.push(b'}');
     Ok(out)
 }
 
 fn floe_json_value_bytes_from_row(
-    schema: &CdcTableSchema,
     row: &CdcRow,
+    encoder: &FloeJsonRowEncoder,
     deleted: bool,
 ) -> anyhow::Result<Vec<u8>> {
-    schema.validate_row(row)?;
-    let mut out = Vec::with_capacity(schema.columns().len() * 32 + 64);
+    anyhow::ensure!(
+        row.values().len() == encoder.value_fields.len(),
+        "CDC row has {} values but schema expects {}",
+        row.values().len(),
+        encoder.value_fields.len()
+    );
+    let mut out = Vec::with_capacity(encoder.value_fields.len() * 32 + 64);
     out.push(b'{');
-    let mut first = true;
-    for (column, value) in schema.columns().iter().zip(row.values()) {
-        append_json_field_name(&mut out, &mut first, column.name())?;
-        if let Some(value) = value.as_ref() {
-            append_floe_json_value(&mut out, value, column.data_type())?;
+    for field in &encoder.value_fields {
+        out.extend_from_slice(&field.prefix);
+        let value = row
+            .values()
+            .get(field.column_idx)
+            .ok_or_else(|| anyhow!("CDC row missing column '{}'", field.name))?;
+        if let Some(value) = value {
+            append_floe_json_value(&mut out, value, &field.data_type)?;
         } else {
             out.extend_from_slice(b"null");
         }
     }
+    let mut first = encoder.value_fields.is_empty();
     append_floe_json_metadata(&mut out, &mut first, deleted)?;
     out.push(b'}');
     Ok(out)
 }
 
 fn floe_json_value_bytes_from_key(
-    schema: &CdcTableSchema,
     key: &CdcRowKey,
+    encoder: &FloeJsonRowEncoder,
 ) -> anyhow::Result<Vec<u8>> {
-    key.validate_against_schema(schema)?;
-    let mut out = Vec::with_capacity(schema.primary_key().columns().len() * 24 + 64);
+    anyhow::ensure!(
+        key.values().len() == encoder.key_fields.len(),
+        "CDC row key has {} values but schema expects {}",
+        key.values().len(),
+        encoder.key_fields.len()
+    );
+    let mut out = Vec::with_capacity(encoder.key_fields.len() * 24 + 64);
     out.push(b'{');
-    let mut first = true;
-    for (column, value) in schema.primary_key().columns().iter().zip(key.values()) {
-        let column_definition = schema
-            .columns()
-            .iter()
-            .find(|definition| definition.name() == column)
-            .ok_or_else(|| anyhow!("CDC primary-key column '{column}' missing from schema"))?;
-        append_json_field_name(&mut out, &mut first, column)?;
-        append_floe_json_value(&mut out, value, column_definition.data_type())?;
+    for (field, value) in encoder.key_fields.iter().zip(key.values()) {
+        out.extend_from_slice(&field.prefix);
+        append_floe_json_value(&mut out, value, &field.data_type)?;
     }
+    let mut first = encoder.key_fields.is_empty();
     append_floe_json_metadata(&mut out, &mut first, true)?;
     out.push(b'}');
     Ok(out)
-}
-
-fn append_json_field_name(
-    out: &mut Vec<u8>,
-    first: &mut bool,
-    field_name: &str,
-) -> anyhow::Result<()> {
-    if *first {
-        *first = false;
-    } else {
-        out.push(b',');
-    }
-    serde_json::to_writer(&mut *out, field_name)?;
-    out.push(b':');
-    Ok(())
 }
 
 fn append_floe_json_metadata(
@@ -2922,7 +3043,7 @@ fn append_floe_json_value(
         RowValue::DateDays(value) => write!(out, "{value}")?,
         RowValue::Decimal128(value) => match data_type {
             ColumnType::Decimal128 { scale, .. } => {
-                serde_json::to_writer(out, &format_decimal128_for_json(*value, *scale))?;
+                append_decimal128_json_string(out, *value, *scale)?;
             }
             _ => serde_json::to_writer(out, &value.to_string())?,
         },
@@ -2962,7 +3083,7 @@ fn append_floe_json_columnar_value(
         CdcColumnarColumn::Decimal128 { values, .. } => match columnar_value(values, row_idx)? {
             Some(value) => match &field.data_type {
                 ColumnType::Decimal128 { scale, .. } => {
-                    serde_json::to_writer(out, &format_decimal128_for_json(*value, *scale))?;
+                    append_decimal128_json_string(out, *value, *scale)?;
                 }
                 _ => serde_json::to_writer(out, &value.to_string())?,
             },
@@ -2994,6 +3115,32 @@ fn append_floe_json_columnar_null(
         field.name
     );
     out.extend_from_slice(b"null");
+    Ok(())
+}
+
+fn append_decimal128_json_string(out: &mut Vec<u8>, value: i128, scale: i8) -> anyhow::Result<()> {
+    out.push(b'"');
+    append_decimal128_text(out, value, scale)?;
+    out.push(b'"');
+    Ok(())
+}
+
+fn append_decimal128_text(out: &mut Vec<u8>, value: i128, scale: i8) -> anyhow::Result<()> {
+    if scale <= 0 {
+        write!(out, "{value}")?;
+        return Ok(());
+    }
+    let scale = scale as u32;
+    let factor = 10_u128
+        .checked_pow(scale)
+        .ok_or_else(|| anyhow!("Decimal128 scale {scale} is too large"))?;
+    if value < 0 {
+        out.push(b'-');
+    }
+    let magnitude = value.unsigned_abs();
+    let whole = magnitude / factor;
+    let fraction = magnitude % factor;
+    write!(out, "{whole}.{fraction:0width$}", width = scale as usize)?;
     Ok(())
 }
 
@@ -3699,6 +3846,58 @@ fn failed_target_state(
     state
 }
 
+fn direct_delivered_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    record_count: usize,
+    payload_format: CdcBufferPayloadFormat,
+    mut target_state: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    target_state.insert("source.table".to_string(), plan.upstream_table.clone());
+    target_state.insert("target.kind".to_string(), target_kind(plan).to_string());
+    if let Some(transaction_id) = transaction.transaction_id() {
+        target_state.insert(
+            "source.transaction_id".to_string(),
+            transaction_id.as_str().to_string(),
+        );
+    }
+    match transaction.commit_position() {
+        CdcSourcePosition::Postgres {
+            commit_lsn,
+            event_lsn,
+        } => {
+            target_state.insert(
+                "source.position.postgres.commit_lsn".to_string(),
+                commit_lsn.clone(),
+            );
+            if let Some(event_lsn) = event_lsn {
+                target_state.insert(
+                    "source.position.postgres.event_lsn".to_string(),
+                    event_lsn.clone(),
+                );
+            }
+        }
+        CdcSourcePosition::Opaque { value } => {
+            target_state.insert("source.position".to_string(), value.clone());
+        }
+    }
+    target_state.insert("buffer.status".to_string(), "not_buffered".to_string());
+    target_state.insert("buffer.record_count".to_string(), record_count.to_string());
+    target_state.insert(
+        "buffer.payload_format".to_string(),
+        format!("{payload_format:?}"),
+    );
+    target_state.insert(
+        "target.delivery.status".to_string(),
+        "delivered".to_string(),
+    );
+    target_state.insert(
+        "target.delivery.replay_may_duplicate".to_string(),
+        "false".to_string(),
+    );
+    target_state
+}
+
 fn base_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
@@ -3819,15 +4018,13 @@ fn log_replication_pipeline_perf(
     );
 }
 
-fn log_replication_durable_stage_perf(
+fn log_replication_direct_delivery_perf(
     plan: &ReplicationPipelineRuntimePlan,
-    manifest: &CdcBufferedTransactionManifest,
     records: usize,
-    append_send_elapsed: Duration,
-    buffer_append_elapsed: Duration,
+    payload_format: CdcBufferPayloadFormat,
+    payload_bytes: usize,
     target_send_elapsed: Duration,
     checkpoint_elapsed: Duration,
-    delivery_elapsed: Duration,
 ) {
     if !*CDC_PERF_LOGGING_ENABLED {
         return;
@@ -3835,14 +4032,43 @@ fn log_replication_durable_stage_perf(
     tracing::info!(
         pipeline = %plan.name,
         records,
-        buffer_payload_format = ?manifest.payload_format(),
-        buffer_payload_bytes = manifest.payload_bytes(),
-        append_and_target_send_ms = append_send_elapsed.as_millis() as u64,
-        buffer_append_ms = buffer_append_elapsed.as_millis() as u64,
+        buffer_payload_format = ?payload_format,
+        buffer_payload_bytes = payload_bytes,
         target_send_ms = target_send_elapsed.as_millis() as u64,
-        pending_checkpoint_ms = checkpoint_elapsed.as_millis() as u64,
-        delivery_checkpoint_ms = delivery_elapsed.as_millis() as u64,
-        "postgres cdc durable replication pipeline stages processed"
+        delivery_checkpoint_ms = checkpoint_elapsed.as_millis() as u64,
+        "postgres cdc durable replication pipeline direct delivery completed"
+    );
+}
+
+fn log_replication_kafka_send_perf(
+    topic: &str,
+    records: &[CdcBufferRecord],
+    partition_offsets: usize,
+    enqueue_elapsed: Duration,
+    delivery_wait_elapsed: Duration,
+    total_elapsed: Duration,
+) {
+    if !*CDC_PERF_LOGGING_ENABLED {
+        return;
+    }
+    let key_bytes = records
+        .iter()
+        .map(|record| record.key().map_or(0, <[u8]>::len))
+        .sum::<usize>();
+    let value_bytes = records
+        .iter()
+        .map(|record| record.value().map_or(0, <[u8]>::len))
+        .sum::<usize>();
+    tracing::info!(
+        topic,
+        records = records.len(),
+        key_bytes,
+        value_bytes,
+        partition_offsets,
+        enqueue_ms = enqueue_elapsed.as_millis() as u64,
+        delivery_wait_ms = delivery_wait_elapsed.as_millis() as u64,
+        total_ms = total_elapsed.as_millis() as u64,
+        "postgres cdc replication Kafka target send completed"
     );
 }
 
@@ -4542,7 +4768,34 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_transaction_records_include_idempotency_headers() {
+    fn pipeline_transaction_records_omit_metadata_headers_by_default() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        let schemas = HashMap::from([(table_id.clone(), schema(table_id.clone()))]);
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-77").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let records = encode_pipeline_transaction_records(&plan, &schemas, &transaction).unwrap();
+
+        assert!(records[0].headers().is_empty());
+    }
+
+    #[test]
+    fn pipeline_transaction_records_can_include_idempotency_headers() {
         let table_id = CdcTableId::new("orders").unwrap();
         let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
         let schemas = HashMap::from([(table_id.clone(), schema(table_id.clone()))]);
@@ -4568,7 +4821,9 @@ mod tests {
         )
         .unwrap();
 
-        let records = encode_pipeline_transaction_records(&plan, &schemas, &transaction).unwrap();
+        let records =
+            encode_pipeline_transaction_records_with_metadata(&plan, &schemas, &transaction, true)
+                .unwrap();
 
         assert_eq!(
             header_value(&records[0], FLOE_HEADER_IDEMPOTENCY_KEY),

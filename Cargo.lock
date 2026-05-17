@@ -2208,6 +2208,7 @@ dependencies = [
  "futures",
  "mimalloc",
  "prometheus",
+ "rayon",
  "rdkafka",
  "reqwest",
  "serde",
