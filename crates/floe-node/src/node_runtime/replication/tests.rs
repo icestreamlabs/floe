@@ -1,3 +1,7 @@
+use super::encoding::{
+    encode_debezium_pipeline_records, encode_pipeline_buffer_records,
+    encode_pipeline_transaction_records, encode_pipeline_transaction_records_with_metadata,
+};
 use super::*;
 use floe_cdc_core::{CdcColumn, CdcPrimaryKey, CdcRow, CdcTransactionId, UpstreamTableRef};
 use floe_core::RowValue;
