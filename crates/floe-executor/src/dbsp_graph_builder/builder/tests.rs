@@ -1,3 +1,8 @@
+use super::transient_topn::{
+    TransientDirectTop1Config, TransientDirectTop1PartitionKey, TransientDirectTop1PartitionLayout,
+    TransientDirectTop1Processor, TransientTop1Processor, TransientTopNKeyLayout,
+    TransientTopNProcessor,
+};
 use super::*;
 
 use std::collections::{BTreeSet, HashMap};
