@@ -174,6 +174,23 @@ struct SnapshotConcurrencyDecision {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSinkHealth {
+    Healthy,
+    Backpressured,
+    TargetError,
+}
+
+impl SnapshotSinkHealth {
+    fn unhealthy_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Healthy => None,
+            Self::Backpressured => Some("sink_backpressure"),
+            Self::TargetError => Some("sink_error"),
+        }
+    }
+}
+
 impl SnapshotScanLimiter {
     fn new(source: impl Into<String>, slot: impl Into<String>, max_workers: usize) -> Self {
         let source = source.into();
@@ -256,6 +273,7 @@ impl SnapshotAdaptiveConcurrencyRuntime {
         slot: &str,
         max_workers: usize,
         task_count: usize,
+        cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
         parent_cancel: &CancellationToken,
     ) -> Self {
         let config = snapshot_adaptive_concurrency_config(max_workers);
@@ -289,6 +307,7 @@ impl SnapshotAdaptiveConcurrencyRuntime {
                 task_slot,
                 config,
                 task_scan_limiter,
+                cdc_replication_debug,
                 wal_pressure_rx,
                 scan_observation_rx,
                 task_cancel,
@@ -369,6 +388,7 @@ async fn run_snapshot_adaptive_concurrency_controller(
     slot: String,
     config: SnapshotAdaptiveConcurrencyConfig,
     scan_limiter: Arc<SnapshotScanLimiter>,
+    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     mut wal_pressure_rx: watch::Receiver<SnapshotWalBufferPressure>,
     mut scan_observation_rx: mpsc::UnboundedReceiver<SnapshotScanObservation>,
     cancel: CancellationToken,
@@ -396,10 +416,12 @@ async fn run_snapshot_adaptive_concurrency_controller(
                 let scan_observation = latest_scan_observation.take();
                 let scan_elapsed_ms = scan_observation.map(|observation: SnapshotScanObservation| observation.elapsed_ms);
                 let scan_rows = scan_observation.map(|observation: SnapshotScanObservation| observation.rows);
+                let sink_health = snapshot_sink_health(&cdc_replication_debug, &source).await;
                 let decision = snapshot_concurrency_decision(
                     config,
                     current_target,
                     wal_pressure,
+                    sink_health,
                     scan_observation,
                 );
                 if let Some(decision) = decision
@@ -421,6 +443,7 @@ async fn run_snapshot_adaptive_concurrency_controller(
                         wal_buffer_fill_percent = wal_pressure.fill_percent(),
                         scan_elapsed_ms,
                         scan_rows,
+                        sink_health = ?sink_health,
                         direction = decision.direction,
                         reason = decision.reason,
                         "adjusted adaptive Postgres CDC snapshot concurrency"
@@ -435,9 +458,21 @@ fn snapshot_concurrency_decision(
     config: SnapshotAdaptiveConcurrencyConfig,
     current_target: usize,
     wal_pressure: SnapshotWalBufferPressure,
+    sink_health: SnapshotSinkHealth,
     scan_observation: Option<SnapshotScanObservation>,
 ) -> Option<SnapshotConcurrencyDecision> {
     let current_target = current_target.clamp(config.min_workers, config.max_workers);
+    if let Some(reason) = sink_health.unhealthy_reason() {
+        if current_target > config.min_workers {
+            return Some(SnapshotConcurrencyDecision {
+                target_workers: config.min_workers,
+                direction: "decrease",
+                reason,
+            });
+        }
+        return None;
+    }
+
     let wal_fill_percent = wal_pressure.fill_percent();
     if wal_pressure.capacity > 0
         && wal_fill_percent >= config.wal_buffer_high_watermark_percent
@@ -473,6 +508,31 @@ fn snapshot_concurrency_decision(
     }
 
     None
+}
+
+async fn snapshot_sink_health(
+    shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    source: &str,
+) -> SnapshotSinkHealth {
+    let state = shared.read().await;
+    let mut has_target_error = false;
+    for pipeline in state
+        .pipelines
+        .iter()
+        .filter(|pipeline| pipeline.source == source)
+    {
+        if pipeline.source_backpressure_active {
+            return SnapshotSinkHealth::Backpressured;
+        }
+        if pipeline.last_error.is_some() {
+            has_target_error = true;
+        }
+    }
+    if has_target_error {
+        SnapshotSinkHealth::TargetError
+    } else {
+        SnapshotSinkHealth::Healthy
+    }
 }
 
 pub(super) async fn ensure_postgres_cdc_publication_and_slot(
@@ -821,6 +881,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             slot,
             max_workers,
             task_count,
+            Arc::clone(cdc_replication_debug),
             &cancel,
         );
         let mut worker_handles = Vec::with_capacity(task_count);
@@ -2535,6 +2596,7 @@ mod tests {
                     pending_events: 8,
                     capacity: 10,
                 },
+                SnapshotSinkHealth::Healthy,
                 None,
             ),
             Some(SnapshotConcurrencyDecision {
@@ -2551,6 +2613,7 @@ mod tests {
                     pending_events: 1,
                     capacity: 10,
                 },
+                SnapshotSinkHealth::Healthy,
                 Some(SnapshotScanObservation {
                     elapsed_ms: 2_000,
                     rows: 10,
@@ -2570,6 +2633,7 @@ mod tests {
                     pending_events: 1,
                     capacity: 10,
                 },
+                SnapshotSinkHealth::Healthy,
                 None,
             ),
             Some(SnapshotConcurrencyDecision {
@@ -2577,6 +2641,36 @@ mod tests {
                 direction: "increase",
                 reason: "wal_buffer_low",
             })
+        );
+        assert_eq!(
+            snapshot_concurrency_decision(
+                config,
+                4,
+                SnapshotWalBufferPressure {
+                    pending_events: 1,
+                    capacity: 10,
+                },
+                SnapshotSinkHealth::Backpressured,
+                None,
+            ),
+            Some(SnapshotConcurrencyDecision {
+                target_workers: 1,
+                direction: "decrease",
+                reason: "sink_backpressure",
+            })
+        );
+        assert_eq!(
+            snapshot_concurrency_decision(
+                config,
+                1,
+                SnapshotWalBufferPressure {
+                    pending_events: 1,
+                    capacity: 10,
+                },
+                SnapshotSinkHealth::TargetError,
+                None,
+            ),
+            None
         );
     }
 
