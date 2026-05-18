@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use dbsp_storage::storage::KeyValueTable;
 use floe_cdc_core::{
     CdcChange, CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey,
@@ -310,6 +310,44 @@ impl CdcTableStore {
         Ok(result)
     }
 
+    pub async fn complete_unchanged_toast(
+        &self,
+        schemas: &HashMap<CdcTableId, CdcTableSchema>,
+        transaction: &TransactionBatch,
+    ) -> Result<TransactionBatch> {
+        transaction.validate_against_schemas(schemas)?;
+        if !transaction_has_unchanged_toast(transaction) {
+            return Ok(transaction.clone());
+        }
+
+        let mut overlay = HashMap::<Vec<u8>, Option<CdcRow>>::new();
+        let mut change_batches = Vec::with_capacity(transaction.change_batches().len());
+        for change_batch in transaction.change_batches() {
+            let schema = schemas.get(change_batch.table_id()).ok_or_else(|| {
+                anyhow!("missing schema for '{}'", change_batch.table_id().as_str())
+            })?;
+            change_batches.push(
+                self.complete_unchanged_toast_in_change_batch(schema, change_batch, &mut overlay)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "complete unchanged TOAST values for table '{}'",
+                            change_batch.table_id().as_str()
+                        )
+                    })?,
+            );
+        }
+
+        Ok(TransactionBatch::new(
+            transaction.source_id().clone(),
+            transaction.transaction_id().cloned(),
+            transaction.start_position().cloned(),
+            transaction.commit_position().clone(),
+            change_batches,
+        )?
+        .with_schema_versions(transaction.schema_versions().clone()))
+    }
+
     pub async fn stage_transaction(
         &self,
         schemas: &HashMap<CdcTableId, CdcTableSchema>,
@@ -388,39 +426,66 @@ impl CdcTableStore {
                 CdcChange::Update { key, before, after } => {
                     let before_key = key_for_update_lookup(schema, key.as_ref(), before, after)?;
                     let before_storage_key = row_key_bytes(schema.table_id(), &before_key)?;
+                    let stored_old_row =
+                        row_with_overlay(&before_storage_key, overlay, &prefetched_rows);
                     let old_row = match before {
-                        Some(row) => row.clone(),
-                        None => row_with_overlay(&before_storage_key, overlay, &prefetched_rows)
-                            .ok_or_else(|| {
+                        Some(row) if row.has_unchanged_toast() => {
+                            let previous = stored_old_row.as_ref().ok_or_else(|| {
                                 anyhow!(
-                                    "CDC update for table '{}' could not find previous row",
+                                    "CDC update for table '{}' could not resolve unchanged TOAST because previous row was not found",
                                     schema.table_id().as_str()
                                 )
-                            })?,
+                            })?;
+                            row.resolve_unchanged_toast(previous)?
+                        }
+                        Some(row) => row.clone(),
+                        None => stored_old_row.ok_or_else(|| {
+                            anyhow!(
+                                "CDC update for table '{}' could not find previous row",
+                                schema.table_id().as_str()
+                            )
+                        })?,
                     };
+                    let after = if after.has_unchanged_toast() {
+                        after.resolve_unchanged_toast(&old_row)?
+                    } else {
+                        after.clone()
+                    };
+                    schema.validate_row(&old_row)?;
+                    schema.validate_row(&after)?;
                     deltas.push(CdcRowDelta::delete(old_row));
 
-                    let after_key = schema.primary_key_from_row(after)?;
+                    let after_key = schema.primary_key_from_row(&after)?;
                     let after_storage_key = row_key_bytes(schema.table_id(), &after_key)?;
                     if before_storage_key != after_storage_key {
                         stage_delete_row(batch, overlay, before_storage_key);
                     }
                     stage_put_row(batch, overlay, after_storage_key, after.clone())?;
-                    deltas.push(CdcRowDelta::insert(after.clone()));
+                    deltas.push(CdcRowDelta::insert(after));
                 }
                 CdcChange::Delete { key, before } => {
                     let delete_key = key_for_delete_lookup(schema, key.as_ref(), before)?;
                     let storage_key = row_key_bytes(schema.table_id(), &delete_key)?;
+                    let stored_old_row = row_with_overlay(&storage_key, overlay, &prefetched_rows);
                     let old_row = match before {
-                        Some(row) => row.clone(),
-                        None => row_with_overlay(&storage_key, overlay, &prefetched_rows)
-                            .ok_or_else(|| {
+                        Some(row) if row.has_unchanged_toast() => {
+                            let previous = stored_old_row.as_ref().ok_or_else(|| {
                                 anyhow!(
-                                    "CDC delete for table '{}' could not find previous row",
+                                    "CDC delete for table '{}' could not resolve unchanged TOAST because previous row was not found",
                                     schema.table_id().as_str()
                                 )
-                            })?,
+                            })?;
+                            row.resolve_unchanged_toast(previous)?
+                        }
+                        Some(row) => row.clone(),
+                        None => stored_old_row.ok_or_else(|| {
+                            anyhow!(
+                                "CDC delete for table '{}' could not find previous row",
+                                schema.table_id().as_str()
+                            )
+                        })?,
                     };
+                    schema.validate_row(&old_row)?;
                     stage_delete_row(batch, overlay, storage_key);
                     deltas.push(CdcRowDelta::delete(old_row));
                 }
@@ -457,6 +522,108 @@ impl CdcTableStore {
         Ok(())
     }
 
+    async fn complete_unchanged_toast_in_change_batch(
+        &self,
+        schema: &CdcTableSchema,
+        change_batch: &ChangeBatch,
+        overlay: &mut HashMap<Vec<u8>, Option<CdcRow>>,
+    ) -> Result<ChangeBatch> {
+        if let Some(rows) = change_batch.snapshot_insert_rows() {
+            for row_idx in 0..rows.row_count() {
+                let row = rows.row(row_idx)?;
+                let key = schema.primary_key_from_row(&row)?;
+                let storage_key = row_key_bytes(schema.table_id(), &key)?;
+                overlay.insert(storage_key, Some(row));
+            }
+            return Ok(change_batch.clone());
+        }
+
+        let prefetched_rows = self
+            .prefetch_old_rows(schema, change_batch, overlay)
+            .await?;
+        let mut changes = Vec::with_capacity(change_batch.changes().len());
+        for change in change_batch.changes() {
+            match change {
+                CdcChange::Insert { row } => {
+                    ensure_no_unresolved_toast("insert", schema.table_id(), row)?;
+                    let key = schema.primary_key_from_row(row)?;
+                    let storage_key = row_key_bytes(schema.table_id(), &key)?;
+                    overlay.insert(storage_key, Some(row.clone()));
+                    changes.push(change.clone());
+                }
+                CdcChange::Update { key, before, after } => {
+                    let before_key = key_for_update_lookup(schema, key.as_ref(), before, after)?;
+                    let before_storage_key = row_key_bytes(schema.table_id(), &before_key)?;
+                    let stored_old_row =
+                        row_with_overlay(&before_storage_key, overlay, &prefetched_rows);
+                    let before = match before {
+                        Some(row) if row.has_unchanged_toast() => {
+                            let previous = stored_old_row.as_ref().ok_or_else(|| {
+                                anyhow!(
+                                    "CDC update for table '{}' could not resolve unchanged TOAST because previous row was not found",
+                                    schema.table_id().as_str()
+                                )
+                            })?;
+                            Some(row.resolve_unchanged_toast(previous)?)
+                        }
+                        Some(row) => Some(row.clone()),
+                        None => None,
+                    };
+                    let base_row =
+                        before.as_ref().or(stored_old_row.as_ref()).ok_or_else(|| {
+                            anyhow!(
+                                "CDC update for table '{}' could not find previous row",
+                                schema.table_id().as_str()
+                            )
+                        })?;
+                    let after = if after.has_unchanged_toast() {
+                        after.resolve_unchanged_toast(base_row)?
+                    } else {
+                        after.clone()
+                    };
+                    schema.validate_row(&after)?;
+                    let after_key = schema.primary_key_from_row(&after)?;
+                    if before_storage_key != row_key_bytes(schema.table_id(), &after_key)? {
+                        overlay.insert(before_storage_key, None);
+                    }
+                    let after_storage_key = row_key_bytes(schema.table_id(), &after_key)?;
+                    overlay.insert(after_storage_key, Some(after.clone()));
+                    changes.push(CdcChange::Update {
+                        key: key.clone(),
+                        before,
+                        after,
+                    });
+                }
+                CdcChange::Delete { key, before } => {
+                    let delete_key = key_for_delete_lookup(schema, key.as_ref(), before)?;
+                    let storage_key = row_key_bytes(schema.table_id(), &delete_key)?;
+                    let stored_old_row = row_with_overlay(&storage_key, overlay, &prefetched_rows);
+                    let before = match before {
+                        Some(row) if row.has_unchanged_toast() => {
+                            let previous = stored_old_row.as_ref().ok_or_else(|| {
+                                anyhow!(
+                                    "CDC delete for table '{}' could not resolve unchanged TOAST because previous row was not found",
+                                    schema.table_id().as_str()
+                                )
+                            })?;
+                            Some(row.resolve_unchanged_toast(previous)?)
+                        }
+                        Some(row) => Some(row.clone()),
+                        None => None,
+                    };
+                    overlay.insert(storage_key, None);
+                    changes.push(CdcChange::Delete {
+                        key: key.clone(),
+                        before,
+                    });
+                }
+                CdcChange::Truncate => changes.push(CdcChange::Truncate),
+            }
+        }
+
+        ChangeBatch::new(change_batch.table_id().clone(), changes)
+    }
+
     async fn prefetch_old_rows(
         &self,
         schema: &CdcTableSchema,
@@ -467,11 +634,18 @@ impl CdcTableStore {
         let mut seen = HashSet::new();
         for change in change_batch.changes() {
             let storage_key = match change {
-                CdcChange::Update { key, before, after } if before.is_none() => {
+                CdcChange::Update { key, before, after }
+                    if before.is_none()
+                        || before.as_ref().is_some_and(CdcRow::has_unchanged_toast)
+                        || after.has_unchanged_toast() =>
+                {
                     let before_key = key_for_update_lookup(schema, key.as_ref(), before, after)?;
                     row_key_bytes(schema.table_id(), &before_key)?
                 }
-                CdcChange::Delete { key, before } if before.is_none() => {
+                CdcChange::Delete { key, before }
+                    if before.is_none()
+                        || before.as_ref().is_some_and(CdcRow::has_unchanged_toast) =>
+                {
                     let delete_key = key_for_delete_lookup(schema, key.as_ref(), before)?;
                     row_key_bytes(schema.table_id(), &delete_key)?
                 }
@@ -525,6 +699,36 @@ fn row_with_overlay(
     prefetched_rows.get(storage_key).cloned().flatten()
 }
 
+fn transaction_has_unchanged_toast(transaction: &TransactionBatch) -> bool {
+    transaction
+        .change_batches()
+        .iter()
+        .flat_map(ChangeBatch::changes)
+        .any(change_has_unchanged_toast)
+}
+
+fn change_has_unchanged_toast(change: &CdcChange) -> bool {
+    match change {
+        CdcChange::Insert { row } => row.has_unchanged_toast(),
+        CdcChange::Update { before, after, .. } => {
+            before.as_ref().is_some_and(CdcRow::has_unchanged_toast) || after.has_unchanged_toast()
+        }
+        CdcChange::Delete { before, .. } => {
+            before.as_ref().is_some_and(CdcRow::has_unchanged_toast)
+        }
+        CdcChange::Truncate => false,
+    }
+}
+
+fn ensure_no_unresolved_toast(operation: &str, table_id: &CdcTableId, row: &CdcRow) -> Result<()> {
+    ensure!(
+        !row.has_unchanged_toast(),
+        "CDC {operation} for table '{}' contains unresolved unchanged TOAST",
+        table_id.as_str()
+    );
+    Ok(())
+}
+
 fn stage_checkpoint(checkpoint: &CdcCheckpoint, batch: &mut WriteBatch) -> Result<()> {
     batch.put(
         checkpoint_key(checkpoint.source_id()),
@@ -543,9 +747,9 @@ fn key_for_update_lookup(
         return Ok(key.clone());
     }
     if let Some(before) = before {
-        return schema.primary_key_from_row(before);
+        return schema.primary_key_from_row_allowing_unchanged_toast(before);
     }
-    schema.primary_key_from_row(after)
+    schema.primary_key_from_row_allowing_unchanged_toast(after)
 }
 
 fn key_for_delete_lookup(
@@ -559,7 +763,7 @@ fn key_for_delete_lookup(
     let Some(before) = before else {
         bail!("CDC delete requires a key or before row");
     };
-    schema.primary_key_from_row(before)
+    schema.primary_key_from_row_allowing_unchanged_toast(before)
 }
 
 fn stage_put_row(
@@ -1297,6 +1501,65 @@ mod tests {
                 .expect("load deleted row"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_unchanged_toast_columns_from_previous_row() {
+        let store = test_store("cdc-resolve-unchanged-toast").await;
+        let schema = orders_schema();
+        let table_id = schema.table_id().clone();
+        let original = row(1, Some(100), Some("large-note"));
+        let insert = tx(
+            "0/1",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Insert {
+                        row: original.clone(),
+                    }],
+                )
+                .expect("insert batch"),
+            ],
+        );
+        store
+            .apply_transaction(&schemas(schema.clone()), &insert)
+            .await
+            .expect("apply insert");
+
+        let unresolved_after = CdcRow::with_unchanged_toast_indices(
+            [Some(RowValue::Int64(1)), Some(RowValue::Int64(150)), None],
+            [2],
+        )
+        .expect("unresolved toast row");
+        let update = tx(
+            "0/2",
+            vec![
+                ChangeBatch::new(
+                    table_id.clone(),
+                    vec![CdcChange::Update {
+                        key: Some(key(1)),
+                        before: None,
+                        after: unresolved_after,
+                    }],
+                )
+                .expect("update batch"),
+            ],
+        );
+        let result = store
+            .apply_transaction(&schemas(schema), &update)
+            .await
+            .expect("apply toast update");
+        let expected = row(1, Some(150), Some("large-note"));
+
+        assert_eq!(
+            store
+                .load_row(&table_id, &key(1))
+                .await
+                .expect("load resolved row"),
+            Some(expected.clone())
+        );
+        assert_eq!(result.table_deltas()[0].deltas()[0].row(), &original);
+        assert_eq!(result.table_deltas()[0].deltas()[1].row(), &expected);
     }
 
     #[tokio::test]

@@ -19,9 +19,9 @@ use floe_cdc_core::{
     ChangeBatch, TransactionBatch, UpstreamTableRef,
 };
 use floe_cdc_pg::{
-    PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,
+    PostgresCdcConfig, PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,
     PostgresSchemaEvolutionPolicy, PostgresTableRouter, PostgresTransactionAssembler,
-    config_with_stored_cdc_checkpoint,
+    config_with_stored_cdc_checkpoint, create_pgoutput_slot_with_exported_snapshot,
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
@@ -145,6 +145,28 @@ struct QueuedCdcTransaction {
     transaction: TransactionBatch,
 }
 
+struct BufferedPostgresWalStream {
+    slot: String,
+    snapshot_lsn: PostgresLsn,
+    release_feedback_tx: watch::Sender<bool>,
+    receiver: mpsc::Receiver<QueuedCdcTransaction>,
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+struct InitialPostgresSnapshot {
+    lsn: Option<PostgresLsn>,
+    wal_stream: Option<BufferedPostgresWalStream>,
+}
+
+impl std::fmt::Debug for InitialPostgresSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialPostgresSnapshot")
+            .field("lsn", &self.lsn)
+            .field("has_wal_stream", &self.wal_stream.is_some())
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 struct ReplicationPipelineRuntimePlan {
     name: String,
@@ -184,7 +206,6 @@ enum ReplicationPipelineRuntimeBufferMode {
 struct PostgresCdcRuntimePlan {
     source_id: CdcSourceId,
     schemas: HashMap<CdcTableId, CdcTableSchema>,
-    materialized_table_ids: HashSet<CdcTableId>,
     replication_pipelines: Vec<ReplicationPipelineRuntimePlan>,
 }
 

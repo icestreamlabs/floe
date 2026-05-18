@@ -149,6 +149,104 @@ async fn postgres_pgoutput_stream_updates_cdc_table_state() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires logical-replication Postgres; run scripts/run_postgres_cdc_pgoutput_e2e.sh"]
+async fn postgres_pgoutput_completes_unchanged_toast_values() -> Result<()> {
+    let env = PgEnv::from_env()?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let table_name = format!("floe_cdc_toast_orders_{run_id}");
+    let slot = format!("floe_cdc_toast_slot_{run_id}");
+    let publication = format!("floe_cdc_toast_pub_{run_id}");
+    let source_id = CdcSourceId::new("pg_toast")?;
+    let table_id = CdcTableId::new("orders")?;
+    let schema = orders_schema(table_id.clone(), &table_name)?;
+    let store = test_store(&format!("pgoutput-toast-e2e-{run_id}")).await?;
+
+    let (client, connection) = tokio_postgres::connect(&env.dsn(), NoTls)
+        .await
+        .context("connect Postgres control plane for TOAST test")?;
+    let _connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    setup_publication_and_slot(&client, &table_name, &publication, &slot).await?;
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE {table_name} ALTER COLUMN note SET STORAGE EXTERNAL;"
+        ))
+        .await
+        .context("force source note column into external TOAST storage")?;
+    let start_lsn = create_slot(&client, &slot).await?;
+
+    let config = PostgresCdcConfig::new(
+        env.host.clone(),
+        env.user.clone(),
+        env.password.clone(),
+        env.database.clone(),
+        slot.clone(),
+        publication.clone(),
+    )?
+    .with_port(env.port)?
+    .with_start_lsn(start_lsn)
+    .with_status_interval(Duration::from_millis(100))?
+    .with_idle_wakeup_interval(Duration::from_secs(1))?;
+    let mut replication = PostgresReplicationClient::connect(&config).await?;
+    let mut applier = PostgresCdcEventApplier::new(
+        source_id,
+        store.clone(),
+        HashMap::from([(table_id.clone(), schema)]),
+    );
+
+    let test_result = async {
+        let large_note = large_toast_note();
+        client
+            .execute(
+                &format!("INSERT INTO {table_name} (id, amount, note) VALUES ($1, $2, $3)"),
+                &[&11_i64, &110_i64, &large_note],
+            )
+            .await
+            .context("insert source row with TOAST-sized text")?;
+        process_until_row(
+            &store,
+            &mut replication,
+            &mut applier,
+            &table_id,
+            key(11),
+            Some(row(11, 110, &large_note)?),
+            "inserted TOAST row",
+        )
+        .await?;
+
+        client
+            .execute(
+                &format!("UPDATE {table_name} SET amount = $1 WHERE id = $2"),
+                &[&111_i64, &11_i64],
+            )
+            .await
+            .context("update source row without changing TOAST column")?;
+        process_until_row(
+            &store,
+            &mut replication,
+            &mut applier,
+            &table_id,
+            key(11),
+            Some(row(11, 111, &large_note)?),
+            "updated TOAST row",
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    replication.stop();
+    let _ = replication.shutdown().await;
+    cleanup_postgres(&client, &publication, &slot, &table_name).await;
+    test_result
+}
+
+#[tokio::test]
+#[ignore = "requires logical-replication Postgres; run scripts/run_postgres_cdc_pgoutput_e2e.sh"]
 async fn postgres_pgoutput_survives_idle_before_wal() -> Result<()> {
     let env = PgEnv::from_env()?;
     let run_id = SystemTime::now()
@@ -297,6 +395,13 @@ fn row(id: i64, amount: i64, note: &str) -> Result<CdcRow> {
         Some(RowValue::Int64(amount)),
         Some(RowValue::Utf8(note.to_string())),
     ])
+}
+
+fn large_toast_note() -> String {
+    (0..2048)
+        .map(|idx| format!("toast-segment-{idx:04}-{}", "x".repeat(48)))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 async fn setup_publication_and_slot(

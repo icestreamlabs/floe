@@ -48,7 +48,6 @@ pub(super) async fn postgres_cdc_runtime_plan(
     let database_name = postgres_database_name(connection_string, connector_name);
 
     let mut schemas = HashMap::new();
-    let mut materialized_table_ids = HashSet::new();
     let mut table_id_by_upstream = HashMap::<String, CdcTableId>::new();
     let pipeline_upstreams = replication_pipelines
         .values()
@@ -76,7 +75,6 @@ pub(super) async fn postgres_cdc_runtime_plan(
             definition,
             upstream_table_ref_for_postgres_include_table(binding.upstream_table())?,
         )?;
-        materialized_table_ids.insert(schema.table_id().clone());
         table_id_by_upstream.insert(
             binding.upstream_table().to_string(),
             schema.table_id().clone(),
@@ -118,7 +116,6 @@ pub(super) async fn postgres_cdc_runtime_plan(
             definition,
             upstream_table_ref_for_postgres_include_table(include_table)?,
         )?;
-        materialized_table_ids.insert(schema.table_id().clone());
         table_id_by_upstream.insert(include_table.to_string(), schema.table_id().clone());
         schemas.insert(schema.table_id().clone(), schema);
     }
@@ -177,7 +174,6 @@ pub(super) async fn postgres_cdc_runtime_plan(
     Ok(Some(PostgresCdcRuntimePlan {
         source_id: CdcSourceId::new(connector_name)?,
         schemas,
-        materialized_table_ids,
         replication_pipelines: pipeline_plans,
     }))
 }
@@ -511,10 +507,7 @@ async fn run_native_postgres_cdc_connector(
         &runtime_plan,
     )
     .await?;
-    let start_lsn = stored_slot_start_lsn(&connection_string, &slot)
-        .await
-        .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
-    let initial_snapshot_lsn = super::postgres_snapshot::run_initial_postgres_snapshot_if_needed(
+    let initial_snapshot = super::postgres_snapshot::run_initial_postgres_snapshot_if_needed(
         &connection_string,
         &slot,
         &publication,
@@ -525,6 +518,24 @@ async fn run_native_postgres_cdc_connector(
         &cancel,
     )
     .await?;
+    if let Some(lsn) = initial_snapshot.lsn {
+        metrics::record_postgres_cdc_upstream_lsn(
+            runtime_plan.source_id.as_str(),
+            &slot,
+            lsn.as_u64(),
+        );
+        metrics::record_postgres_cdc_durable_lsn(
+            runtime_plan.source_id.as_str(),
+            &slot,
+            lsn.as_u64(),
+        );
+    }
+    if let Some(wal_stream) = initial_snapshot.wal_stream {
+        return forward_buffered_postgres_wal_stream(wal_stream, sender, cancel).await;
+    }
+    let start_lsn = stored_slot_start_lsn(&connection_string, &slot)
+        .await
+        .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
     let replication_config = replication_config_from_connection_string(
         &connection_string,
         &slot,
@@ -552,19 +563,6 @@ async fn run_native_postgres_cdc_connector(
         slot = %slot,
         "native Postgres CDC replication stream connected"
     );
-    if let Some(lsn) = initial_snapshot_lsn {
-        metrics::record_postgres_cdc_upstream_lsn(
-            runtime_plan.source_id.as_str(),
-            &slot,
-            lsn.as_u64(),
-        );
-        metrics::record_postgres_cdc_durable_lsn(
-            runtime_plan.source_id.as_str(),
-            &slot,
-            lsn.as_u64(),
-        );
-        replication.update_applied_lsn(lsn);
-    }
     let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
     let mut assembler = PostgresTransactionAssembler::with_schemas(
         runtime_plan.source_id.clone(),
@@ -629,6 +627,41 @@ async fn run_native_postgres_cdc_connector(
     let shutdown_result = replication.shutdown().await;
     result?;
     shutdown_result
+}
+
+async fn forward_buffered_postgres_wal_stream(
+    mut stream: BufferedPostgresWalStream,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        slot = %stream.slot,
+        snapshot_lsn = %stream.snapshot_lsn,
+        "forwarding buffered Postgres CDC WAL stream after durable initial snapshot"
+    );
+
+    loop {
+        let transaction = tokio::select! {
+            _ = cancel.cancelled() => break,
+            transaction = stream.receiver.recv() => transaction,
+        };
+        let Some(transaction) = transaction else {
+            break;
+        };
+        if let Err(err) = sender.send(transaction).await {
+            stream.task.abort();
+            let _ = stream.task.await;
+            return Err(anyhow!(
+                "failed to enqueue buffered native Postgres CDC transaction: {err}"
+            ));
+        }
+    }
+
+    match stream.task.await {
+        Ok(result) => result,
+        Err(err) if err.is_cancelled() && cancel.is_cancelled() => Ok(()),
+        Err(err) => Err(anyhow!("buffered Postgres CDC WAL task failed: {err}")),
+    }
 }
 
 fn postgres_replication_event_frontier_lsn(
@@ -1618,10 +1651,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .map(|plan| (plan.source_id.clone(), plan.schemas.clone()))
             .collect::<HashMap<_, _>>(),
     );
-    let cdc_materialized_table_ids_by_source_id = Arc::new(
+    let cdc_stateful_table_ids_by_source_id = Arc::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
-            .map(|plan| (plan.source_id.clone(), plan.materialized_table_ids.clone()))
+            .map(|plan| {
+                (
+                    plan.source_id.clone(),
+                    plan.schemas.keys().cloned().collect::<HashSet<_>>(),
+                )
+            })
             .collect::<HashMap<_, _>>(),
     );
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
@@ -1947,8 +1985,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let outer_for_task = Arc::clone(&outer_registry);
     let cdc_table_store_for_task = cdc_table_store.clone();
     let cdc_schemas_by_source_id_for_task = Arc::clone(&cdc_schemas_by_source_id);
-    let cdc_materialized_table_ids_by_source_id_for_task =
-        Arc::clone(&cdc_materialized_table_ids_by_source_id);
+    let cdc_stateful_table_ids_by_source_id_for_task =
+        Arc::clone(&cdc_stateful_table_ids_by_source_id);
     let decoders_by_source_id_for_task = Arc::clone(&decoders_by_source_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
@@ -2158,19 +2196,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     executor_cancel.cancel();
                     break 'executor;
                 };
-                let materialized_table_ids = cdc_materialized_table_ids_by_source_id_for_task
+                let cdc_transaction_batch = match cdc_table_store_for_task
+                    .complete_unchanged_toast(schemas, &cdc_transaction.transaction)
+                    .await
+                {
+                    Ok(transaction) => transaction,
+                    Err(err) => {
+                        let message = format!(
+                            "failed to complete native CDC unchanged TOAST values for source '{}': {err}",
+                            cdc_transaction.source_id.as_str()
+                        );
+                        tracing::error!(error = %err, "{message}");
+                        record_runtime_failure(&failure_for_executor, message);
+                        executor_cancel.cancel();
+                        break 'executor;
+                    }
+                };
+                let stateful_table_ids = cdc_stateful_table_ids_by_source_id_for_task
                     .get(&cdc_transaction.source_id)
                     .cloned()
                     .unwrap_or_default();
-                let materialized_transaction = match materialized_transaction(
+                let stateful_transaction = match materialized_transaction(
                     &cdc_transaction.source_id,
-                    &materialized_table_ids,
-                    &cdc_transaction.transaction,
+                    &stateful_table_ids,
+                    &cdc_transaction_batch,
                 ) {
                     Ok(transaction) => transaction,
                     Err(err) => {
                         let message = format!(
-                            "failed to split native CDC transaction for source '{}': {err}",
+                            "failed to split native CDC state transaction for source '{}': {err}",
                             cdc_transaction.source_id.as_str()
                         );
                         tracing::error!(error = %err, "{message}");
@@ -2181,7 +2235,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 };
                 let mut staged_writes = WriteBatch::new();
                 let mut apply_result = None;
-                if let Some(transaction) = materialized_transaction.as_ref() {
+                if let Some(transaction) = stateful_transaction.as_ref() {
                     apply_result = match cdc_table_store_for_task
                         .stage_transaction(schemas, transaction, &mut staged_writes)
                         .await
@@ -2206,7 +2260,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         .run_transaction(
                             &cdc_transaction.source_id,
                             schemas,
-                            &cdc_transaction.transaction,
+                            &cdc_transaction_batch,
                             Some(&storage_for_replication_task),
                         )
                         .await
@@ -2229,7 +2283,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let feedback_position = apply_result
                     .as_ref()
                     .map(|result| result.checkpoint().position())
-                    .unwrap_or_else(|| cdc_transaction.transaction.commit_position());
+                    .unwrap_or_else(|| cdc_transaction_batch.commit_position());
                 let feedback_lsn = match PostgresLsn::from_source_position(feedback_position) {
                     Ok(lsn) => lsn,
                     Err(err) => {
@@ -2243,9 +2297,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         break 'executor;
                     }
                 };
-                if materialized_transaction.is_none() && pipeline_records > 0 {
-                    let checkpoint =
-                        pipeline_checkpoint_from_transaction(&cdc_transaction.transaction);
+                if stateful_transaction.is_none() && pipeline_records > 0 {
+                    let checkpoint = pipeline_checkpoint_from_transaction(&cdc_transaction_batch);
                     if let Err(err) = cdc_table_store_for_task
                         .commit_checkpoint(&checkpoint)
                         .await
@@ -2268,7 +2321,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     cdc_transaction.slot.clone(),
                     cdc_transaction.source_id.as_str().to_string(),
                 );
-                for change_batch in cdc_transaction.transaction.change_batches() {
+                for change_batch in cdc_transaction_batch.change_batches() {
                     tick_postgres_table_lsns.push((
                         cdc_transaction.source_id.as_str().to_string(),
                         cdc_transaction.slot.clone(),
@@ -2276,7 +2329,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         feedback_lsn.as_u64(),
                     ));
                 }
-                if materialized_transaction.is_none() {
+                if stateful_transaction.is_none() {
                     if pipeline_records > 0 {
                         advance_postgres_cdc_commit_state(
                             &mut committed_postgres_lsns,
@@ -2310,9 +2363,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     let source_name = table_deltas.table_id().as_str();
                     let Some(source_id) = source_id_by_name_for_task.get(source_name).copied()
                     else {
-                        tracing::warn!(
+                        tracing::debug!(
                             source = %source_name,
-                            "native CDC table delta references unknown source"
+                            "dropping native CDC state delta for table outside DBSP source registry"
                         );
                         continue;
                     };

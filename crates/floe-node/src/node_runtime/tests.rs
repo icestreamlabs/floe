@@ -1003,7 +1003,6 @@ async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
     .expect("runtime plan")
     .expect("native runtime plan");
 
-    assert!(plan.materialized_table_ids.is_empty());
     assert_eq!(plan.replication_pipelines.len(), 1);
     let pipeline_plan = &plan.replication_pipelines[0];
     assert_eq!(pipeline_plan.table_id.as_str(), "orders");

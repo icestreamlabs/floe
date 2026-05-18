@@ -446,6 +446,18 @@ impl CdcTableSchema {
     }
 
     pub fn validate_row(&self, row: &CdcRow) -> Result<()> {
+        self.validate_row_with_toast_policy(row, false)
+    }
+
+    pub fn validate_row_allowing_unchanged_toast(&self, row: &CdcRow) -> Result<()> {
+        self.validate_row_with_toast_policy(row, true)
+    }
+
+    fn validate_row_with_toast_policy(
+        &self,
+        row: &CdcRow,
+        allow_unchanged_toast: bool,
+    ) -> Result<()> {
         ensure!(
             row.values().len() == self.columns.len(),
             "CDC row length {} does not match table '{}' column count {}",
@@ -454,6 +466,19 @@ impl CdcTableSchema {
             self.columns.len()
         );
         for (idx, (column, value)) in self.columns.iter().zip(row.values()).enumerate() {
+            if row.is_unchanged_toast(idx) {
+                ensure!(
+                    allow_unchanged_toast,
+                    "CDC row column '{}' contains unresolved unchanged TOAST",
+                    column.name()
+                );
+                ensure!(
+                    !self.primary_key.contains_column(column.name()),
+                    "CDC primary-key column '{}' cannot contain unresolved unchanged TOAST",
+                    column.name()
+                );
+                continue;
+            }
             match value {
                 Some(value) if column.data_type().matches_value(value) => {}
                 Some(_) => bail!(
@@ -507,6 +532,15 @@ impl CdcTableSchema {
 
     pub fn primary_key_from_row(&self, row: &CdcRow) -> Result<CdcRowKey> {
         self.validate_row(row)?;
+        self.primary_key_from_validated_row(row)
+    }
+
+    pub fn primary_key_from_row_allowing_unchanged_toast(&self, row: &CdcRow) -> Result<CdcRowKey> {
+        self.validate_row_allowing_unchanged_toast(row)?;
+        self.primary_key_from_validated_row(row)
+    }
+
+    fn primary_key_from_validated_row(&self, row: &CdcRow) -> Result<CdcRowKey> {
         let mut values = Vec::with_capacity(self.primary_key.columns().len());
         for idx in self.primary_key_indices() {
             let column = &self.columns[idx];
@@ -554,17 +588,79 @@ impl CdcTableSchema {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CdcRow {
     values: Vec<Option<RowValue>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unchanged_toast_indices: Vec<usize>,
 }
 
 impl CdcRow {
     pub fn new(values: impl IntoIterator<Item = Option<RowValue>>) -> Result<Self> {
         let values: Vec<Option<RowValue>> = values.into_iter().collect();
         ensure!(!values.is_empty(), "CDC row cannot be empty");
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            unchanged_toast_indices: Vec::new(),
+        })
+    }
+
+    pub fn with_unchanged_toast_indices(
+        values: impl IntoIterator<Item = Option<RowValue>>,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
+        let values: Vec<Option<RowValue>> = values.into_iter().collect();
+        ensure!(!values.is_empty(), "CDC row cannot be empty");
+        let mut indices: Vec<usize> = indices.into_iter().collect();
+        indices.sort_unstable();
+        indices.dedup();
+        for idx in &indices {
+            ensure!(
+                *idx < values.len(),
+                "unchanged TOAST column index {idx} out of bounds for CDC row with {} columns",
+                values.len()
+            );
+        }
+        Ok(Self {
+            values,
+            unchanged_toast_indices: indices,
+        })
     }
 
     pub fn values(&self) -> &[Option<RowValue>] {
         &self.values
+    }
+
+    pub fn has_unchanged_toast(&self) -> bool {
+        !self.unchanged_toast_indices.is_empty()
+    }
+
+    pub fn unchanged_toast_indices(&self) -> &[usize] {
+        &self.unchanged_toast_indices
+    }
+
+    pub fn is_unchanged_toast(&self, column_idx: usize) -> bool {
+        self.unchanged_toast_indices
+            .binary_search(&column_idx)
+            .is_ok()
+    }
+
+    pub fn resolve_unchanged_toast(&self, previous: &CdcRow) -> Result<Self> {
+        if !self.has_unchanged_toast() {
+            return Ok(self.clone());
+        }
+        ensure!(
+            self.values.len() == previous.values.len(),
+            "cannot resolve unchanged TOAST row with {} columns from previous row with {} columns",
+            self.values.len(),
+            previous.values.len()
+        );
+        let mut values = self.values.clone();
+        for &idx in &self.unchanged_toast_indices {
+            ensure!(
+                !previous.is_unchanged_toast(idx),
+                "previous CDC row also has unresolved unchanged TOAST at column index {idx}"
+            );
+            values[idx] = previous.values[idx].clone();
+        }
+        CdcRow::new(values)
     }
 }
 
@@ -814,11 +910,11 @@ impl CdcChange {
                     key.validate_against_schema(schema)?;
                 }
                 if let Some(before) = before {
-                    schema.validate_row(before)?;
-                    schema.primary_key_from_row(before)?;
+                    schema.validate_row_allowing_unchanged_toast(before)?;
+                    schema.primary_key_from_row_allowing_unchanged_toast(before)?;
                 }
-                schema.validate_row(after)?;
-                schema.primary_key_from_row(after)?;
+                schema.validate_row_allowing_unchanged_toast(after)?;
+                schema.primary_key_from_row_allowing_unchanged_toast(after)?;
             }
             CdcChange::Delete { key, before } => {
                 ensure!(
@@ -829,8 +925,8 @@ impl CdcChange {
                     key.validate_against_schema(schema)?;
                 }
                 if let Some(before) = before {
-                    schema.validate_row(before)?;
-                    schema.primary_key_from_row(before)?;
+                    schema.validate_row_allowing_unchanged_toast(before)?;
+                    schema.primary_key_from_row_allowing_unchanged_toast(before)?;
                 }
             }
             CdcChange::Truncate => {}

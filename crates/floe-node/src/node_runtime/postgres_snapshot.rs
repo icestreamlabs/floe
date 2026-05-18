@@ -5,7 +5,7 @@ use floe_cdc_core::{
     CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcTransactionId, ChangeBatch,
     TransactionBatch,
 };
-use futures::{StreamExt, TryStreamExt, pin_mut};
+use futures::{TryStreamExt, pin_mut};
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
@@ -45,6 +45,7 @@ struct PostgresSnapshot {
     lsn: PostgresLsn,
     transaction: Option<TransactionBatch>,
     row_count: usize,
+    wal_stream: Option<BufferedPostgresWalStream>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,12 @@ enum SnapshotTableChunk {
         lower_inclusive: i64,
         upper_exclusive: Option<i64>,
     },
+}
+
+struct SnapshotWorkerControl {
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+    start_rx: watch::Receiver<bool>,
+    scan_permits: Arc<tokio::sync::Semaphore>,
 }
 
 pub(super) async fn ensure_postgres_cdc_publication_and_slot(
@@ -126,38 +133,17 @@ async fn ensure_postgres_cdc_publication_and_slot_with_client(
         );
     }
 
-    let slot_row = client
-        .query_opt(
-            "SELECT plugin
-             FROM pg_replication_slots
-             WHERE slot_name = $1",
-            &[&slot],
-        )
-        .await
-        .with_context(|| format!("check Postgres CDC logical replication slot '{slot}'"))?;
-    match slot_row {
-        Some(row) => {
-            let plugin: Option<String> = row.get(0);
-            ensure!(
-                plugin.as_deref() == Some("pgoutput"),
-                "Postgres CDC logical replication slot '{slot}' must use pgoutput, got {:?}",
-                plugin
-            );
-        }
+    match postgres_replication_slot_plugin(client, slot).await? {
+        Some(plugin) => ensure!(
+            plugin.as_deref() == Some("pgoutput"),
+            "Postgres CDC logical replication slot '{slot}' must use pgoutput, got {:?}",
+            plugin
+        ),
         None => {
-            client
-                .query_one(
-                    "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&slot],
-                )
-                .await
-                .with_context(|| {
-                    format!("create Postgres CDC pgoutput replication slot '{slot}'")
-                })?;
-            tracing::info!(
+            tracing::debug!(
                 source = %runtime_plan.source_id.as_str(),
                 slot = %slot,
-                "created Postgres CDC logical replication slot"
+                "Postgres CDC logical replication slot is missing; initial snapshot will create it with an exported snapshot"
             );
         }
     }
@@ -174,7 +160,7 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
     sender: &mpsc::Sender<QueuedCdcTransaction>,
     commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
     cancel: &CancellationToken,
-) -> Result<Option<PostgresLsn>> {
+) -> Result<InitialPostgresSnapshot> {
     if table_store
         .load_checkpoint(&runtime_plan.source_id)
         .await
@@ -186,11 +172,22 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
         })?
         .is_some()
     {
-        return Ok(None);
+        return Ok(InitialPostgresSnapshot {
+            lsn: None,
+            wal_stream: None,
+        });
     }
 
-    let snapshot =
-        load_postgres_initial_snapshot(connection_string, publication, runtime_plan).await?;
+    let wal_commit_lsn_rx = commit_lsn_rx.as_ref().map(|receiver| (**receiver).clone());
+    let snapshot = load_postgres_initial_snapshot(
+        connection_string,
+        slot,
+        publication,
+        runtime_plan,
+        wal_commit_lsn_rx,
+        cancel.clone(),
+    )
+    .await?;
     finish_loaded_postgres_snapshot(
         slot,
         publication,
@@ -213,40 +210,67 @@ async fn finish_loaded_postgres_snapshot(
     commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
     cancel: &CancellationToken,
     snapshot: PostgresSnapshot,
-) -> Result<Option<PostgresLsn>> {
-    match snapshot.transaction {
-        Some(transaction) => {
-            sender
-                .send(QueuedCdcTransaction {
-                    slot: slot.to_string(),
-                    source_id: runtime_plan.source_id.clone(),
-                    transaction,
-                })
-                .await
-                .map_err(|err| anyhow!("failed to enqueue initial Postgres CDC snapshot: {err}"))?;
-            wait_for_postgres_snapshot_commit(commit_lsn_rx, slot, snapshot.lsn, cancel).await?;
+) -> Result<InitialPostgresSnapshot> {
+    let lsn = snapshot.lsn;
+    let row_count = snapshot.row_count;
+    let mut wal_stream = snapshot.wal_stream;
+
+    let finish_result = async {
+        match snapshot.transaction {
+            Some(transaction) => {
+                sender
+                    .send(QueuedCdcTransaction {
+                        slot: slot.to_string(),
+                        source_id: runtime_plan.source_id.clone(),
+                        transaction,
+                    })
+                    .await
+                    .map_err(|err| {
+                        anyhow!("failed to enqueue initial Postgres CDC snapshot: {err}")
+                    })?;
+                wait_for_postgres_snapshot_commit(commit_lsn_rx, slot, lsn, cancel).await?;
+            }
+            None => {
+                let checkpoint = snapshot_checkpoint(&runtime_plan.source_id, lsn)?;
+                table_store.commit_checkpoint(&checkpoint).await?;
+            }
         }
-        None => {
-            let checkpoint = snapshot_checkpoint(&runtime_plan.source_id, snapshot.lsn)?;
-            table_store.commit_checkpoint(&checkpoint).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(err) = finish_result {
+        if let Some(stream) = wal_stream.take() {
+            abort_buffered_postgres_wal_stream(stream).await;
         }
+        return Err(err);
+    }
+
+    if let Some(stream) = wal_stream.as_ref() {
+        release_buffered_postgres_wal_feedback(stream);
     }
 
     tracing::info!(
         source = %runtime_plan.source_id.as_str(),
         slot = %slot,
         publication = %publication,
-        lsn = %snapshot.lsn,
-        rows = snapshot.row_count,
+        lsn = %lsn,
+        rows = row_count,
         "completed initial Postgres CDC snapshot"
     );
-    Ok(Some(snapshot.lsn))
+    Ok(InitialPostgresSnapshot {
+        lsn: Some(lsn),
+        wal_stream,
+    })
 }
 
 async fn load_postgres_initial_snapshot(
     connection_string: &str,
+    slot: &str,
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
     let (mut client, connection) =
         tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
@@ -260,10 +284,14 @@ async fn load_postgres_initial_snapshot(
 
     let snapshot = load_postgres_initial_snapshot_from_client(
         connection_string,
+        slot,
         &mut client,
         publication,
         &runtime_plan.source_id,
         &runtime_plan.schemas,
+        runtime_plan,
+        wal_commit_lsn_rx,
+        cancel,
     )
     .await;
     drop(client);
@@ -273,168 +301,539 @@ async fn load_postgres_initial_snapshot(
 
 async fn load_postgres_initial_snapshot_from_client(
     connection_string: &str,
+    slot: &str,
     client: &mut tokio_postgres::Client,
     publication: &str,
     source_id: &CdcSourceId,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
     let sorted_schemas = sorted_snapshot_schemas(schemas);
     let max_workers = *POSTGRES_SNAPSHOT_MAX_WORKERS;
-    if max_workers > 1 && (sorted_schemas.len() > 1 || *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS > 1) {
-        return load_parallel_postgres_initial_snapshot_from_client(
-            connection_string,
-            client,
-            publication,
-            source_id,
-            sorted_schemas,
-            max_workers,
-        )
-        .await;
+    match postgres_replication_slot_plugin(client, slot).await? {
+        Some(plugin) => {
+            ensure!(
+                plugin.as_deref() == Some("pgoutput"),
+                "Postgres CDC logical replication slot '{slot}' must use pgoutput, got {:?}",
+                plugin
+            );
+            bail!(
+                "Postgres CDC logical replication slot '{slot}' already exists but Floe has no durable CDC checkpoint. Floe cannot derive a lock-free initial snapshot boundary from an existing slot safely; drop the slot and let Floe recreate it, or restore the matching Floe data directory/checkpoint."
+            );
+        }
+        None => {
+            return load_exported_slot_postgres_initial_snapshot_from_client(
+                connection_string,
+                slot,
+                client,
+                publication,
+                source_id,
+                runtime_plan,
+                sorted_schemas,
+                max_workers,
+                wal_commit_lsn_rx,
+                cancel,
+            )
+            .await;
+        }
     }
-
-    let transaction = client
-        .transaction()
-        .await
-        .context("begin initial Postgres CDC snapshot transaction")?;
-
-    if !sorted_schemas.is_empty() {
-        transaction
-            .batch_execute(&snapshot_lock_sql(&sorted_schemas))
-            .await
-            .context("lock Postgres CDC snapshot tables")?;
-    }
-
-    validate_publication_tables(&transaction, publication, &sorted_schemas).await?;
-    for schema in &sorted_schemas {
-        validate_upstream_table_schema(&transaction, schema).await?;
-    }
-
-    let lsn_row = transaction
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
-        .await
-        .context("capture Postgres CDC snapshot LSN")?;
-    let lsn_text: String = lsn_row.get(0);
-    let snapshot_lsn = PostgresLsn::parse(&lsn_text)?;
-
-    let mut change_batches = Vec::new();
-    let mut row_count = 0_usize;
-    for schema in sorted_schemas {
-        let table_snapshot = snapshot_table_change_batches(&transaction, schema).await?;
-        row_count = row_count.saturating_add(table_snapshot.row_count);
-        change_batches.extend(table_snapshot.change_batches);
-    }
-    transaction
-        .commit()
-        .await
-        .context("commit initial Postgres CDC snapshot transaction")?;
-
-    let transaction = snapshot_transaction_batch(source_id, snapshot_lsn, change_batches)?;
-
-    Ok(PostgresSnapshot {
-        lsn: snapshot_lsn,
-        transaction,
-        row_count,
-    })
 }
 
-async fn load_parallel_postgres_initial_snapshot_from_client(
+async fn load_exported_slot_postgres_initial_snapshot_from_client(
     connection_string: &str,
+    slot: &str,
     client: &mut tokio_postgres::Client,
     publication: &str,
     source_id: &CdcSourceId,
+    runtime_plan: &PostgresCdcRuntimePlan,
     sorted_schemas: Vec<&CdcTableSchema>,
     max_workers: usize,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
+    let replication_config = replication_config_from_connection_string(
+        connection_string,
+        slot,
+        publication,
+        PostgresLsn::ZERO,
+    )?;
+    let exported_slot = create_pgoutput_slot_with_exported_snapshot(&replication_config)
+        .await
+        .with_context(|| {
+            format!(
+                "create Postgres CDC slot '{slot}' with an exported snapshot for lock-free initial snapshot"
+            )
+        })?;
+    let snapshot_lsn = exported_slot.consistent_lsn();
+    let exported_snapshot = exported_slot.snapshot_name().to_string();
     let transaction = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await
-        .context("begin exported initial Postgres CDC snapshot transaction")?;
-
-    if !sorted_schemas.is_empty() {
-        transaction
-            .batch_execute(&snapshot_lock_sql(&sorted_schemas))
-            .await
-            .context("lock Postgres CDC snapshot tables")?;
-    }
+        .context("begin exported-slot initial Postgres CDC snapshot transaction")?;
+    bind_transaction_to_exported_snapshot(&transaction, &exported_snapshot).await?;
 
     validate_publication_tables(&transaction, publication, &sorted_schemas).await?;
     for schema in &sorted_schemas {
         validate_upstream_table_schema(&transaction, schema).await?;
     }
 
-    let lsn_row = transaction
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
-        .await
-        .context("capture Postgres CDC snapshot LSN")?;
-    let lsn_text: String = lsn_row.get(0);
-    let snapshot_lsn = PostgresLsn::parse(&lsn_text)?;
-    let exported_snapshot_row = transaction
-        .query_one("SELECT pg_export_snapshot()", &[])
-        .await
-        .context("export Postgres CDC snapshot for parallel table reads")?;
-    let exported_snapshot: String = exported_snapshot_row.get(0);
-
     let mut snapshot_tasks = Vec::new();
-    for (table_idx, schema) in sorted_schemas.iter().enumerate() {
-        let chunks = snapshot_table_chunks(&transaction, schema).await?;
-        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            snapshot_tasks.push((table_idx, chunk_idx, (*schema).clone(), chunk));
+    let use_parallel_workers =
+        max_workers > 1 && (sorted_schemas.len() > 1 || *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS > 1);
+    if use_parallel_workers {
+        for (table_idx, schema) in sorted_schemas.iter().enumerate() {
+            let chunks = snapshot_table_chunks(&transaction, schema).await?;
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                snapshot_tasks.push((table_idx, chunk_idx, (*schema).clone(), chunk));
+            }
         }
     }
-    let task_count = snapshot_tasks.len();
 
-    let mut table_snapshots = futures::stream::iter(snapshot_tasks.into_iter().map(
-        |(table_idx, chunk_idx, schema, chunk)| {
+    let mut snapshot_transaction = Some(transaction);
+    let (change_batches, row_count, task_count, wal_stream) = if use_parallel_workers {
+        let task_count = snapshot_tasks.len();
+        let (start_tx, start_rx) = watch::channel(false);
+        let scan_permits = Arc::new(tokio::sync::Semaphore::new(max_workers));
+        let mut worker_handles = Vec::with_capacity(task_count);
+        let mut ready_receivers = Vec::with_capacity(task_count);
+        for (table_idx, chunk_idx, schema, chunk) in snapshot_tasks {
             let connection_string = connection_string.to_string();
             let exported_snapshot = exported_snapshot.clone();
-            async move {
+            let start_rx = start_rx.clone();
+            let scan_permits = Arc::clone(&scan_permits);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            ready_receivers.push(ready_rx);
+            worker_handles.push(tokio::spawn(async move {
                 snapshot_table_change_batches_from_exported_snapshot(
                     &connection_string,
                     &exported_snapshot,
                     &schema,
                     &chunk,
+                    Some(SnapshotWorkerControl {
+                        ready_tx,
+                        start_rx,
+                        scan_permits,
+                    }),
                 )
                 .await
                 .map(|snapshot| (table_idx, chunk_idx, snapshot))
-            }
-        },
-    ))
-    .buffer_unordered(max_workers)
-    .try_collect::<Vec<_>>()
-    .await?;
-    table_snapshots.sort_by_key(|(table_idx, chunk_idx, _)| (*table_idx, *chunk_idx));
+            }));
+        }
 
-    transaction
-        .commit()
+        if let Err(err) = wait_for_snapshot_workers_ready(ready_receivers).await {
+            abort_snapshot_worker_tasks(worker_handles).await;
+            return Err(err);
+        }
+
+        if let Err(err) = snapshot_transaction
+            .take()
+            .expect("snapshot validation transaction is present")
+            .commit()
+            .await
+            .context("commit exported-slot initial Postgres CDC validation transaction")
+        {
+            abort_snapshot_worker_tasks(worker_handles).await;
+            return Err(err);
+        }
+        drop(exported_slot);
+
+        match start_buffered_postgres_wal_stream(
+            connection_string,
+            slot,
+            publication,
+            runtime_plan,
+            snapshot_lsn,
+            wal_commit_lsn_rx,
+            cancel,
+        )
         .await
-        .context("commit exported initial Postgres CDC snapshot transaction")?;
+        {
+            Ok(stream) => {
+                if let Err(err) = start_tx
+                    .send(true)
+                    .context("release Postgres snapshot workers after starting WAL stream")
+                {
+                    abort_buffered_postgres_wal_stream(stream).await;
+                    abort_snapshot_worker_tasks(worker_handles).await;
+                    return Err(err);
+                }
 
-    let mut change_batches = Vec::new();
-    let mut row_count = 0_usize;
-    let table_count = sorted_schemas.len();
-    for (_, _, table_snapshot) in table_snapshots {
-        row_count = row_count.saturating_add(table_snapshot.row_count);
-        change_batches.extend(table_snapshot.change_batches);
-    }
+                let table_snapshots = match collect_snapshot_worker_tasks(worker_handles).await {
+                    Ok(snapshots) => snapshots,
+                    Err(err) => {
+                        abort_buffered_postgres_wal_stream(stream).await;
+                        return Err(err);
+                    }
+                };
+
+                let mut table_snapshots = table_snapshots;
+                table_snapshots.sort_by_key(|(table_idx, chunk_idx, _)| (*table_idx, *chunk_idx));
+
+                let mut change_batches = Vec::new();
+                let mut row_count = 0_usize;
+                for (_, _, table_snapshot) in table_snapshots {
+                    row_count = row_count.saturating_add(table_snapshot.row_count);
+                    change_batches.extend(table_snapshot.change_batches);
+                }
+                (change_batches, row_count, task_count, stream)
+            }
+            Err(err) => {
+                abort_snapshot_worker_tasks(worker_handles).await;
+                return Err(err);
+            }
+        }
+    } else {
+        drop(exported_slot);
+        let stream = start_buffered_postgres_wal_stream(
+            connection_string,
+            slot,
+            publication,
+            runtime_plan,
+            snapshot_lsn,
+            wal_commit_lsn_rx,
+            cancel,
+        )
+        .await?;
+
+        let scan_result = async {
+            let mut change_batches = Vec::new();
+            let mut row_count = 0_usize;
+            for schema in &sorted_schemas {
+                let table_snapshot = snapshot_table_change_batches(
+                    snapshot_transaction
+                        .as_ref()
+                        .expect("snapshot transaction is present"),
+                    schema,
+                )
+                .await?;
+                row_count = row_count.saturating_add(table_snapshot.row_count);
+                change_batches.extend(table_snapshot.change_batches);
+            }
+            snapshot_transaction
+                .take()
+                .expect("snapshot transaction is present")
+                .commit()
+                .await
+                .context("commit exported-slot initial Postgres CDC snapshot transaction")?;
+            Ok::<_, anyhow::Error>((change_batches, row_count, sorted_schemas.len()))
+        }
+        .await;
+
+        let (change_batches, row_count, task_count) = match scan_result {
+            Ok(result) => result,
+            Err(err) => {
+                abort_buffered_postgres_wal_stream(stream).await;
+                return Err(err);
+            }
+        };
+        (change_batches, row_count, task_count, stream)
+    };
     let transaction = snapshot_transaction_batch(source_id, snapshot_lsn, change_batches)?;
 
     tracing::info!(
         source = %source_id.as_str(),
-        tables = table_count,
+        slot = %slot,
+        snapshot = %exported_snapshot,
+        lsn = %snapshot_lsn,
+        tables = sorted_schemas.len(),
         tasks = task_count,
         max_workers,
         rows = row_count,
-        "loaded initial Postgres CDC snapshot with parallel workers"
+        "loaded lock-free initial Postgres CDC snapshot from exported logical-slot snapshot"
     );
 
     Ok(PostgresSnapshot {
         lsn: snapshot_lsn,
         transaction,
         row_count,
+        wal_stream: Some(wal_stream),
     })
+}
+
+async fn start_buffered_postgres_wal_stream(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    snapshot_lsn: PostgresLsn,
+    commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
+) -> Result<BufferedPostgresWalStream> {
+    let replication_config = replication_config_from_connection_string(
+        connection_string,
+        slot,
+        publication,
+        snapshot_lsn,
+    )
+    .with_context(|| {
+        format!("configure Postgres CDC WAL stream from snapshot LSN {snapshot_lsn}")
+    })?;
+    let replication = connect_postgres_replication_client_with_retry(&replication_config).await?;
+    let capacity = replication_config.buffer_events();
+    let slot = slot.to_string();
+    let (sender, receiver) = mpsc::channel(capacity);
+    let (release_feedback_tx, release_feedback_rx) = watch::channel(false);
+    let task_runtime_plan = runtime_plan.clone();
+    let task_slot = slot.clone();
+    let task = tokio::spawn(async move {
+        buffer_postgres_wal_stream(
+            replication,
+            task_runtime_plan,
+            task_slot,
+            snapshot_lsn,
+            commit_lsn_rx,
+            release_feedback_rx,
+            sender,
+            cancel,
+        )
+        .await
+    });
+    tracing::info!(
+        source = %runtime_plan.source_id.as_str(),
+        slot = %slot,
+        lsn = %snapshot_lsn,
+        buffer_events = capacity,
+        "started buffered Postgres CDC WAL stream while initial snapshot is loading"
+    );
+    Ok(BufferedPostgresWalStream {
+        slot,
+        snapshot_lsn,
+        release_feedback_tx,
+        receiver,
+        task,
+    })
+}
+
+async fn connect_postgres_replication_client_with_retry(
+    config: &PostgresCdcConfig,
+) -> Result<PostgresReplicationClient> {
+    let started_at = Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match PostgresReplicationClient::connect(config).await {
+            Ok(client) => return Ok(client),
+            Err(err)
+                if started_at.elapsed() < Duration::from_secs(5)
+                    && format!("{err:#}").contains("active") =>
+            {
+                tracing::debug!(
+                    slot = %config.slot(),
+                    attempts,
+                    error = %err,
+                    "Postgres CDC WAL stream is waiting for exported snapshot slot release"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn buffer_postgres_wal_stream(
+    mut replication: PostgresReplicationClient,
+    runtime_plan: PostgresCdcRuntimePlan,
+    slot: String,
+    snapshot_lsn: PostgresLsn,
+    mut commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    mut release_feedback_rx: watch::Receiver<bool>,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        runtime_plan.source_id.clone(),
+        router,
+        runtime_plan.schemas.clone(),
+        PostgresSchemaEvolutionPolicy::FailFast,
+    );
+    let mut feedback_released = false;
+    let mut last_committed_tick_id = 0_u64;
+
+    let result = async {
+        loop {
+            if !feedback_released && *release_feedback_rx.borrow_and_update() {
+                feedback_released = true;
+                replication.update_applied_lsn(snapshot_lsn);
+            }
+            if feedback_released {
+                update_buffered_postgres_applied_lsn(
+                    &mut replication,
+                    commit_lsn_rx.as_mut(),
+                    &slot,
+                    &mut last_committed_tick_id,
+                )?;
+            }
+
+            let event = tokio::select! {
+                _ = cancel.cancelled() => break,
+                changed = release_feedback_rx.changed(), if !feedback_released => {
+                    changed.context("buffered Postgres CDC feedback release channel closed")?;
+                    continue;
+                }
+                event = replication.recv() => event.context("receive buffered native Postgres CDC event")?,
+            };
+            let Some(event) = event else {
+                break;
+            };
+            if let Some(frontier_lsn) = buffered_postgres_replication_event_frontier_lsn(&event) {
+                metrics::record_postgres_cdc_upstream_lsn(
+                    runtime_plan.source_id.as_str(),
+                    &slot,
+                    frontier_lsn.as_u64(),
+                );
+            }
+            if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
+                break;
+            }
+            let Some(transaction) = assembler.accept_event(event)? else {
+                continue;
+            };
+            let commit_lsn = PostgresLsn::from_source_position(transaction.commit_position())?;
+            if commit_lsn <= snapshot_lsn {
+                tracing::debug!(
+                    source = %runtime_plan.source_id.as_str(),
+                    slot = %slot,
+                    commit_lsn = %commit_lsn,
+                    snapshot_lsn = %snapshot_lsn,
+                    "dropping Postgres CDC WAL transaction covered by initial snapshot"
+                );
+                continue;
+            }
+            tracing::debug!(
+                source = %runtime_plan.source_id.as_str(),
+                slot = %slot,
+                change_batches = transaction.change_batches().len(),
+                commit_position = ?transaction.commit_position(),
+                "buffered native Postgres CDC transaction during initial snapshot"
+            );
+            sender
+                .send(QueuedCdcTransaction {
+                    slot: slot.clone(),
+                    source_id: runtime_plan.source_id.clone(),
+                    transaction,
+                })
+                .await
+                .map_err(|err| {
+                    anyhow!("failed to enqueue buffered native Postgres CDC transaction: {err}")
+                })?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    replication.stop();
+    let shutdown_result = replication.shutdown().await;
+    result?;
+    shutdown_result
+}
+
+fn buffered_postgres_replication_event_frontier_lsn(
+    event: &PostgresReplicationEvent,
+) -> Option<PostgresLsn> {
+    match event {
+        PostgresReplicationEvent::KeepAlive { wal_end, .. } => Some(*wal_end),
+        PostgresReplicationEvent::Begin { final_lsn, .. } => Some(*final_lsn),
+        PostgresReplicationEvent::XLogData { wal_end, .. } => Some(*wal_end),
+        PostgresReplicationEvent::Commit { end_lsn, .. } => Some(*end_lsn),
+        PostgresReplicationEvent::Message { lsn, .. } => Some(*lsn),
+        PostgresReplicationEvent::StoppedAt { reached } => Some(*reached),
+    }
+}
+
+fn update_buffered_postgres_applied_lsn(
+    replication: &mut PostgresReplicationClient,
+    receiver: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    slot: &str,
+    last_committed_tick_id: &mut u64,
+) -> Result<()> {
+    let Some(receiver) = receiver else {
+        return Ok(());
+    };
+
+    let mut latest_commit = None;
+    while receiver.has_changed().unwrap_or(false) {
+        latest_commit = Some(receiver.borrow_and_update().clone());
+    }
+    let Some(commit) = latest_commit else {
+        return Ok(());
+    };
+    if commit.tick_id <= *last_committed_tick_id {
+        return Ok(());
+    }
+
+    if let Some(target_lsn) = commit
+        .slots
+        .iter()
+        .find(|entry| entry.slot == slot)
+        .map(|entry| entry.lsn.as_str())
+    {
+        replication.update_applied_lsn(PostgresLsn::parse(target_lsn)?);
+    }
+    *last_committed_tick_id = commit.tick_id;
+    Ok(())
+}
+
+fn release_buffered_postgres_wal_feedback(stream: &BufferedPostgresWalStream) {
+    let _ = stream.release_feedback_tx.send(true);
+}
+
+async fn abort_buffered_postgres_wal_stream(stream: BufferedPostgresWalStream) {
+    stream.task.abort();
+    let _ = stream.task.await;
+}
+
+async fn wait_for_snapshot_workers_ready(
+    ready_receivers: Vec<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
+    for receiver in ready_receivers {
+        receiver
+            .await
+            .context("Postgres snapshot worker exited before binding exported snapshot")?;
+    }
+    Ok(())
+}
+
+async fn collect_snapshot_worker_tasks(
+    worker_handles: Vec<JoinHandle<Result<(usize, usize, SnapshotTableChangeBatches)>>>,
+) -> Result<Vec<(usize, usize, SnapshotTableChangeBatches)>> {
+    let mut snapshots = Vec::with_capacity(worker_handles.len());
+    let mut first_error = None;
+    for handle in worker_handles {
+        match handle.await {
+            Ok(Ok(snapshot)) => snapshots.push(snapshot),
+            Ok(Err(err)) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow!("Postgres snapshot worker task failed: {err}"));
+                }
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(snapshots)
+}
+
+async fn abort_snapshot_worker_tasks(
+    worker_handles: Vec<JoinHandle<Result<(usize, usize, SnapshotTableChangeBatches)>>>,
+) {
+    for handle in &worker_handles {
+        handle.abort();
+    }
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
 }
 
 fn snapshot_transaction_batch(
@@ -471,14 +870,20 @@ fn sorted_snapshot_schemas(schemas: &HashMap<CdcTableId, CdcTableSchema>) -> Vec
     sorted
 }
 
-fn snapshot_lock_sql(schemas: &[&CdcTableSchema]) -> String {
-    let mut tables = schemas
-        .iter()
-        .map(|schema| qualified_table_name(schema.upstream_table()))
-        .collect::<Vec<_>>();
-    tables.sort();
-    tables.dedup();
-    format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "))
+async fn postgres_replication_slot_plugin(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<Option<Option<String>>> {
+    let row = client
+        .query_opt(
+            "SELECT plugin
+             FROM pg_replication_slots
+             WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .with_context(|| format!("check Postgres CDC logical replication slot '{slot}'"))?;
+    Ok(row.map(|row| row.get(0)))
 }
 
 async fn validate_publication_tables(
@@ -1059,6 +1464,7 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
     exported_snapshot: &str,
     schema: &CdcTableSchema,
     chunk: &SnapshotTableChunk,
+    worker_control: Option<SnapshotWorkerControl>,
 ) -> Result<SnapshotTableChangeBatches> {
     let (mut client, connection) =
         tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
@@ -1084,13 +1490,24 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
             .start()
             .await
             .context("begin Postgres snapshot worker transaction")?;
-        transaction
-            .batch_execute(&format!(
-                "SET TRANSACTION SNAPSHOT {}",
-                quote_pg_literal(exported_snapshot)
-            ))
-            .await
-            .context("bind Postgres snapshot worker to exported snapshot")?;
+        bind_transaction_to_exported_snapshot(&transaction, exported_snapshot).await?;
+        let _scan_permit = if let Some(control) = worker_control {
+            let SnapshotWorkerControl {
+                ready_tx,
+                mut start_rx,
+                scan_permits,
+            } = control;
+            let _ = ready_tx.send(());
+            wait_for_snapshot_worker_start(&mut start_rx).await?;
+            Some(
+                scan_permits
+                    .acquire_owned()
+                    .await
+                    .context("acquire Postgres snapshot worker scan permit")?,
+            )
+        } else {
+            None
+        };
         let snapshot = snapshot_table_change_batches_for_chunk(&transaction, schema, chunk).await;
         transaction
             .commit()
@@ -1103,6 +1520,31 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
     drop(client);
     connection_task.abort();
     result
+}
+
+async fn wait_for_snapshot_worker_start(start_rx: &mut watch::Receiver<bool>) -> Result<()> {
+    loop {
+        if *start_rx.borrow_and_update() {
+            return Ok(());
+        }
+        start_rx
+            .changed()
+            .await
+            .context("Postgres snapshot worker start channel closed before WAL stream started")?;
+    }
+}
+
+async fn bind_transaction_to_exported_snapshot(
+    transaction: &tokio_postgres::Transaction<'_>,
+    exported_snapshot: &str,
+) -> Result<()> {
+    transaction
+        .batch_execute(&format!(
+            "SET TRANSACTION SNAPSHOT {}",
+            quote_pg_literal(exported_snapshot)
+        ))
+        .await
+        .context("bind Postgres transaction to exported snapshot")
 }
 
 fn snapshot_table_query(schema: &CdcTableSchema, chunk: &SnapshotTableChunk) -> String {
@@ -1571,7 +2013,6 @@ mod tests {
         let runtime_plan = PostgresCdcRuntimePlan {
             source_id: source_id.clone(),
             schemas: HashMap::new(),
-            materialized_table_ids: HashSet::new(),
             replication_pipelines: Vec::new(),
         };
         let lsn = PostgresLsn::from_u64(120);
@@ -1596,6 +2037,7 @@ mod tests {
             )
             .expect("snapshot transaction"),
             row_count: 1,
+            wal_stream: None,
         };
         let (sender, mut receiver) = mpsc::channel(1);
         let (_commit_sender, mut commit_receiver) = watch::channel(PostgresCdcCommit::default());

@@ -156,13 +156,17 @@ impl PgOutputRelation {
             self.qualified_name(),
             self.columns.len()
         );
-        CdcRow::new(
-            self.columns
-                .iter()
-                .zip(tuple.values())
-                .map(|(column, value)| tuple_value_to_row_value(column, value))
-                .collect::<Result<Vec<_>>>()?,
-        )
+        let mut values = Vec::with_capacity(tuple.values().len());
+        let mut unchanged_toast_indices = Vec::new();
+        for (idx, (column, value)) in self.columns.iter().zip(tuple.values()).enumerate() {
+            if matches!(value, PgOutputTupleValue::UnchangedToast) {
+                values.push(None);
+                unchanged_toast_indices.push(idx);
+            } else {
+                values.push(tuple_value_to_row_value(column, value)?);
+            }
+        }
+        CdcRow::with_unchanged_toast_indices(values, unchanged_toast_indices)
     }
 
     pub fn tuple_to_cdc_key(&self, tuple: &PgOutputTuple) -> Result<CdcRowKey> {
@@ -575,9 +579,15 @@ fn message_relation_changes(
 
 fn change_to_cdc(relation: &PgOutputRelation, change: RelationChange<'_>) -> Result<CdcChange> {
     match change {
-        RelationChange::Insert(new) => Ok(CdcChange::Insert {
-            row: relation.tuple_to_cdc_row(new)?,
-        }),
+        RelationChange::Insert(new) => {
+            let row = relation.tuple_to_cdc_row(new)?;
+            ensure!(
+                !row.has_unchanged_toast(),
+                "pgoutput insert for relation '{}' contains unchanged TOAST value",
+                relation.qualified_name()
+            );
+            Ok(CdcChange::Insert { row })
+        }
         RelationChange::Update { old, key, new } => Ok(CdcChange::Update {
             key: key
                 .map(|tuple| relation.tuple_to_cdc_key(tuple))
@@ -628,7 +638,7 @@ fn tuple_value_to_row_value(
             column.name()
         ),
         PgOutputTupleValue::UnchangedToast => bail!(
-            "unchanged TOAST value for column '{}' cannot be converted to a full CDC row",
+            "unchanged TOAST value for column '{}' must be handled by tuple_to_cdc_row",
             column.name()
         ),
     }
@@ -838,6 +848,8 @@ impl PgOutputReader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use floe_core::RowValue;
 
@@ -936,6 +948,27 @@ mod tests {
             match value {
                 Some(value) => put_text_value(&mut out, value),
                 None => put_null_value(&mut out),
+            }
+        }
+        out
+    }
+
+    fn tuple_with_unchanged_toast(
+        values: impl IntoIterator<Item = Option<&'static str>>,
+        unchanged_toast_indices: impl IntoIterator<Item = usize>,
+    ) -> Vec<u8> {
+        let values: Vec<Option<&'static str>> = values.into_iter().collect();
+        let unchanged_toast_indices: HashSet<usize> = unchanged_toast_indices.into_iter().collect();
+        let mut out = Vec::new();
+        put_u16(&mut out, values.len() as u16);
+        for (idx, value) in values.into_iter().enumerate() {
+            if unchanged_toast_indices.contains(&idx) {
+                put_u8(&mut out, b'u');
+            } else {
+                match value {
+                    Some(value) => put_text_value(&mut out, value),
+                    None => put_null_value(&mut out),
+                }
             }
         }
         out
@@ -1102,6 +1135,46 @@ mod tests {
                     Some(RowValue::Bool(false)),
                 ])
                 .expect("row")
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_update_with_unchanged_toast_marker() {
+        let mut decoder = decoder_with_relation();
+        let mut out = Vec::new();
+        put_u8(&mut out, b'U');
+        put_u32(&mut out, 42);
+        put_u8(&mut out, b'K');
+        out.extend_from_slice(&tuple([Some("7"), None, None, None]));
+        put_u8(&mut out, b'N');
+        out.extend_from_slice(&tuple_with_unchanged_toast(
+            [Some("7"), Some("150"), None, Some("false")],
+            [2],
+        ));
+
+        let change = decoder
+            .decode_cdc_change(Bytes::from(out))
+            .expect("decode update")
+            .expect("change")
+            .into_change();
+        let expected_after = CdcRow::with_unchanged_toast_indices(
+            [
+                Some(RowValue::Int64(7)),
+                Some(RowValue::Int64(150)),
+                None,
+                Some(RowValue::Bool(false)),
+            ],
+            [2],
+        )
+        .expect("row");
+
+        assert_eq!(
+            change,
+            CdcChange::Update {
+                key: Some(CdcRowKey::new([RowValue::Int64(7)]).expect("key")),
+                before: None,
+                after: expected_after,
             }
         );
     }

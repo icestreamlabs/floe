@@ -427,13 +427,6 @@ async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await;
-    client
-        .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await
-        .context("create native pgoutput replication slot")?;
 
     let config = json!({
         "connectors": [
@@ -606,13 +599,6 @@ async fn postgres_cdc_table_restart_resumes_from_committed_lsn() -> Result<()> {
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await;
-    client
-        .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await
-        .context("create native pgoutput restart replication slot")?;
 
     let config = json!({
         "connectors": [
@@ -778,13 +764,6 @@ async fn postgres_cdc_shared_source_transaction_feeds_join_mv() -> Result<()> {
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await;
-    client
-        .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await
-        .context("create shared-source pgoutput replication slot")?;
 
     let config = json!({
         "connectors": [
@@ -1090,13 +1069,6 @@ async fn postgres_cdc_sql_source_table_mv_acceptance() -> Result<()> {
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await;
-    client
-        .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await
-        .context("create SQL CDC pgoutput replication slot")?;
 
     let sql = format!(
         "CREATE SOURCE {source_name} WITH (
@@ -1329,13 +1301,6 @@ async fn postgres_cdc_table_aggregate_update_delete_acceptance() -> Result<()> {
     let _ = client
         .query("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await;
-    client
-        .query_one(
-            "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await
-        .context("create aggregate pgoutput replication slot")?;
 
     let config = json!({
         "connectors": [
