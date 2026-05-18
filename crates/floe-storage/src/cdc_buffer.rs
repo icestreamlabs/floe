@@ -1228,6 +1228,10 @@ fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn encode_cdc_buffer_records_payload(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
+    encode_payload_records(records)
+}
+
 fn encode_payload_change_batches(change_batches: &[ChangeBatch]) -> Result<Vec<u8>> {
     ensure!(
         !change_batches.is_empty(),
@@ -1306,6 +1310,10 @@ fn decode_payload_records(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
         "CDC buffer payload blob has trailing bytes"
     );
     Ok(records)
+}
+
+pub fn decode_cdc_buffer_records_payload(payload: &[u8]) -> Result<Vec<CdcBufferRecord>> {
+    decode_payload_records(payload)
 }
 
 fn decode_payload_change_batches(payload: &[u8]) -> Result<Vec<ChangeBatch>> {

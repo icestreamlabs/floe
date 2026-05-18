@@ -27,7 +27,8 @@ use floe_node_core::debezium_encoder::{
 use floe_storage::{
     CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage,
     CdcBufferRecord, CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest,
-    ReplicationPipelineCheckpoint, SlateCatalog,
+    ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry, SlateCatalog,
+    encode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
 use rayon::prelude::*;
@@ -1067,7 +1068,59 @@ impl ReplicationPipelineRuntime {
             0
         };
         if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
-            self.send_records_to_target(plan, &buffered_records).await?;
+            if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
+                self.record_target_write_failure(plan, &err);
+                let Some(storage) = storage else {
+                    return Err(err);
+                };
+                if !replication_pipeline_uses_dlq(plan) {
+                    return Err(err);
+                }
+                let dlq_entry = self
+                    .persist_dead_letter_records(
+                        plan,
+                        storage,
+                        transaction.commit_position(),
+                        transaction.transaction_id(),
+                        &buffered_records,
+                        &err,
+                    )
+                    .await?;
+                storage
+                    .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                        &plan.name,
+                        &plan.source_name,
+                        transaction.commit_position().clone(),
+                        transaction.transaction_id().cloned(),
+                        direct_dead_lettered_target_state(
+                            plan,
+                            transaction,
+                            record_count,
+                            CdcBufferPayloadFormat::KafkaRecords,
+                            &dlq_entry,
+                            &err,
+                        ),
+                        current_unix_time_ms(),
+                    )?)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "persist replication pipeline '{}' dead-letter checkpoint",
+                            plan.name
+                        )
+                    })?;
+                log_replication_pipeline_perf(
+                    plan,
+                    transaction,
+                    record_count,
+                    payload_bytes,
+                    encode_elapsed,
+                    perf_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
+                return Ok(buffered_records.len());
+            }
             log_replication_pipeline_perf(
                 plan,
                 transaction,
@@ -1225,6 +1278,55 @@ impl ReplicationPipelineRuntime {
                 }
                 Err(err) => {
                     self.record_target_write_failure(plan, &err);
+                    if replication_pipeline_uses_dlq(plan) {
+                        let dlq_entry = self
+                            .persist_dead_letter_records(
+                                plan,
+                                storage,
+                                transaction.commit_position(),
+                                transaction.transaction_id(),
+                                prepared_append.target_records(),
+                                &err,
+                            )
+                            .await?;
+                        storage
+                            .put_replication_pipeline_checkpoint(
+                                ReplicationPipelineCheckpoint::new(
+                                    &plan.name,
+                                    &plan.source_name,
+                                    transaction.commit_position().clone(),
+                                    transaction.transaction_id().cloned(),
+                                    direct_dead_lettered_target_state(
+                                        plan,
+                                        transaction,
+                                        record_count,
+                                        prepared_append.append.payload_format(),
+                                        &dlq_entry,
+                                        &err,
+                                    ),
+                                    current_unix_time_ms(),
+                                )?,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "persist replication pipeline '{}' dead-letter checkpoint",
+                                    plan.name
+                                )
+                            })?;
+                        record_buffer_stats(&buffer_store, &plan.name).await?;
+                        log_replication_pipeline_perf(
+                            plan,
+                            transaction,
+                            record_count,
+                            payload_bytes,
+                            encode_elapsed,
+                            perf_started_at
+                                .map(|started_at| started_at.elapsed())
+                                .unwrap_or(Duration::ZERO),
+                        );
+                        return Ok(record_count);
+                    }
                     let append_started_at = perf_enabled.then(Instant::now);
                     let manifest = append_buffer_transaction(
                         &buffer_store,
@@ -1574,6 +1676,19 @@ impl ReplicationPipelineRuntime {
                     .await
             }
             Err(err) => {
+                if replication_pipeline_uses_dlq(plan) {
+                    self.record_target_write_failure(plan, &err);
+                    return self
+                        .mark_manifest_dead_lettered(
+                            plan,
+                            buffer_store,
+                            storage,
+                            manifest,
+                            records,
+                            &err,
+                        )
+                        .await;
+                }
                 self.mark_manifest_delivery_failed(plan, storage, manifest, err)
                     .await?;
                 Ok(0)
@@ -1682,6 +1797,115 @@ impl ReplicationPipelineRuntime {
                 )
             })?;
         Ok(())
+    }
+
+    async fn mark_manifest_dead_lettered(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        buffer_store: &CdcBufferStore,
+        storage: &SlateCatalog,
+        manifest: &CdcBufferedTransactionManifest,
+        records: &[CdcBufferRecord],
+        err: &anyhow::Error,
+    ) -> anyhow::Result<usize> {
+        let dlq_entry = self
+            .persist_dead_letter_records(
+                plan,
+                storage,
+                manifest.source_position(),
+                manifest.transaction_id(),
+                records,
+                err,
+            )
+            .await?;
+        let dead_lettered_at = current_unix_time_ms();
+        buffer_store
+            .mark_delivered(manifest, dead_lettered_at)
+            .await
+            .with_context(|| {
+                format!(
+                    "mark replication pipeline '{}' buffered transaction dead-lettered",
+                    plan.name
+                )
+            })?;
+        storage
+            .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
+                &plan.name,
+                &plan.source_name,
+                manifest.source_position().clone(),
+                manifest.transaction_id().cloned(),
+                dead_lettered_target_state(plan, manifest, &dlq_entry, err),
+                dead_lettered_at,
+            )?)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist replication pipeline '{}' dead-letter checkpoint",
+                    plan.name
+                )
+            })?;
+        Ok(manifest.record_count())
+    }
+
+    async fn persist_dead_letter_records(
+        &self,
+        plan: &ReplicationPipelineRuntimePlan,
+        storage: &SlateCatalog,
+        source_position: &CdcSourcePosition,
+        transaction_id: Option<&CdcTransactionId>,
+        records: &[CdcBufferRecord],
+        err: &anyhow::Error,
+    ) -> anyhow::Result<ReplicationPipelineDlqEntry> {
+        let dlq_id = replication_pipeline_dlq_id(source_position, transaction_id);
+        let payload = encode_cdc_buffer_records_payload(records)
+            .context("encode replication pipeline DLQ payload")?;
+        let payload_bytes = payload.len();
+        let payload_object_key = storage
+            .put_replication_pipeline_dlq_payload(&plan.name, &dlq_id, payload)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist replication pipeline '{}' dead-letter payload",
+                    plan.name
+                )
+            })?;
+        let entry = ReplicationPipelineDlqEntry::new(
+            &plan.name,
+            dlq_id,
+            &plan.source_name,
+            source_position.clone(),
+            transaction_id.cloned(),
+            format!("{}_delivery", target_kind(plan)),
+            format!("{err:#}"),
+            1,
+            Some(payload_object_key),
+            Some("kafka_records".to_string()),
+            payload_bytes,
+            dead_letter_target_state(plan, err),
+            current_unix_time_ms(),
+        )?;
+        storage
+            .put_replication_pipeline_dlq_entry(entry.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "persist replication pipeline '{}' dead-letter entry",
+                    plan.name
+                )
+            })?;
+        tracing::warn!(
+            pipeline = %plan.name,
+            source = %plan.source_name,
+            target_kind = target_kind(plan),
+            dlq_id = %entry.dlq_id(),
+            records = records.len(),
+            payload_bytes = entry.payload_bytes(),
+            source_position = %source_position_key(source_position),
+            transaction_id = transaction_id.map(CdcTransactionId::as_str),
+            error = %err,
+            "replication pipeline target write dead-lettered"
+        );
+        Ok(entry)
     }
 
     fn record_target_write_failure(
@@ -4112,6 +4336,18 @@ fn failed_target_state(
     state
 }
 
+fn dead_lettered_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    manifest: &CdcBufferedTransactionManifest,
+    dlq_entry: &ReplicationPipelineDlqEntry,
+    err: &anyhow::Error,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = base_target_state(plan, manifest);
+    state.insert("buffer.status".to_string(), "dead_lettered".to_string());
+    add_dead_letter_state(&mut state, dlq_entry, err);
+    state
+}
+
 fn direct_delivered_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     transaction: &TransactionBatch,
@@ -4162,6 +4398,72 @@ fn direct_delivered_target_state(
         "false".to_string(),
     );
     target_state
+}
+
+fn direct_dead_lettered_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    record_count: usize,
+    payload_format: CdcBufferPayloadFormat,
+    dlq_entry: &ReplicationPipelineDlqEntry,
+    err: &anyhow::Error,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = direct_delivered_target_state(
+        plan,
+        transaction,
+        record_count,
+        payload_format,
+        std::collections::BTreeMap::new(),
+    );
+    add_dead_letter_state(&mut state, dlq_entry, err);
+    state
+}
+
+fn add_dead_letter_state(
+    state: &mut std::collections::BTreeMap<String, String>,
+    dlq_entry: &ReplicationPipelineDlqEntry,
+    err: &anyhow::Error,
+) {
+    state.insert(
+        "target.delivery.status".to_string(),
+        "dead_lettered".to_string(),
+    );
+    state.insert(
+        "target.delivery.replay_may_duplicate".to_string(),
+        "false".to_string(),
+    );
+    state.insert("target.dlq.id".to_string(), dlq_entry.dlq_id().to_string());
+    state.insert(
+        "target.dlq.status".to_string(),
+        dlq_entry.status().as_str().to_string(),
+    );
+    if let Some(payload_object_key) = dlq_entry.payload_object_key() {
+        state.insert(
+            "target.dlq.payload_object_key".to_string(),
+            payload_object_key.to_string(),
+        );
+    }
+    state.insert(
+        "target.last_error".to_string(),
+        truncate_target_error(&format!("{err:#}")),
+    );
+}
+
+fn dead_letter_target_state(
+    plan: &ReplicationPipelineRuntimePlan,
+    err: &anyhow::Error,
+) -> std::collections::BTreeMap<String, String> {
+    let mut state = std::collections::BTreeMap::new();
+    state.insert("target.kind".to_string(), target_kind(plan).to_string());
+    state.insert(
+        "target.delivery.status".to_string(),
+        "dead_lettered".to_string(),
+    );
+    state.insert(
+        "target.last_error".to_string(),
+        truncate_target_error(&format!("{err:#}")),
+    );
+    state
 }
 
 fn base_target_state(
@@ -4217,6 +4519,34 @@ fn target_kind(plan: &ReplicationPipelineRuntimePlan) -> &'static str {
         ReplicationPipelineRuntimeTarget::Kafka { .. } => "kafka",
         ReplicationPipelineRuntimeTarget::Postgres { .. } => "postgres",
     }
+}
+
+fn replication_pipeline_uses_dlq(plan: &ReplicationPipelineRuntimePlan) -> bool {
+    plan.error_policy.mode() == CatalogReplicationErrorPolicyMode::DeadLetterAndContinue
+}
+
+fn replication_pipeline_dlq_id(
+    source_position: &CdcSourcePosition,
+    transaction_id: Option<&CdcTransactionId>,
+) -> String {
+    let position = source_position_key(source_position);
+    let transaction = transaction_id.map_or("none", CdcTransactionId::as_str);
+    format!(
+        "{}-{}-{}",
+        hex_component(position.as_bytes()),
+        hex_component(transaction.as_bytes()),
+        current_unix_time_ms()
+    )
+}
+
+fn hex_component(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 fn truncate_target_error(message: &str) -> String {
@@ -5582,6 +5912,166 @@ mod tests {
             .await
             .expect("pending after restart replay");
         assert_eq!(still_pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn durable_pipeline_dead_letters_and_advances_when_policy_allows() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        plan.error_policy = CatalogReplicationErrorPolicy::new(
+            CatalogReplicationErrorPolicyMode::DeadLetterAndContinue,
+            None,
+        );
+        let runtime = test_runtime_with_plan(plan.clone());
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
+        let source_id = CdcSourceId::new("pg_main").unwrap();
+        let transaction = TransactionBatch::new(
+            source_id.clone(),
+            Some(CdcTransactionId::new("pg-xid-301").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(1, "open"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .run_transaction(&source_id, &schemas, &transaction, Some(&storage))
+                .await
+                .expect("dead-letter transaction"),
+            1
+        );
+
+        let buffer_store = storage.cdc_buffer_store();
+        let pending = buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending transactions");
+        assert!(pending.is_empty());
+        let dlq_entries = storage
+            .replication_pipeline_dlq_entries(&plan.name)
+            .await
+            .expect("dlq entries");
+        assert_eq!(dlq_entries.len(), 1);
+        let dlq_entry = &dlq_entries[0];
+        assert_eq!(dlq_entry.source_position(), transaction.commit_position());
+        assert_eq!(dlq_entry.error_class(), "kafka_delivery");
+        assert_eq!(dlq_entry.payload_format(), Some("kafka_records"));
+        let payload = storage
+            .replication_pipeline_dlq_payload(dlq_entry.payload_object_key().unwrap())
+            .await
+            .expect("dlq payload");
+        let records =
+            floe_storage::decode_cdc_buffer_records_payload(&payload).expect("decode payload");
+        assert_eq!(records.len(), 1);
+
+        let checkpoint = storage
+            .replication_pipeline_checkpoint(&plan.name)
+            .await
+            .expect("checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.source_position(), transaction.commit_position());
+        assert_eq!(
+            checkpoint.target_state()["target.delivery.status"],
+            "dead_lettered"
+        );
+        assert_eq!(
+            checkpoint.target_state()["target.delivery.replay_may_duplicate"],
+            "false"
+        );
+        assert_eq!(
+            checkpoint.target_state()["target.dlq.id"],
+            dlq_entry.dlq_id()
+        );
+        assert!(checkpoint.target_state()["target.last_error"].contains("has no Kafka writer"));
+    }
+
+    #[tokio::test]
+    async fn replay_dead_letters_pending_buffer_when_policy_allows() {
+        let table_id = CdcTableId::new("orders").unwrap();
+        let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+        plan.error_policy = CatalogReplicationErrorPolicy::new(
+            CatalogReplicationErrorPolicyMode::DeadLetterAndContinue,
+            None,
+        );
+        let runtime = test_runtime_with_plan(plan.clone());
+        let storage = SlateCatalog::in_memory().await.unwrap();
+        let transaction = TransactionBatch::new(
+            CdcSourceId::new("pg_main").unwrap(),
+            Some(CdcTransactionId::new("pg-xid-302").unwrap()),
+            None,
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6D00", None).unwrap(),
+            vec![
+                ChangeBatch::new(
+                    table_id,
+                    vec![CdcChange::Insert {
+                        row: row(2, "paid"),
+                    }],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let prepared = prepare_replication_buffer_append(
+            &plan,
+            &transaction,
+            vec![CdcBufferRecord::new(Some(vec![2]), Some(vec![3]))],
+        )
+        .unwrap();
+        let buffer_store = storage.cdc_buffer_store();
+        let manifest = buffer_store
+            .append_transaction(&prepared.append)
+            .await
+            .expect("append pending transaction");
+
+        assert_eq!(
+            runtime
+                .replay_buffered(&storage)
+                .await
+                .expect("dead-letter pending transaction"),
+            1
+        );
+        assert!(
+            buffer_store
+                .pending_transactions(&plan.name, 10)
+                .await
+                .expect("pending transactions")
+                .is_empty()
+        );
+        let delivered = buffer_store
+            .delivery_frontier(&plan.name)
+            .await
+            .expect("delivery frontier")
+            .expect("delivery frontier");
+        assert_eq!(delivered.source_position(), manifest.source_position());
+
+        let checkpoint = storage
+            .replication_pipeline_checkpoint(&plan.name)
+            .await
+            .expect("checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.source_position(), manifest.source_position());
+        assert_eq!(
+            checkpoint.target_state()["target.delivery.status"],
+            "dead_lettered"
+        );
+        assert_eq!(
+            storage
+                .replication_pipeline_dlq_entries(&plan.name)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

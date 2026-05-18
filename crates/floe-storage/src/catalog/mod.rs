@@ -19,6 +19,7 @@ use floe_core::{RowValue, RowValues};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, Settings, WriteOptions};
 use slatedb::{CloseReason, Db, Error as SlateError, ErrorKind, WriteBatch};
@@ -836,6 +837,55 @@ impl SlateCatalog {
         Ok(Some(entry))
     }
 
+    pub async fn put_replication_pipeline_dlq_payload(
+        &self,
+        pipeline_name: &str,
+        dlq_id: &str,
+        payload: Vec<u8>,
+    ) -> Result<String> {
+        ensure!(
+            !pipeline_name.trim().is_empty(),
+            "replication pipeline DLQ payload pipeline name cannot be empty"
+        );
+        ensure!(
+            !dlq_id.trim().is_empty(),
+            "replication pipeline DLQ payload id cannot be empty"
+        );
+        ensure!(
+            !dlq_id.contains('/'),
+            "replication pipeline DLQ payload id cannot contain '/'"
+        );
+        let object_key = replication_pipeline_dlq_payload_object_key(pipeline_name, dlq_id);
+        self.object_store
+            .put(&ObjectPath::from(object_key.clone()), payload.into())
+            .await
+            .with_context(|| format!("write replication pipeline DLQ payload '{object_key}'"))?;
+        Ok(object_key)
+    }
+
+    pub async fn replication_pipeline_dlq_payload(
+        &self,
+        payload_object_key: &str,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            !payload_object_key.trim().is_empty(),
+            "replication pipeline DLQ payload object key cannot be empty"
+        );
+        let payload = self
+            .object_store
+            .get(&ObjectPath::from(payload_object_key.to_string()))
+            .await
+            .with_context(|| {
+                format!("load replication pipeline DLQ payload '{payload_object_key}'")
+            })?
+            .bytes()
+            .await
+            .with_context(|| {
+                format!("read replication pipeline DLQ payload '{payload_object_key}'")
+            })?;
+        Ok(payload.to_vec())
+    }
+
     pub async fn save_materialized_view_schema(&self, name: &str, schema: SchemaRef) -> Result<()> {
         let key = mv_schema_key(name);
         let mut payload = Vec::new();
@@ -951,6 +1001,14 @@ fn replication_pipeline_dlq_entry_key(pipeline_name: &str, dlq_id: &str) -> Vec<
     format!("{REPLICATION_PIPELINE_DLQ_PREFIX}{pipeline_name}/{dlq_id}").into_bytes()
 }
 
+fn replication_pipeline_dlq_payload_object_key(pipeline_name: &str, dlq_id: &str) -> String {
+    format!(
+        "floe_cdc_dlq_blobs/v1/pipeline/{}/{}.bin",
+        hex_component(pipeline_name.as_bytes()),
+        dlq_id
+    )
+}
+
 fn table_row_prefix(name: &str) -> Vec<u8> {
     format!("{TABLE_DATA_PREFIX}{name}/").into_bytes()
 }
@@ -1011,6 +1069,16 @@ fn encode_key_value(value: &RowValue) -> Result<Vec<u8>> {
 
 fn map_slate_err(err: SlateError) -> anyhow::Error {
     anyhow::Error::new(err)
+}
+
+fn hex_component(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1188,6 +1256,22 @@ mod tests {
             .expect("checkpoint exists");
         assert_eq!(loaded_checkpoint, checkpoint);
 
+        let dlq_payload = b"encoded failed records".to_vec();
+        let dlq_payload_object_key = catalog
+            .put_replication_pipeline_dlq_payload(
+                "pg_orders_to_kafka",
+                "0_16B6C50_tx_7",
+                dlq_payload.clone(),
+            )
+            .await
+            .expect("persist dlq payload");
+        assert_eq!(
+            catalog
+                .replication_pipeline_dlq_payload(&dlq_payload_object_key)
+                .await
+                .expect("load dlq payload"),
+            dlq_payload
+        );
         let dlq_entry = ReplicationPipelineDlqEntry::new(
             "pg_orders_to_kafka",
             "0_16B6C50_tx_7",
@@ -1197,7 +1281,7 @@ mod tests {
             "kafka_delivery",
             "broker unavailable",
             2,
-            Some("floe_cdc_dlq_blobs/v1/pg_orders_to_kafka/0_16B6C50_tx_7.bin".to_string()),
+            Some(dlq_payload_object_key),
             Some("kafka_records".to_string()),
             4096,
             BTreeMap::from([("kafka.topic".to_string(), "orders_cdc".to_string())]),
