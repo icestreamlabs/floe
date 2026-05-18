@@ -29,6 +29,8 @@ use floe_core::catalog::{
     PostgresCdcSchemaEvolutionPolicy as CatalogPostgresCdcSchemaEvolutionPolicy,
     PostgresCdcSourceDefinition, ReplicationBufferMode as CatalogReplicationBufferMode,
     ReplicationBufferPolicy as CatalogReplicationBufferPolicy,
+    ReplicationErrorPolicy as CatalogReplicationErrorPolicy,
+    ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode,
     ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
     ReplicationPipelineFormat as CatalogReplicationPipelineFormat,
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
@@ -66,6 +68,7 @@ use floe_server as server;
 use floe_sql_parser::{
     CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
     ReplicationBufferMode as SqlReplicationBufferMode,
+    ReplicationErrorPolicyMode as SqlReplicationErrorPolicyMode,
     ReplicationPipelineDefinition as SqlReplicationPipelineDefinition,
     ReplicationPipelineFormat as SqlReplicationPipelineFormat,
     ReplicationPipelineTarget as SqlReplicationPipelineTarget, SourceConnector, SqlColumnType,
@@ -182,6 +185,7 @@ struct ReplicationPipelineRuntimePlan {
     format: ReplicationPipelineRuntimeFormat,
     buffer_mode: ReplicationPipelineRuntimeBufferMode,
     buffer_policy: CatalogReplicationBufferPolicy,
+    error_policy: CatalogReplicationErrorPolicy,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
 }

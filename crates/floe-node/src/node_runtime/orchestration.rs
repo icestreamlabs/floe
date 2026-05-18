@@ -268,6 +268,7 @@ fn replication_pipeline_runtime_plan_from_catalog(
             }
         },
         buffer_policy: pipeline.buffer_policy(),
+        error_policy: pipeline.error_policy(),
         emit_tombstones: pipeline.emit_tombstones(),
         include_transaction_metadata: pipeline.include_transaction_metadata(),
     })

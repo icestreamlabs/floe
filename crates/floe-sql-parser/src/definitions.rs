@@ -289,6 +289,7 @@ pub struct ReplicationPipelineDefinition {
     buffer_policy: ReplicationBufferPolicy,
     emit_tombstones: bool,
     include_transaction_metadata: bool,
+    error_policy: ReplicationErrorPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +317,20 @@ pub struct ReplicationBufferPolicy {
     max_pending_records: Option<usize>,
     max_pending_transactions: Option<usize>,
     max_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplicationErrorPolicy {
+    mode: ReplicationErrorPolicyMode,
+    max_retries: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplicationErrorPolicyMode {
+    FailFast,
+    #[default]
+    RetryWithBackoff,
+    DeadLetterAndContinue,
 }
 
 impl SinkDefinition {
@@ -368,6 +383,7 @@ impl ReplicationPipelineDefinition {
         buffer_policy: ReplicationBufferPolicy,
         emit_tombstones: bool,
         include_transaction_metadata: bool,
+        error_policy: ReplicationErrorPolicy,
     ) -> Result<Self> {
         let name = name.into();
         let source_name = source_name.into();
@@ -394,6 +410,7 @@ impl ReplicationPipelineDefinition {
             buffer_policy,
             emit_tombstones,
             include_transaction_metadata,
+            error_policy,
         })
     }
 
@@ -432,6 +449,10 @@ impl ReplicationPipelineDefinition {
     pub fn include_transaction_metadata(&self) -> bool {
         self.include_transaction_metadata
     }
+
+    pub fn error_policy(&self) -> ReplicationErrorPolicy {
+        self.error_policy
+    }
 }
 
 impl ReplicationBufferPolicy {
@@ -463,6 +484,20 @@ impl ReplicationBufferPolicy {
 
     pub fn max_pending_age_ms(&self) -> Option<u64> {
         self.max_pending_age_ms
+    }
+}
+
+impl ReplicationErrorPolicy {
+    pub fn new(mode: ReplicationErrorPolicyMode, max_retries: Option<u32>) -> Self {
+        Self { mode, max_retries }
+    }
+
+    pub fn mode(&self) -> ReplicationErrorPolicyMode {
+        self.mode
+    }
+
+    pub fn max_retries(&self) -> Option<u32> {
+        self.max_retries
     }
 }
 

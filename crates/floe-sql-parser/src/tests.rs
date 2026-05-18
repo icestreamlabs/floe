@@ -142,7 +142,9 @@ fn parse_create_replication_pipeline_statement() {
             buffer.max_pending_objects = 64,
             buffer.max_pending_age_ms = 60000,
             tombstones = true,
-            transaction_metadata = true
+            transaction_metadata = true,
+            error.policy = 'dead-letter-and-continue',
+            error.max_retries = 3
          )",
     )
     .expect("parse replication pipeline");
@@ -172,6 +174,11 @@ fn parse_create_replication_pipeline_statement() {
             assert!(definition.emit_tombstones());
             assert!(definition.include_transaction_metadata());
             assert_eq!(
+                definition.error_policy().mode(),
+                ReplicationErrorPolicyMode::DeadLetterAndContinue
+            );
+            assert_eq!(definition.error_policy().max_retries(), Some(3));
+            assert_eq!(
                 definition.target(),
                 &ReplicationPipelineTarget::Kafka {
                     brokers: "localhost:9092".to_string(),
@@ -197,6 +204,11 @@ fn parse_create_replication_pipeline_defaults() {
     };
     assert_eq!(definition.format(), ReplicationPipelineFormat::FloeJson);
     assert_eq!(definition.buffer_mode(), ReplicationBufferMode::Durable);
+    assert_eq!(
+        definition.error_policy().mode(),
+        ReplicationErrorPolicyMode::RetryWithBackoff
+    );
+    assert_eq!(definition.error_policy().max_retries(), None);
     assert!(!definition.emit_tombstones());
     assert!(!definition.include_transaction_metadata());
 }

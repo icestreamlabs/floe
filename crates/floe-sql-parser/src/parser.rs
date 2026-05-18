@@ -12,8 +12,9 @@ use crate::definitions::{
     CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
     CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
     PostgresCdcSchemaEvolutionPolicy, PostgresCdcSourceOptions, ReplicationBufferMode,
-    ReplicationBufferPolicy, ReplicationPipelineDefinition, ReplicationPipelineFormat,
-    ReplicationPipelineTarget, SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
+    ReplicationBufferPolicy, ReplicationErrorPolicy, ReplicationErrorPolicyMode,
+    ReplicationPipelineDefinition, ReplicationPipelineFormat, ReplicationPipelineTarget,
+    SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
 };
 
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
@@ -681,6 +682,15 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
     .map(|value| parse_bool_option("include_transaction_metadata", value))
     .transpose()?
     .unwrap_or(false);
+    let error_policy = ReplicationErrorPolicy::new(
+        option_any(&options, &["error.policy", "error_policy"])
+            .map(parse_replication_error_policy_mode)
+            .transpose()?
+            .unwrap_or_default(),
+        option_any(&options, &["error.max_retries", "error_max_retries"])
+            .map(|value| parse_u32_option("error.max_retries", value))
+            .transpose()?,
+    );
 
     let target = match target_name.to_ascii_lowercase().replace('-', "_").as_str() {
         "kafka" => ReplicationPipelineTarget::Kafka {
@@ -716,6 +726,7 @@ fn parse_replication_pipeline_statement(sql: &str) -> Result<ReplicationPipeline
         buffer_policy,
         emit_tombstones,
         include_transaction_metadata,
+        error_policy,
     )
 }
 
@@ -1148,6 +1159,25 @@ fn parse_u64_option(name: &str, value: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
+}
+
+fn parse_u32_option(name: &str, value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
+}
+
+fn parse_replication_error_policy_mode(value: &str) -> Result<ReplicationErrorPolicyMode> {
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "fail_fast" | "failfast" => Ok(ReplicationErrorPolicyMode::FailFast),
+        "retry" | "retry_with_backoff" => Ok(ReplicationErrorPolicyMode::RetryWithBackoff),
+        "dlq" | "dead_letter" | "dead_letter_and_continue" => {
+            Ok(ReplicationErrorPolicyMode::DeadLetterAndContinue)
+        }
+        other => Err(anyhow!(
+            "unsupported replication pipeline error policy '{other}'"
+        )),
+    }
 }
 
 fn normalize_sink_format(value: &str) -> String {

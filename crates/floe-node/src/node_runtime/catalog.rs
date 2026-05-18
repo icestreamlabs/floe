@@ -118,6 +118,20 @@ pub(super) fn replication_pipeline_definition_from_sql(
         ),
         definition.emit_tombstones(),
         definition.include_transaction_metadata(),
+        CatalogReplicationErrorPolicy::new(
+            match definition.error_policy().mode() {
+                SqlReplicationErrorPolicyMode::FailFast => {
+                    CatalogReplicationErrorPolicyMode::FailFast
+                }
+                SqlReplicationErrorPolicyMode::RetryWithBackoff => {
+                    CatalogReplicationErrorPolicyMode::RetryWithBackoff
+                }
+                SqlReplicationErrorPolicyMode::DeadLetterAndContinue => {
+                    CatalogReplicationErrorPolicyMode::DeadLetterAndContinue
+                }
+            },
+            definition.error_policy().max_retries(),
+        ),
     )
 }
 

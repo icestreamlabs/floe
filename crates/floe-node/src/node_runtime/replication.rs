@@ -427,6 +427,7 @@ pub(super) struct ReplicationPipelineStatusSnapshot {
     pipeline_name: String,
     source_name: String,
     schema_evolution_policy: String,
+    error_policy: String,
     target_kind: String,
     checkpoint_position: Option<CdcSourcePosition>,
     checkpoint_lsn_bytes: Option<u64>,
@@ -453,6 +454,10 @@ impl ReplicationPipelineStatusSnapshot {
 
     pub(super) fn schema_evolution_policy(&self) -> &str {
         &self.schema_evolution_policy
+    }
+
+    pub(super) fn error_policy(&self) -> &str {
+        &self.error_policy
     }
 
     pub(super) fn target_kind(&self) -> &str {
@@ -856,6 +861,7 @@ impl ReplicationPipelineRuntime {
                     pipeline_name: plan.name.clone(),
                     source_name: plan.source_name.clone(),
                     schema_evolution_policy: plan.schema_evolution_policy.as_str().to_string(),
+                    error_policy: plan.error_policy.mode().as_str().to_string(),
                     target_kind: target_kind(plan).to_string(),
                     checkpoint_position,
                     checkpoint_lsn_bytes,
@@ -3795,6 +3801,7 @@ fn cdc_replication_debug_state_from_snapshots(
                 pipeline: snapshot.pipeline_name().to_string(),
                 source: snapshot.source_name().to_string(),
                 schema_evolution_policy: snapshot.schema_evolution_policy().to_string(),
+                error_policy: snapshot.error_policy().to_string(),
                 target_kind: snapshot.target_kind().to_string(),
                 checkpoint_position: snapshot.checkpoint_position().map(source_position_key),
                 checkpoint_lsn_bytes: snapshot.checkpoint_lsn_bytes(),
@@ -4266,6 +4273,7 @@ fn log_replication_pipeline_perf(
         upstream_table = %plan.upstream_table,
         format = ?plan.format,
         buffer_mode = ?plan.buffer_mode,
+        error_policy = %plan.error_policy.mode().as_str(),
         change_batches = transaction.change_batches().len(),
         changes,
         records,
@@ -4555,6 +4563,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::DebeziumJson,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -4601,6 +4610,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::DebeziumJson,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: true,
         };
@@ -4655,6 +4665,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::FloeJson,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -4798,6 +4809,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -4859,6 +4871,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -4918,6 +4931,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::ArrowIpc,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         };
@@ -5817,6 +5831,7 @@ mod tests {
             format: ReplicationPipelineRuntimeFormat::FloeJson,
             buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
             buffer_policy: CatalogReplicationBufferPolicy::default(),
+            error_policy: CatalogReplicationErrorPolicy::default(),
             emit_tombstones: false,
             include_transaction_metadata: false,
         }

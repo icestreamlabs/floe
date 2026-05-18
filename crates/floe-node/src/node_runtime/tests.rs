@@ -741,7 +741,9 @@ fn replication_pipeline_definition_from_sql_preserves_postgres_target() {
          FROM pg_main TABLE public.orders
          INTO POSTGRES WITH (
             connection = 'postgres://postgres:postgres@localhost/postgres',
-            table = 'public.orders_copy'
+            table = 'public.orders_copy',
+            error.policy = 'dead_letter_and_continue',
+            error.max_retries = 5
          )",
     )
     .expect("parse pipeline");
@@ -765,6 +767,11 @@ fn replication_pipeline_definition_from_sql_preserves_postgres_target() {
             table: "public.orders_copy".to_string(),
         }
     );
+    assert_eq!(
+        pipeline.error_policy().mode(),
+        CatalogReplicationErrorPolicyMode::DeadLetterAndContinue
+    );
+    assert_eq!(pipeline.error_policy().max_retries(), Some(5));
 }
 
 #[test]
@@ -861,6 +868,7 @@ fn catalog_postgres_source_connector_merges_pipeline_tables() {
         CatalogReplicationBufferPolicy::default(),
         false,
         false,
+        CatalogReplicationErrorPolicy::default(),
     )
     .expect("pipeline");
     let mut pipelines = HashMap::new();
@@ -954,6 +962,7 @@ async fn postgres_cdc_runtime_plan_accepts_postgres_replication_target() {
         CatalogReplicationBufferPolicy::default(),
         false,
         false,
+        CatalogReplicationErrorPolicy::default(),
     )
     .expect("pipeline");
 
@@ -1007,6 +1016,7 @@ async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
         CatalogReplicationBufferPolicy::default(),
         false,
         false,
+        CatalogReplicationErrorPolicy::default(),
     )
     .expect("pipeline");
 

@@ -173,6 +173,8 @@ pub struct ReplicationPipelineDefinition {
     emit_tombstones: bool,
     #[serde(default)]
     include_transaction_metadata: bool,
+    #[serde(default)]
+    error_policy: ReplicationErrorPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -185,6 +187,33 @@ pub struct ReplicationBufferPolicy {
     max_pending_transactions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReplicationErrorPolicy {
+    #[serde(default)]
+    mode: ReplicationErrorPolicyMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_retries: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationErrorPolicyMode {
+    FailFast,
+    #[default]
+    RetryWithBackoff,
+    DeadLetterAndContinue,
+}
+
+impl ReplicationErrorPolicyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FailFast => "fail_fast",
+            Self::RetryWithBackoff => "retry_with_backoff",
+            Self::DeadLetterAndContinue => "dead_letter_and_continue",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,6 +463,7 @@ impl ReplicationPipelineDefinition {
         buffer_policy: ReplicationBufferPolicy,
         emit_tombstones: bool,
         include_transaction_metadata: bool,
+        error_policy: ReplicationErrorPolicy,
     ) -> Result<Self> {
         let name = name.into();
         let source_name = source_name.into();
@@ -461,6 +491,7 @@ impl ReplicationPipelineDefinition {
             buffer_policy,
             emit_tombstones,
             include_transaction_metadata,
+            error_policy,
         })
     }
 
@@ -499,6 +530,10 @@ impl ReplicationPipelineDefinition {
     pub fn include_transaction_metadata(&self) -> bool {
         self.include_transaction_metadata
     }
+
+    pub fn error_policy(&self) -> ReplicationErrorPolicy {
+        self.error_policy
+    }
 }
 
 impl ReplicationBufferPolicy {
@@ -530,6 +565,20 @@ impl ReplicationBufferPolicy {
 
     pub fn max_pending_age_ms(&self) -> Option<u64> {
         self.max_pending_age_ms
+    }
+}
+
+impl ReplicationErrorPolicy {
+    pub fn new(mode: ReplicationErrorPolicyMode, max_retries: Option<u32>) -> Self {
+        Self { mode, max_retries }
+    }
+
+    pub fn mode(&self) -> ReplicationErrorPolicyMode {
+        self.mode
+    }
+
+    pub fn max_retries(&self) -> Option<u32> {
+        self.max_retries
     }
 }
 

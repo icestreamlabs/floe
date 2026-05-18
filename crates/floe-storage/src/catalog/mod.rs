@@ -32,6 +32,7 @@ const MV_DEF_PREFIX: &str = "meta/mv/definition/";
 const MV_SCHEMA_PREFIX: &str = "meta/mv/schema/";
 const REPLICATION_PIPELINE_DEF_PREFIX: &str = "meta/replication_pipeline/definition/";
 const REPLICATION_PIPELINE_CHECKPOINT_PREFIX: &str = "meta/replication_pipeline/checkpoint/";
+const REPLICATION_PIPELINE_DLQ_PREFIX: &str = "meta/replication_pipeline/dlq/";
 
 #[derive(Clone)]
 pub struct SlateCatalog {
@@ -56,6 +57,39 @@ pub struct ReplicationPipelineCheckpoint {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     target_state: BTreeMap<String, String>,
     committed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationPipelineDlqEntry {
+    pipeline_name: String,
+    dlq_id: String,
+    source_name: String,
+    source_position: CdcSourcePosition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<CdcTransactionId>,
+    error_class: String,
+    error_message: String,
+    attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_object_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_format: Option<String>,
+    payload_bytes: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    target_state: BTreeMap<String, String>,
+    #[serde(default)]
+    status: ReplicationPipelineDlqStatus,
+    created_at_unix_ms: u64,
+    last_updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationPipelineDlqStatus {
+    #[default]
+    Pending,
+    Replayed,
+    Discarded,
 }
 
 impl MaterializedViewMetadata {
@@ -131,6 +165,165 @@ impl ReplicationPipelineCheckpoint {
 
     pub fn committed_at_unix_ms(&self) -> u64 {
         self.committed_at_unix_ms
+    }
+}
+
+impl ReplicationPipelineDlqEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pipeline_name: impl Into<String>,
+        dlq_id: impl Into<String>,
+        source_name: impl Into<String>,
+        source_position: CdcSourcePosition,
+        transaction_id: Option<CdcTransactionId>,
+        error_class: impl Into<String>,
+        error_message: impl Into<String>,
+        attempt_count: u32,
+        payload_object_key: Option<String>,
+        payload_format: Option<String>,
+        payload_bytes: usize,
+        target_state: BTreeMap<String, String>,
+        created_at_unix_ms: u64,
+    ) -> Result<Self> {
+        let entry = Self {
+            pipeline_name: pipeline_name.into(),
+            dlq_id: dlq_id.into(),
+            source_name: source_name.into(),
+            source_position,
+            transaction_id,
+            error_class: error_class.into(),
+            error_message: error_message.into(),
+            attempt_count,
+            payload_object_key,
+            payload_format,
+            payload_bytes,
+            target_state,
+            status: ReplicationPipelineDlqStatus::Pending,
+            created_at_unix_ms,
+            last_updated_at_unix_ms: created_at_unix_ms,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub fn pipeline_name(&self) -> &str {
+        &self.pipeline_name
+    }
+
+    pub fn dlq_id(&self) -> &str {
+        &self.dlq_id
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    pub fn source_position(&self) -> &CdcSourcePosition {
+        &self.source_position
+    }
+
+    pub fn transaction_id(&self) -> Option<&CdcTransactionId> {
+        self.transaction_id.as_ref()
+    }
+
+    pub fn error_class(&self) -> &str {
+        &self.error_class
+    }
+
+    pub fn error_message(&self) -> &str {
+        &self.error_message
+    }
+
+    pub fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+
+    pub fn payload_object_key(&self) -> Option<&str> {
+        self.payload_object_key.as_deref()
+    }
+
+    pub fn payload_format(&self) -> Option<&str> {
+        self.payload_format.as_deref()
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    pub fn target_state(&self) -> &BTreeMap<String, String> {
+        &self.target_state
+    }
+
+    pub fn status(&self) -> ReplicationPipelineDlqStatus {
+        self.status
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    pub fn last_updated_at_unix_ms(&self) -> u64 {
+        self.last_updated_at_unix_ms
+    }
+
+    pub fn with_status(
+        mut self,
+        status: ReplicationPipelineDlqStatus,
+        last_updated_at_unix_ms: u64,
+    ) -> Self {
+        self.status = status;
+        self.last_updated_at_unix_ms = last_updated_at_unix_ms;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.pipeline_name.trim().is_empty(),
+            "replication pipeline DLQ entry pipeline name cannot be empty"
+        );
+        ensure!(
+            !self.dlq_id.trim().is_empty(),
+            "replication pipeline DLQ entry id cannot be empty"
+        );
+        ensure!(
+            !self.dlq_id.contains('/'),
+            "replication pipeline DLQ entry id cannot contain '/'"
+        );
+        ensure!(
+            !self.source_name.trim().is_empty(),
+            "replication pipeline DLQ entry source name cannot be empty"
+        );
+        ensure!(
+            !self.error_class.trim().is_empty(),
+            "replication pipeline DLQ entry error class cannot be empty"
+        );
+        ensure!(
+            !self.error_message.trim().is_empty(),
+            "replication pipeline DLQ entry error message cannot be empty"
+        );
+        if let Some(payload_object_key) = self.payload_object_key.as_deref() {
+            ensure!(
+                !payload_object_key.trim().is_empty(),
+                "replication pipeline DLQ entry payload object key cannot be empty"
+            );
+        }
+        if let Some(payload_format) = self.payload_format.as_deref() {
+            ensure!(
+                !payload_format.trim().is_empty(),
+                "replication pipeline DLQ entry payload format cannot be empty"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl ReplicationPipelineDlqStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Replayed => "replayed",
+            Self::Discarded => "discarded",
+        }
     }
 }
 
@@ -555,6 +748,94 @@ impl SlateCatalog {
         }
     }
 
+    pub async fn put_replication_pipeline_dlq_entry(
+        &self,
+        entry: ReplicationPipelineDlqEntry,
+    ) -> Result<()> {
+        entry.validate()?;
+        let key = replication_pipeline_dlq_entry_key(entry.pipeline_name(), entry.dlq_id());
+        let encoded = serde_json::to_vec(&entry).with_context(|| {
+            format!(
+                "failed to serialize replication pipeline '{}' DLQ entry {}",
+                entry.pipeline_name(),
+                entry.dlq_id()
+            )
+        })?;
+        let mut batch = WriteBatch::new();
+        batch.put(&key, encoded);
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_slate_err)
+            .with_context(|| {
+                format!(
+                    "failed to persist replication pipeline '{}' DLQ entry {}",
+                    entry.pipeline_name(),
+                    entry.dlq_id()
+                )
+            })
+    }
+
+    pub async fn replication_pipeline_dlq_entry(
+        &self,
+        pipeline_name: &str,
+        dlq_id: &str,
+    ) -> Result<Option<ReplicationPipelineDlqEntry>> {
+        let key = replication_pipeline_dlq_entry_key(pipeline_name, dlq_id);
+        let bytes = self.db.get(key).await.map_err(map_slate_err)?;
+        if let Some(bytes) = bytes {
+            let entry = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse replication pipeline '{pipeline_name}' DLQ entry {dlq_id}")
+            })?;
+            Ok(Some(entry))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn replication_pipeline_dlq_entries(
+        &self,
+        pipeline_name: &str,
+    ) -> Result<Vec<ReplicationPipelineDlqEntry>> {
+        let prefix = replication_pipeline_dlq_entry_prefix(pipeline_name);
+        scan_prefix(&self.db, &prefix)
+            .await?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_slice::<ReplicationPipelineDlqEntry>(&value).with_context(|| {
+                    format!(
+                        "failed to deserialize replication pipeline '{pipeline_name}' DLQ entry"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub async fn update_replication_pipeline_dlq_entry_status(
+        &self,
+        pipeline_name: &str,
+        dlq_id: &str,
+        status: ReplicationPipelineDlqStatus,
+        last_updated_at_unix_ms: u64,
+    ) -> Result<Option<ReplicationPipelineDlqEntry>> {
+        let Some(entry) = self
+            .replication_pipeline_dlq_entry(pipeline_name, dlq_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let entry = entry.with_status(status, last_updated_at_unix_ms);
+        self.put_replication_pipeline_dlq_entry(entry.clone())
+            .await?;
+        Ok(Some(entry))
+    }
+
     pub async fn save_materialized_view_schema(&self, name: &str, schema: SchemaRef) -> Result<()> {
         let key = mv_schema_key(name);
         let mut payload = Vec::new();
@@ -660,6 +941,14 @@ fn replication_pipeline_definition_key(name: &str) -> Vec<u8> {
 
 fn replication_pipeline_checkpoint_key(name: &str) -> Vec<u8> {
     format!("{REPLICATION_PIPELINE_CHECKPOINT_PREFIX}{name}").into_bytes()
+}
+
+fn replication_pipeline_dlq_entry_prefix(pipeline_name: &str) -> Vec<u8> {
+    format!("{REPLICATION_PIPELINE_DLQ_PREFIX}{pipeline_name}/").into_bytes()
+}
+
+fn replication_pipeline_dlq_entry_key(pipeline_name: &str, dlq_id: &str) -> Vec<u8> {
+    format!("{REPLICATION_PIPELINE_DLQ_PREFIX}{pipeline_name}/{dlq_id}").into_bytes()
 }
 
 fn table_row_prefix(name: &str) -> Vec<u8> {
@@ -857,6 +1146,7 @@ mod tests {
             floe_core::catalog::ReplicationBufferPolicy::default(),
             true,
             true,
+            floe_core::catalog::ReplicationErrorPolicy::default(),
         )
         .expect("pipeline");
         catalog
@@ -897,6 +1187,60 @@ mod tests {
             .expect("load checkpoint")
             .expect("checkpoint exists");
         assert_eq!(loaded_checkpoint, checkpoint);
+
+        let dlq_entry = ReplicationPipelineDlqEntry::new(
+            "pg_orders_to_kafka",
+            "0_16B6C50_tx_7",
+            "pg_main",
+            CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+            Some(CdcTransactionId::new("tx-7").expect("transaction")),
+            "kafka_delivery",
+            "broker unavailable",
+            2,
+            Some("floe_cdc_dlq_blobs/v1/pg_orders_to_kafka/0_16B6C50_tx_7.bin".to_string()),
+            Some("kafka_records".to_string()),
+            4096,
+            BTreeMap::from([("kafka.topic".to_string(), "orders_cdc".to_string())]),
+            1_700_000_000_001,
+        )
+        .expect("dlq entry");
+        catalog
+            .put_replication_pipeline_dlq_entry(dlq_entry.clone())
+            .await
+            .expect("persist dlq entry");
+
+        let loaded_dlq_entry = catalog
+            .replication_pipeline_dlq_entry("pg_orders_to_kafka", "0_16B6C50_tx_7")
+            .await
+            .expect("load dlq entry")
+            .expect("dlq entry exists");
+        assert_eq!(loaded_dlq_entry, dlq_entry);
+        assert_eq!(
+            catalog
+                .replication_pipeline_dlq_entries("pg_orders_to_kafka")
+                .await
+                .unwrap(),
+            vec![dlq_entry]
+        );
+
+        let updated_dlq_entry = catalog
+            .update_replication_pipeline_dlq_entry_status(
+                "pg_orders_to_kafka",
+                "0_16B6C50_tx_7",
+                ReplicationPipelineDlqStatus::Replayed,
+                1_700_000_000_002,
+            )
+            .await
+            .expect("update dlq status")
+            .expect("dlq entry exists");
+        assert_eq!(
+            updated_dlq_entry.status(),
+            ReplicationPipelineDlqStatus::Replayed
+        );
+        assert_eq!(
+            updated_dlq_entry.last_updated_at_unix_ms(),
+            1_700_000_000_002
+        );
     }
 
     #[tokio::test]
@@ -915,6 +1259,7 @@ mod tests {
             floe_core::catalog::ReplicationBufferPolicy::default(),
             false,
             false,
+            floe_core::catalog::ReplicationErrorPolicy::default(),
         )
         .expect("pipeline");
 
