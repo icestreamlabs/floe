@@ -71,7 +71,13 @@ pub struct CdcReplicationDebugState {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PostgresCdcDebugSourceState {
     pub source: String,
+    pub slot: Option<String>,
     pub schema_evolution_policy: String,
+    pub upstream_lsn: Option<String>,
+    pub upstream_lsn_bytes: Option<u64>,
+    pub durable_lsn: Option<String>,
+    pub durable_lsn_bytes: Option<u64>,
+    pub source_lag_bytes: Option<u64>,
     pub latest_schema_evolution: Option<PostgresCdcSchemaEvolutionDebugState>,
 }
 
@@ -95,6 +101,8 @@ pub struct CdcReplicationDebugPipelineState {
     pub schema_evolution_policy: String,
     pub target_kind: String,
     pub checkpoint_position: Option<String>,
+    pub checkpoint_lsn_bytes: Option<u64>,
+    pub checkpoint_lag_bytes: Option<u64>,
     pub checkpoint_transaction_id: Option<String>,
     pub target_state: BTreeMap<String, String>,
     pub pending_transactions: usize,
@@ -608,7 +616,13 @@ mod tests {
             refresh_error: None,
             postgres_sources: vec![PostgresCdcDebugSourceState {
                 source: "pg_main".to_string(),
+                slot: Some("slot_main".to_string()),
                 schema_evolution_policy: "ignore_compatible".to_string(),
+                upstream_lsn: Some("0/16B6C80".to_string()),
+                upstream_lsn_bytes: Some(23_817_344),
+                durable_lsn: Some("0/16B6C50".to_string()),
+                durable_lsn_bytes: Some(23_817_296),
+                source_lag_bytes: Some(48),
                 latest_schema_evolution: Some(PostgresCdcSchemaEvolutionDebugState {
                     table: "orders".to_string(),
                     upstream_table: "public.orders".to_string(),
@@ -627,6 +641,8 @@ mod tests {
                 schema_evolution_policy: "ignore_compatible".to_string(),
                 target_kind: "kafka".to_string(),
                 checkpoint_position: Some("pg/0/16B6C50".to_string()),
+                checkpoint_lsn_bytes: Some(23_817_296),
+                checkpoint_lag_bytes: Some(48),
                 checkpoint_transaction_id: Some("pg-xid-77".to_string()),
                 target_state: BTreeMap::from([(
                     "target.delivery.status".to_string(),

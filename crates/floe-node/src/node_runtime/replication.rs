@@ -429,6 +429,7 @@ pub(super) struct ReplicationPipelineStatusSnapshot {
     schema_evolution_policy: String,
     target_kind: String,
     checkpoint_position: Option<CdcSourcePosition>,
+    checkpoint_lsn_bytes: Option<u64>,
     checkpoint_transaction_id: Option<CdcTransactionId>,
     target_state: std::collections::BTreeMap<String, String>,
     pending_transactions: usize,
@@ -460,6 +461,10 @@ impl ReplicationPipelineStatusSnapshot {
 
     pub(super) fn checkpoint_position(&self) -> Option<&CdcSourcePosition> {
         self.checkpoint_position.as_ref()
+    }
+
+    pub(super) fn checkpoint_lsn_bytes(&self) -> Option<u64> {
+        self.checkpoint_lsn_bytes
     }
 
     pub(super) fn checkpoint_transaction_id(&self) -> Option<&CdcTransactionId> {
@@ -830,21 +835,30 @@ impl ReplicationPipelineRuntime {
                     .with_context(|| {
                         format!("load replication pipeline '{}' checkpoint", plan.name)
                     })?;
-                let (checkpoint_position, checkpoint_transaction_id, target_state) = checkpoint
+                let (
+                    checkpoint_position,
+                    checkpoint_lsn_bytes,
+                    checkpoint_transaction_id,
+                    target_state,
+                ) = checkpoint
                     .map(|checkpoint| {
+                        let checkpoint_lsn_bytes =
+                            postgres_position_lsn_bytes(checkpoint.source_position());
                         (
                             Some(checkpoint.source_position().clone()),
+                            checkpoint_lsn_bytes,
                             checkpoint.transaction_id().cloned(),
                             checkpoint.target_state().clone(),
                         )
                     })
-                    .unwrap_or((None, None, std::collections::BTreeMap::new()));
+                    .unwrap_or((None, None, None, std::collections::BTreeMap::new()));
                 snapshots.push(ReplicationPipelineStatusSnapshot {
                     pipeline_name: plan.name.clone(),
                     source_name: plan.source_name.clone(),
                     schema_evolution_policy: plan.schema_evolution_policy.as_str().to_string(),
                     target_kind: target_kind(plan).to_string(),
                     checkpoint_position,
+                    checkpoint_lsn_bytes,
                     checkpoint_transaction_id,
                     target_state,
                     pending_transactions: stats.pending_transactions(),
@@ -877,6 +891,7 @@ impl ReplicationPipelineRuntime {
                 let mut next_state = cdc_replication_debug_state_from_snapshots(snapshots);
                 let mut state = shared.write().await;
                 next_state.postgres_sources = state.postgres_sources.clone();
+                enrich_pipeline_checkpoint_lag(&mut next_state);
                 *state = next_state;
                 Ok(())
             }
@@ -3782,6 +3797,8 @@ fn cdc_replication_debug_state_from_snapshots(
                 schema_evolution_policy: snapshot.schema_evolution_policy().to_string(),
                 target_kind: snapshot.target_kind().to_string(),
                 checkpoint_position: snapshot.checkpoint_position().map(source_position_key),
+                checkpoint_lsn_bytes: snapshot.checkpoint_lsn_bytes(),
+                checkpoint_lag_bytes: None,
                 checkpoint_transaction_id: snapshot
                     .checkpoint_transaction_id()
                     .map(|transaction_id| transaction_id.as_str().to_string()),
@@ -3796,6 +3813,32 @@ fn cdc_replication_debug_state_from_snapshots(
                 last_error: snapshot.last_error().map(str::to_string),
             })
             .collect(),
+    }
+}
+
+fn postgres_position_lsn_bytes(position: &CdcSourcePosition) -> Option<u64> {
+    let CdcSourcePosition::Postgres { commit_lsn, .. } = position else {
+        return None;
+    };
+    PostgresLsn::parse(commit_lsn).ok().map(|lsn| lsn.as_u64())
+}
+
+fn enrich_pipeline_checkpoint_lag(state: &mut http_ingest::CdcReplicationDebugState) {
+    let upstream_lsn_by_source = state
+        .postgres_sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .upstream_lsn_bytes
+                .map(|upstream_lsn| (source.source.as_str(), upstream_lsn))
+        })
+        .collect::<HashMap<_, _>>();
+    for pipeline in &mut state.pipelines {
+        pipeline.checkpoint_lag_bytes = pipeline.checkpoint_lsn_bytes.and_then(|checkpoint_lsn| {
+            upstream_lsn_by_source
+                .get(pipeline.source.as_str())
+                .map(|upstream_lsn| upstream_lsn.saturating_sub(checkpoint_lsn))
+        });
     }
 }
 
@@ -5223,6 +5266,8 @@ mod tests {
             snapshot.checkpoint_position(),
             Some(manifest.source_position())
         );
+        let checkpoint_lsn_bytes = PostgresLsn::parse("0/16B6C50").unwrap().as_u64();
+        assert_eq!(snapshot.checkpoint_lsn_bytes(), Some(checkpoint_lsn_bytes));
         assert_eq!(
             snapshot
                 .checkpoint_transaction_id()
@@ -5234,6 +5279,23 @@ mod tests {
         let debug_state = Arc::new(tokio::sync::RwLock::new(
             http_ingest::CdcReplicationDebugState::default(),
         ));
+        {
+            let mut state = debug_state.write().await;
+            state
+                .postgres_sources
+                .push(http_ingest::PostgresCdcDebugSourceState {
+                    source: "pg_main".to_string(),
+                    slot: Some("slot_main".to_string()),
+                    upstream_lsn: Some(
+                        PostgresLsn::from_u64(checkpoint_lsn_bytes + 48).to_pg_string(),
+                    ),
+                    upstream_lsn_bytes: Some(checkpoint_lsn_bytes + 48),
+                    durable_lsn: Some(PostgresLsn::from_u64(checkpoint_lsn_bytes).to_pg_string()),
+                    durable_lsn_bytes: Some(checkpoint_lsn_bytes),
+                    source_lag_bytes: Some(48),
+                    ..http_ingest::PostgresCdcDebugSourceState::default()
+                });
+        }
         runtime
             .refresh_debug_state(&storage, &debug_state)
             .await
@@ -5248,6 +5310,11 @@ mod tests {
             debug_pipeline.checkpoint_position.as_deref(),
             Some("pg/0/16B6C50")
         );
+        assert_eq!(
+            debug_pipeline.checkpoint_lsn_bytes,
+            Some(checkpoint_lsn_bytes)
+        );
+        assert_eq!(debug_pipeline.checkpoint_lag_bytes, Some(48));
         assert_eq!(
             debug_pipeline.checkpoint_transaction_id.as_deref(),
             Some("pg-xid-77")

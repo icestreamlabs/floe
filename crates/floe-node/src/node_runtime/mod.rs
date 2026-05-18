@@ -259,7 +259,7 @@ async fn initialize_postgres_cdc_debug_sources<'a>(
         .map(|plan| http_ingest::PostgresCdcDebugSourceState {
             source: plan.source_id.as_str().to_string(),
             schema_evolution_policy: plan.schema_evolution_policy.as_str().to_string(),
-            latest_schema_evolution: None,
+            ..http_ingest::PostgresCdcDebugSourceState::default()
         })
         .collect::<Vec<_>>();
     next_sources.sort_by(|left, right| left.source.cmp(&right.source));
@@ -273,6 +273,12 @@ async fn initialize_postgres_cdc_debug_sources<'a>(
             .find(|source| source.source == next_source.source)
         {
             next_source.latest_schema_evolution = existing_source.latest_schema_evolution.clone();
+            next_source.slot = existing_source.slot.clone();
+            next_source.upstream_lsn = existing_source.upstream_lsn.clone();
+            next_source.upstream_lsn_bytes = existing_source.upstream_lsn_bytes;
+            next_source.durable_lsn = existing_source.durable_lsn.clone();
+            next_source.durable_lsn_bytes = existing_source.durable_lsn_bytes;
+            next_source.source_lag_bytes = existing_source.source_lag_bytes;
         }
     }
     state.postgres_sources = next_sources;
@@ -313,7 +319,7 @@ async fn record_postgres_schema_evolution_observations(
                     .push(http_ingest::PostgresCdcDebugSourceState {
                         source: source_id.as_str().to_string(),
                         schema_evolution_policy: observation.policy().as_str().to_string(),
-                        latest_schema_evolution: None,
+                        ..http_ingest::PostgresCdcDebugSourceState::default()
                     });
                 state.postgres_sources.len() - 1
             }
@@ -332,6 +338,61 @@ async fn record_postgres_schema_evolution_observations(
         .postgres_sources
         .sort_by(|left, right| left.source.cmp(&right.source));
     state.updated_at_unix_ms = observed_at_unix_ms;
+}
+
+fn record_postgres_cdc_debug_lsn(
+    shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    source: &str,
+    slot: &str,
+    upstream_lsn: Option<u64>,
+    durable_lsn: Option<u64>,
+) {
+    let Ok(mut state) = shared.try_write() else {
+        return;
+    };
+    let source_idx = match state
+        .postgres_sources
+        .iter()
+        .position(|source_state| source_state.source == source)
+    {
+        Some(source_idx) => source_idx,
+        None => {
+            state
+                .postgres_sources
+                .push(http_ingest::PostgresCdcDebugSourceState {
+                    source: source.to_string(),
+                    slot: Some(slot.to_string()),
+                    ..http_ingest::PostgresCdcDebugSourceState::default()
+                });
+            state.postgres_sources.len() - 1
+        }
+    };
+    let source_state = state
+        .postgres_sources
+        .get_mut(source_idx)
+        .expect("Postgres CDC debug source index is valid");
+    source_state.slot = Some(slot.to_string());
+    if let Some(upstream_lsn) = upstream_lsn {
+        let upstream_lsn = source_state
+            .upstream_lsn_bytes
+            .unwrap_or(0)
+            .max(upstream_lsn);
+        source_state.upstream_lsn_bytes = Some(upstream_lsn);
+        source_state.upstream_lsn = Some(PostgresLsn::from_u64(upstream_lsn).to_pg_string());
+    }
+    if let Some(durable_lsn) = durable_lsn {
+        let durable_lsn = source_state.durable_lsn_bytes.unwrap_or(0).max(durable_lsn);
+        source_state.durable_lsn_bytes = Some(durable_lsn);
+        source_state.durable_lsn = Some(PostgresLsn::from_u64(durable_lsn).to_pg_string());
+    }
+    source_state.source_lag_bytes = match (
+        source_state.upstream_lsn_bytes,
+        source_state.durable_lsn_bytes,
+    ) {
+        (Some(upstream_lsn), Some(durable_lsn)) => Some(upstream_lsn.saturating_sub(durable_lsn)),
+        _ => None,
+    };
+    state.updated_at_unix_ms = current_unix_time_ms();
 }
 
 fn postgres_schema_evolution_debug_state(

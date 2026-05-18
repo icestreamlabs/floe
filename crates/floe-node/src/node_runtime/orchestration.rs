@@ -553,6 +553,13 @@ async fn run_native_postgres_cdc_connector(
             &slot,
             lsn.as_u64(),
         );
+        record_postgres_cdc_debug_lsn(
+            &cdc_replication_debug,
+            runtime_plan.source_id.as_str(),
+            &slot,
+            Some(lsn.as_u64()),
+            Some(lsn.as_u64()),
+        );
     }
     if let Some(wal_stream) = initial_snapshot.wal_stream {
         return forward_buffered_postgres_wal_stream(wal_stream, sender, cancel).await;
@@ -617,6 +624,13 @@ async fn run_native_postgres_cdc_connector(
                     runtime_plan.source_id.as_str(),
                     &slot,
                     frontier_lsn.as_u64(),
+                );
+                record_postgres_cdc_debug_lsn(
+                    &cdc_replication_debug,
+                    runtime_plan.source_id.as_str(),
+                    &slot,
+                    Some(frontier_lsn.as_u64()),
+                    None,
                 );
             }
             if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
@@ -2065,6 +2079,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut sink_checkpoint_rx_for_task = sink_checkpoint_rx;
     const MAX_SINK_CURSOR_UPDATES_PER_ITER: usize = 4096;
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
+    let cdc_replication_debug_for_task = Arc::clone(&cdc_replication_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
@@ -2406,6 +2421,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         for (slot, (lsn_value, _)) in &tick_postgres_lsns {
                             if let Some(source) = tick_postgres_sources.get(slot) {
                                 metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
+                                record_postgres_cdc_debug_lsn(
+                                    &cdc_replication_debug_for_task,
+                                    source,
+                                    slot,
+                                    None,
+                                    Some(*lsn_value),
+                                );
                             }
                         }
                         for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {
@@ -2954,6 +2976,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             for (slot, (lsn_value, _)) in &tick_postgres_lsns {
                 if let Some(source) = tick_postgres_sources.get(slot) {
                     metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
+                    record_postgres_cdc_debug_lsn(
+                        &cdc_replication_debug_for_task,
+                        source,
+                        slot,
+                        None,
+                        Some(*lsn_value),
+                    );
                 }
             }
             for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {

@@ -1191,6 +1191,13 @@ async fn buffer_postgres_wal_stream(
                     &slot,
                     frontier_lsn.as_u64(),
                 );
+                record_postgres_cdc_debug_lsn(
+                    &cdc_replication_debug,
+                    runtime_plan.source_id.as_str(),
+                    &slot,
+                    Some(frontier_lsn.as_u64()),
+                    None,
+                );
             }
             if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
                 break;
