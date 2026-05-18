@@ -11,9 +11,9 @@ use sqlparser::parser::Parser;
 use crate::definitions::{
     CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
     CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
-    PostgresCdcSourceOptions, ReplicationBufferMode, ReplicationBufferPolicy,
-    ReplicationPipelineDefinition, ReplicationPipelineFormat, ReplicationPipelineTarget,
-    SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
+    PostgresCdcSchemaEvolutionPolicy, PostgresCdcSourceOptions, ReplicationBufferMode,
+    ReplicationBufferPolicy, ReplicationPipelineDefinition, ReplicationPipelineFormat,
+    ReplicationPipelineTarget, SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
 };
 
 pub fn parse_floe_statement(sql: &str) -> Result<FloeStatement> {
@@ -90,17 +90,20 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
         .to_ascii_lowercase()
         .replace('-', "_");
     let connector = match connector.as_str() {
-        "postgres_cdc" => SourceConnector::PostgresCdc(PostgresCdcSourceOptions::new(
-            postgres_connection_string_from_options(&options)?,
-            option_any(&options, &["slot.name", "slot"])
-                .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires slot.name/slot"))?
-                .to_string(),
-            option_any(&options, &["publication.name", "publication"]).map(ToString::to_string),
-            options
-                .get("include_schema_in_source")
-                .map(|value| parse_bool_option("include_schema_in_source", value))
-                .transpose()?,
-        )?),
+        "postgres_cdc" => SourceConnector::PostgresCdc(
+            PostgresCdcSourceOptions::new_with_schema_evolution_policy(
+                postgres_connection_string_from_options(&options)?,
+                option_any(&options, &["slot.name", "slot"])
+                    .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires slot.name/slot"))?
+                    .to_string(),
+                option_any(&options, &["publication.name", "publication"]).map(ToString::to_string),
+                options
+                    .get("include_schema_in_source")
+                    .map(|value| parse_bool_option("include_schema_in_source", value))
+                    .transpose()?,
+                postgres_schema_evolution_policy_from_options(&options)?,
+            )?,
+        ),
         other => return Err(anyhow!("unsupported source connector type '{other}'")),
     };
 
@@ -744,6 +747,36 @@ fn postgres_connection_string_from_options(
         parts.push(format!("password={password}"));
     }
     Ok(parts.join(" "))
+}
+
+fn postgres_schema_evolution_policy_from_options(
+    options: &std::collections::HashMap<String, String>,
+) -> Result<PostgresCdcSchemaEvolutionPolicy> {
+    let Some(value) = option_any(
+        options,
+        &[
+            "schema.evolution",
+            "schema_evolution",
+            "schema.evolution.policy",
+            "schema_evolution_policy",
+        ],
+    ) else {
+        return Ok(PostgresCdcSchemaEvolutionPolicy::FailFast);
+    };
+
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "fail_fast" | "failfast" => Ok(PostgresCdcSchemaEvolutionPolicy::FailFast),
+        "ignore_compatible" | "project_compatible" => {
+            Ok(PostgresCdcSchemaEvolutionPolicy::IgnoreCompatible)
+        }
+        "apply_compatible_additions" | "apply_compatible" => {
+            Ok(PostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions)
+        }
+        other => Err(anyhow!(
+            "unsupported Postgres CDC schema evolution policy '{other}'; expected fail_fast, ignore_compatible, or apply_compatible_additions"
+        )),
+    }
 }
 
 fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {

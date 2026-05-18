@@ -30,6 +30,7 @@ fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
 pub(super) async fn postgres_cdc_runtime_plan(
     connector_name: &str,
     connection_string: &str,
+    schema_evolution_policy: PostgresSchemaEvolutionPolicy,
     include_tables: Option<&[String]>,
     registry: &SourceRegistry,
     source_tables: &HashMap<String, SourceBackedTableDefinition>,
@@ -164,6 +165,7 @@ pub(super) async fn postgres_cdc_runtime_plan(
             pipeline,
             schema,
             database_name.clone(),
+            schema_evolution_policy,
         )?);
     }
 
@@ -174,8 +176,25 @@ pub(super) async fn postgres_cdc_runtime_plan(
     Ok(Some(PostgresCdcRuntimePlan {
         source_id: CdcSourceId::new(connector_name)?,
         schemas,
+        schema_evolution_policy,
         replication_pipelines: pipeline_plans,
     }))
+}
+
+fn postgres_schema_evolution_policy_from_catalog(
+    policy: CatalogPostgresCdcSchemaEvolutionPolicy,
+) -> PostgresSchemaEvolutionPolicy {
+    match policy {
+        CatalogPostgresCdcSchemaEvolutionPolicy::FailFast => {
+            PostgresSchemaEvolutionPolicy::FailFast
+        }
+        CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible => {
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible
+        }
+        CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
+            PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions
+        }
+    }
 }
 
 fn replication_pipeline_schema_from_registry(
@@ -205,6 +224,7 @@ fn replication_pipeline_runtime_plan_from_catalog(
     pipeline: &CatalogReplicationPipelineDefinition,
     schema: CdcTableSchema,
     database_name: String,
+    schema_evolution_policy: PostgresSchemaEvolutionPolicy,
 ) -> anyhow::Result<ReplicationPipelineRuntimePlan> {
     let table_id = schema.table_id().clone();
     let target = match pipeline.target() {
@@ -228,6 +248,7 @@ fn replication_pipeline_runtime_plan_from_catalog(
         upstream_table: pipeline.upstream_table().to_string(),
         table_id,
         schema,
+        schema_evolution_policy,
         target,
         format: match pipeline.format() {
             CatalogReplicationPipelineFormat::FloeJson => {
@@ -478,6 +499,7 @@ pub(super) fn merge_catalog_source_connectors(
                     publication: postgres.publication().map(ToString::to_string),
                     include_tables: Some(include_tables),
                     include_schema_in_source: postgres.include_schema_in_source(),
+                    schema_evolution_policy: Some(postgres.schema_evolution_policy()),
                 }
             }
         };
@@ -568,7 +590,7 @@ async fn run_native_postgres_cdc_connector(
         runtime_plan.source_id.clone(),
         router,
         runtime_plan.schemas.clone(),
-        PostgresSchemaEvolutionPolicy::FailFast,
+        runtime_plan.schema_evolution_policy,
     );
     let mut last_committed_tick_id = 0_u64;
 
@@ -1533,15 +1555,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     for connector in &connector_specs {
         let ConnectorConfig::PostgresCdc {
             connection,
+            schema_evolution_policy,
             include_tables,
             ..
         } = &connector.config
         else {
             continue;
         };
+        let schema_evolution_policy = schema_evolution_policy
+            .as_ref()
+            .copied()
+            .unwrap_or(CatalogPostgresCdcSchemaEvolutionPolicy::FailFast);
         if let Some(plan) = postgres_cdc_runtime_plan(
             &connector.name,
             connection,
+            postgres_schema_evolution_policy_from_catalog(schema_evolution_policy),
             include_tables.as_deref(),
             &source_registry,
             &source_backed_tables,
@@ -1554,6 +1582,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 connector.name
             )
         })? {
+            metrics::record_postgres_cdc_schema_evolution_policy(
+                plan.source_id.as_str(),
+                plan.schema_evolution_policy.as_str(),
+            );
             postgres_cdc_runtime_plans_by_connector.insert(connector.name.clone(), plan);
         }
     }
@@ -1921,6 +1953,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         connector = %connector.name,
                         source = %runtime_plan.source_id.as_str(),
                         tables = runtime_plan.schemas.len(),
+                        schema_evolution_policy = ?runtime_plan.schema_evolution_policy,
                         "using native Postgres CDC table runtime"
                     );
                     let transaction_sender = cdc_transaction_sender.clone();

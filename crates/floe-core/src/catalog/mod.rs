@@ -128,6 +128,27 @@ pub struct PostgresCdcSourceDefinition {
     publication: Option<String>,
     #[serde(default)]
     include_schema_in_source: Option<bool>,
+    #[serde(default = "default_postgres_cdc_schema_evolution_policy")]
+    schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresCdcSchemaEvolutionPolicy {
+    #[default]
+    FailFast,
+    IgnoreCompatible,
+    ApplyCompatibleAdditions,
+}
+
+impl PostgresCdcSchemaEvolutionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FailFast => "fail_fast",
+            Self::IgnoreCompatible => "ignore_compatible",
+            Self::ApplyCompatibleAdditions => "apply_compatible_additions",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +211,10 @@ pub enum ReplicationBufferMode {
 
 fn default_replication_buffer_mode() -> ReplicationBufferMode {
     ReplicationBufferMode::Durable
+}
+
+fn default_postgres_cdc_schema_evolution_policy() -> PostgresCdcSchemaEvolutionPolicy {
+    PostgresCdcSchemaEvolutionPolicy::FailFast
 }
 
 impl<'de> Deserialize<'de> for TableDefinition {
@@ -303,6 +328,22 @@ impl PostgresCdcSourceDefinition {
         publication: Option<String>,
         include_schema_in_source: Option<bool>,
     ) -> Result<Self> {
+        Self::new_with_schema_evolution_policy(
+            connection,
+            slot,
+            publication,
+            include_schema_in_source,
+            PostgresCdcSchemaEvolutionPolicy::FailFast,
+        )
+    }
+
+    pub fn new_with_schema_evolution_policy(
+        connection: impl Into<String>,
+        slot: impl Into<String>,
+        publication: Option<String>,
+        include_schema_in_source: Option<bool>,
+        schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+    ) -> Result<Self> {
         let connection = connection.into();
         let slot = slot.into();
         ensure!(
@@ -318,6 +359,7 @@ impl PostgresCdcSourceDefinition {
             slot,
             publication,
             include_schema_in_source,
+            schema_evolution_policy,
         })
     }
 
@@ -335,6 +377,10 @@ impl PostgresCdcSourceDefinition {
 
     pub fn include_schema_in_source(&self) -> Option<bool> {
         self.include_schema_in_source
+    }
+
+    pub fn schema_evolution_policy(&self) -> PostgresCdcSchemaEvolutionPolicy {
+        self.schema_evolution_policy
     }
 }
 

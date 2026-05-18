@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::Deserialize;
 
+use floe_core::catalog::PostgresCdcSchemaEvolutionPolicy;
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME, PERSON_SOURCE_NAME};
 use floe_node_core::source::SourceRegistry;
 use floe_sql_parser::{MaterializedViewDefinition, SinkConnector, SinkDefinition};
@@ -221,6 +222,8 @@ pub enum ConnectorConfig {
         include_tables: Option<Vec<String>>,
         #[serde(default)]
         include_schema_in_source: Option<bool>,
+        #[serde(default)]
+        schema_evolution_policy: Option<PostgresCdcSchemaEvolutionPolicy>,
     },
 }
 

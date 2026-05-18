@@ -1,4 +1,5 @@
 use super::*;
+use floe_sql_parser::PostgresCdcSchemaEvolutionPolicy as SqlPostgresCdcSchemaEvolutionPolicy;
 
 pub(super) fn table_definition_from_sql(
     definition: &CreateTableDefinition,
@@ -30,16 +31,33 @@ pub(super) fn catalog_source_definition_from_sql(
     definition: &CreateSourceDefinition,
 ) -> anyhow::Result<CatalogSourceDefinition> {
     let connector = match definition.connector() {
-        SourceConnector::PostgresCdc(options) => {
-            CatalogSourceConnector::PostgresCdc(PostgresCdcSourceDefinition::new(
+        SourceConnector::PostgresCdc(options) => CatalogSourceConnector::PostgresCdc(
+            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
                 options.connection(),
                 options.slot(),
                 options.publication().map(ToString::to_string),
                 options.include_schema_in_source(),
-            )?)
-        }
+                catalog_postgres_schema_evolution_policy(options.schema_evolution_policy()),
+            )?,
+        ),
     };
     CatalogSourceDefinition::new(definition.name(), connector)
+}
+
+fn catalog_postgres_schema_evolution_policy(
+    policy: SqlPostgresCdcSchemaEvolutionPolicy,
+) -> CatalogPostgresCdcSchemaEvolutionPolicy {
+    match policy {
+        SqlPostgresCdcSchemaEvolutionPolicy::FailFast => {
+            CatalogPostgresCdcSchemaEvolutionPolicy::FailFast
+        }
+        SqlPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible => {
+            CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible
+        }
+        SqlPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
+            CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions
+        }
+    }
 }
 
 pub(super) fn source_backed_table_definition_from_sql(

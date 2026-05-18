@@ -198,6 +198,15 @@ static POSTGRES_CDC_TABLE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register floe_postgres_cdc_table_lag_bytes")
 });
 
+static POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_schema_evolution_policy",
+        "Configured Postgres CDC schema evolution policy per source; the active policy label is set to 1",
+        &["source", "policy"]
+    )
+    .expect("register floe_postgres_cdc_schema_evolution_policy")
+});
+
 static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_transactions",
@@ -483,6 +492,18 @@ pub(crate) fn record_postgres_cdc_table_applied_lsn(
     }
 }
 
+pub(crate) fn record_postgres_cdc_schema_evolution_policy(source: &str, active_policy: &str) {
+    for policy in [
+        "fail_fast",
+        "ignore_compatible",
+        "apply_compatible_additions",
+    ] {
+        POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY
+            .with_label_values(&[source, policy])
+            .set(i64::from(policy == active_policy));
+    }
+}
+
 pub(crate) fn record_cdc_buffer_pending(
     pipeline: &str,
     transactions: usize,
@@ -569,6 +590,7 @@ pub(crate) fn init() {
     let _ = &*POSTGRES_CDC_SOURCE_LAG_BYTES;
     let _ = &*POSTGRES_CDC_TABLE_LAST_APPLIED_LSN;
     let _ = &*POSTGRES_CDC_TABLE_LAG_BYTES;
+    let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY;
     let _ = &*CDC_BUFFER_PENDING_TRANSACTIONS;
     let _ = &*CDC_BUFFER_PENDING_OBJECTS;
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
@@ -611,6 +633,7 @@ mod tests {
         record_postgres_cdc_upstream_lsn(source, slot, 150);
         record_postgres_cdc_durable_lsn(source, slot, 100);
         record_postgres_cdc_table_applied_lsn(source, slot, table, 90);
+        record_postgres_cdc_schema_evolution_policy(source, "ignore_compatible");
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -624,6 +647,12 @@ mod tests {
         ));
         assert!(body.contains(
             "floe_postgres_cdc_table_lag_bytes{slot=\"slot_metrics_test\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 60"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_schema_evolution_policy{policy=\"ignore_compatible\",source=\"pg_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_schema_evolution_policy{policy=\"fail_fast\",source=\"pg_metrics_test\"} 0"
         ));
     }
 

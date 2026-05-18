@@ -650,7 +650,7 @@ async fn buffer_postgres_wal_stream(
         runtime_plan.source_id.clone(),
         router,
         runtime_plan.schemas.clone(),
-        PostgresSchemaEvolutionPolicy::FailFast,
+        runtime_plan.schema_evolution_policy,
     );
     let mut feedback_released = false;
     let mut last_committed_tick_id = 0_u64;
@@ -2013,6 +2013,7 @@ mod tests {
         let runtime_plan = PostgresCdcRuntimePlan {
             source_id: source_id.clone(),
             schemas: HashMap::new(),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             replication_pipelines: Vec::new(),
         };
         let lsn = PostgresLsn::from_u64(120);

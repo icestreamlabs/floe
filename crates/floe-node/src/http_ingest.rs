@@ -71,6 +71,7 @@ pub struct CdcReplicationDebugState {
 pub struct CdcReplicationDebugPipelineState {
     pub pipeline: String,
     pub source: String,
+    pub schema_evolution_policy: String,
     pub target_kind: String,
     pub checkpoint_position: Option<String>,
     pub checkpoint_transaction_id: Option<String>,
@@ -587,6 +588,7 @@ mod tests {
             pipelines: vec![CdcReplicationDebugPipelineState {
                 pipeline: "orders_pipe".to_string(),
                 source: "pg_main".to_string(),
+                schema_evolution_policy: "ignore_compatible".to_string(),
                 target_kind: "kafka".to_string(),
                 checkpoint_position: Some("pg/0/16B6C50".to_string()),
                 checkpoint_transaction_id: Some("pg-xid-77".to_string()),

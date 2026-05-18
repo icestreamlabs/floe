@@ -62,6 +62,14 @@ pub struct PostgresCdcSourceOptions {
     slot: String,
     publication: Option<String>,
     include_schema_in_source: Option<bool>,
+    schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresCdcSchemaEvolutionPolicy {
+    FailFast,
+    IgnoreCompatible,
+    ApplyCompatibleAdditions,
 }
 
 impl CreateTableDefinition {
@@ -189,6 +197,22 @@ impl PostgresCdcSourceOptions {
         publication: Option<String>,
         include_schema_in_source: Option<bool>,
     ) -> Result<Self> {
+        Self::new_with_schema_evolution_policy(
+            connection,
+            slot,
+            publication,
+            include_schema_in_source,
+            PostgresCdcSchemaEvolutionPolicy::FailFast,
+        )
+    }
+
+    pub fn new_with_schema_evolution_policy(
+        connection: impl Into<String>,
+        slot: impl Into<String>,
+        publication: Option<String>,
+        include_schema_in_source: Option<bool>,
+        schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+    ) -> Result<Self> {
         let connection = connection.into();
         let slot = slot.into();
         if connection.trim().is_empty() {
@@ -202,6 +226,7 @@ impl PostgresCdcSourceOptions {
             slot,
             publication,
             include_schema_in_source,
+            schema_evolution_policy,
         })
     }
 
@@ -219,6 +244,10 @@ impl PostgresCdcSourceOptions {
 
     pub fn include_schema_in_source(&self) -> Option<bool> {
         self.include_schema_in_source
+    }
+
+    pub fn schema_evolution_policy(&self) -> PostgresCdcSchemaEvolutionPolicy {
+        self.schema_evolution_policy
     }
 }
 

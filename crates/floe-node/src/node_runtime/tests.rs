@@ -630,7 +630,8 @@ fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
             connector = 'postgres-cdc',
             connection = 'postgres://postgres:postgres@localhost/postgres',
             slot.name = 'floe_slot',
-            publication.name = 'floe_pub'
+            publication.name = 'floe_pub',
+            schema.evolution = 'apply-compatible-additions'
         )",
     )
     .expect("parse create source");
@@ -646,6 +647,10 @@ fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
     );
     assert_eq!(postgres.slot(), "floe_slot");
     assert_eq!(postgres.publication(), Some("floe_pub"));
+    assert_eq!(
+        postgres.schema_evolution_policy(),
+        CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions
+    );
 }
 
 #[test]
@@ -653,11 +658,12 @@ fn materialized_view_validation_rejects_raw_cdc_source_references() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new(
+            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
+                CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
             )
             .expect("postgres source"),
         ),
@@ -686,11 +692,12 @@ fn materialized_view_validation_accepts_cdc_table_references() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new(
+            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
+                CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
             )
             .expect("postgres source"),
         ),
@@ -767,11 +774,12 @@ fn catalog_postgres_source_connector_merges_include_tables() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new(
+            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
+                CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
             )
             .expect("postgres source"),
         ),
@@ -799,6 +807,7 @@ fn catalog_postgres_source_connector_merges_include_tables() {
         publication,
         include_tables,
         include_schema_in_source,
+        schema_evolution_policy,
         ..
     } = &connector_specs[0].config
     else {
@@ -815,6 +824,10 @@ fn catalog_postgres_source_connector_merges_include_tables() {
         Some(&["public.orders".to_string()][..])
     );
     assert_eq!(include_schema_in_source.as_ref().copied(), Some(false));
+    assert_eq!(
+        schema_evolution_policy.as_ref().copied(),
+        Some(CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible)
+    );
 }
 
 #[test]
@@ -888,6 +901,7 @@ async fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     let plan = postgres_cdc_runtime_plan(
         "pg_main",
         "postgres://postgres:postgres@localhost/postgres",
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
         Some(&include_tables),
         &registry,
         &HashMap::new(),
@@ -907,6 +921,10 @@ async fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     assert_eq!(schema.primary_key().columns(), &["id".to_string()]);
     assert_eq!(schema.columns().len(), 3);
     assert!(!schema.columns()[0].nullable());
+    assert_eq!(
+        plan.schema_evolution_policy,
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible
+    );
 }
 
 #[tokio::test]
@@ -942,6 +960,7 @@ async fn postgres_cdc_runtime_plan_accepts_postgres_replication_target() {
     let plan = postgres_cdc_runtime_plan(
         "pg_main",
         "postgres://postgres:postgres@localhost/postgres",
+        PostgresSchemaEvolutionPolicy::FailFast,
         Some(&include_tables),
         &registry,
         &HashMap::new(),
@@ -994,6 +1013,7 @@ async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
     let plan = postgres_cdc_runtime_plan(
         "pg_main",
         "postgres://postgres:postgres@localhost/postgres",
+        PostgresSchemaEvolutionPolicy::FailFast,
         Some(&include_tables),
         &registry,
         &HashMap::new(),
@@ -1031,6 +1051,7 @@ async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
     let plan = postgres_cdc_runtime_plan(
         "pg_main",
         "postgres://postgres:postgres@localhost/postgres",
+        PostgresSchemaEvolutionPolicy::FailFast,
         Some(&include_tables),
         &registry,
         &HashMap::new(),

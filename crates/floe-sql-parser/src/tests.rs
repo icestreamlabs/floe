@@ -101,7 +101,8 @@ fn parse_create_postgres_cdc_source_statement() {
             connection = 'postgres://postgres:postgres@localhost/postgres',
             slot.name = 'floe_slot',
             publication.name = 'floe_pub',
-            include_schema_in_source = true
+            include_schema_in_source = true,
+            schema.evolution = 'ignore-compatible'
         )",
     )
     .expect("parse source");
@@ -111,11 +112,12 @@ fn parse_create_postgres_cdc_source_statement() {
             assert_eq!(
                 definition.connector(),
                 &SourceConnector::PostgresCdc(
-                    PostgresCdcSourceOptions::new(
+                    PostgresCdcSourceOptions::new_with_schema_evolution_policy(
                         "postgres://postgres:postgres@localhost/postgres",
                         "floe_slot",
                         Some("floe_pub".to_string()),
                         Some(true),
+                        PostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
                     )
                     .expect("options")
                 )

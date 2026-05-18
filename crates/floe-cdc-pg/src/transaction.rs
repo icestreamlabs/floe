@@ -21,6 +21,16 @@ pub enum PostgresSchemaEvolutionPolicy {
     ApplyCompatibleAdditions,
 }
 
+impl PostgresSchemaEvolutionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FailFast => "fail_fast",
+            Self::IgnoreCompatible => "ignore_compatible",
+            Self::ApplyCompatibleAdditions => "apply_compatible_additions",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PostgresTableRouter {
     by_upstream_table: HashMap<UpstreamTableRef, CdcTableId>,

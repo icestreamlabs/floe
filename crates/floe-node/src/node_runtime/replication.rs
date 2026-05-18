@@ -426,6 +426,7 @@ pub(super) struct ReplicationPipelineRuntime {
 pub(super) struct ReplicationPipelineStatusSnapshot {
     pipeline_name: String,
     source_name: String,
+    schema_evolution_policy: String,
     target_kind: String,
     checkpoint_position: Option<CdcSourcePosition>,
     checkpoint_transaction_id: Option<CdcTransactionId>,
@@ -447,6 +448,10 @@ impl ReplicationPipelineStatusSnapshot {
 
     pub(super) fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    pub(super) fn schema_evolution_policy(&self) -> &str {
+        &self.schema_evolution_policy
     }
 
     pub(super) fn target_kind(&self) -> &str {
@@ -837,6 +842,7 @@ impl ReplicationPipelineRuntime {
                 snapshots.push(ReplicationPipelineStatusSnapshot {
                     pipeline_name: plan.name.clone(),
                     source_name: plan.source_name.clone(),
+                    schema_evolution_policy: plan.schema_evolution_policy.as_str().to_string(),
                     target_kind: target_kind(plan).to_string(),
                     checkpoint_position,
                     checkpoint_transaction_id,
@@ -3769,6 +3775,7 @@ fn cdc_replication_debug_state_from_snapshots(
             .map(|snapshot| http_ingest::CdcReplicationDebugPipelineState {
                 pipeline: snapshot.pipeline_name().to_string(),
                 source: snapshot.source_name().to_string(),
+                schema_evolution_policy: snapshot.schema_evolution_policy().to_string(),
                 target_kind: snapshot.target_kind().to_string(),
                 checkpoint_position: snapshot.checkpoint_position().map(source_position_key),
                 checkpoint_transaction_id: snapshot
@@ -4493,6 +4500,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -4538,6 +4546,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -4591,6 +4600,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -4733,6 +4743,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -4793,6 +4804,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -4851,6 +4863,7 @@ mod tests {
             upstream_table: "public.orders".to_string(),
             table_id: CdcTableId::new("orders").unwrap(),
             schema: schema(CdcTableId::new("orders").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: "orders".to_string(),
@@ -5725,6 +5738,7 @@ mod tests {
             upstream_table: upstream_table.to_string(),
             table_id: table_id.clone(),
             schema: schema_for_table(table_id, upstream_table.strip_prefix("public.").unwrap()),
+            schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
             target: ReplicationPipelineRuntimeTarget::Kafka {
                 brokers: "localhost:9092".to_string(),
                 topic: upstream_table.to_string(),

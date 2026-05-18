@@ -327,6 +327,7 @@ impl ConnectorSpec {
                 publication,
                 include_tables,
                 include_schema_in_source,
+                schema_evolution_policy,
                 ..
             } => {
                 let mut props = vec![("slot".to_string(), slot.clone())];
@@ -340,6 +341,12 @@ impl ConnectorSpec {
                     props.push((
                         "include_schema_in_source".to_string(),
                         include_schema_in_source.to_string(),
+                    ));
+                }
+                if let Some(schema_evolution_policy) = schema_evolution_policy {
+                    props.push((
+                        "schema_evolution_policy".to_string(),
+                        schema_evolution_policy.as_str().to_string(),
                     ));
                 }
                 props

@@ -25,6 +25,7 @@ use floe_cdc_pg::{
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
+    PostgresCdcSchemaEvolutionPolicy as CatalogPostgresCdcSchemaEvolutionPolicy,
     PostgresCdcSourceDefinition, ReplicationBufferMode as CatalogReplicationBufferMode,
     ReplicationBufferPolicy as CatalogReplicationBufferPolicy,
     ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
@@ -175,6 +176,7 @@ struct ReplicationPipelineRuntimePlan {
     upstream_table: String,
     table_id: CdcTableId,
     schema: CdcTableSchema,
+    schema_evolution_policy: PostgresSchemaEvolutionPolicy,
     target: ReplicationPipelineRuntimeTarget,
     format: ReplicationPipelineRuntimeFormat,
     buffer_mode: ReplicationPipelineRuntimeBufferMode,
@@ -206,6 +208,7 @@ enum ReplicationPipelineRuntimeBufferMode {
 struct PostgresCdcRuntimePlan {
     source_id: CdcSourceId,
     schemas: HashMap<CdcTableId, CdcTableSchema>,
+    schema_evolution_policy: PostgresSchemaEvolutionPolicy,
     replication_pipelines: Vec<ReplicationPipelineRuntimePlan>,
 }
 
