@@ -874,7 +874,10 @@ impl ReplicationPipelineRuntime {
     ) -> anyhow::Result<()> {
         match self.status_snapshots(storage).await {
             Ok(snapshots) => {
-                *shared.write().await = cdc_replication_debug_state_from_snapshots(snapshots);
+                let mut next_state = cdc_replication_debug_state_from_snapshots(snapshots);
+                let mut state = shared.write().await;
+                next_state.postgres_sources = state.postgres_sources.clone();
+                *state = next_state;
                 Ok(())
             }
             Err(err) => {
@@ -3770,6 +3773,7 @@ fn cdc_replication_debug_state_from_snapshots(
     http_ingest::CdcReplicationDebugState {
         updated_at_unix_ms: current_unix_time_ms(),
         refresh_error: None,
+        postgres_sources: Vec::new(),
         pipelines: snapshots
             .into_iter()
             .map(|snapshot| http_ingest::CdcReplicationDebugPipelineState {

@@ -516,6 +516,7 @@ async fn run_native_postgres_cdc_connector(
     mut config: PostgresCdcConnectorConfig,
     runtime_plan: PostgresCdcRuntimePlan,
     table_store: CdcTableStore,
+    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -536,6 +537,7 @@ async fn run_native_postgres_cdc_connector(
         &runtime_plan,
         &table_store,
         &sender,
+        &cdc_replication_debug,
         config.commit_lsn_rx.as_mut(),
         &cancel,
     )
@@ -620,7 +622,33 @@ async fn run_native_postgres_cdc_connector(
             if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
                 break;
             }
-            let Some(transaction) = assembler.accept_event(event)? else {
+            let transaction = match assembler.accept_event(event) {
+                Ok(transaction) => {
+                    let observations = assembler.drain_schema_evolution_observations();
+                    if !observations.is_empty() {
+                        record_postgres_schema_evolution_observations(
+                            &cdc_replication_debug,
+                            &runtime_plan.source_id,
+                            observations,
+                        )
+                        .await;
+                    }
+                    transaction
+                }
+                Err(err) => {
+                    let observations = assembler.drain_schema_evolution_observations();
+                    if !observations.is_empty() {
+                        record_postgres_schema_evolution_observations(
+                            &cdc_replication_debug,
+                            &runtime_plan.source_id,
+                            observations,
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
+            let Some(transaction) = transaction else {
                 continue;
             };
             tracing::debug!(
@@ -1589,6 +1617,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             postgres_cdc_runtime_plans_by_connector.insert(connector.name.clone(), plan);
         }
     }
+    initialize_postgres_cdc_debug_sources(
+        &cdc_replication_debug,
+        postgres_cdc_runtime_plans_by_connector.values(),
+    )
+    .await;
     let replication_pipeline_runtime = Arc::new(ReplicationPipelineRuntime::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
@@ -1958,11 +1991,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     );
                     let transaction_sender = cdc_transaction_sender.clone();
                     let table_store = cdc_table_store.clone();
+                    let cdc_replication_debug = Arc::clone(&cdc_replication_debug);
                     connector_handles.push(tokio::spawn(async move {
                         if let Err(err) = run_native_postgres_cdc_connector(
                             config,
                             runtime_plan,
                             table_store,
+                            cdc_replication_debug,
                             transaction_sender,
                             cancel.clone(),
                         )

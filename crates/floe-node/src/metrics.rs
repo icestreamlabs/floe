@@ -207,6 +207,26 @@ static POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY: LazyLock<IntGaugeVec> = LazyLock::n
     .expect("register floe_postgres_cdc_schema_evolution_policy")
 });
 
+static POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_postgres_cdc_schema_evolution_events_total",
+        "Observed Postgres CDC schema evolution events by source, table, outcome, and policy",
+        &["source", "table", "outcome", "policy"]
+    )
+    .expect("register floe_postgres_cdc_schema_evolution_events_total")
+});
+
+static POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS: LazyLock<IntGaugeVec> = LazyLock::new(
+    || {
+        register_int_gauge_vec!(
+            "floe_postgres_cdc_schema_evolution_last_observed_unix_ms",
+            "Unix timestamp in milliseconds for the latest observed Postgres CDC schema evolution event",
+            &["source", "table", "outcome", "policy"]
+        )
+        .expect("register floe_postgres_cdc_schema_evolution_last_observed_unix_ms")
+    },
+);
+
 static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_transactions",
@@ -504,6 +524,21 @@ pub(crate) fn record_postgres_cdc_schema_evolution_policy(source: &str, active_p
     }
 }
 
+pub(crate) fn record_postgres_cdc_schema_evolution_observation(
+    source: &str,
+    table: &str,
+    outcome: &str,
+    policy: &str,
+    observed_at_unix_ms: u64,
+) {
+    POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL
+        .with_label_values(&[source, table, outcome, policy])
+        .inc();
+    POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS
+        .with_label_values(&[source, table, outcome, policy])
+        .set(i64_from_u64(observed_at_unix_ms));
+}
+
 pub(crate) fn record_cdc_buffer_pending(
     pipeline: &str,
     transactions: usize,
@@ -591,6 +626,8 @@ pub(crate) fn init() {
     let _ = &*POSTGRES_CDC_TABLE_LAST_APPLIED_LSN;
     let _ = &*POSTGRES_CDC_TABLE_LAG_BYTES;
     let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY;
+    let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL;
+    let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS;
     let _ = &*CDC_BUFFER_PENDING_TRANSACTIONS;
     let _ = &*CDC_BUFFER_PENDING_OBJECTS;
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
@@ -634,6 +671,13 @@ mod tests {
         record_postgres_cdc_durable_lsn(source, slot, 100);
         record_postgres_cdc_table_applied_lsn(source, slot, table, 90);
         record_postgres_cdc_schema_evolution_policy(source, "ignore_compatible");
+        record_postgres_cdc_schema_evolution_observation(
+            source,
+            table,
+            "compatible_addition",
+            "ignore_compatible",
+            123_456,
+        );
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -653,6 +697,12 @@ mod tests {
         ));
         assert!(body.contains(
             "floe_postgres_cdc_schema_evolution_policy{policy=\"fail_fast\",source=\"pg_metrics_test\"} 0"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_schema_evolution_events_total{outcome=\"compatible_addition\",policy=\"ignore_compatible\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_schema_evolution_last_observed_unix_ms{outcome=\"compatible_addition\",policy=\"ignore_compatible\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 123456"
         ));
     }
 

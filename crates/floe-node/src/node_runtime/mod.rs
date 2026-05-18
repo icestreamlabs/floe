@@ -20,8 +20,9 @@ use floe_cdc_core::{
 };
 use floe_cdc_pg::{
     PostgresCdcConfig, PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,
-    PostgresSchemaEvolutionPolicy, PostgresTableRouter, PostgresTransactionAssembler,
-    config_with_stored_cdc_checkpoint, create_pgoutput_slot_with_exported_snapshot,
+    PostgresSchemaEvolutionObservation, PostgresSchemaEvolutionPolicy, PostgresTableRouter,
+    PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
+    create_pgoutput_slot_with_exported_snapshot,
 };
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
@@ -248,3 +249,108 @@ pub(crate) use orchestration::run;
 use replication::*;
 use shutdown::*;
 use startup::*;
+
+async fn initialize_postgres_cdc_debug_sources<'a>(
+    shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    plans: impl IntoIterator<Item = &'a PostgresCdcRuntimePlan>,
+) {
+    let mut next_sources = plans
+        .into_iter()
+        .map(|plan| http_ingest::PostgresCdcDebugSourceState {
+            source: plan.source_id.as_str().to_string(),
+            schema_evolution_policy: plan.schema_evolution_policy.as_str().to_string(),
+            latest_schema_evolution: None,
+        })
+        .collect::<Vec<_>>();
+    next_sources.sort_by(|left, right| left.source.cmp(&right.source));
+    next_sources.dedup_by(|left, right| left.source == right.source);
+
+    let mut state = shared.write().await;
+    for next_source in &mut next_sources {
+        if let Some(existing_source) = state
+            .postgres_sources
+            .iter()
+            .find(|source| source.source == next_source.source)
+        {
+            next_source.latest_schema_evolution = existing_source.latest_schema_evolution.clone();
+        }
+    }
+    state.postgres_sources = next_sources;
+    state.updated_at_unix_ms = current_unix_time_ms();
+}
+
+async fn record_postgres_schema_evolution_observations(
+    shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    source_id: &CdcSourceId,
+    observations: Vec<PostgresSchemaEvolutionObservation>,
+) {
+    if observations.is_empty() {
+        return;
+    }
+
+    let observed_at_unix_ms = current_unix_time_ms();
+    for observation in &observations {
+        metrics::record_postgres_cdc_schema_evolution_observation(
+            source_id.as_str(),
+            observation.table_id().as_str(),
+            observation.outcome().as_str(),
+            observation.policy().as_str(),
+            observed_at_unix_ms,
+        );
+    }
+
+    let mut state = shared.write().await;
+    for observation in observations {
+        let source_idx = match state
+            .postgres_sources
+            .iter()
+            .position(|source| source.source == source_id.as_str())
+        {
+            Some(source_idx) => source_idx,
+            None => {
+                state
+                    .postgres_sources
+                    .push(http_ingest::PostgresCdcDebugSourceState {
+                        source: source_id.as_str().to_string(),
+                        schema_evolution_policy: observation.policy().as_str().to_string(),
+                        latest_schema_evolution: None,
+                    });
+                state.postgres_sources.len() - 1
+            }
+        };
+        let source_state = state
+            .postgres_sources
+            .get_mut(source_idx)
+            .expect("Postgres CDC debug source index is valid");
+        source_state.schema_evolution_policy = observation.policy().as_str().to_string();
+        source_state.latest_schema_evolution = Some(postgres_schema_evolution_debug_state(
+            &observation,
+            observed_at_unix_ms,
+        ));
+    }
+    state
+        .postgres_sources
+        .sort_by(|left, right| left.source.cmp(&right.source));
+    state.updated_at_unix_ms = observed_at_unix_ms;
+}
+
+fn postgres_schema_evolution_debug_state(
+    observation: &PostgresSchemaEvolutionObservation,
+    observed_at_unix_ms: u64,
+) -> http_ingest::PostgresCdcSchemaEvolutionDebugState {
+    http_ingest::PostgresCdcSchemaEvolutionDebugState {
+        table: observation.table_id().as_str().to_string(),
+        upstream_table: format!(
+            "{}.{}",
+            observation.upstream_table().schema(),
+            observation.upstream_table().table()
+        ),
+        policy: observation.policy().as_str().to_string(),
+        outcome: observation.outcome().as_str().to_string(),
+        added_columns: observation.added_columns().to_vec(),
+        reason: observation.reason().map(str::to_string),
+        catalog_schema_version: observation.catalog_schema_version(),
+        observed_schema_version: observation.observed_schema_version(),
+        observed_at_unix_ms,
+    }
+}

@@ -31,6 +31,92 @@ impl PostgresSchemaEvolutionPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresSchemaEvolutionOutcome {
+    CompatibleAddition,
+    RejectedCompatibleAddition,
+    Incompatible,
+}
+
+impl PostgresSchemaEvolutionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompatibleAddition => "compatible_addition",
+            Self::RejectedCompatibleAddition => "rejected_compatible_addition",
+            Self::Incompatible => "incompatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresSchemaEvolutionObservation {
+    table_id: CdcTableId,
+    upstream_table: UpstreamTableRef,
+    policy: PostgresSchemaEvolutionPolicy,
+    outcome: PostgresSchemaEvolutionOutcome,
+    added_columns: Vec<String>,
+    reason: Option<String>,
+    catalog_schema_version: u64,
+    observed_schema_version: u64,
+}
+
+impl PostgresSchemaEvolutionObservation {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        table_id: CdcTableId,
+        upstream_table: UpstreamTableRef,
+        policy: PostgresSchemaEvolutionPolicy,
+        outcome: PostgresSchemaEvolutionOutcome,
+        added_columns: Vec<String>,
+        reason: Option<String>,
+        catalog_schema_version: u64,
+        observed_schema_version: u64,
+    ) -> Self {
+        Self {
+            table_id,
+            upstream_table,
+            policy,
+            outcome,
+            added_columns,
+            reason,
+            catalog_schema_version,
+            observed_schema_version,
+        }
+    }
+
+    pub fn table_id(&self) -> &CdcTableId {
+        &self.table_id
+    }
+
+    pub fn upstream_table(&self) -> &UpstreamTableRef {
+        &self.upstream_table
+    }
+
+    pub fn policy(&self) -> PostgresSchemaEvolutionPolicy {
+        self.policy
+    }
+
+    pub fn outcome(&self) -> PostgresSchemaEvolutionOutcome {
+        self.outcome
+    }
+
+    pub fn added_columns(&self) -> &[String] {
+        &self.added_columns
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    pub fn catalog_schema_version(&self) -> u64 {
+        self.catalog_schema_version
+    }
+
+    pub fn observed_schema_version(&self) -> u64 {
+        self.observed_schema_version
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PostgresTableRouter {
     by_upstream_table: HashMap<UpstreamTableRef, CdcTableId>,
@@ -66,6 +152,7 @@ pub struct PostgresTransactionAssembler {
     schemas: HashMap<CdcTableId, CdcTableSchema>,
     schema_policy: PostgresSchemaEvolutionPolicy,
     schema_versions: CdcSchemaVersionMap,
+    schema_observations: Vec<PostgresSchemaEvolutionObservation>,
 }
 
 impl PostgresTransactionAssembler {
@@ -78,6 +165,7 @@ impl PostgresTransactionAssembler {
             schemas: HashMap::new(),
             schema_policy: PostgresSchemaEvolutionPolicy::FailFast,
             schema_versions: CdcSchemaVersionMap::new(),
+            schema_observations: Vec::new(),
         }
     }
 
@@ -96,6 +184,7 @@ impl PostgresTransactionAssembler {
             schemas,
             schema_policy,
             schema_versions,
+            schema_observations: Vec::new(),
         }
     }
 
@@ -121,6 +210,12 @@ impl PostgresTransactionAssembler {
 
     pub fn decoder(&self) -> &PgOutputDecoder {
         &self.decoder
+    }
+
+    pub fn drain_schema_evolution_observations(
+        &mut self,
+    ) -> Vec<PostgresSchemaEvolutionObservation> {
+        self.schema_observations.drain(..).collect()
     }
 
     pub fn reset_stream_state(&mut self) {
@@ -178,16 +273,33 @@ impl PostgresTransactionAssembler {
             return Ok(());
         };
         let observed_schema = relation.to_cdc_schema(table_id.clone())?;
+        let catalog_schema_version = catalog_schema.stable_fingerprint();
+        let observed_schema_version = observed_schema.stable_fingerprint();
+        let catalog_column_count = catalog_schema.columns().len();
+        let observed_column_count = observed_schema.columns().len();
         match classify_schema_evolution(catalog_schema, &observed_schema) {
             SchemaEvolution::Unchanged => {
-                self.schema_versions.insert(
-                    table_id.as_str().to_string(),
-                    catalog_schema.stable_fingerprint(),
-                );
+                self.schema_versions
+                    .insert(table_id.as_str().to_string(), catalog_schema_version);
                 Ok(())
             }
             SchemaEvolution::CompatibleAddition { added_columns } => match self.schema_policy {
                 PostgresSchemaEvolutionPolicy::FailFast => {
+                    self.record_schema_evolution_observation(
+                        PostgresSchemaEvolutionObservation::new(
+                            table_id.clone(),
+                            upstream_table.clone(),
+                            self.schema_policy,
+                            PostgresSchemaEvolutionOutcome::RejectedCompatibleAddition,
+                            added_columns.clone(),
+                            Some(
+                                "compatible column additions rejected by fail-fast policy"
+                                    .to_string(),
+                            ),
+                            catalog_schema_version,
+                            observed_schema_version,
+                        ),
+                    );
                     tracing::warn!(
                         source = %self.source_id.as_str(),
                         table = %table_id.as_str(),
@@ -195,8 +307,8 @@ impl PostgresTransactionAssembler {
                         policy = ?self.schema_policy,
                         added_column_count = added_columns.len(),
                         added_columns = ?added_columns,
-                        catalog_schema_version = catalog_schema.stable_fingerprint(),
-                        observed_schema_version = observed_schema.stable_fingerprint(),
+                        catalog_schema_version,
+                        observed_schema_version,
                         "Postgres CDC relation schema has compatible additions but fail-fast policy rejects schema evolution"
                     );
                     bail!(
@@ -206,6 +318,18 @@ impl PostgresTransactionAssembler {
                 }
                 PostgresSchemaEvolutionPolicy::IgnoreCompatible
                 | PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
+                    self.record_schema_evolution_observation(
+                        PostgresSchemaEvolutionObservation::new(
+                            table_id.clone(),
+                            upstream_table.clone(),
+                            self.schema_policy,
+                            PostgresSchemaEvolutionOutcome::CompatibleAddition,
+                            added_columns.clone(),
+                            None,
+                            catalog_schema_version,
+                            observed_schema_version,
+                        ),
+                    );
                     tracing::info!(
                         source = %self.source_id.as_str(),
                         table = %table_id.as_str(),
@@ -213,28 +337,36 @@ impl PostgresTransactionAssembler {
                         policy = ?self.schema_policy,
                         added_column_count = added_columns.len(),
                         added_columns = ?added_columns,
-                        catalog_schema_version = catalog_schema.stable_fingerprint(),
-                        observed_schema_version = observed_schema.stable_fingerprint(),
+                        catalog_schema_version,
+                        observed_schema_version,
                         "Postgres CDC relation schema has compatible additions; projecting to catalog schema"
                     );
-                    self.schema_versions.insert(
-                        table_id.as_str().to_string(),
-                        observed_schema.stable_fingerprint(),
-                    );
+                    self.schema_versions
+                        .insert(table_id.as_str().to_string(), observed_schema_version);
                     Ok(())
                 }
             },
             SchemaEvolution::Incompatible(reason) => {
+                self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
+                    table_id.clone(),
+                    upstream_table.clone(),
+                    self.schema_policy,
+                    PostgresSchemaEvolutionOutcome::Incompatible,
+                    Vec::new(),
+                    Some(reason.clone()),
+                    catalog_schema_version,
+                    observed_schema_version,
+                ));
                 tracing::warn!(
                     source = %self.source_id.as_str(),
                     table = %table_id.as_str(),
                     upstream_table = %format!("{}.{}", upstream_table.schema(), upstream_table.table()),
                     policy = ?self.schema_policy,
                     reason = %reason,
-                    catalog_column_count = catalog_schema.columns().len(),
-                    observed_column_count = observed_schema.columns().len(),
-                    catalog_schema_version = catalog_schema.stable_fingerprint(),
-                    observed_schema_version = observed_schema.stable_fingerprint(),
+                    catalog_column_count,
+                    observed_column_count,
+                    catalog_schema_version,
+                    observed_schema_version,
                     "Postgres CDC relation schema is incompatible with catalog schema"
                 );
                 bail!(
@@ -243,6 +375,13 @@ impl PostgresTransactionAssembler {
                 )
             }
         }
+    }
+
+    fn record_schema_evolution_observation(
+        &mut self,
+        observation: PostgresSchemaEvolutionObservation,
+    ) {
+        self.schema_observations.push(observation);
     }
 
     fn route_change(&self, change: &PgOutputCdcChange) -> Result<Option<(CdcTableId, CdcChange)>> {
@@ -1216,6 +1355,22 @@ mod tests {
         assembler
             .accept_event(xlog(relation.clone()))
             .expect("compatible relation");
+        let observations = assembler.drain_schema_evolution_observations();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.table_id().as_str(), "orders");
+        assert_eq!(observation.upstream_table().schema(), "public");
+        assert_eq!(observation.upstream_table().table(), "orders");
+        assert_eq!(
+            observation.policy(),
+            PostgresSchemaEvolutionPolicy::IgnoreCompatible
+        );
+        assert_eq!(
+            observation.outcome(),
+            PostgresSchemaEvolutionOutcome::CompatibleAddition
+        );
+        assert_eq!(observation.added_columns(), &["note".to_string()]);
+        assert_eq!(observation.reason(), None);
         assembler.accept_event(begin(57)).expect("begin");
         assembler
             .accept_event(xlog(insert_message_with_values(
@@ -1273,6 +1428,22 @@ mod tests {
             .expect_err("compatible addition should fail under fail-fast");
 
         assert!(format!("{err:#}").contains("compatible column additions"));
+        let observations = assembler.drain_schema_evolution_observations();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(
+            observation.policy(),
+            PostgresSchemaEvolutionPolicy::FailFast
+        );
+        assert_eq!(
+            observation.outcome(),
+            PostgresSchemaEvolutionOutcome::RejectedCompatibleAddition
+        );
+        assert_eq!(observation.added_columns(), &["note".to_string()]);
+        assert_eq!(
+            observation.reason(),
+            Some("compatible column additions rejected by fail-fast policy")
+        );
     }
 
     #[test]
@@ -1292,6 +1463,20 @@ mod tests {
             .expect_err("type change should fail");
 
         assert!(format!("{err:#}").contains("type changed"));
+        let observations = assembler.drain_schema_evolution_observations();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(
+            observation.outcome(),
+            PostgresSchemaEvolutionOutcome::Incompatible
+        );
+        assert_eq!(observation.added_columns(), &[] as &[String]);
+        assert!(
+            observation
+                .reason()
+                .expect("reason")
+                .contains("type changed")
+        );
     }
 
     #[test]

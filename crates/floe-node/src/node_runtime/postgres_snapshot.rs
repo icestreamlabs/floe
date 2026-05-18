@@ -158,6 +158,7 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
     runtime_plan: &PostgresCdcRuntimePlan,
     table_store: &CdcTableStore,
     sender: &mpsc::Sender<QueuedCdcTransaction>,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
     cancel: &CancellationToken,
 ) -> Result<InitialPostgresSnapshot> {
@@ -184,6 +185,7 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
         slot,
         publication,
         runtime_plan,
+        cdc_replication_debug,
         wal_commit_lsn_rx,
         cancel.clone(),
     )
@@ -269,6 +271,7 @@ async fn load_postgres_initial_snapshot(
     slot: &str,
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
@@ -290,6 +293,7 @@ async fn load_postgres_initial_snapshot(
         &runtime_plan.source_id,
         &runtime_plan.schemas,
         runtime_plan,
+        cdc_replication_debug,
         wal_commit_lsn_rx,
         cancel,
     )
@@ -307,6 +311,7 @@ async fn load_postgres_initial_snapshot_from_client(
     source_id: &CdcSourceId,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
     runtime_plan: &PostgresCdcRuntimePlan,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
@@ -331,6 +336,7 @@ async fn load_postgres_initial_snapshot_from_client(
                 publication,
                 source_id,
                 runtime_plan,
+                cdc_replication_debug,
                 sorted_schemas,
                 max_workers,
                 wal_commit_lsn_rx,
@@ -348,6 +354,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
     publication: &str,
     source_id: &CdcSourceId,
     runtime_plan: &PostgresCdcRuntimePlan,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sorted_schemas: Vec<&CdcTableSchema>,
     max_workers: usize,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
@@ -448,6 +455,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             publication,
             runtime_plan,
             snapshot_lsn,
+            cdc_replication_debug,
             wal_commit_lsn_rx,
             cancel,
         )
@@ -495,6 +503,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             publication,
             runtime_plan,
             snapshot_lsn,
+            cdc_replication_debug,
             wal_commit_lsn_rx,
             cancel,
         )
@@ -561,6 +570,7 @@ async fn start_buffered_postgres_wal_stream(
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
     snapshot_lsn: PostgresLsn,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<BufferedPostgresWalStream> {
@@ -580,12 +590,14 @@ async fn start_buffered_postgres_wal_stream(
     let (release_feedback_tx, release_feedback_rx) = watch::channel(false);
     let task_runtime_plan = runtime_plan.clone();
     let task_slot = slot.clone();
+    let task_cdc_replication_debug = Arc::clone(cdc_replication_debug);
     let task = tokio::spawn(async move {
         buffer_postgres_wal_stream(
             replication,
             task_runtime_plan,
             task_slot,
             snapshot_lsn,
+            task_cdc_replication_debug,
             commit_lsn_rx,
             release_feedback_rx,
             sender,
@@ -640,6 +652,7 @@ async fn buffer_postgres_wal_stream(
     runtime_plan: PostgresCdcRuntimePlan,
     slot: String,
     snapshot_lsn: PostgresLsn,
+    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     mut commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     mut release_feedback_rx: watch::Receiver<bool>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
@@ -691,7 +704,33 @@ async fn buffer_postgres_wal_stream(
             if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
                 break;
             }
-            let Some(transaction) = assembler.accept_event(event)? else {
+            let transaction = match assembler.accept_event(event) {
+                Ok(transaction) => {
+                    let observations = assembler.drain_schema_evolution_observations();
+                    if !observations.is_empty() {
+                        record_postgres_schema_evolution_observations(
+                            &cdc_replication_debug,
+                            &runtime_plan.source_id,
+                            observations,
+                        )
+                        .await;
+                    }
+                    transaction
+                }
+                Err(err) => {
+                    let observations = assembler.drain_schema_evolution_observations();
+                    if !observations.is_empty() {
+                        record_postgres_schema_evolution_observations(
+                            &cdc_replication_debug,
+                            &runtime_plan.source_id,
+                            observations,
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
+            let Some(transaction) = transaction else {
                 continue;
             };
             let commit_lsn = PostgresLsn::from_source_position(transaction.commit_position())?;

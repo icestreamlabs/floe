@@ -64,7 +64,28 @@ pub struct WatermarkDebugState {
 pub struct CdcReplicationDebugState {
     pub updated_at_unix_ms: u64,
     pub refresh_error: Option<String>,
+    pub postgres_sources: Vec<PostgresCdcDebugSourceState>,
     pub pipelines: Vec<CdcReplicationDebugPipelineState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PostgresCdcDebugSourceState {
+    pub source: String,
+    pub schema_evolution_policy: String,
+    pub latest_schema_evolution: Option<PostgresCdcSchemaEvolutionDebugState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PostgresCdcSchemaEvolutionDebugState {
+    pub table: String,
+    pub upstream_table: String,
+    pub policy: String,
+    pub outcome: String,
+    pub added_columns: Vec<String>,
+    pub reason: Option<String>,
+    pub catalog_schema_version: u64,
+    pub observed_schema_version: u64,
+    pub observed_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -585,6 +606,21 @@ mod tests {
         let snapshot = Arc::new(RwLock::new(CdcReplicationDebugState {
             updated_at_unix_ms: 9,
             refresh_error: None,
+            postgres_sources: vec![PostgresCdcDebugSourceState {
+                source: "pg_main".to_string(),
+                schema_evolution_policy: "ignore_compatible".to_string(),
+                latest_schema_evolution: Some(PostgresCdcSchemaEvolutionDebugState {
+                    table: "orders".to_string(),
+                    upstream_table: "public.orders".to_string(),
+                    policy: "ignore_compatible".to_string(),
+                    outcome: "compatible_addition".to_string(),
+                    added_columns: vec!["note".to_string()],
+                    reason: None,
+                    catalog_schema_version: 1,
+                    observed_schema_version: 2,
+                    observed_at_unix_ms: 8,
+                }),
+            }],
             pipelines: vec![CdcReplicationDebugPipelineState {
                 pipeline: "orders_pipe".to_string(),
                 source: "pg_main".to_string(),
