@@ -227,6 +227,52 @@ static POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS: LazyLock<IntGaugeVec
     },
 );
 
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_TARGET: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_snapshot_concurrency_target",
+        "Current adaptive Postgres CDC initial snapshot scan concurrency target",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_snapshot_concurrency_target")
+});
+
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_snapshot_concurrency_active",
+        "Current active Postgres CDC initial snapshot scan workers",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_snapshot_concurrency_active")
+});
+
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_MAX: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_snapshot_concurrency_max",
+        "Maximum configured Postgres CDC initial snapshot scan workers",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_snapshot_concurrency_max")
+});
+
+static POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_FILL_PERCENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+            "floe_postgres_cdc_snapshot_wal_buffer_fill_percent",
+            "Percent fill of the in-memory WAL buffer used while Postgres CDC initial snapshot scans are running",
+            &["source", "slot"]
+        )
+        .expect("register floe_postgres_cdc_snapshot_wal_buffer_fill_percent")
+});
+
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ADJUSTMENTS_TOTAL: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "floe_postgres_cdc_snapshot_concurrency_adjustments_total",
+            "Adaptive Postgres CDC initial snapshot concurrency target changes",
+            &["source", "slot", "direction", "reason"]
+        )
+        .expect("register floe_postgres_cdc_snapshot_concurrency_adjustments_total")
+    });
+
 static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_transactions",
@@ -539,6 +585,51 @@ pub(crate) fn record_postgres_cdc_schema_evolution_observation(
         .set(i64_from_u64(observed_at_unix_ms));
 }
 
+pub(crate) fn record_postgres_cdc_snapshot_concurrency(
+    source: &str,
+    slot: &str,
+    target: usize,
+    active: usize,
+    max: usize,
+) {
+    POSTGRES_CDC_SNAPSHOT_CONCURRENCY_TARGET
+        .with_label_values(&[source, slot])
+        .set(i64_from_usize(target));
+    POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ACTIVE
+        .with_label_values(&[source, slot])
+        .set(i64_from_usize(active));
+    POSTGRES_CDC_SNAPSHOT_CONCURRENCY_MAX
+        .with_label_values(&[source, slot])
+        .set(i64_from_usize(max));
+}
+
+pub(crate) fn record_postgres_cdc_snapshot_wal_buffer_fill(
+    source: &str,
+    slot: &str,
+    pending: usize,
+    capacity: usize,
+) {
+    let fill_percent = if capacity == 0 {
+        0
+    } else {
+        pending.saturating_mul(100) / capacity
+    };
+    POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_FILL_PERCENT
+        .with_label_values(&[source, slot])
+        .set(i64_from_usize(fill_percent.min(100)));
+}
+
+pub(crate) fn inc_postgres_cdc_snapshot_concurrency_adjustment(
+    source: &str,
+    slot: &str,
+    direction: &str,
+    reason: &str,
+) {
+    POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ADJUSTMENTS_TOTAL
+        .with_label_values(&[source, slot, direction, reason])
+        .inc();
+}
+
 pub(crate) fn record_cdc_buffer_pending(
     pipeline: &str,
     transactions: usize,
@@ -628,6 +719,11 @@ pub(crate) fn init() {
     let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY;
     let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL;
     let _ = &*POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS;
+    let _ = &*POSTGRES_CDC_SNAPSHOT_CONCURRENCY_TARGET;
+    let _ = &*POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ACTIVE;
+    let _ = &*POSTGRES_CDC_SNAPSHOT_CONCURRENCY_MAX;
+    let _ = &*POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_FILL_PERCENT;
+    let _ = &*POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ADJUSTMENTS_TOTAL;
     let _ = &*CDC_BUFFER_PENDING_TRANSACTIONS;
     let _ = &*CDC_BUFFER_PENDING_OBJECTS;
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
@@ -655,6 +751,10 @@ fn i64_from_u64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn i64_from_usize(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use prometheus::{Encoder, TextEncoder};
@@ -677,6 +777,14 @@ mod tests {
             "compatible_addition",
             "ignore_compatible",
             123_456,
+        );
+        record_postgres_cdc_snapshot_concurrency(source, slot, 2, 1, 4);
+        record_postgres_cdc_snapshot_wal_buffer_fill(source, slot, 3, 4);
+        inc_postgres_cdc_snapshot_concurrency_adjustment(
+            source,
+            slot,
+            "decrease",
+            "wal_buffer_high",
         );
 
         let encoder = TextEncoder::new();
@@ -703,6 +811,21 @@ mod tests {
         ));
         assert!(body.contains(
             "floe_postgres_cdc_schema_evolution_last_observed_unix_ms{outcome=\"compatible_addition\",policy=\"ignore_compatible\",source=\"pg_metrics_test\",table=\"orders_metrics_test\"} 123456"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_snapshot_concurrency_target{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 2"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_snapshot_concurrency_active{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_snapshot_concurrency_max{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 4"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_snapshot_wal_buffer_fill_percent{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 75"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_snapshot_concurrency_adjustments_total{direction=\"decrease\",reason=\"wal_buffer_high\",slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 1"
         ));
     }
 

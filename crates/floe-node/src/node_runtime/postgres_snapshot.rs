@@ -14,6 +14,12 @@ use tokio_postgres::types::Type;
 const DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
 const DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS: usize = 1;
 const DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: usize = 1;
+const DEFAULT_POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY: bool = true;
+const DEFAULT_POSTGRES_SNAPSHOT_MIN_WORKERS: usize = 1;
+const DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: usize = 75;
+const DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: usize = 25;
+const DEFAULT_POSTGRES_SNAPSHOT_SLOW_SCAN_MS: u64 = 30_000;
+const DEFAULT_POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS: u64 = 500;
 static POSTGRES_SNAPSHOT_ROWS_PER_BATCH: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH")
         .ok()
@@ -34,6 +40,47 @@ static POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: LazyLock<usize> = LazyLock::new(|| 
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS)
+});
+static POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ADAPTIVE_CONCURRENCY")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY)
+});
+static POSTGRES_SNAPSHOT_MIN_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_MIN_WORKERS)
+});
+static POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT)
+});
+static POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value <= 100)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT)
+});
+static POSTGRES_SNAPSHOT_SLOW_SCAN_MS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_SLOW_SCAN_MS)
+});
+static POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS)
 });
 static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("FLOE_CDC_PERF_LOG")
@@ -61,7 +108,371 @@ enum SnapshotTableChunk {
 struct SnapshotWorkerControl {
     ready_tx: tokio::sync::oneshot::Sender<()>,
     start_rx: watch::Receiver<bool>,
-    scan_permits: Arc<tokio::sync::Semaphore>,
+    scan_limiter: Arc<SnapshotScanLimiter>,
+    scan_observation_tx: Option<mpsc::UnboundedSender<SnapshotScanObservation>>,
+}
+
+struct SnapshotScanLimiter {
+    source: String,
+    slot: String,
+    max_workers: usize,
+    target_workers: AtomicUsize,
+    active_workers: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+struct SnapshotScanPermit {
+    limiter: Arc<SnapshotScanLimiter>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SnapshotWalBufferPressure {
+    pending_events: usize,
+    capacity: usize,
+}
+
+impl SnapshotWalBufferPressure {
+    fn fill_percent(self) -> usize {
+        if self.capacity == 0 {
+            0
+        } else {
+            self.pending_events.saturating_mul(100) / self.capacity
+        }
+        .min(100)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotScanObservation {
+    elapsed_ms: u64,
+    rows: usize,
+}
+
+struct SnapshotAdaptiveConcurrencyRuntime {
+    scan_limiter: Arc<SnapshotScanLimiter>,
+    scan_observation_tx: Option<mpsc::UnboundedSender<SnapshotScanObservation>>,
+    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
+    cancel: Option<CancellationToken>,
+    task: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotAdaptiveConcurrencyConfig {
+    enabled: bool,
+    min_workers: usize,
+    max_workers: usize,
+    wal_buffer_high_watermark_percent: usize,
+    wal_buffer_low_watermark_percent: usize,
+    slow_scan_ms: u64,
+    controller_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotConcurrencyDecision {
+    target_workers: usize,
+    direction: &'static str,
+    reason: &'static str,
+}
+
+impl SnapshotScanLimiter {
+    fn new(source: impl Into<String>, slot: impl Into<String>, max_workers: usize) -> Self {
+        let source = source.into();
+        let slot = slot.into();
+        let max_workers = max_workers.max(1);
+        let limiter = Self {
+            source,
+            slot,
+            max_workers,
+            target_workers: AtomicUsize::new(max_workers),
+            active_workers: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        };
+        limiter.record_metrics();
+        limiter
+    }
+
+    async fn acquire(self: &Arc<Self>) -> SnapshotScanPermit {
+        loop {
+            let active = self.active_workers.load(Ordering::Acquire);
+            let target = self.target_workers.load(Ordering::Acquire).max(1);
+            if active < target
+                && self
+                    .active_workers
+                    .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.record_metrics();
+                return SnapshotScanPermit {
+                    limiter: Arc::clone(self),
+                };
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn set_target(&self, target_workers: usize) -> Option<(usize, usize)> {
+        let target_workers = target_workers.clamp(1, self.max_workers);
+        let previous = self
+            .target_workers
+            .swap(target_workers, Ordering::AcqRel)
+            .clamp(1, self.max_workers);
+        self.record_metrics();
+        self.notify.notify_waiters();
+        (previous != target_workers).then_some((previous, target_workers))
+    }
+
+    fn target_workers(&self) -> usize {
+        self.target_workers
+            .load(Ordering::Acquire)
+            .clamp(1, self.max_workers)
+    }
+
+    fn active_workers(&self) -> usize {
+        self.active_workers.load(Ordering::Acquire)
+    }
+
+    fn record_metrics(&self) {
+        crate::metrics::record_postgres_cdc_snapshot_concurrency(
+            &self.source,
+            &self.slot,
+            self.target_workers(),
+            self.active_workers(),
+            self.max_workers,
+        );
+    }
+}
+
+impl Drop for SnapshotScanPermit {
+    fn drop(&mut self) {
+        self.limiter.active_workers.fetch_sub(1, Ordering::AcqRel);
+        self.limiter.record_metrics();
+        self.limiter.notify.notify_waiters();
+    }
+}
+
+impl SnapshotAdaptiveConcurrencyRuntime {
+    fn new(
+        source_id: &CdcSourceId,
+        slot: &str,
+        max_workers: usize,
+        task_count: usize,
+        parent_cancel: &CancellationToken,
+    ) -> Self {
+        let config = snapshot_adaptive_concurrency_config(max_workers);
+        let scan_limiter = Arc::new(SnapshotScanLimiter::new(
+            source_id.as_str(),
+            slot,
+            config.max_workers,
+        ));
+        if !config.enabled || task_count <= 1 {
+            return Self {
+                scan_limiter,
+                scan_observation_tx: None,
+                wal_pressure_tx: None,
+                cancel: None,
+                task: None,
+            };
+        }
+
+        let (scan_observation_tx, scan_observation_rx) = mpsc::unbounded_channel();
+        let (wal_pressure_tx, wal_pressure_rx) =
+            watch::channel(SnapshotWalBufferPressure::default());
+        let cancel = parent_cancel.child_token();
+        let task_scan_limiter = Arc::clone(&scan_limiter);
+        let task_cancel = cancel.clone();
+        let source = source_id.as_str().to_string();
+        let slot = slot.to_string();
+        let task_slot = slot.clone();
+        let task = tokio::spawn(async move {
+            run_snapshot_adaptive_concurrency_controller(
+                source,
+                task_slot,
+                config,
+                task_scan_limiter,
+                wal_pressure_rx,
+                scan_observation_rx,
+                task_cancel,
+            )
+            .await;
+        });
+
+        tracing::info!(
+            source = %source_id.as_str(),
+            slot = %slot,
+            min_workers = config.min_workers,
+            max_workers = config.max_workers,
+            wal_buffer_high_watermark_percent = config.wal_buffer_high_watermark_percent,
+            wal_buffer_low_watermark_percent = config.wal_buffer_low_watermark_percent,
+            slow_scan_ms = config.slow_scan_ms,
+            controller_interval_ms = config.controller_interval.as_millis() as u64,
+            "enabled adaptive Postgres CDC snapshot concurrency"
+        );
+
+        Self {
+            scan_limiter,
+            scan_observation_tx: Some(scan_observation_tx),
+            wal_pressure_tx: Some(wal_pressure_tx),
+            cancel: Some(cancel),
+            task: Some(task),
+        }
+    }
+
+    fn scan_limiter(&self) -> Arc<SnapshotScanLimiter> {
+        Arc::clone(&self.scan_limiter)
+    }
+
+    fn scan_observation_tx(&self) -> Option<mpsc::UnboundedSender<SnapshotScanObservation>> {
+        self.scan_observation_tx.clone()
+    }
+
+    fn wal_pressure_tx(&self) -> Option<watch::Sender<SnapshotWalBufferPressure>> {
+        self.wal_pressure_tx.clone()
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(task) = self.task.take()
+            && let Err(err) = task.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(
+                error = %err,
+                "Postgres CDC snapshot adaptive concurrency controller task failed"
+            );
+        }
+    }
+}
+
+fn snapshot_adaptive_concurrency_config(max_workers: usize) -> SnapshotAdaptiveConcurrencyConfig {
+    let max_workers = max_workers.max(1);
+    let min_workers = (*POSTGRES_SNAPSHOT_MIN_WORKERS).clamp(1, max_workers);
+    let high = *POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT;
+    let mut low = *POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT;
+    if low >= high {
+        low = high.saturating_sub(1);
+    }
+    SnapshotAdaptiveConcurrencyConfig {
+        enabled: *POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY && max_workers > 1,
+        min_workers,
+        max_workers,
+        wal_buffer_high_watermark_percent: high,
+        wal_buffer_low_watermark_percent: low,
+        slow_scan_ms: *POSTGRES_SNAPSHOT_SLOW_SCAN_MS,
+        controller_interval: Duration::from_millis(*POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS),
+    }
+}
+
+async fn run_snapshot_adaptive_concurrency_controller(
+    source: String,
+    slot: String,
+    config: SnapshotAdaptiveConcurrencyConfig,
+    scan_limiter: Arc<SnapshotScanLimiter>,
+    mut wal_pressure_rx: watch::Receiver<SnapshotWalBufferPressure>,
+    mut scan_observation_rx: mpsc::UnboundedReceiver<SnapshotScanObservation>,
+    cancel: CancellationToken,
+) {
+    let mut latest_scan_observation = None;
+    let mut interval = tokio::time::interval(config.controller_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            maybe_observation = scan_observation_rx.recv() => {
+                match maybe_observation {
+                    Some(observation) => latest_scan_observation = Some(observation),
+                    None => break,
+                }
+            }
+            changed = wal_pressure_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let current_target = scan_limiter.target_workers();
+                let wal_pressure = *wal_pressure_rx.borrow();
+                let scan_observation = latest_scan_observation.take();
+                let scan_elapsed_ms = scan_observation.map(|observation: SnapshotScanObservation| observation.elapsed_ms);
+                let scan_rows = scan_observation.map(|observation: SnapshotScanObservation| observation.rows);
+                let decision = snapshot_concurrency_decision(
+                    config,
+                    current_target,
+                    wal_pressure,
+                    scan_observation,
+                );
+                if let Some(decision) = decision
+                    && let Some((previous_target, target_workers)) =
+                        scan_limiter.set_target(decision.target_workers)
+                {
+                    crate::metrics::inc_postgres_cdc_snapshot_concurrency_adjustment(
+                        &source,
+                        &slot,
+                        decision.direction,
+                        decision.reason,
+                    );
+                    tracing::info!(
+                        source = %source,
+                        slot = %slot,
+                        previous_target,
+                        target_workers,
+                        active_workers = scan_limiter.active_workers(),
+                        wal_buffer_fill_percent = wal_pressure.fill_percent(),
+                        scan_elapsed_ms,
+                        scan_rows,
+                        direction = decision.direction,
+                        reason = decision.reason,
+                        "adjusted adaptive Postgres CDC snapshot concurrency"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn snapshot_concurrency_decision(
+    config: SnapshotAdaptiveConcurrencyConfig,
+    current_target: usize,
+    wal_pressure: SnapshotWalBufferPressure,
+    scan_observation: Option<SnapshotScanObservation>,
+) -> Option<SnapshotConcurrencyDecision> {
+    let current_target = current_target.clamp(config.min_workers, config.max_workers);
+    let wal_fill_percent = wal_pressure.fill_percent();
+    if wal_pressure.capacity > 0
+        && wal_fill_percent >= config.wal_buffer_high_watermark_percent
+        && current_target > config.min_workers
+    {
+        return Some(SnapshotConcurrencyDecision {
+            target_workers: current_target.saturating_sub(1).max(config.min_workers),
+            direction: "decrease",
+            reason: "wal_buffer_high",
+        });
+    }
+
+    if let Some(scan_observation) = scan_observation
+        && scan_observation.elapsed_ms >= config.slow_scan_ms
+        && current_target > config.min_workers
+    {
+        return Some(SnapshotConcurrencyDecision {
+            target_workers: current_target.saturating_sub(1).max(config.min_workers),
+            direction: "decrease",
+            reason: "snapshot_scan_slow",
+        });
+    }
+
+    if wal_pressure.capacity > 0
+        && wal_fill_percent <= config.wal_buffer_low_watermark_percent
+        && current_target < config.max_workers
+    {
+        return Some(SnapshotConcurrencyDecision {
+            target_workers: current_target.saturating_add(1).min(config.max_workers),
+            direction: "increase",
+            reason: "wal_buffer_low",
+        });
+    }
+
+    None
 }
 
 pub(super) async fn ensure_postgres_cdc_publication_and_slot(
@@ -405,14 +816,21 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
     let (change_batches, row_count, task_count, wal_stream) = if use_parallel_workers {
         let task_count = snapshot_tasks.len();
         let (start_tx, start_rx) = watch::channel(false);
-        let scan_permits = Arc::new(tokio::sync::Semaphore::new(max_workers));
+        let mut adaptive_concurrency = SnapshotAdaptiveConcurrencyRuntime::new(
+            source_id,
+            slot,
+            max_workers,
+            task_count,
+            &cancel,
+        );
         let mut worker_handles = Vec::with_capacity(task_count);
         let mut ready_receivers = Vec::with_capacity(task_count);
         for (table_idx, chunk_idx, schema, chunk) in snapshot_tasks {
             let connection_string = connection_string.to_string();
             let exported_snapshot = exported_snapshot.clone();
             let start_rx = start_rx.clone();
-            let scan_permits = Arc::clone(&scan_permits);
+            let scan_limiter = adaptive_concurrency.scan_limiter();
+            let scan_observation_tx = adaptive_concurrency.scan_observation_tx();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_receivers.push(ready_rx);
             worker_handles.push(tokio::spawn(async move {
@@ -424,7 +842,8 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                     Some(SnapshotWorkerControl {
                         ready_tx,
                         start_rx,
-                        scan_permits,
+                        scan_limiter,
+                        scan_observation_tx,
                     }),
                 )
                 .await
@@ -433,6 +852,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
         }
 
         if let Err(err) = wait_for_snapshot_workers_ready(ready_receivers).await {
+            adaptive_concurrency.shutdown().await;
             abort_snapshot_worker_tasks(worker_handles).await;
             return Err(err);
         }
@@ -444,6 +864,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             .await
             .context("commit exported-slot initial Postgres CDC validation transaction")
         {
+            adaptive_concurrency.shutdown().await;
             abort_snapshot_worker_tasks(worker_handles).await;
             return Err(err);
         }
@@ -456,6 +877,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             runtime_plan,
             snapshot_lsn,
             cdc_replication_debug,
+            adaptive_concurrency.wal_pressure_tx(),
             wal_commit_lsn_rx,
             cancel,
         )
@@ -466,6 +888,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                     .send(true)
                     .context("release Postgres snapshot workers after starting WAL stream")
                 {
+                    adaptive_concurrency.shutdown().await;
                     abort_buffered_postgres_wal_stream(stream).await;
                     abort_snapshot_worker_tasks(worker_handles).await;
                     return Err(err);
@@ -474,10 +897,12 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                 let table_snapshots = match collect_snapshot_worker_tasks(worker_handles).await {
                     Ok(snapshots) => snapshots,
                     Err(err) => {
+                        adaptive_concurrency.shutdown().await;
                         abort_buffered_postgres_wal_stream(stream).await;
                         return Err(err);
                     }
                 };
+                adaptive_concurrency.shutdown().await;
 
                 let mut table_snapshots = table_snapshots;
                 table_snapshots.sort_by_key(|(table_idx, chunk_idx, _)| (*table_idx, *chunk_idx));
@@ -491,6 +916,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                 (change_batches, row_count, task_count, stream)
             }
             Err(err) => {
+                adaptive_concurrency.shutdown().await;
                 abort_snapshot_worker_tasks(worker_handles).await;
                 return Err(err);
             }
@@ -504,6 +930,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             runtime_plan,
             snapshot_lsn,
             cdc_replication_debug,
+            None,
             wal_commit_lsn_rx,
             cancel,
         )
@@ -571,6 +998,7 @@ async fn start_buffered_postgres_wal_stream(
     runtime_plan: &PostgresCdcRuntimePlan,
     snapshot_lsn: PostgresLsn,
     cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
     commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<BufferedPostgresWalStream> {
@@ -598,6 +1026,7 @@ async fn start_buffered_postgres_wal_stream(
             task_slot,
             snapshot_lsn,
             task_cdc_replication_debug,
+            wal_pressure_tx,
             commit_lsn_rx,
             release_feedback_rx,
             sender,
@@ -653,6 +1082,7 @@ async fn buffer_postgres_wal_stream(
     slot: String,
     snapshot_lsn: PostgresLsn,
     cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
     mut commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     mut release_feedback_rx: watch::Receiver<bool>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
@@ -751,6 +1181,15 @@ async fn buffer_postgres_wal_stream(
                 commit_position = ?transaction.commit_position(),
                 "buffered native Postgres CDC transaction during initial snapshot"
             );
+            record_snapshot_wal_buffer_pressure(
+                &wal_pressure_tx,
+                runtime_plan.source_id.as_str(),
+                &slot,
+                sender.max_capacity()
+                    .saturating_sub(sender.capacity())
+                    .saturating_add(1),
+                sender.max_capacity(),
+            );
             sender
                 .send(QueuedCdcTransaction {
                     slot: slot.clone(),
@@ -761,6 +1200,13 @@ async fn buffer_postgres_wal_stream(
                 .map_err(|err| {
                     anyhow!("failed to enqueue buffered native Postgres CDC transaction: {err}")
                 })?;
+            record_snapshot_wal_buffer_pressure(
+                &wal_pressure_tx,
+                runtime_plan.source_id.as_str(),
+                &slot,
+                sender.max_capacity().saturating_sub(sender.capacity()),
+                sender.max_capacity(),
+            );
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -770,6 +1216,28 @@ async fn buffer_postgres_wal_stream(
     let shutdown_result = replication.shutdown().await;
     result?;
     shutdown_result
+}
+
+fn record_snapshot_wal_buffer_pressure(
+    sender: &Option<watch::Sender<SnapshotWalBufferPressure>>,
+    source: &str,
+    slot: &str,
+    pending_events: usize,
+    capacity: usize,
+) {
+    let pending_events = pending_events.min(capacity);
+    crate::metrics::record_postgres_cdc_snapshot_wal_buffer_fill(
+        source,
+        slot,
+        pending_events,
+        capacity,
+    );
+    if let Some(sender) = sender {
+        let _ = sender.send(SnapshotWalBufferPressure {
+            pending_events,
+            capacity,
+        });
+    }
 }
 
 fn buffered_postgres_replication_event_frontier_lsn(
@@ -1530,24 +1998,31 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
             .await
             .context("begin Postgres snapshot worker transaction")?;
         bind_transaction_to_exported_snapshot(&transaction, exported_snapshot).await?;
-        let _scan_permit = if let Some(control) = worker_control {
+        let scan_permit = if let Some(control) = worker_control {
             let SnapshotWorkerControl {
                 ready_tx,
                 mut start_rx,
-                scan_permits,
+                scan_limiter,
+                scan_observation_tx,
             } = control;
             let _ = ready_tx.send(());
             wait_for_snapshot_worker_start(&mut start_rx).await?;
-            Some(
-                scan_permits
-                    .acquire_owned()
-                    .await
-                    .context("acquire Postgres snapshot worker scan permit")?,
-            )
+            Some((scan_limiter.acquire().await, scan_observation_tx))
         } else {
             None
         };
+        let scan_started_at = Instant::now();
         let snapshot = snapshot_table_change_batches_for_chunk(&transaction, schema, chunk).await;
+        if let (Some((_, Some(scan_observation_tx))), Ok(snapshot)) = (&scan_permit, &snapshot) {
+            let _ = scan_observation_tx.send(SnapshotScanObservation {
+                elapsed_ms: scan_started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                rows: snapshot.row_count,
+            });
+        }
         transaction
             .commit()
             .await
@@ -2038,6 +2513,100 @@ mod tests {
         )
         .expect("schema");
         assert!(single_int64_primary_key_column(&composite_schema).is_none());
+    }
+
+    #[test]
+    fn adaptive_snapshot_concurrency_decision_uses_wal_and_scan_pressure() {
+        let config = SnapshotAdaptiveConcurrencyConfig {
+            enabled: true,
+            min_workers: 1,
+            max_workers: 4,
+            wal_buffer_high_watermark_percent: 75,
+            wal_buffer_low_watermark_percent: 25,
+            slow_scan_ms: 1_000,
+            controller_interval: Duration::from_millis(500),
+        };
+
+        assert_eq!(
+            snapshot_concurrency_decision(
+                config,
+                4,
+                SnapshotWalBufferPressure {
+                    pending_events: 8,
+                    capacity: 10,
+                },
+                None,
+            ),
+            Some(SnapshotConcurrencyDecision {
+                target_workers: 3,
+                direction: "decrease",
+                reason: "wal_buffer_high",
+            })
+        );
+        assert_eq!(
+            snapshot_concurrency_decision(
+                config,
+                3,
+                SnapshotWalBufferPressure {
+                    pending_events: 1,
+                    capacity: 10,
+                },
+                Some(SnapshotScanObservation {
+                    elapsed_ms: 2_000,
+                    rows: 10,
+                }),
+            ),
+            Some(SnapshotConcurrencyDecision {
+                target_workers: 2,
+                direction: "decrease",
+                reason: "snapshot_scan_slow",
+            })
+        );
+        assert_eq!(
+            snapshot_concurrency_decision(
+                config,
+                2,
+                SnapshotWalBufferPressure {
+                    pending_events: 1,
+                    capacity: 10,
+                },
+                None,
+            ),
+            Some(SnapshotConcurrencyDecision {
+                target_workers: 3,
+                direction: "increase",
+                reason: "wal_buffer_low",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_scan_limiter_respects_dynamic_target() {
+        let limiter = Arc::new(SnapshotScanLimiter::new("pg_test", "slot_test", 2));
+        let first_permit = limiter.acquire().await;
+        let second_permit = limiter.acquire().await;
+        assert_eq!(limiter.active_workers(), 2);
+        assert_eq!(limiter.set_target(1), Some((2, 1)));
+
+        let acquire_waiter = {
+            let limiter = Arc::clone(&limiter);
+            tokio::spawn(async move { limiter.acquire().await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!acquire_waiter.is_finished());
+
+        drop(first_permit);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!acquire_waiter.is_finished());
+
+        drop(second_permit);
+        let third_permit = tokio::time::timeout(Duration::from_secs(1), acquire_waiter)
+            .await
+            .expect("scan permit acquisition should resume")
+            .expect("scan permit task should succeed");
+        assert_eq!(limiter.active_workers(), 1);
+        drop(third_permit);
+        assert_eq!(limiter.active_workers(), 0);
     }
 
     #[tokio::test]
