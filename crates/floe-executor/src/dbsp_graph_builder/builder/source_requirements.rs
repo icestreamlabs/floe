@@ -1,0 +1,393 @@
+use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSourceRequirements {
+    pub source_name: String,
+    pub required_columns: Vec<usize>,
+}
+
+pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
+    }
+    // Keep orchestration durability decisions aligned with the builder by using the same
+    // recursive source-root matcher here. Optimizer-inserted wrapper projections can otherwise
+    // preserve the transient fast path in the builder while leaving durable outer streams enabled.
+    if let Some(shape) = try_build_transient_source_root_materialization(plan, plan.root)? {
+        return Ok(Some(BTreeSet::from([shape.source_name])));
+    }
+    if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
+        && shape
+            .steps
+            .iter()
+            .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
+    {
+        return Ok(Some(BTreeSet::from([
+            shape.left_source_root.source_name,
+            shape.right_source_root.source_name,
+        ])));
+    }
+
+    let persistence_policy = PersistencePolicy::for_plan(plan);
+    let Some(transient_opt) = try_build_transient_segment_optimization(
+        plan,
+        plan.root,
+        &HashMap::new(),
+        "source_batch_journal",
+        true,
+        &persistence_policy,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(join_node) = plan.node(transient_opt.durable_input_idx) else {
+        return Ok(None);
+    };
+    let DbspNodeKind::Join(join) = &join_node.kind else {
+        return Ok(None);
+    };
+    if !matches!(join.join_type, dbsp::DbspJoinType::Inner)
+        || !has_single_consumer(plan, transient_opt.durable_input_idx)
+    {
+        return Ok(None);
+    }
+    let (left_idx, right_idx) = join_inputs(join_node)?;
+    let Some(left_root) = try_build_transient_source_root_materialization(plan, left_idx)? else {
+        return Ok(None);
+    };
+    let Some(right_root) = try_build_transient_source_root_materialization(plan, right_idx)? else {
+        return Ok(None);
+    };
+    Ok(Some(BTreeSet::from([
+        left_root.source_name,
+        right_root.source_name,
+    ])))
+}
+
+pub fn source_batch_journal_root_source_name(plan: &CircuitPlan) -> Option<String> {
+    source_batch_journal_root_sources(plan)
+        .ok()
+        .flatten()
+        .and_then(|sources| {
+            if sources.len() == 1 {
+                sources.into_iter().next()
+            } else {
+                None
+            }
+        })
+}
+
+pub fn transient_source_root_requirements(
+    plan: &CircuitPlan,
+) -> Result<Option<TransientSourceRootRequirements>> {
+    let Some(shape) = find_transient_source_root_shape(plan, plan.root)? else {
+        return Ok(None);
+    };
+    let source_name = shape.source_name().to_string();
+    let required_columns = match &shape {
+        TransientSourceRootShape::Source { source, .. }
+        | TransientSourceRootShape::Select { source, .. } => {
+            (0..source.output_schema().len()).collect()
+        }
+        TransientSourceRootShape::Project { project, .. } => required_encoded_input_columns(
+            None,
+            Some(project.expressions()),
+            project.input_schema(),
+        )?,
+        TransientSourceRootShape::FilterMap {
+            select, project, ..
+        } => required_encoded_input_columns(
+            Some(select.predicate()),
+            Some(project.expressions()),
+            select.output_schema(),
+        )?,
+    };
+    Ok(Some(TransientSourceRootRequirements {
+        source_name,
+        required_columns,
+    }))
+}
+
+pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSourceRequirements>>> {
+    let Some(root) = plan.node(plan.root) else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut required_columns_by_node: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    required_columns_by_node.insert(root.id, (0..root.output_schema.len()).collect());
+    let mut pending = VecDeque::from([root.id]);
+    let mut required_columns_by_source: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+
+    while let Some(node_id) = pending.pop_front() {
+        let Some(node) = plan.node(node_id) else {
+            bail!("plan source requirement analysis could not find node {node_id}");
+        };
+        let Some(required_columns) = required_columns_by_node.get(&node_id).cloned() else {
+            continue;
+        };
+
+        match &node.kind {
+            DbspNodeKind::Source(source) => {
+                required_columns_by_source
+                    .entry(source.table.name.to_string())
+                    .or_default()
+                    .extend(required_columns);
+            }
+            DbspNodeKind::Select(select) => {
+                let input_idx = first_input(node, "select")?;
+                let mut input_columns = required_columns;
+                add_required_expression_columns(
+                    select.predicate().expression(),
+                    select.output_schema().as_ref(),
+                    &mut input_columns,
+                )?;
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::Project(project) => {
+                let input_idx = first_input(node, "project")?;
+                let mut input_columns = BTreeSet::new();
+                for column_idx in required_columns {
+                    let expr = project.expressions().get(column_idx).ok_or_else(|| {
+                        anyhow!(
+                            "required output column {column_idx} out of bounds for project node"
+                        )
+                    })?;
+                    add_required_expression_columns(
+                        expr.expression(),
+                        project.input_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::Join(join) => {
+                if node.inputs.len() != 2 {
+                    bail!(
+                        "join source requirement analysis expected 2 inputs, found {}",
+                        node.inputs.len()
+                    );
+                }
+                let left_idx = node.inputs[0];
+                let right_idx = node.inputs[1];
+                let mut left_columns = BTreeSet::new();
+                let mut right_columns = BTreeSet::new();
+                split_join_required_columns(
+                    &required_columns,
+                    join.left_schema.len(),
+                    &mut left_columns,
+                    &mut right_columns,
+                )?;
+                for key in &join.keys {
+                    add_required_expression_columns(
+                        key.left_expression(),
+                        join.left_schema.as_ref(),
+                        &mut left_columns,
+                    )?;
+                    add_required_expression_columns(
+                        key.right_expression(),
+                        join.right_schema.as_ref(),
+                        &mut right_columns,
+                    )?;
+                }
+                if let Some(residual) = &join.residual {
+                    let mut residual_columns = BTreeSet::new();
+                    add_required_expression_columns(
+                        residual,
+                        join.output_schema.as_ref(),
+                        &mut residual_columns,
+                    )?;
+                    split_join_required_columns(
+                        &residual_columns,
+                        join.left_schema.len(),
+                        &mut left_columns,
+                        &mut right_columns,
+                    )?;
+                }
+                if extend_required_columns(&mut required_columns_by_node, left_idx, left_columns) {
+                    pending.push_back(left_idx);
+                }
+                if extend_required_columns(&mut required_columns_by_node, right_idx, right_columns)
+                {
+                    pending.push_back(right_idx);
+                }
+            }
+            DbspNodeKind::Aggregate(aggregate) => {
+                let input_idx = first_input(node, "aggregate")?;
+                let mut input_columns = BTreeSet::new();
+                for group_key in aggregate.group_keys() {
+                    add_required_expression_columns(
+                        group_key.expression(),
+                        aggregate.input_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                let group_key_count = aggregate.group_keys().len();
+                for column_idx in required_columns {
+                    let Some(aggregate_idx) = column_idx.checked_sub(group_key_count) else {
+                        continue;
+                    };
+                    let aggregate_expr =
+                        aggregate.aggregates().get(aggregate_idx).ok_or_else(|| {
+                            anyhow!(
+                                "required output column {column_idx} out of bounds for aggregate node"
+                            )
+                        })?;
+                    if let Some(expr) = aggregate_expr.expression() {
+                        add_required_expression_columns(
+                            expr,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                    if let Some(filter) = aggregate_expr.filter() {
+                        add_required_expression_columns(
+                            filter,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::WindowAggregate(window) => {
+                let input_idx = first_input(node, "window aggregate")?;
+                let aggregate = &window.aggregate;
+                let mut input_columns = BTreeSet::new();
+                add_required_expression_columns(
+                    &window.window.time_expression,
+                    aggregate.input_schema().as_ref(),
+                    &mut input_columns,
+                )?;
+                for group_key in aggregate.group_keys() {
+                    add_required_expression_columns(
+                        group_key.expression(),
+                        aggregate.input_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                let group_key_count = aggregate.group_keys().len();
+                let aggregate_output_offset = 2 + group_key_count;
+                for column_idx in required_columns {
+                    let Some(aggregate_idx) = column_idx.checked_sub(aggregate_output_offset)
+                    else {
+                        continue;
+                    };
+                    let aggregate_expr =
+                        aggregate.aggregates().get(aggregate_idx).ok_or_else(|| {
+                            anyhow!(
+                                "required output column {column_idx} out of bounds for window aggregate node"
+                            )
+                        })?;
+                    if let Some(expr) = aggregate_expr.expression() {
+                        add_required_expression_columns(
+                            expr,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                    if let Some(filter) = aggregate_expr.filter() {
+                        add_required_expression_columns(
+                            filter,
+                            aggregate.input_schema().as_ref(),
+                            &mut input_columns,
+                        )?;
+                    }
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::Passthrough | DbspNodeKind::Sink(_) => {
+                let operator = match &node.kind {
+                    DbspNodeKind::Passthrough => "passthrough",
+                    DbspNodeKind::Sink(_) => "sink",
+                    _ => unreachable!(),
+                };
+                let input_idx = first_input(node, operator)?;
+                if extend_required_columns(
+                    &mut required_columns_by_node,
+                    input_idx,
+                    required_columns,
+                ) {
+                    pending.push_back(input_idx);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(
+        required_columns_by_source
+            .into_iter()
+            .map(|(source_name, required_columns)| PlanSourceRequirements {
+                source_name,
+                required_columns: required_columns.into_iter().collect(),
+            })
+            .collect(),
+    ))
+}
+
+fn extend_required_columns(
+    required_columns_by_node: &mut HashMap<usize, BTreeSet<usize>>,
+    node_idx: usize,
+    columns: BTreeSet<usize>,
+) -> bool {
+    let entry = required_columns_by_node.entry(node_idx).or_default();
+    let previous_len = entry.len();
+    entry.extend(columns);
+    entry.len() != previous_len
+}
+
+fn add_required_expression_columns(
+    expression: &dbsp::DbspExpression,
+    input_schema: &RowSchema,
+    columns: &mut BTreeSet<usize>,
+) -> Result<()> {
+    for column in expression.expr().column_refs() {
+        let qualified = column.flat_name();
+        let column_idx = input_schema
+            .field_index(&qualified)
+            .or_else(|| input_schema.field_index(column.name.as_str()))
+            .ok_or_else(|| anyhow!("column '{}' not found in input schema", qualified))?;
+        columns.insert(column_idx);
+    }
+    Ok(())
+}
+
+fn split_join_required_columns(
+    columns: &BTreeSet<usize>,
+    left_width: usize,
+    left_columns: &mut BTreeSet<usize>,
+    right_columns: &mut BTreeSet<usize>,
+) -> Result<()> {
+    for column_idx in columns {
+        if *column_idx < left_width {
+            left_columns.insert(*column_idx);
+            continue;
+        }
+        let right_idx = column_idx
+            .checked_sub(left_width)
+            .ok_or_else(|| anyhow!("join column index underflow for {column_idx}"))?;
+        right_columns.insert(right_idx);
+    }
+    Ok(())
+}
