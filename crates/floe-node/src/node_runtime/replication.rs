@@ -4,7 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::CompressionType;
-use floe_cdc_core::{CdcSourceId, CdcTableId, CdcTableSchema, CdcTransactionId, TransactionBatch};
+use floe_cdc_core::{CdcSourceId, CdcTableId, CdcTableSchema, TransactionBatch};
 #[cfg(test)]
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
@@ -26,7 +26,6 @@ const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: &str = "1048576";
 const DEFAULT_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES: &str = "0";
 const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT: Duration = Duration::from_millis(500);
-const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 const FLOE_JSON_VERSION: i64 = 1;
 const FLOE_JSON_DELETED_FIELD: &str = "__floe_deleted";
 const FLOE_JSON_VERSION_FIELD: &str = "__floe_version";
@@ -841,82 +840,6 @@ impl ReplicationPipelineRuntime {
         }
     }
 
-    async fn replay_pending_for_plan(
-        &self,
-        plan: &ReplicationPipelineRuntimePlan,
-        buffer_store: &CdcBufferStore,
-        storage: &SlateCatalog,
-    ) -> anyhow::Result<usize> {
-        let _replay_guard = ReplicationReplayStateGuard::new(self, &plan.name);
-        let mut delivered_records = 0usize;
-        let pending = buffer_store
-            .pending_transactions(&plan.name, REPLICATION_BUFFER_REPLAY_LIMIT)
-            .await
-            .with_context(|| {
-                format!(
-                    "load pending replication pipeline '{}' buffer transactions",
-                    plan.name
-                )
-            })?;
-        let pending_transactions = pending.len();
-        if pending_transactions > 0 {
-            tracing::info!(
-                pipeline = %plan.name,
-                source = %plan.source_name,
-                target_kind = target_kind(plan),
-                pending_transactions,
-                replay_limit = REPLICATION_BUFFER_REPLAY_LIMIT,
-                "replication pipeline durable buffer replay started"
-            );
-        }
-        let mut attempted_transactions = 0usize;
-        let mut delivered_transactions = 0usize;
-        for manifest in pending {
-            attempted_transactions = attempted_transactions.saturating_add(1);
-            let records = replay::load_manifest_records(plan, buffer_store, &manifest).await?;
-            let delivery_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
-            let delivered = self
-                .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
-                .await?;
-            let delivery_elapsed = delivery_started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or(Duration::ZERO);
-            log_replication_replay_delivery_perf(plan, &manifest, delivery_elapsed, delivered);
-            if delivered == 0 {
-                tracing::warn!(
-                    pipeline = %plan.name,
-                    source = %plan.source_name,
-                    target_kind = target_kind(plan),
-                    transaction_key = %manifest.transaction_key(),
-                    records = manifest.record_count(),
-                    payload_bytes = manifest.payload_bytes(),
-                    source_position = %encoding::source_position_key(manifest.source_position()),
-                    transaction_id = manifest.transaction_id().map(CdcTransactionId::as_str),
-                    "replication pipeline durable buffer replay paused because target delivery made no progress"
-                );
-                break;
-            }
-            delivered_transactions = delivered_transactions.saturating_add(1);
-            delivered_records = delivered_records.saturating_add(delivered);
-            self.spawn_cleanup_delivered_if_due(plan, buffer_store);
-        }
-        if pending_transactions > 0 {
-            tracing::info!(
-                pipeline = %plan.name,
-                source = %plan.source_name,
-                target_kind = target_kind(plan),
-                pending_transactions,
-                attempted_transactions,
-                delivered_transactions,
-                delivered_records,
-                replay_exhausted = attempted_transactions == pending_transactions,
-                "replication pipeline durable buffer replay finished"
-            );
-        }
-        record_buffer_stats(buffer_store, &plan.name).await?;
-        Ok(delivered_records)
-    }
-
     async fn enforce_buffer_limits_before_append(
         &self,
         plan: &ReplicationPipelineRuntimePlan,
@@ -1089,7 +1012,6 @@ use dead_letter::persist_dead_letter_records;
 use perf::{
     log_replication_buffer_append_perf, log_replication_direct_delivery_perf,
     log_replication_kafka_send_perf, log_replication_pipeline_perf,
-    log_replication_replay_delivery_perf,
 };
 pub(super) use plan_helpers::{
     materialized_transaction, pipeline_checkpoint_from_transaction, replication_pipeline_table_id,
@@ -1097,7 +1019,6 @@ pub(super) use plan_helpers::{
 use plan_helpers::{
     ordered_replication_plans_for_transaction, replication_pipeline_targets_are_distinct,
 };
-use runtime_state::ReplicationReplayStateGuard;
 use status::{
     ReplicationPipelineStatusSnapshot, cdc_replication_debug_state_from_snapshots,
     enrich_pipeline_checkpoint_lag, postgres_position_lsn_bytes,
