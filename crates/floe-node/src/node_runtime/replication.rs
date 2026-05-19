@@ -9,8 +9,8 @@ use floe_cdc_core::{
     ChangeBatch, TransactionBatch,
 };
 use floe_storage::{
-    CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage,
-    CdcBufferRecord, CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
+    CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage, CdcBufferRecord,
+    CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
     ReplicationPipelineDlqEntry, SlateCatalog, encode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
@@ -205,19 +205,6 @@ pub(super) struct ReplicationPipelineRuntime {
     replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
     backpressure_state_by_pipeline: Mutex<HashMap<String, bool>>,
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
-}
-
-struct PreparedReplicationBufferAppend {
-    append: CdcBufferAppend,
-    target_records: Option<Vec<CdcBufferRecord>>,
-}
-
-impl PreparedReplicationBufferAppend {
-    fn target_records(&self) -> &[CdcBufferRecord] {
-        self.target_records
-            .as_deref()
-            .unwrap_or_else(|| self.append.records())
-    }
 }
 
 struct ReplicationReplayStateGuard<'a> {
@@ -1600,22 +1587,6 @@ impl ReplicationPipelineRuntime {
     }
 }
 
-async fn append_buffer_transaction(
-    buffer_store: &CdcBufferStore,
-    append: &CdcBufferAppend,
-    await_durable: bool,
-) -> anyhow::Result<CdcBufferedTransactionManifest> {
-    let manifest = if await_durable {
-        buffer_store.append_transaction(append).await
-    } else {
-        buffer_store
-            .append_transaction_without_durable_wait(append)
-            .await
-    }?;
-    crate::metrics::inc_cdc_buffer_object_op(append.pipeline_name(), "create", 1);
-    Ok(manifest)
-}
-
 fn ordered_replication_plans_for_transaction<'a>(
     plans: &'a [ReplicationPipelineRuntimePlan],
     transaction: &TransactionBatch,
@@ -1660,45 +1631,6 @@ fn transaction_change_count_for_table(
         .filter(|batch| batch.table_id() == table_id)
         .map(ChangeBatch::change_count)
         .sum()
-}
-
-fn prepare_replication_buffer_append(
-    plan: &ReplicationPipelineRuntimePlan,
-    transaction: &TransactionBatch,
-    target_records: Vec<CdcBufferRecord>,
-) -> anyhow::Result<PreparedReplicationBufferAppend> {
-    let buffered_at_unix_ms = current_unix_time_ms();
-    Ok(PreparedReplicationBufferAppend {
-        append: CdcBufferAppend::new(
-            &plan.name,
-            &plan.source_name,
-            plan.table_id.as_str(),
-            transaction.commit_position().clone(),
-            transaction.transaction_id().cloned(),
-            target_records,
-            buffered_at_unix_ms,
-        )?
-        .with_schema_versions(transaction.schema_versions().clone()),
-        target_records: None,
-    })
-}
-
-async fn record_buffer_stats(
-    buffer_store: &CdcBufferStore,
-    pipeline_name: &str,
-) -> anyhow::Result<()> {
-    let stats = buffer_store
-        .stats(pipeline_name, current_unix_time_ms())
-        .await
-        .with_context(|| format!("load CDC buffer stats for pipeline '{pipeline_name}'"))?;
-    crate::metrics::record_cdc_buffer_pending(
-        pipeline_name,
-        stats.pending_transactions(),
-        stats.pending_records(),
-        stats.pending_bytes(),
-        stats.oldest_pending_age_ms(),
-    );
-    Ok(())
 }
 
 fn log_replication_pipeline_perf(
@@ -1909,8 +1841,9 @@ use buffer::{
     effective_usize_limit,
 };
 use buffer::{
-    buffer_limit_violation, effective_replication_buffer_limits, estimated_buffer_payload_bytes,
-    log_replication_buffer_backpressure,
+    append_buffer_transaction, buffer_limit_violation, effective_replication_buffer_limits,
+    estimated_buffer_payload_bytes, log_replication_buffer_backpressure,
+    prepare_replication_buffer_append, record_buffer_stats,
 };
 use status::{
     ReplicationPipelineStatusSnapshot, cdc_replication_debug_state_from_snapshots,

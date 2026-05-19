@@ -1,9 +1,15 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use floe_storage::{CdcBufferRecord, CdcBufferStats};
+use anyhow::Context;
+use floe_cdc_core::TransactionBatch;
+use floe_storage::{
+    CdcBufferAppend, CdcBufferRecord, CdcBufferStats, CdcBufferStore,
+    CdcBufferedTransactionManifest,
+};
 
 use super::super::ReplicationPipelineRuntimePlan;
+use super::current_unix_time_ms;
 use super::target_state::target_kind;
 
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
@@ -73,6 +79,19 @@ pub(super) enum ReplicationBufferLimitViolation {
     },
 }
 
+pub(super) struct PreparedReplicationBufferAppend {
+    pub(super) append: CdcBufferAppend,
+    pub(super) target_records: Option<Vec<CdcBufferRecord>>,
+}
+
+impl PreparedReplicationBufferAppend {
+    pub(super) fn target_records(&self) -> &[CdcBufferRecord] {
+        self.target_records
+            .as_deref()
+            .unwrap_or_else(|| self.append.records())
+    }
+}
+
 impl ReplicationBufferLimits {
     pub(super) fn enabled(self) -> bool {
         self.max_pending_bytes.is_some()
@@ -136,6 +155,61 @@ fn replication_buffer_limits() -> ReplicationBufferLimits {
         max_pending_transactions: *REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
         max_pending_age_ms: *REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
     }
+}
+
+pub(super) async fn append_buffer_transaction(
+    buffer_store: &CdcBufferStore,
+    append: &CdcBufferAppend,
+    await_durable: bool,
+) -> anyhow::Result<CdcBufferedTransactionManifest> {
+    let manifest = if await_durable {
+        buffer_store.append_transaction(append).await
+    } else {
+        buffer_store
+            .append_transaction_without_durable_wait(append)
+            .await
+    }?;
+    crate::metrics::inc_cdc_buffer_object_op(append.pipeline_name(), "create", 1);
+    Ok(manifest)
+}
+
+pub(super) fn prepare_replication_buffer_append(
+    plan: &ReplicationPipelineRuntimePlan,
+    transaction: &TransactionBatch,
+    target_records: Vec<CdcBufferRecord>,
+) -> anyhow::Result<PreparedReplicationBufferAppend> {
+    let buffered_at_unix_ms = current_unix_time_ms();
+    Ok(PreparedReplicationBufferAppend {
+        append: CdcBufferAppend::new(
+            &plan.name,
+            &plan.source_name,
+            plan.table_id.as_str(),
+            transaction.commit_position().clone(),
+            transaction.transaction_id().cloned(),
+            target_records,
+            buffered_at_unix_ms,
+        )?
+        .with_schema_versions(transaction.schema_versions().clone()),
+        target_records: None,
+    })
+}
+
+pub(super) async fn record_buffer_stats(
+    buffer_store: &CdcBufferStore,
+    pipeline_name: &str,
+) -> anyhow::Result<()> {
+    let stats = buffer_store
+        .stats(pipeline_name, current_unix_time_ms())
+        .await
+        .with_context(|| format!("load CDC buffer stats for pipeline '{pipeline_name}'"))?;
+    crate::metrics::record_cdc_buffer_pending(
+        pipeline_name,
+        stats.pending_transactions(),
+        stats.pending_records(),
+        stats.pending_bytes(),
+        stats.oldest_pending_age_ms(),
+    );
+    Ok(())
 }
 
 pub(super) fn effective_replication_buffer_limits(
