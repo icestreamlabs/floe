@@ -1,6 +1,5 @@
 use super::*;
 
-use std::fmt;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,9 +10,8 @@ use floe_cdc_core::{
 };
 use floe_storage::{
     CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage,
-    CdcBufferRecord, CdcBufferStats, CdcBufferStore, CdcBufferedTransactionManifest,
-    ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry, SlateCatalog,
-    encode_cdc_buffer_records_payload,
+    CdcBufferRecord, CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
+    ReplicationPipelineDlqEntry, SlateCatalog, encode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
 
@@ -44,10 +42,6 @@ const FLOE_HEADER_TRANSACTION_ID: &str = "floe-transaction-id";
 const FLOE_HEADER_RECORD_SEQUENCE: &str = "floe-record-sequence";
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS: usize = 0;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: usize = 0;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
 const DEFAULT_REPLICATION_KAFKA_METADATA_HEADERS: bool = false;
@@ -132,36 +126,6 @@ static REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: LazyLock<u64> = LazyLock::new(|| 
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS)
 });
-static REPLICATION_BUFFER_MAX_PENDING_BYTES: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_BYTES",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES,
-    )
-});
-static REPLICATION_BUFFER_MAX_PENDING_RECORDS: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_RECORDS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS,
-    )
-});
-static REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-    )
-    .or_else(|| {
-        env_usize_limit(
-            "FLOE_REPLICATION_BUFFER_MAX_PENDING_OBJECTS",
-            DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-        )
-    })
-});
-static REPLICATION_BUFFER_MAX_PENDING_AGE_MS: LazyLock<Option<u64>> = LazyLock::new(|| {
-    env_u64_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
-    )
-});
 static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("FLOE_CDC_PERF_LOG")
         .ok()
@@ -179,37 +143,6 @@ static REPLICATION_KAFKA_METADATA_HEADERS: LazyLock<bool> = LazyLock::new(|| {
         DEFAULT_REPLICATION_KAFKA_METADATA_HEADERS,
     )
 });
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReplicationBufferLimits {
-    max_pending_bytes: Option<usize>,
-    max_pending_records: Option<usize>,
-    max_pending_transactions: Option<usize>,
-    max_pending_age_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplicationBufferLimitViolation {
-    Bytes {
-        pending_bytes: usize,
-        incoming_bytes: usize,
-        max_pending_bytes: usize,
-    },
-    Records {
-        pending_records: usize,
-        incoming_records: usize,
-        max_pending_records: usize,
-    },
-    Objects {
-        pending_transactions: usize,
-        incoming_transactions: usize,
-        max_pending_transactions: usize,
-    },
-    Age {
-        oldest_pending_age_ms: u64,
-        max_pending_age_ms: u64,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationArrowIpcCompression {
@@ -238,114 +171,6 @@ impl ReplicationArrowIpcCompression {
     }
 }
 
-impl ReplicationBufferLimits {
-    fn enabled(self) -> bool {
-        self.max_pending_bytes.is_some()
-            || self.max_pending_records.is_some()
-            || self.max_pending_transactions.is_some()
-            || self.max_pending_age_ms.is_some()
-    }
-}
-
-impl fmt::Display for ReplicationBufferLimitViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Bytes {
-                pending_bytes,
-                incoming_bytes,
-                max_pending_bytes,
-            } => write!(
-                f,
-                "pending buffer bytes would be {} with incoming {} bytes, above max {} bytes",
-                pending_bytes.saturating_add(*incoming_bytes),
-                incoming_bytes,
-                max_pending_bytes
-            ),
-            Self::Records {
-                pending_records,
-                incoming_records,
-                max_pending_records,
-            } => write!(
-                f,
-                "pending buffer records would be {} with incoming {} records, above max {} records",
-                pending_records.saturating_add(*incoming_records),
-                incoming_records,
-                max_pending_records
-            ),
-            Self::Objects {
-                pending_transactions,
-                incoming_transactions,
-                max_pending_transactions,
-            } => write!(
-                f,
-                "pending buffer objects would be {} with incoming {} object, above max {} objects",
-                pending_transactions.saturating_add(*incoming_transactions),
-                incoming_transactions,
-                max_pending_transactions
-            ),
-            Self::Age {
-                oldest_pending_age_ms,
-                max_pending_age_ms,
-            } => write!(
-                f,
-                "oldest pending transaction age is {oldest_pending_age_ms} ms, above max {max_pending_age_ms} ms"
-            ),
-        }
-    }
-}
-
-fn replication_buffer_limits() -> ReplicationBufferLimits {
-    ReplicationBufferLimits {
-        max_pending_bytes: *REPLICATION_BUFFER_MAX_PENDING_BYTES,
-        max_pending_records: *REPLICATION_BUFFER_MAX_PENDING_RECORDS,
-        max_pending_transactions: *REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-        max_pending_age_ms: *REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
-    }
-}
-
-fn effective_replication_buffer_limits(
-    plan: &ReplicationPipelineRuntimePlan,
-) -> ReplicationBufferLimits {
-    let defaults = replication_buffer_limits();
-    ReplicationBufferLimits {
-        max_pending_bytes: effective_usize_limit(
-            plan.buffer_policy.max_pending_bytes(),
-            defaults.max_pending_bytes,
-        ),
-        max_pending_records: effective_usize_limit(
-            plan.buffer_policy.max_pending_records(),
-            defaults.max_pending_records,
-        ),
-        max_pending_transactions: effective_usize_limit(
-            plan.buffer_policy.max_pending_transactions(),
-            defaults.max_pending_transactions,
-        ),
-        max_pending_age_ms: effective_u64_limit(
-            plan.buffer_policy.max_pending_age_ms(),
-            defaults.max_pending_age_ms,
-        ),
-    }
-}
-
-fn effective_usize_limit(
-    override_value: Option<usize>,
-    default_value: Option<usize>,
-) -> Option<usize> {
-    match override_value {
-        Some(0) => None,
-        Some(value) => Some(value),
-        None => default_value,
-    }
-}
-
-fn effective_u64_limit(override_value: Option<u64>, default_value: Option<u64>) -> Option<u64> {
-    match override_value {
-        Some(0) => None,
-        Some(value) => Some(value),
-        None => default_value,
-    }
-}
-
 fn env_usize_string(name: &str, default_value: &str) -> String {
     std::env::var(name)
         .ok()
@@ -358,22 +183,6 @@ fn env_positive_usize_string(name: &str, default_value: &str) -> String {
         .ok()
         .filter(|value| value.parse::<usize>().is_ok_and(|parsed| parsed > 0))
         .unwrap_or_else(|| default_value.to_string())
-}
-
-fn env_usize_limit(name: &str, default_value: usize) -> Option<usize> {
-    let value = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default_value);
-    (value > 0).then_some(value)
-}
-
-fn env_u64_limit(name: &str, default_value: u64) -> Option<u64> {
-    let value = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default_value);
-    (value > 0).then_some(value)
 }
 
 fn env_bool(name: &str, default_value: bool) -> bool {
@@ -1962,47 +1771,6 @@ fn prepare_replication_buffer_append(
     })
 }
 
-fn log_replication_buffer_backpressure(
-    plan: &ReplicationPipelineRuntimePlan,
-    phase: &str,
-    stats: Option<&CdcBufferStats>,
-    incoming_bytes: usize,
-    incoming_records: usize,
-    limits: ReplicationBufferLimits,
-    violation: ReplicationBufferLimitViolation,
-    delivered_records: Option<usize>,
-) {
-    tracing::warn!(
-        pipeline = %plan.name,
-        source = %plan.source_name,
-        target_kind = target_kind(plan),
-        phase,
-        violation_kind = buffer_limit_violation_kind(violation),
-        violation = %violation,
-        pending_transactions = stats.map(CdcBufferStats::pending_transactions).unwrap_or(0),
-        pending_records = stats.map(CdcBufferStats::pending_records).unwrap_or(0),
-        pending_bytes = stats.map(CdcBufferStats::pending_bytes).unwrap_or(0),
-        oldest_pending_age_ms = stats.and_then(CdcBufferStats::oldest_pending_age_ms),
-        incoming_bytes,
-        incoming_records,
-        delivered_records,
-        max_pending_bytes = limits.max_pending_bytes,
-        max_pending_records = limits.max_pending_records,
-        max_pending_transactions = limits.max_pending_transactions,
-        max_pending_age_ms = limits.max_pending_age_ms,
-        "replication pipeline durable buffer guardrail applying CDC source backpressure"
-    );
-}
-
-fn buffer_limit_violation_kind(violation: ReplicationBufferLimitViolation) -> &'static str {
-    match violation {
-        ReplicationBufferLimitViolation::Bytes { .. } => "pending_bytes",
-        ReplicationBufferLimitViolation::Records { .. } => "pending_records",
-        ReplicationBufferLimitViolation::Objects { .. } => "pending_objects",
-        ReplicationBufferLimitViolation::Age { .. } => "pending_age",
-    }
-}
-
 fn cdc_replication_debug_state_from_snapshots(
     snapshots: Vec<ReplicationPipelineStatusSnapshot>,
 ) -> http_ingest::CdcReplicationDebugState {
@@ -2231,63 +1999,6 @@ fn log_replication_replay_delivery_perf(
     );
 }
 
-fn estimated_buffer_payload_bytes(records: &[CdcBufferRecord]) -> usize {
-    records.iter().fold(16usize, |bytes, record| {
-        bytes
-            .saturating_add(24)
-            .saturating_add(record.byte_len())
-            .saturating_add(record.headers().len().saturating_mul(16))
-    })
-}
-
-fn buffer_limit_violation(
-    pending_transactions: usize,
-    pending_records: usize,
-    pending_bytes: usize,
-    oldest_pending_age_ms: Option<u64>,
-    incoming_bytes: usize,
-    incoming_records: usize,
-    limits: ReplicationBufferLimits,
-) -> Option<ReplicationBufferLimitViolation> {
-    if let Some(max_pending_bytes) = limits.max_pending_bytes
-        && pending_bytes.saturating_add(incoming_bytes) > max_pending_bytes
-    {
-        return Some(ReplicationBufferLimitViolation::Bytes {
-            pending_bytes,
-            incoming_bytes,
-            max_pending_bytes,
-        });
-    }
-    if let Some(max_pending_records) = limits.max_pending_records
-        && pending_records.saturating_add(incoming_records) > max_pending_records
-    {
-        return Some(ReplicationBufferLimitViolation::Records {
-            pending_records,
-            incoming_records,
-            max_pending_records,
-        });
-    }
-    if let Some(max_pending_transactions) = limits.max_pending_transactions
-        && pending_transactions.saturating_add(1) > max_pending_transactions
-    {
-        return Some(ReplicationBufferLimitViolation::Objects {
-            pending_transactions,
-            incoming_transactions: 1,
-            max_pending_transactions,
-        });
-    }
-    if let Some(max_pending_age_ms) = limits.max_pending_age_ms
-        && let Some(oldest_pending_age_ms) = oldest_pending_age_ms
-        && oldest_pending_age_ms > max_pending_age_ms
-    {
-        return Some(ReplicationBufferLimitViolation::Age {
-            oldest_pending_age_ms,
-            max_pending_age_ms,
-        });
-    }
-    None
-}
-
 pub(super) fn replication_pipeline_table_id(
     source_name: &str,
     upstream_table: &str,
@@ -2337,10 +2048,20 @@ fn current_unix_time_ms() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+mod buffer;
 mod encoding;
 mod target_state;
 mod writers;
 
+#[cfg(test)]
+use buffer::{
+    ReplicationBufferLimitViolation, ReplicationBufferLimits, effective_u64_limit,
+    effective_usize_limit,
+};
+use buffer::{
+    buffer_limit_violation, effective_replication_buffer_limits, estimated_buffer_payload_bytes,
+    log_replication_buffer_backpressure,
+};
 use target_state::{
     dead_letter_target_state, dead_lettered_target_state, delivered_target_state,
     direct_dead_lettered_target_state, direct_delivered_target_state, failed_target_state,
