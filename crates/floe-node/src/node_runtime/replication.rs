@@ -9,8 +9,8 @@ use floe_cdc_core::{
     TransactionBatch,
 };
 use floe_storage::{
-    CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage, CdcBufferRecord,
-    CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, SlateCatalog,
+    CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferRecord, CdcBufferStore,
+    CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, SlateCatalog,
 };
 use futures::future::join_all;
 
@@ -910,81 +910,7 @@ impl ReplicationPipelineRuntime {
         let mut delivered_transactions = 0usize;
         for manifest in pending {
             attempted_transactions = attempted_transactions.saturating_add(1);
-            let payload_load_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
-            let records = match manifest.payload_format() {
-                CdcBufferPayloadFormat::KafkaRecords => {
-                    let records = buffer_store.records(&manifest).await.with_context(|| {
-                        format!(
-                            "load replication pipeline '{}' buffered payloads",
-                            plan.name
-                        )
-                    })?;
-                    if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
-                        crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
-                    }
-                    records
-                }
-                CdcBufferPayloadFormat::ChangeBatches => {
-                    anyhow::ensure!(
-                        plan.format == ReplicationPipelineRuntimeFormat::FloeJson,
-                        "replication pipeline '{}' cannot replay change batch buffer payloads for {:?}",
-                        plan.name,
-                        plan.format
-                    );
-                    let batches =
-                        buffer_store
-                            .change_batches(&manifest)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "load replication pipeline '{}' buffered change batches",
-                                    plan.name
-                                )
-                            })?;
-                    if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
-                        crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
-                    }
-                    let payload_load_elapsed = payload_load_started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    let encode_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
-                    let mut records = encoding::encode_floe_json_buffered_change_batches(
-                        plan,
-                        &plan.schema,
-                        &batches,
-                    )?;
-                    encoding::add_replication_record_metadata(
-                        plan,
-                        manifest.source_position(),
-                        manifest.transaction_id(),
-                        &mut records,
-                        0,
-                    );
-                    let encode_elapsed = encode_started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    log_replication_replay_payload_perf(
-                        plan,
-                        &manifest,
-                        payload_load_elapsed,
-                        encode_elapsed,
-                        records.len(),
-                    );
-                    records
-                }
-            };
-            if manifest.payload_format() == CdcBufferPayloadFormat::KafkaRecords {
-                let payload_load_elapsed = payload_load_started_at
-                    .map(|started_at| started_at.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                log_replication_replay_payload_perf(
-                    plan,
-                    &manifest,
-                    payload_load_elapsed,
-                    Duration::ZERO,
-                    records.len(),
-                );
-            }
+            let records = replay::load_manifest_records(plan, buffer_store, &manifest).await?;
             let delivery_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
             let delivered = self
                 .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
@@ -1621,6 +1547,7 @@ mod buffer;
 mod dead_letter;
 mod encoding;
 mod perf;
+mod replay;
 mod status;
 mod target_state;
 mod writers;
@@ -1639,7 +1566,7 @@ use dead_letter::persist_dead_letter_records;
 use perf::{
     log_replication_buffer_append_perf, log_replication_direct_delivery_perf,
     log_replication_kafka_send_perf, log_replication_pipeline_perf,
-    log_replication_replay_delivery_perf, log_replication_replay_payload_perf,
+    log_replication_replay_delivery_perf,
 };
 use status::{
     ReplicationPipelineStatusSnapshot, cdc_replication_debug_state_from_snapshots,
