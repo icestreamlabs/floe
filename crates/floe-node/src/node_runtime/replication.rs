@@ -207,94 +207,6 @@ pub(super) struct ReplicationPipelineRuntime {
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ReplicationPipelineStatusSnapshot {
-    pipeline_name: String,
-    source_name: String,
-    schema_evolution_policy: String,
-    error_policy: String,
-    target_kind: String,
-    checkpoint_position: Option<CdcSourcePosition>,
-    checkpoint_lsn_bytes: Option<u64>,
-    checkpoint_transaction_id: Option<CdcTransactionId>,
-    target_state: std::collections::BTreeMap<String, String>,
-    pending_transactions: usize,
-    pending_records: usize,
-    pending_bytes: usize,
-    oldest_pending_age_ms: Option<u64>,
-    replaying: bool,
-    source_backpressure_active: bool,
-    last_error: Option<String>,
-}
-
-#[allow(dead_code)]
-impl ReplicationPipelineStatusSnapshot {
-    pub(super) fn pipeline_name(&self) -> &str {
-        &self.pipeline_name
-    }
-
-    pub(super) fn source_name(&self) -> &str {
-        &self.source_name
-    }
-
-    pub(super) fn schema_evolution_policy(&self) -> &str {
-        &self.schema_evolution_policy
-    }
-
-    pub(super) fn error_policy(&self) -> &str {
-        &self.error_policy
-    }
-
-    pub(super) fn target_kind(&self) -> &str {
-        &self.target_kind
-    }
-
-    pub(super) fn checkpoint_position(&self) -> Option<&CdcSourcePosition> {
-        self.checkpoint_position.as_ref()
-    }
-
-    pub(super) fn checkpoint_lsn_bytes(&self) -> Option<u64> {
-        self.checkpoint_lsn_bytes
-    }
-
-    pub(super) fn checkpoint_transaction_id(&self) -> Option<&CdcTransactionId> {
-        self.checkpoint_transaction_id.as_ref()
-    }
-
-    pub(super) fn target_state(&self) -> &std::collections::BTreeMap<String, String> {
-        &self.target_state
-    }
-
-    pub(super) fn pending_transactions(&self) -> usize {
-        self.pending_transactions
-    }
-
-    pub(super) fn pending_records(&self) -> usize {
-        self.pending_records
-    }
-
-    pub(super) fn pending_bytes(&self) -> usize {
-        self.pending_bytes
-    }
-
-    pub(super) fn oldest_pending_age_ms(&self) -> Option<u64> {
-        self.oldest_pending_age_ms
-    }
-
-    pub(super) fn replaying(&self) -> bool {
-        self.replaying
-    }
-
-    pub(super) fn source_backpressure_active(&self) -> bool {
-        self.source_backpressure_active
-    }
-
-    pub(super) fn last_error(&self) -> Option<&str> {
-        self.last_error.as_deref()
-    }
-}
-
 struct PreparedReplicationBufferAppend {
     append: CdcBufferAppend,
     target_records: Option<Vec<CdcBufferRecord>>,
@@ -1771,69 +1683,6 @@ fn prepare_replication_buffer_append(
     })
 }
 
-fn cdc_replication_debug_state_from_snapshots(
-    snapshots: Vec<ReplicationPipelineStatusSnapshot>,
-) -> http_ingest::CdcReplicationDebugState {
-    http_ingest::CdcReplicationDebugState {
-        updated_at_unix_ms: current_unix_time_ms(),
-        refresh_error: None,
-        postgres_sources: Vec::new(),
-        pipelines: snapshots
-            .into_iter()
-            .map(|snapshot| http_ingest::CdcReplicationDebugPipelineState {
-                pipeline: snapshot.pipeline_name().to_string(),
-                source: snapshot.source_name().to_string(),
-                schema_evolution_policy: snapshot.schema_evolution_policy().to_string(),
-                error_policy: snapshot.error_policy().to_string(),
-                target_kind: snapshot.target_kind().to_string(),
-                checkpoint_position: snapshot
-                    .checkpoint_position()
-                    .map(encoding::source_position_key),
-                checkpoint_lsn_bytes: snapshot.checkpoint_lsn_bytes(),
-                checkpoint_lag_bytes: None,
-                checkpoint_transaction_id: snapshot
-                    .checkpoint_transaction_id()
-                    .map(|transaction_id| transaction_id.as_str().to_string()),
-                target_state: snapshot.target_state().clone(),
-                pending_transactions: snapshot.pending_transactions(),
-                pending_objects: snapshot.pending_transactions(),
-                pending_records: snapshot.pending_records(),
-                pending_bytes: snapshot.pending_bytes(),
-                oldest_pending_age_ms: snapshot.oldest_pending_age_ms(),
-                replaying: snapshot.replaying(),
-                source_backpressure_active: snapshot.source_backpressure_active(),
-                last_error: snapshot.last_error().map(str::to_string),
-            })
-            .collect(),
-    }
-}
-
-fn postgres_position_lsn_bytes(position: &CdcSourcePosition) -> Option<u64> {
-    let CdcSourcePosition::Postgres { commit_lsn, .. } = position else {
-        return None;
-    };
-    PostgresLsn::parse(commit_lsn).ok().map(|lsn| lsn.as_u64())
-}
-
-fn enrich_pipeline_checkpoint_lag(state: &mut http_ingest::CdcReplicationDebugState) {
-    let upstream_lsn_by_source = state
-        .postgres_sources
-        .iter()
-        .filter_map(|source| {
-            source
-                .upstream_lsn_bytes
-                .map(|upstream_lsn| (source.source.as_str(), upstream_lsn))
-        })
-        .collect::<HashMap<_, _>>();
-    for pipeline in &mut state.pipelines {
-        pipeline.checkpoint_lag_bytes = pipeline.checkpoint_lsn_bytes.and_then(|checkpoint_lsn| {
-            upstream_lsn_by_source
-                .get(pipeline.source.as_str())
-                .map(|upstream_lsn| upstream_lsn.saturating_sub(checkpoint_lsn))
-        });
-    }
-}
-
 async fn record_buffer_stats(
     buffer_store: &CdcBufferStore,
     pipeline_name: &str,
@@ -2050,6 +1899,7 @@ fn current_unix_time_ms() -> u64 {
 
 mod buffer;
 mod encoding;
+mod status;
 mod target_state;
 mod writers;
 
@@ -2061,6 +1911,10 @@ use buffer::{
 use buffer::{
     buffer_limit_violation, effective_replication_buffer_limits, estimated_buffer_payload_bytes,
     log_replication_buffer_backpressure,
+};
+use status::{
+    ReplicationPipelineStatusSnapshot, cdc_replication_debug_state_from_snapshots,
+    enrich_pipeline_checkpoint_lag, postgres_position_lsn_bytes,
 };
 use target_state::{
     dead_letter_target_state, dead_lettered_target_state, delivered_target_state,
