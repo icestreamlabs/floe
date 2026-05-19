@@ -8,8 +8,8 @@ use super::writers::{
 };
 use super::*;
 use floe_cdc_core::{
-    CdcChange, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey, CdcRow,
-    CdcRowKey, CdcTransactionId, UpstreamTableRef,
+    CdcChange, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey, CdcRow, CdcRowKey,
+    CdcTransactionId, UpstreamTableRef,
 };
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
