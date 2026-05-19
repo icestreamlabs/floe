@@ -5,13 +5,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::CompressionType;
 use floe_cdc_core::{
-    CdcCheckpoint, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId,
-    ChangeBatch, TransactionBatch,
+    CdcCheckpoint, CdcSourceId, CdcTableId, CdcTableSchema, CdcTransactionId, ChangeBatch,
+    TransactionBatch,
 };
 use floe_storage::{
     CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage, CdcBufferRecord,
-    CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
-    ReplicationPipelineDlqEntry, SlateCatalog, encode_cdc_buffer_records_payload,
+    CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, SlateCatalog,
 };
 use futures::future::join_all;
 
@@ -578,16 +577,15 @@ impl ReplicationPipelineRuntime {
                 if !replication_pipeline_uses_dlq(plan) {
                     return Err(err);
                 }
-                let dlq_entry = self
-                    .persist_dead_letter_records(
-                        plan,
-                        storage,
-                        transaction.commit_position(),
-                        transaction.transaction_id(),
-                        &buffered_records,
-                        &err,
-                    )
-                    .await?;
+                let dlq_entry = persist_dead_letter_records(
+                    plan,
+                    storage,
+                    transaction.commit_position(),
+                    transaction.transaction_id(),
+                    &buffered_records,
+                    &err,
+                )
+                .await?;
                 storage
                     .put_replication_pipeline_checkpoint(ReplicationPipelineCheckpoint::new(
                         &plan.name,
@@ -781,16 +779,15 @@ impl ReplicationPipelineRuntime {
                 Err(err) => {
                     self.record_target_write_failure(plan, &err);
                     if replication_pipeline_uses_dlq(plan) {
-                        let dlq_entry = self
-                            .persist_dead_letter_records(
-                                plan,
-                                storage,
-                                transaction.commit_position(),
-                                transaction.transaction_id(),
-                                prepared_append.target_records(),
-                                &err,
-                            )
-                            .await?;
+                        let dlq_entry = persist_dead_letter_records(
+                            plan,
+                            storage,
+                            transaction.commit_position(),
+                            transaction.transaction_id(),
+                            prepared_append.target_records(),
+                            &err,
+                        )
+                        .await?;
                         storage
                             .put_replication_pipeline_checkpoint(
                                 ReplicationPipelineCheckpoint::new(
@@ -1313,16 +1310,15 @@ impl ReplicationPipelineRuntime {
         records: &[CdcBufferRecord],
         err: &anyhow::Error,
     ) -> anyhow::Result<usize> {
-        let dlq_entry = self
-            .persist_dead_letter_records(
-                plan,
-                storage,
-                manifest.source_position(),
-                manifest.transaction_id(),
-                records,
-                err,
-            )
-            .await?;
+        let dlq_entry = persist_dead_letter_records(
+            plan,
+            storage,
+            manifest.source_position(),
+            manifest.transaction_id(),
+            records,
+            err,
+        )
+        .await?;
         let dead_lettered_at = current_unix_time_ms();
         buffer_store
             .mark_delivered(manifest, dead_lettered_at)
@@ -1350,67 +1346,6 @@ impl ReplicationPipelineRuntime {
                 )
             })?;
         Ok(manifest.record_count())
-    }
-
-    async fn persist_dead_letter_records(
-        &self,
-        plan: &ReplicationPipelineRuntimePlan,
-        storage: &SlateCatalog,
-        source_position: &CdcSourcePosition,
-        transaction_id: Option<&CdcTransactionId>,
-        records: &[CdcBufferRecord],
-        err: &anyhow::Error,
-    ) -> anyhow::Result<ReplicationPipelineDlqEntry> {
-        let dlq_id = replication_pipeline_dlq_id(source_position, transaction_id);
-        let payload = encode_cdc_buffer_records_payload(records)
-            .context("encode replication pipeline DLQ payload")?;
-        let payload_bytes = payload.len();
-        let payload_object_key = storage
-            .put_replication_pipeline_dlq_payload(&plan.name, &dlq_id, payload)
-            .await
-            .with_context(|| {
-                format!(
-                    "persist replication pipeline '{}' dead-letter payload",
-                    plan.name
-                )
-            })?;
-        let entry = ReplicationPipelineDlqEntry::new(
-            &plan.name,
-            dlq_id,
-            &plan.source_name,
-            source_position.clone(),
-            transaction_id.cloned(),
-            format!("{}_delivery", target_kind(plan)),
-            format!("{err:#}"),
-            1,
-            Some(payload_object_key),
-            Some("kafka_records".to_string()),
-            payload_bytes,
-            dead_letter_target_state(plan, err),
-            current_unix_time_ms(),
-        )?;
-        storage
-            .put_replication_pipeline_dlq_entry(entry.clone())
-            .await
-            .with_context(|| {
-                format!(
-                    "persist replication pipeline '{}' dead-letter entry",
-                    plan.name
-                )
-            })?;
-        tracing::warn!(
-            pipeline = %plan.name,
-            source = %plan.source_name,
-            target_kind = target_kind(plan),
-            dlq_id = %entry.dlq_id(),
-            records = records.len(),
-            payload_bytes = entry.payload_bytes(),
-            source_position = %encoding::source_position_key(source_position),
-            transaction_id = transaction_id.map(CdcTransactionId::as_str),
-            error = %err,
-            "replication pipeline target write dead-lettered"
-        );
-        Ok(entry)
     }
 
     fn record_target_write_failure(
@@ -1683,6 +1618,7 @@ fn current_unix_time_ms() -> u64 {
 }
 
 mod buffer;
+mod dead_letter;
 mod encoding;
 mod perf;
 mod status;
@@ -1699,6 +1635,7 @@ use buffer::{
     estimated_buffer_payload_bytes, log_replication_buffer_backpressure,
     prepare_replication_buffer_append, record_buffer_stats,
 };
+use dead_letter::persist_dead_letter_records;
 use perf::{
     log_replication_buffer_append_perf, log_replication_direct_delivery_perf,
     log_replication_kafka_send_perf, log_replication_pipeline_perf,
@@ -1709,10 +1646,9 @@ use status::{
     enrich_pipeline_checkpoint_lag, postgres_position_lsn_bytes,
 };
 use target_state::{
-    dead_letter_target_state, dead_lettered_target_state, delivered_target_state,
-    direct_dead_lettered_target_state, direct_delivered_target_state, failed_target_state,
-    pending_target_state, replication_pipeline_dlq_id, replication_pipeline_uses_dlq, target_kind,
-    truncate_target_error,
+    dead_lettered_target_state, delivered_target_state, direct_dead_lettered_target_state,
+    direct_delivered_target_state, failed_target_state, pending_target_state,
+    replication_pipeline_uses_dlq, target_kind, truncate_target_error,
 };
 
 #[cfg(test)]
