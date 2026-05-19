@@ -2484,7 +2484,7 @@ fn quote_pg_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use floe_cdc_core::{CdcColumn, CdcPrimaryKey, UpstreamTableRef};
+    use floe_cdc_core::{CdcChange, CdcColumn, CdcPrimaryKey, UpstreamTableRef};
     use floe_core::RowValue;
     use floe_core::catalog::ColumnType;
     use std::sync::Arc;

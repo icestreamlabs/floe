@@ -1,4 +1,38 @@
-use super::*;
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use arrow_array::builder::{
+    BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder, StringBuilder,
+    TimestampMillisecondBuilder,
+};
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+use arrow_ipc::MetadataVersion;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use floe_cdc_core::{
+    CdcChange, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourceId,
+    CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId, ChangeBatch, TransactionBatch,
+};
+use floe_core::RowValue;
+use floe_core::catalog::ColumnType;
+use floe_node_core::debezium_encoder::{
+    DebeziumEncodeContext, DebeziumEncodedRecord, DebeziumEnvelopeConfig, encode_debezium_change,
+    encode_debezium_snapshot_row,
+};
+use floe_storage::CdcBufferRecord;
+use rayon::prelude::*;
+
+use super::super::{ReplicationPipelineRuntimeFormat, ReplicationPipelineRuntimePlan};
+use super::{
+    FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE, FLOE_HEADER_RECORD_SEQUENCE,
+    FLOE_HEADER_SOURCE, FLOE_HEADER_SOURCE_POSITION, FLOE_HEADER_SOURCE_TABLE,
+    FLOE_HEADER_TRANSACTION_ID, FLOE_JSON_DELETED_FIELD, FLOE_JSON_PARALLEL_RECORD_THRESHOLD,
+    FLOE_JSON_VERSION, FLOE_JSON_VERSION_FIELD, REPLICATION_ARROW_IPC_COMPRESSION,
+    REPLICATION_ARROW_IPC_ROWS_PER_RECORD, REPLICATION_KAFKA_METADATA_HEADERS,
+    REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK,
+};
 
 pub(super) fn encode_pipeline_transaction_records(
     plan: &ReplicationPipelineRuntimePlan,

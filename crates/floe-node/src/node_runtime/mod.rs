@@ -15,8 +15,8 @@ use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
-    CdcChange, CdcCheckpoint, CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema,
-    ChangeBatch, TransactionBatch, UpstreamTableRef,
+    CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, ChangeBatch,
+    TransactionBatch, UpstreamTableRef,
 };
 use floe_cdc_pg::{
     PostgresCdcConfig, PostgresLsn, PostgresReplicationClient, PostgresReplicationEvent,

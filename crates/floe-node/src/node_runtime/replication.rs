@@ -1,28 +1,13 @@
 use super::*;
 
-use std::ffi::{CString, c_void};
 use std::fmt;
-use std::io::Write as _;
-use std::ptr;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder, StringBuilder,
-    TimestampMillisecondBuilder,
-};
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
-use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
-use arrow_ipc::{CompressionType, MetadataVersion};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_ipc::CompressionType;
 use floe_cdc_core::{
-    CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourcePosition, CdcTransactionId,
-};
-use floe_core::RowValue;
-use floe_node_core::debezium_encoder::{
-    DebeziumEncodeContext, DebeziumEncodedRecord, DebeziumEnvelopeConfig, encode_debezium_change,
-    encode_debezium_snapshot_row,
+    CdcCheckpoint, CdcSourceId, CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId,
+    ChangeBatch, TransactionBatch,
 };
 use floe_storage::{
     CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferPayloadFormat, CdcBufferPayloadStorage,
@@ -31,15 +16,6 @@ use floe_storage::{
     encode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
-use rayon::prelude::*;
-use rdkafka::ClientConfig;
-use rdkafka::bindings as rdsys;
-use rdkafka::client::ClientContext;
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::{Header, Message, OwnedHeaders};
-use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
-use rdkafka::types::RDKafkaTopic;
-use tokio_postgres::types::ToSql;
 
 const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;

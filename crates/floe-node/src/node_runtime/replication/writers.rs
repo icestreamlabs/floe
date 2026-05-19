@@ -1,4 +1,34 @@
-use super::*;
+use std::collections::HashSet;
+use std::ffi::{CString, c_void};
+use std::ptr;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, anyhow};
+use floe_cdc_core::{CdcColumn, CdcTableSchema};
+use floe_core::catalog::ColumnType;
+use floe_storage::CdcBufferRecord;
+use rdkafka::ClientConfig;
+use rdkafka::bindings as rdsys;
+use rdkafka::client::ClientContext;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use rdkafka::message::{Header, Message, OwnedHeaders};
+use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
+use rdkafka::types::RDKafkaTopic;
+use tokio_postgres::types::ToSql;
+
+use super::super::ReplicationPipelineRuntimeBufferMode;
+use super::{
+    CDC_PERF_LOGGING_ENABLED, FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_ACKS,
+    REPLICATION_KAFKA_BATCH_NUM_MESSAGES, REPLICATION_KAFKA_BATCH_SIZE,
+    REPLICATION_KAFKA_ENABLE_IDEMPOTENCE, REPLICATION_KAFKA_LINGER_MS,
+    REPLICATION_KAFKA_MESSAGE_MAX_BYTES, REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES,
+    REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS, REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT,
+    REPLICATION_KAFKA_QUEUE_MAX_KBYTES, REPLICATION_KAFKA_QUEUE_MAX_MESSAGES,
+    REPLICATION_KAFKA_RETRY_ATTEMPTS, REPLICATION_KAFKA_RETRY_BASE_MS,
+    REPLICATION_KAFKA_SEND_TIMEOUT, encoding, log_replication_kafka_send_perf,
+};
 
 pub(super) struct KafkaReplicationPipelineWriter {
     producer: ThreadedProducer<KafkaReplicationPipelineContext>,
