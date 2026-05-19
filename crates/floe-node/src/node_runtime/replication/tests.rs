@@ -2,6 +2,7 @@ use super::encoding::{
     encode_debezium_pipeline_records, encode_pipeline_buffer_records,
     encode_pipeline_transaction_records, encode_pipeline_transaction_records_with_metadata,
 };
+use super::target_state::{delivered_target_state, failed_target_state};
 use super::writers::{
     PostgresParamValue, PostgresReplicationPipelineWriter, parse_floe_json_record_key,
     parse_floe_json_record_value, postgres_key_params_from_json, postgres_row_params_from_json,
