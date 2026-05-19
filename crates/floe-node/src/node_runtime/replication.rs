@@ -4,10 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::CompressionType;
-use floe_cdc_core::{
-    CdcCheckpoint, CdcSourceId, CdcTableId, CdcTableSchema, CdcTransactionId, ChangeBatch,
-    TransactionBatch,
-};
+use floe_cdc_core::{CdcSourceId, CdcTableId, CdcTableSchema, CdcTransactionId, TransactionBatch};
 #[cfg(test)]
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
@@ -1057,93 +1054,6 @@ impl ReplicationPipelineRuntime {
     }
 }
 
-fn ordered_replication_plans_for_transaction<'a>(
-    plans: &'a [ReplicationPipelineRuntimePlan],
-    transaction: &TransactionBatch,
-) -> Vec<&'a ReplicationPipelineRuntimePlan> {
-    let mut ordered = plans.iter().collect::<Vec<_>>();
-    if ordered.len() <= 1 || !replication_pipeline_targets_are_distinct(plans) {
-        return ordered;
-    }
-    ordered.sort_by(|left, right| {
-        transaction_change_count_for_table(transaction, &right.table_id).cmp(
-            &transaction_change_count_for_table(transaction, &left.table_id),
-        )
-    });
-    ordered
-}
-
-fn replication_pipeline_targets_are_distinct(plans: &[ReplicationPipelineRuntimePlan]) -> bool {
-    let mut targets = HashSet::with_capacity(plans.len());
-    plans
-        .iter()
-        .all(|plan| targets.insert(replication_pipeline_target_identity(plan)))
-}
-
-fn replication_pipeline_target_identity(plan: &ReplicationPipelineRuntimePlan) -> String {
-    match &plan.target {
-        ReplicationPipelineRuntimeTarget::Kafka { brokers, topic } => {
-            format!("kafka\0{brokers}\0{topic}")
-        }
-        ReplicationPipelineRuntimeTarget::Postgres { connection, table } => {
-            format!("postgres\0{connection}\0{table}")
-        }
-    }
-}
-
-fn transaction_change_count_for_table(
-    transaction: &TransactionBatch,
-    table_id: &CdcTableId,
-) -> usize {
-    transaction
-        .change_batches()
-        .iter()
-        .filter(|batch| batch.table_id() == table_id)
-        .map(ChangeBatch::change_count)
-        .sum()
-}
-
-pub(super) fn replication_pipeline_table_id(
-    source_name: &str,
-    upstream_table: &str,
-) -> anyhow::Result<CdcTableId> {
-    CdcTableId::new(format!("{source_name}:{upstream_table}"))
-}
-
-pub(super) fn materialized_transaction(
-    source_id: &CdcSourceId,
-    materialized_table_ids: &HashSet<CdcTableId>,
-    transaction: &TransactionBatch,
-) -> anyhow::Result<Option<TransactionBatch>> {
-    let change_batches = transaction
-        .change_batches()
-        .iter()
-        .filter(|batch| materialized_table_ids.contains(batch.table_id()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if change_batches.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(TransactionBatch::new(
-        source_id.clone(),
-        transaction.transaction_id().cloned(),
-        transaction.start_position().cloned(),
-        transaction.commit_position().clone(),
-        change_batches,
-    )?))
-}
-
-pub(super) fn pipeline_checkpoint_from_transaction(
-    transaction: &TransactionBatch,
-) -> CdcCheckpoint {
-    CdcCheckpoint::new(
-        transaction.source_id().clone(),
-        transaction.commit_position().clone(),
-        transaction.transaction_id().cloned(),
-    )
-    .with_schema_versions(transaction.schema_versions().clone())
-}
-
 fn current_unix_time_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1158,6 +1068,7 @@ mod dead_letter;
 mod delivery;
 mod encoding;
 mod perf;
+mod plan_helpers;
 mod replay;
 mod runtime_state;
 mod status;
@@ -1179,6 +1090,12 @@ use perf::{
     log_replication_buffer_append_perf, log_replication_direct_delivery_perf,
     log_replication_kafka_send_perf, log_replication_pipeline_perf,
     log_replication_replay_delivery_perf,
+};
+pub(super) use plan_helpers::{
+    materialized_transaction, pipeline_checkpoint_from_transaction, replication_pipeline_table_id,
+};
+use plan_helpers::{
+    ordered_replication_plans_for_transaction, replication_pipeline_targets_are_distinct,
 };
 use runtime_state::ReplicationReplayStateGuard;
 use status::{
