@@ -193,27 +193,6 @@ pub(super) struct ReplicationPipelineRuntime {
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
 }
 
-struct ReplicationReplayStateGuard<'a> {
-    runtime: &'a ReplicationPipelineRuntime,
-    pipeline_name: String,
-}
-
-impl<'a> ReplicationReplayStateGuard<'a> {
-    fn new(runtime: &'a ReplicationPipelineRuntime, pipeline_name: &str) -> Self {
-        runtime.set_replay_state(pipeline_name, true);
-        Self {
-            runtime,
-            pipeline_name: pipeline_name.to_string(),
-        }
-    }
-}
-
-impl Drop for ReplicationReplayStateGuard<'_> {
-    fn drop(&mut self) {
-        self.runtime.set_replay_state(&self.pipeline_name, false);
-    }
-}
-
 impl ReplicationPipelineRuntime {
     pub(super) fn new(
         plans: impl IntoIterator<Item = ReplicationPipelineRuntimePlan>,
@@ -1076,60 +1055,6 @@ impl ReplicationPipelineRuntime {
         self.set_source_backpressure_state(&plan.name, false);
         Ok(())
     }
-
-    fn set_replay_state(&self, pipeline_name: &str, replaying: bool) {
-        crate::metrics::record_cdc_replication_replaying(pipeline_name, replaying);
-        match self.replay_state_by_pipeline.lock() {
-            Ok(mut state) => {
-                state.insert(pipeline_name.to_string(), replaying);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    pipeline = %pipeline_name,
-                    replaying,
-                    "replication pipeline replay state lock poisoned"
-                );
-            }
-        }
-    }
-
-    fn set_source_backpressure_state(&self, pipeline_name: &str, active: bool) {
-        crate::metrics::record_cdc_buffer_source_backpressure_active(pipeline_name, active);
-        match self.backpressure_state_by_pipeline.lock() {
-            Ok(mut state) => {
-                state.insert(pipeline_name.to_string(), active);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    pipeline = %pipeline_name,
-                    active,
-                    "replication pipeline backpressure state lock poisoned"
-                );
-            }
-        }
-    }
-
-    fn set_last_target_error(&self, pipeline_name: &str, error: String) {
-        crate::metrics::record_cdc_replication_target_error(pipeline_name, true);
-        match self.last_target_error_by_pipeline.lock() {
-            Ok(mut errors) => {
-                errors.insert(pipeline_name.to_string(), truncate_target_error(&error));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    pipeline = %pipeline_name,
-                    "replication pipeline target error state lock poisoned"
-                );
-            }
-        }
-    }
-
-    fn clear_last_target_error(&self, pipeline_name: &str) {
-        crate::metrics::record_cdc_replication_target_error(pipeline_name, false);
-        if let Ok(mut errors) = self.last_target_error_by_pipeline.lock() {
-            errors.remove(pipeline_name);
-        }
-    }
 }
 
 fn ordered_replication_plans_for_transaction<'a>(
@@ -1234,6 +1159,7 @@ mod delivery;
 mod encoding;
 mod perf;
 mod replay;
+mod runtime_state;
 mod status;
 mod target_state;
 mod writers;
@@ -1254,13 +1180,14 @@ use perf::{
     log_replication_kafka_send_perf, log_replication_pipeline_perf,
     log_replication_replay_delivery_perf,
 };
+use runtime_state::ReplicationReplayStateGuard;
 use status::{
     ReplicationPipelineStatusSnapshot, cdc_replication_debug_state_from_snapshots,
     enrich_pipeline_checkpoint_lag, postgres_position_lsn_bytes,
 };
 use target_state::{
     direct_dead_lettered_target_state, direct_delivered_target_state, pending_target_state,
-    replication_pipeline_uses_dlq, target_kind, truncate_target_error,
+    replication_pipeline_uses_dlq, target_kind,
 };
 
 #[cfg(test)]
