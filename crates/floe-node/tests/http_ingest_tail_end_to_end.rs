@@ -1,9 +1,12 @@
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use anyhow::{Context, Result, bail};
+use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -165,12 +168,6 @@ async fn wait_for_tail_rows(path: &Path) -> Result<Vec<Value>> {
         "tail sink output never appeared in {}",
         path.to_string_lossy()
     )
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind to ephemeral port")?;
-    let port = listener.local_addr().context("read ephemeral port")?.port();
-    Ok(port)
 }
 
 fn temp_path(name: &str) -> PathBuf {

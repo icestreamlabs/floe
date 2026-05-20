@@ -1,13 +1,16 @@
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[path = "support/ports.rs"]
+mod ports;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use ports::find_unused_port;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -1901,9 +1904,4 @@ async fn read_rows(path: &Path) -> Result<Vec<Value>> {
         rows.push(serde_json::from_str::<Value>(line).context("parse jsonl row")?);
     }
     Ok(rows)
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    Ok(listener.local_addr().context("read ephemeral port")?.port())
 }

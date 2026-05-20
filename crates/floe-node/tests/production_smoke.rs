@@ -1,9 +1,12 @@
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use anyhow::{Context, Result, bail};
+use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -553,11 +556,6 @@ async fn read_rows(path: &Path) -> Result<Vec<Value>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind to ephemeral port")?;
-    Ok(listener.local_addr().context("read ephemeral port")?.port())
 }
 
 #[allow(dead_code)]

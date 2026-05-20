@@ -1,9 +1,12 @@
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use anyhow::{Context, Result, bail};
+use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::json;
 use tokio::process::Command;
@@ -160,12 +163,6 @@ async fn admin_healthz_is_available_without_http_ingest() -> Result<()> {
     let _ = child.wait().await;
     let _ = std::fs::remove_file(&config_path);
     test_result
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind to ephemeral port")?;
-    let port = listener.local_addr().context("read ephemeral port")?.port();
-    Ok(port)
 }
 
 fn temp_path(name: &str) -> PathBuf {

@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[path = "ports.rs"]
+mod ports;
 
 use anyhow::{Context, Result, bail};
 use futures::TryStreamExt;
@@ -23,6 +25,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+use ports::find_unused_port;
 
 pub(crate) const BID_ROW_COUNT: usize = 1_000_000;
 pub(crate) const JOIN_AUCTION_ROW_COUNT: usize = 10_000;
@@ -1639,11 +1643,6 @@ fn mix_string(mut acc: i128, value: &str) -> i128 {
         acc = mix(acc, i128::from(*byte));
     }
     mix(acc, 31)
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    Ok(listener.local_addr().context("read ephemeral port")?.port())
 }
 
 fn read_log_tail(path: &Path, max_lines: usize) -> Result<String> {

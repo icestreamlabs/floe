@@ -1,8 +1,11 @@
-use std::net::TcpListener;
 use std::process::Stdio;
 use std::time::Duration;
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use anyhow::{Context, Result, anyhow, bail};
+use ports::find_unused_port;
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -100,10 +103,4 @@ async fn wait_for_bid_rows(client: &tokio_postgres::Client) -> Result<Vec<tokio_
         }
     }
     Err(anyhow!("timed out waiting for rows from {sql}"))
-}
-
-fn find_unused_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind to ephemeral port")?;
-    let port = listener.local_addr().context("read ephemeral port")?.port();
-    Ok(port)
 }
