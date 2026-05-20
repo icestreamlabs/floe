@@ -8,12 +8,20 @@ use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, Error as SlateError, WriteBatch};
 
-use crate::object_payload::{
-    delete_payload_object_if_exists, hex_component, load_payload_object,
-    push_length_prefixed_component, put_payload_object,
+mod keys;
+
+#[cfg(test)]
+use keys::payload_key;
+use keys::{
+    delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_blob_key,
+    payload_object_key, payload_prefix, pending_manifest_key, pending_manifest_prefix,
+    source_frontier_key, transaction_key,
 };
 
-const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
+use crate::object_payload::{
+    delete_payload_object_if_exists, load_payload_object, put_payload_object,
+};
+
 const CDC_BUFFER_PAYLOAD_MAGIC_V1: &[u8; 8] = b"FCDCBUF1";
 const CDC_BUFFER_PAYLOAD_MAGIC: &[u8; 8] = b"FCDCBUF2";
 const CDC_BUFFER_CHANGE_BATCHES_MAGIC: &[u8; 8] = b"FCDCBCH1";
@@ -1031,122 +1039,6 @@ fn prefix_bounds(prefix: &[u8]) -> Range<Vec<u8>> {
     let mut end = prefix.to_vec();
     end.push(0xFF);
     prefix.to_vec()..end
-}
-
-fn source_frontier_key(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"frontier/source");
-    key
-}
-
-fn delivery_frontier_key(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"frontier/delivery");
-    key
-}
-
-fn pending_manifest_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"pending/");
-    key
-}
-
-fn pending_manifest_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pending_manifest_prefix(pipeline_name);
-    key.extend_from_slice(transaction_key.as_bytes());
-    key
-}
-
-fn delivered_manifest_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"delivered/");
-    key
-}
-
-fn delivered_manifest_key(
-    pipeline_name: &str,
-    delivered_at_unix_ms: u64,
-    transaction_key: &str,
-) -> Vec<u8> {
-    let mut key = delivered_manifest_prefix(pipeline_name);
-    key.extend_from_slice(format!("{delivered_at_unix_ms:020}/").as_bytes());
-    key.extend_from_slice(transaction_key.as_bytes());
-    key
-}
-
-fn payload_prefix(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"payload/");
-    key.extend_from_slice(transaction_key.as_bytes());
-    key.extend_from_slice(b"/");
-    key
-}
-
-fn payload_blob_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"payload_blob/");
-    key.extend_from_slice(transaction_key.as_bytes());
-    key
-}
-
-fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> String {
-    format!(
-        "floe_cdc_buffer_blobs/v1/pipeline/{}/{}.bin",
-        hex_component(pipeline_name.as_bytes()),
-        transaction_key
-    )
-}
-
-#[cfg(test)]
-fn payload_key(pipeline_name: &str, transaction_key: &str, record_idx: usize) -> Vec<u8> {
-    let mut key = payload_prefix(pipeline_name, transaction_key);
-    key.extend_from_slice(format!("{record_idx:020}").as_bytes());
-    key
-}
-
-fn pipeline_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = CDC_BUFFER_PREFIX.to_vec();
-    key.extend_from_slice(b"pipeline/");
-    push_length_prefixed_component(&mut key, pipeline_name.as_bytes());
-    key.extend_from_slice(b"/");
-    key
-}
-
-fn transaction_key(
-    position: &CdcSourcePosition,
-    transaction_id: Option<&CdcTransactionId>,
-) -> Result<String> {
-    let tx = transaction_id.map_or("none".to_string(), |tx| {
-        hex_component(tx.as_str().as_bytes())
-    });
-    match position {
-        CdcSourcePosition::Postgres {
-            commit_lsn,
-            event_lsn,
-        } => Ok(format!(
-            "pg/{:020}/{:020}/{tx}",
-            parse_postgres_lsn(commit_lsn)?,
-            event_lsn
-                .as_deref()
-                .map(parse_postgres_lsn)
-                .transpose()?
-                .unwrap_or(u64::MAX)
-        )),
-        CdcSourcePosition::Opaque { value } => {
-            Ok(format!("opaque/{}/{tx}", hex_component(value.as_bytes())))
-        }
-    }
-}
-
-fn parse_postgres_lsn(value: &str) -> Result<u64> {
-    let (high, low) = value
-        .split_once('/')
-        .ok_or_else(|| anyhow!("invalid Postgres LSN '{value}'"))?;
-    let high = u64::from_str_radix(high, 16)
-        .with_context(|| format!("invalid Postgres LSN high word '{high}'"))?;
-    let low = u64::from_str_radix(low, 16)
-        .with_context(|| format!("invalid Postgres LSN low word '{low}'"))?;
-    Ok((high << 32) | low)
 }
 
 fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
