@@ -2,6 +2,8 @@ mod client;
 mod config;
 mod lsn;
 mod pgoutput;
+#[cfg(test)]
+mod pgoutput_test_messages;
 mod snapshot;
 mod transaction;
 

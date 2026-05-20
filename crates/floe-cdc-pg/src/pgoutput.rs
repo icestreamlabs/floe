@@ -848,139 +848,24 @@ impl PgOutputReader {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
+    use crate::pgoutput_test_messages::{
+        insert_message as insert_relation_message, orders_relation_message,
+        orders_relation_message_for, origin_message, put_text_value, put_u8, put_u16, put_u32,
+        put_unchanged_toast_value, truncate_message, tuple, tuple_with_unchanged_toast,
+    };
     use floe_core::RowValue;
 
-    fn put_u8(out: &mut Vec<u8>, value: u8) {
-        out.push(value);
-    }
-
-    fn put_u16(out: &mut Vec<u8>, value: u16) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-
-    fn put_u32(out: &mut Vec<u8>, value: u32) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-
-    fn put_i32(out: &mut Vec<u8>, value: i32) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-
-    fn put_u64(out: &mut Vec<u8>, value: u64) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-
-    fn put_cstring(out: &mut Vec<u8>, value: &str) {
-        out.extend_from_slice(value.as_bytes());
-        out.push(0);
-    }
-
-    fn put_text_value(out: &mut Vec<u8>, value: &str) {
-        put_u8(out, b't');
-        put_i32(out, value.len() as i32);
-        out.extend_from_slice(value.as_bytes());
-    }
-
-    fn put_null_value(out: &mut Vec<u8>) {
-        put_u8(out, b'n');
-    }
-
-    fn put_unchanged_toast_value(out: &mut Vec<u8>) {
-        put_u8(out, b'u');
-    }
-
     fn relation_message() -> Bytes {
-        relation_message_for(42, "orders")
+        orders_relation_message()
     }
 
     fn relation_message_for(relation_id: u32, table: &str) -> Bytes {
-        let mut out = Vec::new();
-        put_u8(&mut out, b'R');
-        put_u32(&mut out, relation_id);
-        put_cstring(&mut out, "public");
-        put_cstring(&mut out, table);
-        put_u8(&mut out, b'd');
-        put_u16(&mut out, 4);
-
-        put_u8(&mut out, 1);
-        put_cstring(&mut out, "id");
-        put_u32(&mut out, PG_INT8_OID);
-        put_i32(&mut out, -1);
-
-        put_u8(&mut out, 0);
-        put_cstring(&mut out, "amount");
-        put_u32(&mut out, PG_INT4_OID);
-        put_i32(&mut out, -1);
-
-        put_u8(&mut out, 0);
-        put_cstring(&mut out, "status");
-        put_u32(&mut out, PG_TEXT_OID);
-        put_i32(&mut out, -1);
-
-        put_u8(&mut out, 0);
-        put_cstring(&mut out, "active");
-        put_u32(&mut out, PG_BOOL_OID);
-        put_i32(&mut out, -1);
-
-        Bytes::from(out)
-    }
-
-    fn truncate_message(relation_ids: impl IntoIterator<Item = u32>) -> Bytes {
-        let relation_ids: Vec<u32> = relation_ids.into_iter().collect();
-        let mut out = Vec::new();
-        put_u8(&mut out, b'T');
-        put_u32(&mut out, relation_ids.len() as u32);
-        put_u8(&mut out, 0);
-        for relation_id in relation_ids {
-            put_u32(&mut out, relation_id);
-        }
-        Bytes::from(out)
-    }
-
-    fn tuple(values: impl IntoIterator<Item = Option<&'static str>>) -> Vec<u8> {
-        let values: Vec<Option<&'static str>> = values.into_iter().collect();
-        let mut out = Vec::new();
-        put_u16(&mut out, values.len() as u16);
-        for value in values {
-            match value {
-                Some(value) => put_text_value(&mut out, value),
-                None => put_null_value(&mut out),
-            }
-        }
-        out
-    }
-
-    fn tuple_with_unchanged_toast(
-        values: impl IntoIterator<Item = Option<&'static str>>,
-        unchanged_toast_indices: impl IntoIterator<Item = usize>,
-    ) -> Vec<u8> {
-        let values: Vec<Option<&'static str>> = values.into_iter().collect();
-        let unchanged_toast_indices: HashSet<usize> = unchanged_toast_indices.into_iter().collect();
-        let mut out = Vec::new();
-        put_u16(&mut out, values.len() as u16);
-        for (idx, value) in values.into_iter().enumerate() {
-            if unchanged_toast_indices.contains(&idx) {
-                put_u8(&mut out, b'u');
-            } else {
-                match value {
-                    Some(value) => put_text_value(&mut out, value),
-                    None => put_null_value(&mut out),
-                }
-            }
-        }
-        out
+        orders_relation_message_for(relation_id, table)
     }
 
     fn insert_message(values: impl IntoIterator<Item = Option<&'static str>>) -> Bytes {
-        let mut out = Vec::new();
-        put_u8(&mut out, b'I');
-        put_u32(&mut out, 42);
-        put_u8(&mut out, b'N');
-        out.extend_from_slice(&tuple(values));
-        Bytes::from(out)
+        insert_relation_message(42, values)
     }
 
     fn decoder_with_relation() -> PgOutputDecoder {
@@ -1227,12 +1112,8 @@ mod tests {
             }
         );
 
-        let mut origin = Vec::new();
-        put_u8(&mut origin, b'O');
-        put_u64(&mut origin, 0x16B6C50);
-        put_cstring(&mut origin, "upstream");
         assert_eq!(
-            decode_pgoutput_message(Bytes::from(origin)).expect("origin"),
+            decode_pgoutput_message(origin_message(0x16B6C50, "upstream")).expect("origin"),
             PgOutputMessage::Origin {
                 commit_lsn: PostgresLsn::from_u64(0x16B6C50),
                 name: "upstream".to_string(),

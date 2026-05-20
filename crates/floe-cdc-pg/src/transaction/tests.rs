@@ -16,6 +16,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::pgoutput_test_messages::{
+    TEST_PG_INT8_OID as PG_INT8_OID, TEST_PG_TEXT_OID as PG_TEXT_OID,
+    id_status_relation_message as relation_message, insert_id_status_message as insert_message,
+    insert_text_message as insert_message_with_values,
+    relation_message_with_column_specs as relation_message_with_columns, truncate_message,
+};
 use crate::{
     PgOutputMessage, PostgresCdcConfig, PostgresLsn, PostgresReplicationEvent,
     decode_pgoutput_message,
@@ -23,94 +29,6 @@ use crate::{
 
 const RELATION_ID: u32 = 42;
 const OTHER_RELATION_ID: u32 = 43;
-const PG_INT8_OID: u32 = 20;
-const PG_TEXT_OID: u32 = 25;
-
-fn put_u8(out: &mut Vec<u8>, value: u8) {
-    out.push(value);
-}
-
-fn put_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_i32(out: &mut Vec<u8>, value: i32) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_cstring(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(value.as_bytes());
-    out.push(0);
-}
-
-fn put_text_value(out: &mut Vec<u8>, value: &str) {
-    put_u8(out, b't');
-    put_i32(out, value.len() as i32);
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn relation_message(relation_id: u32, table: &str) -> Bytes {
-    relation_message_with_columns(
-        relation_id,
-        table,
-        &[("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)],
-    )
-}
-
-fn relation_message_with_columns(
-    relation_id: u32,
-    table: &str,
-    columns: &[(&str, u32, bool)],
-) -> Bytes {
-    let mut out = Vec::new();
-    put_u8(&mut out, b'R');
-    put_u32(&mut out, relation_id);
-    put_cstring(&mut out, "public");
-    put_cstring(&mut out, table);
-    put_u8(&mut out, b'd');
-    put_u16(&mut out, columns.len() as u16);
-
-    for (name, oid, is_key) in columns {
-        put_u8(&mut out, u8::from(*is_key));
-        put_cstring(&mut out, name);
-        put_u32(&mut out, *oid);
-        put_i32(&mut out, -1);
-    }
-
-    Bytes::from(out)
-}
-
-fn insert_message(relation_id: u32, id: i64, status: &str) -> Bytes {
-    insert_message_with_values(relation_id, &[id.to_string(), status.to_string()])
-}
-
-fn insert_message_with_values(relation_id: u32, values: &[String]) -> Bytes {
-    let mut out = Vec::new();
-    put_u8(&mut out, b'I');
-    put_u32(&mut out, relation_id);
-    put_u8(&mut out, b'N');
-    put_u16(&mut out, values.len() as u16);
-    for value in values {
-        put_text_value(&mut out, value);
-    }
-    Bytes::from(out)
-}
-
-fn truncate_message(relation_ids: impl IntoIterator<Item = u32>) -> Bytes {
-    let relation_ids: Vec<u32> = relation_ids.into_iter().collect();
-    let mut out = Vec::new();
-    put_u8(&mut out, b'T');
-    put_u32(&mut out, relation_ids.len() as u32);
-    put_u8(&mut out, 0);
-    for relation_id in relation_ids {
-        put_u32(&mut out, relation_id);
-    }
-    Bytes::from(out)
-}
 
 fn begin(xid: u32) -> PostgresReplicationEvent {
     PostgresReplicationEvent::Begin {
