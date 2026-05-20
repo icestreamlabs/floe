@@ -1,3 +1,4 @@
+use super::config::ReplicationArrowIpcCompression;
 use super::encoding::{
     encode_debezium_pipeline_records, encode_pipeline_buffer_records,
     encode_pipeline_transaction_records, encode_pipeline_transaction_records_with_metadata,
