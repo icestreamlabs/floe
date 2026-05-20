@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use floe_cdc_core::{CdcSourceId, CdcTableId, CdcTableSchema, TransactionBatch};
+use floe_config::ReplicationConfig as FloeReplicationConfig;
 #[cfg(test)]
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
@@ -19,11 +20,13 @@ pub(super) struct ReplicationPipelineRuntime {
     replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
     backpressure_state_by_pipeline: Mutex<HashMap<String, bool>>,
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
+    settings: FloeReplicationConfig,
 }
 
 impl ReplicationPipelineRuntime {
     pub(super) fn new(
         plans: impl IntoIterator<Item = ReplicationPipelineRuntimePlan>,
+        settings: FloeReplicationConfig,
     ) -> anyhow::Result<Self> {
         let mut pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>> =
             HashMap::new();
@@ -72,6 +75,7 @@ impl ReplicationPipelineRuntime {
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
             backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),
+            settings,
         })
     }
 

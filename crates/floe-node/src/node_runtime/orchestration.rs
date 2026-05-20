@@ -1637,10 +1637,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         postgres_cdc_runtime_plans_by_connector.values(),
     )
     .await;
+    let replication_settings = config
+        .as_ref()
+        .map(|cfg| cfg.replication)
+        .unwrap_or_default()
+        .with_legacy_env_overrides();
     let replication_pipeline_runtime = Arc::new(ReplicationPipelineRuntime::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
             .flat_map(|plan| plan.replication_pipelines.iter().cloned()),
+        replication_settings,
     )?);
     replication_pipeline_runtime
         .refresh_debug_state(&storage, &cdc_replication_debug)

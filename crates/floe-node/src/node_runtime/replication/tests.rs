@@ -1508,6 +1508,7 @@ fn test_runtime_with_plan(plan: ReplicationPipelineRuntimePlan) -> ReplicationPi
         replay_state_by_pipeline: Mutex::new(HashMap::new()),
         backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
         last_target_error_by_pipeline: Mutex::new(HashMap::new()),
+        settings: FloeReplicationConfig::default(),
     }
 }
 

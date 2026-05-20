@@ -25,6 +25,8 @@ pub struct NodeConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +160,74 @@ pub struct MaintenanceConfig {
     pub compact_namespace: Vec<String>,
     #[serde(default)]
     pub gc_namespace: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationConfig {
+    #[serde(default)]
+    pub buffer_cleanup: ReplicationBufferCleanupConfig,
+}
+
+impl ReplicationConfig {
+    pub const DEFAULT: Self = Self {
+        buffer_cleanup: ReplicationBufferCleanupConfig::DEFAULT,
+    };
+
+    pub fn with_legacy_env_overrides(mut self) -> Self {
+        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_DELIVERED_RETENTION_MS") {
+            self.buffer_cleanup.delivered_retention_ms = value;
+        }
+        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS") {
+            self.buffer_cleanup.cleanup_interval_ms = value;
+        }
+        self
+    }
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationBufferCleanupConfig {
+    #[serde(default = "default_replication_buffer_delivered_retention_ms")]
+    pub delivered_retention_ms: u64,
+    #[serde(default = "default_replication_buffer_cleanup_interval_ms")]
+    pub cleanup_interval_ms: u64,
+}
+
+impl ReplicationBufferCleanupConfig {
+    pub const DEFAULT: Self = Self {
+        delivered_retention_ms: DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS,
+        cleanup_interval_ms: DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS,
+    };
+}
+
+impl Default for ReplicationBufferCleanupConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
+const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
+
+fn default_replication_buffer_delivered_retention_ms() -> u64 {
+    DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
+}
+
+fn default_replication_buffer_cleanup_interval_ms() -> u64 {
+    DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -708,6 +778,23 @@ mod tests {
             Some(SourceJournalConfig::Auto)
         );
         assert_eq!(config.maintenance.paused, Some(true));
+    }
+
+    #[test]
+    fn load_config_accepts_replication_buffer_cleanup_section() {
+        let input = r#"
+            [replication.buffer_cleanup]
+            delivered_retention_ms = 1000
+            cleanup_interval_ms = 250
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+
+        assert_eq!(
+            config.replication.buffer_cleanup.delivered_retention_ms,
+            1000
+        );
+        assert_eq!(config.replication.buffer_cleanup.cleanup_interval_ms, 250);
     }
 
     #[test]
