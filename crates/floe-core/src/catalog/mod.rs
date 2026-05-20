@@ -583,7 +583,7 @@ impl ReplicationErrorPolicy {
 }
 
 impl ReplicationPipelineTarget {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         match self {
             Self::Kafka { brokers, topic } => {
                 ensure!(

@@ -30,12 +30,13 @@ use floe_core::catalog::{
     PostgresCdcSourceDefinition, ReplicationBufferMode as CatalogReplicationBufferMode,
     ReplicationBufferPolicy as CatalogReplicationBufferPolicy,
     ReplicationErrorPolicy as CatalogReplicationErrorPolicy,
-    ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode,
     ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
     ReplicationPipelineFormat as CatalogReplicationPipelineFormat,
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
     TableDefinition,
 };
+#[cfg(test)]
+use floe_core::catalog::ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
@@ -67,11 +68,7 @@ use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
     CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,
-    ReplicationBufferMode as SqlReplicationBufferMode,
-    ReplicationErrorPolicyMode as SqlReplicationErrorPolicyMode,
-    ReplicationPipelineDefinition as SqlReplicationPipelineDefinition,
-    ReplicationPipelineFormat as SqlReplicationPipelineFormat,
-    ReplicationPipelineTarget as SqlReplicationPipelineTarget, SourceConnector, SqlColumnType,
+    ReplicationPipelineDefinition as SqlReplicationPipelineDefinition, SourceConnector,
     parse_floe_program,
 };
 use floe_storage::MaterializedViewMetadata;

@@ -1,4 +1,9 @@
 use anyhow::{Result, anyhow};
+pub use floe_core::catalog::{
+    ColumnType as SqlColumnType, PostgresCdcSchemaEvolutionPolicy, ReplicationBufferMode,
+    ReplicationBufferPolicy, ReplicationErrorPolicy, ReplicationErrorPolicyMode,
+    ReplicationPipelineFormat, ReplicationPipelineTarget,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloeStatement {
@@ -36,16 +41,6 @@ pub struct CreateTableSourceDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SqlColumnType {
-    Int64,
-    Bool,
-    Utf8,
-    TimestampMillis,
-    DateDays,
-    Numeric,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSourceDefinition {
     name: String,
     connector: SourceConnector,
@@ -63,13 +58,6 @@ pub struct PostgresCdcSourceOptions {
     publication: Option<String>,
     include_schema_in_source: Option<bool>,
     schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostgresCdcSchemaEvolutionPolicy {
-    FailFast,
-    IgnoreCompatible,
-    ApplyCompatibleAdditions,
 }
 
 impl CreateTableDefinition {
@@ -292,47 +280,6 @@ pub struct ReplicationPipelineDefinition {
     error_policy: ReplicationErrorPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplicationPipelineTarget {
-    Kafka { brokers: String, topic: String },
-    Postgres { connection: String, table: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicationPipelineFormat {
-    FloeJson,
-    DebeziumJson,
-    ArrowIpc,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicationBufferMode {
-    Durable,
-    NoBuffer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReplicationBufferPolicy {
-    max_pending_bytes: Option<usize>,
-    max_pending_records: Option<usize>,
-    max_pending_transactions: Option<usize>,
-    max_pending_age_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReplicationErrorPolicy {
-    mode: ReplicationErrorPolicyMode,
-    max_retries: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReplicationErrorPolicyMode {
-    FailFast,
-    #[default]
-    RetryWithBackoff,
-    DeadLetterAndContinue,
-}
-
 impl SinkDefinition {
     pub fn new(
         name: impl Into<String>,
@@ -452,82 +399,6 @@ impl ReplicationPipelineDefinition {
 
     pub fn error_policy(&self) -> ReplicationErrorPolicy {
         self.error_policy
-    }
-}
-
-impl ReplicationBufferPolicy {
-    pub fn new(
-        max_pending_bytes: Option<usize>,
-        max_pending_records: Option<usize>,
-        max_pending_transactions: Option<usize>,
-        max_pending_age_ms: Option<u64>,
-    ) -> Self {
-        Self {
-            max_pending_bytes,
-            max_pending_records,
-            max_pending_transactions,
-            max_pending_age_ms,
-        }
-    }
-
-    pub fn max_pending_bytes(&self) -> Option<usize> {
-        self.max_pending_bytes
-    }
-
-    pub fn max_pending_records(&self) -> Option<usize> {
-        self.max_pending_records
-    }
-
-    pub fn max_pending_transactions(&self) -> Option<usize> {
-        self.max_pending_transactions
-    }
-
-    pub fn max_pending_age_ms(&self) -> Option<u64> {
-        self.max_pending_age_ms
-    }
-}
-
-impl ReplicationErrorPolicy {
-    pub fn new(mode: ReplicationErrorPolicyMode, max_retries: Option<u32>) -> Self {
-        Self { mode, max_retries }
-    }
-
-    pub fn mode(&self) -> ReplicationErrorPolicyMode {
-        self.mode
-    }
-
-    pub fn max_retries(&self) -> Option<u32> {
-        self.max_retries
-    }
-}
-
-impl ReplicationPipelineTarget {
-    fn validate(&self) -> Result<()> {
-        match self {
-            Self::Kafka { brokers, topic } => {
-                if brokers.trim().is_empty() {
-                    return Err(anyhow!(
-                        "replication pipeline Kafka brokers cannot be empty"
-                    ));
-                }
-                if topic.trim().is_empty() {
-                    return Err(anyhow!("replication pipeline Kafka topic cannot be empty"));
-                }
-            }
-            Self::Postgres { connection, table } => {
-                if connection.trim().is_empty() {
-                    return Err(anyhow!(
-                        "replication pipeline Postgres connection cannot be empty"
-                    ));
-                }
-                if table.trim().is_empty() {
-                    return Err(anyhow!(
-                        "replication pipeline Postgres target table cannot be empty"
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 

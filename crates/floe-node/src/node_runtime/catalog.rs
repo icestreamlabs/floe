@@ -1,5 +1,4 @@
 use super::*;
-use floe_sql_parser::PostgresCdcSchemaEvolutionPolicy as SqlPostgresCdcSchemaEvolutionPolicy;
 
 pub(super) fn table_definition_from_sql(
     definition: &CreateTableDefinition,
@@ -8,17 +7,9 @@ pub(super) fn table_definition_from_sql(
         .columns()
         .iter()
         .map(|column| {
-            let data_type = match column.data_type() {
-                SqlColumnType::Int64 => ColumnType::Int64,
-                SqlColumnType::Bool => ColumnType::Bool,
-                SqlColumnType::Utf8 => ColumnType::Utf8,
-                SqlColumnType::TimestampMillis => ColumnType::TimestampMillis,
-                SqlColumnType::DateDays => ColumnType::DateDays,
-                SqlColumnType::Numeric => ColumnType::Numeric,
-            };
             ColumnDefinition::new_typed_nullable(
                 column.name(),
-                data_type,
+                column.data_type().clone(),
                 column.nullable(),
                 column.primary_key(),
             )
@@ -37,27 +28,11 @@ pub(super) fn catalog_source_definition_from_sql(
                 options.slot(),
                 options.publication().map(ToString::to_string),
                 options.include_schema_in_source(),
-                catalog_postgres_schema_evolution_policy(options.schema_evolution_policy()),
+                options.schema_evolution_policy(),
             )?,
         ),
     };
     CatalogSourceDefinition::new(definition.name(), connector)
-}
-
-fn catalog_postgres_schema_evolution_policy(
-    policy: SqlPostgresCdcSchemaEvolutionPolicy,
-) -> CatalogPostgresCdcSchemaEvolutionPolicy {
-    match policy {
-        SqlPostgresCdcSchemaEvolutionPolicy::FailFast => {
-            CatalogPostgresCdcSchemaEvolutionPolicy::FailFast
-        }
-        SqlPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible => {
-            CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible
-        }
-        SqlPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
-            CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions
-        }
-    }
 }
 
 pub(super) fn source_backed_table_definition_from_sql(
@@ -78,60 +53,17 @@ pub(super) fn source_backed_table_definition_from_sql(
 pub(super) fn replication_pipeline_definition_from_sql(
     definition: &SqlReplicationPipelineDefinition,
 ) -> anyhow::Result<CatalogReplicationPipelineDefinition> {
-    let target = match definition.target() {
-        SqlReplicationPipelineTarget::Kafka { brokers, topic } => {
-            CatalogReplicationPipelineTarget::Kafka {
-                brokers: brokers.clone(),
-                topic: topic.clone(),
-            }
-        }
-        SqlReplicationPipelineTarget::Postgres { connection, table } => {
-            CatalogReplicationPipelineTarget::Postgres {
-                connection: connection.clone(),
-                table: table.clone(),
-            }
-        }
-    };
-    let format = match definition.format() {
-        SqlReplicationPipelineFormat::FloeJson => CatalogReplicationPipelineFormat::FloeJson,
-        SqlReplicationPipelineFormat::DebeziumJson => {
-            CatalogReplicationPipelineFormat::DebeziumJson
-        }
-        SqlReplicationPipelineFormat::ArrowIpc => CatalogReplicationPipelineFormat::ArrowIpc,
-    };
-    let buffer_mode = match definition.buffer_mode() {
-        SqlReplicationBufferMode::Durable => CatalogReplicationBufferMode::Durable,
-        SqlReplicationBufferMode::NoBuffer => CatalogReplicationBufferMode::NoBuffer,
-    };
     CatalogReplicationPipelineDefinition::new(
         definition.name(),
         definition.source_name(),
         definition.upstream_table(),
-        target,
-        format,
-        buffer_mode,
-        CatalogReplicationBufferPolicy::new(
-            definition.buffer_policy().max_pending_bytes(),
-            definition.buffer_policy().max_pending_records(),
-            definition.buffer_policy().max_pending_transactions(),
-            definition.buffer_policy().max_pending_age_ms(),
-        ),
+        definition.target().clone(),
+        definition.format(),
+        definition.buffer_mode(),
+        definition.buffer_policy(),
         definition.emit_tombstones(),
         definition.include_transaction_metadata(),
-        CatalogReplicationErrorPolicy::new(
-            match definition.error_policy().mode() {
-                SqlReplicationErrorPolicyMode::FailFast => {
-                    CatalogReplicationErrorPolicyMode::FailFast
-                }
-                SqlReplicationErrorPolicyMode::RetryWithBackoff => {
-                    CatalogReplicationErrorPolicyMode::RetryWithBackoff
-                }
-                SqlReplicationErrorPolicyMode::DeadLetterAndContinue => {
-                    CatalogReplicationErrorPolicyMode::DeadLetterAndContinue
-                }
-            },
-            definition.error_policy().max_retries(),
-        ),
+        definition.error_policy(),
     )
 }
 
