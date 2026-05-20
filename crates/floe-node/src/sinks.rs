@@ -36,8 +36,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{SinkConfig, SinkSpec};
 use crate::metrics;
+use floe_config::{SinkConfig, SinkSpec};
 
 const DEFAULT_SINK_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_ROWS: usize = 1;

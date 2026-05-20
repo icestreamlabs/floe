@@ -11,6 +11,7 @@ allocator-jemalloc = ["dep:tikv-jemallocator"]
 [dependencies]
 floe-executor = { path = "../floe-executor" }
 floe-node-core = { path = "../floe-node-core" }
+floe-config = { path = "../floe-config" }
 floe-server = { path = "../floe-server" }
 floe-storage = { path = "../floe-storage" }
 floe-core = { path = "../floe-core" }

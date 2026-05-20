@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/floe-node",
+    "crates/floe-config",
     "crates/floe-node-core",
     "crates/floe-cdc",
     "crates/floe-cdc-core",
@@ -64,6 +65,7 @@ toml = "0.8"
 url = "2.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 floe-sql-parser = { path = "crates/floe-sql-parser" }
+floe-config = { path = "crates/floe-config" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.13"

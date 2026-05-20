@@ -24,6 +24,8 @@ use floe_cdc_pg::{
     PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
     create_pgoutput_slot_with_exported_snapshot,
 };
+#[cfg(test)]
+use floe_core::catalog::ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode;
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
     PostgresCdcSchemaEvolutionPolicy as CatalogPostgresCdcSchemaEvolutionPolicy,
@@ -35,8 +37,6 @@ use floe_core::catalog::{
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
     TableDefinition,
 };
-#[cfg(test)]
-use floe_core::catalog::ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
@@ -81,13 +81,14 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{
+use crate::{cli, http_ingest, metrics, sinks};
+use floe_config as config;
+use floe_config::{
     ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
     SinkConfig, SinkSpec, SourceJournalConfig, apply_connector_properties, load_config,
     materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
     sink_spec_from_sql,
 };
-use crate::{cli, config, http_ingest, metrics, sinks};
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);

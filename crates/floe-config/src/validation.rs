@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn validate_node_config(config: &NodeConfig) -> Result<()> {
+pub(crate) fn validate_node_config(config: &NodeConfig) -> Result<()> {
     let mut seen_mv_names = HashSet::new();
     for (index, mv) in config.materialized_views.iter().enumerate() {
         ensure_non_empty(&mv.name, &format!("materialized_views[{index}].name"))?;

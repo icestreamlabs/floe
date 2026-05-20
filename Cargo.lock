@@ -2125,6 +2125,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "floe-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "floe-core",
+ "floe-node-core",
+ "floe-sql-parser",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio-postgres",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "floe-connector-sdk"
 version = "0.1.0"
 dependencies = [
@@ -2199,6 +2216,7 @@ dependencies = [
  "floe-cdc",
  "floe-cdc-core",
  "floe-cdc-pg",
+ "floe-config",
  "floe-core",
  "floe-executor",
  "floe-node-core",

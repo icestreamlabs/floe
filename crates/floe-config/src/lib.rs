@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use reqwest::Url;
 use serde::Deserialize;
+use url::Url;
 
 use floe_core::catalog::PostgresCdcSchemaEvolutionPolicy;
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME, PERSON_SOURCE_NAME};
@@ -326,7 +326,7 @@ mod loading;
 mod normalization;
 mod validation;
 
-pub use loading::load_config;
+pub use loading::{load_config, load_toml_config, parse_toml_config};
 pub use normalization::{
     apply_connector_properties, materialized_view_definitions_from_config, normalize_connectors,
     normalize_sinks, sink_spec_from_sql,
@@ -377,6 +377,29 @@ mod tests {
         "#;
         let config: NodeConfig = toml::from_str(input).expect("parse toml");
         assert_eq!(config.connectors.len(), 1);
+    }
+
+    #[test]
+    fn parse_toml_config_accepts_multiline_sql() {
+        let input = r#"
+            [[materialized_views]]
+            name = "mv_orders"
+            query = '''
+            CREATE MATERIALIZED VIEW mv_orders AS
+            SELECT customer_id, count(*) AS order_count
+            FROM orders
+            GROUP BY customer_id
+            '''
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml config");
+
+        assert_eq!(config.materialized_views.len(), 1);
+        assert!(
+            config.materialized_views[0]
+                .query
+                .contains("GROUP BY customer_id")
+        );
     }
 
     #[test]
