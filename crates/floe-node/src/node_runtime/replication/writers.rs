@@ -19,6 +19,7 @@ use rdkafka::types::RDKafkaTopic;
 use tokio_postgres::types::ToSql;
 
 use super::super::ReplicationPipelineRuntimeBufferMode;
+use super::target_state::TargetStateBuilder;
 use super::{
     CDC_PERF_LOGGING_ENABLED, FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_ACKS,
     REPLICATION_KAFKA_BATCH_NUM_MESSAGES, REPLICATION_KAFKA_BATCH_SIZE,
@@ -333,15 +334,12 @@ impl KafkaReplicationPipelineWriter {
                 .unwrap_or(Duration::ZERO),
         );
 
-        let mut target_state = std::collections::BTreeMap::new();
-        target_state.insert("kafka.topic".to_string(), self.topic.clone());
+        let mut target_state = TargetStateBuilder::new();
+        target_state.target_topic(&self.topic);
         for (partition, offset) in offsets_by_partition {
-            target_state.insert(
-                format!("kafka.partition.{partition}.offset"),
-                offset.to_string(),
-            );
+            target_state.target_partition_offset(partition, offset);
         }
-        Ok(target_state)
+        Ok(target_state.build())
     }
 
     async fn enqueue_record_with_retry(
@@ -685,10 +683,11 @@ impl PostgresReplicationPipelineWriter {
     }
 
     fn target_state(&self, records: usize) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::from([
-            ("postgres.table".to_string(), self.target_table.clone()),
-            ("postgres.records_applied".to_string(), records.to_string()),
-        ])
+        let mut target_state = TargetStateBuilder::new();
+        target_state
+            .postgres_table(&self.target_table)
+            .postgres_records_applied(records);
+        target_state.build()
     }
 }
 

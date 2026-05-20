@@ -9,36 +9,260 @@ use floe_storage::{
 use super::super::{ReplicationPipelineRuntimePlan, ReplicationPipelineRuntimeTarget};
 use super::{current_unix_time_ms, encoding};
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum BufferStatus {
+    Durable,
+    Delivered,
+    DeadLettered,
+    NotBuffered,
+}
+
+impl BufferStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Delivered => "delivered",
+            Self::DeadLettered => "dead_lettered",
+            Self::NotBuffered => "not_buffered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DeliveryStatus {
+    Pending,
+    Delivered,
+    Failed,
+    DeadLettered,
+}
+
+impl DeliveryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::DeadLettered => "dead_lettered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct TargetStateBuilder {
+    state: BTreeMap<String, String>,
+}
+
+impl TargetStateBuilder {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn from_state(state: BTreeMap<String, String>) -> Self {
+        Self { state }
+    }
+
+    pub(super) fn for_buffered_manifest(
+        plan: &ReplicationPipelineRuntimePlan,
+        manifest: &CdcBufferedTransactionManifest,
+    ) -> Self {
+        let mut builder = Self::new();
+        builder
+            .source_table(&plan.upstream_table)
+            .target_kind(target_kind(plan))
+            .buffer_transaction_key(manifest.transaction_key())
+            .buffer_record_count(manifest.record_count())
+            .buffer_payload_format(manifest.payload_format());
+        if let Some(transaction_id) = manifest.transaction_id() {
+            builder.source_transaction_id(transaction_id);
+        }
+        builder.source_position(manifest.source_position());
+        builder
+    }
+
+    pub(super) fn for_direct_transaction(
+        plan: &ReplicationPipelineRuntimePlan,
+        transaction: &TransactionBatch,
+    ) -> Self {
+        let mut builder = Self::new();
+        builder
+            .source_table(&plan.upstream_table)
+            .target_kind(target_kind(plan));
+        if let Some(transaction_id) = transaction.transaction_id() {
+            builder.source_transaction_id(transaction_id);
+        }
+        builder.source_position(transaction.commit_position());
+        builder
+    }
+
+    pub(super) fn source_table(&mut self, table: impl Into<String>) -> &mut Self {
+        self.state.insert("source.table".to_string(), table.into());
+        self
+    }
+
+    pub(super) fn source_transaction_id(&mut self, transaction_id: &CdcTransactionId) -> &mut Self {
+        self.state.insert(
+            "source.transaction_id".to_string(),
+            transaction_id.as_str().to_string(),
+        );
+        self
+    }
+
+    pub(super) fn source_position(&mut self, position: &CdcSourcePosition) -> &mut Self {
+        match position {
+            CdcSourcePosition::Postgres {
+                commit_lsn,
+                event_lsn,
+            } => {
+                self.state.insert(
+                    "source.position.postgres.commit_lsn".to_string(),
+                    commit_lsn.clone(),
+                );
+                if let Some(event_lsn) = event_lsn {
+                    self.state.insert(
+                        "source.position.postgres.event_lsn".to_string(),
+                        event_lsn.clone(),
+                    );
+                }
+            }
+            CdcSourcePosition::Opaque { value } => {
+                self.state
+                    .insert("source.position".to_string(), value.clone());
+            }
+        }
+        self
+    }
+
+    pub(super) fn target_kind(&mut self, kind: impl Into<String>) -> &mut Self {
+        self.state.insert("target.kind".to_string(), kind.into());
+        self
+    }
+
+    pub(super) fn target_topic(&mut self, topic: impl Into<String>) -> &mut Self {
+        self.state.insert("kafka.topic".to_string(), topic.into());
+        self
+    }
+
+    pub(super) fn target_partition_offset(&mut self, partition: i32, offset: i64) -> &mut Self {
+        self.state.insert(
+            format!("kafka.partition.{partition}.offset"),
+            offset.to_string(),
+        );
+        self
+    }
+
+    pub(super) fn postgres_table(&mut self, table: impl Into<String>) -> &mut Self {
+        self.state
+            .insert("postgres.table".to_string(), table.into());
+        self
+    }
+
+    pub(super) fn postgres_records_applied(&mut self, records: usize) -> &mut Self {
+        self.state
+            .insert("postgres.records_applied".to_string(), records.to_string());
+        self
+    }
+
+    pub(super) fn buffer_status(&mut self, status: BufferStatus) -> &mut Self {
+        self.state
+            .insert("buffer.status".to_string(), status.as_str().to_string());
+        self
+    }
+
+    pub(super) fn buffer_transaction_key(&mut self, transaction_key: &str) -> &mut Self {
+        self.state.insert(
+            "buffer.transaction_key".to_string(),
+            transaction_key.to_string(),
+        );
+        self
+    }
+
+    pub(super) fn buffer_record_count(&mut self, record_count: usize) -> &mut Self {
+        self.state
+            .insert("buffer.record_count".to_string(), record_count.to_string());
+        self
+    }
+
+    pub(super) fn buffer_payload_format(
+        &mut self,
+        payload_format: CdcBufferPayloadFormat,
+    ) -> &mut Self {
+        self.state.insert(
+            "buffer.payload_format".to_string(),
+            format!("{payload_format:?}"),
+        );
+        self
+    }
+
+    pub(super) fn delivery_status(&mut self, status: DeliveryStatus) -> &mut Self {
+        self.state.insert(
+            "target.delivery.status".to_string(),
+            status.as_str().to_string(),
+        );
+        self
+    }
+
+    pub(super) fn replay_may_duplicate(&mut self, may_duplicate: bool) -> &mut Self {
+        self.state.insert(
+            "target.delivery.replay_may_duplicate".to_string(),
+            may_duplicate.to_string(),
+        );
+        self
+    }
+
+    pub(super) fn dlq_entry(&mut self, dlq_entry: &ReplicationPipelineDlqEntry) -> &mut Self {
+        self.state
+            .insert("target.dlq.id".to_string(), dlq_entry.dlq_id().to_string());
+        self.state.insert(
+            "target.dlq.status".to_string(),
+            dlq_entry.status().as_str().to_string(),
+        );
+        if let Some(payload_object_key) = dlq_entry.payload_object_key() {
+            self.state.insert(
+                "target.dlq.payload_object_key".to_string(),
+                payload_object_key.to_string(),
+            );
+        }
+        self
+    }
+
+    pub(super) fn last_error(&mut self, err: &anyhow::Error) -> &mut Self {
+        self.state.insert(
+            "target.last_error".to_string(),
+            truncate_target_error(&format!("{err:#}")),
+        );
+        self
+    }
+
+    pub(super) fn build(self) -> BTreeMap<String, String> {
+        self.state
+    }
+}
+
 pub(super) fn pending_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
 ) -> BTreeMap<String, String> {
-    let mut state = base_target_state(plan, manifest);
-    state.insert("buffer.status".to_string(), "durable".to_string());
-    state.insert("target.delivery.status".to_string(), "pending".to_string());
-    state.insert(
-        "target.delivery.replay_may_duplicate".to_string(),
-        "true".to_string(),
-    );
-    state
+    let mut builder = TargetStateBuilder::for_buffered_manifest(plan, manifest);
+    builder
+        .buffer_status(BufferStatus::Durable)
+        .delivery_status(DeliveryStatus::Pending)
+        .replay_may_duplicate(true);
+    builder.build()
 }
 
 pub(super) fn delivered_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
-    mut target_state: BTreeMap<String, String>,
+    target_state: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    target_state.extend(base_target_state(plan, manifest));
-    target_state.insert("buffer.status".to_string(), "delivered".to_string());
-    target_state.insert(
-        "target.delivery.status".to_string(),
-        "delivered".to_string(),
-    );
-    target_state.insert(
-        "target.delivery.replay_may_duplicate".to_string(),
-        "false".to_string(),
-    );
-    target_state
+    let mut base = TargetStateBuilder::for_buffered_manifest(plan, manifest).build();
+    base.extend(target_state);
+    let mut builder = TargetStateBuilder::from_state(base);
+    builder
+        .buffer_status(BufferStatus::Delivered)
+        .delivery_status(DeliveryStatus::Delivered)
+        .replay_may_duplicate(false);
+    builder.build()
 }
 
 pub(super) fn failed_target_state(
@@ -46,18 +270,13 @@ pub(super) fn failed_target_state(
     manifest: &CdcBufferedTransactionManifest,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
-    let mut state = base_target_state(plan, manifest);
-    state.insert("buffer.status".to_string(), "durable".to_string());
-    state.insert("target.delivery.status".to_string(), "failed".to_string());
-    state.insert(
-        "target.delivery.replay_may_duplicate".to_string(),
-        "true".to_string(),
-    );
-    state.insert(
-        "target.last_error".to_string(),
-        truncate_target_error(&format!("{err:#}")),
-    );
-    state
+    let mut builder = TargetStateBuilder::for_buffered_manifest(plan, manifest);
+    builder
+        .buffer_status(BufferStatus::Durable)
+        .delivery_status(DeliveryStatus::Failed)
+        .replay_may_duplicate(true)
+        .last_error(err);
+    builder.build()
 }
 
 pub(super) fn dead_lettered_target_state(
@@ -66,10 +285,10 @@ pub(super) fn dead_lettered_target_state(
     dlq_entry: &ReplicationPipelineDlqEntry,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
-    let mut state = base_target_state(plan, manifest);
-    state.insert("buffer.status".to_string(), "dead_lettered".to_string());
-    add_dead_letter_state(&mut state, dlq_entry, err);
-    state
+    let mut builder = TargetStateBuilder::for_buffered_manifest(plan, manifest);
+    builder.buffer_status(BufferStatus::DeadLettered);
+    add_dead_letter_state(&mut builder, dlq_entry, err);
+    builder.build()
 }
 
 pub(super) fn direct_delivered_target_state(
@@ -77,51 +296,18 @@ pub(super) fn direct_delivered_target_state(
     transaction: &TransactionBatch,
     record_count: usize,
     payload_format: CdcBufferPayloadFormat,
-    mut target_state: BTreeMap<String, String>,
+    target_state: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    target_state.insert("source.table".to_string(), plan.upstream_table.clone());
-    target_state.insert("target.kind".to_string(), target_kind(plan).to_string());
-    if let Some(transaction_id) = transaction.transaction_id() {
-        target_state.insert(
-            "source.transaction_id".to_string(),
-            transaction_id.as_str().to_string(),
-        );
-    }
-    match transaction.commit_position() {
-        CdcSourcePosition::Postgres {
-            commit_lsn,
-            event_lsn,
-        } => {
-            target_state.insert(
-                "source.position.postgres.commit_lsn".to_string(),
-                commit_lsn.clone(),
-            );
-            if let Some(event_lsn) = event_lsn {
-                target_state.insert(
-                    "source.position.postgres.event_lsn".to_string(),
-                    event_lsn.clone(),
-                );
-            }
-        }
-        CdcSourcePosition::Opaque { value } => {
-            target_state.insert("source.position".to_string(), value.clone());
-        }
-    }
-    target_state.insert("buffer.status".to_string(), "not_buffered".to_string());
-    target_state.insert("buffer.record_count".to_string(), record_count.to_string());
-    target_state.insert(
-        "buffer.payload_format".to_string(),
-        format!("{payload_format:?}"),
-    );
-    target_state.insert(
-        "target.delivery.status".to_string(),
-        "delivered".to_string(),
-    );
-    target_state.insert(
-        "target.delivery.replay_may_duplicate".to_string(),
-        "false".to_string(),
-    );
-    target_state
+    let mut base = TargetStateBuilder::for_direct_transaction(plan, transaction).build();
+    base.extend(target_state);
+    let mut builder = TargetStateBuilder::from_state(base);
+    builder
+        .buffer_status(BufferStatus::NotBuffered)
+        .buffer_record_count(record_count)
+        .buffer_payload_format(payload_format)
+        .delivery_status(DeliveryStatus::Delivered)
+        .replay_may_duplicate(false);
+    builder.build()
 }
 
 pub(super) fn direct_dead_lettered_target_state(
@@ -132,110 +318,40 @@ pub(super) fn direct_dead_lettered_target_state(
     dlq_entry: &ReplicationPipelineDlqEntry,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
-    let mut state = direct_delivered_target_state(
+    let state = direct_delivered_target_state(
         plan,
         transaction,
         record_count,
         payload_format,
         BTreeMap::new(),
     );
-    add_dead_letter_state(&mut state, dlq_entry, err);
-    state
+    let mut builder = TargetStateBuilder::from_state(state);
+    add_dead_letter_state(&mut builder, dlq_entry, err);
+    builder.build()
 }
 
 fn add_dead_letter_state(
-    state: &mut BTreeMap<String, String>,
+    builder: &mut TargetStateBuilder,
     dlq_entry: &ReplicationPipelineDlqEntry,
     err: &anyhow::Error,
 ) {
-    state.insert(
-        "target.delivery.status".to_string(),
-        "dead_lettered".to_string(),
-    );
-    state.insert(
-        "target.delivery.replay_may_duplicate".to_string(),
-        "false".to_string(),
-    );
-    state.insert("target.dlq.id".to_string(), dlq_entry.dlq_id().to_string());
-    state.insert(
-        "target.dlq.status".to_string(),
-        dlq_entry.status().as_str().to_string(),
-    );
-    if let Some(payload_object_key) = dlq_entry.payload_object_key() {
-        state.insert(
-            "target.dlq.payload_object_key".to_string(),
-            payload_object_key.to_string(),
-        );
-    }
-    state.insert(
-        "target.last_error".to_string(),
-        truncate_target_error(&format!("{err:#}")),
-    );
+    builder
+        .delivery_status(DeliveryStatus::DeadLettered)
+        .replay_may_duplicate(false)
+        .dlq_entry(dlq_entry)
+        .last_error(err);
 }
 
 pub(super) fn dead_letter_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
-    let mut state = BTreeMap::new();
-    state.insert("target.kind".to_string(), target_kind(plan).to_string());
-    state.insert(
-        "target.delivery.status".to_string(),
-        "dead_lettered".to_string(),
-    );
-    state.insert(
-        "target.last_error".to_string(),
-        truncate_target_error(&format!("{err:#}")),
-    );
-    state
-}
-
-fn base_target_state(
-    plan: &ReplicationPipelineRuntimePlan,
-    manifest: &CdcBufferedTransactionManifest,
-) -> BTreeMap<String, String> {
-    let mut state = BTreeMap::new();
-    state.insert("source.table".to_string(), plan.upstream_table.clone());
-    state.insert("target.kind".to_string(), target_kind(plan).to_string());
-    state.insert(
-        "buffer.transaction_key".to_string(),
-        manifest.transaction_key().to_string(),
-    );
-    state.insert(
-        "buffer.record_count".to_string(),
-        manifest.record_count().to_string(),
-    );
-    state.insert(
-        "buffer.payload_format".to_string(),
-        format!("{:?}", manifest.payload_format()),
-    );
-    if let Some(transaction_id) = manifest.transaction_id() {
-        state.insert(
-            "source.transaction_id".to_string(),
-            transaction_id.as_str().to_string(),
-        );
-    }
-    match manifest.source_position() {
-        CdcSourcePosition::Postgres {
-            commit_lsn,
-            event_lsn,
-        } => {
-            state.insert(
-                "source.position.postgres.commit_lsn".to_string(),
-                commit_lsn.clone(),
-            );
-            if let Some(event_lsn) = event_lsn {
-                state.insert(
-                    "source.position.postgres.event_lsn".to_string(),
-                    event_lsn.clone(),
-                );
-            }
-        }
-        CdcSourcePosition::Opaque { value } => {
-            state.insert("source.position".to_string(), value.clone());
-        }
-    }
-    state
+    let mut builder = TargetStateBuilder::new();
+    builder
+        .target_kind(target_kind(plan))
+        .delivery_status(DeliveryStatus::DeadLettered)
+        .last_error(err);
+    builder.build()
 }
 
 pub(super) fn target_kind(plan: &ReplicationPipelineRuntimePlan) -> &'static str {

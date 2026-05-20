@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use anyhow::{Context, anyhow};
 use floe_storage::{
     CdcBufferRecord, CdcBufferStore, CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint,
@@ -53,7 +51,7 @@ impl ReplicationPipelineRuntime {
         &self,
         plan: &ReplicationPipelineRuntimePlan,
         records: &[CdcBufferRecord],
-    ) -> anyhow::Result<BTreeMap<String, String>> {
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
         match &plan.target {
             ReplicationPipelineRuntimeTarget::Kafka { .. } => {
                 let writer = self
@@ -62,9 +60,7 @@ impl ReplicationPipelineRuntime {
                     .ok_or_else(|| {
                         anyhow!("replication pipeline '{}' has no Kafka writer", plan.name)
                     })?;
-                let mut target_state = writer.send_records(records).await?;
-                target_state.insert("source.table".to_string(), plan.upstream_table.clone());
-                Ok(target_state)
+                writer.send_records(records).await
             }
             ReplicationPipelineRuntimeTarget::Postgres { .. } => {
                 let writer = self
@@ -76,9 +72,7 @@ impl ReplicationPipelineRuntime {
                             plan.name
                         )
                     })?;
-                let mut target_state = writer.send_records(records).await?;
-                target_state.insert("source.table".to_string(), plan.upstream_table.clone());
-                Ok(target_state)
+                writer.send_records(records).await
             }
         }
     }
@@ -89,7 +83,7 @@ impl ReplicationPipelineRuntime {
         buffer_store: &CdcBufferStore,
         storage: &SlateCatalog,
         manifest: &CdcBufferedTransactionManifest,
-        target_state: BTreeMap<String, String>,
+        target_state: std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<usize> {
         let delivered_at = current_unix_time_ms();
         buffer_store
