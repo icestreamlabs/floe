@@ -3,11 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use floe_cdc_core::{CdcSchemaVersionMap, CdcSourcePosition, CdcTransactionId, ChangeBatch};
-use object_store::path::Path as ObjectPath;
-use object_store::{Error as ObjectStoreError, ObjectStore};
+use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, Error as SlateError, WriteBatch};
+
+use crate::object_payload::{
+    delete_payload_object_if_exists, hex_component, load_payload_object,
+    push_length_prefixed_component, put_payload_object,
+};
 
 const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
 const CDC_BUFFER_PAYLOAD_MAGIC_V1: &[u8; 8] = b"FCDCBUF1";
@@ -167,13 +171,7 @@ impl CdcBufferStore {
         let payload_format = append.payload_format();
         let payload_object_key = payload_object_key(&append.pipeline_name, &transaction_key);
         let object_store = self.payload_object_store()?;
-        object_store
-            .put(
-                &ObjectPath::from(payload_object_key.clone()),
-                payload.into(),
-            )
-            .await
-            .with_context(|| format!("write CDC buffer payload object '{payload_object_key}'"))?;
+        put_payload_object(object_store, &payload_object_key, payload, "CDC buffer").await?;
         let manifest = CdcBufferedTransactionManifest {
             pipeline_name: append.pipeline_name.clone(),
             source_name: append.source_name.clone(),
@@ -243,24 +241,7 @@ impl CdcBufferStore {
         );
         let records = match manifest.payload_storage() {
             CdcBufferPayloadStorage::ObjectStore => {
-                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
-                    anyhow!(
-                        "CDC buffer transaction '{}' is missing payload object key",
-                        manifest.transaction_key()
-                    )
-                })?;
-                let object_store = self.payload_object_store()?;
-                let payload = object_store
-                    .get(&ObjectPath::from(payload_object_key.to_string()))
-                    .await
-                    .with_context(|| {
-                        format!("load CDC buffer payload object '{payload_object_key}'")
-                    })?
-                    .bytes()
-                    .await
-                    .with_context(|| {
-                        format!("read CDC buffer payload object '{payload_object_key}'")
-                    })?;
+                let payload = self.object_payload(manifest).await?;
                 decode_payload_records(&payload).with_context(|| {
                     format!(
                         "decode CDC buffer payload object '{}'",
@@ -292,24 +273,7 @@ impl CdcBufferStore {
         );
         let batches = match manifest.payload_storage() {
             CdcBufferPayloadStorage::ObjectStore => {
-                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
-                    anyhow!(
-                        "CDC buffer transaction '{}' is missing payload object key",
-                        manifest.transaction_key()
-                    )
-                })?;
-                let object_store = self.payload_object_store()?;
-                let payload = object_store
-                    .get(&ObjectPath::from(payload_object_key.to_string()))
-                    .await
-                    .with_context(|| {
-                        format!("load CDC buffer payload object '{payload_object_key}'")
-                    })?
-                    .bytes()
-                    .await
-                    .with_context(|| {
-                        format!("read CDC buffer payload object '{payload_object_key}'")
-                    })?;
+                let payload = self.object_payload(manifest).await?;
                 decode_payload_change_batches(&payload).with_context(|| {
                     format!(
                         "decode CDC buffer change batch payload '{}'",
@@ -632,6 +596,21 @@ impl CdcBufferStore {
         })
     }
 
+    async fn object_payload(&self, manifest: &CdcBufferedTransactionManifest) -> Result<Vec<u8>> {
+        let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+            anyhow!(
+                "CDC buffer transaction '{}' is missing payload object key",
+                manifest.transaction_key()
+            )
+        })?;
+        load_payload_object(
+            self.payload_object_store()?,
+            payload_object_key,
+            "CDC buffer",
+        )
+        .await
+    }
+
     async fn legacy_slate_records(
         &self,
         manifest: &CdcBufferedTransactionManifest,
@@ -667,17 +646,12 @@ impl CdcBufferStore {
     }
 
     async fn delete_payload_object(&self, payload_object_key: &str) -> Result<()> {
-        let object_store = self.payload_object_store()?;
-        match object_store
-            .delete(&ObjectPath::from(payload_object_key.to_string()))
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(ObjectStoreError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(err).with_context(|| {
-                format!("delete CDC buffer payload object '{payload_object_key}'")
-            }),
-        }
+        delete_payload_object_if_exists(
+            self.payload_object_store()?,
+            payload_object_key,
+            "CDC buffer",
+        )
+        .await
     }
 }
 
@@ -1118,7 +1092,7 @@ fn payload_blob_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
 fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> String {
     format!(
         "floe_cdc_buffer_blobs/v1/pipeline/{}/{}.bin",
-        hex(pipeline_name.as_bytes()),
+        hex_component(pipeline_name.as_bytes()),
         transaction_key
     )
 }
@@ -1133,7 +1107,7 @@ fn payload_key(pipeline_name: &str, transaction_key: &str, record_idx: usize) ->
 fn pipeline_prefix(pipeline_name: &str) -> Vec<u8> {
     let mut key = CDC_BUFFER_PREFIX.to_vec();
     key.extend_from_slice(b"pipeline/");
-    push_component(&mut key, pipeline_name.as_bytes());
+    push_length_prefixed_component(&mut key, pipeline_name.as_bytes());
     key.extend_from_slice(b"/");
     key
 }
@@ -1142,7 +1116,9 @@ fn transaction_key(
     position: &CdcSourcePosition,
     transaction_id: Option<&CdcTransactionId>,
 ) -> Result<String> {
-    let tx = transaction_id.map_or("none".to_string(), |tx| hex(tx.as_str().as_bytes()));
+    let tx = transaction_id.map_or("none".to_string(), |tx| {
+        hex_component(tx.as_str().as_bytes())
+    });
     match position {
         CdcSourcePosition::Postgres {
             commit_lsn,
@@ -1156,7 +1132,9 @@ fn transaction_key(
                 .transpose()?
                 .unwrap_or(u64::MAX)
         )),
-        CdcSourcePosition::Opaque { value } => Ok(format!("opaque/{}/{tx}", hex(value.as_bytes()))),
+        CdcSourcePosition::Opaque { value } => {
+            Ok(format!("opaque/{}/{tx}", hex_component(value.as_bytes())))
+        }
     }
 }
 
@@ -1169,22 +1147,6 @@ fn parse_postgres_lsn(value: &str) -> Result<u64> {
     let low = u64::from_str_radix(low, 16)
         .with_context(|| format!("invalid Postgres LSN low word '{low}'"))?;
     Ok((high << 32) | low)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
-}
-
-fn push_component(out: &mut Vec<u8>, component: &[u8]) {
-    let len = u32::try_from(component.len()).expect("CDC buffer key component length exceeds u32");
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(component);
 }
 
 fn encode_payload_records(records: &[CdcBufferRecord]) -> Result<Vec<u8>> {
@@ -1379,6 +1341,7 @@ mod tests {
     use super::*;
     use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcTableId};
     use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
 
     async fn test_store(name: &str) -> CdcBufferStore {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

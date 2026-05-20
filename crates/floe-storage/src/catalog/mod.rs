@@ -19,11 +19,12 @@ use floe_core::{RowValue, RowValues};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, Settings, WriteOptions};
 use slatedb::{CloseReason, Db, Error as SlateError, ErrorKind, WriteBatch};
 use tokio::fs;
+
+use crate::object_payload::{hex_component, load_payload_object, put_payload_object};
 
 const TABLE_DEF_PREFIX: &str = "meta/table/";
 const TABLE_DATA_PREFIX: &str = "data/";
@@ -856,10 +857,13 @@ impl SlateCatalog {
             "replication pipeline DLQ payload id cannot contain '/'"
         );
         let object_key = replication_pipeline_dlq_payload_object_key(pipeline_name, dlq_id);
-        self.object_store
-            .put(&ObjectPath::from(object_key.clone()), payload.into())
-            .await
-            .with_context(|| format!("write replication pipeline DLQ payload '{object_key}'"))?;
+        put_payload_object(
+            &self.object_store,
+            &object_key,
+            payload,
+            "replication pipeline DLQ",
+        )
+        .await?;
         Ok(object_key)
     }
 
@@ -871,19 +875,12 @@ impl SlateCatalog {
             !payload_object_key.trim().is_empty(),
             "replication pipeline DLQ payload object key cannot be empty"
         );
-        let payload = self
-            .object_store
-            .get(&ObjectPath::from(payload_object_key.to_string()))
-            .await
-            .with_context(|| {
-                format!("load replication pipeline DLQ payload '{payload_object_key}'")
-            })?
-            .bytes()
-            .await
-            .with_context(|| {
-                format!("read replication pipeline DLQ payload '{payload_object_key}'")
-            })?;
-        Ok(payload.to_vec())
+        load_payload_object(
+            &self.object_store,
+            payload_object_key,
+            "replication pipeline DLQ",
+        )
+        .await
     }
 
     pub async fn save_materialized_view_schema(&self, name: &str, schema: SchemaRef) -> Result<()> {
@@ -1069,16 +1066,6 @@ fn encode_key_value(value: &RowValue) -> Result<Vec<u8>> {
 
 fn map_slate_err(err: SlateError) -> anyhow::Error {
     anyhow::Error::new(err)
-}
-
-fn hex_component(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

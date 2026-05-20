@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod cdc_buffer;
+mod object_payload;
 
 pub use catalog::{
     MaterializedViewMetadata, ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry,
