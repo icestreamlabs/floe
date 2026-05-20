@@ -17,8 +17,6 @@ use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
     DbspNodeKind, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
 };
-use slatedb::WriteBatch;
-use slatedb::config::ScanOptions;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -1266,94 +1264,6 @@ fn has_single_consumer(plan: &CircuitPlan, node_idx: usize) -> bool {
         == 1
 }
 
-struct TransientSegmentOptimization {
-    durable_input_idx: usize,
-    optimized_nodes: Vec<usize>,
-    score: i32,
-    steps: Vec<TransientSegmentStep>,
-    transform: Arc<DeltaTransformFn>,
-}
-
-fn try_build_transient_segment_optimization(
-    plan: &CircuitPlan,
-    terminal_input_idx: usize,
-    built: &HashMap<usize, DeltaHandleStream>,
-    graph_id: &str,
-    allow_terminal_without_consumer: bool,
-    persistence_policy: &PersistencePolicy,
-) -> Result<Option<TransientSegmentOptimization>> {
-    let Some(segment) = persistence_policy.build_transient_segment(
-        plan,
-        terminal_input_idx,
-        built,
-        allow_terminal_without_consumer,
-    )?
-    else {
-        return Ok(None);
-    };
-    build_transient_segment_optimization_from_spec(graph_id, segment).map(Some)
-}
-
-fn build_transient_segment_optimization_from_spec(
-    graph_id: &str,
-    segment: TransientSegmentSpec,
-) -> Result<TransientSegmentOptimization> {
-    let steps = segment.steps.clone();
-    let mut evaluators = Vec::new();
-    for step in &steps {
-        match step {
-            TransientSegmentStep::Passthrough => {}
-            TransientSegmentStep::Select { predicate, schema } => {
-                evaluators.push(VectorizedFilterProjectEvaluator::for_filter(
-                    predicate,
-                    Arc::clone(schema),
-                )?);
-            }
-            TransientSegmentStep::Project {
-                expressions,
-                schema,
-            } => {
-                evaluators.push(VectorizedFilterProjectEvaluator::for_map(
-                    expressions.as_ref(),
-                    Arc::clone(schema),
-                )?);
-            }
-        }
-    }
-
-    let evaluators = Arc::new(evaluators);
-    let graph_id = graph_id.to_string();
-    let transform: Arc<DeltaTransformFn> = Arc::new(move |deltas| {
-        apply_transient_segment_vectorized(&graph_id, evaluators.as_ref(), deltas)
-    });
-
-    Ok(TransientSegmentOptimization {
-        durable_input_idx: segment.durable_input_idx,
-        optimized_nodes: segment.segment_nodes,
-        score: segment.score,
-        steps,
-        transform,
-    })
-}
-
-fn apply_transient_segment_vectorized(
-    graph_id: &str,
-    evaluators: &[VectorizedFilterProjectEvaluator],
-    deltas: &[(Vec<u8>, i64)],
-) -> Result<Vec<(Vec<u8>, i64)>> {
-    if evaluators.is_empty() {
-        return Ok(deltas.to_vec());
-    }
-    let mut deltas = evaluators[0].transform_delta(graph_id, deltas)?;
-    for evaluator in &evaluators[1..] {
-        if deltas.is_empty() {
-            break;
-        }
-        deltas = evaluator.transform_delta(graph_id, &deltas)?;
-    }
-    Ok(deltas)
-}
-
 #[derive(Clone)]
 struct TransientSourceRootMaterialization {
     source_name: String,
@@ -1391,135 +1301,6 @@ struct TransientJoinInputOptimization {
     optimized_nodes: Vec<usize>,
     receiver:
         tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
-}
-
-struct PersistentTransientInputState {
-    table: Option<Arc<dyn KeyValueTable>>,
-    prefix: Vec<u8>,
-    rows: HashMap<Vec<u8>, i64>,
-}
-
-impl PersistentTransientInputState {
-    async fn load(
-        table: Option<Arc<dyn KeyValueTable>>,
-        graph_id: &str,
-        label: impl AsRef<str>,
-    ) -> Result<Self> {
-        let prefix = transient_helper_state_prefix(graph_id, label.as_ref());
-        let entries = match table.as_ref() {
-            Some(table) => table
-                .scan_prefix(&prefix, &ScanOptions::default())
-                .await
-                .with_context(|| {
-                    format!(
-                        "load transient helper input state for graph '{graph_id}' label '{}'",
-                        label.as_ref()
-                    )
-                })?,
-            None => Vec::new(),
-        };
-        let mut rows = HashMap::with_capacity(entries.len());
-        for (key, value) in entries {
-            if value.len() != std::mem::size_of::<i64>() {
-                tracing::warn!(
-                    graph_id,
-                    label = label.as_ref(),
-                    key_len = key.len(),
-                    value_len = value.len(),
-                    "skipping malformed transient helper state row"
-                );
-                continue;
-            }
-            let row = key[prefix.len()..].to_vec();
-            let mut weight = [0_u8; 8];
-            weight.copy_from_slice(&value);
-            let weight = i64::from_le_bytes(weight);
-            if weight != 0 {
-                rows.insert(row, weight);
-            }
-        }
-        Ok(Self {
-            table,
-            prefix,
-            rows,
-        })
-    }
-
-    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
-        self.rows
-            .iter()
-            .map(|(row, weight)| (row.clone(), *weight))
-            .collect()
-    }
-
-    async fn apply_deltas(&mut self, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
-        if deltas.is_empty() {
-            return Ok(());
-        }
-        let mut batch = WriteBatch::new();
-        let mut dirty = false;
-        for (row, diff) in deltas {
-            if *diff == 0 {
-                continue;
-            }
-            let previous = self.rows.get(row).copied().unwrap_or(0);
-            let next = previous.saturating_add(*diff);
-            let mut key = self.prefix.clone();
-            key.extend_from_slice(row);
-            if next == 0 {
-                self.rows.remove(row);
-                batch.delete(key);
-            } else {
-                self.rows.insert(row.clone(), next);
-                batch.put(key, next.to_le_bytes());
-            }
-            dirty = true;
-        }
-        if dirty && let Some(table) = self.table.as_ref() {
-            table.write_batch(batch).await?;
-        }
-        Ok(())
-    }
-
-    async fn replace_with_snapshot(&mut self, rows: Vec<(Vec<u8>, i64)>) -> Result<()> {
-        let next_rows = rows
-            .into_iter()
-            .filter(|(_, weight)| *weight != 0)
-            .collect::<HashMap<_, _>>();
-        if self.rows == next_rows {
-            return Ok(());
-        }
-
-        let mut batch = WriteBatch::new();
-        for row in self.rows.keys() {
-            if !next_rows.contains_key(row) {
-                let mut key = self.prefix.clone();
-                key.extend_from_slice(row);
-                batch.delete(key);
-            }
-        }
-        for (row, weight) in &next_rows {
-            if self.rows.get(row).copied() != Some(*weight) {
-                let mut key = self.prefix.clone();
-                key.extend_from_slice(row);
-                batch.put(key, weight.to_le_bytes());
-            }
-        }
-        if let Some(table) = self.table.as_ref() {
-            table.write_batch(batch).await?;
-        }
-        self.rows = next_rows;
-        Ok(())
-    }
-}
-
-fn transient_helper_state_prefix(graph_id: &str, label: &str) -> Vec<u8> {
-    let mut prefix = b"floe/transient_helper_state/".to_vec();
-    prefix.extend_from_slice(graph_id.as_bytes());
-    prefix.push(b'/');
-    prefix.extend_from_slice(label.as_bytes());
-    prefix.push(b'/');
-    prefix
 }
 
 #[derive(Clone)]
@@ -1625,8 +1406,17 @@ pub use source_requirements::{
     source_batch_journal_root_sources, transient_source_root_requirements,
 };
 
+mod row_helpers;
 mod source_requirements;
+mod transient_receivers;
+mod transient_segment;
+mod transient_state;
 mod transient_topn;
+
+use row_helpers::*;
+use transient_receivers::{build_transient_source_receiver, build_transient_transform_receiver};
+use transient_segment::try_build_transient_segment_optimization;
+use transient_state::PersistentTransientInputState;
 
 #[cfg(test)]
 fn join_input_unique_on_direct_source_primary_key<'a>(
@@ -1700,175 +1490,6 @@ fn join_input_direct_source_primary_key_columns<'a>(
         Ok(Some(Arc::new(primary_key_columns.into_iter().collect())))
     } else {
         Ok(None)
-    }
-}
-
-fn try_build_direct_join_output_projection(
-    join: &dbsp::DbspJoinNode,
-    steps: &[TransientSegmentStep],
-) -> Option<Arc<Vec<EncodedRowProjectionColumn>>> {
-    let mut project_expressions: Option<Arc<Vec<DbspProjectExpr>>> = None;
-    for step in steps {
-        match step {
-            TransientSegmentStep::Passthrough => {}
-            TransientSegmentStep::Select { .. } => return None,
-            TransientSegmentStep::Project { expressions, .. } => {
-                if project_expressions.is_some() {
-                    return None;
-                }
-                project_expressions = Some(Arc::clone(expressions));
-            }
-        }
-    }
-
-    let expressions = project_expressions?;
-    let left_width = join.left_schema.len();
-    let columns = expressions
-        .iter()
-        .map(|expr| {
-            let column_idx = projection_direct_column_index(expr, join.output_schema.as_ref())?;
-            if column_idx < left_width {
-                Some(EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Left,
-                    index: column_idx,
-                })
-            } else {
-                Some(EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Right,
-                    index: column_idx - left_width,
-                })
-            }
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(Arc::new(columns))
-}
-
-fn projection_direct_column_index(expr: &DbspProjectExpr, schema: &RowSchema) -> Option<usize> {
-    match expr.expression().expr() {
-        Expr::Alias(alias) => {
-            projection_direct_column_index_expression(alias.expr.as_ref(), schema)
-        }
-        other => projection_direct_column_index_expression(other, schema),
-    }
-}
-
-fn projection_direct_column_index_expression(expr: &Expr, schema: &RowSchema) -> Option<usize> {
-    match expr {
-        Expr::Column(column) => projection_resolve_direct_column(schema, column),
-        Expr::Alias(alias) => {
-            projection_direct_column_index_expression(alias.expr.as_ref(), schema)
-        }
-        _ => None,
-    }
-}
-
-fn projection_resolve_direct_column(schema: &RowSchema, column: &Column) -> Option<usize> {
-    let qualified = column.flat_name();
-    schema
-        .field_index(&qualified)
-        .or_else(|| schema.field_index(&column.name))
-}
-
-fn extract_encoded_row_int64_column(bytes: &[u8], target_index: usize) -> Result<Option<i64>> {
-    if bytes.len() < 4 {
-        bail!("encoded key too short");
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    if target_index >= count {
-        bail!("encoded row missing int64 column at index {target_index}");
-    }
-
-    let mut cursor = 4usize;
-    for column_idx in 0..count {
-        let tag = *bytes
-            .get(cursor)
-            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
-        cursor += 1;
-        if column_idx == target_index {
-            return match tag {
-                0x01 => {
-                    let end = cursor + 8;
-                    let chunk = bytes
-                        .get(cursor..end)
-                        .ok_or_else(|| anyhow!("truncated int64"))?;
-                    Ok(Some(i64::from_le_bytes(chunk.try_into().unwrap())))
-                }
-                0x05 | 0x00 => Ok(None),
-                other => Err(anyhow!(
-                    "expected int64 encoded field at index {target_index}, found tag {other:#x}"
-                )),
-            };
-        }
-        cursor = skip_encoded_row_field(bytes, cursor, tag)?;
-    }
-
-    bail!("encoded row missing int64 column at index {target_index}")
-}
-
-fn extract_encoded_row_i64_like_column(bytes: &[u8], target_index: usize) -> Result<Option<i64>> {
-    if bytes.len() < 4 {
-        bail!("encoded key too short");
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    if target_index >= count {
-        bail!("encoded row missing i64-like column at index {target_index}");
-    }
-
-    let mut cursor = 4usize;
-    for column_idx in 0..count {
-        let tag = *bytes
-            .get(cursor)
-            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
-        cursor += 1;
-        if column_idx == target_index {
-            return match tag {
-                0x01 | 0x03 => {
-                    let end = cursor + 8;
-                    let chunk = bytes
-                        .get(cursor..end)
-                        .ok_or_else(|| anyhow!("truncated fixed-width i64-like value"))?;
-                    Ok(Some(i64::from_le_bytes(chunk.try_into().unwrap())))
-                }
-                0x05 | 0x07 | 0x00 => Ok(None),
-                other => Err(anyhow!(
-                    "expected i64-like encoded field at index {target_index}, found tag {other:#x}"
-                )),
-            };
-        }
-        cursor = skip_encoded_row_field(bytes, cursor, tag)?;
-    }
-
-    bail!("encoded row missing i64-like column at index {target_index}")
-}
-
-fn skip_encoded_row_field(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
-    match tag {
-        0x00 | 0x05 | 0x06 | 0x07 | 0x08 => Ok(cursor),
-        0x01 | 0x03 => {
-            let end = cursor + 8;
-            bytes
-                .get(cursor..end)
-                .ok_or_else(|| anyhow!("truncated fixed-width value"))?;
-            Ok(end)
-        }
-        0x02 => {
-            let len_bytes = bytes
-                .get(cursor..cursor + 4)
-                .ok_or_else(|| anyhow!("truncated string length"))?;
-            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            let end = cursor + 4 + len;
-            bytes
-                .get(cursor + 4..end)
-                .ok_or_else(|| anyhow!("truncated string payload"))?;
-            Ok(end)
-        }
-        0x04 => {
-            bytes
-                .get(cursor)
-                .ok_or_else(|| anyhow!("missing boolean payload"))?;
-            Ok(cursor + 1)
-        }
-        _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
     }
 }
 
@@ -2645,99 +2266,6 @@ async fn try_build_transient_source_aggregate_root_materialization(
         optimized_nodes: shape.optimized_nodes,
         receiver,
     }))
-}
-
-fn build_transient_source_receiver(
-    graph_id: &str,
-    task_label: impl Into<String>,
-    upstream: TransientSourceHandleStream,
-    input_transform: Arc<DeltaTransformFn>,
-    cancel: &CancellationToken,
-    task_events: &GraphTaskSender,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let mut upstream_rx = upstream.subscribe();
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
-    let graph_id = graph_id.to_string();
-    let task_label = task_label.into();
-    let task_events = task_events.clone();
-    let cancel = cancel.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                maybe_batch = upstream_rx.recv() => {
-                    let Some(batch) = maybe_batch else {
-                        break;
-                    };
-                    let input_deltas = match input_transform(batch.deltas.as_ref()) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
-                    if tx.send(TransientMaterializeBatch {
-                        version: batch.version,
-                        deltas: Arc::new(input_deltas),
-                    }).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    rx
-}
-
-fn build_transient_transform_receiver(
-    graph_id: &str,
-    task_label: impl Into<String>,
-    mut upstream: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
-    transform: Arc<DeltaTransformFn>,
-    cancel: &CancellationToken,
-    task_events: &GraphTaskSender,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
-    let graph_id = graph_id.to_string();
-    let task_label = task_label.into();
-    let task_events = task_events.clone();
-    let cancel = cancel.clone();
-    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                maybe_batch = upstream.recv() => {
-                    let Some(batch) = maybe_batch else {
-                        break;
-                    };
-                    let output_deltas = match transform(batch.deltas.as_ref()) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
-                        }
-                    };
-                    if debug_transient_join {
-                        eprintln!(
-                            "transient-transform-output graph_id={} task={} version={} rows={}",
-                            graph_id,
-                            task_label,
-                            batch.version,
-                            output_deltas.len()
-                        );
-                    }
-                    if tx.send(TransientMaterializeBatch {
-                        version: batch.version,
-                        deltas: Arc::new(output_deltas),
-                    }).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    rx
 }
 
 async fn build_transient_aggregate_receiver(
@@ -4872,35 +4400,6 @@ fn compose_optional_delta_transform(
         Some(first) => compose_delta_transforms(first, second),
         None => second,
     })
-}
-
-fn try_build_direct_row_projection(project: &DbspProjectNode) -> Option<Arc<Vec<usize>>> {
-    let columns = project
-        .expressions()
-        .iter()
-        .map(|expr| projection_direct_column_index(expr, project.input_schema().as_ref()))
-        .collect::<Option<Vec<_>>>()?;
-    Some(Arc::new(columns))
-}
-
-fn compose_direct_row_projection(
-    first: Option<Arc<Vec<usize>>>,
-    second: Arc<Vec<usize>>,
-) -> Result<Arc<Vec<usize>>> {
-    let Some(first) = first else {
-        return Ok(second);
-    };
-    let mut composed = Vec::with_capacity(second.len());
-    for projected_idx in second.iter().copied() {
-        let Some(&source_idx) = first.get(projected_idx) else {
-            bail!(
-                "direct projection index {projected_idx} out of bounds for prior width {}",
-                first.len()
-            );
-        };
-        composed.push(source_idx);
-    }
-    Ok(Arc::new(composed))
 }
 
 fn find_transient_source_root_shape(
