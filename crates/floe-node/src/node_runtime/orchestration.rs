@@ -1639,7 +1639,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     .await;
     let replication_settings = config
         .as_ref()
-        .map(|cfg| cfg.replication)
+        .map(|cfg| cfg.replication.clone())
         .unwrap_or_default()
         .with_legacy_env_overrides();
     let replication_pipeline_runtime = Arc::new(ReplicationPipelineRuntime::new(

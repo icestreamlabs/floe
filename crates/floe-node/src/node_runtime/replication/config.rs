@@ -6,15 +6,6 @@ use arrow_ipc::CompressionType;
 pub(super) const REPLICATION_KAFKA_RETRY_ATTEMPTS: usize = 5;
 pub(super) const REPLICATION_KAFKA_RETRY_BASE_MS: u64 = 50;
 pub(super) const REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS: &str = "1000";
-const DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES: &str = "10485760";
-const DEFAULT_REPLICATION_KAFKA_ACKS: &str = "1";
-const DEFAULT_REPLICATION_KAFKA_ENABLE_IDEMPOTENCE: &str = "false";
-const DEFAULT_REPLICATION_KAFKA_BATCH_SIZE: &str = "1000000";
-const DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES: &str = "1000000";
-const DEFAULT_REPLICATION_KAFKA_LINGER_MS: &str = "1";
-const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: &str = "1000000";
-const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: &str = "1048576";
-const DEFAULT_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES: &str = "0";
 pub(super) const REPLICATION_KAFKA_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT: Duration = Duration::from_millis(500);
 pub(super) const FLOE_JSON_VERSION: i64 = 1;
@@ -31,62 +22,6 @@ const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
 const DEFAULT_REPLICATION_KAFKA_METADATA_HEADERS: bool = false;
 pub(super) const FLOE_JSON_PARALLEL_RECORD_THRESHOLD: usize = 4_096;
-
-pub(super) static REPLICATION_KAFKA_MESSAGE_MAX_BYTES: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES")
-        .ok()
-        .filter(|value| value.parse::<usize>().is_ok_and(|bytes| bytes > 0))
-        .unwrap_or_else(|| DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES.to_string())
-});
-pub(super) static REPLICATION_KAFKA_ACKS: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("FLOE_REPLICATION_KAFKA_ACKS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REPLICATION_KAFKA_ACKS.to_string())
-});
-pub(super) static REPLICATION_KAFKA_ENABLE_IDEMPOTENCE: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("FLOE_REPLICATION_KAFKA_ENABLE_IDEMPOTENCE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REPLICATION_KAFKA_ENABLE_IDEMPOTENCE.to_string())
-});
-pub(super) static REPLICATION_KAFKA_BATCH_SIZE: LazyLock<String> = LazyLock::new(|| {
-    env_positive_usize_string(
-        "FLOE_REPLICATION_KAFKA_BATCH_SIZE",
-        DEFAULT_REPLICATION_KAFKA_BATCH_SIZE,
-    )
-});
-pub(super) static REPLICATION_KAFKA_BATCH_NUM_MESSAGES: LazyLock<String> = LazyLock::new(|| {
-    env_positive_usize_string(
-        "FLOE_REPLICATION_KAFKA_BATCH_NUM_MESSAGES",
-        DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES,
-    )
-});
-pub(super) static REPLICATION_KAFKA_LINGER_MS: LazyLock<String> = LazyLock::new(|| {
-    env_usize_string(
-        "FLOE_REPLICATION_KAFKA_LINGER_MS",
-        DEFAULT_REPLICATION_KAFKA_LINGER_MS,
-    )
-});
-pub(super) static REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: LazyLock<String> = LazyLock::new(|| {
-    env_usize_string(
-        "FLOE_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES",
-        DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES,
-    )
-});
-pub(super) static REPLICATION_KAFKA_QUEUE_MAX_KBYTES: LazyLock<String> = LazyLock::new(|| {
-    env_usize_string(
-        "FLOE_REPLICATION_KAFKA_QUEUE_MAX_KBYTES",
-        DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES,
-    )
-});
-pub(super) static REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES: LazyLock<String> =
-    LazyLock::new(|| {
-        env_usize_string(
-            "FLOE_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES",
-            DEFAULT_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES,
-        )
-    });
 pub(super) static REPLICATION_ARROW_IPC_ROWS_PER_RECORD: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD")
         .ok()
@@ -145,20 +80,6 @@ impl ReplicationArrowIpcCompression {
             Self::Lz4Frame => CompressionType::LZ4_FRAME,
         }
     }
-}
-
-fn env_usize_string(name: &str, default_value: &str) -> String {
-    std::env::var(name)
-        .ok()
-        .filter(|value| value.parse::<usize>().is_ok())
-        .unwrap_or_else(|| default_value.to_string())
-}
-
-fn env_positive_usize_string(name: &str, default_value: &str) -> String {
-    std::env::var(name)
-        .ok()
-        .filter(|value| value.parse::<usize>().is_ok_and(|parsed| parsed > 0))
-        .unwrap_or_else(|| default_value.to_string())
 }
 
 fn env_bool(name: &str, default_value: bool) -> bool {

@@ -162,21 +162,18 @@ pub struct MaintenanceConfig {
     pub gc_namespace: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     #[serde(default)]
     pub buffer_cleanup: ReplicationBufferCleanupConfig,
     #[serde(default)]
     pub buffer_limits: ReplicationBufferLimitsConfig,
+    #[serde(default)]
+    pub kafka: ReplicationKafkaProducerConfig,
 }
 
 impl ReplicationConfig {
-    pub const DEFAULT: Self = Self {
-        buffer_cleanup: ReplicationBufferCleanupConfig::DEFAULT,
-        buffer_limits: ReplicationBufferLimitsConfig::DEFAULT,
-    };
-
     pub fn with_legacy_env_overrides(mut self) -> Self {
         if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_DELIVERED_RETENTION_MS") {
             self.buffer_cleanup.delivered_retention_ms = value;
@@ -198,13 +195,34 @@ impl ReplicationConfig {
         if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS") {
             self.buffer_limits.max_pending_age_ms = value;
         }
+        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES") {
+            self.kafka.message_max_bytes = value;
+        }
+        if let Some(value) = env_nonempty_string("FLOE_REPLICATION_KAFKA_ACKS") {
+            self.kafka.acks = value;
+        }
+        if let Some(value) = env_bool("FLOE_REPLICATION_KAFKA_ENABLE_IDEMPOTENCE") {
+            self.kafka.enable_idempotence = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_BATCH_SIZE") {
+            self.kafka.batch_size = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_BATCH_NUM_MESSAGES") {
+            self.kafka.batch_num_messages = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_LINGER_MS") {
+            self.kafka.linger_ms = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES") {
+            self.kafka.queue_max_messages = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_QUEUE_MAX_KBYTES") {
+            self.kafka.queue_max_kbytes = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES") {
+            self.kafka.message_send_max_retries = value;
+        }
         self
-    }
-}
-
-impl Default for ReplicationConfig {
-    fn default() -> Self {
-        Self::DEFAULT
     }
 }
 
@@ -258,9 +276,54 @@ impl Default for ReplicationBufferLimitsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationKafkaProducerConfig {
+    #[serde(default = "default_replication_kafka_message_max_bytes")]
+    pub message_max_bytes: usize,
+    #[serde(default = "default_replication_kafka_acks")]
+    pub acks: String,
+    #[serde(default)]
+    pub enable_idempotence: bool,
+    #[serde(default = "default_replication_kafka_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_replication_kafka_batch_num_messages")]
+    pub batch_num_messages: usize,
+    #[serde(default = "default_replication_kafka_linger_ms")]
+    pub linger_ms: usize,
+    #[serde(default = "default_replication_kafka_queue_max_messages")]
+    pub queue_max_messages: usize,
+    #[serde(default = "default_replication_kafka_queue_max_kbytes")]
+    pub queue_max_kbytes: usize,
+    #[serde(default)]
+    pub message_send_max_retries: usize,
+}
+
+impl Default for ReplicationKafkaProducerConfig {
+    fn default() -> Self {
+        Self {
+            message_max_bytes: DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES,
+            acks: default_replication_kafka_acks(),
+            enable_idempotence: false,
+            batch_size: DEFAULT_REPLICATION_KAFKA_BATCH_SIZE,
+            batch_num_messages: DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES,
+            linger_ms: DEFAULT_REPLICATION_KAFKA_LINGER_MS,
+            queue_max_messages: DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES,
+            queue_max_kbytes: DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES,
+            message_send_max_retries: 0,
+        }
+    }
+}
+
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
+const DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES: usize = 10_485_760;
+const DEFAULT_REPLICATION_KAFKA_BATCH_SIZE: usize = 1_000_000;
+const DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES: usize = 1_000_000;
+const DEFAULT_REPLICATION_KAFKA_LINGER_MS: usize = 1;
+const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: usize = 1_000_000;
+const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: usize = 1_048_576;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
@@ -274,16 +337,64 @@ fn default_replication_buffer_max_pending_bytes() -> usize {
     DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES
 }
 
+fn default_replication_kafka_message_max_bytes() -> usize {
+    DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES
+}
+
+fn default_replication_kafka_acks() -> String {
+    "1".to_string()
+}
+
+fn default_replication_kafka_batch_size() -> usize {
+    DEFAULT_REPLICATION_KAFKA_BATCH_SIZE
+}
+
+fn default_replication_kafka_batch_num_messages() -> usize {
+    DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES
+}
+
+fn default_replication_kafka_linger_ms() -> usize {
+    DEFAULT_REPLICATION_KAFKA_LINGER_MS
+}
+
+fn default_replication_kafka_queue_max_messages() -> usize {
+    DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES
+}
+
+fn default_replication_kafka_queue_max_kbytes() -> usize {
+    DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+fn env_positive_usize(name: &str) -> Option<usize> {
+    env_usize(name).filter(|value| *value > 0)
+}
+
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn env_nonempty_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -869,6 +980,34 @@ mod tests {
         assert_eq!(config.replication.buffer_limits.max_pending_records, 456);
         assert_eq!(config.replication.buffer_limits.max_pending_transactions, 7);
         assert_eq!(config.replication.buffer_limits.max_pending_age_ms, 89);
+    }
+
+    #[test]
+    fn load_config_accepts_replication_kafka_section() {
+        let input = r#"
+            [replication.kafka]
+            message_max_bytes = 2000000
+            acks = "all"
+            enable_idempotence = true
+            batch_size = 300000
+            batch_num_messages = 400000
+            linger_ms = 2
+            queue_max_messages = 500000
+            queue_max_kbytes = 600000
+            message_send_max_retries = 3
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+
+        assert_eq!(config.replication.kafka.message_max_bytes, 2_000_000);
+        assert_eq!(config.replication.kafka.acks, "all");
+        assert!(config.replication.kafka.enable_idempotence);
+        assert_eq!(config.replication.kafka.batch_size, 300_000);
+        assert_eq!(config.replication.kafka.batch_num_messages, 400_000);
+        assert_eq!(config.replication.kafka.linger_ms, 2);
+        assert_eq!(config.replication.kafka.queue_max_messages, 500_000);
+        assert_eq!(config.replication.kafka.queue_max_kbytes, 600_000);
+        assert_eq!(config.replication.kafka.message_send_max_retries, 3);
     }
 
     #[test]

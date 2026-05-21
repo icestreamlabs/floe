@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use floe_cdc_core::{CdcColumn, CdcTableSchema};
+use floe_config::ReplicationKafkaProducerConfig;
 use floe_core::catalog::ColumnType;
 use floe_storage::CdcBufferRecord;
 use rdkafka::ClientConfig;
@@ -21,14 +22,10 @@ use tokio_postgres::types::ToSql;
 use super::super::ReplicationPipelineRuntimeBufferMode;
 use super::target_state::TargetStateBuilder;
 use super::{
-    CDC_PERF_LOGGING_ENABLED, FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_ACKS,
-    REPLICATION_KAFKA_BATCH_NUM_MESSAGES, REPLICATION_KAFKA_BATCH_SIZE,
-    REPLICATION_KAFKA_ENABLE_IDEMPOTENCE, REPLICATION_KAFKA_LINGER_MS,
-    REPLICATION_KAFKA_MESSAGE_MAX_BYTES, REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES,
-    REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS, REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT,
-    REPLICATION_KAFKA_QUEUE_MAX_KBYTES, REPLICATION_KAFKA_QUEUE_MAX_MESSAGES,
-    REPLICATION_KAFKA_RETRY_ATTEMPTS, REPLICATION_KAFKA_RETRY_BASE_MS,
-    REPLICATION_KAFKA_SEND_TIMEOUT, encoding, log_replication_kafka_send_perf,
+    CDC_PERF_LOGGING_ENABLED, FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS,
+    REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT, REPLICATION_KAFKA_RETRY_ATTEMPTS,
+    REPLICATION_KAFKA_RETRY_BASE_MS, REPLICATION_KAFKA_SEND_TIMEOUT, encoding,
+    log_replication_kafka_send_perf,
 };
 
 pub(super) struct KafkaReplicationPipelineWriter {
@@ -219,6 +216,7 @@ impl KafkaReplicationPipelineWriter {
         brokers: &str,
         topic: &str,
         _buffer_mode: ReplicationPipelineRuntimeBufferMode,
+        settings: ReplicationKafkaProducerConfig,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !brokers.trim().is_empty(),
@@ -232,33 +230,30 @@ impl KafkaReplicationPipelineWriter {
         config
             .set("bootstrap.servers", brokers)
             .set("message.timeout.ms", REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS)
-            .set(
-                "message.max.bytes",
-                REPLICATION_KAFKA_MESSAGE_MAX_BYTES.as_str(),
-            )
-            .set("acks", REPLICATION_KAFKA_ACKS.as_str())
+            .set("message.max.bytes", settings.message_max_bytes.to_string())
+            .set("acks", settings.acks.as_str())
             .set(
                 "enable.idempotence",
-                REPLICATION_KAFKA_ENABLE_IDEMPOTENCE.as_str(),
+                settings.enable_idempotence.to_string(),
             )
             .set("compression.type", "none")
-            .set("linger.ms", REPLICATION_KAFKA_LINGER_MS.as_str())
-            .set("batch.size", REPLICATION_KAFKA_BATCH_SIZE.as_str())
+            .set("linger.ms", settings.linger_ms.to_string())
+            .set("batch.size", settings.batch_size.to_string())
             .set(
                 "batch.num.messages",
-                REPLICATION_KAFKA_BATCH_NUM_MESSAGES.as_str(),
+                settings.batch_num_messages.to_string(),
             )
             .set(
                 "queue.buffering.max.messages",
-                REPLICATION_KAFKA_QUEUE_MAX_MESSAGES.as_str(),
+                settings.queue_max_messages.to_string(),
             )
             .set(
                 "queue.buffering.max.kbytes",
-                REPLICATION_KAFKA_QUEUE_MAX_KBYTES.as_str(),
+                settings.queue_max_kbytes.to_string(),
             )
             .set(
                 "message.send.max.retries",
-                REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES.as_str(),
+                settings.message_send_max_retries.to_string(),
             );
         let producer: ThreadedProducer<KafkaReplicationPipelineContext> = config
             .create_with_context(KafkaReplicationPipelineContext)
