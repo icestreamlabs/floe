@@ -21,6 +21,8 @@ pub(crate) fn validate_node_config(config: &NodeConfig) -> Result<()> {
     validate_runtime_config(&config.runtime)?;
     validate_storage_config(&config.storage)?;
     validate_maintenance_config(&config.maintenance)?;
+    validate_replication_config(&config.replication)?;
+    validate_postgres_cdc_config(&config.postgres_cdc)?;
     Ok(())
 }
 
@@ -132,6 +134,54 @@ fn validate_maintenance_config(maintenance: &MaintenanceConfig) -> Result<()> {
     for (index, namespace) in maintenance.gc_namespace.iter().enumerate() {
         ensure_non_empty(namespace, &format!("maintenance.gc_namespace[{index}]"))?;
     }
+    Ok(())
+}
+
+fn validate_replication_config(replication: &ReplicationConfig) -> Result<()> {
+    ensure_positive_usize(
+        replication.kafka.message_max_bytes,
+        "replication.kafka.message_max_bytes",
+    )?;
+    ensure_non_empty(&replication.kafka.acks, "replication.kafka.acks")?;
+    ensure_positive_usize(replication.kafka.batch_size, "replication.kafka.batch_size")?;
+    ensure_positive_usize(
+        replication.kafka.batch_num_messages,
+        "replication.kafka.batch_num_messages",
+    )?;
+    ensure_positive_usize(
+        replication.encoding.arrow_ipc_rows_per_record,
+        "replication.encoding.arrow_ipc_rows_per_record",
+    )?;
+    ensure_positive_usize(
+        replication.encoding.snapshot_batches_per_chunk,
+        "replication.encoding.snapshot_batches_per_chunk",
+    )?;
+    Ok(())
+}
+
+fn validate_postgres_cdc_config(postgres_cdc: &PostgresCdcConfig) -> Result<()> {
+    let snapshot = &postgres_cdc.snapshot;
+    ensure_positive_usize(
+        snapshot.rows_per_batch,
+        "postgres_cdc.snapshot.rows_per_batch",
+    )?;
+    ensure_positive_usize(snapshot.max_workers, "postgres_cdc.snapshot.max_workers")?;
+    ensure_positive_usize(
+        snapshot.intra_table_chunks,
+        "postgres_cdc.snapshot.intra_table_chunks",
+    )?;
+    ensure_positive_usize(snapshot.min_workers, "postgres_cdc.snapshot.min_workers")?;
+    if !(1..=100).contains(&snapshot.wal_buffer_high_watermark_percent) {
+        bail!("postgres_cdc.snapshot.wal_buffer_high_watermark_percent must be between 1 and 100");
+    }
+    if snapshot.wal_buffer_low_watermark_percent > 100 {
+        bail!("postgres_cdc.snapshot.wal_buffer_low_watermark_percent must be <= 100");
+    }
+    ensure_positive_u64(snapshot.slow_scan_ms, "postgres_cdc.snapshot.slow_scan_ms")?;
+    ensure_positive_u64(
+        snapshot.controller_interval_ms,
+        "postgres_cdc.snapshot.controller_interval_ms",
+    )?;
     Ok(())
 }
 
@@ -449,6 +499,20 @@ fn ensure_optional_positive_u64(value: Option<u64>, field_path: &str) -> Result<
     if let Some(value) = value
         && value == 0
     {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_positive_usize(value: usize, field_path: &str) -> Result<()> {
+    if value == 0 {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_positive_u64(value: u64, field_path: &str) -> Result<()> {
+    if value == 0 {
         bail!("{field_path} must be greater than 0");
     }
     Ok(())

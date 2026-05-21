@@ -1120,6 +1120,44 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_non_positive_replication_encoding_rows_per_record() {
+        let config = NodeConfig {
+            replication: ReplicationConfig {
+                encoding: ReplicationEncodingConfig {
+                    arrow_ipc_rows_per_record: 0,
+                    ..ReplicationEncodingConfig::default()
+                },
+                ..ReplicationConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("replication.encoding.arrow_ipc_rows_per_record must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_postgres_cdc_snapshot_watermark() {
+        let config = NodeConfig {
+            postgres_cdc: PostgresCdcConfig {
+                snapshot: PostgresCdcSnapshotConfig {
+                    wal_buffer_high_watermark_percent: 0,
+                    ..PostgresCdcSnapshotConfig::default()
+                },
+            },
+            ..NodeConfig::default()
+        };
+
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(err.to_string().contains(
+            "postgres_cdc.snapshot.wal_buffer_high_watermark_percent must be between 1 and 100"
+        ));
+    }
+
+    #[test]
     fn load_config_accepts_materialized_views_and_runtime_sections() {
         let input = r#"
             [[connectors]]
