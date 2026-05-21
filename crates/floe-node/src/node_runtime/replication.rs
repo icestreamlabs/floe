@@ -685,7 +685,10 @@ impl ReplicationPipelineRuntime {
         incoming_records: usize,
         has_pending: bool,
     ) -> anyhow::Result<()> {
-        let limits = effective_replication_buffer_limits(plan);
+        let limits = effective_replication_buffer_limits(
+            plan,
+            ReplicationBufferLimits::from_config(self.settings.buffer_limits),
+        );
         if !limits.enabled() {
             self.set_source_backpressure_state(&plan.name, false);
             return Ok(());
@@ -836,14 +839,11 @@ mod target_state;
 mod writers;
 
 #[cfg(test)]
+use buffer::{ReplicationBufferLimitViolation, effective_u64_limit, effective_usize_limit};
 use buffer::{
-    ReplicationBufferLimitViolation, ReplicationBufferLimits, effective_u64_limit,
-    effective_usize_limit,
-};
-use buffer::{
-    append_buffer_transaction, buffer_limit_violation, effective_replication_buffer_limits,
-    estimated_buffer_payload_bytes, log_replication_buffer_backpressure,
-    prepare_replication_buffer_append, record_buffer_stats,
+    ReplicationBufferLimits, append_buffer_transaction, buffer_limit_violation,
+    effective_replication_buffer_limits, estimated_buffer_payload_bytes,
+    log_replication_buffer_backpressure, prepare_replication_buffer_append, record_buffer_stats,
 };
 use config::{
     CDC_PERF_LOGGING_ENABLED, FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE,

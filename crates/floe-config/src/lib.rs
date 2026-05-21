@@ -167,11 +167,14 @@ pub struct MaintenanceConfig {
 pub struct ReplicationConfig {
     #[serde(default)]
     pub buffer_cleanup: ReplicationBufferCleanupConfig,
+    #[serde(default)]
+    pub buffer_limits: ReplicationBufferLimitsConfig,
 }
 
 impl ReplicationConfig {
     pub const DEFAULT: Self = Self {
         buffer_cleanup: ReplicationBufferCleanupConfig::DEFAULT,
+        buffer_limits: ReplicationBufferLimitsConfig::DEFAULT,
     };
 
     pub fn with_legacy_env_overrides(mut self) -> Self {
@@ -180,6 +183,20 @@ impl ReplicationConfig {
         }
         if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS") {
             self.buffer_cleanup.cleanup_interval_ms = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_BYTES") {
+            self.buffer_limits.max_pending_bytes = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_RECORDS") {
+            self.buffer_limits.max_pending_records = value;
+        }
+        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS")
+            .or_else(|| env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_OBJECTS"))
+        {
+            self.buffer_limits.max_pending_transactions = value;
+        }
+        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS") {
+            self.buffer_limits.max_pending_age_ms = value;
         }
         self
     }
@@ -213,8 +230,37 @@ impl Default for ReplicationBufferCleanupConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationBufferLimitsConfig {
+    #[serde(default = "default_replication_buffer_max_pending_bytes")]
+    pub max_pending_bytes: usize,
+    #[serde(default)]
+    pub max_pending_records: usize,
+    #[serde(default)]
+    pub max_pending_transactions: usize,
+    #[serde(default)]
+    pub max_pending_age_ms: u64,
+}
+
+impl ReplicationBufferLimitsConfig {
+    pub const DEFAULT: Self = Self {
+        max_pending_bytes: DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES,
+        max_pending_records: 0,
+        max_pending_transactions: 0,
+        max_pending_age_ms: 0,
+    };
+}
+
+impl Default for ReplicationBufferLimitsConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
@@ -222,6 +268,16 @@ fn default_replication_buffer_delivered_retention_ms() -> u64 {
 
 fn default_replication_buffer_cleanup_interval_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS
+}
+
+fn default_replication_buffer_max_pending_bytes() -> usize {
+    DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -795,6 +851,24 @@ mod tests {
             1000
         );
         assert_eq!(config.replication.buffer_cleanup.cleanup_interval_ms, 250);
+    }
+
+    #[test]
+    fn load_config_accepts_replication_buffer_limits_section() {
+        let input = r#"
+            [replication.buffer_limits]
+            max_pending_bytes = 123
+            max_pending_records = 456
+            max_pending_transactions = 7
+            max_pending_age_ms = 89
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+
+        assert_eq!(config.replication.buffer_limits.max_pending_bytes, 123);
+        assert_eq!(config.replication.buffer_limits.max_pending_records, 456);
+        assert_eq!(config.replication.buffer_limits.max_pending_transactions, 7);
+        assert_eq!(config.replication.buffer_limits.max_pending_age_ms, 89);
     }
 
     #[test]
