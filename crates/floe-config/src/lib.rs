@@ -27,6 +27,8 @@ pub struct NodeConfig {
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub replication: ReplicationConfig,
+    #[serde(default)]
+    pub postgres_cdc: PostgresCdcConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +177,99 @@ pub struct ReplicationConfig {
     pub encoding: ReplicationEncodingConfig,
     #[serde(default)]
     pub perf_log: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresCdcConfig {
+    #[serde(default)]
+    pub snapshot: PostgresCdcSnapshotConfig,
+}
+
+impl PostgresCdcConfig {
+    pub fn with_legacy_env_overrides(mut self) -> Self {
+        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH") {
+            self.snapshot.rows_per_batch = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS") {
+            self.snapshot.max_workers = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS") {
+            self.snapshot.intra_table_chunks = value;
+        }
+        if let Some(value) = env_bool("FLOE_POSTGRES_CDC_SNAPSHOT_ADAPTIVE_CONCURRENCY") {
+            self.snapshot.adaptive_concurrency = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS") {
+            self.snapshot.min_workers = value;
+        }
+        if let Some(value) =
+            env_usize("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT")
+                .filter(|value| (1..=100).contains(value))
+        {
+            self.snapshot.wal_buffer_high_watermark_percent = value;
+        }
+        if let Some(value) =
+            env_usize("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT")
+                .filter(|value| *value <= 100)
+        {
+            self.snapshot.wal_buffer_low_watermark_percent = value;
+        }
+        if let Some(value) = env_positive_u64("FLOE_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS") {
+            self.snapshot.slow_scan_ms = value;
+        }
+        if let Some(value) = env_positive_u64("FLOE_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS") {
+            self.snapshot.controller_interval_ms = value;
+        }
+        if let Some(value) = env_bool("FLOE_CDC_PERF_LOG") {
+            self.snapshot.perf_log = value;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresCdcSnapshotConfig {
+    #[serde(default = "default_postgres_cdc_snapshot_rows_per_batch")]
+    pub rows_per_batch: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_max_workers")]
+    pub max_workers: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_intra_table_chunks")]
+    pub intra_table_chunks: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_adaptive_concurrency")]
+    pub adaptive_concurrency: bool,
+    #[serde(default = "default_postgres_cdc_snapshot_min_workers")]
+    pub min_workers: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_wal_buffer_high_watermark_percent")]
+    pub wal_buffer_high_watermark_percent: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_wal_buffer_low_watermark_percent")]
+    pub wal_buffer_low_watermark_percent: usize,
+    #[serde(default = "default_postgres_cdc_snapshot_slow_scan_ms")]
+    pub slow_scan_ms: u64,
+    #[serde(default = "default_postgres_cdc_snapshot_controller_interval_ms")]
+    pub controller_interval_ms: u64,
+    #[serde(default)]
+    pub perf_log: bool,
+}
+
+impl Default for PostgresCdcSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            rows_per_batch: DEFAULT_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH,
+            max_workers: DEFAULT_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS,
+            intra_table_chunks: DEFAULT_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS,
+            adaptive_concurrency: true,
+            min_workers: DEFAULT_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS,
+            wal_buffer_high_watermark_percent:
+                DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT,
+            wal_buffer_low_watermark_percent:
+                DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT,
+            slow_scan_ms: DEFAULT_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS,
+            controller_interval_ms: DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS,
+            perf_log: false,
+        }
+    }
 }
 
 impl ReplicationConfig {
@@ -387,6 +482,14 @@ const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: usize = 1_000_000;
 const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: usize = 1_048_576;
 const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
 const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS: usize = 1;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS: usize = 1;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS: usize = 1;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: usize = 75;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: usize = 25;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS: u64 = 30_000;
+const DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS: u64 = 500;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
@@ -436,6 +539,42 @@ fn default_replication_snapshot_batches_per_chunk() -> usize {
     DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK
 }
 
+fn default_postgres_cdc_snapshot_rows_per_batch() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH
+}
+
+fn default_postgres_cdc_snapshot_max_workers() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS
+}
+
+fn default_postgres_cdc_snapshot_intra_table_chunks() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS
+}
+
+fn default_postgres_cdc_snapshot_adaptive_concurrency() -> bool {
+    true
+}
+
+fn default_postgres_cdc_snapshot_min_workers() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS
+}
+
+fn default_postgres_cdc_snapshot_wal_buffer_high_watermark_percent() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT
+}
+
+fn default_postgres_cdc_snapshot_wal_buffer_low_watermark_percent() -> usize {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT
+}
+
+fn default_postgres_cdc_snapshot_slow_scan_ms() -> u64 {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS
+}
+
+fn default_postgres_cdc_snapshot_controller_interval_ms() -> u64 {
+    DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name)
         .ok()
@@ -450,6 +589,10 @@ fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn env_positive_u64(name: &str) -> Option<u64> {
+    env_u64(name).filter(|value| *value > 0)
 }
 
 fn env_nonempty_string(name: &str) -> Option<String> {
@@ -1104,6 +1247,37 @@ mod tests {
             Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
         );
         assert!(config.replication.encoding.kafka_metadata_headers);
+    }
+
+    #[test]
+    fn load_config_accepts_postgres_cdc_snapshot_section() {
+        let input = r#"
+            [postgres_cdc.snapshot]
+            rows_per_batch = 8192
+            max_workers = 4
+            intra_table_chunks = 8
+            adaptive_concurrency = false
+            min_workers = 2
+            wal_buffer_high_watermark_percent = 80
+            wal_buffer_low_watermark_percent = 20
+            slow_scan_ms = 12000
+            controller_interval_ms = 250
+            perf_log = true
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+        let snapshot = config.postgres_cdc.snapshot;
+
+        assert_eq!(snapshot.rows_per_batch, 8192);
+        assert_eq!(snapshot.max_workers, 4);
+        assert_eq!(snapshot.intra_table_chunks, 8);
+        assert!(!snapshot.adaptive_concurrency);
+        assert_eq!(snapshot.min_workers, 2);
+        assert_eq!(snapshot.wal_buffer_high_watermark_percent, 80);
+        assert_eq!(snapshot.wal_buffer_low_watermark_percent, 20);
+        assert_eq!(snapshot.slow_scan_ms, 12_000);
+        assert_eq!(snapshot.controller_interval_ms, 250);
+        assert!(snapshot.perf_log);
     }
 
     #[test]

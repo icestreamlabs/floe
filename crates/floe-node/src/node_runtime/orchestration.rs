@@ -516,6 +516,7 @@ pub(super) fn merge_catalog_source_connectors(
 async fn run_native_postgres_cdc_connector(
     mut config: PostgresCdcConnectorConfig,
     runtime_plan: PostgresCdcRuntimePlan,
+    snapshot_settings: PostgresCdcSnapshotConfig,
     table_store: CdcTableStore,
     cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
@@ -539,6 +540,7 @@ async fn run_native_postgres_cdc_connector(
         &table_store,
         &sender,
         &cdc_replication_debug,
+        snapshot_settings,
         config.commit_lsn_rx.as_mut(),
         &cancel,
     )
@@ -791,6 +793,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(config) = config.as_ref() {
         apply_runtime_config_defaults(&mut run_args, config);
     }
+    let postgres_cdc_settings = config
+        .as_ref()
+        .map(|cfg| cfg.postgres_cdc)
+        .unwrap_or_default()
+        .with_legacy_env_overrides();
 
     if run_args.config.is_none()
         && run_args.kafka_brokers.is_some()
@@ -2013,10 +2020,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     let transaction_sender = cdc_transaction_sender.clone();
                     let table_store = cdc_table_store.clone();
                     let cdc_replication_debug = Arc::clone(&cdc_replication_debug);
+                    let snapshot_settings = postgres_cdc_settings.snapshot;
                     connector_handles.push(tokio::spawn(async move {
                         if let Err(err) = run_native_postgres_cdc_connector(
                             config,
                             runtime_plan,
+                            snapshot_settings,
                             table_store,
                             cdc_replication_debug,
                             transaction_sender,

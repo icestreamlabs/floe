@@ -85,9 +85,9 @@ use crate::{cli, http_ingest, metrics, sinks};
 use floe_config as config;
 use floe_config::{
     ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
-    SinkConfig, SinkSpec, SourceJournalConfig, apply_connector_properties, load_config,
-    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
-    sink_spec_from_sql,
+    PostgresCdcSnapshotConfig, SinkConfig, SinkSpec, SourceJournalConfig,
+    apply_connector_properties, load_config, materialized_view_definitions_from_config,
+    normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
