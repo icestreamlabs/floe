@@ -4,9 +4,9 @@ use floe_cdc_core::{ChangeBatch, TransactionBatch};
 use floe_storage::{CdcBufferPayloadFormat, CdcBufferRecord, CdcBufferedTransactionManifest};
 
 use super::super::ReplicationPipelineRuntimePlan;
-use super::CDC_PERF_LOGGING_ENABLED;
 
 pub(super) fn log_replication_pipeline_perf(
+    perf_enabled: bool,
     plan: &ReplicationPipelineRuntimePlan,
     transaction: &TransactionBatch,
     records: usize,
@@ -14,7 +14,7 @@ pub(super) fn log_replication_pipeline_perf(
     encode_elapsed: Duration,
     total_elapsed: Duration,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     let changes = transaction
@@ -42,6 +42,7 @@ pub(super) fn log_replication_pipeline_perf(
 }
 
 pub(super) fn log_replication_direct_delivery_perf(
+    perf_enabled: bool,
     plan: &ReplicationPipelineRuntimePlan,
     records: usize,
     payload_format: CdcBufferPayloadFormat,
@@ -49,7 +50,7 @@ pub(super) fn log_replication_direct_delivery_perf(
     target_send_elapsed: Duration,
     checkpoint_elapsed: Duration,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     tracing::info!(
@@ -64,6 +65,7 @@ pub(super) fn log_replication_direct_delivery_perf(
 }
 
 pub(super) fn log_replication_kafka_send_perf(
+    perf_enabled: bool,
     topic: &str,
     records: &[CdcBufferRecord],
     partition_offsets: usize,
@@ -71,7 +73,7 @@ pub(super) fn log_replication_kafka_send_perf(
     delivery_wait_elapsed: Duration,
     total_elapsed: Duration,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     let key_bytes = records
@@ -96,11 +98,12 @@ pub(super) fn log_replication_kafka_send_perf(
 }
 
 pub(super) fn log_replication_buffer_append_perf(
+    perf_enabled: bool,
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
     append_elapsed: Duration,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     tracing::info!(
@@ -114,13 +117,14 @@ pub(super) fn log_replication_buffer_append_perf(
 }
 
 pub(super) fn log_replication_replay_payload_perf(
+    perf_enabled: bool,
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
     payload_load_elapsed: Duration,
     encode_elapsed: Duration,
     records: usize,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     tracing::info!(
@@ -135,12 +139,13 @@ pub(super) fn log_replication_replay_payload_perf(
 }
 
 pub(super) fn log_replication_replay_delivery_perf(
+    perf_enabled: bool,
     plan: &ReplicationPipelineRuntimePlan,
     manifest: &CdcBufferedTransactionManifest,
     delivery_elapsed: Duration,
     delivered_records: usize,
 ) {
-    if !*CDC_PERF_LOGGING_ENABLED {
+    if !perf_enabled {
         return;
     }
     tracing::info!(

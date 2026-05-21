@@ -171,6 +171,10 @@ pub struct ReplicationConfig {
     pub buffer_limits: ReplicationBufferLimitsConfig,
     #[serde(default)]
     pub kafka: ReplicationKafkaProducerConfig,
+    #[serde(default)]
+    pub encoding: ReplicationEncodingConfig,
+    #[serde(default)]
+    pub perf_log: bool,
 }
 
 impl ReplicationConfig {
@@ -221,6 +225,22 @@ impl ReplicationConfig {
         }
         if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES") {
             self.kafka.message_send_max_retries = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD") {
+            self.encoding.arrow_ipc_rows_per_record = value;
+        }
+        if let Some(value) = env_positive_usize("FLOE_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK") {
+            self.encoding.snapshot_batches_per_chunk = value;
+        }
+        if let Ok(value) = std::env::var("FLOE_REPLICATION_ARROW_IPC_COMPRESSION") {
+            self.encoding.arrow_ipc_compression =
+                ReplicationArrowIpcCompressionConfig::parse(&value);
+        }
+        if let Some(value) = env_bool("FLOE_REPLICATION_KAFKA_METADATA_HEADERS") {
+            self.encoding.kafka_metadata_headers = value;
+        }
+        if let Some(value) = env_bool("FLOE_CDC_PERF_LOG") {
+            self.perf_log = value;
         }
         self
     }
@@ -315,6 +335,47 @@ impl Default for ReplicationKafkaProducerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationEncodingConfig {
+    #[serde(default = "default_replication_arrow_ipc_rows_per_record")]
+    pub arrow_ipc_rows_per_record: usize,
+    #[serde(default = "default_replication_snapshot_batches_per_chunk")]
+    pub snapshot_batches_per_chunk: usize,
+    #[serde(default)]
+    pub arrow_ipc_compression: Option<ReplicationArrowIpcCompressionConfig>,
+    #[serde(default)]
+    pub kafka_metadata_headers: bool,
+}
+
+impl Default for ReplicationEncodingConfig {
+    fn default() -> Self {
+        Self {
+            arrow_ipc_rows_per_record: DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
+            snapshot_batches_per_chunk: DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK,
+            arrow_ipc_compression: None,
+            kafka_metadata_headers: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationArrowIpcCompressionConfig {
+    #[serde(alias = "lz4", alias = "lz4-frame")]
+    Lz4Frame,
+}
+
+impl ReplicationArrowIpcCompressionConfig {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "false" | "0" => None,
+            "lz4" | "lz4_frame" | "lz4-frame" => Some(Self::Lz4Frame),
+            _ => None,
+        }
+    }
+}
+
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
@@ -324,6 +385,8 @@ const DEFAULT_REPLICATION_KAFKA_BATCH_NUM_MESSAGES: usize = 1_000_000;
 const DEFAULT_REPLICATION_KAFKA_LINGER_MS: usize = 1;
 const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES: usize = 1_000_000;
 const DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES: usize = 1_048_576;
+const DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD: usize = 16_384;
+const DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK: usize = 1;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
@@ -363,6 +426,14 @@ fn default_replication_kafka_queue_max_messages() -> usize {
 
 fn default_replication_kafka_queue_max_kbytes() -> usize {
     DEFAULT_REPLICATION_KAFKA_QUEUE_MAX_KBYTES
+}
+
+fn default_replication_arrow_ipc_rows_per_record() -> usize {
+    DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD
+}
+
+fn default_replication_snapshot_batches_per_chunk() -> usize {
+    DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -1008,6 +1079,45 @@ mod tests {
         assert_eq!(config.replication.kafka.queue_max_messages, 500_000);
         assert_eq!(config.replication.kafka.queue_max_kbytes, 600_000);
         assert_eq!(config.replication.kafka.message_send_max_retries, 3);
+    }
+
+    #[test]
+    fn load_config_accepts_replication_encoding_section() {
+        let input = r#"
+            [replication]
+            perf_log = true
+
+            [replication.encoding]
+            arrow_ipc_rows_per_record = 2048
+            snapshot_batches_per_chunk = 4
+            arrow_ipc_compression = "lz4_frame"
+            kafka_metadata_headers = true
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+
+        assert!(config.replication.perf_log);
+        assert_eq!(config.replication.encoding.arrow_ipc_rows_per_record, 2048);
+        assert_eq!(config.replication.encoding.snapshot_batches_per_chunk, 4);
+        assert_eq!(
+            config.replication.encoding.arrow_ipc_compression,
+            Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
+        );
+        assert!(config.replication.encoding.kafka_metadata_headers);
+    }
+
+    #[test]
+    fn replication_arrow_ipc_compression_config_parses_legacy_env_values() {
+        assert_eq!(
+            ReplicationArrowIpcCompressionConfig::parse("lz4"),
+            Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
+        );
+        assert_eq!(
+            ReplicationArrowIpcCompressionConfig::parse("lz4-frame"),
+            Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
+        );
+        assert_eq!(ReplicationArrowIpcCompressionConfig::parse("none"), None);
+        assert_eq!(ReplicationArrowIpcCompressionConfig::parse("bogus"), None);
     }
 
     #[test]

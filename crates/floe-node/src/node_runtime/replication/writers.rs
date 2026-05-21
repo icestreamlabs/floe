@@ -22,7 +22,7 @@ use tokio_postgres::types::ToSql;
 use super::super::ReplicationPipelineRuntimeBufferMode;
 use super::target_state::TargetStateBuilder;
 use super::{
-    CDC_PERF_LOGGING_ENABLED, FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS,
+    FLOE_JSON_DELETED_FIELD, REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS,
     REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT, REPLICATION_KAFKA_RETRY_ATTEMPTS,
     REPLICATION_KAFKA_RETRY_BASE_MS, REPLICATION_KAFKA_SEND_TIMEOUT, encoding,
     log_replication_kafka_send_perf,
@@ -33,6 +33,7 @@ pub(super) struct KafkaReplicationPipelineWriter {
     native_topic: KafkaNativeTopic,
     topic: String,
     partition_offsets: usize,
+    perf_log: bool,
 }
 
 struct KafkaNativeTopic {
@@ -217,6 +218,7 @@ impl KafkaReplicationPipelineWriter {
         topic: &str,
         _buffer_mode: ReplicationPipelineRuntimeBufferMode,
         settings: ReplicationKafkaProducerConfig,
+        perf_log: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !brokers.trim().is_empty(),
@@ -283,6 +285,7 @@ impl KafkaReplicationPipelineWriter {
             native_topic,
             topic: topic.to_string(),
             partition_offsets,
+            perf_log,
         })
     }
 
@@ -290,7 +293,7 @@ impl KafkaReplicationPipelineWriter {
         &self,
         records: &[CdcBufferRecord],
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-        let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
+        let perf_enabled = self.perf_log;
         let perf_started_at = perf_enabled.then(Instant::now);
         let enqueue_started_at = perf_enabled.then(Instant::now);
         let delivery_state = KafkaDeliveryBatchState::new(records.len(), self.partition_offsets);
@@ -319,6 +322,7 @@ impl KafkaReplicationPipelineWriter {
             .map(|started_at| started_at.elapsed())
             .unwrap_or(Duration::ZERO);
         log_replication_kafka_send_perf(
+            perf_enabled,
             &self.topic,
             records,
             self.partition_offsets,

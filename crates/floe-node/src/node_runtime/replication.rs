@@ -43,6 +43,7 @@ impl ReplicationPipelineRuntime {
                             topic,
                             plan.buffer_mode,
                             settings.kafka.clone(),
+                            settings.perf_log,
                         )?),
                     );
                 }
@@ -225,7 +226,11 @@ impl ReplicationPipelineRuntime {
         if plans
             .iter()
             .any(|plan| plan.format == ReplicationPipelineRuntimeFormat::FloeJson)
-            && let Some(chunks) = encoding::chunk_snapshot_transaction(source_id, transaction)?
+            && let Some(chunks) = encoding::chunk_snapshot_transaction_with_settings(
+                source_id,
+                transaction,
+                self.settings.encoding,
+            )?
         {
             let mut written = 0usize;
             let chunk_count = chunks.len();
@@ -240,7 +245,7 @@ impl ReplicationPipelineRuntime {
                     .iter()
                     .any(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
             {
-                let flush_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+                let flush_started_at = self.settings.perf_log.then(Instant::now);
                 storage
                     .cdc_buffer_store()
                     .flush()
@@ -271,7 +276,7 @@ impl ReplicationPipelineRuntime {
             let written = self
                 .run_transaction_for_plans(plans, schemas, transaction, Some(storage), false)
                 .await?;
-            let flush_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+            let flush_started_at = self.settings.perf_log.then(Instant::now);
             storage
                 .cdc_buffer_store()
                 .flush()
@@ -350,11 +355,15 @@ impl ReplicationPipelineRuntime {
         storage: Option<&SlateCatalog>,
         await_durable_buffer_append: bool,
     ) -> anyhow::Result<usize> {
-        let perf_enabled = *CDC_PERF_LOGGING_ENABLED;
+        let perf_enabled = self.settings.perf_log;
         let perf_started_at = perf_enabled.then(Instant::now);
         let encode_started_at = perf_enabled.then(Instant::now);
-        let buffered_records =
-            encoding::encode_pipeline_transaction_records(plan, schemas, transaction)?;
+        let buffered_records = encoding::encode_pipeline_transaction_records_with_settings(
+            plan,
+            schemas,
+            transaction,
+            self.settings.encoding,
+        )?;
         let encode_elapsed = encode_started_at
             .map(|started_at| started_at.elapsed())
             .unwrap_or(Duration::ZERO);
@@ -409,6 +418,7 @@ impl ReplicationPipelineRuntime {
                         )
                     })?;
                 log_replication_pipeline_perf(
+                    perf_enabled,
                     plan,
                     transaction,
                     record_count,
@@ -421,6 +431,7 @@ impl ReplicationPipelineRuntime {
                 return Ok(buffered_records.len());
             }
             log_replication_pipeline_perf(
+                perf_enabled,
                 plan,
                 transaction,
                 record_count,
@@ -488,7 +499,7 @@ impl ReplicationPipelineRuntime {
                 let append_elapsed = append_started_at
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or(Duration::ZERO);
-                log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
+                log_replication_buffer_append_perf(perf_enabled, plan, &manifest, append_elapsed);
                 storage
                     .put_replication_pipeline_checkpoint_without_durable_wait(
                         ReplicationPipelineCheckpoint::new(
@@ -508,6 +519,7 @@ impl ReplicationPipelineRuntime {
                     .await?;
                 record_buffer_stats(&buffer_store, &plan.name).await?;
                 log_replication_pipeline_perf(
+                    perf_enabled,
                     plan,
                     transaction,
                     manifest.record_count(),
@@ -555,6 +567,7 @@ impl ReplicationPipelineRuntime {
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
                     log_replication_direct_delivery_perf(
+                        perf_enabled,
                         plan,
                         record_count,
                         prepared_append.append.payload_format(),
@@ -564,6 +577,7 @@ impl ReplicationPipelineRuntime {
                     );
                     record_buffer_stats(&buffer_store, &plan.name).await?;
                     log_replication_pipeline_perf(
+                        perf_enabled,
                         plan,
                         transaction,
                         record_count,
@@ -614,6 +628,7 @@ impl ReplicationPipelineRuntime {
                             })?;
                         record_buffer_stats(&buffer_store, &plan.name).await?;
                         log_replication_pipeline_perf(
+                            perf_enabled,
                             plan,
                             transaction,
                             record_count,
@@ -641,11 +656,17 @@ impl ReplicationPipelineRuntime {
                     let append_elapsed = append_started_at
                         .map(|started_at| started_at.elapsed())
                         .unwrap_or(Duration::ZERO);
-                    log_replication_buffer_append_perf(plan, &manifest, append_elapsed);
+                    log_replication_buffer_append_perf(
+                        perf_enabled,
+                        plan,
+                        &manifest,
+                        append_elapsed,
+                    );
                     self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
                         .await?;
                     record_buffer_stats(&buffer_store, &plan.name).await?;
                     log_replication_pipeline_perf(
+                        perf_enabled,
                         plan,
                         transaction,
                         record_count,
@@ -664,6 +685,7 @@ impl ReplicationPipelineRuntime {
                 return Err(err);
             }
             log_replication_pipeline_perf(
+                perf_enabled,
                 plan,
                 transaction,
                 record_count,
@@ -847,15 +869,12 @@ use buffer::{
     log_replication_buffer_backpressure, prepare_replication_buffer_append, record_buffer_stats,
 };
 use config::{
-    CDC_PERF_LOGGING_ENABLED, FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE,
-    FLOE_HEADER_RECORD_SEQUENCE, FLOE_HEADER_SOURCE, FLOE_HEADER_SOURCE_POSITION,
-    FLOE_HEADER_SOURCE_TABLE, FLOE_HEADER_TRANSACTION_ID, FLOE_JSON_DELETED_FIELD,
-    FLOE_JSON_PARALLEL_RECORD_THRESHOLD, FLOE_JSON_VERSION, FLOE_JSON_VERSION_FIELD,
-    REPLICATION_ARROW_IPC_COMPRESSION, REPLICATION_ARROW_IPC_ROWS_PER_RECORD,
-    REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS, REPLICATION_KAFKA_METADATA_HEADERS,
+    FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE, FLOE_HEADER_RECORD_SEQUENCE,
+    FLOE_HEADER_SOURCE, FLOE_HEADER_SOURCE_POSITION, FLOE_HEADER_SOURCE_TABLE,
+    FLOE_HEADER_TRANSACTION_ID, FLOE_JSON_DELETED_FIELD, FLOE_JSON_PARALLEL_RECORD_THRESHOLD,
+    FLOE_JSON_VERSION, FLOE_JSON_VERSION_FIELD, REPLICATION_KAFKA_MESSAGE_TIMEOUT_MS,
     REPLICATION_KAFKA_METADATA_WARMUP_TIMEOUT, REPLICATION_KAFKA_RETRY_ATTEMPTS,
     REPLICATION_KAFKA_RETRY_BASE_MS, REPLICATION_KAFKA_SEND_TIMEOUT,
-    REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK,
 };
 use dead_letter::persist_dead_letter_records;
 use perf::{

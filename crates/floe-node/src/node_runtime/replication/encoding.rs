@@ -8,13 +8,14 @@ use arrow_array::builder::{
     TimestampMillisecondBuilder,
 };
 use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
-use arrow_ipc::MetadataVersion;
 use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow_ipc::{CompressionType, MetadataVersion};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use floe_cdc_core::{
     CdcChange, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourceId,
     CdcSourcePosition, CdcTableId, CdcTableSchema, CdcTransactionId, ChangeBatch, TransactionBatch,
 };
+use floe_config::{ReplicationArrowIpcCompressionConfig, ReplicationEncodingConfig};
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use floe_node_core::debezium_encoder::{
@@ -29,28 +30,59 @@ use super::{
     FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE, FLOE_HEADER_RECORD_SEQUENCE,
     FLOE_HEADER_SOURCE, FLOE_HEADER_SOURCE_POSITION, FLOE_HEADER_SOURCE_TABLE,
     FLOE_HEADER_TRANSACTION_ID, FLOE_JSON_DELETED_FIELD, FLOE_JSON_PARALLEL_RECORD_THRESHOLD,
-    FLOE_JSON_VERSION, FLOE_JSON_VERSION_FIELD, REPLICATION_ARROW_IPC_COMPRESSION,
-    REPLICATION_ARROW_IPC_ROWS_PER_RECORD, REPLICATION_KAFKA_METADATA_HEADERS,
-    REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK,
+    FLOE_JSON_VERSION, FLOE_JSON_VERSION_FIELD,
 };
 
+#[cfg(test)]
 pub(super) fn encode_pipeline_transaction_records(
     plan: &ReplicationPipelineRuntimePlan,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
     transaction: &TransactionBatch,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
-    encode_pipeline_transaction_records_with_metadata(
+    encode_pipeline_transaction_records_with_settings(
         plan,
         schemas,
         transaction,
-        *REPLICATION_KAFKA_METADATA_HEADERS,
+        ReplicationEncodingConfig::default(),
     )
 }
 
+pub(super) fn encode_pipeline_transaction_records_with_settings(
+    plan: &ReplicationPipelineRuntimePlan,
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    encode_pipeline_transaction_records_with_metadata_and_settings(
+        plan,
+        schemas,
+        transaction,
+        settings,
+        settings.kafka_metadata_headers,
+    )
+}
+
+#[cfg(test)]
 pub(super) fn encode_pipeline_transaction_records_with_metadata(
     plan: &ReplicationPipelineRuntimePlan,
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
     transaction: &TransactionBatch,
+    include_metadata_headers: bool,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    encode_pipeline_transaction_records_with_metadata_and_settings(
+        plan,
+        schemas,
+        transaction,
+        ReplicationEncodingConfig::default(),
+        include_metadata_headers,
+    )
+}
+
+pub(super) fn encode_pipeline_transaction_records_with_metadata_and_settings(
+    plan: &ReplicationPipelineRuntimePlan,
+    schemas: &HashMap<CdcTableId, CdcTableSchema>,
+    transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
     include_metadata_headers: bool,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     let mut matching_batches = transaction
@@ -72,8 +104,13 @@ pub(super) fn encode_pipeline_transaction_records_with_metadata(
     let mut records = Vec::new();
     let mut next_sequence = 0usize;
     for change_batch in matching_batches {
-        let mut batch_records =
-            encode_pipeline_buffer_records(plan, schema, change_batch, transaction)?;
+        let mut batch_records = encode_pipeline_buffer_records_with_settings(
+            plan,
+            schema,
+            change_batch,
+            transaction,
+            settings,
+        )?;
         if include_metadata_headers {
             add_replication_record_metadata(
                 plan,
@@ -151,14 +188,15 @@ fn replication_record_idempotency_key(
     }
 }
 
-pub(super) fn chunk_snapshot_transaction(
+pub(super) fn chunk_snapshot_transaction_with_settings(
     source_id: &CdcSourceId,
     transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<Option<Vec<TransactionBatch>>> {
     let Some(transaction_id) = transaction.transaction_id() else {
         return Ok(None);
     };
-    let batches_per_chunk = *REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK;
+    let batches_per_chunk = settings.snapshot_batches_per_chunk.max(1);
     if !transaction_id.as_str().starts_with("snapshot:")
         || transaction.change_batches().len() <= batches_per_chunk
     {
@@ -196,11 +234,28 @@ pub(super) fn chunk_snapshot_transaction(
     Ok(Some(chunks))
 }
 
+#[cfg(test)]
 pub(super) fn encode_pipeline_buffer_records(
     plan: &ReplicationPipelineRuntimePlan,
     schema: &CdcTableSchema,
     batch: &ChangeBatch,
     transaction: &TransactionBatch,
+) -> anyhow::Result<Vec<CdcBufferRecord>> {
+    encode_pipeline_buffer_records_with_settings(
+        plan,
+        schema,
+        batch,
+        transaction,
+        ReplicationEncodingConfig::default(),
+    )
+}
+
+pub(super) fn encode_pipeline_buffer_records_with_settings(
+    plan: &ReplicationPipelineRuntimePlan,
+    schema: &CdcTableSchema,
+    batch: &ChangeBatch,
+    transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     if let Some(rows) = batch.snapshot_insert_rows() {
         return match plan.format {
@@ -213,7 +268,13 @@ pub(super) fn encode_pipeline_buffer_records(
                 debezium_records_to_buffer_records(&records)
             }
             ReplicationPipelineRuntimeFormat::ArrowIpc => {
-                encode_arrow_ipc_snapshot_pipeline_records(plan, schema, rows, transaction)
+                encode_arrow_ipc_snapshot_pipeline_records(
+                    plan,
+                    schema,
+                    rows,
+                    transaction,
+                    settings,
+                )
             }
         };
     }
@@ -227,7 +288,7 @@ pub(super) fn encode_pipeline_buffer_records(
             debezium_records_to_buffer_records(&records)
         }
         ReplicationPipelineRuntimeFormat::ArrowIpc => {
-            encode_arrow_ipc_pipeline_records(plan, schema, batch, transaction)
+            encode_arrow_ipc_pipeline_records(plan, schema, batch, transaction, settings)
         }
     }
 }
@@ -815,9 +876,10 @@ fn encode_arrow_ipc_pipeline_records(
     schema: &CdcTableSchema,
     batch: &ChangeBatch,
     transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     let mut records = Vec::new();
-    let rows_per_record = *REPLICATION_ARROW_IPC_ROWS_PER_RECORD;
+    let rows_per_record = settings.arrow_ipc_rows_per_record.max(1);
     let mut builder = ArrowIpcChangeBatchBuilder::new(schema, rows_per_record);
     let is_snapshot = transaction
         .transaction_id()
@@ -831,7 +893,13 @@ fn encode_arrow_ipc_pipeline_records(
             CdcChange::Update { before, after, .. } => {
                 if let Some(before) = before {
                     builder.append_row(before, "u_before", -1, sequence)?;
-                    flush_arrow_ipc_record_if_full(plan, transaction, &mut builder, &mut records)?;
+                    flush_arrow_ipc_record_if_full(
+                        plan,
+                        transaction,
+                        &mut builder,
+                        &mut records,
+                        settings,
+                    )?;
                 }
                 builder.append_row(after, "u", 1, sequence)?;
             }
@@ -855,10 +923,15 @@ fn encode_arrow_ipc_pipeline_records(
                 ));
             }
         }
-        flush_arrow_ipc_record_if_full(plan, transaction, &mut builder, &mut records)?;
+        flush_arrow_ipc_record_if_full(plan, transaction, &mut builder, &mut records, settings)?;
     }
     if !builder.is_empty() {
-        records.push(finish_arrow_ipc_record(plan, transaction, &mut builder)?);
+        records.push(finish_arrow_ipc_record(
+            plan,
+            transaction,
+            &mut builder,
+            settings,
+        )?);
     }
     Ok(records)
 }
@@ -868,10 +941,11 @@ fn encode_arrow_ipc_snapshot_pipeline_records(
     schema: &CdcTableSchema,
     rows: &CdcColumnarRowBatch,
     transaction: &TransactionBatch,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
     schema.validate_columnar_rows(rows)?;
     let mut records = Vec::new();
-    let rows_per_record = *REPLICATION_ARROW_IPC_ROWS_PER_RECORD;
+    let rows_per_record = settings.arrow_ipc_rows_per_record.max(1);
     for start in (0..rows.row_count()).step_by(rows_per_record) {
         let len = rows.row_count().saturating_sub(start).min(rows_per_record);
         let batch = arrow_ipc_snapshot_record_batch(schema, rows, start, len)?;
@@ -880,6 +954,7 @@ fn encode_arrow_ipc_snapshot_pipeline_records(
             transaction,
             start / rows_per_record,
             batch,
+            settings.arrow_ipc_compression,
         )?);
     }
     Ok(records)
@@ -890,9 +965,15 @@ fn flush_arrow_ipc_record_if_full(
     transaction: &TransactionBatch,
     builder: &mut ArrowIpcChangeBatchBuilder,
     records: &mut Vec<CdcBufferRecord>,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<()> {
     if builder.is_full() {
-        records.push(finish_arrow_ipc_record(plan, transaction, builder)?);
+        records.push(finish_arrow_ipc_record(
+            plan,
+            transaction,
+            builder,
+            settings,
+        )?);
     }
     Ok(())
 }
@@ -901,10 +982,17 @@ fn finish_arrow_ipc_record(
     plan: &ReplicationPipelineRuntimePlan,
     transaction: &TransactionBatch,
     builder: &mut ArrowIpcChangeBatchBuilder,
+    settings: ReplicationEncodingConfig,
 ) -> anyhow::Result<CdcBufferRecord> {
     let chunk_idx = builder.chunk_idx();
     let batch = builder.finish()?;
-    arrow_ipc_record_from_batch(plan, transaction, chunk_idx, batch)
+    arrow_ipc_record_from_batch(
+        plan,
+        transaction,
+        chunk_idx,
+        batch,
+        settings.arrow_ipc_compression,
+    )
 }
 
 fn arrow_ipc_record_from_batch(
@@ -912,10 +1000,11 @@ fn arrow_ipc_record_from_batch(
     transaction: &TransactionBatch,
     chunk_idx: usize,
     batch: RecordBatch,
+    compression: Option<ReplicationArrowIpcCompressionConfig>,
 ) -> anyhow::Result<CdcBufferRecord> {
     let mut value = Vec::new();
     {
-        let mut writer = arrow_ipc_stream_writer(&mut value, batch.schema().as_ref())
+        let mut writer = arrow_ipc_stream_writer(&mut value, batch.schema().as_ref(), compression)
             .context("create replication Arrow IPC writer")?;
         writer
             .write(&batch)
@@ -936,17 +1025,26 @@ fn arrow_ipc_record_from_batch(
 fn arrow_ipc_stream_writer<'a>(
     value: &'a mut Vec<u8>,
     schema: &ArrowSchema,
+    compression: Option<ReplicationArrowIpcCompressionConfig>,
 ) -> anyhow::Result<StreamWriter<&'a mut Vec<u8>>> {
-    let Some(compression) = *REPLICATION_ARROW_IPC_COMPRESSION else {
+    let Some(compression) = compression else {
         return StreamWriter::try_new(value, schema)
             .context("create uncompressed Arrow IPC writer");
     };
     let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5)
         .context("create Arrow IPC writer options")?
-        .try_with_compression(Some(compression.arrow_type()))
+        .try_with_compression(Some(arrow_ipc_compression_type(compression)))
         .context("configure Arrow IPC compression")?;
     StreamWriter::try_new_with_options(value, schema, options)
         .with_context(|| format!("create {compression:?} Arrow IPC writer"))
+}
+
+fn arrow_ipc_compression_type(
+    compression: ReplicationArrowIpcCompressionConfig,
+) -> CompressionType {
+    match compression {
+        ReplicationArrowIpcCompressionConfig::Lz4Frame => CompressionType::LZ4_FRAME,
+    }
 }
 
 fn arrow_ipc_snapshot_record_batch(
