@@ -486,6 +486,54 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
                 &format!("sinks[{index}].retry_max_backoff_ms"),
             )?;
         }
+        SinkConfig::Postgres {
+            name,
+            connection,
+            table,
+            mv,
+            mode,
+            primary_key,
+            with_snapshot: _,
+            as_of: _,
+            retry_max_attempts,
+            retry_base_ms,
+            retry_max_backoff_ms,
+        } => {
+            ensure_optional_non_empty(name.as_deref(), &format!("sinks[{index}].name"))?;
+            ensure_non_empty(connection, &format!("sinks[{index}].connection"))?;
+            connection
+                .parse::<tokio_postgres::Config>()
+                .with_context(|| {
+                    format!("sinks[{index}].connection must be a valid Postgres connection string")
+                })?;
+            ensure_non_empty(table, &format!("sinks[{index}].table"))?;
+            ensure_non_empty(mv, &format!("sinks[{index}].mv"))?;
+            let normalized_mode = mode
+                .as_deref()
+                .map(normalize_sink_format)
+                .unwrap_or_else(|| "upsert".to_string());
+            if !matches!(normalized_mode.as_str(), "upsert" | "append_only") {
+                bail!(
+                    "sinks[{index}].mode must be one of upsert, append_only (found '{}')",
+                    mode.as_deref().unwrap_or("upsert")
+                );
+            }
+            if normalized_mode == "upsert" && primary_key.as_ref().is_none_or(Vec::is_empty) {
+                bail!("sinks[{index}].primary_key is required for Postgres upsert sinks");
+            }
+            if let Some(primary_key) = primary_key {
+                validate_key_columns(primary_key, &format!("sinks[{index}].primary_key"))?;
+            }
+            ensure_optional_positive_usize(
+                *retry_max_attempts,
+                &format!("sinks[{index}].retry_max_attempts"),
+            )?;
+            ensure_optional_positive_u64(*retry_base_ms, &format!("sinks[{index}].retry_base_ms"))?;
+            ensure_optional_positive_u64(
+                *retry_max_backoff_ms,
+                &format!("sinks[{index}].retry_max_backoff_ms"),
+            )?;
+        }
     }
     Ok(())
 }

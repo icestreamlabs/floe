@@ -207,31 +207,45 @@ include_tables = ["nexmark_bid", "nexmark_auction"]
 
 ## Sink Connectors
 
-Sinks stream materialized view output (TAIL semantics) to external systems.
-Each sink specifies the materialized view name (`mv`) and optional tail
-parameters (`with_snapshot`, `as_of`).
+Sinks stream materialized view changelog output to external systems. Each sink
+specifies the materialized view name (`mv`) and optional stream parameters
+(`with_snapshot`, `as_of`).
 
 Supported sinks:
 
 - Kafka (`type = "kafka"`) writes JSON rows to a topic.
 - File (`type = "file"`) appends JSONL rows to a file.
 - HTTP (`type = "http"`) POSTs JSON batches to a URL.
+- Postgres (`type = "postgres"`) writes MV changes into a target table.
+
+Postgres sinks support two modes:
+
+- `mode = "upsert"` requires `primary_key = [...]`. Negative diffs delete by
+  key, then positive diffs upsert rows in the same transaction.
+- `mode = "append_only"` inserts positive diffs and fails if the MV emits a
+  negative diff.
 
 Reliability and throughput options:
 
-- `batch_rows` (all sinks): flush when buffered row count reaches threshold.
-- `batch_bytes` (all sinks): flush when buffered serialized bytes reach threshold.
-- `queue_capacity` (all sinks): bounded in-memory queue size between TAIL producer and sink worker.
-- `retry_max_attempts` (Kafka/HTTP): max delivery attempts before permanent failure.
-- `retry_base_ms` (Kafka/HTTP): base delay for exponential backoff.
-- `retry_max_backoff_ms` (Kafka/HTTP): max delay cap for backoff.
+- `batch_rows` (Kafka/File/HTTP): flush when buffered row count reaches threshold.
+- `batch_bytes` (Kafka/File/HTTP): flush when buffered serialized bytes reach
+  threshold.
+- `queue_capacity` (Kafka/File/HTTP): bounded in-memory queue size between the
+  changelog producer and sink worker.
+- `retry_max_attempts` (Kafka/HTTP/Postgres): max delivery attempts before
+  permanent failure.
+- `retry_base_ms` (Kafka/HTTP/Postgres): base delay for exponential backoff.
+- `retry_max_backoff_ms` (Kafka/HTTP/Postgres): max delay cap for backoff.
 
 Execution semantics:
 
-- Rows are flushed on threshold, tail tick boundary, and shutdown.
+- Kafka/File/HTTP rows are flushed on threshold, MV version boundary, and shutdown.
+- Postgres applies each MV version in one transaction and checkpoints after
+  commit.
 - Kafka and HTTP sinks retry transient failures with bounded exponential backoff.
 - Permanent failures are recorded and stop the sink task.
-- Backpressure is applied naturally via bounded queues when sink workers lag.
+- Backpressure is applied via bounded queues for queued sinks and directly by
+  the Postgres commit path for Postgres sinks.
 - Metrics exported per sink:
   - `floe_sink_queue_depth{sink=...}`
   - `floe_sink_version_lag{sink=...}`

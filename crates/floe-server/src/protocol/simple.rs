@@ -3,6 +3,10 @@ use std::sync::Arc;
 
 use arrow_pg::datatypes::df::encode_dataframe;
 use async_trait::async_trait;
+use floe_executor::subscribe::{
+    SubscribeExecutionConfig, execute_subscribe_with_config, parse_subscribe_sql,
+    subscribe_output_schema,
+};
 use floe_executor::tail::{execute_tail_with_config, parse_tail_sql, tail_output_schema};
 use futures::Sink;
 use pgwire::api::ClientInfo;
@@ -21,6 +25,7 @@ use crate::execution::FloeServerState;
 use crate::management::{detect_single_management_statement, handle_management_statement};
 use crate::protocol::bootstrap::{detect_noop_session_command, rewrite_bootstrap_sql};
 use crate::sql::{extract_tables_from_query, is_system_catalog_relation, unqualified_table_name};
+use crate::subscribe::{SubscribeResponseStream, detect_single_subscribe_statement};
 use crate::tail::{TailResponseStream, detect_single_tail_statement};
 use crate::types::arrow_schema_to_field_info;
 use crate::{feature_not_supported_error, parse_error, planner_error, user_error};
@@ -82,6 +87,33 @@ impl FloeQueryHandler {
         Ok(Response::Query(QueryResponse::new(fields, rows)))
     }
 
+    async fn execute_subscribe_statement(&self, sql: &str) -> PgWireResult<Response> {
+        let params = parse_subscribe_sql(sql)
+            .map_err(|err| user_error(format!("SUBSCRIBE parse error: {err}")))?;
+        self.state
+            .ensure_materialized_view_registered(&params.mv_name)
+            .await?;
+        let schema =
+            subscribe_output_schema(self.state.materialized_views.as_ref(), &params.mv_name)
+                .map_err(|err| user_error(format!("SUBSCRIBE schema error: {err}")))?;
+        let fields = Arc::new(arrow_schema_to_field_info(&schema)?);
+        let cancel = CancellationToken::new();
+        let tail_config = self.state.runtime_config.tail;
+        let stream = execute_subscribe_with_config(
+            self.state.materialized_views.as_ref(),
+            params,
+            SubscribeExecutionConfig {
+                channel_capacity: tail_config.channel_capacity,
+                max_catchup_versions: tail_config.max_catchup_versions,
+            },
+            cancel.clone(),
+        )
+        .await
+        .map_err(|err| user_error(format!("SUBSCRIBE execution error: {err}")))?;
+        let rows = SubscribeResponseStream::new(fields.clone(), stream, cancel);
+        Ok(Response::Query(QueryResponse::new(fields, rows)))
+    }
+
     pub(super) async fn ensure_materialized_views_in_query(
         &self,
         query: &Query,
@@ -139,6 +171,10 @@ impl SimpleQueryHandler for FloeQueryHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        if let Some(subscribe_sql) = detect_single_subscribe_statement(query) {
+            let response = self.execute_subscribe_statement(subscribe_sql).await?;
+            return Ok(vec![response]);
+        }
         if let Some(tail_sql) = detect_single_tail_statement(query) {
             let response = self.execute_tail_statement(tail_sql).await?;
             return Ok(vec![response]);

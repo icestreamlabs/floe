@@ -17,6 +17,11 @@ pub enum FloeStatement {
         with_snapshot: bool,
         as_of: Option<i64>,
     },
+    Subscribe {
+        mv_name: String,
+        with_snapshot: bool,
+        as_of: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +268,12 @@ pub enum SinkConnector {
     Http {
         url: String,
         batch_size: Option<usize>,
+    },
+    Postgres {
+        connection: String,
+        table: String,
+        mode: Option<String>,
+        primary_key: Vec<String>,
     },
 }
 

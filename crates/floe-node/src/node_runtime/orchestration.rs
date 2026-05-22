@@ -1040,9 +1040,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         "--mv-query",
                     )?;
                 }
-                FloeStatement::Tail { .. } => {
+                FloeStatement::Tail { .. } | FloeStatement::Subscribe { .. } => {
                     return Err(anyhow!(
-                        "TAIL statements are not supported in --mv-query programs"
+                        "TAIL/SUBSCRIBE statements are not supported in --mv-query programs"
                     ));
                 }
             }
@@ -1605,6 +1605,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         port: admin_port,
         health: admin_health,
         storage_db: Some(db.clone()),
+        materialized_views: Some(Arc::clone(&mv_registry)),
     };
     let admin_cancel = service_cancel.clone();
     let runtime_cancel_for_admin = runtime_cancel.clone();
@@ -3168,7 +3169,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let sink_handles = sinks::spawn_sinks(
         sink_specs,
-        query.clone(),
         Arc::clone(&mv_registry),
         sink_resume_cursors,
         Some(sink_checkpoint_tx),

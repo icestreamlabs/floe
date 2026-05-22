@@ -1,10 +1,6 @@
-use std::collections::HashMap;
-use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -13,14 +9,12 @@ use datafusion::execution::context::SessionContext;
 use futures::Stream;
 #[cfg(test)]
 use futures::StreamExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
-use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
-use crate::metrics;
-use crate::mv::runtime::MaterializedView;
-use crate::scalar_array_builder::ScalarColumnBuilder;
+use crate::mv_changelog::{
+    MvCatalog, MvChangelogBatch, MvChangelogExecutionConfig, MvChangelogParams, MvChangelogStream,
+    execute_mv_changelog_with_config, is_mv_changelog_canceled_error,
+};
 use floe_sql_parser::{FloeStatement, parse_floe_statement};
 
 /// Alias for the DataFusion session context.
@@ -29,8 +23,6 @@ pub type SessionCtx = SessionContext;
 pub type PgResult<T> = Result<T>;
 const TAIL_STREAM_CHANNEL_CAPACITY_DEFAULT: usize = 256;
 const TAIL_MAX_CATCHUP_VERSIONS_DEFAULT: i64 = 32;
-const TAIL_DELTA_LOG_SAMPLE_EVERY: usize = 128;
-static TAIL_DELTA_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TailExecutionConfig {
@@ -65,23 +57,8 @@ pub struct TailBatch {
     pub times: Vec<Option<i64>>,
 }
 
-#[derive(Debug)]
-struct TailCanceledError;
-
-impl fmt::Display for TailCanceledError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "query canceled")
-    }
-}
-
-impl std::error::Error for TailCanceledError {}
-
-fn query_canceled_error() -> anyhow::Error {
-    anyhow::Error::new(TailCanceledError)
-}
-
 pub fn is_tail_canceled_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<TailCanceledError>().is_some()
+    is_mv_changelog_canceled_error(err)
 }
 
 fn build_tail_schema(user_schema: &SchemaRef) -> SchemaRef {
@@ -107,12 +84,12 @@ pub struct TailParams {
 #[derive(Debug)]
 pub struct TailStream {
     schema: SchemaRef,
-    receiver: mpsc::Receiver<PgResult<TailBatch>>,
+    inner: MvChangelogStream,
 }
 
 impl TailStream {
-    fn new(schema: SchemaRef, receiver: mpsc::Receiver<PgResult<TailBatch>>) -> Self {
-        Self { schema, receiver }
+    fn new(schema: SchemaRef, inner: MvChangelogStream) -> Self {
+        Self { schema, inner }
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -124,26 +101,12 @@ impl Stream for TailStream {
     type Item = PgResult<TailBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_recv(cx)
-    }
-}
-
-pub trait MvCatalog: Send + Sync {
-    type View: MaterializedView + Send + Sync + 'static;
-
-    fn materialized_view(&self, name: &str) -> Option<Arc<Self::View>>;
-    fn schema(&self, name: &str) -> Option<SchemaRef>;
-}
-
-impl MvCatalog for MaterializedViewRegistry {
-    type View = MaterializedViewHandle;
-
-    fn materialized_view(&self, name: &str) -> Option<Arc<Self::View>> {
-        self.get(name)
-    }
-
-    fn schema(&self, name: &str) -> Option<SchemaRef> {
-        self.schema(name)
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(tail_batch_from_changelog(batch))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -171,40 +134,23 @@ where
 {
     crate::metrics::init();
     let _ = ctx;
-    let mv = catalog
-        .materialized_view(&params.mv_name)
-        .ok_or_else(|| anyhow!("materialized view '{}' not found", params.mv_name))?;
     let output_schema = tail_output_schema(catalog, &params.mv_name)?;
-    let base_schema = catalog.schema(&params.mv_name).ok_or_else(|| {
-        anyhow!(
-            "materialized view '{}' is missing schema metadata",
-            params.mv_name
-        )
-    })?;
+    let stream = execute_mv_changelog_with_config(
+        catalog,
+        MvChangelogParams {
+            mv_name: params.mv_name,
+            with_snapshot: params.with_snapshot,
+            as_of: params.as_of,
+        },
+        MvChangelogExecutionConfig {
+            channel_capacity: config.channel_capacity(),
+            max_catchup_versions: config.max_catchup_versions(),
+        },
+        cancel,
+    )
+    .await?;
 
-    let (tx, rx) = mpsc::channel(config.channel_capacity());
-    let mv_for_task = Arc::clone(&mv);
-    let schema_for_task = Arc::clone(&base_schema);
-    let params_for_task = params.clone();
-
-    let cancel_task = cancel.clone();
-    tokio::spawn(async move {
-        let mut sender = tx;
-        if let Err(err) = run_tail_task(
-            mv_for_task,
-            schema_for_task,
-            params_for_task,
-            config,
-            cancel_task,
-            &mut sender,
-        )
-        .await
-        {
-            let _ = sender.send(Err(err)).await;
-        }
-    });
-
-    Ok(TailStream::new(output_schema, rx))
+    Ok(TailStream::new(output_schema, stream))
 }
 
 pub fn parse_tail_sql(sql: &str) -> PgResult<TailParams> {
@@ -232,334 +178,33 @@ where
     Ok(build_tail_schema(&base))
 }
 
-async fn run_tail_task<M: MaterializedView + 'static>(
-    mv: Arc<M>,
-    schema: SchemaRef,
-    params: TailParams,
-    config: TailExecutionConfig,
-    cancel: CancellationToken,
-    tx: &mut mpsc::Sender<PgResult<TailBatch>>,
-) -> PgResult<()> {
-    let TailParams {
-        mv_name,
-        with_snapshot,
-        as_of,
-    } = params;
-    let mut version_rx = mv.subscribe_versions();
-    let latest = mv.latest_version();
-    let mut last_emitted;
-    let max_catchup_versions = config.max_catchup_versions();
-
-    if let Some(as_of_version) = as_of {
-        ensure!(
-            mv_version_exists(mv.as_ref(), as_of_version),
-            "version {as_of_version} not found for requested materialized view"
-        );
-        if with_snapshot {
-            emit_version(mv.as_ref(), &schema, &mv_name, as_of_version, tx).await?;
-        }
-        last_emitted = as_of_version;
-    } else if with_snapshot {
-        if let Some(version) = latest {
-            emit_version(mv.as_ref(), &schema, &mv_name, version, tx).await?;
-            last_emitted = version;
-        } else {
-            last_emitted = -1;
-        }
-    } else {
-        last_emitted = latest.unwrap_or(-1);
-    }
-
-    loop {
-        let latest_now = mv.latest_version().unwrap_or(last_emitted);
-        if latest_now > last_emitted {
-            let mut emitted = 0_i64;
-            while emitted < max_catchup_versions {
-                let Some(next_version) = mv.next_version_after(last_emitted) else {
-                    break;
-                };
-                if next_version > latest_now {
-                    break;
-                }
-                emit_delta(mv.as_ref(), &schema, &mv_name, next_version, tx).await?;
-                last_emitted = next_version;
-                emitted += 1;
-            }
-            if mv
-                .next_version_after(last_emitted)
-                .is_some_and(|next_version| next_version <= latest_now)
-            {
-                tokio::task::yield_now().await;
-            }
-            continue;
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(query_canceled_error());
-            }
-            changed = version_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn mv_version_exists<M: MaterializedView>(mv: &M, version: i64) -> bool {
-    mv.latest_version() == Some(version)
-        || mv.next_version_after(version.saturating_sub(1)) == Some(version)
-}
-
-async fn emit_version<M: MaterializedView>(
-    mv: &M,
-    schema: &SchemaRef,
-    mv_name: &str,
-    version: i64,
-    tx: &mut mpsc::Sender<PgResult<TailBatch>>,
-) -> PgResult<()> {
-    let version_time = mv.version_time(version);
-    let batches =
-        materialize_snapshot_batches(mv, Arc::clone(schema), version, version_time).await?;
-    let emit_span = tracing::debug_span!(
-        "tail_emit",
-        mv = %mv_name,
-        version,
-        mode = "snapshot"
-    );
-    let _emit_guard = emit_span.enter();
-    for batch in batches {
-        let payload = TailBatch { version, ..batch };
-        let row_count = payload.batch.num_rows();
-        if tx.send(Ok(payload)).await.is_err() {
-            break;
-        }
-        metrics::inc_tail_rows(row_count);
-        tracing::debug!(rows = row_count, "tail batch emitted");
-    }
-    Ok(())
-}
-
-async fn emit_delta<M: MaterializedView>(
-    mv: &M,
-    schema: &SchemaRef,
-    mv_name: &str,
-    version: i64,
-    tx: &mut mpsc::Sender<PgResult<TailBatch>>,
-) -> PgResult<()> {
-    let delta_start = Instant::now();
-    let version_time = mv.version_time(version);
-    let materialize_start = Instant::now();
-    let batches = materialize_delta_batches(mv, Arc::clone(schema), version, version_time).await?;
-    let materialize_ms = materialize_start.elapsed().as_millis() as u64;
-    let row_count: usize = batches.iter().map(|batch| batch.batch.num_rows()).sum();
-    let emit_span = tracing::debug_span!(
-        "tail_emit",
-        mv = %mv_name,
-        version,
-        mode = "delta"
-    );
-    let _emit_guard = emit_span.enter();
-    for batch in batches {
-        let payload = TailBatch { version, ..batch };
-        let row_count = payload.batch.num_rows();
-        if tx.send(Ok(payload)).await.is_err() {
-            break;
-        }
-        metrics::inc_tail_rows(row_count);
-        tracing::debug!(rows = row_count, "tail batch emitted");
-    }
-    let total_ms = delta_start.elapsed().as_millis() as u64;
-    let seq = TAIL_DELTA_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if seq < 16 || seq.is_multiple_of(TAIL_DELTA_LOG_SAMPLE_EVERY) {
-        tracing::info!(
-            mv = %mv_name,
-            version,
-            rows = row_count,
-            materialize_ms,
-            total_ms,
-            "tail delta emit metrics"
-        );
-    }
-    Ok(())
-}
-
-async fn materialize_snapshot_batches<M: MaterializedView>(
-    mv: &M,
-    schema: SchemaRef,
-    version: i64,
-    version_time: Option<i64>,
-) -> PgResult<Vec<TailBatch>> {
-    let snapshot = mv.snapshot_for(version).await?;
-    let rows = rows_from_snapshot(snapshot, &schema)?;
-    build_tail_batches(rows, schema, version_time)
-}
-
-async fn materialize_delta_batches<M: MaterializedView>(
-    mv: &M,
-    schema: SchemaRef,
-    version: i64,
-    version_time: Option<i64>,
-) -> PgResult<Vec<TailBatch>> {
-    let total_start = Instant::now();
-    let delta_iter_start = Instant::now();
-    let deltas = mv.delta_for(version).await?;
-    let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
-    let rows_decode_start = Instant::now();
-    let rows = rows_from_delta(deltas, &schema)?;
-    let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
-    let rows_len = rows.ops.len();
-    let batch_build_start = Instant::now();
-    let batches = build_tail_batches(rows, schema, version_time)?;
-    let batch_build_ms = batch_build_start.elapsed().as_millis() as u64;
-    let total_ms = total_start.elapsed().as_millis() as u64;
-    if version <= 8 || total_ms >= 1000 {
-        tracing::info!(
-            version,
-            rows = rows_len,
-            delta_iter_ms,
-            rows_decode_ms,
-            batch_build_ms,
-            total_ms,
-            "tail delta materialize breakdown"
-        );
-    }
-    Ok(batches)
-}
-
-struct TailDecodedRows {
-    builders: Vec<ScalarColumnBuilder>,
-    ops: Vec<i16>,
-}
-
-fn rows_from_snapshot(
-    snapshot: HashMap<Vec<u8>, i64>,
-    schema: &SchemaRef,
-) -> PgResult<TailDecodedRows> {
-    let column_count = schema.fields().len();
-    let builders = schema
-        .fields()
+fn tail_batch_from_changelog(batch: MvChangelogBatch) -> PgResult<TailBatch> {
+    let ops = batch
+        .diffs
         .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
-        .collect::<Result<Vec<_>>>()?;
-    let mut decoded_rows = TailDecodedRows {
-        builders,
-        ops: Vec::new(),
-    };
-    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
-    for (key, diff) in snapshot {
-        if diff < 0 {
-            bail!("materialized view snapshot contains negative diff {diff}");
-        }
-        if diff == 0 {
-            continue;
-        }
-        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
-        if decode_scratch.len() != column_count {
-            bail!(
-                "decoded row has {} columns but schema has {}",
-                decode_scratch.len(),
-                column_count
-            );
-        }
-        let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
-        for (idx, value) in decode_scratch.iter().enumerate() {
-            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
-        }
-        decoded_rows.ops.resize(decoded_rows.ops.len() + count, 1);
-    }
-    Ok(decoded_rows)
-}
-
-fn rows_from_delta(deltas: Vec<(Vec<u8>, i64)>, schema: &SchemaRef) -> PgResult<TailDecodedRows> {
-    let column_count = schema.fields().len();
-    let builders = schema
-        .fields()
-        .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
-        .collect::<Result<Vec<_>>>()?;
-    let mut decoded_rows = TailDecodedRows {
-        builders,
-        ops: Vec::new(),
-    };
-    let deltas = coalesce_tail_deltas(deltas);
-    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
-    for (key, diff) in deltas {
-        if diff == 0 {
-            continue;
-        }
-        let op = if diff > 0 { 1 } else { -1 };
-        let count = diff.checked_abs().context("delta diff overflow")? as usize;
-        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
-        if decode_scratch.len() != column_count {
-            bail!(
-                "decoded row has {} columns but schema has {}",
-                decode_scratch.len(),
-                column_count
-            );
-        }
-        for (idx, value) in decode_scratch.iter().enumerate() {
-            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
-        }
-        decoded_rows.ops.resize(decoded_rows.ops.len() + count, op);
-    }
-    Ok(decoded_rows)
-}
-
-fn coalesce_tail_deltas(deltas: Vec<(Vec<u8>, i64)>) -> HashMap<Vec<u8>, i64> {
-    let mut merged = HashMap::with_capacity(deltas.len());
-    for (key, diff) in deltas {
-        if diff == 0 {
-            continue;
-        }
-        let entry = merged.entry(key.clone()).or_insert(0);
-        *entry += diff;
-        if *entry == 0 {
-            merged.remove(&key);
-        }
-    }
-    merged
-}
-
-fn build_tail_batches(
-    rows: TailDecodedRows,
-    schema: SchemaRef,
-    version_time: Option<i64>,
-) -> PgResult<Vec<TailBatch>> {
-    if rows.ops.is_empty() {
-        return Ok(vec![TailBatch {
-            version: 0,
-            batch: RecordBatch::new_empty(schema),
-            ops: Vec::new(),
-            times: Vec::new(),
-        }]);
-    }
-    let arrays = rows
-        .builders
-        .into_iter()
-        .map(|mut builder| builder.finish_array())
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)?;
+        .map(|diff| i16::try_from(*diff).context("MV changelog diff does not fit TAIL __op"))
+        .collect::<PgResult<Vec<_>>>()?;
     ensure!(
-        rows.ops.len() == batch.num_rows(),
-        "tail ops length mismatch"
+        ops.len() == batch.batch.num_rows(),
+        "TAIL ops length mismatch"
     );
-    Ok(vec![TailBatch {
-        version: 0,
-        times: vec![version_time; batch.num_rows()],
-        batch,
-        ops: rows.ops,
-    }])
+    let times = vec![batch.version_time; batch.batch.num_rows()];
+    Ok(TailBatch {
+        version: batch.version,
+        batch: batch.batch,
+        ops,
+        times,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dbsp_bridge::DbspBridge;
+    use crate::encoding::decode_all_encoded_row_scalars_into;
     use crate::materialized_view::DbspPersistedState;
     use crate::mv::registry::MaterializedViewRegistry;
+    use crate::mv::runtime::MaterializedView;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use dbsp::StreamRetention;
@@ -855,10 +500,10 @@ mod tests {
             }
             decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
             let value = match decode_scratch.first().and_then(|value| value.as_ref()) {
-                Some(crate::encoding::EncodedRowScalar::Int64(v)) => *v,
+                Some(crate::encoding::EncodedRowScalar::Int64(v)) => v,
                 _ => continue,
             };
-            expected.insert(value, diff);
+            expected.insert(*value, diff);
         }
 
         assert_eq!(state, expected);

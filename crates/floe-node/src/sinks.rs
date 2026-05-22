@@ -17,10 +17,11 @@ use floe_cdc_core::{
     CdcTransactionId, UpstreamTableRef,
 };
 use floe_core::{RowValue, catalog::ColumnType};
-use floe_executor::FloeQueryContext;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::checkpoint::SinkCursor;
-use floe_executor::tail::{TailBatch, TailParams, execute_tail, is_tail_canceled_error};
+use floe_executor::mv_changelog::{
+    MvChangelogBatch, MvChangelogParams, execute_mv_changelog, is_mv_changelog_canceled_error,
+};
 use floe_node_core::debezium_encoder::{
     DebeziumEncodeContext, DebeziumEnvelopeConfig, encode_debezium_change,
 };
@@ -47,16 +48,18 @@ const DEFAULT_RETRY_BASE_MS: u64 = 100;
 const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 5_000;
 const DEFAULT_KAFKA_CHECKPOINT_PARTITION: i32 = 0;
 const DEFAULT_KAFKA_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
-const TAIL_BATCH_LOG_SAMPLE_EVERY: u64 = 256;
-static TAIL_BATCH_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const CHANGELOG_BATCH_LOG_SAMPLE_EVERY: u64 = 256;
+static CHANGELOG_BATCH_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 mod file_backend;
 mod http_backend;
 mod kafka_backend;
+mod postgres_backend;
 
 use file_backend::*;
 use http_backend::*;
 use kafka_backend::*;
+use postgres_backend::*;
 
 #[derive(Clone, Copy)]
 struct BatchPolicy {
@@ -210,7 +213,6 @@ enum SinkEvent {
 
 pub fn spawn_sinks(
     sinks: Vec<SinkSpec>,
-    query: FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     resume_cursors: HashMap<String, SinkCursor>,
     checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
@@ -222,7 +224,6 @@ pub fn spawn_sinks(
     for sink in sinks {
         let resume_cursor = resume_cursors.get(&sink.name).cloned();
         let checkpoint_tx = checkpoint_tx.clone();
-        let ctx = query.clone();
         let registry = registry.clone();
         let tail_cancel = tail_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
@@ -231,7 +232,6 @@ pub fn spawn_sinks(
             let name = sink.name.clone();
             if let Err(err) = run_sink(
                 sink,
-                ctx,
                 registry,
                 resume_cursor,
                 checkpoint_tx,
@@ -239,7 +239,7 @@ pub fn spawn_sinks(
             )
             .await
             {
-                if is_tail_canceled_error(&err) {
+                if is_mv_changelog_canceled_error(&err) {
                     tracing::info!(sink = %name, "sink canceled");
                 } else {
                     tracing::error!(sink = %name, error = %err, "sink failed");
@@ -265,7 +265,6 @@ fn record_runtime_failure(state: &Arc<StdMutex<Option<String>>>, message: String
 
 async fn run_sink(
     sink: SinkSpec,
-    query: FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     resume_cursor: Option<SinkCursor>,
     checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
@@ -310,7 +309,6 @@ async fn run_sink(
             )?;
             run_kafka_sink(
                 &sink.name,
-                &query,
                 registry,
                 cancel,
                 &brokers,
@@ -347,7 +345,6 @@ async fn run_sink(
             let queue_capacity = queue_capacity.unwrap_or(DEFAULT_SINK_QUEUE_CAPACITY);
             run_file_sink(
                 &sink.name,
-                &query,
                 registry,
                 cancel,
                 &path,
@@ -386,7 +383,6 @@ async fn run_sink(
             )?;
             run_http_sink(
                 &sink.name,
-                &query,
                 registry,
                 cancel,
                 &url,
@@ -400,18 +396,52 @@ async fn run_sink(
             )
             .await
         }
+        SinkConfig::Postgres {
+            connection,
+            table,
+            mv,
+            mode,
+            primary_key,
+            with_snapshot,
+            as_of,
+            retry_max_attempts,
+            retry_base_ms,
+            retry_max_backoff_ms,
+            ..
+        } => {
+            let retry_policy = RetryPolicy::new(
+                retry_max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
+                Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
+                Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
+            )?;
+            run_postgres_sink(
+                &sink.name,
+                registry,
+                cancel,
+                &connection,
+                &table,
+                &mv,
+                mode.as_deref(),
+                primary_key.unwrap_or_default(),
+                with_snapshot.unwrap_or(false) && resume_with_snapshot,
+                as_of.or(resume_as_of),
+                retry_policy,
+                checkpoint_tx,
+            )
+            .await
+        }
     }
 }
-async fn stream_tail_into_queue(
-    stream: impl futures::Stream<Item = Result<TailBatch>> + Unpin,
+async fn stream_changelog_into_queue(
+    stream: impl futures::Stream<Item = Result<MvChangelogBatch>> + Unpin,
     sender: mpsc::Sender<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
 ) -> Result<()> {
-    stream_tail_into_queue_with_encoding(stream, sender, tracker, SinkEncoding::Json).await
+    stream_changelog_into_queue_with_encoding(stream, sender, tracker, SinkEncoding::Json).await
 }
 
-async fn stream_tail_into_queue_with_encoding(
-    mut stream: impl futures::Stream<Item = Result<TailBatch>> + Unpin,
+async fn stream_changelog_into_queue_with_encoding(
+    mut stream: impl futures::Stream<Item = Result<MvChangelogBatch>> + Unpin,
     sender: mpsc::Sender<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
     encoding: SinkEncoding,
@@ -422,17 +452,17 @@ async fn stream_tail_into_queue_with_encoding(
         let schema = batch.batch.schema();
         let version = batch.version;
         let row_count = batch.batch.num_rows();
-        let seq = TAIL_BATCH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
-        if seq < 16 || seq.is_multiple_of(TAIL_BATCH_LOG_SAMPLE_EVERY) {
+        let seq = CHANGELOG_BATCH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
+        if seq < 16 || seq.is_multiple_of(CHANGELOG_BATCH_LOG_SAMPLE_EVERY) {
             tracing::info!(
                 batch_seq = seq,
                 version,
                 rows = row_count,
-                "sink tail batch observed"
+                "sink MV changelog batch observed"
             );
         }
         let convert_start = Instant::now();
-        let rows = encode_tail_batch_for_sink(&batch, &schema, &encoding)?;
+        let rows = encode_changelog_batch_for_sink(&batch, &schema, &encoding)?;
         let convert_latency_ms = convert_start.elapsed().as_millis() as u64;
         let enqueue_start = Instant::now();
         if !rows.is_empty() {
@@ -451,7 +481,7 @@ async fn stream_tail_into_queue_with_encoding(
         tracker.on_enqueue(version);
         let enqueue_latency_ms = enqueue_start.elapsed().as_millis() as u64;
         let batch_latency_ms = batch_start.elapsed().as_millis() as u64;
-        if seq < 16 || seq.is_multiple_of(TAIL_BATCH_LOG_SAMPLE_EVERY) {
+        if seq < 16 || seq.is_multiple_of(CHANGELOG_BATCH_LOG_SAMPLE_EVERY) {
             tracing::info!(
                 batch_seq = seq,
                 version,
@@ -459,7 +489,7 @@ async fn stream_tail_into_queue_with_encoding(
                 convert_latency_ms,
                 enqueue_latency_ms,
                 batch_latency_ms,
-                "sink tail batch conversion metrics"
+                "sink MV changelog batch conversion metrics"
             );
         }
     }
@@ -494,21 +524,24 @@ fn kafka_sink_encoding(
     }
 }
 
-fn encode_tail_batch_for_sink(
-    batch: &TailBatch,
+fn encode_changelog_batch_for_sink(
+    batch: &MvChangelogBatch,
     schema: &SchemaRef,
     encoding: &SinkEncoding,
 ) -> Result<Vec<SinkRecord>> {
     match encoding {
-        SinkEncoding::Json => encode_tail_batch_as_json(batch, schema),
-        SinkEncoding::Debezium(config) => encode_tail_batch_as_debezium(batch, schema, config),
+        SinkEncoding::Json => encode_changelog_batch_as_json(batch, schema),
+        SinkEncoding::Debezium(config) => encode_changelog_batch_as_debezium(batch, schema, config),
     }
 }
 
-fn encode_tail_batch_as_json(batch: &TailBatch, schema: &SchemaRef) -> Result<Vec<SinkRecord>> {
+fn encode_changelog_batch_as_json(
+    batch: &MvChangelogBatch,
+    schema: &SchemaRef,
+) -> Result<Vec<SinkRecord>> {
     let mut rows = Vec::with_capacity(batch.batch.num_rows());
     for row_idx in 0..batch.batch.num_rows() {
-        let json = tail_row_to_json(batch, row_idx, schema)?;
+        let json = changelog_row_to_json(batch, row_idx, schema)?;
         let payload = serde_json::to_string(&json).context("serialize sink row")?;
         rows.push(SinkRecord {
             version: batch.version,
@@ -522,12 +555,12 @@ fn encode_tail_batch_as_json(batch: &TailBatch, schema: &SchemaRef) -> Result<Ve
     Ok(rows)
 }
 
-fn encode_tail_batch_as_debezium(
-    batch: &TailBatch,
+fn encode_changelog_batch_as_debezium(
+    batch: &MvChangelogBatch,
     schema: &SchemaRef,
     config: &DebeziumSinkEncoding,
 ) -> Result<Vec<SinkRecord>> {
-    let cdc_schema = cdc_schema_from_tail_schema(schema, config)?;
+    let cdc_schema = cdc_schema_from_changelog_schema(schema, config)?;
     let envelope_config =
         DebeziumEnvelopeConfig::new(&config.source_name)?.with_database_name(&config.database_name);
     let source_position =
@@ -536,8 +569,8 @@ fn encode_tail_batch_as_debezium(
         CdcTransactionId::new(format!("mv-{}-{}", config.table_name, batch.version))?;
     let mut rows = Vec::with_capacity(batch.batch.num_rows());
     for row_idx in 0..batch.batch.num_rows() {
-        let row = cdc_row_from_tail_batch(batch, row_idx, &cdc_schema)?;
-        let op = batch.ops.get(row_idx).copied().unwrap_or(1);
+        let row = cdc_row_from_changelog_batch(batch, row_idx, &cdc_schema)?;
+        let op = batch.diffs.get(row_idx).copied().unwrap_or(1);
         let change = if op < 0 {
             CdcChange::Delete {
                 key: None,
@@ -554,7 +587,7 @@ fn encode_tail_batch_as_debezium(
                 source_position: Some(&source_position),
                 transaction_id: Some(&transaction_id),
                 sequence: Some(u64::try_from(row_idx).unwrap_or(u64::MAX)),
-                ts_ms: tail_row_time_ms(batch, row_idx),
+                ts_ms: changelog_batch_time_ms(batch),
             },
         )?;
         for record in records {
@@ -598,16 +631,11 @@ fn current_unix_time_ms() -> u64 {
     }
 }
 
-fn tail_row_time_ms(batch: &TailBatch, row_idx: usize) -> Option<i64> {
-    batch
-        .times
-        .get(row_idx)
-        .copied()
-        .flatten()
-        .map(|micros| micros / 1_000)
+fn changelog_batch_time_ms(batch: &MvChangelogBatch) -> Option<i64> {
+    batch.version_time.map(|micros| micros / 1_000)
 }
 
-fn cdc_schema_from_tail_schema(
+fn cdc_schema_from_changelog_schema(
     schema: &SchemaRef,
     config: &DebeziumSinkEncoding,
 ) -> Result<CdcTableSchema> {
@@ -654,8 +682,8 @@ fn column_type_from_arrow(data_type: &DataType) -> Result<ColumnType> {
     }
 }
 
-fn cdc_row_from_tail_batch(
-    batch: &TailBatch,
+fn cdc_row_from_changelog_batch(
+    batch: &MvChangelogBatch,
     row_idx: usize,
     schema: &CdcTableSchema,
 ) -> Result<CdcRow> {
@@ -809,8 +837,8 @@ fn arrow_numeric_string_value(array: &dyn Array, row_idx: usize) -> Result<Strin
     )
 }
 
-fn tail_row_to_json(
-    batch: &TailBatch,
+fn changelog_row_to_json(
+    batch: &MvChangelogBatch,
     row_idx: usize,
     schema: &SchemaRef,
 ) -> Result<serde_json::Value> {
@@ -821,10 +849,9 @@ fn tail_row_to_json(
     );
     object.insert(
         "__op".to_string(),
-        serde_json::Value::from(batch.ops.get(row_idx).copied().unwrap_or(0)),
+        serde_json::Value::from(batch.diffs.get(row_idx).copied().unwrap_or(0)),
     );
-    let time = batch.times.get(row_idx).copied().flatten();
-    if let Some(time) = time {
+    if let Some(time) = batch.version_time {
         object.insert("__time".to_string(), serde_json::Value::from(time));
     } else {
         object.insert("__time".to_string(), serde_json::Value::Null);
@@ -936,6 +963,7 @@ mod tests {
     use axum::{Json, Router};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use floe_executor::mv_changelog::MvChangelogBatchKind;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
@@ -973,14 +1001,15 @@ mod tests {
             ],
         )
         .expect("record batch");
-        let tail = TailBatch {
+        let changelog = MvChangelogBatch {
             version: 42,
+            version_time: Some(1_234_000),
+            kind: MvChangelogBatchKind::Delta,
             batch,
-            ops: vec![1, -1],
-            times: vec![Some(1_234_000), Some(1_235_000)],
+            diffs: vec![1, -1],
         };
-        let rows = encode_tail_batch_as_debezium(
-            &tail,
+        let rows = encode_changelog_batch_as_debezium(
+            &changelog,
             &schema,
             &DebeziumSinkEncoding {
                 source_name: "orders_sink".to_string(),
@@ -1018,7 +1047,7 @@ mod tests {
         assert_eq!(second_value["payload"]["op"], "d");
         assert_eq!(second_value["payload"]["before"]["status"], "closed");
         assert_eq!(second_value["payload"]["after"], serde_json::Value::Null);
-        assert_eq!(second_value["payload"]["ts_ms"], 1235);
+        assert_eq!(second_value["payload"]["ts_ms"], 1234);
     }
 
     #[test]

@@ -94,6 +94,38 @@ fn parse_create_sink_statement() {
 }
 
 #[test]
+fn parse_create_postgres_sink_statement() {
+    let stmt = parse_floe_statement(
+        "CREATE SINK out_orders FROM mv_orders WITH (
+            connector = 'postgres',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            table = 'public.orders_copy',
+            type = 'upsert',
+            primary_key = 'tenant_id,id',
+            with_snapshot = true
+        )",
+    )
+    .expect("parse sink");
+    match stmt {
+        FloeStatement::CreateSink(definition) => {
+            assert_eq!(definition.name(), "out_orders");
+            assert_eq!(definition.mv_name(), "mv_orders");
+            assert!(definition.with_snapshot());
+            assert_eq!(
+                definition.connector(),
+                &SinkConnector::Postgres {
+                    connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+                    table: "public.orders_copy".to_string(),
+                    mode: Some("upsert".to_string()),
+                    primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+                }
+            );
+        }
+        other => panic!("expected CREATE SINK statement, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_create_postgres_cdc_source_statement() {
     let stmt = parse_floe_statement(
         "CREATE SOURCE pg_main WITH (
@@ -487,6 +519,30 @@ fn parse_tail_variants() {
     assert_eq!(
         stmt,
         FloeStatement::Tail {
+            mv_name: "mv_orders".to_string(),
+            with_snapshot: true,
+            as_of: Some(42),
+        }
+    );
+}
+
+#[test]
+fn parse_subscribe_variants() {
+    let stmt = parse_floe_statement("SUBSCRIBE mv_orders").expect("parse subscribe");
+    assert_eq!(
+        stmt,
+        FloeStatement::Subscribe {
+            mv_name: "mv_orders".to_string(),
+            with_snapshot: false,
+            as_of: None,
+        }
+    );
+
+    let stmt = parse_floe_statement("SUBSCRIBE mv_orders WITH SNAPSHOT AS OF 42")
+        .expect("parse subscribe");
+    assert_eq!(
+        stmt,
+        FloeStatement::Subscribe {
             mv_name: "mv_orders".to_string(),
             with_snapshot: true,
             as_of: Some(42),

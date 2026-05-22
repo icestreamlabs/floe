@@ -58,6 +58,10 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
             statements.push(parse_tail_statement(normalized)?);
             continue;
         }
+        if starts_with_keyword(normalized, "SUBSCRIBE") {
+            statements.push(parse_subscribe_statement(normalized)?);
+            continue;
+        }
         return Err(anyhow!("unsupported SQL statement: {normalized}"));
     }
     if statements.is_empty() {
@@ -520,6 +524,7 @@ fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
         ));
     }
 
+    let connector_from_connector_key = options.contains_key("connector");
     let connector = options
         .get("connector")
         .or_else(|| options.get("type"))
@@ -571,6 +576,37 @@ fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
                 .map(|value| parse_usize_option("batch_size", value))
                 .transpose()?;
             SinkConnector::Http { url, batch_size }
+        }
+        "postgres" | "postgresql" => {
+            let connection =
+                option_any(&options, &["connection", "connection_string", "dsn", "url"])
+                    .ok_or_else(|| {
+                        anyhow!("Postgres sink requires connection/connection_string/url")
+                    })?
+                    .to_string();
+            let table = option_any(&options, &["table", "target.table", "target_table"])
+                .ok_or_else(|| anyhow!("Postgres sink requires table/target_table"))?
+                .to_string();
+            let mode = option_any(&options, &["mode", "sink_type", "sink.type"])
+                .or_else(|| {
+                    connector_from_connector_key
+                        .then(|| options.get("type").map(String::as_str))
+                        .flatten()
+                })
+                .map(normalize_sink_format);
+            let primary_key = option_any(
+                &options,
+                &["primary_key", "primary.key", "key_columns", "key.columns"],
+            )
+            .map(parse_column_list_option)
+            .transpose()?
+            .unwrap_or_default();
+            SinkConnector::Postgres {
+                connection,
+                table,
+                mode,
+                primary_key,
+            }
         }
         other => return Err(anyhow!("unsupported sink connector type '{other}'")),
     };
@@ -791,8 +827,26 @@ fn postgres_schema_evolution_policy_from_options(
 }
 
 fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
-    let mut rest = consume_keyword(sql, "TAIL")
-        .ok_or_else(|| anyhow!("expected TAIL at start of statement"))?;
+    let (mv_name, with_snapshot, as_of) = parse_stream_statement_parts(sql, "TAIL")?;
+    Ok(FloeStatement::Tail {
+        mv_name,
+        with_snapshot,
+        as_of,
+    })
+}
+
+fn parse_subscribe_statement(sql: &str) -> Result<FloeStatement> {
+    let (mv_name, with_snapshot, as_of) = parse_stream_statement_parts(sql, "SUBSCRIBE")?;
+    Ok(FloeStatement::Subscribe {
+        mv_name,
+        with_snapshot,
+        as_of,
+    })
+}
+
+fn parse_stream_statement_parts(sql: &str, keyword: &str) -> Result<(String, bool, Option<i64>)> {
+    let mut rest = consume_keyword(sql, keyword)
+        .ok_or_else(|| anyhow!("expected {keyword} at start of statement"))?;
     let (next, mv_name) = parse_identifier(rest)?;
     rest = next;
 
@@ -807,12 +861,12 @@ fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
     if !rest.is_empty() {
         let Some(after_as) = consume_keyword(rest, "AS") else {
             return Err(anyhow!(
-                "unexpected tokens after TAIL statement: {}",
+                "unexpected tokens after {keyword} statement: {}",
                 rest.trim()
             ));
         };
         let after_of = consume_keyword(after_as, "OF")
-            .ok_or_else(|| anyhow!("expected OF after AS in TAIL statement"))?;
+            .ok_or_else(|| anyhow!("expected OF after AS in {keyword} statement"))?;
         let (next, version) = parse_integer_literal(after_of)?;
         as_of = Some(version);
         rest = next;
@@ -820,16 +874,12 @@ fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
 
     if !rest.trim().is_empty() {
         return Err(anyhow!(
-            "unexpected tokens after TAIL statement: {}",
+            "unexpected tokens after {keyword} statement: {}",
             rest.trim()
         ));
     }
 
-    Ok(FloeStatement::Tail {
-        mv_name,
-        with_snapshot,
-        as_of,
-    })
+    Ok((mv_name, with_snapshot, as_of))
 }
 
 fn parse_parenthesized_options(

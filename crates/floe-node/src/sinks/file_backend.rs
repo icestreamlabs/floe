@@ -2,7 +2,6 @@ use super::*;
 
 pub(super) async fn run_file_sink(
     sink_name: &str,
-    query: &FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     cancel: CancellationToken,
     path: &str,
@@ -18,10 +17,9 @@ pub(super) async fn run_file_sink(
         bail!("sink queue_capacity must be greater than zero");
     }
 
-    let stream = execute_tail(
-        &query.session(),
+    let stream = execute_mv_changelog(
         registry.as_ref(),
-        TailParams {
+        MvChangelogParams {
             mv_name: mv.to_string(),
             with_snapshot,
             as_of,
@@ -32,7 +30,11 @@ pub(super) async fn run_file_sink(
 
     let (tx, rx) = mpsc::channel(queue_capacity);
     let tracker = SinkQueueTracker::new(sink_name);
-    let producer_task = tokio::spawn(stream_tail_into_queue(stream, tx, Arc::clone(&tracker)));
+    let producer_task = tokio::spawn(stream_changelog_into_queue(
+        stream,
+        tx,
+        Arc::clone(&tracker),
+    ));
     let consumer_result = run_file_worker(
         sink_name,
         mv,

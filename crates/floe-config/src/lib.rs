@@ -636,6 +636,27 @@ pub enum SinkConfig {
         #[serde(default)]
         retry_max_backoff_ms: Option<u64>,
     },
+    Postgres {
+        #[serde(default)]
+        name: Option<String>,
+        connection: String,
+        table: String,
+        mv: String,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        primary_key: Option<Vec<String>>,
+        #[serde(default)]
+        with_snapshot: Option<bool>,
+        #[serde(default)]
+        as_of: Option<i64>,
+        #[serde(default)]
+        retry_max_attempts: Option<usize>,
+        #[serde(default)]
+        retry_base_ms: Option<u64>,
+        #[serde(default)]
+        retry_max_backoff_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -800,6 +821,52 @@ mod tests {
                 );
             }
             other => panic!("expected Kafka sink config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_sql_postgres_sink_options_to_runtime_config() {
+        let definition = SinkDefinition::new(
+            "out_orders",
+            "mv_orders",
+            SinkConnector::Postgres {
+                connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+                table: "public.orders_copy".to_string(),
+                mode: Some("upsert".to_string()),
+                primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+            },
+            true,
+            Some(9),
+        );
+        let spec = sink_spec_from_sql(&definition).expect("map sink");
+        match spec.config {
+            SinkConfig::Postgres {
+                name,
+                connection,
+                table,
+                mv,
+                mode,
+                primary_key,
+                with_snapshot,
+                as_of,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("out_orders"));
+                assert_eq!(
+                    connection,
+                    "postgres://postgres:postgres@localhost/postgres"
+                );
+                assert_eq!(table, "public.orders_copy");
+                assert_eq!(mv, "mv_orders");
+                assert_eq!(mode.as_deref(), Some("upsert"));
+                assert_eq!(
+                    primary_key,
+                    Some(vec!["tenant_id".to_string(), "id".to_string()])
+                );
+                assert_eq!(with_snapshot, Some(true));
+                assert_eq!(as_of, Some(9));
+            }
+            other => panic!("expected Postgres sink config, got {other:?}"),
         }
     }
 
@@ -994,6 +1061,33 @@ mod tests {
         };
         let err = validate_node_config(&config).expect_err("validation should fail");
         assert!(err.to_string().contains("sinks[0].key_columns is required"));
+    }
+
+    #[test]
+    fn validation_requires_primary_key_for_postgres_upsert_sink() {
+        let config = NodeConfig {
+            connectors: vec![ConnectorConfig::Generator {
+                name: None,
+                events_per_second: Some(1.0),
+                max_events: None,
+            }],
+            sinks: vec![SinkConfig::Postgres {
+                name: Some("sink_pg".to_string()),
+                connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+                table: "public.orders_copy".to_string(),
+                mv: "mv_orders".to_string(),
+                mode: Some("upsert".to_string()),
+                primary_key: None,
+                with_snapshot: Some(false),
+                as_of: None,
+                retry_max_attempts: None,
+                retry_base_ms: None,
+                retry_max_backoff_ms: None,
+            }],
+            ..NodeConfig::default()
+        };
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(err.to_string().contains("sinks[0].primary_key is required"));
     }
 
     #[test]

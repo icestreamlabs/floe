@@ -3,6 +3,7 @@ mod execution;
 mod management;
 mod protocol;
 mod sql;
+mod subscribe;
 mod tail;
 mod types;
 

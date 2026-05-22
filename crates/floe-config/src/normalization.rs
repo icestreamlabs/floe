@@ -110,6 +110,24 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             retry_base_ms: None,
             retry_max_backoff_ms: None,
         },
+        SinkConnector::Postgres {
+            connection,
+            table,
+            mode,
+            primary_key,
+        } => SinkConfig::Postgres {
+            name: Some(definition.name().to_string()),
+            connection: connection.clone(),
+            table: table.clone(),
+            mv: definition.mv_name().to_string(),
+            mode: mode.clone(),
+            primary_key: (!primary_key.is_empty()).then(|| primary_key.clone()),
+            with_snapshot: Some(definition.with_snapshot()),
+            as_of: definition.as_of(),
+            retry_max_attempts: None,
+            retry_base_ms: None,
+            retry_max_backoff_ms: None,
+        },
     };
     Ok(SinkSpec {
         name: definition.name().to_string(),
@@ -360,6 +378,7 @@ impl SinkConfig {
             SinkConfig::Kafka { .. } => "kafka",
             SinkConfig::File { .. } => "file",
             SinkConfig::Http { .. } => "http",
+            SinkConfig::Postgres { .. } => "postgres",
         }
     }
 
@@ -367,7 +386,8 @@ impl SinkConfig {
         match self {
             SinkConfig::Kafka { name, .. }
             | SinkConfig::File { name, .. }
-            | SinkConfig::Http { name, .. } => name.as_deref(),
+            | SinkConfig::Http { name, .. }
+            | SinkConfig::Postgres { name, .. } => name.as_deref(),
         }
     }
 }

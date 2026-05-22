@@ -25,7 +25,6 @@ struct KafkaSinkCheckpointRecord {
 
 pub(super) async fn run_kafka_sink(
     sink_name: &str,
-    query: &FloeQueryContext,
     registry: Arc<MaterializedViewRegistry>,
     cancel: CancellationToken,
     brokers: &str,
@@ -86,10 +85,9 @@ pub(super) async fn run_kafka_sink(
         effective_with_snapshot = false;
     }
 
-    let stream = execute_tail(
-        &query.session(),
+    let stream = execute_mv_changelog(
         registry.as_ref(),
-        TailParams {
+        MvChangelogParams {
             mv_name: mv.to_string(),
             with_snapshot: effective_with_snapshot,
             as_of: effective_as_of,
@@ -100,7 +98,7 @@ pub(super) async fn run_kafka_sink(
 
     let (tx, rx) = mpsc::channel(queue_capacity);
     let tracker = SinkQueueTracker::new(sink_name);
-    let producer_task = tokio::spawn(stream_tail_into_queue_with_encoding(
+    let producer_task = tokio::spawn(stream_changelog_into_queue_with_encoding(
         stream,
         tx,
         Arc::clone(&tracker),

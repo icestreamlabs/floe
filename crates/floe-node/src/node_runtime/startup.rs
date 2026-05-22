@@ -432,7 +432,8 @@ pub(super) fn sink_mv_name(config: &SinkConfig) -> &str {
     match config {
         SinkConfig::Kafka { mv, .. }
         | SinkConfig::File { mv, .. }
-        | SinkConfig::Http { mv, .. } => mv,
+        | SinkConfig::Http { mv, .. }
+        | SinkConfig::Postgres { mv, .. } => mv,
     }
 }
 
