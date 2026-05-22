@@ -23,6 +23,11 @@ pub struct DebeziumEncodeContext<'a> {
     pub ts_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DebeziumBatchEncodeOptions {
+    pub snapshot_read: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebeziumEncodedRecord {
     key: Option<Value>,
@@ -115,6 +120,22 @@ pub fn encode_debezium_change_batch(
     config: &DebeziumEnvelopeConfig,
     context: DebeziumEncodeContext<'_>,
 ) -> Result<Vec<DebeziumEncodedRecord>> {
+    encode_debezium_change_batch_with_options(
+        schema,
+        batch,
+        config,
+        context,
+        DebeziumBatchEncodeOptions::default(),
+    )
+}
+
+pub fn encode_debezium_change_batch_with_options(
+    schema: &CdcTableSchema,
+    batch: &ChangeBatch,
+    config: &DebeziumEnvelopeConfig,
+    context: DebeziumEncodeContext<'_>,
+    options: DebeziumBatchEncodeOptions,
+) -> Result<Vec<DebeziumEncodedRecord>> {
     anyhow::ensure!(
         batch.table_id() == schema.table_id(),
         "Debezium batch table '{}' does not match schema table '{}'",
@@ -149,6 +170,17 @@ pub fn encode_debezium_change_batch(
                 .unwrap_or(0)
                 .saturating_add(u64::try_from(idx).unwrap_or(u64::MAX)),
         );
+        if options.snapshot_read
+            && let CdcChange::Insert { row } = change
+        {
+            records.push(encode_debezium_snapshot_row(
+                schema,
+                row,
+                config,
+                change_context,
+            )?);
+            continue;
+        }
         records.extend(encode_debezium_change(
             schema,
             change,
@@ -845,6 +877,35 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(value_payload(&records[0])["transaction"]["total_order"], 10);
         assert_eq!(value_payload(&records[1])["transaction"]["total_order"], 11);
+    }
+
+    #[test]
+    fn change_batch_encoder_can_emit_insert_changes_as_snapshot_reads() {
+        let schema = orders_schema();
+        let config = DebeziumEnvelopeConfig::new("pg_main")
+            .unwrap()
+            .with_database_name("postgres");
+        let batch = ChangeBatch::new(
+            schema.table_id().clone(),
+            vec![CdcChange::Insert {
+                row: row(7, 42, 99, Some("open")),
+            }],
+        )
+        .unwrap();
+        let records = encode_debezium_change_batch_with_options(
+            &schema,
+            &batch,
+            &config,
+            DebeziumEncodeContext::default(),
+            DebeziumBatchEncodeOptions {
+                snapshot_read: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(value_payload(&records[0])["op"], "r");
+        assert_eq!(value_payload(&records[0])["source"]["snapshot"], "true");
     }
 
     #[test]

@@ -606,8 +606,6 @@ pub enum SinkConfig {
         #[serde(default)]
         append: Option<bool>,
         #[serde(default)]
-        effectively_once: Option<bool>,
-        #[serde(default)]
         batch_rows: Option<usize>,
         #[serde(default)]
         batch_bytes: Option<usize>,

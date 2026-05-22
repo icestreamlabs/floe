@@ -19,8 +19,8 @@ use floe_config::{ReplicationArrowIpcCompressionConfig, ReplicationEncodingConfi
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use floe_node_core::debezium_encoder::{
-    DebeziumEncodeContext, DebeziumEncodedRecord, DebeziumEnvelopeConfig, encode_debezium_change,
-    encode_debezium_snapshot_row,
+    DebeziumBatchEncodeOptions, DebeziumEncodeContext, DebeziumEncodedRecord,
+    DebeziumEnvelopeConfig, encode_debezium_change_batch_with_options,
 };
 use floe_storage::CdcBufferRecord;
 use rayon::prelude::*;
@@ -263,8 +263,7 @@ pub(super) fn encode_pipeline_buffer_records_with_settings(
                 encode_floe_json_snapshot_pipeline_records(plan, schema, rows)
             }
             ReplicationPipelineRuntimeFormat::DebeziumJson => {
-                let records =
-                    encode_debezium_snapshot_pipeline_records(plan, schema, rows, transaction)?;
+                let records = encode_debezium_pipeline_records(plan, schema, batch, transaction)?;
                 debezium_records_to_buffer_records(&records)
             }
             ReplicationPipelineRuntimeFormat::ArrowIpc => {
@@ -814,47 +813,20 @@ pub(super) fn encode_debezium_pipeline_records(
     let is_snapshot = transaction
         .transaction_id()
         .is_some_and(|tx| tx.as_str().starts_with("snapshot:"));
-    let mut records = Vec::new();
-    for (idx, change) in batch.changes().iter().enumerate() {
-        let context = DebeziumEncodeContext {
+    encode_debezium_change_batch_with_options(
+        schema,
+        batch,
+        &config,
+        DebeziumEncodeContext {
             source_position: Some(transaction.commit_position()),
             transaction_id: transaction.transaction_id(),
-            sequence: Some(u64::try_from(idx).unwrap_or(u64::MAX)),
+            sequence: Some(0),
             ts_ms: None,
-        };
-        if is_snapshot && let CdcChange::Insert { row } = change {
-            records.push(encode_debezium_snapshot_row(schema, row, &config, context)?);
-            continue;
-        }
-        records.extend(encode_debezium_change(schema, change, &config, context)?);
-    }
-    Ok(records)
-}
-
-fn encode_debezium_snapshot_pipeline_records(
-    plan: &ReplicationPipelineRuntimePlan,
-    schema: &CdcTableSchema,
-    rows: &CdcColumnarRowBatch,
-    transaction: &TransactionBatch,
-) -> anyhow::Result<Vec<DebeziumEncodedRecord>> {
-    let config = DebeziumEnvelopeConfig::new(&plan.source_name)?
-        .with_database_name(&plan.database_name)
-        .with_emit_tombstones(plan.emit_tombstones)
-        .with_transaction_metadata(plan.include_transaction_metadata);
-    let mut records = Vec::with_capacity(rows.row_count());
-    for row_idx in 0..rows.row_count() {
-        let row = rows.row(row_idx)?;
-        let context = DebeziumEncodeContext {
-            source_position: Some(transaction.commit_position()),
-            transaction_id: transaction.transaction_id(),
-            sequence: Some(u64::try_from(row_idx).unwrap_or(u64::MAX)),
-            ts_ms: None,
-        };
-        records.push(encode_debezium_snapshot_row(
-            schema, &row, &config, context,
-        )?);
-    }
-    Ok(records)
+        },
+        DebeziumBatchEncodeOptions {
+            snapshot_read: is_snapshot,
+        },
+    )
 }
 
 fn debezium_records_to_buffer_records(

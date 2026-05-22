@@ -92,7 +92,6 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
             append: *append,
-            effectively_once: None,
             batch_rows: None,
             batch_bytes: None,
             queue_capacity: None,

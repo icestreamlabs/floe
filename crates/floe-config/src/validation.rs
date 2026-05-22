@@ -435,7 +435,6 @@ fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
             with_snapshot: _,
             as_of: _,
             append: _,
-            effectively_once: _,
             batch_rows,
             batch_bytes,
             queue_capacity,

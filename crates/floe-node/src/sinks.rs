@@ -30,7 +30,7 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::{Message, Offset, TopicPartitionList};
 use reqwest::Client;
-use tokio::fs::{self, OpenOptions};
+use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -335,7 +335,6 @@ async fn run_sink(
             with_snapshot,
             as_of,
             append,
-            effectively_once,
             batch_rows,
             batch_bytes,
             queue_capacity,
@@ -356,7 +355,6 @@ async fn run_sink(
                 with_snapshot.unwrap_or(false) && resume_with_snapshot,
                 as_of.or(resume_as_of),
                 append.unwrap_or(true),
-                effectively_once.unwrap_or(false),
                 queue_capacity,
                 batch_policy,
                 checkpoint_tx,
@@ -938,10 +936,8 @@ mod tests {
     use axum::{Json, Router};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tempfile::tempdir;
     use tokio::net::TcpListener;
 
     #[test]
@@ -1048,99 +1044,6 @@ mod tests {
         let (batch_key, keys) = build_http_idempotency_keys(&rows);
         assert_eq!(batch_key, "batch:7:0..7:1");
         assert_eq!(keys, "7:0,7:1");
-    }
-
-    #[tokio::test]
-    async fn versioned_file_sink_writes_atomic_files_and_markers() {
-        let temp = tempdir().expect("tempdir");
-        let base = temp.path().join("sink.jsonl");
-        let base_str = base.to_string_lossy().to_string();
-        let rows = vec![SinkRecord {
-            version: 5,
-            row_idx: 0,
-            key: None,
-            json: serde_json::json!({"auction": 1}),
-            payload: "{\"auction\":1}".to_string(),
-            byte_len: 13,
-        }];
-
-        write_versioned_file_batch(&base_str, 5, &rows)
-            .await
-            .expect("write versioned file");
-        write_versioned_file_batch(&base_str, 5, &rows)
-            .await
-            .expect("idempotent rewrite");
-
-        let data_path = format!("{base_str}.v5.jsonl");
-        let manifest_path = format!("{base_str}.manifest");
-        let commit_path = format!("{base_str}.commit");
-        assert!(std::path::Path::new(&data_path).exists());
-        assert!(std::path::Path::new(&manifest_path).exists());
-        assert!(std::path::Path::new(&commit_path).exists());
-
-        let manifest = fs::read_to_string(&manifest_path).expect("read manifest");
-        assert_eq!(manifest.lines().count(), 1);
-        assert!(manifest.contains("\"version\":5"));
-        let commit = fs::read_to_string(&commit_path).expect("read commit");
-        assert_eq!(commit.trim(), "5");
-    }
-
-    #[tokio::test]
-    async fn file_effectively_once_crash_mid_batch_leaves_no_commit_marker() {
-        let temp = tempdir().expect("tempdir");
-        let base = temp.path().join("sink.jsonl");
-        let base_str = base.to_string_lossy().to_string();
-        let (tx, rx) = mpsc::channel(8);
-        let tracker = SinkQueueTracker::new("sink_file");
-        let worker_path = base_str.clone();
-        let task = tokio::spawn(async move {
-            run_file_worker_effectively_once("sink_file", "mv_bid", &worker_path, rx, tracker, None)
-                .await
-        });
-
-        tx.send(SinkEvent::Rows(vec![SinkRecord {
-            version: 9,
-            row_idx: 0,
-            key: None,
-            json: serde_json::json!({"auction": 9}),
-            payload: "{\"auction\":9}".to_string(),
-            byte_len: 13,
-        }]))
-        .await
-        .expect("send row");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        task.abort();
-        let _ = task.await;
-
-        assert!(!std::path::Path::new(&format!("{base_str}.commit")).exists());
-        assert!(!std::path::Path::new(&format!("{base_str}.v9.jsonl")).exists());
-    }
-
-    #[tokio::test]
-    async fn file_effectively_once_restart_does_not_duplicate_committed_version() {
-        let temp = tempdir().expect("tempdir");
-        let base = temp.path().join("sink.jsonl");
-        let base_str = base.to_string_lossy().to_string();
-
-        let rows = vec![SinkRecord {
-            version: 3,
-            row_idx: 0,
-            key: None,
-            json: serde_json::json!({"auction": 3}),
-            payload: "{\"auction\":3}".to_string(),
-            byte_len: 13,
-        }];
-        write_versioned_file_batch(&base_str, 3, &rows)
-            .await
-            .expect("first commit");
-        write_versioned_file_batch(&base_str, 3, &rows)
-            .await
-            .expect("replayed commit");
-
-        let manifest = fs::read_to_string(format!("{base_str}.manifest")).expect("manifest");
-        assert_eq!(manifest.lines().count(), 1);
-        let commit = fs::read_to_string(format!("{base_str}.commit")).expect("commit marker");
-        assert_eq!(commit.trim(), "3");
     }
 
     #[derive(Clone)]
