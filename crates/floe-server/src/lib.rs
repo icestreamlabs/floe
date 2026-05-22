@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use floe_executor::dbsp_bridge::DbspBridge;
+use floe_executor::tail::TailExecutionConfig;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry};
 use floe_storage::SlateCatalog;
 use pgwire::error::{ErrorInfo, PgWireError};
@@ -24,34 +25,48 @@ use tokio_util::sync::CancellationToken;
 use execution::FloeServerState;
 use protocol::FloeServerFactory;
 
-const LISTEN_ENV: &str = "FLOE_PG_ADDR";
-const DATA_ENV: &str = "FLOE_DATA_DIR";
-const OBJECT_STORE_PROVIDER_ENV: &str = "CLOUD_PROVIDER";
-const OBJECT_STORE_ENV_FILE_ENV: &str = "FLOE_OBJECT_STORE_ENV_FILE";
-const SLATEDB_NAME_ENV: &str = "FLOE_SLATEDB_NAME";
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:6432";
 
-pub async fn init_storage(settings: Option<Settings>) -> Result<Arc<SlateCatalog>> {
-    if std::env::var(OBJECT_STORE_PROVIDER_ENV).is_ok() {
-        let env_file = std::env::var(OBJECT_STORE_ENV_FILE_ENV).ok();
-        let object_store = slatedb::admin::load_object_store_from_env(env_file)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServerRuntimeConfig {
+    pub tail: TailExecutionConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ServerStorageConfig {
+    pub data_dir: Option<PathBuf>,
+    pub object_store_from_env: bool,
+    pub object_store_env_file: Option<String>,
+    pub slatedb_name: Option<String>,
+}
+
+impl ServerStorageConfig {
+    pub fn in_memory() -> Self {
+        Self::default()
+    }
+}
+
+pub async fn init_storage(
+    config: ServerStorageConfig,
+    settings: Option<Settings>,
+) -> Result<Arc<SlateCatalog>> {
+    if config.object_store_from_env {
+        let object_store = slatedb::admin::load_object_store_from_env(config.object_store_env_file)
             .map_err(|err| anyhow::anyhow!("{err}"))
-            .context("failed to initialise SlateDB object store from environment")?;
-        let db_name = std::env::var(SLATEDB_NAME_ENV).unwrap_or_else(|_| "floe".to_string());
+            .context("failed to initialise SlateDB object store from configured environment")?;
+        let db_name = config.slatedb_name.unwrap_or_else(|| "floe".to_string());
         return SlateCatalog::with_object_store_with_settings(db_name, object_store, settings)
             .await
             .map(Arc::new)
             .context("failed to initialise SlateDB object-store catalog");
     }
 
-    match std::env::var(DATA_ENV) {
-        Ok(dir) => {
-            let path = PathBuf::from(dir);
-            SlateCatalog::with_filesystem_with_settings(path, settings)
-                .await
-                .map(Arc::new)
-                .context("failed to initialise SlateDB filesystem catalog")
-        }
-        Err(_) => SlateCatalog::in_memory_with_settings(settings)
+    match config.data_dir {
+        Some(path) => SlateCatalog::with_filesystem_with_settings(path, settings)
+            .await
+            .map(Arc::new)
+            .context("failed to initialise SlateDB filesystem catalog"),
+        None => SlateCatalog::in_memory_with_settings(settings)
             .await
             .map(Arc::new)
             .context("failed to initialise SlateDB in-memory catalog"),
@@ -96,12 +111,43 @@ pub async fn run_with_shutdown(
     materialized_views: Arc<MaterializedViewRegistry>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    run_with_shutdown_on(DEFAULT_LISTEN_ADDR, query, materialized_views, shutdown).await
+}
+
+pub async fn run_with_shutdown_on(
+    address: impl Into<String>,
+    query: FloeQueryContext,
+    materialized_views: Arc<MaterializedViewRegistry>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    run_with_shutdown_on_with_config(
+        address,
+        query,
+        materialized_views,
+        shutdown,
+        ServerRuntimeConfig::default(),
+    )
+    .await
+}
+
+pub async fn run_with_shutdown_on_with_config(
+    address: impl Into<String>,
+    query: FloeQueryContext,
+    materialized_views: Arc<MaterializedViewRegistry>,
+    shutdown: CancellationToken,
+    runtime_config: ServerRuntimeConfig,
+) -> Result<()> {
     let db = query.storage().db();
     let bridge = DbspBridge::new(db).await?;
-    let state = Arc::new(FloeServerState::new(query, materialized_views, bridge));
+    let state = Arc::new(FloeServerState::new_with_config(
+        query,
+        materialized_views,
+        bridge,
+        runtime_config,
+    ));
     let factory = Arc::new(FloeServerFactory::new(state));
 
-    let address = std::env::var(LISTEN_ENV).unwrap_or_else(|_| "127.0.0.1:6432".to_string());
+    let address = address.into();
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind pgwire listener at {address}"))?;

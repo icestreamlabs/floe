@@ -47,8 +47,9 @@ pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{
     BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig,
-    PlanSourceRequirements, plan_source_requirements, source_batch_journal_root_source_name,
-    source_batch_journal_root_sources, transient_source_root_requirements,
+    PersistencePolicyConfig, PlanSourceRequirements, plan_source_requirements,
+    source_batch_journal_root_source_name, source_batch_journal_root_sources,
+    source_batch_journal_root_sources_with_config, transient_source_root_requirements,
 };
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use dbsp_table_environment::DbspTableEnvironment;
@@ -67,6 +68,7 @@ pub use table_provider::{
     DynamicStateExec, DynamicStateTableProvider, MaterializedViewTableProvider, SlateTableProvider,
     SourceTableProvider,
 };
+pub use tail::TailExecutionConfig;
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
 pub use vectorized_exec::{VectorizedPlanExecutor, VectorizedTickOutput};
 pub use vectorized_keys::{

@@ -45,8 +45,9 @@ use floe_executor::source_journal::SourceBatchJournal;
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
-    OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
-    ValidatedPlan, plan_source_requirements, source_batch_journal_root_sources, validate_dbsp_plan,
+    OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig, SourceRowDecoder,
+    SourceTableProvider, TailExecutionConfig, ValidatedPlan, plan_source_requirements,
+    source_batch_journal_root_sources_with_config, validate_dbsp_plan,
 };
 use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
 use floe_node_core::connector::{ConnectorContext, run_connector};
@@ -94,9 +95,6 @@ static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
-const SLATEDB_CONFIG_ENV: &str = "FLOE_SLATEDB_CONFIG";
-const SLATEDB_ENV_PREFIX_ENV: &str = "FLOE_SLATEDB_ENV_PREFIX";
-const DEFAULT_SLATEDB_ENV_PREFIX: &str = "SLATEDB_";
 const DEFAULT_EVENTS_PER_SECOND: f64 = 10.0;
 const DEFAULT_MV_RETAIN_LAST: usize = 1;
 const DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN: usize = 512;
@@ -112,11 +110,10 @@ const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INGEST_BATCH_SIZE: usize = 256;
 const DEFAULT_INGEST_BATCH_PER_SOURCE: usize = 64;
 const DEFAULT_INGEST_BATCH_PER_CONNECTOR: usize = 64;
+const DEFAULT_PGWIRE_ADDR: &str = "127.0.0.1:6432";
 const DEFAULT_ADMIN_PORT: u16 = 8081;
 const CHECKPOINT_GRAPH_ID: &str = "floe_runtime";
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
-const ADMIN_PORT_ENV: &str = "FLOE_ADMIN_PORT";
-const SLATEDB_CLOSE_TIMEOUT_MS_ENV: &str = "FLOE_SLATEDB_CLOSE_TIMEOUT_MS";
 const DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
 

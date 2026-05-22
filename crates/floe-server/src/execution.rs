@@ -16,23 +16,41 @@ use datafusion::arrow::record_batch::RecordBatch;
 
 use super::sql::{extract_tables_from_query, is_system_catalog_relation, unqualified_table_name};
 use super::{parse_error, undefined_table_error};
+use crate::ServerRuntimeConfig;
 use crate::catalog_shim::refresh_catalog_shim;
 
 pub(crate) struct FloeServerState {
     pub(crate) query: FloeQueryContext,
     pub(crate) materialized_views: Arc<MaterializedViewRegistry>,
+    pub(crate) runtime_config: ServerRuntimeConfig,
     bridge: Arc<Mutex<DbspBridge>>,
 }
 
 impl FloeServerState {
+    #[cfg(test)]
     pub(crate) fn new(
         query: FloeQueryContext,
         materialized_views: Arc<MaterializedViewRegistry>,
         bridge: DbspBridge,
     ) -> Self {
+        Self::new_with_config(
+            query,
+            materialized_views,
+            bridge,
+            ServerRuntimeConfig::default(),
+        )
+    }
+
+    pub(crate) fn new_with_config(
+        query: FloeQueryContext,
+        materialized_views: Arc<MaterializedViewRegistry>,
+        bridge: DbspBridge,
+        runtime_config: ServerRuntimeConfig,
+    ) -> Self {
         Self {
             query,
             materialized_views,
+            runtime_config,
             bridge: Arc::new(Mutex::new(bridge)),
         }
     }

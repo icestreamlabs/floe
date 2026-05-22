@@ -60,7 +60,43 @@ POSTGRES_SLOT_LOG="${ARTIFACT_DIR}/postgres-slot.log"
 DOCKER_STATS_LOG="${ARTIFACT_DIR}/docker-stats.log"
 
 mkdir -p "${ARTIFACT_DIR}"
-printf '{}\n' >"${CONFIG_PATH}"
+case "${ARROW_IPC_COMPRESSION}" in
+  ""|none|off|false|0)
+    ARROW_IPC_COMPRESSION_JSON="null"
+    ;;
+  lz4|lz4_frame|lz4-frame)
+    ARROW_IPC_COMPRESSION_JSON='"lz4_frame"'
+    ;;
+  *)
+    echo "unsupported ARROW_IPC_COMPRESSION=${ARROW_IPC_COMPRESSION}; expected none or lz4_frame" >&2
+    exit 1
+    ;;
+esac
+cat >"${CONFIG_PATH}" <<JSON
+{
+  "runtime": {
+    "pgwire_addr": "127.0.0.1:${FLOE_PG_PORT}",
+    "admin_port": 0
+  },
+  "storage": {
+    "data_dir": "${ARTIFACT_DIR}/floe-data"
+  },
+  "replication": {
+    "encoding": {
+      "arrow_ipc_rows_per_record": ${ARROW_IPC_ROWS_PER_RECORD},
+      "arrow_ipc_compression": ${ARROW_IPC_COMPRESSION_JSON},
+      "kafka_metadata_headers": ${KAFKA_METADATA_HEADERS}
+    }
+  },
+  "postgres_cdc": {
+    "snapshot": {
+      "rows_per_batch": ${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH},
+      "max_workers": ${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS},
+      "intra_table_chunks": ${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}
+    }
+  }
+}
+JSON
 
 node_pid=""
 node_process_group=0
@@ -1176,18 +1212,9 @@ SLATEDB_ARGS=(
 echo "Starting Floe node"
 node_started_ns="$(date +%s%N)"
 if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1; then
-  node_process_group=1
-  setsid /usr/bin/time -v -o "${NODE_RESOURCE_LOG}" \
-    env \
-    FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
-    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-    FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
-    FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
-    FLOE_REPLICATION_KAFKA_METADATA_HEADERS="${KAFKA_METADATA_HEADERS}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
-    "${FLOE_BIN}" run \
+	node_process_group=1
+	setsid /usr/bin/time -v -o "${NODE_RESOURCE_LOG}" \
+	  "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
       "${SLATEDB_ARGS[@]}" \
@@ -1196,17 +1223,9 @@ if command -v setsid >/dev/null 2>&1 && command -v /usr/bin/time >/dev/null 2>&1
       --ingest-batch-per-connector 16384 \
       >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
 elif command -v setsid >/dev/null 2>&1; then
-  node_process_group=1
-  setsid env \
-    FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
-    FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-    FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
-    FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
-    FLOE_REPLICATION_KAFKA_METADATA_HEADERS="${KAFKA_METADATA_HEADERS}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
-    FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
-    "${FLOE_BIN}" run \
+	node_process_group=1
+	setsid \
+	  "${FLOE_BIN}" run \
       --config "${CONFIG_PATH}" \
       --mv-query "$(cat "${SQL_PATH}")" \
       "${SLATEDB_ARGS[@]}" \
@@ -1215,16 +1234,8 @@ elif command -v setsid >/dev/null 2>&1; then
       --ingest-batch-per-connector 16384 \
       >"${NODE_STDOUT}" 2>"${NODE_STDERR}" &
 else
-  node_process_group=0
-  FLOE_DATA_DIR="${ARTIFACT_DIR}/floe-data" \
-  FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-  FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD="${ARROW_IPC_ROWS_PER_RECORD}" \
-  FLOE_REPLICATION_ARROW_IPC_COMPRESSION="${ARROW_IPC_COMPRESSION}" \
-  FLOE_REPLICATION_KAFKA_METADATA_HEADERS="${KAFKA_METADATA_HEADERS}" \
-  FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
-  FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
-  FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
-  "${FLOE_BIN}" run \
+	node_process_group=0
+	"${FLOE_BIN}" run \
     --config "${CONFIG_PATH}" \
     --mv-query "$(cat "${SQL_PATH}")" \
     "${SLATEDB_ARGS[@]}" \

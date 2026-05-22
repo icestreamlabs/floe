@@ -67,14 +67,7 @@ async fn http_ingest_to_mv_to_http_sink_acceptance() -> Result<()> {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write acceptance config")?;
 
-    let mut child = spawn_node_with_env(
-        &config_path,
-        &data_dir,
-        0,
-        Some(BID_MV_SQL),
-        &[("FLOE_DISABLE_PGWIRE".to_string(), "1".to_string())],
-    )
-    .await?;
+    let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(BID_MV_SQL), &[]).await?;
 
     let test_result = async {
         wait_for_healthz(&ingest_addr).await?;
@@ -329,14 +322,7 @@ async fn postgres_cdc_to_mv_to_file_sink_acceptance() -> Result<()> {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .context("write cdc acceptance config")?;
 
-    let mut child = spawn_node_with_env(
-        &config_path,
-        &data_dir,
-        0,
-        Some(BID_MV_SQL),
-        &[("FLOE_DISABLE_PGWIRE".to_string(), "1".to_string())],
-    )
-    .await?;
+    let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(BID_MV_SQL), &[]).await?;
 
     let test_result = async {
         sleep(Duration::from_millis(500)).await;
@@ -466,14 +452,7 @@ async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
          );
          CREATE MATERIALIZED VIEW {mv_name} AS SELECT auction, bidder, price FROM {table}"
     );
-    let mut child = spawn_node_with_env(
-        &config_path,
-        &data_dir,
-        0,
-        Some(&sql),
-        &[("FLOE_DISABLE_PGWIRE".to_string(), "1".to_string())],
-    )
-    .await?;
+    let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
 
     let test_result = async {
         sleep(Duration::from_millis(500)).await;
@@ -955,14 +934,9 @@ async fn postgres_cdc_shared_source_snapshot_converges_to_wal_stream() -> Result
          SELECT b.auction, b.bidder, b.price, a.seller
          FROM {bid_table} AS b JOIN {auction_table} AS a ON b.auction = a.id"
     );
-    let mut child = spawn_node_with_env(
-        &config_path,
-        &data_dir,
-        pg_port,
-        Some(&sql),
-        &[("FLOE_ADMIN_PORT".to_string(), admin_port.to_string())],
-    )
-    .await?;
+    let admin_args = vec!["--admin-port".to_string(), admin_port.to_string()];
+    let mut child =
+        spawn_node_with_args(&config_path, &data_dir, pg_port, Some(&sql), &admin_args).await?;
 
     let test_result = async {
         wait_for_join_mv_count_at_least(pg_port, &join_mv, 81, 781, 9801, 1).await?;
@@ -1433,25 +1407,25 @@ async fn spawn_node(
     pg_port: u16,
     mv_sql: Option<&str>,
 ) -> Result<Child> {
-    spawn_node_with_env(config_path, data_dir, pg_port, mv_sql, &[]).await
+    spawn_node_with_args(config_path, data_dir, pg_port, mv_sql, &[]).await
 }
 
-async fn spawn_node_with_env(
+async fn spawn_node_with_args(
     config_path: &Path,
     data_dir: &Path,
     pg_port: u16,
     mv_sql: Option<&str>,
-    extra_env: &[(String, String)],
+    extra_args: &[String],
 ) -> Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
+    cmd.arg("run");
     if pg_port > 0 {
-        cmd.env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"));
+        cmd.arg("--pgwire-addr").arg(format!("127.0.0.1:{pg_port}"));
     } else {
-        cmd.env("FLOE_DISABLE_PGWIRE", "1");
+        cmd.arg("--disable-pgwire");
     }
-    cmd.env("FLOE_DATA_DIR", data_dir)
-        .env("FLOE_ADMIN_PORT", "0")
-        .arg("run")
+    cmd.arg("--data-dir")
+        .arg(data_dir)
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .stdout(if std::env::var_os("FLOE_TEST_NODE_STDERR").is_some() {
@@ -1464,8 +1438,11 @@ async fn spawn_node_with_env(
         } else {
             Stdio::null()
         });
-    for (key, value) in extra_env {
-        cmd.env(key, value);
+    if !extra_args.iter().any(|arg| arg == "--admin-port") {
+        cmd.arg("--admin-port").arg("0");
+    }
+    for arg in extra_args {
+        cmd.arg(arg);
     }
     if let Some(sql) = mv_sql {
         cmd.arg("--mv-query").arg(sql);

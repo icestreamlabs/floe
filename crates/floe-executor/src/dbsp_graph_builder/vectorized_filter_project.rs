@@ -3150,9 +3150,9 @@ mod helper_tests {
         );
         assert_eq!(invert_comparison_operator(Operator::And), None);
 
-        assert_eq!(compare_i64(10, 10, Operator::Eq).expect("eq"), true);
-        assert_eq!(compare_i64(10, 11, Operator::Lt).expect("lt"), true);
-        assert_eq!(compare_i64(11, 10, Operator::Gt).expect("gt"), true);
+        assert!(compare_i64(10, 10, Operator::Eq).expect("eq"));
+        assert!(compare_i64(10, 11, Operator::Lt).expect("lt"));
+        assert!(compare_i64(11, 10, Operator::Gt).expect("gt"));
         assert!(compare_i64(1, 2, Operator::And).is_err());
 
         assert_eq!(and_bool_opt(Some(true), Some(false)), Some(false));
@@ -3258,7 +3258,10 @@ mod helper_tests {
         );
 
         assert!(encoded_field_end(&[0x09], 0).is_err());
-        assert!(project_encoded_row(&encoded, &[999..1000], 1).is_err());
+        let missing_projection = 999..1000;
+        assert!(
+            project_encoded_row(&encoded, std::slice::from_ref(&missing_projection), 1).is_err()
+        );
     }
 
     #[test]

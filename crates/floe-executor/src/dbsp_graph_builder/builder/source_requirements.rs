@@ -8,6 +8,13 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
+    source_batch_journal_root_sources_with_config(plan, PersistencePolicyConfig::default())
+}
+
+pub fn source_batch_journal_root_sources_with_config(
+    plan: &CircuitPlan,
+    persistence_policy_config: PersistencePolicyConfig,
+) -> Result<Option<BTreeSet<String>>> {
     if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
         return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
     }
@@ -38,7 +45,8 @@ pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BT
         ])));
     }
 
-    let persistence_policy = PersistencePolicy::for_plan(plan);
+    let persistence_policy =
+        PersistencePolicy::for_plan_with_config(plan, persistence_policy_config);
     let Some(transient_opt) = try_build_transient_segment_optimization(
         plan,
         plan.root,

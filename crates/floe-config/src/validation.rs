@@ -59,6 +59,24 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         "runtime.watermark_idle_source_ms",
     )?;
     ensure_optional_positive_usize(
+        runtime.tail_channel_capacity,
+        "runtime.tail_channel_capacity",
+    )?;
+    ensure_optional_positive_i64(
+        runtime.tail_max_catchup_versions,
+        "runtime.tail_max_catchup_versions",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.transient_segment_max_nodes,
+        "runtime.transient_segment_max_nodes",
+    )?;
+    ensure_optional_nonnegative_i32(
+        runtime.transient_segment_min_score,
+        "runtime.transient_segment_min_score",
+    )?;
+    ensure_optional_positive_u16(runtime.admin_port, "runtime.admin_port")?;
+    ensure_optional_non_empty(runtime.pgwire_addr.as_deref(), "runtime.pgwire_addr")?;
+    ensure_optional_positive_usize(
         runtime.mv_flush.max_pending_deltas,
         "runtime.mv_flush.max_pending_deltas",
     )?;
@@ -94,10 +112,29 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_storage_config(storage: &StorageConfig) -> Result<()> {
+    if storage.object_store_from_env && storage.data_dir.is_some() {
+        bail!("storage.data_dir cannot be set when storage.object_store_from_env is true");
+    }
+    if !storage.object_store_from_env && storage.object_store_env_file.is_some() {
+        bail!("storage.object_store_env_file requires storage.object_store_from_env = true");
+    }
+    if !storage.object_store_from_env && storage.slatedb_name.is_some() {
+        bail!("storage.slatedb_name requires storage.object_store_from_env = true");
+    }
+    ensure_optional_non_empty(storage.data_dir.as_deref(), "storage.data_dir")?;
+    ensure_optional_non_empty(
+        storage.object_store_env_file.as_deref(),
+        "storage.object_store_env_file",
+    )?;
+    ensure_optional_non_empty(storage.slatedb_name.as_deref(), "storage.slatedb_name")?;
     ensure_optional_non_empty(storage.slatedb_config.as_deref(), "storage.slatedb_config")?;
     ensure_optional_non_empty(
         storage.slatedb_env_prefix.as_deref(),
         "storage.slatedb_env_prefix",
+    )?;
+    ensure_optional_positive_u64(
+        storage.slatedb_close_timeout_ms,
+        "storage.slatedb_close_timeout_ms",
     )?;
     ensure_optional_positive_usize(
         storage.zset_compaction_max_chain_len,
@@ -500,6 +537,33 @@ fn ensure_optional_positive_u64(value: Option<u64>, field_path: &str) -> Result<
         && value == 0
     {
         bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_u16(value: Option<u16>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value == 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_i64(value: Option<i64>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value <= 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_nonnegative_i32(value: Option<i32>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value < 0
+    {
+        bail!("{field_path} must be greater than or equal to 0");
     }
     Ok(())
 }

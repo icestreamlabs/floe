@@ -5337,10 +5337,7 @@ fn timestamp_int_row(start: i64, end: i64, values: &[i64]) -> TestRow {
 fn int_utf8_row(id: i64, label: Option<&str>) -> TestRow {
     vec![
         Some(EncodedRowScalar::Int64(id)),
-        match label {
-            Some(label) => Some(EncodedRowScalar::Utf8(label.to_string())),
-            None => None,
-        },
+        label.map(|label| EncodedRowScalar::Utf8(label.to_string())),
     ]
 }
 

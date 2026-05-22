@@ -36,9 +36,11 @@ async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_floe-node"))
-        .env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"))
-        .env("FLOE_ADMIN_PORT", "0")
         .arg("run")
+        .arg("--pgwire-addr")
+        .arg(format!("127.0.0.1:{pg_port}"))
+        .arg("--admin-port")
+        .arg("0")
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .stdout(Stdio::null())
@@ -116,9 +118,10 @@ async fn admin_healthz_is_available_without_http_ingest() -> Result<()> {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_floe-node"))
-        .env("FLOE_DISABLE_PGWIRE", "1")
-        .env("FLOE_ADMIN_PORT", admin_port.to_string())
         .arg("run")
+        .arg("--disable-pgwire")
+        .arg("--admin-port")
+        .arg(admin_port.to_string())
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .stdout(Stdio::null())

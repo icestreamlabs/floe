@@ -51,9 +51,11 @@ async fn http_ingest_tail_streams_rows() -> Result<()> {
 
     let binary = env!("CARGO_BIN_EXE_floe-node");
     let mut child = Command::new(binary)
-        .env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"))
-        .env("FLOE_ADMIN_PORT", "0")
         .arg("run")
+        .arg("--pgwire-addr")
+        .arg(format!("127.0.0.1:{pg_port}"))
+        .arg("--admin-port")
+        .arg("0")
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .arg("--mv-query")

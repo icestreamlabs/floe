@@ -1309,7 +1309,7 @@ impl DbspGraphBuilder {
             } else {
                 deltas.as_ref().clone()
             };
-            if std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some() {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 eprintln!(
                     "transient-join-output graph_id={} version={} rows={}",
                     observer_graph_id,

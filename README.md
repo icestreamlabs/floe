@@ -37,17 +37,20 @@ Optional inputs:
 
 Runtime configuration:
 
-- `FLOE_PG_ADDR` to change the pgwire bind address (default `127.0.0.1:6432`)
-- `FLOE_DATA_DIR` to persist SlateDB state (default in-memory)
-- `FLOE_SLATEDB_CONFIG` to load a SlateDB settings file (TOML/YAML/JSON)
-- `FLOE_SLATEDB_ENV_PREFIX` to change the SlateDB env prefix (default `SLATEDB_`)
+- `--pgwire-addr` / `runtime.pgwire_addr` to change the pgwire bind address
+  (default `127.0.0.1:6432`)
+- `--data-dir` / `storage.data_dir` to persist SlateDB state (default
+  in-memory)
+- `--admin-port` / `runtime.admin_port` to change the admin HTTP port
+- `--slatedb-config` / `storage.slatedb_config` to load a SlateDB settings file
+  (TOML/YAML/JSON)
 
 Observability:
 
 - Floe always runs an admin server exposing `/healthz`, `/readyz`, and
   `/metrics`.
 - Admin host defaults to `--http-host`; admin port defaults to `8081`
-  (`FLOE_ADMIN_PORT` overrides).
+  (`--admin-port` or `runtime.admin_port` overrides).
 - `/healthz` reports process liveness.
 - `/readyz` reports process + executor + storage + runtime readiness.
 - If HTTP ingest is enabled, `/healthz`, `/readyz`, and `/metrics` are also
@@ -76,9 +79,10 @@ cache settings via:
   - `--slatedb-compaction-max-concurrent 2`
   - `--slatedb-await-durable`
   - `--slatedb-cache-dir /tmp/floe-slate-cache --slatedb-cache-max-bytes 1073741824`
-- A settings file: `--slatedb-config /path/to/SlateDb.toml` (or `FLOE_SLATEDB_CONFIG`)
-- Environment variables: `SLATEDB_FLUSH_INTERVAL=250ms` (prefix configurable via
-  `FLOE_SLATEDB_ENV_PREFIX`)
+- A settings file: `--slatedb-config /path/to/SlateDb.toml` or
+  `storage.slatedb_config = "/path/to/SlateDb.toml"`
+- Environment variables can still be used for SlateDB internals when explicitly
+  requested with `--slatedb-env-prefix` or `storage.slatedb_env_prefix`.
 
 Defaults (SlateDB 0.8.2):
 
@@ -147,7 +151,7 @@ Additional operational documentation:
 
 - `docs/production_readiness.md`: production exit checklist and quick operator runbook.
 - `docs/runtime_config.md`: config-first schema, precedence rules, and examples.
-- `docs/storage_data_directory.md`: `FLOE_DATA_DIR` behavior and safe reset procedure.
+- `docs/storage_data_directory.md`: `--data-dir` behavior and safe reset procedure.
 - `docs/operator_runbook.md`: production-like startup/restart/troubleshooting guide.
 - `docs/ga_contract.md`: connector/sink delivery guarantees and GA limitations.
 - `docs/supported_features.md`: explicit SQL/connectors/sinks support matrix.

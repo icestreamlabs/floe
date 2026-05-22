@@ -83,6 +83,22 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub watermark_idle_source_ms: Option<u64>,
     #[serde(default)]
+    pub pre_tick_commit_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub tail_channel_capacity: Option<usize>,
+    #[serde(default)]
+    pub tail_max_catchup_versions: Option<i64>,
+    #[serde(default)]
+    pub transient_segment_max_nodes: Option<usize>,
+    #[serde(default)]
+    pub transient_segment_min_score: Option<i32>,
+    #[serde(default)]
+    pub admin_port: Option<u16>,
+    #[serde(default)]
+    pub pgwire_addr: Option<String>,
+    #[serde(default)]
+    pub pgwire_enabled: Option<bool>,
+    #[serde(default)]
     pub mv_flush: MvFlushConfig,
     #[serde(default)]
     pub mv_snapshot: MvSnapshotConfig,
@@ -126,9 +142,19 @@ pub struct StorageConfig {
     #[serde(default)]
     pub await_durable: Option<bool>,
     #[serde(default)]
+    pub data_dir: Option<String>,
+    #[serde(default)]
+    pub object_store_from_env: bool,
+    #[serde(default)]
+    pub object_store_env_file: Option<String>,
+    #[serde(default)]
+    pub slatedb_name: Option<String>,
+    #[serde(default)]
     pub slatedb_config: Option<String>,
     #[serde(default)]
     pub slatedb_env_prefix: Option<String>,
+    #[serde(default)]
+    pub slatedb_close_timeout_ms: Option<u64>,
     #[serde(default)]
     pub zset_compaction_max_chain_len: Option<usize>,
     #[serde(default)]
@@ -186,48 +212,6 @@ pub struct PostgresCdcConfig {
     pub snapshot: PostgresCdcSnapshotConfig,
 }
 
-impl PostgresCdcConfig {
-    pub fn with_legacy_env_overrides(mut self) -> Self {
-        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH") {
-            self.snapshot.rows_per_batch = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS") {
-            self.snapshot.max_workers = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS") {
-            self.snapshot.intra_table_chunks = value;
-        }
-        if let Some(value) = env_bool("FLOE_POSTGRES_CDC_SNAPSHOT_ADAPTIVE_CONCURRENCY") {
-            self.snapshot.adaptive_concurrency = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS") {
-            self.snapshot.min_workers = value;
-        }
-        if let Some(value) =
-            env_usize("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT")
-                .filter(|value| (1..=100).contains(value))
-        {
-            self.snapshot.wal_buffer_high_watermark_percent = value;
-        }
-        if let Some(value) =
-            env_usize("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT")
-                .filter(|value| *value <= 100)
-        {
-            self.snapshot.wal_buffer_low_watermark_percent = value;
-        }
-        if let Some(value) = env_positive_u64("FLOE_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS") {
-            self.snapshot.slow_scan_ms = value;
-        }
-        if let Some(value) = env_positive_u64("FLOE_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS") {
-            self.snapshot.controller_interval_ms = value;
-        }
-        if let Some(value) = env_bool("FLOE_CDC_PERF_LOG") {
-            self.snapshot.perf_log = value;
-        }
-        self
-    }
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresCdcSnapshotConfig {
@@ -269,75 +253,6 @@ impl Default for PostgresCdcSnapshotConfig {
             controller_interval_ms: DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS,
             perf_log: false,
         }
-    }
-}
-
-impl ReplicationConfig {
-    pub fn with_legacy_env_overrides(mut self) -> Self {
-        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_DELIVERED_RETENTION_MS") {
-            self.buffer_cleanup.delivered_retention_ms = value;
-        }
-        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS") {
-            self.buffer_cleanup.cleanup_interval_ms = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_BYTES") {
-            self.buffer_limits.max_pending_bytes = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_RECORDS") {
-            self.buffer_limits.max_pending_records = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS")
-            .or_else(|| env_usize("FLOE_REPLICATION_BUFFER_MAX_PENDING_OBJECTS"))
-        {
-            self.buffer_limits.max_pending_transactions = value;
-        }
-        if let Some(value) = env_u64("FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS") {
-            self.buffer_limits.max_pending_age_ms = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_MESSAGE_MAX_BYTES") {
-            self.kafka.message_max_bytes = value;
-        }
-        if let Some(value) = env_nonempty_string("FLOE_REPLICATION_KAFKA_ACKS") {
-            self.kafka.acks = value;
-        }
-        if let Some(value) = env_bool("FLOE_REPLICATION_KAFKA_ENABLE_IDEMPOTENCE") {
-            self.kafka.enable_idempotence = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_BATCH_SIZE") {
-            self.kafka.batch_size = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_REPLICATION_KAFKA_BATCH_NUM_MESSAGES") {
-            self.kafka.batch_num_messages = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_LINGER_MS") {
-            self.kafka.linger_ms = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_QUEUE_MAX_MESSAGES") {
-            self.kafka.queue_max_messages = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_QUEUE_MAX_KBYTES") {
-            self.kafka.queue_max_kbytes = value;
-        }
-        if let Some(value) = env_usize("FLOE_REPLICATION_KAFKA_MESSAGE_SEND_MAX_RETRIES") {
-            self.kafka.message_send_max_retries = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_REPLICATION_ARROW_IPC_ROWS_PER_RECORD") {
-            self.encoding.arrow_ipc_rows_per_record = value;
-        }
-        if let Some(value) = env_positive_usize("FLOE_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK") {
-            self.encoding.snapshot_batches_per_chunk = value;
-        }
-        if let Ok(value) = std::env::var("FLOE_REPLICATION_ARROW_IPC_COMPRESSION") {
-            self.encoding.arrow_ipc_compression =
-                ReplicationArrowIpcCompressionConfig::parse(&value);
-        }
-        if let Some(value) = env_bool("FLOE_REPLICATION_KAFKA_METADATA_HEADERS") {
-            self.encoding.kafka_metadata_headers = value;
-        }
-        if let Some(value) = env_bool("FLOE_CDC_PERF_LOG") {
-            self.perf_log = value;
-        }
-        self
     }
 }
 
@@ -573,42 +488,6 @@ fn default_postgres_cdc_snapshot_slow_scan_ms() -> u64 {
 
 fn default_postgres_cdc_snapshot_controller_interval_ms() -> u64 {
     DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-}
-
-fn env_positive_usize(name: &str) -> Option<usize> {
-    env_usize(name).filter(|value| *value > 0)
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-}
-
-fn env_positive_u64(name: &str) -> Option<u64> {
-    env_u64(name).filter(|value| *value > 0)
-}
-
-fn env_nonempty_string(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1170,6 +1049,14 @@ mod tests {
             [runtime]
             ingest_batch_size = 128
             mv_retain_last = 5
+            admin_port = 8082
+            pgwire_addr = "127.0.0.1:6543"
+            pgwire_enabled = false
+            pre_tick_commit_delay_ms = 10
+            tail_channel_capacity = 512
+            tail_max_catchup_versions = 64
+            transient_segment_max_nodes = 48
+            transient_segment_min_score = 0
 
             [runtime.mv_snapshot]
             max_pending_batches = 2048
@@ -1178,7 +1065,9 @@ mod tests {
 
             [storage]
             await_durable = true
+            data_dir = "/tmp/floe-data"
             source_journal = "auto"
+            slatedb_close_timeout_ms = 1000
             zset_compaction_max_chain_len = 64
 
             [maintenance]
@@ -1191,12 +1080,43 @@ mod tests {
         assert_eq!(config.runtime.mv_snapshot.max_pending_batches, Some(2048));
         assert_eq!(config.runtime.mv_snapshot.max_pending_rows, Some(500000));
         assert_eq!(config.runtime.mv_snapshot.max_delay_ms, Some(2000));
+        assert_eq!(config.runtime.admin_port, Some(8082));
+        assert_eq!(
+            config.runtime.pgwire_addr.as_deref(),
+            Some("127.0.0.1:6543")
+        );
+        assert_eq!(config.runtime.pgwire_enabled, Some(false));
+        assert_eq!(config.runtime.pre_tick_commit_delay_ms, Some(10));
+        assert_eq!(config.runtime.tail_channel_capacity, Some(512));
+        assert_eq!(config.runtime.tail_max_catchup_versions, Some(64));
+        assert_eq!(config.runtime.transient_segment_max_nodes, Some(48));
+        assert_eq!(config.runtime.transient_segment_min_score, Some(0));
         assert_eq!(config.storage.await_durable, Some(true));
+        assert_eq!(config.storage.data_dir.as_deref(), Some("/tmp/floe-data"));
         assert_eq!(
             config.storage.source_journal,
             Some(SourceJournalConfig::Auto)
         );
+        assert_eq!(config.storage.slatedb_close_timeout_ms, Some(1000));
         assert_eq!(config.maintenance.paused, Some(true));
+    }
+
+    #[test]
+    fn load_config_accepts_object_store_storage_section() {
+        let input = r#"
+            [storage]
+            object_store_from_env = true
+            object_store_env_file = "/tmp/object-store.env"
+            slatedb_name = "floe-test"
+        "#;
+        let config: NodeConfig = toml::from_str(input).expect("parse toml");
+        validate_node_config(&config).expect("valid object-store config");
+        assert!(config.storage.object_store_from_env);
+        assert_eq!(
+            config.storage.object_store_env_file.as_deref(),
+            Some("/tmp/object-store.env")
+        );
+        assert_eq!(config.storage.slatedb_name.as_deref(), Some("floe-test"));
     }
 
     #[test]
@@ -1319,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_arrow_ipc_compression_config_parses_legacy_env_values() {
+    fn replication_arrow_ipc_compression_config_parses_alias_values() {
         assert_eq!(
             ReplicationArrowIpcCompressionConfig::parse("lz4"),
             Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)

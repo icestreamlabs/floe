@@ -318,18 +318,16 @@ fn evaluate_aggregate_values(
             && aggregate_eval_direct_column_index(filter, schema).is_none()
         {
             let key = aggregate_eval_expr_key(filter.expr());
-            if !seen_non_direct.contains_key(&key) {
-                unique_non_direct.push((key.clone(), filter.expr().clone()));
-                seen_non_direct.insert(key, ());
+            if seen_non_direct.insert(key.clone(), ()).is_none() {
+                unique_non_direct.push((key, filter.expr().clone()));
             }
         }
         if let Some(expr) = agg.expression()
             && aggregate_eval_direct_column_index(expr, schema).is_none()
         {
             let key = aggregate_eval_expr_key(expr.expr());
-            if !seen_non_direct.contains_key(&key) {
-                unique_non_direct.push((key.clone(), expr.expr().clone()));
-                seen_non_direct.insert(key, ());
+            if seen_non_direct.insert(key.clone(), ()).is_none() {
+                unique_non_direct.push((key, expr.expr().clone()));
             }
         }
     }
@@ -622,7 +620,7 @@ fn evaluate_aggregate_values(
 
     plans
         .iter()
-        .zip(accumulators.into_iter())
+        .zip(accumulators)
         .map(|(plan, accumulator)| match accumulator {
             AggregateAccumulator::CountDistinct { weights } => Some(EncodedRowScalar::Int64(
                 weights.values().filter(|weight| **weight > 0).count() as i64,

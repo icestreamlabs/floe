@@ -843,7 +843,7 @@ fn transient_filter_map_transform_accepts_rows_when_project_schema_is_stale() {
 
     let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
     let encoded = encode_event(&decoder, bid_event_payload(9, 101, 1000), "nexmark_bid");
-    let transformed = transform(&vec![(encoded, 1)]).expect("transform rows");
+    let transformed = transform(&[(encoded, 1)]).expect("transform rows");
     assert_eq!(transformed.len(), 1);
 
     let mut decoded = Vec::new();
@@ -1059,7 +1059,7 @@ async fn q20_filtered_unique_auction_side_emits_closed_join_keys() {
         "nexmark_auction",
     );
     let closed_keys =
-        closed_key_transform(&vec![(matching, 1), (nonmatching.clone(), 1)]).expect("closed keys");
+        closed_key_transform(&[(matching, 1), (nonmatching.clone(), 1)]).expect("closed keys");
     let expected_key = extract_encoded_row_columns(&nonmatching, right_key_columns.as_ref(), true)
         .expect("extract nonmatching auction key")
         .expect("nonmatching auction key");
@@ -1967,7 +1967,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         &right_stream,
         left_key.clone(),
         right_key.clone(),
-        predicate.clone(),
+        predicate,
         projector,
         None,
     )
@@ -2380,7 +2380,7 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         &right_stream,
         left_key.clone(),
         right_key.clone(),
-        predicate.clone(),
+        predicate,
         |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             crate::encoding::concat_encoded_rows(left_bytes, right_bytes).unwrap_or_default()
         },

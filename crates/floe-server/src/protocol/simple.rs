@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_pg::datatypes::df::encode_dataframe;
 use async_trait::async_trait;
-use floe_executor::tail::{execute_tail, parse_tail_sql, tail_output_schema};
+use floe_executor::tail::{execute_tail_with_config, parse_tail_sql, tail_output_schema};
 use futures::Sink;
 use pgwire::api::ClientInfo;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -69,10 +69,11 @@ impl FloeQueryHandler {
         let fields = Arc::new(arrow_schema_to_field_info(&schema)?);
         let cancel = CancellationToken::new();
         let session = self.state.query.session();
-        let tail_stream = execute_tail(
+        let tail_stream = execute_tail_with_config(
             &session,
             self.state.materialized_views.as_ref(),
             params,
+            self.state.runtime_config.tail,
             cancel.clone(),
         )
         .await

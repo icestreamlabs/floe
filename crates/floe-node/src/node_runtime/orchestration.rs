@@ -796,8 +796,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let postgres_cdc_settings = config
         .as_ref()
         .map(|cfg| cfg.postgres_cdc)
-        .unwrap_or_default()
-        .with_legacy_env_overrides();
+        .unwrap_or_default();
 
     if run_args.config.is_none()
         && run_args.kafka_brokers.is_some()
@@ -805,6 +804,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     {
         return Err(anyhow::anyhow!(
             "--kafka-topics is required when --kafka-brokers is set"
+        ));
+    }
+    if run_args.object_store_from_env && run_args.data_dir.is_some() {
+        return Err(anyhow::anyhow!(
+            "--data-dir cannot be used with --object-store-from-env"
+        ));
+    }
+    if !run_args.object_store_from_env && run_args.object_store_env_file.is_some() {
+        return Err(anyhow::anyhow!(
+            "--object-store-env-file requires --object-store-from-env"
+        ));
+    }
+    if !run_args.object_store_from_env && run_args.slatedb_name.is_some() {
+        return Err(anyhow::anyhow!(
+            "--slatedb-name requires --object-store-from-env"
         ));
     }
     let awaited_durable = run_args.slatedb_await_durable.unwrap_or(true);
@@ -843,10 +857,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     source_registry.extend(floe_node_core::generator::definitions()?);
 
     let slate_settings = load_slatedb_settings(&run_args)?;
+    let storage_config = server::ServerStorageConfig {
+        data_dir: run_args.data_dir.clone().map(PathBuf::from),
+        object_store_from_env: run_args.object_store_from_env,
+        object_store_env_file: run_args.object_store_env_file.clone(),
+        slatedb_name: run_args.slatedb_name.clone(),
+    };
     let storage = if run_args.dry_run {
         None
     } else {
-        Some(server::init_storage(slate_settings).await?)
+        Some(server::init_storage(storage_config, slate_settings).await?)
     };
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
     let mut catalog_sources: HashMap<String, CatalogSourceDefinition> = HashMap::new();
@@ -1064,10 +1084,25 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &available_sources,
         &materialized_views,
         &sink_specs,
+        &run_args,
     );
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
+    let mut tail_execution_config = TailExecutionConfig::default();
+    if let Some(channel_capacity) = run_args.tail_channel_capacity {
+        tail_execution_config.channel_capacity = channel_capacity;
+    }
+    if let Some(max_catchup_versions) = run_args.tail_max_catchup_versions {
+        tail_execution_config.max_catchup_versions = max_catchup_versions;
+    }
+    let mut persistence_policy_config = PersistencePolicyConfig::default();
+    if let Some(max_nodes) = run_args.transient_segment_max_nodes {
+        persistence_policy_config.max_transient_segment_nodes = max_nodes;
+    }
+    if let Some(min_score) = run_args.transient_segment_min_score {
+        persistence_policy_config.min_transient_segment_score = min_score;
+    }
     let circuit_plans = build_dataflows(
         &planned_materialized_views,
         &available_sources,
@@ -1087,7 +1122,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             required_sources, ..
         } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
         all_required_sources.extend(required_sources.iter().cloned());
-        if let Some(source_names) = source_batch_journal_root_sources(plan)?
+        if let Some(source_names) =
+            source_batch_journal_root_sources_with_config(plan, persistence_policy_config)?
             && !source_names.is_empty()
             && source_names == required_sources
         {
@@ -1305,6 +1341,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
+    graph_builder.set_persistence_policy_config(persistence_policy_config);
     if let Some(config) = config.as_ref() {
         graph_builder.set_mv_flush_coalescing(mv_flush_coalescing_config(&config.runtime.mv_flush));
         graph_builder.set_mv_overlay_snapshot(mv_snapshot_config(&config.runtime.mv_snapshot));
@@ -1444,11 +1481,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             "building DBSP graph"
         );
 
-        let enable_source_batch_journal = source_batch_journal_root_sources(plan)?
-            .as_ref()
-            .is_some_and(|source_names| {
-                !source_names.is_empty() && source_names == required_sources
-            });
+        let enable_source_batch_journal =
+            source_batch_journal_root_sources_with_config(plan, persistence_policy_config)?
+                .as_ref()
+                .is_some_and(|source_names| {
+                    !source_names.is_empty() && source_names == required_sources
+                });
 
         graph_builder
             .build(BuildInputs {
@@ -1528,9 +1566,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let max_batch = run_args.ingest_batch_size;
     let max_batch_per_source = run_args.ingest_batch_per_source;
     let max_batch_per_connector = run_args.ingest_batch_per_connector;
-    let configured_watermark_idle_source_ms = config
-        .as_ref()
-        .and_then(|cfg| cfg.runtime.watermark_idle_source_ms);
+    let pre_tick_commit_delay_ms = run_args.pre_tick_commit_delay_ms.unwrap_or(0);
+    let watermark_idle_source_ms = run_args.watermark_idle_source_ms.unwrap_or(0);
+    let watermark_idle_source_ms = if watermark_idle_source_ms == 0 {
+        DEFAULT_WATERMARK_IDLE_SOURCE_MS
+    } else {
+        watermark_idle_source_ms
+    };
 
     let runtime_cancel_for_propagation = runtime_cancel.clone();
     let ingest_cancel_for_propagation = ingest_cancel.clone();
@@ -1543,10 +1585,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         service_cancel_for_propagation.cancel();
     });
 
-    let admin_port = std::env::var(ADMIN_PORT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_ADMIN_PORT);
+    let admin_port = run_args.admin_port.unwrap_or(DEFAULT_ADMIN_PORT);
     let watermark_debug = Arc::new(tokio::sync::RwLock::new(http_ingest::WatermarkDebugState {
         policy: "min_active_sources".to_string(),
         ..http_ingest::WatermarkDebugState::default()
@@ -1647,8 +1686,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let replication_settings = config
         .as_ref()
         .map(|cfg| cfg.replication.clone())
-        .unwrap_or_default()
-        .with_legacy_env_overrides();
+        .unwrap_or_default();
     let replication_pipeline_runtime = Arc::new(ReplicationPipelineRuntime::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
@@ -2127,16 +2165,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         let mut last_checkpoint_commit_at = Instant::now();
         let mut source_watermarks: HashMap<String, i64> = HashMap::new();
         let mut source_last_seen_at: HashMap<String, Instant> = HashMap::new();
-        let pre_tick_commit_delay_ms = std::env::var("FLOE_TEST_PRE_TICK_COMMIT_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let watermark_idle_source_ms = std::env::var("FLOE_WATERMARK_IDLE_SOURCE_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(
-                configured_watermark_idle_source_ms.unwrap_or(DEFAULT_WATERMARK_IDLE_SOURCE_MS),
-            );
         let watermark_idle_timeout = Duration::from_millis(watermark_idle_source_ms);
         let executor_loop_started = Instant::now();
         let mut first_nonempty_decode_logged = false;
@@ -3155,12 +3183,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         shutdown_signal.clone(),
     );
 
+    let pgwire_addr = run_args
+        .pgwire_addr
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PGWIRE_ADDR.to_string());
     let server_handle = spawn_pgwire_server(
         query.clone(),
         Arc::clone(&mv_registry),
         service_cancel.clone(),
         runtime_cancel.clone(),
         Arc::clone(&runtime_failure),
+        !run_args.disable_pgwire,
+        pgwire_addr,
+        server::ServerRuntimeConfig {
+            tail: tail_execution_config,
+        },
     );
 
     tokio::select! {
@@ -3249,13 +3286,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     drop(mv_registry);
     drop(outer_registry);
 
-    let close_timeout = slatedb_close_timeout();
+    let close_timeout = Duration::from_millis(
+        run_args
+            .slatedb_close_timeout_ms
+            .unwrap_or(DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS),
+    );
     let close_result = match tokio::time::timeout(close_timeout, db.close()).await {
         Ok(result) => result.map_err(anyhow::Error::new),
         Err(_) => {
             tracing::warn!(
                 timeout_ms = close_timeout.as_millis() as u64,
-                env = SLATEDB_CLOSE_TIMEOUT_MS_ENV,
                 "timed out closing SlateDB; continuing shutdown"
             );
             Ok(())
@@ -3273,12 +3313,4 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     close_result?;
 
     server_result
-}
-
-fn slatedb_close_timeout() -> Duration {
-    std::env::var(SLATEDB_CLOSE_TIMEOUT_MS_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS))
 }

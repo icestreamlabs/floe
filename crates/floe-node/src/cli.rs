@@ -51,11 +51,63 @@ pub struct RunArgs {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// SlateDB settings file (TOML/YAML/JSON). Overrides SLATEDB_ env settings.
+    /// Persist SlateDB state under this filesystem directory instead of using in-memory storage.
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<String>,
+
+    /// Initialise SlateDB storage from object-store environment variables.
+    #[arg(long = "object-store-from-env")]
+    pub object_store_from_env: bool,
+
+    /// Dotenv-style file to load before reading object-store environment variables.
+    #[arg(long = "object-store-env-file")]
+    pub object_store_env_file: Option<String>,
+
+    /// SlateDB database name when using object-store storage.
+    #[arg(long = "slatedb-name")]
+    pub slatedb_name: Option<String>,
+
+    /// Address for the pgwire endpoint.
+    #[arg(long = "pgwire-addr")]
+    pub pgwire_addr: Option<String>,
+
+    /// Do not start the pgwire endpoint.
+    #[arg(long = "disable-pgwire")]
+    pub disable_pgwire: bool,
+
+    /// Port for the admin HTTP endpoint.
+    #[arg(long = "admin-port")]
+    pub admin_port: Option<u16>,
+
+    /// Test/debug delay before committing each runtime tick.
+    #[arg(long = "pre-tick-commit-delay-ms", value_parser = parse_nonnegative_u64)]
+    pub pre_tick_commit_delay_ms: Option<u64>,
+
+    /// Duration after which idle sources stop holding back the global watermark.
+    #[arg(long = "watermark-idle-source-ms", value_parser = parse_positive_u64)]
+    pub watermark_idle_source_ms: Option<u64>,
+
+    /// Channel capacity for pgwire TAIL streams.
+    #[arg(long = "tail-channel-capacity", value_parser = parse_positive_usize)]
+    pub tail_channel_capacity: Option<usize>,
+
+    /// Maximum materialized-view versions a TAIL stream catches up per scheduler pass.
+    #[arg(long = "tail-max-catchup-versions", value_parser = parse_positive_i64)]
+    pub tail_max_catchup_versions: Option<i64>,
+
+    /// Maximum number of transient operators folded into one materialization segment.
+    #[arg(long = "transient-segment-max-nodes", value_parser = parse_positive_usize)]
+    pub transient_segment_max_nodes: Option<usize>,
+
+    /// Minimum score required before the transient segment optimization is used.
+    #[arg(long = "transient-segment-min-score", value_parser = parse_nonnegative_i32)]
+    pub transient_segment_min_score: Option<i32>,
+
+    /// SlateDB settings file (TOML/YAML/JSON).
     #[arg(long = "slatedb-config")]
     pub slatedb_config: Option<String>,
 
-    /// Environment variable prefix to read SlateDB settings from (default: SLATEDB_).
+    /// Environment variable prefix to read SlateDB settings from when explicitly set.
     #[arg(long = "slatedb-env-prefix")]
     pub slatedb_env_prefix: Option<String>,
 
@@ -104,6 +156,10 @@ pub struct RunArgs {
     /// Cache SlateDB PUT operations to disk (requires --slatedb-cache-dir).
     #[arg(long = "slatedb-cache-puts")]
     pub slatedb_cache_puts: bool,
+
+    /// Timeout for closing SlateDB during shutdown.
+    #[arg(long = "slatedb-close-timeout-ms", value_parser = parse_positive_u64)]
+    pub slatedb_close_timeout_ms: Option<u64>,
 
     /// Number of materialized view versions to retain (0 keeps all versions).
     #[arg(long = "mv-retain-last", default_value_t = 1, value_parser = parse_nonnegative_usize)]
@@ -339,6 +395,37 @@ fn parse_nonnegative_u64(value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| "value must be a non-negative integer".to_string())
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let parsed = parse_nonnegative_u64(value)?;
+    if parsed == 0 {
+        Err("value must be greater than 0".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_positive_i64(value: &str) -> Result<i64, String> {
+    let parsed: i64 = value
+        .parse()
+        .map_err(|_| "value must be a positive integer".to_string())?;
+    if parsed <= 0 {
+        Err("value must be greater than 0".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_nonnegative_i32(value: &str) -> Result<i32, String> {
+    let parsed: i32 = value
+        .parse()
+        .map_err(|_| "value must be a non-negative integer".to_string())?;
+    if parsed < 0 {
+        Err("value must be greater than or equal to 0".to_string())
+    } else {
+        Ok(parsed)
+    }
 }
 
 #[cfg(test)]

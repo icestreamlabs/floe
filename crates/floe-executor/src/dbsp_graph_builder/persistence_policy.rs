@@ -40,26 +40,40 @@ pub(crate) struct PersistencePolicy {
     min_transient_segment_score: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistencePolicyConfig {
+    pub max_transient_segment_nodes: usize,
+    pub min_transient_segment_score: i32,
+}
+
+impl Default for PersistencePolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_transient_segment_nodes: 32,
+            min_transient_segment_score: 1,
+        }
+    }
+}
+
 impl PersistencePolicy {
+    #[cfg(test)]
     pub(crate) fn for_plan(plan: &CircuitPlan) -> Self {
+        Self::for_plan_with_config(plan, PersistencePolicyConfig::default())
+    }
+
+    pub(crate) fn for_plan_with_config(
+        plan: &CircuitPlan,
+        config: PersistencePolicyConfig,
+    ) -> Self {
         let classes = plan
             .nodes()
             .iter()
             .map(|node| (node.id, classify_node(&node.kind)))
             .collect::<HashMap<_, _>>();
-        let max_transient_segment_nodes = std::env::var("FLOE_TRANSIENT_SEGMENT_MAX_NODES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(32);
-        let min_transient_segment_score = std::env::var("FLOE_TRANSIENT_SEGMENT_MIN_SCORE")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(1);
         Self {
             classes,
-            max_transient_segment_nodes,
-            min_transient_segment_score,
+            max_transient_segment_nodes: config.max_transient_segment_nodes,
+            min_transient_segment_score: config.min_transient_segment_score,
         }
     }
 

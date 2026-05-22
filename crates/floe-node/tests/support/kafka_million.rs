@@ -1465,9 +1465,11 @@ async fn spawn_node(config: NodeSpawnConfig<'_>) -> Result<Child> {
         .with_context(|| format!("create {}", stderr_log_path.display()))?;
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
-    cmd.env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"))
-        .env("FLOE_ADMIN_PORT", "0")
-        .arg("run")
+    cmd.arg("run")
+        .arg("--pgwire-addr")
+        .arg(format!("127.0.0.1:{pg_port}"))
+        .arg("--admin-port")
+        .arg("0")
         .arg("--ingest-queue-capacity")
         .arg("262144")
         .arg("--ingest-batch-size")
