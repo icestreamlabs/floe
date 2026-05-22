@@ -536,6 +536,120 @@ async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
 #[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_mv_to_postgres_sink_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let escaped_dsn = sql_string_literal(&dsn);
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let source_name = format!("pg_sink_source_{run_id}");
+    let source_table = format!("floe_mv_sink_orders_{run_id}");
+    let target_table = format!("floe_mv_sink_target_{run_id}");
+    let mv_name = format!("mv_pg_sink_{run_id}");
+    let sink_name = format!("pg_sink_{run_id}");
+    let slot = format!("floe_mv_sink_{run_id}");
+    let publication = format!("floe_mv_sink_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("postgres_mv_sink_acceptance.json");
+    std::fs::write(&config_path, "{}").context("write empty acceptance config")?;
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for MV sink acceptance setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres MV sink acceptance setup connection closed");
+        }
+    });
+
+    cleanup_postgres_sink_acceptance(&client, &publication, &slot, &source_table, &target_table)
+        .await;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {source_table} (
+               id BIGINT PRIMARY KEY,
+               amount BIGINT NOT NULL,
+               note TEXT
+             );
+             CREATE TABLE {target_table} (
+               id BIGINT PRIMARY KEY,
+               amount BIGINT NOT NULL,
+               note TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {source_table};"
+        ))
+        .await
+        .context("prepare Postgres MV sink acceptance tables")?;
+
+    let sql = format!(
+        "CREATE SOURCE {source_name} WITH (
+            connector = 'postgres-cdc',
+            connection = '{escaped_dsn}',
+            slot.name = '{slot}',
+            publication.name = '{publication}'
+         );
+         CREATE TABLE {source_table} (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT NOT NULL,
+            note TEXT
+         ) FROM {source_name} TABLE 'public.{source_table}';
+         CREATE MATERIALIZED VIEW {mv_name} AS
+         SELECT id, amount, note FROM {source_table};
+         CREATE SINK {sink_name} FROM {mv_name} WITH (
+            connector = 'postgres',
+            connection = '{escaped_dsn}',
+            table = 'public.{target_table}',
+            mode = 'upsert',
+            primary_key = 'id',
+            with_snapshot = true
+         );"
+    );
+    let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .execute(
+                &format!("INSERT INTO {source_table} (id, amount, note) VALUES ($1, $2, $3)"),
+                &[&1_i64, &100_i64, &"open"],
+            )
+            .await
+            .context("insert source row for Postgres MV sink")?;
+        wait_for_postgres_sink_row(&client, &target_table, 1, 100, Some("open")).await?;
+
+        client
+            .execute(
+                &format!("UPDATE {source_table} SET amount = $1, note = $2 WHERE id = $3"),
+                &[&175_i64, &"paid", &1_i64],
+            )
+            .await
+            .context("update source row for Postgres MV sink")?;
+        wait_for_postgres_sink_row(&client, &target_table, 1, 175, Some("paid")).await?;
+
+        client
+            .execute(
+                &format!("DELETE FROM {source_table} WHERE id = $1"),
+                &[&1_i64],
+            )
+            .await
+            .context("delete source row for Postgres MV sink")?;
+        wait_for_postgres_sink_absent(&client, &target_table, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    cleanup_postgres_sink_acceptance(&client, &publication, &slot, &source_table, &target_table)
+        .await;
+    test_result
+}
+
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
 async fn postgres_cdc_table_restart_resumes_from_committed_lsn() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
@@ -1850,6 +1964,100 @@ async fn query_bidder_aggregate(
     connection_handle.abort();
     let _ = connection_handle.await;
     Ok(aggregate)
+}
+
+fn sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+async fn cleanup_postgres_sink_acceptance(
+    client: &tokio_postgres::Client,
+    publication: &str,
+    slot: &str,
+    source_table: &str,
+    target_table: &str,
+) {
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .execute(
+            "SELECT pg_drop_replication_slot($1)
+             WHERE EXISTS (
+               SELECT 1
+               FROM pg_replication_slots
+               WHERE slot_name = $1
+             )",
+            &[&slot],
+        )
+        .await;
+    let _ = client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {target_table};
+             DROP TABLE IF EXISTS {source_table};"
+        ))
+        .await;
+}
+
+async fn wait_for_postgres_sink_row(
+    client: &tokio_postgres::Client,
+    table: &str,
+    id: i64,
+    amount: i64,
+    note: Option<&str>,
+) -> Result<()> {
+    let mut last_seen = None;
+    for _ in 0..120 {
+        let rows = client
+            .query(
+                &format!("SELECT amount, note FROM {table} WHERE id = $1"),
+                &[&id],
+            )
+            .await
+            .with_context(|| format!("query Postgres sink table {table}"))?;
+        match rows.as_slice() {
+            [row] => {
+                let row_amount = row.try_get::<_, i64>(0).context("decode sink amount")?;
+                let row_note = row
+                    .try_get::<_, Option<String>>(1)
+                    .context("decode sink note")?;
+                if row_amount == amount && row_note.as_deref() == note {
+                    return Ok(());
+                }
+                last_seen = Some(format!("amount={row_amount}, note={row_note:?}"));
+            }
+            rows => {
+                last_seen = Some(format!("{} rows", rows.len()));
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "timed out waiting for Postgres sink table {table} id={id} amount={amount} note={note:?}; last seen: {:?}",
+        last_seen
+    )
+}
+
+async fn wait_for_postgres_sink_absent(
+    client: &tokio_postgres::Client,
+    table: &str,
+    id: i64,
+) -> Result<()> {
+    for _ in 0..120 {
+        let row = client
+            .query_one(
+                &format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE id = $1"),
+                &[&id],
+            )
+            .await
+            .with_context(|| format!("query Postgres sink table {table} absence"))?;
+        let count = row.try_get::<_, i64>(0).context("decode sink count")?;
+        if count == 0 {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    bail!("timed out waiting for Postgres sink table {table} id={id} to be absent")
 }
 
 async fn wait_for_rows_matching(

@@ -7,7 +7,6 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Body;
-use axum::extract::Path;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::header;
@@ -206,7 +205,7 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route("/debug/watermarks", get(debug_watermarks_admin))
         .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
         .route("/debug/storage/flush", post(debug_storage_flush_admin))
-        .route("/subscribe/:mv", get(subscribe_sse_admin))
+        .route("/mv", get(subscribe_sse_admin))
         .route("/metrics", get(metrics))
         .with_state(state);
     let addr = format!("{}:{}", config.host, config.port);
@@ -417,7 +416,6 @@ async fn debug_storage_flush_admin(State(state): State<HttpAdminState>) -> impl 
 
 async fn subscribe_sse_admin(
     State(state): State<HttpAdminState>,
-    Path(mv): Path<String>,
     Query(query): Query<SubscribeQuery>,
 ) -> Response {
     let Some(registry) = &state.materialized_views else {
@@ -434,13 +432,24 @@ async fn subscribe_sse_admin(
         )
             .into_response();
     }
-    if registry.get(&mv).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("materialized view '{mv}' not found")})),
-        )
-            .into_response();
-    }
+    let handles = registry.handles();
+    let mv = match handles.as_slice() {
+        [handle] => handle.name().to_string(),
+        [] => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no materialized view registered"})),
+            )
+                .into_response();
+        }
+        _ => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "expected exactly one materialized view"})),
+            )
+                .into_response();
+        }
+    };
 
     let cancel = state.cancel.child_token();
     let stream = match execute_mv_changelog(
@@ -951,5 +960,66 @@ mod tests {
             .expect("request");
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_mv_endpoint_selects_single_registered_mv() {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.register("mv_one");
+        let state = HttpAdminState {
+            cancel: CancellationToken::new(),
+            health: HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
+                cdc_replication_debug: None,
+            },
+            storage_db: None,
+            materialized_views: Some(registry),
+        };
+        let app = Router::new()
+            .route("/mv", get(subscribe_sse_admin))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/mv")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn admin_mv_endpoint_rejects_multiple_registered_mvs() {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.register("mv_one");
+        registry.register("mv_two");
+        let state = HttpAdminState {
+            cancel: CancellationToken::new(),
+            health: HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
+                cdc_replication_debug: None,
+            },
+            storage_db: None,
+            materialized_views: Some(registry),
+        };
+        let app = Router::new()
+            .route("/mv", get(subscribe_sse_admin))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/mv")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
