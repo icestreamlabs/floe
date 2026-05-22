@@ -12,7 +12,7 @@ use super::buffer::record_buffer_stats;
 use super::perf::{log_replication_replay_delivery_perf, log_replication_replay_payload_perf};
 use super::runtime_state::ReplicationReplayStateGuard;
 use super::target_state::target_kind;
-use super::{CDC_PERF_LOGGING_ENABLED, ReplicationPipelineRuntime, encoding};
+use super::{ReplicationPipelineRuntime, encoding};
 
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 
@@ -49,13 +49,21 @@ impl ReplicationPipelineRuntime {
         let mut delivered_transactions = 0usize;
         for manifest in pending {
             attempted_transactions = attempted_transactions.saturating_add(1);
-            let records = load_manifest_records(plan, buffer_store, &manifest).await?;
-            let delivery_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+            let records =
+                load_manifest_records(plan, buffer_store, &manifest, self.settings.perf_log)
+                    .await?;
+            let delivery_started_at = self.settings.perf_log.then(Instant::now);
             let delivered = self
                 .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
                 .await?;
             let delivery_elapsed = elapsed_or_zero(delivery_started_at);
-            log_replication_replay_delivery_perf(plan, &manifest, delivery_elapsed, delivered);
+            log_replication_replay_delivery_perf(
+                self.settings.perf_log,
+                plan,
+                &manifest,
+                delivery_elapsed,
+                delivered,
+            );
             if delivered == 0 {
                 tracing::warn!(
                     pipeline = %plan.name,
@@ -96,8 +104,9 @@ pub(super) async fn load_manifest_records(
     plan: &ReplicationPipelineRuntimePlan,
     buffer_store: &CdcBufferStore,
     manifest: &CdcBufferedTransactionManifest,
+    perf_enabled: bool,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
-    let payload_load_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+    let payload_load_started_at = perf_enabled.then(Instant::now);
     let records = match manifest.payload_format() {
         CdcBufferPayloadFormat::KafkaRecords => {
             let records = buffer_store.records(manifest).await.with_context(|| {
@@ -127,7 +136,7 @@ pub(super) async fn load_manifest_records(
                 })?;
             record_object_store_get(plan, manifest);
             let payload_load_elapsed = elapsed_or_zero(payload_load_started_at);
-            let encode_started_at = CDC_PERF_LOGGING_ENABLED.then(Instant::now);
+            let encode_started_at = perf_enabled.then(Instant::now);
             let mut records =
                 encoding::encode_floe_json_buffered_change_batches(plan, &plan.schema, &batches)?;
             encoding::add_replication_record_metadata(
@@ -138,6 +147,7 @@ pub(super) async fn load_manifest_records(
                 0,
             );
             log_replication_replay_payload_perf(
+                perf_enabled,
                 plan,
                 manifest,
                 payload_load_elapsed,
@@ -149,6 +159,7 @@ pub(super) async fn load_manifest_records(
     };
     if manifest.payload_format() == CdcBufferPayloadFormat::KafkaRecords {
         log_replication_replay_payload_perf(
+            perf_enabled,
             plan,
             manifest,
             elapsed_or_zero(payload_load_started_at),

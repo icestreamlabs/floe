@@ -1,26 +1,8 @@
-use std::sync::LazyLock;
-
 use anyhow::{Context, anyhow};
 use floe_storage::{CdcBufferCleanupPolicy, CdcBufferStore};
 
 use super::super::ReplicationPipelineRuntimePlan;
 use super::{ReplicationPipelineRuntime, current_unix_time_ms};
-
-const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
-const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
-
-static REPLICATION_BUFFER_DELIVERED_RETENTION_MS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FLOE_REPLICATION_BUFFER_DELIVERED_RETENTION_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS)
-});
-static REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FLOE_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS)
-});
 
 impl ReplicationPipelineRuntime {
     pub(super) async fn cleanup_delivered_if_due(
@@ -35,7 +17,7 @@ impl ReplicationPipelineRuntime {
         let summary = buffer_store
             .cleanup_delivered(
                 &plan.name,
-                CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
+                CdcBufferCleanupPolicy::new(self.settings.buffer_cleanup.delivered_retention_ms),
                 now,
             )
             .await
@@ -63,11 +45,12 @@ impl ReplicationPipelineRuntime {
             Ok(true) => {
                 let cleanup_store = buffer_store.clone();
                 let pipeline_name = plan.name.clone();
+                let delivered_retention_ms = self.settings.buffer_cleanup.delivered_retention_ms;
                 tokio::spawn(async move {
                     match cleanup_store
                         .cleanup_delivered(
                             &pipeline_name,
-                            CdcBufferCleanupPolicy::new(*REPLICATION_BUFFER_DELIVERED_RETENTION_MS),
+                            CdcBufferCleanupPolicy::new(delivered_retention_ms),
                             now,
                         )
                         .await
@@ -101,7 +84,7 @@ impl ReplicationPipelineRuntime {
     }
 
     fn claim_cleanup_due(&self, pipeline_name: &str, now: u64) -> anyhow::Result<bool> {
-        let cleanup_interval_ms = *REPLICATION_BUFFER_CLEANUP_INTERVAL_MS;
+        let cleanup_interval_ms = self.settings.buffer_cleanup.cleanup_interval_ms;
         let mut last_by_pipeline = self
             .buffer_cleanup_last_by_pipeline
             .lock()

@@ -1407,11 +1407,11 @@ floe_benchmark() {
       ;;
   esac
 
-  log "starting Floe native benchmark process"
-  FLOE_PG_ADDR="127.0.0.1:${FLOE_PG_PORT}" \
-    FLOE_ADMIN_PORT=0 \
-    "${REPO_ROOT}/target/release/floe-node" run \
-    --slatedb-await-durable false \
+	log "starting Floe native benchmark process"
+	"${REPO_ROOT}/target/release/floe-node" run \
+	  --pgwire-addr "127.0.0.1:${FLOE_PG_PORT}" \
+	  --admin-port 0 \
+	  --slatedb-await-durable false \
     --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
     --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
     --config "${config_path}" \

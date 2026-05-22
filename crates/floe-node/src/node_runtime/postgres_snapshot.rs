@@ -5,88 +5,11 @@ use floe_cdc_core::{
     CdcCheckpoint, CdcColumnarColumn, CdcColumnarRowBatch, CdcTransactionId, ChangeBatch,
     TransactionBatch,
 };
+use floe_config::PostgresCdcSnapshotConfig;
 use futures::{TryStreamExt, pin_mut};
-use std::sync::LazyLock;
 use std::time::Instant;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::types::Type;
-
-const DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH: usize = 16_384;
-const DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS: usize = 1;
-const DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: usize = 1;
-const DEFAULT_POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY: bool = true;
-const DEFAULT_POSTGRES_SNAPSHOT_MIN_WORKERS: usize = 1;
-const DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: usize = 75;
-const DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: usize = 25;
-const DEFAULT_POSTGRES_SNAPSHOT_SLOW_SCAN_MS: u64 = 30_000;
-const DEFAULT_POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS: u64 = 500;
-static POSTGRES_SNAPSHOT_ROWS_PER_BATCH: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_ROWS_PER_BATCH)
-});
-static POSTGRES_SNAPSHOT_MAX_WORKERS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_MAX_WORKERS)
-});
-static POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS)
-});
-static POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_ADAPTIVE_CONCURRENCY")
-        .ok()
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY)
-});
-static POSTGRES_SNAPSHOT_MIN_WORKERS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_MIN_WORKERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_MIN_WORKERS)
-});
-static POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=100).contains(value))
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT)
-});
-static POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value <= 100)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT)
-});
-static POSTGRES_SNAPSHOT_SLOW_SCAN_MS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_SLOW_SCAN_MS)
-});
-static POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FLOE_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS)
-});
-static CDC_PERF_LOGGING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("FLOE_CDC_PERF_LOG")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-});
 
 struct PostgresSnapshot {
     lsn: PostgresLsn,
@@ -272,11 +195,12 @@ impl SnapshotAdaptiveConcurrencyRuntime {
         source_id: &CdcSourceId,
         slot: &str,
         max_workers: usize,
+        settings: PostgresCdcSnapshotConfig,
         task_count: usize,
         cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
         parent_cancel: &CancellationToken,
     ) -> Self {
-        let config = snapshot_adaptive_concurrency_config(max_workers);
+        let config = snapshot_adaptive_concurrency_config(max_workers, settings);
         let scan_limiter = Arc::new(SnapshotScanLimiter::new(
             source_id.as_str(),
             slot,
@@ -364,22 +288,25 @@ impl SnapshotAdaptiveConcurrencyRuntime {
     }
 }
 
-fn snapshot_adaptive_concurrency_config(max_workers: usize) -> SnapshotAdaptiveConcurrencyConfig {
+fn snapshot_adaptive_concurrency_config(
+    max_workers: usize,
+    settings: PostgresCdcSnapshotConfig,
+) -> SnapshotAdaptiveConcurrencyConfig {
     let max_workers = max_workers.max(1);
-    let min_workers = (*POSTGRES_SNAPSHOT_MIN_WORKERS).clamp(1, max_workers);
-    let high = *POSTGRES_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT;
-    let mut low = *POSTGRES_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT;
+    let min_workers = settings.min_workers.clamp(1, max_workers);
+    let high = settings.wal_buffer_high_watermark_percent.clamp(1, 100);
+    let mut low = settings.wal_buffer_low_watermark_percent.min(100);
     if low >= high {
         low = high.saturating_sub(1);
     }
     SnapshotAdaptiveConcurrencyConfig {
-        enabled: *POSTGRES_SNAPSHOT_ADAPTIVE_CONCURRENCY && max_workers > 1,
+        enabled: settings.adaptive_concurrency && max_workers > 1,
         min_workers,
         max_workers,
         wal_buffer_high_watermark_percent: high,
         wal_buffer_low_watermark_percent: low,
-        slow_scan_ms: *POSTGRES_SNAPSHOT_SLOW_SCAN_MS,
-        controller_interval: Duration::from_millis(*POSTGRES_SNAPSHOT_CONTROLLER_INTERVAL_MS),
+        slow_scan_ms: settings.slow_scan_ms.max(1),
+        controller_interval: Duration::from_millis(settings.controller_interval_ms.max(1)),
     }
 }
 
@@ -630,6 +557,7 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
     table_store: &CdcTableStore,
     sender: &mpsc::Sender<QueuedCdcTransaction>,
     cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    settings: PostgresCdcSnapshotConfig,
     commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
     cancel: &CancellationToken,
 ) -> Result<InitialPostgresSnapshot> {
@@ -657,6 +585,7 @@ pub(super) async fn run_initial_postgres_snapshot_if_needed(
         publication,
         runtime_plan,
         cdc_replication_debug,
+        settings,
         wal_commit_lsn_rx,
         cancel.clone(),
     )
@@ -743,6 +672,7 @@ async fn load_postgres_initial_snapshot(
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
     cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    settings: PostgresCdcSnapshotConfig,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
@@ -765,6 +695,7 @@ async fn load_postgres_initial_snapshot(
         &runtime_plan.schemas,
         runtime_plan,
         cdc_replication_debug,
+        settings,
         wal_commit_lsn_rx,
         cancel,
     )
@@ -783,11 +714,12 @@ async fn load_postgres_initial_snapshot_from_client(
     schemas: &HashMap<CdcTableId, CdcTableSchema>,
     runtime_plan: &PostgresCdcRuntimePlan,
     cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    settings: PostgresCdcSnapshotConfig,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
     let sorted_schemas = sorted_snapshot_schemas(schemas);
-    let max_workers = *POSTGRES_SNAPSHOT_MAX_WORKERS;
+    let max_workers = settings.max_workers.max(1);
     match postgres_replication_slot_plugin(client, slot).await? {
         Some(plugin) => {
             ensure!(
@@ -810,6 +742,7 @@ async fn load_postgres_initial_snapshot_from_client(
                 cdc_replication_debug,
                 sorted_schemas,
                 max_workers,
+                settings,
                 wal_commit_lsn_rx,
                 cancel,
             )
@@ -828,6 +761,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
     cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sorted_schemas: Vec<&CdcTableSchema>,
     max_workers: usize,
+    settings: PostgresCdcSnapshotConfig,
     wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
     cancel: CancellationToken,
 ) -> Result<PostgresSnapshot> {
@@ -862,10 +796,10 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
 
     let mut snapshot_tasks = Vec::new();
     let use_parallel_workers =
-        max_workers > 1 && (sorted_schemas.len() > 1 || *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS > 1);
+        max_workers > 1 && (sorted_schemas.len() > 1 || settings.intra_table_chunks > 1);
     if use_parallel_workers {
         for (table_idx, schema) in sorted_schemas.iter().enumerate() {
-            let chunks = snapshot_table_chunks(&transaction, schema).await?;
+            let chunks = snapshot_table_chunks(&transaction, schema, settings).await?;
             for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
                 snapshot_tasks.push((table_idx, chunk_idx, (*schema).clone(), chunk));
             }
@@ -880,6 +814,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
             source_id,
             slot,
             max_workers,
+            settings,
             task_count,
             Arc::clone(cdc_replication_debug),
             &cancel,
@@ -900,6 +835,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                     &exported_snapshot,
                     &schema,
                     &chunk,
+                    settings,
                     Some(SnapshotWorkerControl {
                         ready_tx,
                         start_rx,
@@ -1006,6 +942,7 @@ async fn load_exported_slot_postgres_initial_snapshot_from_client(
                         .as_ref()
                         .expect("snapshot transaction is present"),
                     schema,
+                    settings,
                 )
                 .await?;
                 row_count = row_count.saturating_add(table_snapshot.row_count);
@@ -1867,8 +1804,9 @@ struct SnapshotTableChangeBatches {
 async fn snapshot_table_chunks(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
+    settings: PostgresCdcSnapshotConfig,
 ) -> Result<Vec<SnapshotTableChunk>> {
-    let requested_chunks = *POSTGRES_SNAPSHOT_INTRA_TABLE_CHUNKS;
+    let requested_chunks = settings.intra_table_chunks.max(1);
     if requested_chunks <= 1 {
         return Ok(vec![SnapshotTableChunk::Full]);
     }
@@ -1967,15 +1905,17 @@ fn int64_snapshot_range_chunks(
 async fn snapshot_table_change_batches(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
+    settings: PostgresCdcSnapshotConfig,
 ) -> Result<SnapshotTableChangeBatches> {
     let chunk = SnapshotTableChunk::Full;
-    snapshot_table_change_batches_for_chunk(transaction, schema, &chunk).await
+    snapshot_table_change_batches_for_chunk(transaction, schema, &chunk, settings).await
 }
 
 async fn snapshot_table_change_batches_for_chunk(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
     chunk: &SnapshotTableChunk,
+    settings: PostgresCdcSnapshotConfig,
 ) -> Result<SnapshotTableChangeBatches> {
     let query = snapshot_table_query(schema, chunk);
     let started_at = Instant::now();
@@ -1994,7 +1934,7 @@ async fn snapshot_table_change_batches_for_chunk(
 
     let mut change_batches = Vec::new();
     let mut row_count = 0_usize;
-    let rows_per_batch = *POSTGRES_SNAPSHOT_ROWS_PER_BATCH;
+    let rows_per_batch = settings.rows_per_batch.max(1);
     let mut builder = SnapshotColumnarBatchBuilder::new(schema, rows_per_batch);
     while let Some(row) = stream.try_next().await.with_context(|| {
         format!(
@@ -2012,7 +1952,7 @@ async fn snapshot_table_change_batches_for_chunk(
     if !builder.is_empty() {
         change_batches.push(builder.finish_change_batch(schema)?);
     }
-    if *CDC_PERF_LOGGING_ENABLED {
+    if settings.perf_log {
         let elapsed = started_at.elapsed();
         tracing::info!(
             table = %schema.table_id().as_str(),
@@ -2039,6 +1979,7 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
     exported_snapshot: &str,
     schema: &CdcTableSchema,
     chunk: &SnapshotTableChunk,
+    settings: PostgresCdcSnapshotConfig,
     worker_control: Option<SnapshotWorkerControl>,
 ) -> Result<SnapshotTableChangeBatches> {
     let (mut client, connection) =
@@ -2080,7 +2021,8 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
             None
         };
         let scan_started_at = Instant::now();
-        let snapshot = snapshot_table_change_batches_for_chunk(&transaction, schema, chunk).await;
+        let snapshot =
+            snapshot_table_change_batches_for_chunk(&transaction, schema, chunk, settings).await;
         if let (Some((_, Some(scan_observation_tx))), Ok(snapshot)) = (&scan_permit, &snapshot) {
             let _ = scan_observation_tx.send(SnapshotScanObservation {
                 elapsed_ms: scan_started_at

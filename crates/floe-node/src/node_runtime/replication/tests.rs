@@ -1,4 +1,3 @@
-use super::config::ReplicationArrowIpcCompression;
 use super::encoding::{
     encode_debezium_pipeline_records, encode_pipeline_buffer_records,
     encode_pipeline_transaction_records, encode_pipeline_transaction_records_with_metadata,
@@ -13,6 +12,7 @@ use floe_cdc_core::{
     CdcChange, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey, CdcRow, CdcRowKey,
     CdcTransactionId, ChangeBatch, UpstreamTableRef,
 };
+use floe_config::ReplicationArrowIpcCompressionConfig;
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 
@@ -1442,15 +1442,15 @@ fn zero_buffer_limit_override_disables_default_limit() {
 #[test]
 fn parses_arrow_ipc_compression_override() {
     assert_eq!(
-        ReplicationArrowIpcCompression::parse("lz4"),
-        Some(ReplicationArrowIpcCompression::Lz4Frame)
+        ReplicationArrowIpcCompressionConfig::parse("lz4"),
+        Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
     );
     assert_eq!(
-        ReplicationArrowIpcCompression::parse("lz4-frame"),
-        Some(ReplicationArrowIpcCompression::Lz4Frame)
+        ReplicationArrowIpcCompressionConfig::parse("lz4-frame"),
+        Some(ReplicationArrowIpcCompressionConfig::Lz4Frame)
     );
-    assert_eq!(ReplicationArrowIpcCompression::parse("none"), None);
-    assert_eq!(ReplicationArrowIpcCompression::parse("bogus"), None);
+    assert_eq!(ReplicationArrowIpcCompressionConfig::parse("none"), None);
+    assert_eq!(ReplicationArrowIpcCompressionConfig::parse("bogus"), None);
 }
 
 fn schema(table_id: CdcTableId) -> CdcTableSchema {
@@ -1508,6 +1508,7 @@ fn test_runtime_with_plan(plan: ReplicationPipelineRuntimePlan) -> ReplicationPi
         replay_state_by_pipeline: Mutex::new(HashMap::new()),
         backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
         last_target_error_by_pipeline: Mutex::new(HashMap::new()),
+        settings: FloeReplicationConfig::default(),
     }
 }
 

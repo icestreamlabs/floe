@@ -1,8 +1,8 @@
 use std::fmt;
-use std::sync::LazyLock;
 
 use anyhow::Context;
 use floe_cdc_core::TransactionBatch;
+use floe_config::ReplicationBufferLimitsConfig;
 use floe_storage::{
     CdcBufferAppend, CdcBufferRecord, CdcBufferStats, CdcBufferStore,
     CdcBufferedTransactionManifest,
@@ -11,42 +11,6 @@ use floe_storage::{
 use super::super::ReplicationPipelineRuntimePlan;
 use super::current_unix_time_ms;
 use super::target_state::target_kind;
-
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS: usize = 0;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: usize = 0;
-const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS: u64 = 0;
-
-static REPLICATION_BUFFER_MAX_PENDING_BYTES: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_BYTES",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES,
-    )
-});
-static REPLICATION_BUFFER_MAX_PENDING_RECORDS: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_RECORDS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_RECORDS,
-    )
-});
-static REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS: LazyLock<Option<usize>> = LazyLock::new(|| {
-    env_usize_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-    )
-    .or_else(|| {
-        env_usize_limit(
-            "FLOE_REPLICATION_BUFFER_MAX_PENDING_OBJECTS",
-            DEFAULT_REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-        )
-    })
-});
-static REPLICATION_BUFFER_MAX_PENDING_AGE_MS: LazyLock<Option<u64>> = LazyLock::new(|| {
-    env_u64_limit(
-        "FLOE_REPLICATION_BUFFER_MAX_PENDING_AGE_MS",
-        DEFAULT_REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
-    )
-});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReplicationBufferLimits {
@@ -93,6 +57,15 @@ impl PreparedReplicationBufferAppend {
 }
 
 impl ReplicationBufferLimits {
+    pub(super) fn from_config(config: ReplicationBufferLimitsConfig) -> Self {
+        Self {
+            max_pending_bytes: nonzero_usize_limit(config.max_pending_bytes),
+            max_pending_records: nonzero_usize_limit(config.max_pending_records),
+            max_pending_transactions: nonzero_usize_limit(config.max_pending_transactions),
+            max_pending_age_ms: nonzero_u64_limit(config.max_pending_age_ms),
+        }
+    }
+
     pub(super) fn enabled(self) -> bool {
         self.max_pending_bytes.is_some()
             || self.max_pending_records.is_some()
@@ -145,15 +118,6 @@ impl fmt::Display for ReplicationBufferLimitViolation {
                 "oldest pending transaction age is {oldest_pending_age_ms} ms, above max {max_pending_age_ms} ms"
             ),
         }
-    }
-}
-
-fn replication_buffer_limits() -> ReplicationBufferLimits {
-    ReplicationBufferLimits {
-        max_pending_bytes: *REPLICATION_BUFFER_MAX_PENDING_BYTES,
-        max_pending_records: *REPLICATION_BUFFER_MAX_PENDING_RECORDS,
-        max_pending_transactions: *REPLICATION_BUFFER_MAX_PENDING_TRANSACTIONS,
-        max_pending_age_ms: *REPLICATION_BUFFER_MAX_PENDING_AGE_MS,
     }
 }
 
@@ -214,8 +178,8 @@ pub(super) async fn record_buffer_stats(
 
 pub(super) fn effective_replication_buffer_limits(
     plan: &ReplicationPipelineRuntimePlan,
+    defaults: ReplicationBufferLimits,
 ) -> ReplicationBufferLimits {
-    let defaults = replication_buffer_limits();
     ReplicationBufferLimits {
         max_pending_bytes: effective_usize_limit(
             plan.buffer_policy.max_pending_bytes(),
@@ -234,6 +198,14 @@ pub(super) fn effective_replication_buffer_limits(
             defaults.max_pending_age_ms,
         ),
     }
+}
+
+fn nonzero_usize_limit(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
+fn nonzero_u64_limit(value: u64) -> Option<u64> {
+    (value > 0).then_some(value)
 }
 
 pub(super) fn effective_usize_limit(
@@ -256,22 +228,6 @@ pub(super) fn effective_u64_limit(
         Some(value) => Some(value),
         None => default_value,
     }
-}
-
-fn env_usize_limit(name: &str, default_value: usize) -> Option<usize> {
-    let value = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default_value);
-    (value > 0).then_some(value)
-}
-
-fn env_u64_limit(name: &str, default_value: u64) -> Option<u64> {
-    let value = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default_value);
-    (value > 0).then_some(value)
 }
 
 pub(super) fn log_replication_buffer_backpressure(

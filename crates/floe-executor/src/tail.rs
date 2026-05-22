@@ -32,6 +32,31 @@ const TAIL_MAX_CATCHUP_VERSIONS_DEFAULT: i64 = 32;
 const TAIL_DELTA_LOG_SAMPLE_EVERY: usize = 128;
 static TAIL_DELTA_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TailExecutionConfig {
+    pub channel_capacity: usize,
+    pub max_catchup_versions: i64,
+}
+
+impl Default for TailExecutionConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: TAIL_STREAM_CHANNEL_CAPACITY_DEFAULT,
+            max_catchup_versions: TAIL_MAX_CATCHUP_VERSIONS_DEFAULT,
+        }
+    }
+}
+
+impl TailExecutionConfig {
+    fn channel_capacity(self) -> usize {
+        self.channel_capacity.max(1)
+    }
+
+    fn max_catchup_versions(self) -> i64 {
+        self.max_catchup_versions.max(1)
+    }
+}
+
 #[derive(Debug)]
 pub struct TailBatch {
     pub version: i64,
@@ -131,6 +156,19 @@ pub async fn execute_tail<C>(
 where
     C: MvCatalog + ?Sized,
 {
+    execute_tail_with_config(ctx, catalog, params, TailExecutionConfig::default(), cancel).await
+}
+
+pub async fn execute_tail_with_config<C>(
+    ctx: &SessionCtx,
+    catalog: &C,
+    params: TailParams,
+    config: TailExecutionConfig,
+    cancel: CancellationToken,
+) -> PgResult<TailStream>
+where
+    C: MvCatalog + ?Sized,
+{
     crate::metrics::init();
     let _ = ctx;
     let mv = catalog
@@ -144,7 +182,7 @@ where
         )
     })?;
 
-    let (tx, rx) = mpsc::channel(tail_stream_channel_capacity());
+    let (tx, rx) = mpsc::channel(config.channel_capacity());
     let mv_for_task = Arc::clone(&mv);
     let schema_for_task = Arc::clone(&base_schema);
     let params_for_task = params.clone();
@@ -156,6 +194,7 @@ where
             mv_for_task,
             schema_for_task,
             params_for_task,
+            config,
             cancel_task,
             &mut sender,
         )
@@ -197,6 +236,7 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     mv: Arc<M>,
     schema: SchemaRef,
     params: TailParams,
+    config: TailExecutionConfig,
     cancel: CancellationToken,
     tx: &mut mpsc::Sender<PgResult<TailBatch>>,
 ) -> PgResult<()> {
@@ -208,7 +248,7 @@ async fn run_tail_task<M: MaterializedView + 'static>(
     let mut version_rx = mv.subscribe_versions();
     let latest = mv.latest_version();
     let mut last_emitted;
-    let max_catchup_versions = tail_max_catchup_versions();
+    let max_catchup_versions = config.max_catchup_versions();
 
     if let Some(as_of_version) = as_of {
         ensure!(
@@ -271,22 +311,6 @@ async fn run_tail_task<M: MaterializedView + 'static>(
 fn mv_version_exists<M: MaterializedView>(mv: &M, version: i64) -> bool {
     mv.latest_version() == Some(version)
         || mv.next_version_after(version.saturating_sub(1)) == Some(version)
-}
-
-fn tail_stream_channel_capacity() -> usize {
-    std::env::var("FLOE_TAIL_CHANNEL_CAPACITY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(TAIL_STREAM_CHANNEL_CAPACITY_DEFAULT)
-}
-
-fn tail_max_catchup_versions() -> i64 {
-    std::env::var("FLOE_TAIL_MAX_CATCHUP_VERSIONS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(TAIL_MAX_CATCHUP_VERSIONS_DEFAULT)
 }
 
 async fn emit_version<M: MaterializedView>(

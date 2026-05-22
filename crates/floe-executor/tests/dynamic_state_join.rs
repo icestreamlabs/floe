@@ -31,7 +31,7 @@ fn extract_single_i64(batches: &[RecordBatch]) -> i64 {
     array.value(0)
 }
 
-fn find_hash_join<'a>(plan: &'a Arc<dyn ExecutionPlan>) -> Option<&'a HashJoinExec> {
+fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<&HashJoinExec> {
     if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() {
         return Some(join);
     }

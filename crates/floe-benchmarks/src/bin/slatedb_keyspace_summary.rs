@@ -5,8 +5,6 @@ use anyhow::{Context, Result, anyhow};
 use slatedb::Db;
 use slatedb::config::ScanOptions;
 
-const SLATEDB_NAME_ENV: &str = "FLOE_SLATEDB_NAME";
-const OBJECT_STORE_ENV_FILE_ENV: &str = "FLOE_OBJECT_STORE_ENV_FILE";
 const PROGRESS_EVERY_ENV: &str = "FLOE_KEYSPACE_SUMMARY_PROGRESS_EVERY";
 
 #[derive(Default)]
@@ -31,14 +29,12 @@ impl Bucket {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    let db_name = args
-        .db_name
-        .or_else(|| std::env::var(SLATEDB_NAME_ENV).ok())
-        .ok_or_else(|| {
-            anyhow!("usage: slatedb_keyspace_summary [--keyspace <prefix>] <slatedb-name>")
-        })?;
-    let env_file = std::env::var(OBJECT_STORE_ENV_FILE_ENV).ok();
-    let object_store = slatedb::admin::load_object_store_from_env(env_file)
+    let db_name = args.db_name.ok_or_else(|| {
+        anyhow!(
+            "usage: slatedb_keyspace_summary [--object-store-env-file <path>] [--keyspace <prefix>] <slatedb-name>"
+        )
+    })?;
+    let object_store = slatedb::admin::load_object_store_from_env(args.object_store_env_file)
         .map_err(|err| anyhow!("{err}"))
         .context("load SlateDB object store from environment")?;
     let db = Arc::new(
@@ -113,6 +109,7 @@ async fn main() -> Result<()> {
 #[derive(Default)]
 struct Args {
     db_name: Option<String>,
+    object_store_env_file: Option<String>,
     keyspaces: Vec<String>,
     progress_every: u64,
 }
@@ -132,6 +129,11 @@ fn parse_args() -> Result<Args> {
                 .next()
                 .ok_or_else(|| anyhow!("--keyspace requires a prefix"))?;
             parsed.keyspaces.push(keyspace);
+        } else if arg == "--object-store-env-file" {
+            parsed.object_store_env_file = Some(
+                args.next()
+                    .ok_or_else(|| anyhow!("--object-store-env-file requires a path"))?,
+            );
         } else if arg == "--progress-every" {
             let progress_every = args
                 .next()

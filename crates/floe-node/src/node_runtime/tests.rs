@@ -13,6 +13,19 @@ fn default_run_args() -> cli::RunArgs {
         mv_query: None,
         config: None,
         dry_run: false,
+        data_dir: None,
+        object_store_from_env: false,
+        object_store_env_file: None,
+        slatedb_name: None,
+        pgwire_addr: None,
+        disable_pgwire: false,
+        admin_port: None,
+        pre_tick_commit_delay_ms: None,
+        watermark_idle_source_ms: None,
+        tail_channel_capacity: None,
+        tail_max_catchup_versions: None,
+        transient_segment_max_nodes: None,
+        transient_segment_min_score: None,
         slatedb_config: None,
         slatedb_env_prefix: None,
         slatedb_flush_interval_ms: None,
@@ -25,6 +38,7 @@ fn default_run_args() -> cli::RunArgs {
         slatedb_cache_max_bytes: None,
         slatedb_cache_part_bytes: None,
         slatedb_cache_puts: false,
+        slatedb_close_timeout_ms: None,
         mv_retain_last: DEFAULT_MV_RETAIN_LAST,
         zset_compaction_max_chain_len: DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN,
         zset_compaction_max_segments: DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS,
@@ -341,7 +355,8 @@ fn log_operator_hints_handles_empty_materialized_views() {
         },
     }];
     let available_sources = BTreeSet::from(["nexmark_bid".to_string()]);
-    log_operator_hints(&connectors, &available_sources, &[], &[]);
+    let args = default_run_args();
+    log_operator_hints(&connectors, &available_sources, &[], &[], &args);
 }
 
 #[test]
@@ -387,13 +402,26 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             kafka_poll_ms: Some(250),
             kafka_max_messages: Some(1024),
             watermark_idle_source_ms: Some(45_000),
+            pre_tick_commit_delay_ms: Some(5),
+            tail_channel_capacity: Some(512),
+            tail_max_catchup_versions: Some(64),
+            transient_segment_max_nodes: Some(48),
+            transient_segment_min_score: Some(0),
+            admin_port: Some(9090),
+            pgwire_addr: Some("127.0.0.1:7777".to_string()),
+            pgwire_enabled: Some(false),
             mv_flush: config::MvFlushConfig::default(),
             mv_snapshot: config::MvSnapshotConfig::default(),
         },
         storage: config::StorageConfig {
             await_durable: Some(true),
+            data_dir: Some("/tmp/floe-data".to_string()),
+            object_store_from_env: false,
+            object_store_env_file: None,
+            slatedb_name: None,
             slatedb_config: Some("/tmp/slatedb.toml".to_string()),
             slatedb_env_prefix: Some("CFG_".to_string()),
+            slatedb_close_timeout_ms: Some(5_000),
             zset_compaction_max_chain_len: Some(99),
             zset_compaction_max_segments: Some(500),
             zset_compaction_backoff_ticks: Some(8),
@@ -427,9 +455,20 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
     assert_eq!(args.kafka_group_id, "cfg-group");
     assert_eq!(args.kafka_poll_ms, 250);
     assert_eq!(args.kafka_max_messages, 1024);
+    assert_eq!(args.pgwire_addr.as_deref(), Some("127.0.0.1:7777"));
+    assert!(args.disable_pgwire);
+    assert_eq!(args.admin_port, Some(9090));
+    assert_eq!(args.pre_tick_commit_delay_ms, Some(5));
+    assert_eq!(args.watermark_idle_source_ms, Some(45_000));
+    assert_eq!(args.tail_channel_capacity, Some(512));
+    assert_eq!(args.tail_max_catchup_versions, Some(64));
+    assert_eq!(args.transient_segment_max_nodes, Some(48));
+    assert_eq!(args.transient_segment_min_score, Some(0));
     assert_eq!(args.slatedb_await_durable, Some(true));
+    assert_eq!(args.data_dir.as_deref(), Some("/tmp/floe-data"));
     assert_eq!(args.slatedb_config.as_deref(), Some("/tmp/slatedb.toml"));
     assert_eq!(args.slatedb_env_prefix.as_deref(), Some("CFG_"));
+    assert_eq!(args.slatedb_close_timeout_ms, Some(5_000));
     assert_eq!(args.zset_compaction_max_chain_len, 99);
     assert_eq!(args.zset_compaction_max_segments, 500);
     assert_eq!(args.zset_compaction_backoff_ticks, 8);

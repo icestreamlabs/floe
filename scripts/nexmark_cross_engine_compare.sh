@@ -66,8 +66,8 @@ FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY="${FLOE_MV_FLUSH_ON_CATCHUP_BOUNDARY:-1}"
 FLOE_L0_SST_BYTES="${FLOE_L0_SST_BYTES:-1073741824}"
 FLOE_MAX_UNFLUSHED_BYTES="${FLOE_MAX_UNFLUSHED_BYTES:-8589934592}"
 FLOE_SLATEDB_AWAIT_DURABLE="${FLOE_SLATEDB_AWAIT_DURABLE:-false}"
-FLOE_SLATEDB_NAME_PREFIX="${FLOE_SLATEDB_NAME_PREFIX:-}"
-FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT:-0}"
+FLOE_OBJECT_STORE_DB_NAME_PREFIX="${FLOE_OBJECT_STORE_DB_NAME_PREFIX:-}"
+FLOE_ADMIN_HTTP_PORT="${FLOE_ADMIN_HTTP_PORT:-0}"
 FLOE_STATE_SETTLE_AFTER_CATCHUP="${FLOE_STATE_SETTLE_AFTER_CATCHUP:-0}"
 FLOE_STATE_SETTLE_REQUIRED="${FLOE_STATE_SETTLE_REQUIRED:-0}"
 FLOE_STATE_SETTLE_TIMEOUT_SECONDS="${FLOE_STATE_SETTLE_TIMEOUT_SECONDS:-300}"
@@ -116,10 +116,10 @@ env_enabled() {
 
 floe_slatedb_name_for_query() {
   local query_id="$1"
-  if [[ -n "${FLOE_SLATEDB_NAME_PREFIX}" ]]; then
-    printf '%s-%s\n' "${FLOE_SLATEDB_NAME_PREFIX}" "${query_id}"
-  elif [[ -n "${FLOE_SLATEDB_NAME:-}" ]]; then
-    printf '%s\n' "${FLOE_SLATEDB_NAME}"
+  if [[ -n "${FLOE_OBJECT_STORE_DB_NAME_PREFIX}" ]]; then
+    printf '%s-%s\n' "${FLOE_OBJECT_STORE_DB_NAME_PREFIX}" "${query_id}"
+  elif [[ -n "${FLOE_OBJECT_STORE_DB_NAME:-}" ]]; then
+    printf '%s\n' "${FLOE_OBJECT_STORE_DB_NAME}"
   fi
 }
 
@@ -769,8 +769,8 @@ settle_floe_state_if_requested() {
   if ! env_enabled "${FLOE_STATE_SETTLE_AFTER_CATCHUP}"; then
     return 0
   fi
-  if [[ "${FLOE_ADMIN_PORT}" == "0" ]]; then
-    printf 'state_settle_requested_but_FLOE_ADMIN_PORT_is_0\n' > "${artifact_dir}/state_settle.error"
+  if [[ "${FLOE_ADMIN_HTTP_PORT}" == "0" ]]; then
+    printf 'state_settle_requested_but_FLOE_ADMIN_HTTP_PORT_is_0\n' > "${artifact_dir}/state_settle.error"
     return 1
   fi
 
@@ -779,7 +779,7 @@ settle_floe_state_if_requested() {
   local start_ms end_ms
   start_ms="$(date +%s%3N)"
   if ! timeout "${FLOE_STATE_SETTLE_TIMEOUT_SECONDS}"s \
-    curl -fsS -X POST "http://127.0.0.1:${FLOE_ADMIN_PORT}/debug/storage/flush" \
+    curl -fsS -X POST "http://127.0.0.1:${FLOE_ADMIN_HTTP_PORT}/debug/storage/flush" \
       > "${response_path}" \
       2> "${stderr_path}"; then
     printf 'state_settle_failed_or_timed_out\n' > "${artifact_dir}/state_settle.error"
@@ -2918,12 +2918,18 @@ run_floe_query() {
   stop_floe_process
   # Prevent stale external floe-node runners from holding the shared pgwire port.
   pkill -f "/target/release/floe-node run" >/dev/null 2>&1 || true
-  local floe_run_env=("FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" "FLOE_ADMIN_PORT=${FLOE_ADMIN_PORT}")
-  if [[ -n "${main_slatedb_name}" ]]; then
-    floe_run_env+=("FLOE_SLATEDB_NAME=${main_slatedb_name}")
-  fi
-  env "${floe_run_env[@]}" "${REPO_ROOT}/target/release/floe-node" run \
-    --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
+	local floe_storage_args=()
+	if [[ -n "${CLOUD_PROVIDER:-}" ]]; then
+	  floe_storage_args+=(--object-store-from-env)
+	  if [[ -n "${main_slatedb_name}" ]]; then
+	    floe_storage_args+=(--slatedb-name "${main_slatedb_name}")
+	  fi
+	fi
+	"${REPO_ROOT}/target/release/floe-node" run \
+	  --pgwire-addr "127.0.0.1:${FLOE_PG_PORT}" \
+	  --admin-port "${FLOE_ADMIN_HTTP_PORT}" \
+	  "${floe_storage_args[@]}" \
+	  --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
     --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
     --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
     --config "${config_path}" \
@@ -3071,17 +3077,17 @@ run_floe_query() {
     local validation_program_sql
     validation_program_sql="$(tr '\n' ' ' < "${validation_program_path}")"
 
-    if [[ -n "${validation_slatedb_name}" ]]; then
+	if [[ -n "${validation_slatedb_name}" && -n "${CLOUD_PROVIDER:-}" ]]; then
       validation_slatedb_name="${validation_slatedb_name}-validation"
     fi
 
     if [[ -n "${validation_slatedb_name}" ]]; then
-      env \
-        "FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" \
-        "FLOE_ADMIN_PORT=0" \
-        "FLOE_SLATEDB_NAME=${validation_slatedb_name}" \
-        "${REPO_ROOT}/target/release/floe-node" run \
-        --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
+	  "${REPO_ROOT}/target/release/floe-node" run \
+	    --pgwire-addr "127.0.0.1:${FLOE_PG_PORT}" \
+	    --admin-port 0 \
+	    --object-store-from-env \
+	    --slatedb-name "${validation_slatedb_name}" \
+	    --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
         --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
         --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
         --config "${validation_config_path}" \
@@ -3090,11 +3096,10 @@ run_floe_query() {
         2> "${validation_artifact_dir}/floe-node.stderr.log" &
       FLOE_NODE_PID=$!
     else
-    env \
-      "FLOE_PG_ADDR=127.0.0.1:${FLOE_PG_PORT}" \
-      "FLOE_ADMIN_PORT=0" \
-      "${REPO_ROOT}/target/release/floe-node" run \
-      --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
+	    "${REPO_ROOT}/target/release/floe-node" run \
+	      --pgwire-addr "127.0.0.1:${FLOE_PG_PORT}" \
+	      --admin-port 0 \
+	      --slatedb-await-durable "${FLOE_SLATEDB_AWAIT_DURABLE}" \
       --slatedb-l0-sst-bytes "${FLOE_L0_SST_BYTES}" \
       --slatedb-max-unflushed-bytes "${FLOE_MAX_UNFLUSHED_BYTES}" \
       --config "${validation_config_path}" \

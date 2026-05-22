@@ -39,7 +39,9 @@ use super::compile::{
     build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
 };
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
-use super::persistence_policy::{PersistencePolicy, TransientSegmentSpec, TransientSegmentStep};
+use super::persistence_policy::{
+    PersistencePolicy, PersistencePolicyConfig, TransientSegmentSpec, TransientSegmentStep,
+};
 use super::vectorized_filter_project::{
     VectorizedFilterProjectEvaluator, required_encoded_input_columns,
 };
@@ -55,6 +57,7 @@ pub struct DbspGraphBuilder {
     output_consolidation_mode: ConsolidationMode,
     pub(super) mv_flush_coalescing: MvFlushCoalescingConfig,
     pub(super) mv_overlay_snapshot: OverlaySnapshotConfig,
+    persistence_policy_config: PersistencePolicyConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,6 +115,7 @@ impl DbspGraphBuilder {
             output_consolidation_mode: ConsolidationMode::ByAllColumns,
             mv_flush_coalescing: MvFlushCoalescingConfig::default(),
             mv_overlay_snapshot: OverlaySnapshotConfig::default(),
+            persistence_policy_config: PersistencePolicyConfig::default(),
         })
     }
 
@@ -139,6 +143,10 @@ impl DbspGraphBuilder {
             sanitized.max_delay_ms = 1;
         }
         self.mv_overlay_snapshot = sanitized;
+    }
+
+    pub fn set_persistence_policy_config(&mut self, config: PersistencePolicyConfig) {
+        self.persistence_policy_config = config;
     }
 
     pub async fn set_stream_compaction(
@@ -199,7 +207,8 @@ impl DbspGraphBuilder {
             .context("validating query plan before DBSP graph build")?;
         let mut built = HashMap::new();
         let mut mv_latest = HashMap::new();
-        let persistence_policy = PersistencePolicy::for_plan(inputs.plan);
+        let persistence_policy =
+            PersistencePolicy::for_plan_with_config(inputs.plan, self.persistence_policy_config);
         tracing::info!(
             graph_id = %self.graph_id(),
             transient_max_segment_nodes = persistence_policy.max_transient_segment_nodes(),
@@ -1403,7 +1412,8 @@ pub struct TransientSourceRootRequirements {
 
 pub use source_requirements::{
     PlanSourceRequirements, plan_source_requirements, source_batch_journal_root_source_name,
-    source_batch_journal_root_sources, transient_source_root_requirements,
+    source_batch_journal_root_sources, source_batch_journal_root_sources_with_config,
+    transient_source_root_requirements,
 };
 
 mod row_helpers;
@@ -1522,7 +1532,7 @@ fn try_build_transient_join_input_optimization(
     let closed_key_transform =
         try_build_transient_join_closed_key_transform(plan, input_idx, closed_key_columns)?;
     let cancel = cancel.clone();
-    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
+    let debug_transient_join = tracing::enabled!(tracing::Level::DEBUG);
 
     tokio::spawn(async move {
         loop {
@@ -2325,7 +2335,7 @@ async fn build_transient_aggregate_receiver_from_batches(
     let task_events = task_events.clone();
     let cancel = cancel.clone();
     let state_label = state_label.into();
-    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
+    let debug_transient_join = tracing::enabled!(tracing::Level::DEBUG);
     if aggregate
         .aggregates()
         .iter()

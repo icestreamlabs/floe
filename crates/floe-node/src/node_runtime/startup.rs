@@ -19,6 +19,35 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.max_events.is_none() {
         args.max_events = runtime.max_events;
     }
+    if args.pgwire_addr.is_none() {
+        args.pgwire_addr = runtime.pgwire_addr.clone();
+    }
+    if !args.disable_pgwire
+        && let Some(enabled) = runtime.pgwire_enabled
+    {
+        args.disable_pgwire = !enabled;
+    }
+    if args.admin_port.is_none() {
+        args.admin_port = runtime.admin_port;
+    }
+    if args.pre_tick_commit_delay_ms.is_none() {
+        args.pre_tick_commit_delay_ms = runtime.pre_tick_commit_delay_ms;
+    }
+    if args.watermark_idle_source_ms.is_none() {
+        args.watermark_idle_source_ms = runtime.watermark_idle_source_ms;
+    }
+    if args.tail_channel_capacity.is_none() {
+        args.tail_channel_capacity = runtime.tail_channel_capacity;
+    }
+    if args.tail_max_catchup_versions.is_none() {
+        args.tail_max_catchup_versions = runtime.tail_max_catchup_versions;
+    }
+    if args.transient_segment_max_nodes.is_none() {
+        args.transient_segment_max_nodes = runtime.transient_segment_max_nodes;
+    }
+    if args.transient_segment_min_score.is_none() {
+        args.transient_segment_min_score = runtime.transient_segment_min_score;
+    }
     if args.output_consolidation_mode == cli::OutputConsolidationMode::AllColumns {
         if let Some(mode) = runtime.output_consolidation_mode {
             args.output_consolidation_mode = match mode {
@@ -78,11 +107,26 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.slatedb_await_durable.is_none() {
         args.slatedb_await_durable = storage.await_durable;
     }
+    if args.data_dir.is_none() {
+        args.data_dir = storage.data_dir.clone();
+    }
+    if !args.object_store_from_env {
+        args.object_store_from_env = storage.object_store_from_env;
+    }
+    if args.object_store_env_file.is_none() {
+        args.object_store_env_file = storage.object_store_env_file.clone();
+    }
+    if args.slatedb_name.is_none() {
+        args.slatedb_name = storage.slatedb_name.clone();
+    }
     if args.slatedb_config.is_none() {
         args.slatedb_config = storage.slatedb_config.clone();
     }
     if args.slatedb_env_prefix.is_none() {
         args.slatedb_env_prefix = storage.slatedb_env_prefix.clone();
+    }
+    if args.slatedb_close_timeout_ms.is_none() {
+        args.slatedb_close_timeout_ms = storage.slatedb_close_timeout_ms;
     }
     if args.zset_compaction_max_chain_len == DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN {
         if let Some(max_chain_len) = storage.zset_compaction_max_chain_len {
@@ -199,30 +243,26 @@ pub(super) async fn upsert_materialized_view_definition(
 }
 
 pub(super) fn load_slatedb_settings(args: &cli::RunArgs) -> anyhow::Result<Option<Settings>> {
-    let config_path = args
-        .slatedb_config
-        .clone()
-        .or_else(|| std::env::var(SLATEDB_CONFIG_ENV).ok());
-
-    let mut settings = if let Some(path) = config_path {
+    let mut settings = if let Some(path) = args.slatedb_config.clone() {
         Some(
             Settings::from_file(&path)
                 .map_err(|err| anyhow!("failed to load SlateDB settings from {path}: {err}"))?,
         )
-    } else {
-        let prefix = args
-            .slatedb_env_prefix
-            .clone()
-            .or_else(|| std::env::var(SLATEDB_ENV_PREFIX_ENV).ok())
-            .unwrap_or_else(|| DEFAULT_SLATEDB_ENV_PREFIX.to_string());
-        let prefix = prefix.trim();
-        if !prefix.is_empty() && env_has_prefix(prefix) {
+    } else if let Some(prefix) = args
+        .slatedb_env_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        if env_has_prefix(prefix) {
             Some(Settings::from_env(prefix).map_err(|err| {
                 anyhow!("failed to load SlateDB settings from env prefix '{prefix}': {err}")
             })?)
         } else {
             None
         }
+    } else {
+        None
     };
 
     if settings.is_none() && slatedb_overrides_present(args) {
@@ -345,11 +385,17 @@ pub(super) fn cli_connector_creation_flags(args: &cli::RunArgs) -> Vec<&'static 
 }
 
 pub(super) fn log_startup_banner(args: &cli::RunArgs, connectors: &[config::ConnectorSpec]) {
-    let pgwire_addr =
-        std::env::var("FLOE_PG_ADDR").unwrap_or_else(|_| "127.0.0.1:6432".to_string());
-    let storage_mode = std::env::var("FLOE_DATA_DIR")
-        .map(|dir| format!("filesystem({dir})"))
-        .unwrap_or_else(|_| "in-memory".to_string());
+    let pgwire_addr = args.pgwire_addr.as_deref().unwrap_or(DEFAULT_PGWIRE_ADDR);
+    let storage_mode = if args.object_store_from_env {
+        format!(
+            "object-store({})",
+            args.slatedb_name.as_deref().unwrap_or("floe")
+        )
+    } else if let Some(dir) = args.data_dir.as_deref() {
+        format!("filesystem({dir})")
+    } else {
+        "in-memory".to_string()
+    };
     let connector_names: Vec<&str> = connectors
         .iter()
         .map(|connector| connector.name.as_str())
@@ -369,6 +415,7 @@ pub(super) fn log_startup_banner(args: &cli::RunArgs, connectors: &[config::Conn
     tracing::info!(
         storage_mode = %storage_mode,
         pgwire_addr = %pgwire_addr,
+        pgwire_enabled = !args.disable_pgwire,
         http_addrs = ?http_addrs,
         connectors = ?connector_names,
         mv_retain_last = args.mv_retain_last,
@@ -418,6 +465,7 @@ pub(super) fn log_operator_hints(
     available_sources: &BTreeSet<String>,
     materialized_views: &[MaterializedViewDefinition],
     sinks: &[SinkSpec],
+    args: &cli::RunArgs,
 ) {
     let connector_names: Vec<&str> = connectors
         .iter()
@@ -425,17 +473,22 @@ pub(super) fn log_operator_hints(
         .collect();
     let sink_names: Vec<&str> = sinks.iter().map(|sink| sink.name.as_str()).collect();
     let mv_names: Vec<&str> = materialized_views.iter().map(|mv| mv.name()).collect();
-    let pgwire_addr =
-        std::env::var("FLOE_PG_ADDR").unwrap_or_else(|_| "127.0.0.1:6432".to_string());
+    let pgwire_addr = args.pgwire_addr.as_deref().unwrap_or(DEFAULT_PGWIRE_ADDR);
+    let pgwire_enabled = !args.disable_pgwire;
 
     tracing::info!(
         pgwire_addr = %pgwire_addr,
+        pgwire_enabled,
         connectors = ?connector_names,
         sources = ?available_sources,
         materialized_views = ?mv_names,
         sinks = ?sink_names,
         "runtime topology"
     );
+
+    if !pgwire_enabled {
+        return;
+    }
 
     for mv_name in mv_names {
         tracing::info!(

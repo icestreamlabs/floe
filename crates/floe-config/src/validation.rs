@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn validate_node_config(config: &NodeConfig) -> Result<()> {
+pub(crate) fn validate_node_config(config: &NodeConfig) -> Result<()> {
     let mut seen_mv_names = HashSet::new();
     for (index, mv) in config.materialized_views.iter().enumerate() {
         ensure_non_empty(&mv.name, &format!("materialized_views[{index}].name"))?;
@@ -21,6 +21,8 @@ pub(super) fn validate_node_config(config: &NodeConfig) -> Result<()> {
     validate_runtime_config(&config.runtime)?;
     validate_storage_config(&config.storage)?;
     validate_maintenance_config(&config.maintenance)?;
+    validate_replication_config(&config.replication)?;
+    validate_postgres_cdc_config(&config.postgres_cdc)?;
     Ok(())
 }
 
@@ -57,6 +59,24 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         "runtime.watermark_idle_source_ms",
     )?;
     ensure_optional_positive_usize(
+        runtime.tail_channel_capacity,
+        "runtime.tail_channel_capacity",
+    )?;
+    ensure_optional_positive_i64(
+        runtime.tail_max_catchup_versions,
+        "runtime.tail_max_catchup_versions",
+    )?;
+    ensure_optional_positive_usize(
+        runtime.transient_segment_max_nodes,
+        "runtime.transient_segment_max_nodes",
+    )?;
+    ensure_optional_nonnegative_i32(
+        runtime.transient_segment_min_score,
+        "runtime.transient_segment_min_score",
+    )?;
+    ensure_optional_positive_u16(runtime.admin_port, "runtime.admin_port")?;
+    ensure_optional_non_empty(runtime.pgwire_addr.as_deref(), "runtime.pgwire_addr")?;
+    ensure_optional_positive_usize(
         runtime.mv_flush.max_pending_deltas,
         "runtime.mv_flush.max_pending_deltas",
     )?;
@@ -92,10 +112,29 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_storage_config(storage: &StorageConfig) -> Result<()> {
+    if storage.object_store_from_env && storage.data_dir.is_some() {
+        bail!("storage.data_dir cannot be set when storage.object_store_from_env is true");
+    }
+    if !storage.object_store_from_env && storage.object_store_env_file.is_some() {
+        bail!("storage.object_store_env_file requires storage.object_store_from_env = true");
+    }
+    if !storage.object_store_from_env && storage.slatedb_name.is_some() {
+        bail!("storage.slatedb_name requires storage.object_store_from_env = true");
+    }
+    ensure_optional_non_empty(storage.data_dir.as_deref(), "storage.data_dir")?;
+    ensure_optional_non_empty(
+        storage.object_store_env_file.as_deref(),
+        "storage.object_store_env_file",
+    )?;
+    ensure_optional_non_empty(storage.slatedb_name.as_deref(), "storage.slatedb_name")?;
     ensure_optional_non_empty(storage.slatedb_config.as_deref(), "storage.slatedb_config")?;
     ensure_optional_non_empty(
         storage.slatedb_env_prefix.as_deref(),
         "storage.slatedb_env_prefix",
+    )?;
+    ensure_optional_positive_u64(
+        storage.slatedb_close_timeout_ms,
+        "storage.slatedb_close_timeout_ms",
     )?;
     ensure_optional_positive_usize(
         storage.zset_compaction_max_chain_len,
@@ -132,6 +171,54 @@ fn validate_maintenance_config(maintenance: &MaintenanceConfig) -> Result<()> {
     for (index, namespace) in maintenance.gc_namespace.iter().enumerate() {
         ensure_non_empty(namespace, &format!("maintenance.gc_namespace[{index}]"))?;
     }
+    Ok(())
+}
+
+fn validate_replication_config(replication: &ReplicationConfig) -> Result<()> {
+    ensure_positive_usize(
+        replication.kafka.message_max_bytes,
+        "replication.kafka.message_max_bytes",
+    )?;
+    ensure_non_empty(&replication.kafka.acks, "replication.kafka.acks")?;
+    ensure_positive_usize(replication.kafka.batch_size, "replication.kafka.batch_size")?;
+    ensure_positive_usize(
+        replication.kafka.batch_num_messages,
+        "replication.kafka.batch_num_messages",
+    )?;
+    ensure_positive_usize(
+        replication.encoding.arrow_ipc_rows_per_record,
+        "replication.encoding.arrow_ipc_rows_per_record",
+    )?;
+    ensure_positive_usize(
+        replication.encoding.snapshot_batches_per_chunk,
+        "replication.encoding.snapshot_batches_per_chunk",
+    )?;
+    Ok(())
+}
+
+fn validate_postgres_cdc_config(postgres_cdc: &PostgresCdcConfig) -> Result<()> {
+    let snapshot = &postgres_cdc.snapshot;
+    ensure_positive_usize(
+        snapshot.rows_per_batch,
+        "postgres_cdc.snapshot.rows_per_batch",
+    )?;
+    ensure_positive_usize(snapshot.max_workers, "postgres_cdc.snapshot.max_workers")?;
+    ensure_positive_usize(
+        snapshot.intra_table_chunks,
+        "postgres_cdc.snapshot.intra_table_chunks",
+    )?;
+    ensure_positive_usize(snapshot.min_workers, "postgres_cdc.snapshot.min_workers")?;
+    if !(1..=100).contains(&snapshot.wal_buffer_high_watermark_percent) {
+        bail!("postgres_cdc.snapshot.wal_buffer_high_watermark_percent must be between 1 and 100");
+    }
+    if snapshot.wal_buffer_low_watermark_percent > 100 {
+        bail!("postgres_cdc.snapshot.wal_buffer_low_watermark_percent must be <= 100");
+    }
+    ensure_positive_u64(snapshot.slow_scan_ms, "postgres_cdc.snapshot.slow_scan_ms")?;
+    ensure_positive_u64(
+        snapshot.controller_interval_ms,
+        "postgres_cdc.snapshot.controller_interval_ms",
+    )?;
     Ok(())
 }
 
@@ -449,6 +536,47 @@ fn ensure_optional_positive_u64(value: Option<u64>, field_path: &str) -> Result<
     if let Some(value) = value
         && value == 0
     {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_u16(value: Option<u16>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value == 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_positive_i64(value: Option<i64>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value <= 0
+    {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_optional_nonnegative_i32(value: Option<i32>, field_path: &str) -> Result<()> {
+    if let Some(value) = value
+        && value < 0
+    {
+        bail!("{field_path} must be greater than or equal to 0");
+    }
+    Ok(())
+}
+
+fn ensure_positive_usize(value: usize, field_path: &str) -> Result<()> {
+    if value == 0 {
+        bail!("{field_path} must be greater than 0");
+    }
+    Ok(())
+}
+
+fn ensure_positive_u64(value: u64, field_path: &str) -> Result<()> {
+    if value == 0 {
         bail!("{field_path} must be greater than 0");
     }
     Ok(())

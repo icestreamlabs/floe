@@ -55,7 +55,7 @@ pub(super) fn build_transient_transform_receiver(
     let task_label = task_label.into();
     let task_events = task_events.clone();
     let cancel = cancel.clone();
-    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
+    let debug_transient_join = tracing::enabled!(tracing::Level::DEBUG);
     tokio::spawn(async move {
         loop {
             tokio::select! {

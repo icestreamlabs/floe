@@ -289,15 +289,12 @@ default_source = "nexmark_bid"
     std::fs::write(&config_path, config).context("write crash config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
-    let mut first = spawn_node_with_env(
+    let mut first = spawn_node_with_args(
         &config_path,
         &data_dir,
         pg_port,
         Some(MV_SQL),
-        &[(
-            "FLOE_TEST_PRE_TICK_COMMIT_DELAY_MS".to_string(),
-            "3000".to_string(),
-        )],
+        &["--pre-tick-commit-delay-ms", "3000"],
     )
     .await?;
     wait_for_healthz(&http_addr).await?;
@@ -333,31 +330,33 @@ async fn spawn_node(
     pg_port: u16,
     mv_sql: Option<&str>,
 ) -> Result<Child> {
-    spawn_node_with_env(config_path, data_dir, pg_port, mv_sql, &[]).await
+    spawn_node_with_args(config_path, data_dir, pg_port, mv_sql, &[]).await
 }
 
-async fn spawn_node_with_env(
+async fn spawn_node_with_args(
     config_path: &Path,
     data_dir: &Path,
     pg_port: u16,
     mv_sql: Option<&str>,
-    extra_env: &[(String, String)],
+    extra_args: &[&str],
 ) -> Result<Child> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
+    cmd.arg("run");
     if pg_port > 0 {
-        cmd.env("FLOE_PG_ADDR", format!("127.0.0.1:{pg_port}"));
+        cmd.arg("--pgwire-addr").arg(format!("127.0.0.1:{pg_port}"));
     } else {
-        cmd.env("FLOE_DISABLE_PGWIRE", "1");
+        cmd.arg("--disable-pgwire");
     }
-    cmd.env("FLOE_DATA_DIR", data_dir)
-        .env("FLOE_ADMIN_PORT", "0")
-        .arg("run")
+    cmd.arg("--data-dir")
+        .arg(data_dir)
+        .arg("--admin-port")
+        .arg("0")
         .arg("--config")
         .arg(config_path.to_string_lossy().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for (key, value) in extra_env {
-        cmd.env(key, value);
+    for arg in extra_args {
+        cmd.arg(arg);
     }
     if let Some(sql) = mv_sql {
         cmd.arg("--mv-query").arg(sql);

@@ -201,7 +201,7 @@ impl TransientTopNProcessor {
             row_key_cache: (!append_only_input).then(HashMap::new),
             order_index: BTreeMap::new(),
             partition_output_cache: BTreeMap::new(),
-            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
         }
     }
@@ -441,7 +441,7 @@ impl TransientAppendOnlyTopNProcessor {
             order_value_types: Arc::clone(&key_layout.order_types),
             order_specs,
             limit: topn.limit(),
-            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
             partitions: HashMap::new(),
         }
@@ -886,7 +886,7 @@ impl TransientBatchTopNProcessor {
             limit: topn.limit(),
             row_key_cache: (!append_only_input).then(HashMap::new),
             partitions: HashMap::new(),
-            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
         }
     }
@@ -1291,7 +1291,7 @@ impl TransientDirectInt64TopNProcessor {
             limit: topn.limit(),
             row_key_cache: HashMap::new(),
             partitions: HashMap::new(),
-            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
         }
     }
@@ -1690,7 +1690,7 @@ impl TransientDirectTop1Processor {
             compact_append_only_state,
             row_key_cache: HashMap::new(),
             partitions: HashMap::new(),
-            profile_enabled: std::env::var_os("FLOE_PROFILE_TRANSIENT_TOPN").is_some(),
+            profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
         }
     }
@@ -2452,7 +2452,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
     let task_events = task_events.clone();
     let cancel = cancel.clone();
     let state_label = state_label.into();
-    let debug_transient_join = std::env::var_os("FLOE_DEBUG_TRANSIENT_JOIN").is_some();
+    let debug_transient_join = tracing::enabled!(tracing::Level::DEBUG);
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
         let mut processor =
             TransientDirectTop1Processor::new(graph_id.clone(), config, compact_append_only_state);

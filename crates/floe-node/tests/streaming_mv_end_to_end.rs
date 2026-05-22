@@ -23,9 +23,11 @@ async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
 
     let binary = env!("CARGO_BIN_EXE_floe-node");
     let mut child = Command::new(binary)
-        .env("FLOE_PG_ADDR", &addr)
-        .env("FLOE_ADMIN_PORT", "0")
-        // .env("FLOE_DATA_DIR", data_dir.path())
+        .arg("run")
+        .arg("--pgwire-addr")
+        .arg(&addr)
+        .arg("--admin-port")
+        .arg("0")
         .arg("--events-per-second")
         .arg("1000")
         .arg("--max-events")

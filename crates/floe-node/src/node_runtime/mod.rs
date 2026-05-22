@@ -24,6 +24,8 @@ use floe_cdc_pg::{
     PostgresTransactionAssembler, config_with_stored_cdc_checkpoint,
     create_pgoutput_slot_with_exported_snapshot,
 };
+#[cfg(test)]
+use floe_core::catalog::ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode;
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
     PostgresCdcSchemaEvolutionPolicy as CatalogPostgresCdcSchemaEvolutionPolicy,
@@ -35,8 +37,6 @@ use floe_core::catalog::{
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
     TableDefinition,
 };
-#[cfg(test)]
-use floe_core::catalog::ReplicationErrorPolicyMode as CatalogReplicationErrorPolicyMode;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
@@ -45,8 +45,9 @@ use floe_executor::source_journal::SourceBatchJournal;
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
-    OuterStreamRegistry, OverlaySnapshotConfig, SourceRowDecoder, SourceTableProvider,
-    ValidatedPlan, plan_source_requirements, source_batch_journal_root_sources, validate_dbsp_plan,
+    OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig, SourceRowDecoder,
+    SourceTableProvider, TailExecutionConfig, ValidatedPlan, plan_source_requirements,
+    source_batch_journal_root_sources_with_config, validate_dbsp_plan,
 };
 use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
 use floe_node_core::connector::{ConnectorContext, run_connector};
@@ -81,21 +82,19 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{
+use crate::{cli, http_ingest, metrics, sinks};
+use floe_config as config;
+use floe_config::{
     ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
-    SinkConfig, SinkSpec, SourceJournalConfig, apply_connector_properties, load_config,
-    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
-    sink_spec_from_sql,
+    PostgresCdcSnapshotConfig, SinkConfig, SinkSpec, SourceJournalConfig,
+    apply_connector_properties, load_config, materialized_view_definitions_from_config,
+    normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
-use crate::{cli, config, http_ingest, metrics, sinks};
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
-const SLATEDB_CONFIG_ENV: &str = "FLOE_SLATEDB_CONFIG";
-const SLATEDB_ENV_PREFIX_ENV: &str = "FLOE_SLATEDB_ENV_PREFIX";
-const DEFAULT_SLATEDB_ENV_PREFIX: &str = "SLATEDB_";
 const DEFAULT_EVENTS_PER_SECOND: f64 = 10.0;
 const DEFAULT_MV_RETAIN_LAST: usize = 1;
 const DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN: usize = 512;
@@ -111,11 +110,10 @@ const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INGEST_BATCH_SIZE: usize = 256;
 const DEFAULT_INGEST_BATCH_PER_SOURCE: usize = 64;
 const DEFAULT_INGEST_BATCH_PER_CONNECTOR: usize = 64;
+const DEFAULT_PGWIRE_ADDR: &str = "127.0.0.1:6432";
 const DEFAULT_ADMIN_PORT: u16 = 8081;
 const CHECKPOINT_GRAPH_ID: &str = "floe_runtime";
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
-const ADMIN_PORT_ENV: &str = "FLOE_ADMIN_PORT";
-const SLATEDB_CLOSE_TIMEOUT_MS_ENV: &str = "FLOE_SLATEDB_CLOSE_TIMEOUT_MS";
 const DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
 
