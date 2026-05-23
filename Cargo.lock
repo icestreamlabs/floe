@@ -2210,6 +2210,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "axum",
+ "bytes",
  "clap",
  "datafusion",
  "dbsp",

@@ -20,6 +20,7 @@ floe-cdc-core = { path = "../floe-cdc-core" }
 floe-cdc-pg = { path = "../floe-cdc-pg" }
 dbsp = { path = "../dbsp" }
 anyhow = { workspace = true }
+bytes = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }

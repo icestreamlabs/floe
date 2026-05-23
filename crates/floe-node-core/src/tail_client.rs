@@ -15,7 +15,15 @@ pub struct TailConfig {
 }
 
 pub fn build_tail_sql(mv: &str, with_snapshot: bool, as_of: Option<i64>) -> String {
-    let mut sql = format!("TAIL {mv}");
+    build_stream_sql("TAIL", mv, with_snapshot, as_of)
+}
+
+pub fn build_subscribe_sql(mv: &str, with_snapshot: bool, as_of: Option<i64>) -> String {
+    build_stream_sql("SUBSCRIBE", mv, with_snapshot, as_of)
+}
+
+fn build_stream_sql(keyword: &str, mv: &str, with_snapshot: bool, as_of: Option<i64>) -> String {
+    let mut sql = format!("{keyword} {mv}");
     if with_snapshot {
         sql.push_str(" WITH SNAPSHOT");
     }
@@ -286,6 +294,10 @@ mod tests {
         assert_eq!(
             build_tail_sql("mv_q1", true, Some(42)),
             "TAIL mv_q1 WITH SNAPSHOT AS OF 42"
+        );
+        assert_eq!(
+            build_subscribe_sql("mv_q1", true, Some(42)),
+            "SUBSCRIBE mv_q1 WITH SNAPSHOT AS OF 42"
         );
     }
 

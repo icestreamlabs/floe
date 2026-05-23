@@ -241,7 +241,8 @@ Execution semantics:
 
 - Kafka/File/HTTP rows are flushed on threshold, MV version boundary, and shutdown.
 - Postgres applies each MV version in one transaction and checkpoints after
-  commit.
+  commit. The sink uses temporary text staging tables loaded by
+  `COPY FROM STDIN`, then applies a bulk delete/upsert or append statement.
 - Kafka and HTTP sinks retry transient failures with bounded exponential backoff.
 - Permanent failures are recorded and stop the sink task.
 - Backpressure is applied via bounded queues for queued sinks and directly by

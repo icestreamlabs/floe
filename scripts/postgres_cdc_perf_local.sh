@@ -1296,10 +1296,31 @@ kafka_stream_seconds="$(awk -F= '$1 == "cdc_counter.stream_seconds" { print $2; 
 kafka_post_stream_wait_seconds="$(awk -F= '$1 == "cdc_counter.post_stream_wait_seconds" { print $2; exit }' "${COUNTER_LOG}")"
 kafka_stream_rows_per_second="$(awk -F= '$1 == "cdc_counter.stream_rows_per_second" { print $2; exit }' "${COUNTER_LOG}")"
 kafka_stream_mb_per_second="$(awk -F= '$1 == "cdc_counter.stream_mb_per_second" { print $2; exit }' "${COUNTER_LOG}")"
+consumer_wall_source_rows_per_second=""
+kafka_stream_source_rows_per_second=""
+harness_overhead_percent=""
+message_multiplier=""
+postgres_load_rows_per_second=""
+postgres_live_write_rows_per_second=""
 if [[ -n "${kafka_stream_seconds}" ]]; then
+  kafka_stream_source_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${kafka_stream_seconds} }")"
   harness_overhead_seconds="$(awk "BEGIN { value = ${end_to_end_seconds} - ${kafka_stream_seconds}; if (value < 0) value = 0; printf \"%.3f\", value }")"
+  harness_overhead_percent="$(awk "BEGIN { printf \"%.1f\", (${harness_overhead_seconds} / ${end_to_end_seconds}) * 100 }")"
 else
   harness_overhead_seconds=""
+fi
+if [[ -n "${kafka_counter_wall_seconds}" ]]; then
+  consumer_wall_source_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${kafka_counter_wall_seconds} }")"
+fi
+if (( source_rows > 0 )); then
+  message_multiplier="$(awk "BEGIN { printf \"%.3f\", ${expected_messages} / ${source_rows} }")"
+fi
+if (( initial_rows > 0 )); then
+  postgres_load_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${initial_rows} / (${load_seconds} > 0.001 ? ${load_seconds} : 0.001) }")"
+fi
+live_rows=$((live_insert_rows + live_update_rows))
+if (( live_rows > 0 )); then
+  postgres_live_write_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${live_rows} / (${live_write_seconds} > 0.001 ? ${live_write_seconds} : 0.001) }")"
 fi
 
 {
@@ -1342,8 +1363,14 @@ fi
   echo "benchmark.kafka_stream_seconds=${kafka_stream_seconds}"
   echo "benchmark.kafka_post_stream_wait_seconds=${kafka_post_stream_wait_seconds}"
   echo "benchmark.kafka_stream_rows_per_second=${kafka_stream_rows_per_second}"
+  echo "benchmark.kafka_stream_source_rows_per_second=${kafka_stream_source_rows_per_second}"
   echo "benchmark.kafka_stream_mb_per_second=${kafka_stream_mb_per_second}"
   echo "benchmark.harness_overhead_seconds=${harness_overhead_seconds}"
+  echo "benchmark.harness_overhead_percent=${harness_overhead_percent}"
+  echo "benchmark.consumer_wall_source_rows_per_second=${consumer_wall_source_rows_per_second}"
+  echo "benchmark.message_multiplier=${message_multiplier}"
+  echo "benchmark.postgres_load_rows_per_second=${postgres_load_rows_per_second}"
+  echo "benchmark.postgres_live_write_rows_per_second=${postgres_live_write_rows_per_second}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"

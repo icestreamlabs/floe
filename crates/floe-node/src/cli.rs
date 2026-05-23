@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use floe_node_core::tail_client::{TailConfig, build_tail_sql};
+use floe_node_core::tail_client::{TailConfig, build_subscribe_sql, build_tail_sql};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -8,7 +8,7 @@ use floe_node_core::tail_client::{TailConfig, build_tail_sql};
     version,
     about = "Floe node entrypoint",
     long_about = "Run and tail a single-node streaming SQL runtime.",
-    after_long_help = "Examples:\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n  floe-node run --config ./floe.toml\n  floe-node tail --mv mv\n  floe-node tail --sql \"TAIL mv WITH (SNAPSHOT)\""
+    after_long_help = "Examples:\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n  floe-node run --config ./floe.toml\n  floe-node tail --mv mv\n  floe-node subscribe --mv mv --with-snapshot\n  floe-node tail --sql \"TAIL mv WITH SNAPSHOT\""
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,6 +20,7 @@ pub struct Cli {
 pub enum Command {
     Run(RunArgs),
     Tail(TailArgs),
+    Subscribe(SubscribeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -333,6 +334,33 @@ pub struct TailArgs {
     pub no_header: bool,
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_long_help = "Examples:\n  # Subscribe by materialized view name\n  floe-node subscribe --mv mv_bid\n\n  # Subscribe with an initial snapshot\n  floe-node subscribe --mv mv_bid --with-snapshot\n\n  # Subscribe by explicit SQL\n  floe-node subscribe --sql \"SUBSCRIBE mv_bid WITH SNAPSHOT\""
+)]
+pub struct SubscribeArgs {
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    #[arg(long, default_value_t = 6432)]
+    pub port: u16,
+    #[arg(long, default_value = "postgres")]
+    pub user: String,
+    #[arg(long, default_value = "postgres")]
+    pub database: String,
+    #[arg(long, required_unless_present = "sql", conflicts_with = "sql")]
+    pub mv: Option<String>,
+    #[arg(long, required_unless_present = "mv", conflicts_with = "mv")]
+    pub sql: Option<String>,
+    #[arg(long)]
+    pub with_snapshot: bool,
+    #[arg(long)]
+    pub as_of: Option<i64>,
+    #[arg(long)]
+    pub max_rows: Option<usize>,
+    #[arg(long)]
+    pub no_header: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 pub enum OutputConsolidationMode {
     AllColumns,
@@ -349,6 +377,30 @@ impl TailArgs {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--mv is required when --sql is not set"))?;
                 build_tail_sql(mv, self.with_snapshot, self.as_of)
+            }
+        };
+        Ok(TailConfig {
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            database: self.database.clone(),
+            sql,
+            max_rows: self.max_rows,
+            no_header: self.no_header,
+        })
+    }
+}
+
+impl SubscribeArgs {
+    pub fn to_config(&self) -> anyhow::Result<TailConfig> {
+        let sql = match self.sql.as_ref() {
+            Some(sql) => sql.to_string(),
+            None => {
+                let mv = self
+                    .mv
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--mv is required when --sql is not set"))?;
+                build_subscribe_sql(mv, self.with_snapshot, self.as_of)
             }
         };
         Ok(TailConfig {
@@ -457,5 +509,16 @@ mod tests {
         assert!(help.contains("Tail by materialized view name"));
         assert!(help.contains("Tail by explicit SQL"));
         assert!(help.contains("--as-of 42 --with-snapshot"));
+    }
+
+    #[test]
+    fn subscribe_help_includes_examples() {
+        let mut cmd = Cli::command();
+        let subscribe = cmd
+            .find_subcommand_mut("subscribe")
+            .expect("subscribe subcommand should exist");
+        let help = subscribe.render_long_help().to_string();
+        assert!(help.contains("Subscribe by materialized view name"));
+        assert!(help.contains("SUBSCRIBE mv_bid WITH SNAPSHOT"));
     }
 }

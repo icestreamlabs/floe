@@ -9,6 +9,7 @@ semantics for materialized views and TAIL.
 - `CREATE TABLE <name> (<columns...>, PRIMARY KEY (...))`
 - `CREATE SINK <sink_name> FROM <mv_name> WITH (<options>)`
 - `TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]`
+- `SUBSCRIBE <mv_name> [WITH SNAPSHOT] [AS OF <version>]`
 - `SELECT ... FROM <materialized_view>` (read-only queries via pgwire)
 
 ## SQL Program Parsing
@@ -19,7 +20,8 @@ semantics for materialized views and TAIL.
   - `CREATE TABLE`
   - `CREATE MATERIALIZED VIEW`
   - `CREATE SINK`
-- `TAIL` remains a query-time statement and is not valid in `--mv-query`.
+- `TAIL` and `SUBSCRIBE` remain query-time statements and are not valid in
+  `--mv-query`.
 
 ## Materialized View Definition Rules
 
@@ -49,7 +51,7 @@ Syntax:
 CREATE SINK <sink_name>
 FROM <mv_name>
 WITH (
-  connector = '<kafka|file|http>',
+  connector = '<kafka|file|http|postgres>',
   ... connector/reliability options ...
 )
 ```
@@ -59,6 +61,7 @@ Connector options:
 - Kafka: `brokers`, `topic`
 - File: `path`, optional `append`
 - HTTP: `url`, optional `batch_size`
+- Postgres: `connection`, `table`, optional `mode`, `primary_key`
 
 Common tail options:
 
@@ -70,13 +73,15 @@ Reliability options:
 - `batch_rows` (flush threshold by row count)
 - `batch_bytes` (flush threshold by serialized payload bytes)
 - `queue_capacity` (bounded sink queue size)
-- `retry_max_attempts` (Kafka/HTTP)
-- `retry_base_ms` (Kafka/HTTP)
-- `retry_max_backoff_ms` (Kafka/HTTP)
+- `retry_max_attempts` (Kafka/HTTP/Postgres)
+- `retry_base_ms` (Kafka/HTTP/Postgres)
+- `retry_max_backoff_ms` (Kafka/HTTP/Postgres)
 
 Sink execution behavior:
 
 - Flush occurs when a threshold is hit, on each tail tick boundary, and on shutdown.
+- Postgres applies each MV version in one transaction using temporary COPY
+  staging tables, then bulk delete/upsert or append SQL.
 - Kafka/HTTP emission retries use bounded exponential backoff.
 - On permanent Kafka/HTTP failures, sink execution stops and the sink task exits with error.
 - Bounded sink queues apply backpressure when consumers fall behind.
@@ -134,15 +139,19 @@ Unsupported constructs with concrete errors:
   epoch) when available. If no event timestamps have been observed yet, it
   falls back to the wall-clock commit time.
 
-## TAIL Semantics
+## TAIL and SUBSCRIBE Semantics
 
-`TAIL` streams **delta updates** (row-level diffs) for each version
-in ascending version order.
+`TAIL` and `SUBSCRIBE` stream **delta updates** (row-level diffs) for each
+version in ascending version order. They share the same snapshot/as-of
+semantics and output shape. `SUBSCRIBE` is the preferred pgwire spelling for
+new clients; `TAIL` remains supported for compatibility with existing Floe
+tools.
 
 Syntax:
 
 ```
 TAIL <mv_name> [WITH SNAPSHOT] [AS OF <version>]
+SUBSCRIBE <mv_name> [WITH SNAPSHOT] [AS OF <version>]
 ```
 
 Behavior:
@@ -166,6 +175,23 @@ Output columns (in order):
 4) User-defined columns from the materialized view
 
 Row order within a version is not guaranteed; versions are emitted in order.
+
+The node CLI exposes both forms:
+
+```bash
+floe-node tail --mv mv_orders --with-snapshot
+floe-node subscribe --mv mv_orders --with-snapshot
+```
+
+The admin HTTP server also exposes the single registered materialized view as
+Server-Sent Events:
+
+```bash
+curl -N 'http://127.0.0.1:8080/mv?with_snapshot=true'
+```
+
+Each SSE message has event type `mv_change` and JSON data containing `mv`,
+`version`, `diff`, `time`, and `row`.
 
 
 ## Schema Evolution

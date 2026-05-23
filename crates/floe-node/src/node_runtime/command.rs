@@ -9,5 +9,10 @@ pub(super) fn parse_run_command() -> anyhow::Result<Option<cli::RunArgs>> {
             tail_client::run(config)?;
             Ok(None)
         }
+        cli::Command::Subscribe(args) => {
+            let config = args.to_config()?;
+            tail_client::run(config)?;
+            Ok(None)
+        }
     }
 }

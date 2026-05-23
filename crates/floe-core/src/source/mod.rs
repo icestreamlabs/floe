@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::catalog::ColumnType;
@@ -192,8 +192,27 @@ impl SourceRegistry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceEvent {
+    source: String,
+    body: SourceEventBody,
+    resume_token: Option<SourceResumeToken>,
+    event_time_ms: Option<u64>,
+    source_id: Option<usize>,
+    kafka_topic: Option<Arc<str>>,
+    kafka_partition: Option<i32>,
+    kafka_offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SourceEventBody {
+    Json(Value),
+    PreencodedRowKey(Vec<u8>),
+    Empty,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourceEventSerde {
     source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<Value>,
@@ -201,16 +220,46 @@ pub struct SourceEvent {
     resume_token: Option<SourceResumeToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_time_ms: Option<u64>,
-    #[serde(skip)]
-    preencoded_row_key: Option<Vec<u8>>,
-    #[serde(skip)]
-    source_id: Option<usize>,
-    #[serde(skip)]
-    kafka_topic: Option<Arc<str>>,
-    #[serde(skip)]
-    kafka_partition: Option<i32>,
-    #[serde(skip)]
-    kafka_offset: Option<i64>,
+}
+
+impl Serialize for SourceEvent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SourceEventSerde {
+            source: self.source.clone(),
+            payload: match &self.body {
+                SourceEventBody::Json(payload) => Some(payload.clone()),
+                SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+            },
+            resume_token: self.resume_token.clone(),
+            event_time_ms: self.event_time_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceEvent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = SourceEventSerde::deserialize(deserializer)?;
+        Ok(Self {
+            source: decoded.source,
+            body: decoded
+                .payload
+                .map(SourceEventBody::Json)
+                .unwrap_or(SourceEventBody::Empty),
+            resume_token: decoded.resume_token,
+            event_time_ms: decoded.event_time_ms,
+            source_id: None,
+            kafka_topic: None,
+            kafka_partition: None,
+            kafka_offset: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -242,10 +291,9 @@ impl SourceEvent {
     pub fn new(source: impl Into<String>, payload: Value) -> Self {
         Self {
             source: source.into(),
-            payload: Some(payload),
+            body: SourceEventBody::Json(payload),
             resume_token: None,
             event_time_ms: None,
-            preencoded_row_key: None,
             source_id: None,
             kafka_topic: None,
             kafka_partition: None,
@@ -256,10 +304,9 @@ impl SourceEvent {
     pub fn preencoded(source: impl Into<String>, preencoded_row_key: Vec<u8>) -> Self {
         Self {
             source: source.into(),
-            payload: None,
+            body: SourceEventBody::PreencodedRowKey(preencoded_row_key),
             resume_token: None,
             event_time_ms: None,
-            preencoded_row_key: Some(preencoded_row_key),
             source_id: None,
             kafka_topic: None,
             kafka_partition: None,
@@ -270,10 +317,9 @@ impl SourceEvent {
     pub fn preencoded_for_source_id(source_id: usize, preencoded_row_key: Vec<u8>) -> Self {
         Self {
             source: String::new(),
-            payload: None,
+            body: SourceEventBody::PreencodedRowKey(preencoded_row_key),
             resume_token: None,
             event_time_ms: None,
-            preencoded_row_key: Some(preencoded_row_key),
             source_id: Some(source_id),
             kafka_topic: None,
             kafka_partition: None,
@@ -290,7 +336,10 @@ impl SourceEvent {
     }
 
     pub fn payload(&self) -> Option<&Value> {
-        self.payload.as_ref()
+        match &self.body {
+            SourceEventBody::Json(payload) => Some(payload),
+            SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+        }
     }
 
     pub fn resume_token(&self) -> Option<&SourceResumeToken> {
@@ -327,27 +376,38 @@ impl SourceEvent {
     }
 
     pub fn preencoded_row_key(&self) -> Option<&[u8]> {
-        self.preencoded_row_key.as_deref()
+        match &self.body {
+            SourceEventBody::PreencodedRowKey(row_key) => Some(row_key.as_slice()),
+            SourceEventBody::Json(_) | SourceEventBody::Empty => None,
+        }
     }
 
     pub fn with_preencoded_row_key(mut self, preencoded_row_key: Vec<u8>) -> Self {
-        self.payload = None;
-        self.preencoded_row_key = Some(preencoded_row_key);
+        self.body = SourceEventBody::PreencodedRowKey(preencoded_row_key);
         self
     }
 
     pub fn take_preencoded_row_key(&mut self) -> Option<Vec<u8>> {
-        self.preencoded_row_key.take()
+        match std::mem::replace(&mut self.body, SourceEventBody::Empty) {
+            SourceEventBody::PreencodedRowKey(row_key) => Some(row_key),
+            other => {
+                self.body = other;
+                None
+            }
+        }
     }
 
     pub fn into_payload(self) -> Option<Value> {
-        self.payload
+        match self.body {
+            SourceEventBody::Json(payload) => Some(payload),
+            SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+        }
     }
 
     pub fn to_json_value(&self) -> Value {
         json!({
             "source": self.source,
-            "data": self.payload.clone().unwrap_or(Value::Null),
+            "data": self.payload().cloned().unwrap_or(Value::Null),
         })
     }
 
@@ -408,6 +468,42 @@ mod tests {
         assert!(serialized.contains("nexmark_person"));
         assert!(serialized.contains("id"));
         assert!(serialized.contains("42"));
+    }
+
+    #[test]
+    fn source_event_body_separates_json_and_preencoded_rows() {
+        let json_event = SourceEvent::new("orders", json!({"id": 7}));
+        assert_eq!(json_event.payload(), Some(&json!({"id": 7})));
+        assert!(json_event.preencoded_row_key().is_none());
+
+        let mut preencoded = SourceEvent::preencoded_for_source_id(3, vec![1, 2, 3]);
+        assert_eq!(preencoded.source_id(), Some(3));
+        assert!(preencoded.payload().is_none());
+        assert_eq!(preencoded.preencoded_row_key(), Some(&[1, 2, 3][..]));
+        assert_eq!(preencoded.take_preencoded_row_key(), Some(vec![1, 2, 3]));
+        assert!(preencoded.preencoded_row_key().is_none());
+        assert!(preencoded.into_payload().is_none());
+    }
+
+    #[test]
+    fn source_event_serde_keeps_external_shape() {
+        let event = SourceEvent::new("orders", json!({"id": 7}))
+            .with_resume_token(SourceResumeToken::File { cursor: 11 })
+            .with_event_time_ms(99);
+
+        let encoded = serde_json::to_value(&event).expect("serialize source event");
+        assert_eq!(encoded["source"], "orders");
+        assert_eq!(encoded["payload"], json!({"id": 7}));
+        assert_eq!(encoded["event_time_ms"], 99);
+
+        let decoded: SourceEvent = serde_json::from_value(encoded).expect("decode source event");
+        assert_eq!(decoded.source(), "orders");
+        assert_eq!(decoded.payload(), Some(&json!({"id": 7})));
+        assert_eq!(decoded.event_time_ms(), Some(99));
+        assert!(matches!(
+            decoded.resume_token(),
+            Some(SourceResumeToken::File { cursor: 11 })
+        ));
     }
 
     #[test]

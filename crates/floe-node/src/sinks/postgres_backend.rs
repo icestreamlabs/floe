@@ -1,11 +1,16 @@
 use std::collections::HashSet;
 
 use anyhow::ensure;
-use futures::StreamExt;
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
-use tokio_postgres::types::ToSql;
 
 use super::*;
+
+const POSTGRES_COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const POSTGRES_INSERT_STAGE_TABLE: &str = "floe_sink_stage_rows";
+const POSTGRES_DELETE_STAGE_TABLE: &str = "floe_sink_stage_deletes";
+const POSTGRES_STAGE_ROW_INDEX_COLUMN: &str = "__floe_row_idx";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostgresSinkMode {
@@ -140,11 +145,19 @@ impl PostgresSinkWriter {
         );
         let target_table = quote_postgres_qualified_name(table)?;
         let insert_sql = match mode {
-            PostgresSinkMode::Upsert => postgres_upsert_sql(&schema, table)?,
-            PostgresSinkMode::AppendOnly => postgres_append_insert_sql(&schema, table)?,
+            PostgresSinkMode::Upsert => {
+                postgres_upsert_from_stage_sql(&schema, table, POSTGRES_INSERT_STAGE_TABLE)?
+            }
+            PostgresSinkMode::AppendOnly => {
+                postgres_append_insert_from_stage_sql(&schema, table, POSTGRES_INSERT_STAGE_TABLE)?
+            }
         };
         let delete_sql = match mode {
-            PostgresSinkMode::Upsert => Some(postgres_delete_sql(&schema, table)?),
+            PostgresSinkMode::Upsert => Some(postgres_delete_using_stage_sql(
+                &schema,
+                table,
+                POSTGRES_DELETE_STAGE_TABLE,
+            )?),
             PostgresSinkMode::AppendOnly => None,
         };
         Ok(Self {
@@ -180,51 +193,73 @@ impl PostgresSinkWriter {
             .transaction()
             .await
             .with_context(|| format!("start Postgres sink transaction for {target_table}"))?;
-        let insert_statement = transaction
-            .prepare(&insert_sql)
-            .await
-            .with_context(|| format!("prepare Postgres sink insert for {target_table}"))?;
-        let delete_statement = if let Some(delete_sql) = &delete_sql {
-            Some(
-                transaction
-                    .prepare(delete_sql)
-                    .await
-                    .with_context(|| format!("prepare Postgres sink delete for {target_table}"))?,
-            )
-        } else {
-            None
-        };
 
         if !actions.deletes.is_empty() {
-            let delete_statement = delete_statement
-                .as_ref()
+            let delete_sql = delete_sql
+                .as_deref()
                 .context("Postgres upsert sink is missing delete statement")?;
-            for params in &actions.deletes {
-                let refs = params
-                    .iter()
-                    .map(PostgresParamValue::as_tosql)
-                    .collect::<Vec<_>>();
-                transaction
-                    .execute(delete_statement, &refs)
-                    .await
-                    .with_context(|| format!("delete MV row from Postgres sink {target_table}"))?;
-            }
+            let key_columns = self
+                .schema
+                .key_column_indexes
+                .iter()
+                .map(|idx| &self.schema.columns[*idx])
+                .collect::<Vec<_>>();
+            create_stage_table(
+                &transaction,
+                POSTGRES_DELETE_STAGE_TABLE,
+                key_columns.len(),
+                false,
+            )
+            .await
+            .with_context(|| {
+                format!("create Postgres sink delete stage table for {target_table}")
+            })?;
+            copy_stage_rows(
+                &transaction,
+                POSTGRES_DELETE_STAGE_TABLE,
+                key_columns.len(),
+                &actions.deletes,
+                false,
+            )
+            .await
+            .with_context(|| format!("COPY delete keys into Postgres sink stage {target_table}"))?;
+            transaction
+                .execute(delete_sql, &[])
+                .await
+                .with_context(|| {
+                    format!("bulk delete MV rows from Postgres sink {target_table}")
+                })?;
         }
 
-        for params in &actions.inserts {
-            let refs = params
-                .iter()
-                .map(PostgresParamValue::as_tosql)
-                .collect::<Vec<_>>();
+        if !actions.inserts.is_empty() {
+            create_stage_table(
+                &transaction,
+                POSTGRES_INSERT_STAGE_TABLE,
+                self.schema.columns.len(),
+                true,
+            )
+            .await
+            .with_context(|| {
+                format!("create Postgres sink insert stage table for {target_table}")
+            })?;
+            copy_stage_rows(
+                &transaction,
+                POSTGRES_INSERT_STAGE_TABLE,
+                self.schema.columns.len(),
+                &actions.inserts,
+                true,
+            )
+            .await
+            .with_context(|| format!("COPY MV rows into Postgres sink stage {target_table}"))?;
             transaction
-                .execute(&insert_statement, &refs)
+                .execute(&insert_sql, &[])
                 .await
                 .with_context(|| match mode {
                     PostgresSinkMode::Upsert => {
-                        format!("upsert MV row into Postgres sink {target_table}")
+                        format!("bulk upsert MV rows into Postgres sink {target_table}")
                     }
                     PostgresSinkMode::AppendOnly => {
-                        format!("insert MV row into append-only Postgres sink {target_table}")
+                        format!("bulk insert MV rows into append-only Postgres sink {target_table}")
                     }
                 })?;
         }
@@ -417,7 +452,7 @@ enum PostgresParamValue {
     Int64(Option<i64>),
     Bool(Option<bool>),
     Text(Option<String>),
-    Float64(Option<f64>),
+    TimestampMillis(Option<i64>),
     Int32(Option<i32>),
 }
 
@@ -427,19 +462,19 @@ impl PostgresParamValue {
             ColumnType::Int64 => Self::Int64(None),
             ColumnType::Bool => Self::Bool(None),
             ColumnType::Utf8 => Self::Text(None),
-            ColumnType::TimestampMillis => Self::Float64(None),
+            ColumnType::TimestampMillis => Self::TimestampMillis(None),
             ColumnType::DateDays => Self::Int32(None),
             ColumnType::Decimal128 { .. } | ColumnType::Numeric => Self::Text(None),
         }
     }
 
-    fn as_tosql(&self) -> &(dyn ToSql + Sync) {
+    fn copy_text(&self) -> Option<String> {
         match self {
-            Self::Int64(value) => value,
-            Self::Bool(value) => value,
-            Self::Text(value) => value,
-            Self::Float64(value) => value,
-            Self::Int32(value) => value,
+            Self::Int64(value) => value.map(|value| value.to_string()),
+            Self::Bool(value) => value.map(|value| value.to_string()),
+            Self::Text(value) => value.clone(),
+            Self::TimestampMillis(value) => value.map(|value| value.to_string()),
+            Self::Int32(value) => value.map(|value| value.to_string()),
         }
     }
 }
@@ -461,7 +496,7 @@ fn postgres_param_from_row_value(
         (ColumnType::Bool, RowValue::Bool(value)) => Ok(PostgresParamValue::Bool(Some(value))),
         (ColumnType::Utf8, RowValue::Utf8(value)) => Ok(PostgresParamValue::Text(Some(value))),
         (ColumnType::TimestampMillis, RowValue::TimestampMillis(value)) => {
-            Ok(PostgresParamValue::Float64(Some(value as f64)))
+            Ok(PostgresParamValue::TimestampMillis(Some(value)))
         }
         (ColumnType::DateDays, RowValue::DateDays(value)) => {
             Ok(PostgresParamValue::Int32(Some(value)))
@@ -479,7 +514,108 @@ fn postgres_param_from_row_value(
     }
 }
 
-fn postgres_append_insert_sql(schema: &PostgresSinkSchema, table: &str) -> Result<String> {
+async fn create_stage_table(
+    transaction: &tokio_postgres::Transaction<'_>,
+    stage_table: &str,
+    column_count: usize,
+    include_row_index: bool,
+) -> Result<()> {
+    let mut columns = (0..column_count)
+        .map(|idx| format!("{} text", quote_postgres_ident(&stage_column_name(idx))))
+        .collect::<Vec<_>>();
+    if include_row_index {
+        columns.push(format!(
+            "{} bigint",
+            quote_postgres_ident(POSTGRES_STAGE_ROW_INDEX_COLUMN)
+        ));
+    }
+    let sql = format!(
+        "CREATE TEMP TABLE {} ({}) ON COMMIT DROP",
+        quote_postgres_ident(stage_table),
+        columns.join(", ")
+    );
+    transaction.batch_execute(&sql).await?;
+    Ok(())
+}
+
+async fn copy_stage_rows(
+    transaction: &tokio_postgres::Transaction<'_>,
+    stage_table: &str,
+    column_count: usize,
+    rows: &[Vec<PostgresParamValue>],
+    include_row_index: bool,
+) -> Result<u64> {
+    let copy_sql = postgres_copy_sql(stage_table, column_count, include_row_index);
+    let mut sink = Box::pin(transaction.copy_in::<_, Bytes>(&copy_sql).await?);
+    let mut buffer = String::with_capacity(POSTGRES_COPY_CHUNK_BYTES.min(64 * 1024));
+    for (row_idx, row) in rows.iter().enumerate() {
+        ensure!(
+            row.len() == column_count,
+            "Postgres sink stage row has {} values, expected {column_count}",
+            row.len()
+        );
+        append_copy_row(&mut buffer, row, include_row_index.then_some(row_idx));
+        if buffer.len() >= POSTGRES_COPY_CHUNK_BYTES {
+            sink.send(Bytes::from(std::mem::take(&mut buffer))).await?;
+        }
+    }
+    if !buffer.is_empty() {
+        sink.send(Bytes::from(buffer)).await?;
+    }
+    let copied = sink.as_mut().finish().await?;
+    Ok(copied)
+}
+
+fn append_copy_row(out: &mut String, row: &[PostgresParamValue], row_idx: Option<usize>) {
+    for (idx, value) in row.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        append_copy_field(out, value.copy_text().as_deref());
+    }
+    if let Some(row_idx) = row_idx {
+        if !row.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&row_idx.to_string());
+    }
+    out.push('\n');
+}
+
+fn append_copy_field(out: &mut String, value: Option<&str>) {
+    let Some(value) = value else {
+        out.push_str("\\N");
+        return;
+    };
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+}
+
+fn postgres_copy_sql(stage_table: &str, column_count: usize, include_row_index: bool) -> String {
+    let mut columns = (0..column_count)
+        .map(|idx| quote_postgres_ident(&stage_column_name(idx)))
+        .collect::<Vec<_>>();
+    if include_row_index {
+        columns.push(quote_postgres_ident(POSTGRES_STAGE_ROW_INDEX_COLUMN));
+    }
+    format!(
+        "COPY {} ({}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        quote_postgres_ident(stage_table),
+        columns.join(", ")
+    )
+}
+
+fn postgres_append_insert_from_stage_sql(
+    schema: &PostgresSinkSchema,
+    table: &str,
+    stage_table: &str,
+) -> Result<String> {
     let table = quote_postgres_qualified_name(table)?;
     let columns = schema
         .columns
@@ -490,16 +626,21 @@ fn postgres_append_insert_sql(schema: &PostgresSinkSchema, table: &str) -> Resul
         .columns
         .iter()
         .enumerate()
-        .map(|(idx, column)| postgres_value_expr(idx + 1, &column.data_type))
+        .map(|(idx, column)| postgres_stage_value_expr("s", idx, &column.data_type))
         .collect::<Vec<_>>();
     Ok(format!(
-        "INSERT INTO {table} ({}) VALUES ({})",
+        "INSERT INTO {table} ({}) SELECT {} FROM {} AS s",
         columns.join(", "),
-        values.join(", ")
+        values.join(", "),
+        quote_postgres_ident(stage_table)
     ))
 }
 
-fn postgres_upsert_sql(schema: &PostgresSinkSchema, table: &str) -> Result<String> {
+fn postgres_upsert_from_stage_sql(
+    schema: &PostgresSinkSchema,
+    table: &str,
+    stage_table: &str,
+) -> Result<String> {
     let table = quote_postgres_qualified_name(table)?;
     let columns = schema
         .columns
@@ -510,7 +651,7 @@ fn postgres_upsert_sql(schema: &PostgresSinkSchema, table: &str) -> Result<Strin
         .columns
         .iter()
         .enumerate()
-        .map(|(idx, column)| postgres_value_expr(idx + 1, &column.data_type))
+        .map(|(idx, column)| postgres_stage_value_expr("s", idx, &column.data_type))
         .collect::<Vec<_>>();
     let primary_keys = schema
         .key_columns
@@ -536,15 +677,35 @@ fn postgres_upsert_sql(schema: &PostgresSinkSchema, table: &str) -> Result<Strin
     } else {
         format!("DO UPDATE SET {}", updates.join(", "))
     };
+    let source_relation = postgres_upsert_stage_relation_sql(schema, stage_table);
     Ok(format!(
-        "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT ({}) {conflict_action}",
+        "INSERT INTO {table} ({}) SELECT {} FROM {source_relation} AS s ON CONFLICT ({}) {conflict_action}",
         columns.join(", "),
         values.join(", "),
         primary_keys.join(", ")
     ))
 }
 
-fn postgres_delete_sql(schema: &PostgresSinkSchema, table: &str) -> Result<String> {
+fn postgres_upsert_stage_relation_sql(schema: &PostgresSinkSchema, stage_table: &str) -> String {
+    let key_refs = schema
+        .key_column_indexes
+        .iter()
+        .map(|idx| quote_postgres_ident(&stage_column_name(*idx)))
+        .collect::<Vec<_>>();
+    format!(
+        "(SELECT DISTINCT ON ({}) * FROM {} ORDER BY {}, {} DESC)",
+        key_refs.join(", "),
+        quote_postgres_ident(stage_table),
+        key_refs.join(", "),
+        quote_postgres_ident(POSTGRES_STAGE_ROW_INDEX_COLUMN)
+    )
+}
+
+fn postgres_delete_using_stage_sql(
+    schema: &PostgresSinkSchema,
+    table: &str,
+    stage_table: &str,
+) -> Result<String> {
     let table = quote_postgres_qualified_name(table)?;
     let predicates = schema
         .key_columns
@@ -562,28 +723,50 @@ fn postgres_delete_sql(schema: &PostgresSinkSchema, table: &str) -> Result<Strin
             let column = &schema.columns[column_idx];
             Ok(format!(
                 "{} = {}",
-                quote_postgres_ident(&column.name),
-                postgres_value_expr(idx + 1, &column.data_type)
+                postgres_target_column_ref("t", &column.name),
+                postgres_stage_value_expr("s", idx, &column.data_type)
             ))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(format!(
-        "DELETE FROM {table} WHERE {}",
+        "DELETE FROM {table} AS t USING {} AS s WHERE {}",
+        quote_postgres_ident(stage_table),
         predicates.join(" AND ")
     ))
 }
 
-fn postgres_value_expr(param_idx: usize, data_type: &ColumnType) -> String {
+fn postgres_stage_value_expr(alias: &str, column_idx: usize, data_type: &ColumnType) -> String {
+    let column = postgres_stage_column_ref(alias, column_idx);
     match data_type {
-        ColumnType::TimestampMillis => {
-            format!("to_timestamp(${param_idx}::double precision / 1000.0)")
-        }
-        ColumnType::DateDays => format!("DATE '1970-01-01' + ${param_idx}::integer"),
+        ColumnType::TimestampMillis => format!("to_timestamp({column}::double precision / 1000.0)"),
+        ColumnType::DateDays => format!("DATE '1970-01-01' + {column}::integer"),
         ColumnType::Decimal128 { .. } | ColumnType::Numeric => {
-            format!("${param_idx}::numeric")
+            format!("{column}::numeric")
         }
-        ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => format!("${param_idx}"),
+        ColumnType::Int64 => format!("{column}::bigint"),
+        ColumnType::Bool => format!("{column}::boolean"),
+        ColumnType::Utf8 => column,
     }
+}
+
+fn postgres_stage_column_ref(alias: &str, column_idx: usize) -> String {
+    format!(
+        "{}.{}",
+        quote_postgres_ident(alias),
+        quote_postgres_ident(&stage_column_name(column_idx))
+    )
+}
+
+fn postgres_target_column_ref(alias: &str, column_name: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_postgres_ident(alias),
+        quote_postgres_ident(column_name)
+    )
+}
+
+fn stage_column_name(idx: usize) -> String {
+    format!("c{idx}")
 }
 
 fn quote_postgres_qualified_name(name: &str) -> Result<String> {
@@ -633,11 +816,13 @@ mod tests {
 
         assert_eq!(
             writer.insert_sql,
-            "INSERT INTO \"public\".\"orders_copy\" (\"id\", \"status\", \"order_date\", \"amount\") VALUES ($1, $2, DATE '1970-01-01' + $3::integer, $4::numeric) ON CONFLICT (\"id\") DO UPDATE SET \"status\" = EXCLUDED.\"status\", \"order_date\" = EXCLUDED.\"order_date\", \"amount\" = EXCLUDED.\"amount\""
+            "INSERT INTO \"public\".\"orders_copy\" (\"id\", \"status\", \"order_date\", \"amount\") SELECT \"s\".\"c0\"::bigint, \"s\".\"c1\", DATE '1970-01-01' + \"s\".\"c2\"::integer, \"s\".\"c3\"::numeric FROM (SELECT DISTINCT ON (\"c0\") * FROM \"floe_sink_stage_rows\" ORDER BY \"c0\", \"__floe_row_idx\" DESC) AS s ON CONFLICT (\"id\") DO UPDATE SET \"status\" = EXCLUDED.\"status\", \"order_date\" = EXCLUDED.\"order_date\", \"amount\" = EXCLUDED.\"amount\""
         );
         assert_eq!(
             writer.delete_sql.as_deref(),
-            Some("DELETE FROM \"public\".\"orders_copy\" WHERE \"id\" = $1")
+            Some(
+                "DELETE FROM \"public\".\"orders_copy\" AS t USING \"floe_sink_stage_deletes\" AS s WHERE \"t\".\"id\" = \"s\".\"c0\"::bigint"
+            )
         );
 
         let amounts = Decimal128Array::from(vec![Some(12345_i128), Some(999_i128)])
@@ -674,6 +859,21 @@ mod tests {
                 PostgresParamValue::Text(Some("9.99".to_string())),
             ]]
         );
+    }
+
+    #[test]
+    fn postgres_stage_copy_rows_quote_values_and_nulls() {
+        let row = vec![
+            PostgresParamValue::Int64(Some(7)),
+            PostgresParamValue::Text(Some("a,\"b\"\nnext".to_string())),
+            PostgresParamValue::Text(None),
+            PostgresParamValue::Bool(Some(true)),
+        ];
+        let mut encoded = String::new();
+
+        append_copy_row(&mut encoded, &row, Some(3));
+
+        assert_eq!(encoded, "\"7\",\"a,\"\"b\"\"\nnext\",\\N,\"true\",3\n");
     }
 
     #[test]
