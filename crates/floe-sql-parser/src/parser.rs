@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    ColumnOption, DataType, Expr, ObjectName, OrderByExpr, Query, Select, SetExpr, Statement,
-    TableConstraint, TableFactor, TableWithJoins,
+    ColumnOption, DataType, ExactNumberInfo, Expr, ObjectName, OrderByExpr, Query, Select, SetExpr,
+    Statement, TableConstraint, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -484,12 +484,12 @@ fn parse_table_column_type(
             SqlColumnType::TimestampMillis
         }
         DataType::Date | DataType::Date32 => SqlColumnType::DateDays,
-        DataType::Numeric(_)
-        | DataType::Decimal(_)
-        | DataType::DecimalUnsigned(_)
-        | DataType::BigNumeric(_)
-        | DataType::BigDecimal(_)
-        | DataType::Dec(_) => SqlColumnType::Numeric,
+        DataType::Numeric(info)
+        | DataType::Decimal(info)
+        | DataType::DecimalUnsigned(info)
+        | DataType::BigNumeric(info)
+        | DataType::BigDecimal(info)
+        | DataType::Dec(info) => parse_exact_numeric_type(info, table_name, column_name)?,
         other => {
             return Err(anyhow!(
                 "unsupported type '{other}' for column '{}' in table '{}'; supported: INT64, BOOL, UTF8/TEXT, TIMESTAMP, DATE, NUMERIC",
@@ -499,6 +499,58 @@ fn parse_table_column_type(
         }
     };
     Ok(parsed)
+}
+
+fn parse_exact_numeric_type(
+    info: &ExactNumberInfo,
+    table_name: &str,
+    column_name: &str,
+) -> Result<SqlColumnType> {
+    match info {
+        ExactNumberInfo::None => Ok(SqlColumnType::Numeric),
+        ExactNumberInfo::Precision(precision) => {
+            decimal128_type_from_exact_number(*precision, 0, table_name, column_name)
+        }
+        ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+            if *scale < 0 {
+                return Err(anyhow!(
+                    "unsupported negative NUMERIC scale {scale} for column '{}' in table '{}'",
+                    column_name,
+                    table_name
+                ));
+            }
+            decimal128_type_from_exact_number(*precision, *scale as u64, table_name, column_name)
+        }
+    }
+}
+
+fn decimal128_type_from_exact_number(
+    precision: u64,
+    scale: u64,
+    table_name: &str,
+    column_name: &str,
+) -> Result<SqlColumnType> {
+    let precision = u8::try_from(precision).map_err(|_| {
+        anyhow!(
+            "unsupported NUMERIC precision {precision} for column '{}' in table '{}'; Decimal128 supports precision 1..=38",
+            column_name,
+            table_name
+        )
+    })?;
+    let scale = i8::try_from(scale).map_err(|_| {
+        anyhow!(
+            "unsupported NUMERIC scale {scale} for column '{}' in table '{}'; Decimal128 supports scale 0..=38",
+            column_name,
+            table_name
+        )
+    })?;
+    SqlColumnType::decimal128(precision, scale).map_err(|err| {
+        anyhow!(
+            "unsupported NUMERIC({precision},{scale}) for column '{}' in table '{}': {err}",
+            column_name,
+            table_name
+        )
+    })
 }
 
 fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {

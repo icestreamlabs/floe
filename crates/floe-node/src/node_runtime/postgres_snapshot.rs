@@ -2459,6 +2459,74 @@ mod tests {
     }
 
     #[test]
+    fn postgres_cdc_type_mapping_covers_claimed_common_types() -> Result<()> {
+        assert_eq!(
+            postgres_column_type("int8", "bigint", None, None)?,
+            ColumnType::Int64
+        );
+        assert_eq!(
+            postgres_column_type("int4", "integer", None, None)?,
+            ColumnType::Int64
+        );
+        assert_eq!(
+            postgres_column_type("bool", "boolean", None, None)?,
+            ColumnType::Bool
+        );
+        assert_eq!(
+            postgres_column_type("text", "text", None, None)?,
+            ColumnType::Utf8
+        );
+        assert_eq!(
+            postgres_column_type("varchar", "character varying", None, None)?,
+            ColumnType::Utf8
+        );
+        assert_eq!(
+            postgres_column_type("date", "date", None, None)?,
+            ColumnType::DateDays
+        );
+        assert_eq!(
+            postgres_column_type("timestamp", "timestamp without time zone", None, None)?,
+            ColumnType::TimestampMillis
+        );
+        assert_eq!(
+            postgres_column_type("timestamptz", "timestamp with time zone", None, None)?,
+            ColumnType::TimestampMillis
+        );
+        assert_eq!(
+            postgres_column_type("numeric", "numeric", Some(12), Some(2))?,
+            ColumnType::decimal128(12, 2)?
+        );
+        assert_eq!(
+            postgres_column_type("numeric", "numeric", None, None)?,
+            ColumnType::Numeric
+        );
+
+        assert!(postgres_type_compatible(
+            &ColumnType::Numeric,
+            "numeric",
+            "numeric",
+            Some(12),
+            Some(2)
+        ));
+        assert!(postgres_type_compatible(
+            &ColumnType::decimal128(12, 2)?,
+            "numeric",
+            "numeric",
+            Some(12),
+            Some(2)
+        ));
+        assert!(!postgres_type_compatible(
+            &ColumnType::decimal128(12, 3)?,
+            "numeric",
+            "numeric",
+            Some(12),
+            Some(2)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn int64_primary_key_chunks_cover_range_without_overlap() {
         let chunks = int64_snapshot_range_chunks("id", 1, 10, 3);
 

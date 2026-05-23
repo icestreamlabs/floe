@@ -944,6 +944,97 @@ mod tests {
         assert_eq!(value["payload"]["after"]["status"], "open");
     }
 
+    #[test]
+    fn envelope_payload_exposes_debezium_compatibility_fields() {
+        let schema = orders_schema();
+        let config = DebeziumEnvelopeConfig::new("pg_main")
+            .unwrap()
+            .with_database_name("inventory")
+            .with_transaction_metadata(true);
+        let tx = CdcTransactionId::new("pg-xid-9").unwrap();
+        let position =
+            CdcSourcePosition::postgres("0/16B6D00", Some("0/16B6C40".to_string())).unwrap();
+        let records = encode_debezium_change(
+            &schema,
+            &CdcChange::Update {
+                key: None,
+                before: Some(row(7, 42, 99, Some("open"))),
+                after: row(7, 42, 125, Some("paid")),
+            },
+            &config,
+            DebeziumEncodeContext {
+                source_position: Some(&position),
+                transaction_id: Some(&tx),
+                sequence: Some(4),
+                ts_ms: Some(1234),
+            },
+        )
+        .unwrap();
+
+        let value = records[0].value().unwrap();
+        let schema_fields = value["schema"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["field"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schema_fields,
+            vec![
+                "before",
+                "after",
+                "source",
+                "op",
+                "ts_ms",
+                "ts_us",
+                "ts_ns",
+                "transaction",
+            ]
+        );
+
+        let payload = value_payload(&records[0]);
+        for field in [
+            "before",
+            "after",
+            "source",
+            "op",
+            "ts_ms",
+            "ts_us",
+            "ts_ns",
+            "transaction",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "missing payload field {field}"
+            );
+        }
+        for source_field in [
+            "version",
+            "connector",
+            "name",
+            "ts_ms",
+            "ts_us",
+            "ts_ns",
+            "snapshot",
+            "db",
+            "sequence",
+            "schema",
+            "table",
+            "txId",
+            "lsn",
+            "xmin",
+        ] {
+            assert!(
+                payload["source"].get(source_field).is_some(),
+                "missing source field {source_field}"
+            );
+        }
+        assert_eq!(payload["op"], "u");
+        assert_eq!(payload["before"]["status"], "open");
+        assert_eq!(payload["after"]["status"], "paid");
+        assert_eq!(payload["transaction"]["id"], "pg-xid-9");
+    }
+
     fn orders_schema() -> CdcTableSchema {
         CdcTableSchema::new(
             CdcTableId::new("orders").unwrap(),

@@ -374,11 +374,45 @@ fn parse_create_table_statement() {
             assert_eq!(id.data_type(), &SqlColumnType::Int64);
             assert!(!id.nullable());
             assert!(id.primary_key());
-            assert_eq!(definition.columns()[1].data_type(), &SqlColumnType::Numeric);
+            assert_eq!(
+                definition.columns()[1].data_type(),
+                &SqlColumnType::Decimal128 {
+                    precision: 15,
+                    scale: 2
+                }
+            );
             assert_eq!(
                 definition.columns()[3].data_type(),
                 &SqlColumnType::DateDays
             );
+        }
+        other => panic!("expected CREATE TABLE statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_numeric_precision_and_unbounded_numeric_types() {
+    let stmt = parse_floe_statement(
+        "CREATE TABLE metrics (id BIGINT PRIMARY KEY, exact_amount NUMERIC(12,2), whole_amount NUMERIC(12), freeform NUMERIC)",
+    )
+    .expect("parse numeric table");
+    match stmt {
+        FloeStatement::CreateTable(definition) => {
+            assert_eq!(
+                definition.columns()[1].data_type(),
+                &SqlColumnType::Decimal128 {
+                    precision: 12,
+                    scale: 2
+                }
+            );
+            assert_eq!(
+                definition.columns()[2].data_type(),
+                &SqlColumnType::Decimal128 {
+                    precision: 12,
+                    scale: 0
+                }
+            );
+            assert_eq!(definition.columns()[3].data_type(), &SqlColumnType::Numeric);
         }
         other => panic!("expected CREATE TABLE statement, got {other:?}"),
     }
