@@ -2,6 +2,7 @@
 .floe/
 out
 *merged_output*.txt
+docs/
 
 # ide
 .idea
