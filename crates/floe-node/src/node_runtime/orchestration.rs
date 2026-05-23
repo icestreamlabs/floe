@@ -1075,6 +1075,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut materialized_views: Vec<MaterializedViewDefinition> =
         materialized_view_map.into_values().collect();
     materialized_views.sort_by(|a, b| a.name().cmp(b.name()));
+    validate_single_materialized_view(&materialized_views)?;
     validate_materialized_views_do_not_query_raw_cdc_sources(
         &catalog_sources,
         &materialized_views,

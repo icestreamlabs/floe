@@ -461,6 +461,24 @@ pub(super) fn merge_sql_sinks(
     Ok(())
 }
 
+pub(super) fn validate_single_materialized_view(
+    materialized_views: &[MaterializedViewDefinition],
+) -> anyhow::Result<()> {
+    if materialized_views.len() <= 1 {
+        return Ok(());
+    }
+    let names = materialized_views
+        .iter()
+        .map(|view| view.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "Floe supports at most one materialized view per process; found {}: {}",
+        materialized_views.len(),
+        names
+    ))
+}
+
 pub(super) fn log_operator_hints(
     connectors: &[config::ConnectorSpec],
     available_sources: &BTreeSet<String>,

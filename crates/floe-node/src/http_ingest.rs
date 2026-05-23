@@ -432,24 +432,14 @@ async fn subscribe_sse_admin(
         )
             .into_response();
     }
-    let handles = registry.handles();
-    let mv = match handles.as_slice() {
-        [handle] => handle.name().to_string(),
-        [] => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "no materialized view registered"})),
-            )
-                .into_response();
-        }
-        _ => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "expected exactly one materialized view"})),
-            )
-                .into_response();
-        }
+    let Some(handle) = registry.handles().into_iter().next() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no materialized view registered"})),
+        )
+            .into_response();
     };
+    let mv = handle.name().to_string();
 
     let cancel = state.cancel.child_token();
     let stream = match execute_mv_changelog(
@@ -990,36 +980,5 @@ mod tests {
         let response = app.oneshot(request).await.expect("response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn admin_mv_endpoint_rejects_multiple_registered_mvs() {
-        let registry = Arc::new(MaterializedViewRegistry::new());
-        registry.register("mv_one");
-        registry.register("mv_two");
-        let state = HttpAdminState {
-            cancel: CancellationToken::new(),
-            health: HttpIngestHealth {
-                executor_running: Arc::new(AtomicBool::new(true)),
-                storage_reachable: Arc::new(AtomicBool::new(true)),
-                runtime_ready: Arc::new(AtomicBool::new(true)),
-                watermark_debug: None,
-                cdc_replication_debug: None,
-            },
-            storage_db: None,
-            materialized_views: Some(registry),
-        };
-        let app = Router::new()
-            .route("/mv", get(subscribe_sse_admin))
-            .with_state(state);
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/mv")
-            .body(Body::empty())
-            .expect("request");
-        let response = app.oneshot(request).await.expect("response");
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
