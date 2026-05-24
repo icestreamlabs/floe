@@ -97,21 +97,21 @@ pub(super) async fn postgres_cdc_runtime_plan(
         }
         let source_name = source_name_for_postgres_include_table(include_table, registry);
         let Some(definition) = registry.get(&source_name) else {
-            tracing::warn!(
-                connector = %connector_name,
-                table = %include_table,
-                source = %source_name,
-                "Postgres CDC table has no source definition; it may be replication-pipeline-only"
-            );
-            continue;
+            return Err(anyhow!(
+                "Postgres CDC include table '{}' for connector '{}' is not bound to a Floe CDC table or replication pipeline; declare CREATE TABLE ... FROM {} TABLE '{}' or CREATE REPLICATION PIPELINE",
+                include_table,
+                connector_name,
+                connector_name,
+                include_table
+            ));
         };
         if !source_definition_has_primary_key(definition) {
-            tracing::warn!(
-                connector = %connector_name,
-                source = %definition.name(),
-                "Postgres CDC source has no primary key; using append-only compatibility path"
-            );
-            continue;
+            return Err(anyhow!(
+                "Postgres CDC include table '{}' for connector '{}' maps to source '{}' without a primary key; CDC tables must declare a primary key",
+                include_table,
+                connector_name,
+                definition.name()
+            ));
         }
         let schema = cdc_table_schema_from_source_definition(
             definition,
@@ -514,7 +514,7 @@ pub(super) fn merge_catalog_source_connectors(
 }
 
 async fn run_native_postgres_cdc_connector(
-    mut config: PostgresCdcConnectorConfig,
+    mut config: PostgresCdcSourceConfig,
     runtime_plan: PostgresCdcRuntimePlan,
     snapshot_settings: PostgresCdcSnapshotConfig,
     table_store: CdcTableStore,
@@ -522,6 +522,7 @@ async fn run_native_postgres_cdc_connector(
     sender: mpsc::Sender<QueuedCdcTransaction>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    config.validate()?;
     let connection_string = config.connection_string.clone();
     let slot = config.slot.clone();
     let publication = config.publication.clone();
@@ -2032,89 +2033,71 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 connection,
                 slot,
                 publication,
-                include_tables,
-                include_schema_in_source,
                 ..
             } => {
                 let publication = publication.unwrap_or_else(default_postgres_publication);
-                let include_schema_in_source = include_schema_in_source.unwrap_or(false);
+                let Some(runtime_plan) = postgres_cdc_runtime_plan else {
+                    tracing::error!(
+                        connector = %connector.name,
+                        "Postgres CDC connector is not bound to a CDC table or replication pipeline"
+                    );
+                    record_runtime_failure(
+                        &failure_state,
+                        format!(
+                            "Postgres CDC connector '{}' must be used by CREATE TABLE ... FROM or CREATE REPLICATION PIPELINE",
+                            connector.name
+                        ),
+                    );
+                    runtime_cancel.cancel();
+                    continue;
+                };
                 let (commit_tx, commit_rx) = watch::channel(PostgresCdcCommit::default());
                 postgres_cdc_commit_senders.push(commit_tx);
                 let failure_state = Arc::clone(&failure_state);
-                let config = PostgresCdcConnectorConfig {
+                let config = PostgresCdcSourceConfig {
                     connection_string: connection,
                     slot,
                     publication,
-                    include_tables,
-                    include_schema_in_source,
                     commit_lsn_rx: Some(commit_rx),
                 };
-                if let Some(runtime_plan) = postgres_cdc_runtime_plan {
-                    tracing::info!(
-                        connector = %connector.name,
-                        source = %runtime_plan.source_id.as_str(),
-                        tables = runtime_plan.schemas.len(),
-                        schema_evolution_policy = ?runtime_plan.schema_evolution_policy,
-                        "using native Postgres CDC table runtime"
-                    );
-                    let transaction_sender = cdc_transaction_sender.clone();
-                    let table_store = cdc_table_store.clone();
-                    let cdc_replication_debug = Arc::clone(&cdc_replication_debug);
-                    let snapshot_settings = postgres_cdc_settings.snapshot;
-                    connector_handles.push(tokio::spawn(async move {
-                        if let Err(err) = run_native_postgres_cdc_connector(
-                            config,
-                            runtime_plan,
-                            snapshot_settings,
-                            table_store,
-                            cdc_replication_debug,
-                            transaction_sender,
-                            cancel.clone(),
-                        )
-                        .await
-                        {
-                            if cancel.is_cancelled() {
-                                tracing::debug!(
-                                    error = %err,
-                                    "native Postgres CDC connector stopped during shutdown"
-                                );
-                                return;
-                            }
-                            tracing::error!(error = %err, "native Postgres CDC connector failed");
-                            record_runtime_failure(
-                                &failure_state,
-                                format!("native Postgres CDC connector failed: {err}"),
+                tracing::info!(
+                    connector = %connector.name,
+                    source = %runtime_plan.source_id.as_str(),
+                    tables = runtime_plan.schemas.len(),
+                    schema_evolution_policy = ?runtime_plan.schema_evolution_policy,
+                    "using native Postgres CDC table runtime"
+                );
+                let transaction_sender = cdc_transaction_sender.clone();
+                let table_store = cdc_table_store.clone();
+                let cdc_replication_debug = Arc::clone(&cdc_replication_debug);
+                let snapshot_settings = postgres_cdc_settings.snapshot;
+                connector_handles.push(tokio::spawn(async move {
+                    if let Err(err) = run_native_postgres_cdc_connector(
+                        config,
+                        runtime_plan,
+                        snapshot_settings,
+                        table_store,
+                        cdc_replication_debug,
+                        transaction_sender,
+                        cancel.clone(),
+                    )
+                    .await
+                    {
+                        if cancel.is_cancelled() {
+                            tracing::debug!(
+                                error = %err,
+                                "native Postgres CDC connector stopped during shutdown"
                             );
-                            runtime_cancel.cancel();
+                            return;
                         }
-                    }));
-                } else {
-                    let definitions = definitions.clone();
-                    connector_handles.push(tokio::spawn(async move {
-                        let mut connector = match PostgresCdcConnector::new(config, definitions) {
-                            Ok(connector) => connector,
-                            Err(err) => {
-                                tracing::error!(error = %err, "Postgres CDC connector config invalid");
-                                record_runtime_failure(
-                                    &failure_state,
-                                    format!("Postgres CDC connector config invalid: {err}"),
-                                );
-                                runtime_cancel.cancel();
-                                return;
-                            }
-                        };
-                        let ctx = ConnectorContext::new(sender);
-                        if let Err(err) = run_connector(&mut connector, &ctx, cancel.clone()).await
-                        {
-                            tracing::error!(error = %err, "Postgres CDC connector failed");
-                            record_runtime_failure(
-                                &failure_state,
-                                format!("Postgres CDC connector failed: {err}"),
-                            );
-                            runtime_cancel.cancel();
-                        }
-                    }));
-                }
+                        tracing::error!(error = %err, "native Postgres CDC connector failed");
+                        record_runtime_failure(
+                            &failure_state,
+                            format!("native Postgres CDC connector failed: {err}"),
+                        );
+                        runtime_cancel.cancel();
+                    }
+                }));
             }
         }
     }
@@ -2616,17 +2599,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     {
                         let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
                         *entry = (*entry).max(offset);
-                    }
-                    if let Some((slot, lsn_value, lsn_text)) =
-                        event_postgres_lsn(event.resume_token())
-                    {
-                        tick_postgres_sources.insert(slot.clone(), source_name.to_string());
-                        let entry = tick_postgres_lsns
-                            .entry(slot)
-                            .or_insert_with(|| (lsn_value, lsn_text.clone()));
-                        if lsn_value > entry.0 {
-                            *entry = (lsn_value, lsn_text);
-                        }
                     }
                     if !materialized_source_ids_for_task
                         .get(source_id)

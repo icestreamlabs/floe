@@ -270,12 +270,6 @@ pub enum SourceResumeToken {
         partition: i32,
         offset: i64,
     },
-    PostgresCdc {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        slot: Option<String>,
-        lsn: String,
-        txid: Option<u64>,
-    },
     File {
         cursor: u64,
     },

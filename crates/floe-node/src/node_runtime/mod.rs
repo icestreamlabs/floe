@@ -61,9 +61,9 @@ use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreCo
 use floe_node_core::planner::{
     PlannedMaterializedView, camel_case_schema, plan_materialized_views,
 };
-use floe_node_core::postgres_cdc_connector::{
-    PostgresCdcCommit, PostgresCdcConnector, PostgresCdcConnectorConfig, PostgresSlotCommit,
-    default_postgres_publication, replication_config_from_connection_string, stored_slot_start_lsn,
+use floe_node_core::postgres_cdc::{
+    PostgresCdcCommit, PostgresCdcSourceConfig, PostgresSlotCommit, default_postgres_publication,
+    replication_config_from_connection_string, stored_slot_start_lsn,
 };
 use floe_node_core::tail_client;
 use floe_server as server;

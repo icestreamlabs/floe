@@ -92,9 +92,6 @@ pub(super) fn event_resume_offset(
             let offset = u64::try_from(*offset).ok()?;
             Some((partition, offset))
         }
-        core_source::SourceResumeToken::PostgresCdc { lsn, .. } => {
-            parse_postgres_lsn(lsn).map(|offset| (0, offset))
-        }
         core_source::SourceResumeToken::File { cursor }
         | core_source::SourceResumeToken::Generator { position: cursor }
         | core_source::SourceResumeToken::ObjectStore { cursor } => Some((0, *cursor)),
@@ -124,19 +121,6 @@ pub(super) fn event_kafka_offset(
             partition,
             offset,
         } => Some((Arc::<str>::from(topic.as_str()), *partition, *offset)),
-        _ => None,
-    }
-}
-
-pub(super) fn event_postgres_lsn(
-    token: Option<&core_source::SourceResumeToken>,
-) -> Option<(String, u64, String)> {
-    match token? {
-        core_source::SourceResumeToken::PostgresCdc { slot, lsn, .. } => {
-            let slot = slot.clone().unwrap_or_else(|| "default".to_string());
-            let value = parse_postgres_lsn(lsn)?;
-            Some((slot, value, lsn.clone()))
-        }
         _ => None,
     }
 }
@@ -204,13 +188,6 @@ pub(super) fn advance_postgres_cdc_commit_state(
             *entry = (*lsn_value, lsn_text.clone());
         }
     }
-}
-
-pub(super) fn parse_postgres_lsn(lsn: &str) -> Option<u64> {
-    let (left, right) = lsn.trim().split_once('/')?;
-    let high = u64::from_str_radix(left, 16).ok()?;
-    let low = u64::from_str_radix(right, 16).ok()?;
-    Some((high << 32) | low)
 }
 
 pub(super) fn current_unix_time_ms() -> u64 {

@@ -1101,7 +1101,7 @@ async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
 }
 
 #[tokio::test]
-async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
+async fn postgres_cdc_runtime_plan_rejects_include_table_without_primary_key() {
     let source = SourceDefinition::new(
         "orders",
         vec![SourceColumn::new("id", SourceDataType::Int64)],
@@ -1111,7 +1111,7 @@ async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
     registry.register(source);
     let include_tables = vec!["orders".to_string()];
 
-    let plan = postgres_cdc_runtime_plan(
+    let err = match postgres_cdc_runtime_plan(
         "pg_main",
         "postgres://postgres:postgres@localhost/postgres",
         PostgresSchemaEvolutionPolicy::FailFast,
@@ -1121,9 +1121,38 @@ async fn postgres_cdc_runtime_plan_falls_back_without_primary_key() {
         &HashMap::new(),
     )
     .await
-    .expect("runtime plan");
+    {
+        Ok(_) => panic!("include-table CDC source without a primary key should fail"),
+        Err(err) => err,
+    };
 
-    assert!(plan.is_none());
+    assert!(
+        err.to_string()
+            .contains("source 'orders' without a primary key")
+    );
+}
+
+#[tokio::test]
+async fn postgres_cdc_runtime_plan_rejects_unbound_include_table() {
+    let registry = SourceRegistry::new();
+    let include_tables = vec!["public.orders".to_string()];
+
+    let err = match postgres_cdc_runtime_plan(
+        "pg_main",
+        "postgres://postgres:postgres@localhost/postgres",
+        PostgresSchemaEvolutionPolicy::FailFast,
+        Some(&include_tables),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .await
+    {
+        Ok(_) => panic!("unbound include-table CDC source should fail"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("not bound to a Floe CDC table"));
 }
 
 #[test]
@@ -1176,33 +1205,6 @@ fn build_postgres_cdc_commit_orders_slots() {
     assert_eq!(commit.slots.len(), 2);
     assert_eq!(commit.slots[0].slot, "a_slot");
     assert_eq!(commit.slots[1].slot, "z_slot");
-}
-
-#[test]
-fn event_postgres_lsn_extracts_slot_and_value() {
-    let token = core_source::SourceResumeToken::PostgresCdc {
-        slot: Some("cdc_slot".to_string()),
-        lsn: "16/B3738".to_string(),
-        txid: None,
-    };
-    let (slot, value, lsn) =
-        event_postgres_lsn(Some(&token)).expect("postgres resume token should parse");
-    assert_eq!(slot, "cdc_slot");
-    assert_eq!(lsn, "16/B3738");
-    assert_eq!(value, parse_postgres_lsn("16/B3738").expect("parse lsn"));
-}
-
-#[test]
-fn event_resume_offset_extracts_postgres_lsn() {
-    let token = core_source::SourceResumeToken::PostgresCdc {
-        slot: Some("slot_a".to_string()),
-        lsn: "0/0000002A".to_string(),
-        txid: Some(5),
-    };
-    assert_eq!(
-        event_resume_offset(Some(&token)),
-        Some((0, parse_postgres_lsn("0/0000002A").expect("parse lsn")))
-    );
 }
 
 #[test]
