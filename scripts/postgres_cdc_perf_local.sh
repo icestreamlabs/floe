@@ -36,6 +36,7 @@ FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH="${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER
 FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS="${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS:-1}"
 FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS="${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS:-1}"
 FLOE_PG_PORT="${FLOE_PG_PORT:-16432}"
+FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT:-18080}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KEEP_CONTAINERS="${KEEP_CONTAINERS:-0}"
@@ -58,6 +59,9 @@ POSTGRES_SETTINGS_LOG="${ARTIFACT_DIR}/postgres-settings.txt"
 KAFKA_TOPIC_LOG="${ARTIFACT_DIR}/kafka-topic.txt"
 POSTGRES_SLOT_LOG="${ARTIFACT_DIR}/postgres-slot.log"
 DOCKER_STATS_LOG="${ARTIFACT_DIR}/docker-stats.log"
+SUMMARY_ENV="${ARTIFACT_DIR}/summary.env"
+SUMMARY_JSON="${ARTIFACT_DIR}/summary.json"
+SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
 
 mkdir -p "${ARTIFACT_DIR}"
 case "${ARROW_IPC_COMPRESSION}" in
@@ -76,7 +80,7 @@ cat >"${CONFIG_PATH}" <<JSON
 {
   "runtime": {
     "pgwire_addr": "127.0.0.1:${FLOE_PG_PORT}",
-    "admin_port": 0
+    "admin_port": ${FLOE_ADMIN_PORT}
   },
   "storage": {
     "data_dir": "${ARTIFACT_DIR}/floe-data"
@@ -139,7 +143,7 @@ stop_node() {
 }
 
 cleanup() {
-  stop_node
+  stop_node || true
   if [[ "${KEEP_CONTAINERS}" != "1" ]]; then
     docker rm -f "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
     docker rm -f "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || true
@@ -179,6 +183,8 @@ write_reproduce_command() {
     printf 'FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
     printf 'FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
     printf 'FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS=%q \\\n' "${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
+    printf 'FLOE_PG_PORT=%q \\\n' "${FLOE_PG_PORT}"
+    printf 'FLOE_ADMIN_PORT=%q \\\n' "${FLOE_ADMIN_PORT}"
     printf 'FLOE_SLATEDB_FLUSH_INTERVAL_MS=%q \\\n' "${SLATEDB_FLUSH_INTERVAL_MS}"
     printf 'TIMEOUT_SECS=%q \\\n' "${TIMEOUT_SECS}"
     printf 'BUILD_RELEASE=%q \\\n' "${BUILD_RELEASE}"
@@ -931,6 +937,7 @@ write_replication_pipeline_sql() {
 
 require_cmd docker
 require_cmd cargo
+require_cmd jq
 
 upstream_tables=()
 pipeline_names=()
@@ -997,6 +1004,15 @@ case "${DATASET}" in
 esac
 topic_list="$(IFS=,; echo "${topics[*]}")"
 
+tables_json="$(
+  printf '%s\n' "${upstream_tables[@]}" \
+    | jq -Rsc 'split("\n") | map(select(length > 0))'
+)"
+topics_json="$(
+  printf '%s\n' "${topics[@]}" \
+    | jq -Rsc 'split("\n") | map(select(length > 0))'
+)"
+
 docker rm -f "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >/dev/null 2>&1 || true
 
 echo "artifact_dir=${ARTIFACT_DIR}"
@@ -1022,6 +1038,8 @@ echo "live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
 echo "postgres_snapshot_rows_per_batch=${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
 echo "postgres_snapshot_max_workers=${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
 echo "postgres_snapshot_intra_table_chunks=${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
+echo "floe_pg_port=${FLOE_PG_PORT}"
+echo "floe_admin_port=${FLOE_ADMIN_PORT}"
 echo "slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
 write_reproduce_command
 
@@ -1296,6 +1314,11 @@ kafka_stream_seconds="$(awk -F= '$1 == "cdc_counter.stream_seconds" { print $2; 
 kafka_post_stream_wait_seconds="$(awk -F= '$1 == "cdc_counter.post_stream_wait_seconds" { print $2; exit }' "${COUNTER_LOG}")"
 kafka_stream_rows_per_second="$(awk -F= '$1 == "cdc_counter.stream_rows_per_second" { print $2; exit }' "${COUNTER_LOG}")"
 kafka_stream_mb_per_second="$(awk -F= '$1 == "cdc_counter.stream_mb_per_second" { print $2; exit }' "${COUNTER_LOG}")"
+observed_kafka_messages="$(awk -F= '$1 == "cdc_counter.observed_messages" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_key_bytes="$(awk -F= '$1 == "cdc_counter.key_bytes" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_value_bytes="$(awk -F= '$1 == "cdc_counter.value_bytes" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_total_bytes="$(awk -F= '$1 == "cdc_counter.total_bytes" { print $2; exit }' "${COUNTER_LOG}")"
+kafka_wall_mb_per_second="$(awk -F= '$1 == "cdc_counter.wall_mb_per_second" { print $2; exit }' "${COUNTER_LOG}")"
 consumer_wall_source_rows_per_second=""
 kafka_stream_source_rows_per_second=""
 harness_overhead_percent=""
@@ -1323,6 +1346,249 @@ if (( live_rows > 0 )); then
   postgres_live_write_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${live_rows} / (${live_write_seconds} > 0.001 ? ${live_write_seconds} : 0.001) }")"
 fi
 
+row_counts_json="$(
+  for idx in "${!upstream_tables[@]}"; do
+    printf '%s=%s\n' "${upstream_tables[$idx]}" "${table_row_counts[$idx]:-0}"
+  done \
+    | jq -Rsc '
+        split("\n")
+        | map(select(length > 0))
+        | map(capture("(?<table>[^=]+)=(?<rows>.*)") | .rows |= tonumber)
+      '
+)"
+
+write_summary_json() {
+  jq -n \
+    --arg run_id "${RUN_ID}" \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg git_commit "$(git rev-parse HEAD 2>/dev/null || true)" \
+    --arg git_branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)" \
+    --arg build_profile "$([[ "${BUILD_RELEASE}" == "1" ]] && printf release || printf debug)" \
+    --arg dataset "${DATASET}" \
+    --arg tpch_scale_factor "${TPCH_SCALE_FACTOR}" \
+    --arg rows "${ROWS}" \
+    --arg mode "${BENCH_MODE}" \
+    --arg source_table "${source_table}" \
+    --arg upstream_table "${upstream_table}" \
+    --argjson upstream_tables "${tables_json}" \
+    --argjson kafka_topics "${topics_json}" \
+    --arg pipeline_format "${PIPELINE_FORMAT}" \
+    --arg durable_replication_buffer "${DURABLE_REPLICATION_BUFFER}" \
+    --arg buffer_max_pending_bytes "${BUFFER_MAX_PENDING_BYTES}" \
+    --arg buffer_max_pending_records "${BUFFER_MAX_PENDING_RECORDS}" \
+    --arg buffer_max_pending_objects "${BUFFER_MAX_PENDING_OBJECTS}" \
+    --arg buffer_max_pending_age_ms "${BUFFER_MAX_PENDING_AGE_MS}" \
+    --arg arrow_ipc_rows_per_record "${ARROW_IPC_ROWS_PER_RECORD}" \
+    --arg arrow_ipc_compression "${ARROW_IPC_COMPRESSION}" \
+    --arg kafka_metadata_headers "${KAFKA_METADATA_HEADERS}" \
+    --arg postgres_snapshot_rows_per_batch "${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}" \
+    --arg postgres_snapshot_max_workers "${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}" \
+    --arg postgres_snapshot_intra_table_chunks "${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}" \
+    --arg floe_pg_port "${FLOE_PG_PORT}" \
+    --arg floe_admin_port "${FLOE_ADMIN_PORT}" \
+    --arg redpanda_kafka_batch_max_bytes "${REDPANDA_KAFKA_BATCH_MAX_BYTES}" \
+    --arg redpanda_topic_max_message_bytes "${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" \
+    --arg live_write_chunk_rows "${LIVE_WRITE_CHUNK_ROWS}" \
+    --arg live_write_sleep_ms "${LIVE_WRITE_SLEEP_MS}" \
+    --arg slatedb_flush_interval_ms "${SLATEDB_FLUSH_INTERVAL_MS}" \
+    --arg initial_rows "${initial_rows}" \
+    --arg live_insert_rows "${live_insert_rows}" \
+    --arg live_update_rows "${live_update_rows}" \
+    --arg source_rows "${source_rows}" \
+    --arg expected_kafka_messages "${expected_messages}" \
+    --arg observed_kafka_messages "${observed_kafka_messages}" \
+    --arg message_multiplier "${message_multiplier}" \
+    --argjson table_row_counts "${row_counts_json}" \
+    --arg postgres_load_seconds "${load_seconds}" \
+    --arg postgres_live_write_seconds "${live_write_seconds}" \
+    --arg end_to_end_seconds "${end_to_end_seconds}" \
+    --arg counter_seconds "${counter_seconds}" \
+    --arg kafka_counter_wall_seconds "${kafka_counter_wall_seconds}" \
+    --arg kafka_pre_stream_wait_seconds "${kafka_pre_stream_wait_seconds}" \
+    --arg kafka_stream_seconds "${kafka_stream_seconds}" \
+    --arg kafka_post_stream_wait_seconds "${kafka_post_stream_wait_seconds}" \
+    --arg harness_overhead_seconds "${harness_overhead_seconds}" \
+    --arg end_to_end_rows_per_second "${end_to_end_rows_per_second}" \
+    --arg kafka_stream_rows_per_second "${kafka_stream_rows_per_second}" \
+    --arg kafka_stream_source_rows_per_second "${kafka_stream_source_rows_per_second}" \
+    --arg consumer_wall_source_rows_per_second "${consumer_wall_source_rows_per_second}" \
+    --arg postgres_load_rows_per_second "${postgres_load_rows_per_second}" \
+    --arg postgres_live_write_rows_per_second "${postgres_live_write_rows_per_second}" \
+    --arg kafka_key_bytes "${kafka_key_bytes}" \
+    --arg kafka_value_bytes "${kafka_value_bytes}" \
+    --arg kafka_total_bytes "${kafka_total_bytes}" \
+    --arg kafka_stream_mb_per_second "${kafka_stream_mb_per_second}" \
+    --arg kafka_wall_mb_per_second "${kafka_wall_mb_per_second}" \
+    --arg harness_overhead_percent "${harness_overhead_percent}" \
+    --arg artifact_dir "${ARTIFACT_DIR}" \
+    --arg node_stdout "${NODE_STDOUT}" \
+    --arg node_stderr "${NODE_STDERR}" \
+    --arg node_resource_log "${NODE_RESOURCE_LOG}" \
+    --arg counter_log "${COUNTER_LOG}" \
+    --arg reproduce_log "${REPRODUCE_LOG}" \
+    --arg system_log "${SYSTEM_LOG}" \
+    --arg postgres_settings_log "${POSTGRES_SETTINGS_LOG}" \
+    --arg postgres_slot_log "${POSTGRES_SLOT_LOG}" \
+    --arg kafka_topic_log "${KAFKA_TOPIC_LOG}" \
+    --arg docker_stats_log "${DOCKER_STATS_LOG}" \
+    '
+    def maybe_num($value): if $value == "" then null else ($value | tonumber) end;
+    def maybe_bool($value):
+      if $value == "true" or $value == "1" then true
+      elif $value == "false" or $value == "0" then false
+      elif $value == "" then null
+      else $value
+      end;
+
+    {
+      schema_version: 1,
+      run: {
+        id: $run_id,
+        timestamp: $timestamp,
+        git_commit: $git_commit,
+        git_branch: $git_branch,
+        build_profile: $build_profile,
+        artifact_dir: $artifact_dir
+      },
+      scenario: {
+        dataset: $dataset,
+        tpch_scale_factor: maybe_num($tpch_scale_factor),
+        requested_rows: maybe_num($rows),
+        mode: $mode,
+        source_table: $source_table,
+        upstream_table: $upstream_table,
+        upstream_tables: $upstream_tables,
+        kafka_topics: $kafka_topics,
+        pipeline_format: $pipeline_format,
+        durable_replication_buffer: maybe_bool($durable_replication_buffer),
+        buffer: {
+          max_pending_bytes: maybe_num($buffer_max_pending_bytes),
+          max_pending_records: maybe_num($buffer_max_pending_records),
+          max_pending_objects: maybe_num($buffer_max_pending_objects),
+          max_pending_age_ms: maybe_num($buffer_max_pending_age_ms)
+        },
+        encoding: {
+          arrow_ipc_rows_per_record: maybe_num($arrow_ipc_rows_per_record),
+          arrow_ipc_compression: $arrow_ipc_compression,
+          kafka_metadata_headers: maybe_bool($kafka_metadata_headers)
+        },
+        postgres_snapshot: {
+          rows_per_batch: maybe_num($postgres_snapshot_rows_per_batch),
+          max_workers: maybe_num($postgres_snapshot_max_workers),
+          intra_table_chunks: maybe_num($postgres_snapshot_intra_table_chunks)
+        },
+        floe_ports: {
+          pgwire: maybe_num($floe_pg_port),
+          admin: maybe_num($floe_admin_port)
+        },
+        redpanda: {
+          kafka_batch_max_bytes: maybe_num($redpanda_kafka_batch_max_bytes),
+          topic_max_message_bytes: maybe_num($redpanda_topic_max_message_bytes)
+        },
+        live_write: {
+          chunk_rows: maybe_num($live_write_chunk_rows),
+          sleep_ms: maybe_num($live_write_sleep_ms)
+        },
+        slatedb: {
+          flush_interval_ms: maybe_num($slatedb_flush_interval_ms)
+        }
+      },
+      counts: {
+        table_rows: $table_row_counts,
+        initial_rows: maybe_num($initial_rows),
+        live_insert_rows: maybe_num($live_insert_rows),
+        live_update_rows: maybe_num($live_update_rows),
+        source_rows: maybe_num($source_rows),
+        expected_kafka_messages: maybe_num($expected_kafka_messages),
+        observed_kafka_messages: maybe_num($observed_kafka_messages),
+        message_multiplier: maybe_num($message_multiplier)
+      },
+      timings_seconds: {
+        postgres_load: maybe_num($postgres_load_seconds),
+        postgres_live_write: maybe_num($postgres_live_write_seconds),
+        end_to_end: maybe_num($end_to_end_seconds),
+        kafka_counter_wall: maybe_num($kafka_counter_wall_seconds),
+        kafka_counter_process: maybe_num($counter_seconds),
+        kafka_pre_stream_wait: maybe_num($kafka_pre_stream_wait_seconds),
+        kafka_stream: maybe_num($kafka_stream_seconds),
+        kafka_post_stream_wait: maybe_num($kafka_post_stream_wait_seconds),
+        harness_overhead: maybe_num($harness_overhead_seconds)
+      },
+      rates: {
+        end_to_end_source_rows_per_second: maybe_num($end_to_end_rows_per_second),
+        kafka_stream_messages_per_second: maybe_num($kafka_stream_rows_per_second),
+        kafka_stream_source_rows_per_second: maybe_num($kafka_stream_source_rows_per_second),
+        consumer_wall_source_rows_per_second: maybe_num($consumer_wall_source_rows_per_second),
+        postgres_load_rows_per_second: maybe_num($postgres_load_rows_per_second),
+        postgres_live_write_rows_per_second: maybe_num($postgres_live_write_rows_per_second),
+        kafka_stream_mb_per_second: maybe_num($kafka_stream_mb_per_second),
+        kafka_wall_mb_per_second: maybe_num($kafka_wall_mb_per_second),
+        harness_overhead_percent: maybe_num($harness_overhead_percent)
+      },
+      bytes: {
+        kafka_key_bytes: maybe_num($kafka_key_bytes),
+        kafka_value_bytes: maybe_num($kafka_value_bytes),
+        kafka_total_bytes: maybe_num($kafka_total_bytes)
+      },
+      artifacts: {
+        summary_env: ($artifact_dir + "/summary.env"),
+        summary_json: ($artifact_dir + "/summary.json"),
+        summary_md: ($artifact_dir + "/summary.md"),
+        node_stdout: $node_stdout,
+        node_stderr: $node_stderr,
+        node_resource_log: $node_resource_log,
+        counter_log: $counter_log,
+        reproduce_log: $reproduce_log,
+        system_log: $system_log,
+        postgres_settings_log: $postgres_settings_log,
+        postgres_slot_log: $postgres_slot_log,
+        kafka_topic_log: $kafka_topic_log,
+        docker_stats_log: $docker_stats_log
+      }
+    }
+    ' >"${SUMMARY_JSON}"
+}
+
+write_summary_markdown() {
+  cat >"${SUMMARY_MD}" <<MD
+# Postgres CDC Benchmark
+
+Run: \`${RUN_ID}\`
+
+Dataset: \`${DATASET}\`
+
+Mode: \`${BENCH_MODE}\`
+
+Format: \`${PIPELINE_FORMAT}\`
+
+Durable replication buffer: \`${DURABLE_REPLICATION_BUFFER}\`
+
+Artifact directory: \`${ARTIFACT_DIR}\`
+
+| Metric | Value |
+| --- | ---: |
+| Source rows | ${source_rows} |
+| Expected Kafka messages | ${expected_messages} |
+| Observed Kafka messages | ${observed_kafka_messages:-} |
+| End-to-end seconds | ${end_to_end_seconds} |
+| End-to-end source rows/s | ${end_to_end_rows_per_second} |
+| Kafka stream seconds | ${kafka_stream_seconds:-} |
+| Kafka stream messages/s | ${kafka_stream_rows_per_second:-} |
+| Kafka stream source rows/s | ${kafka_stream_source_rows_per_second:-} |
+| Consumer wall source rows/s | ${consumer_wall_source_rows_per_second:-} |
+| Harness overhead seconds | ${harness_overhead_seconds:-} |
+| Harness overhead percent | ${harness_overhead_percent:-} |
+| Postgres load seconds | ${load_seconds} |
+| Postgres load rows/s | ${postgres_load_rows_per_second:-} |
+| Postgres live write seconds | ${live_write_seconds} |
+| Postgres live write rows/s | ${postgres_live_write_rows_per_second:-} |
+| Kafka total bytes | ${kafka_total_bytes:-} |
+| Kafka stream MB/s | ${kafka_stream_mb_per_second:-} |
+
+Machine-readable report: \`${SUMMARY_JSON}\`
+MD
+}
+
 {
   echo "benchmark.dataset=${DATASET}"
   echo "benchmark.tpch_scale_factor=${TPCH_SCALE_FACTOR}"
@@ -1347,6 +1613,8 @@ fi
   echo "benchmark.postgres_snapshot_rows_per_batch=${FLOE_POSTGRES_CDC_SNAPSHOT_ROWS_PER_BATCH}"
   echo "benchmark.postgres_snapshot_max_workers=${FLOE_POSTGRES_CDC_SNAPSHOT_MAX_WORKERS}"
   echo "benchmark.postgres_snapshot_intra_table_chunks=${FLOE_POSTGRES_CDC_SNAPSHOT_INTRA_TABLE_CHUNKS}"
+  echo "benchmark.floe_pg_port=${FLOE_PG_PORT}"
+  echo "benchmark.floe_admin_port=${FLOE_ADMIN_PORT}"
   echo "benchmark.redpanda_kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}"
   echo "benchmark.redpanda_topic_max_message_bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}"
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
@@ -1382,9 +1650,16 @@ fi
   echo "benchmark.postgres_slot_log=${POSTGRES_SLOT_LOG}"
   echo "benchmark.kafka_topic_log=${KAFKA_TOPIC_LOG}"
   echo "benchmark.docker_stats_log=${DOCKER_STATS_LOG}"
-} | tee "${ARTIFACT_DIR}/summary.env"
+  echo "benchmark.summary_json=${SUMMARY_JSON}"
+  echo "benchmark.summary_md=${SUMMARY_MD}"
+} | tee "${SUMMARY_ENV}"
+
+write_summary_json
+write_summary_markdown
 
 echo "Stopping Floe node"
 stop_node
 
 echo "CDC benchmark complete."
+echo "summary_json=${SUMMARY_JSON}"
+echo "summary_md=${SUMMARY_MD}"
