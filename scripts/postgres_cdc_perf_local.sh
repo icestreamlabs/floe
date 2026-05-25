@@ -18,6 +18,7 @@ BROKERS="${BROKERS:-127.0.0.1:${REDPANDA_PORT}}"
 ROWS="${ROWS:-100000}"
 DATASET="${DATASET:-synthetic-orders}"
 BENCH_MODE="${BENCH_MODE:-snapshot}"
+TARGET="${TARGET:-kafka}"
 TOPIC="${TOPIC:-floe_cdc_bench_orders}"
 SLOT="${SLOT:-floe_cdc_bench_slot}"
 PUBLICATION="${PUBLICATION:-floe_cdc_bench_pub}"
@@ -64,6 +65,26 @@ SUMMARY_JSON="${ARTIFACT_DIR}/summary.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
 
 mkdir -p "${ARTIFACT_DIR}"
+TARGET_NORMALIZED="${TARGET,,}"
+TARGET_NORMALIZED="${TARGET_NORMALIZED//-/_}"
+case "${TARGET_NORMALIZED}" in
+  kafka|postgres) ;;
+  *)
+    echo "unsupported TARGET=${TARGET} (expected kafka|postgres)" >&2
+    exit 1
+    ;;
+esac
+if [[ "${TARGET_NORMALIZED}" == "postgres" ]]; then
+  normalized_pipeline_format="${PIPELINE_FORMAT,,}"
+  normalized_pipeline_format="${normalized_pipeline_format//-/_}"
+  case "${normalized_pipeline_format}" in
+    floe_json|compact_json) ;;
+    *)
+      echo "TARGET=postgres currently requires PIPELINE_FORMAT=floe-json" >&2
+      exit 1
+      ;;
+  esac
+fi
 case "${ARROW_IPC_COMPRESSION}" in
   ""|none|off|false|0)
     ARROW_IPC_COMPRESSION_JSON="null"
@@ -168,6 +189,7 @@ write_reproduce_command() {
     printf 'DATASET=%q \\\n' "${DATASET}"
     printf 'TPCH_SCALE_FACTOR=%q \\\n' "${TPCH_SCALE_FACTOR}"
     printf 'BENCH_MODE=%q \\\n' "${BENCH_MODE}"
+    printf 'TARGET=%q \\\n' "${TARGET}"
     printf 'TOPIC=%q \\\n' "${TOPIC}"
     printf 'PIPELINE_FORMAT=%q \\\n' "${PIPELINE_FORMAT}"
     printf 'DURABLE_REPLICATION_BUFFER=%q \\\n' "${DURABLE_REPLICATION_BUFFER}"
@@ -308,8 +330,12 @@ write_postgres_slot_info() {
 }
 
 write_docker_stats() {
+  local stats_containers=("${POSTGRES_CONTAINER}")
+  if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+    stats_containers+=("${REDPANDA_CONTAINER}")
+  fi
   docker stats --no-stream --format 'container={{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} block={{.BlockIO}} pids={{.PIDs}}' \
-    "${POSTGRES_CONTAINER}" "${REDPANDA_CONTAINER}" >"${DOCKER_STATS_LOG}" 2>&1 || true
+    "${stats_containers[@]}" >"${DOCKER_STATS_LOG}" 2>&1 || true
   if [[ -n "${node_pid}" ]] && kill -0 "${node_pid}" >/dev/null 2>&1; then
     local observed_pid="${node_pid}"
     if command -v pgrep >/dev/null 2>&1; then
@@ -320,6 +346,76 @@ write_docker_stats() {
       ps -p "${observed_pid}" -o pid=,pcpu=,pmem=,rss=,vsz=,etime=,command=
     } >>"${DOCKER_STATS_LOG}" 2>&1 || true
   fi
+}
+
+postgres_target_table_for_upstream() {
+  local upstream="$1"
+  local schema="${upstream%.*}"
+  local table="${upstream##*.}"
+  if [[ "${schema}" == "${upstream}" ]]; then
+    schema="public"
+    table="${upstream}"
+  fi
+  printf '%s.%s_sink' "${schema}" "${table}"
+}
+
+create_postgres_sink_tables() {
+  if [[ "${TARGET_NORMALIZED}" != "postgres" ]]; then
+    return
+  fi
+  for idx in "${!upstream_tables[@]}"; do
+    local upstream="${upstream_tables[$idx]}"
+    local target="${target_tables[$idx]}"
+    docker exec -i "${POSTGRES_CONTAINER}" psql \
+      -v ON_ERROR_STOP=1 \
+      -U "${POSTGRES_USER}" \
+      -d "${POSTGRES_DB}" >/dev/null <<SQL
+DROP TABLE IF EXISTS ${target};
+CREATE TABLE ${target} (LIKE ${upstream} INCLUDING ALL);
+SQL
+  done
+}
+
+postgres_sink_total_rows() {
+  local total=0
+  for table in "${target_tables[@]}"; do
+    local count
+    count="$(docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM ${table}")"
+    total=$((total + count))
+  done
+  echo "${total}"
+}
+
+postgres_sink_updated_rows() {
+  if [[ "${DATASET}" != "synthetic-orders" ]]; then
+    echo "0"
+    return
+  fi
+  docker exec "${POSTGRES_CONTAINER}" psql -At -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "SELECT COUNT(*) FROM public.orders_sink WHERE status = 'updated'"
+}
+
+wait_for_postgres_sink() {
+  local expected_rows="$1"
+  local expected_updated_rows="$2"
+  local deadline=$((SECONDS + TIMEOUT_SECS))
+  local total_rows=0
+  local updated_rows=0
+  while (( SECONDS < deadline )); do
+    total_rows="$(postgres_sink_total_rows)"
+    if (( expected_updated_rows > 0 )); then
+      updated_rows="$(postgres_sink_updated_rows)"
+    fi
+    if (( total_rows >= expected_rows && updated_rows >= expected_updated_rows )); then
+      sink_observed_rows="${total_rows}"
+      postgres_sink_updated_rows_observed="${updated_rows}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  sink_observed_rows="${total_rows}"
+  postgres_sink_updated_rows_observed="${updated_rows}"
+  echo "Postgres sink observed ${total_rows} rows and ${updated_rows} updated rows; expected ${expected_rows} rows and ${expected_updated_rows} updated rows before timeout" >&2
+  return 1
 }
 
 copy_pipe_delimited_file() {
@@ -912,9 +1008,15 @@ write_replication_pipeline_sql() {
   {
     echo "CREATE REPLICATION PIPELINE ${pipeline_names[$idx]}"
     echo "FROM pg_main TABLE '${upstream_tables[$idx]}'"
-    echo "INTO KAFKA WITH ("
-    echo "  brokers = '${BROKERS}',"
-    echo "  topic = '${topics[$idx]}',"
+    if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+      echo "INTO KAFKA WITH ("
+      echo "  brokers = '${BROKERS}',"
+      echo "  topic = '${topics[$idx]}',"
+    else
+      echo "INTO POSTGRES WITH ("
+      echo "  connection = '${PG_DSN}',"
+      echo "  table = '${target_tables[$idx]}',"
+    fi
     echo "  format = '${PIPELINE_FORMAT}',"
     echo "  durable_buffer = ${DURABLE_REPLICATION_BUFFER},"
     if [[ -n "${BUFFER_MAX_PENDING_BYTES}" ]]; then
@@ -942,6 +1044,7 @@ require_cmd jq
 upstream_tables=()
 pipeline_names=()
 topics=()
+target_tables=()
 table_row_counts=()
 
 case "${DATASET}" in
@@ -1002,14 +1105,31 @@ case "${DATASET}" in
     exit 1
     ;;
 esac
-topic_list="$(IFS=,; echo "${topics[*]}")"
+for idx in "${!upstream_tables[@]}"; do
+  target_tables+=("$(postgres_target_table_for_upstream "${upstream_tables[$idx]}")")
+  if [[ "${TARGET_NORMALIZED}" == "postgres" ]]; then
+    pipeline_names[$idx]="${pipeline_names[$idx]/_to_kafka/_to_postgres}"
+  fi
+done
+if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+  topic_list="$(IFS=,; echo "${topics[*]}")"
+else
+  topic_list=""
+fi
+target_table_list="$(IFS=,; echo "${target_tables[*]}")"
 
 tables_json="$(
   printf '%s\n' "${upstream_tables[@]}" \
     | jq -Rsc 'split("\n") | map(select(length > 0))'
 )"
 topics_json="$(
-  printf '%s\n' "${topics[@]}" \
+  if [[ -n "${topic_list}" ]]; then
+    tr ',' '\n' <<<"${topic_list}"
+  fi \
+    | jq -Rsc 'split("\n") | map(select(length > 0))'
+)"
+target_tables_json="$(
+  printf '%s\n' "${target_tables[@]}" \
     | jq -Rsc 'split("\n") | map(select(length > 0))'
 )"
 
@@ -1020,9 +1140,11 @@ echo "rows=${ROWS}"
 echo "dataset=${DATASET}"
 echo "tpch_scale_factor=${TPCH_SCALE_FACTOR}"
 echo "bench_mode=${BENCH_MODE}"
+echo "target=${TARGET_NORMALIZED}"
 echo "brokers=${BROKERS}"
 echo "topic=${TOPIC}"
 echo "topics=${topic_list}"
+echo "postgres_sink_tables=${target_table_list}"
 echo "pipeline_format=${PIPELINE_FORMAT}"
 echo "durable_replication_buffer=${DURABLE_REPLICATION_BUFFER}"
 echo "buffer_max_pending_bytes=${BUFFER_MAX_PENDING_BYTES:-unset}"
@@ -1045,7 +1167,9 @@ write_reproduce_command
 
 echo "Pulling images..."
 docker pull "${POSTGRES_IMAGE}" >/dev/null
-docker pull "${REDPANDA_IMAGE}" >/dev/null
+if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+  docker pull "${REDPANDA_IMAGE}" >/dev/null
+fi
 
 echo "Starting Postgres ${POSTGRES_IMAGE} on port ${POSTGRES_PORT}"
 docker run -d \
@@ -1063,33 +1187,37 @@ docker run -d \
 wait_for_postgres
 write_system_context
 
-echo "Starting Redpanda ${REDPANDA_IMAGE} on port ${REDPANDA_PORT}"
-docker run -d \
-  --name "${REDPANDA_CONTAINER}" \
-  -p "${REDPANDA_PORT}:9092" \
-  "${REDPANDA_IMAGE}" \
-  redpanda start \
-    --overprovisioned \
-    --smp 1 \
-    --memory 2G \
-    --reserve-memory 0M \
-    --node-id 0 \
-    --check=false \
-    --set "redpanda.kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}" \
-    --kafka-addr PLAINTEXT://0.0.0.0:9092 \
-    --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${REDPANDA_PORT}" >/dev/null
-wait_for_redpanda
+if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+  echo "Starting Redpanda ${REDPANDA_IMAGE} on port ${REDPANDA_PORT}"
+  docker run -d \
+    --name "${REDPANDA_CONTAINER}" \
+    -p "${REDPANDA_PORT}:9092" \
+    "${REDPANDA_IMAGE}" \
+    redpanda start \
+      --overprovisioned \
+      --smp 1 \
+      --memory 2G \
+      --reserve-memory 0M \
+      --node-id 0 \
+      --check=false \
+      --set "redpanda.kafka_batch_max_bytes=${REDPANDA_KAFKA_BATCH_MAX_BYTES}" \
+      --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+      --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${REDPANDA_PORT}" >/dev/null
+  wait_for_redpanda
 
-echo "Creating Kafka topics ${topic_list}"
-for topic in "${topics[@]}"; do
-  if ! docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 \
-    -c "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1; then
-    docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 >/dev/null 2>&1 || true
-  fi
-  docker exec "${REDPANDA_CONTAINER}" rpk topic alter-config "${topic}" \
-    --set "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1 || true
-done
-write_kafka_topic_info
+  echo "Creating Kafka topics ${topic_list}"
+  for topic in "${topics[@]}"; do
+    if ! docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 \
+      -c "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1; then
+      docker exec "${REDPANDA_CONTAINER}" rpk topic create "${topic}" -p 1 -r 1 >/dev/null 2>&1 || true
+    fi
+    docker exec "${REDPANDA_CONTAINER}" rpk topic alter-config "${topic}" \
+      --set "max.message.bytes=${REDPANDA_TOPIC_MAX_MESSAGE_BYTES}" >/dev/null 2>&1 || true
+  done
+  write_kafka_topic_info
+else
+  : >"${KAFKA_TOPIC_LOG}"
+fi
 
 case "${BENCH_MODE}" in
   snapshot|live_insert|snapshot_live_update) ;;
@@ -1177,6 +1305,7 @@ load_finished_ns="$(date +%s%N)"
 load_seconds="$(awk "BEGIN { printf \"%.3f\", (${load_finished_ns} - ${load_started_ns}) / 1000000000 }")"
 echo "timing.postgres_load_seconds=${load_seconds}"
 write_postgres_settings
+create_postgres_sink_tables
 source_rows=$((initial_rows + live_insert_rows + live_update_rows))
 
 if [[ "${BUILD_RELEASE}" == "1" ]]; then
@@ -1221,6 +1350,18 @@ if (( live_update_rows > 0 )); then
   expected_messages=$((expected_messages + $(expected_update_messages_for_chunks "${live_update_rows}" "${LIVE_WRITE_CHUNK_ROWS}")))
 fi
 echo "expected_kafka_messages=${expected_messages}"
+expected_kafka_messages_report="${expected_messages}"
+expected_sink_rows=""
+expected_postgres_updated_rows=0
+if [[ "${TARGET_NORMALIZED}" == "postgres" ]]; then
+  expected_kafka_messages_report=""
+  expected_sink_rows=$((initial_rows + live_insert_rows))
+  if [[ "${DATASET}" == "synthetic-orders" && "${BENCH_MODE}" == "snapshot_live_update" ]]; then
+    expected_postgres_updated_rows="${live_update_rows}"
+  fi
+  echo "expected_postgres_sink_rows=${expected_sink_rows}"
+  echo "expected_postgres_sink_updated_rows=${expected_postgres_updated_rows}"
+fi
 
 SLATEDB_ARGS=(
   --slatedb-await-durable=false
@@ -1264,14 +1405,22 @@ else
 fi
 node_pid="$!"
 
-echo "Counting CDC records from Kafka"
-counter_started_ns="$(date +%s%N)"
-"${COUNTER_BIN}" \
-  --brokers "${BROKERS}" \
-  --topics "${topic_list}" \
-  --expected "${expected_messages}" \
-  --timeout-secs "${TIMEOUT_SECS}" >"${COUNTER_LOG}" 2>&1 &
-counter_pid="$!"
+counter_started_ns=""
+counter_pid=""
+sink_wait_started_ns=""
+if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+  echo "Counting CDC records from Kafka"
+  counter_started_ns="$(date +%s%N)"
+  "${COUNTER_BIN}" \
+    --brokers "${BROKERS}" \
+    --topics "${topic_list}" \
+    --expected "${expected_messages}" \
+    --timeout-secs "${TIMEOUT_SECS}" >"${COUNTER_LOG}" 2>&1 &
+  counter_pid="$!"
+else
+  : >"${COUNTER_LOG}"
+  sink_wait_started_ns="$(date +%s%N)"
+fi
 
 live_write_seconds="0.000"
 if [[ "${BENCH_MODE}" == "live_insert" ]]; then
@@ -1296,17 +1445,36 @@ elif [[ "${BENCH_MODE}" == "snapshot_live_update" ]]; then
   live_write_seconds="$(awk "BEGIN { printf \"%.3f\", (${live_finished_ns} - ${live_started_ns}) / 1000000000 }")"
 fi
 
-if ! wait "${counter_pid}"; then
-  cat "${COUNTER_LOG}" >&2 || true
-  exit 1
+sink_wait_seconds=""
+sink_rows_per_second=""
+sink_observed_rows=""
+postgres_sink_updated_rows_observed=""
+if [[ "${TARGET_NORMALIZED}" == "kafka" ]]; then
+  if ! wait "${counter_pid}"; then
+    cat "${COUNTER_LOG}" >&2 || true
+    exit 1
+  fi
+  cat "${COUNTER_LOG}"
+else
+  echo "Waiting for Postgres sink tables ${target_table_list}"
+  if ! wait_for_postgres_sink "${expected_sink_rows}" "${expected_postgres_updated_rows}"; then
+    tail -80 "${NODE_STDERR}" >&2 || true
+    exit 1
+  fi
+  sink_wait_finished_ns="$(date +%s%N)"
+  sink_wait_seconds="$(awk "BEGIN { printf \"%.3f\", (${sink_wait_finished_ns} - ${sink_wait_started_ns}) / 1000000000 }")"
+  sink_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / (${sink_wait_seconds} > 0.001 ? ${sink_wait_seconds} : 0.001) }")"
 fi
-cat "${COUNTER_LOG}"
 node_finished_ns="$(date +%s%N)"
 write_postgres_slot_info
 write_docker_stats
 
 end_to_end_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${node_started_ns}) / 1000000000 }")"
-counter_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${counter_started_ns}) / 1000000000 }")"
+if [[ -n "${counter_started_ns}" ]]; then
+  counter_seconds="$(awk "BEGIN { printf \"%.3f\", (${node_finished_ns} - ${counter_started_ns}) / 1000000000 }")"
+else
+  counter_seconds=""
+fi
 end_to_end_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / ${end_to_end_seconds} }")"
 kafka_counter_wall_seconds="$(awk -F= '$1 == "cdc_counter.wall_seconds" { print $2; exit }' "${COUNTER_LOG}")"
 kafka_pre_stream_wait_seconds="$(awk -F= '$1 == "cdc_counter.pre_stream_wait_seconds" { print $2; exit }' "${COUNTER_LOG}")"
@@ -1345,6 +1513,21 @@ live_rows=$((live_insert_rows + live_update_rows))
 if (( live_rows > 0 )); then
   postgres_live_write_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${live_rows} / (${live_write_seconds} > 0.001 ? ${live_write_seconds} : 0.001) }")"
 fi
+target_observation_seconds=""
+target_observed_records=""
+target_observed_records_per_second=""
+case "${TARGET_NORMALIZED}" in
+  kafka)
+    target_observation_seconds="${kafka_counter_wall_seconds}"
+    target_observed_records="${observed_kafka_messages}"
+    target_observed_records_per_second="${consumer_wall_source_rows_per_second}"
+    ;;
+  postgres)
+    target_observation_seconds="${sink_wait_seconds}"
+    target_observed_records="${sink_observed_rows}"
+    target_observed_records_per_second="${sink_rows_per_second}"
+    ;;
+esac
 
 row_counts_json="$(
   for idx in "${!upstream_tables[@]}"; do
@@ -1371,7 +1554,9 @@ write_summary_json() {
     --arg source_table "${source_table}" \
     --arg upstream_table "${upstream_table}" \
     --argjson upstream_tables "${tables_json}" \
+    --arg target "${TARGET_NORMALIZED}" \
     --argjson kafka_topics "${topics_json}" \
+    --argjson postgres_sink_tables "${target_tables_json}" \
     --arg pipeline_format "${PIPELINE_FORMAT}" \
     --arg durable_replication_buffer "${DURABLE_REPLICATION_BUFFER}" \
     --arg buffer_max_pending_bytes "${BUFFER_MAX_PENDING_BYTES}" \
@@ -1395,8 +1580,12 @@ write_summary_json() {
     --arg live_insert_rows "${live_insert_rows}" \
     --arg live_update_rows "${live_update_rows}" \
     --arg source_rows "${source_rows}" \
-    --arg expected_kafka_messages "${expected_messages}" \
+    --arg expected_kafka_messages "${expected_kafka_messages_report}" \
     --arg observed_kafka_messages "${observed_kafka_messages}" \
+    --arg expected_sink_rows "${expected_sink_rows}" \
+    --arg sink_observed_rows "${sink_observed_rows}" \
+    --arg expected_postgres_updated_rows "${expected_postgres_updated_rows}" \
+    --arg postgres_sink_updated_rows_observed "${postgres_sink_updated_rows_observed}" \
     --arg message_multiplier "${message_multiplier}" \
     --argjson table_row_counts "${row_counts_json}" \
     --arg postgres_load_seconds "${load_seconds}" \
@@ -1407,6 +1596,8 @@ write_summary_json() {
     --arg kafka_pre_stream_wait_seconds "${kafka_pre_stream_wait_seconds}" \
     --arg kafka_stream_seconds "${kafka_stream_seconds}" \
     --arg kafka_post_stream_wait_seconds "${kafka_post_stream_wait_seconds}" \
+    --arg sink_wait_seconds "${sink_wait_seconds}" \
+    --arg target_observation_seconds "${target_observation_seconds}" \
     --arg harness_overhead_seconds "${harness_overhead_seconds}" \
     --arg end_to_end_rows_per_second "${end_to_end_rows_per_second}" \
     --arg kafka_stream_rows_per_second "${kafka_stream_rows_per_second}" \
@@ -1414,6 +1605,8 @@ write_summary_json() {
     --arg consumer_wall_source_rows_per_second "${consumer_wall_source_rows_per_second}" \
     --arg postgres_load_rows_per_second "${postgres_load_rows_per_second}" \
     --arg postgres_live_write_rows_per_second "${postgres_live_write_rows_per_second}" \
+    --arg sink_rows_per_second "${sink_rows_per_second}" \
+    --arg target_observed_records_per_second "${target_observed_records_per_second}" \
     --arg kafka_key_bytes "${kafka_key_bytes}" \
     --arg kafka_value_bytes "${kafka_value_bytes}" \
     --arg kafka_total_bytes "${kafka_total_bytes}" \
@@ -1458,7 +1651,11 @@ write_summary_json() {
         source_table: $source_table,
         upstream_table: $upstream_table,
         upstream_tables: $upstream_tables,
-        kafka_topics: $kafka_topics,
+        target: {
+          kind: $target,
+          kafka_topics: $kafka_topics,
+          postgres_tables: $postgres_sink_tables
+        },
         pipeline_format: $pipeline_format,
         durable_replication_buffer: maybe_bool($durable_replication_buffer),
         buffer: {
@@ -1501,6 +1698,10 @@ write_summary_json() {
         source_rows: maybe_num($source_rows),
         expected_kafka_messages: maybe_num($expected_kafka_messages),
         observed_kafka_messages: maybe_num($observed_kafka_messages),
+        expected_sink_rows: maybe_num($expected_sink_rows),
+        observed_sink_rows: maybe_num($sink_observed_rows),
+        expected_postgres_updated_rows: maybe_num($expected_postgres_updated_rows),
+        observed_postgres_updated_rows: maybe_num($postgres_sink_updated_rows_observed),
         message_multiplier: maybe_num($message_multiplier)
       },
       timings_seconds: {
@@ -1512,6 +1713,8 @@ write_summary_json() {
         kafka_pre_stream_wait: maybe_num($kafka_pre_stream_wait_seconds),
         kafka_stream: maybe_num($kafka_stream_seconds),
         kafka_post_stream_wait: maybe_num($kafka_post_stream_wait_seconds),
+        sink_wait: maybe_num($sink_wait_seconds),
+        target_observation: maybe_num($target_observation_seconds),
         harness_overhead: maybe_num($harness_overhead_seconds)
       },
       rates: {
@@ -1521,6 +1724,8 @@ write_summary_json() {
         consumer_wall_source_rows_per_second: maybe_num($consumer_wall_source_rows_per_second),
         postgres_load_rows_per_second: maybe_num($postgres_load_rows_per_second),
         postgres_live_write_rows_per_second: maybe_num($postgres_live_write_rows_per_second),
+        sink_rows_per_second: maybe_num($sink_rows_per_second),
+        target_observed_records_per_second: maybe_num($target_observed_records_per_second),
         kafka_stream_mb_per_second: maybe_num($kafka_stream_mb_per_second),
         kafka_wall_mb_per_second: maybe_num($kafka_wall_mb_per_second),
         harness_overhead_percent: maybe_num($harness_overhead_percent)
@@ -1559,6 +1764,8 @@ Dataset: \`${DATASET}\`
 
 Mode: \`${BENCH_MODE}\`
 
+Target: \`${TARGET_NORMALIZED}\`
+
 Format: \`${PIPELINE_FORMAT}\`
 
 Durable replication buffer: \`${DURABLE_REPLICATION_BUFFER}\`
@@ -1568,10 +1775,15 @@ Artifact directory: \`${ARTIFACT_DIR}\`
 | Metric | Value |
 | --- | ---: |
 | Source rows | ${source_rows} |
-| Expected Kafka messages | ${expected_messages} |
+| Expected Kafka messages | ${expected_kafka_messages_report:-} |
 | Observed Kafka messages | ${observed_kafka_messages:-} |
+| Expected Postgres sink rows | ${expected_sink_rows:-} |
+| Observed Postgres sink rows | ${sink_observed_rows:-} |
+| Observed Postgres updated rows | ${postgres_sink_updated_rows_observed:-} |
 | End-to-end seconds | ${end_to_end_seconds} |
 | End-to-end source rows/s | ${end_to_end_rows_per_second} |
+| Target observation seconds | ${target_observation_seconds:-} |
+| Target observed records/s | ${target_observed_records_per_second:-} |
 | Kafka stream seconds | ${kafka_stream_seconds:-} |
 | Kafka stream messages/s | ${kafka_stream_rows_per_second:-} |
 | Kafka stream source rows/s | ${kafka_stream_source_rows_per_second:-} |
@@ -1582,6 +1794,8 @@ Artifact directory: \`${ARTIFACT_DIR}\`
 | Postgres load rows/s | ${postgres_load_rows_per_second:-} |
 | Postgres live write seconds | ${live_write_seconds} |
 | Postgres live write rows/s | ${postgres_live_write_rows_per_second:-} |
+| Postgres sink wait seconds | ${sink_wait_seconds:-} |
+| Postgres sink rows/s | ${sink_rows_per_second:-} |
 | Kafka total bytes | ${kafka_total_bytes:-} |
 | Kafka stream MB/s | ${kafka_stream_mb_per_second:-} |
 
@@ -1595,7 +1809,9 @@ MD
   echo "benchmark.rows=${ROWS}"
   echo "benchmark.source_table=${source_table}"
   echo "benchmark.upstream_table=${upstream_table}"
+  echo "benchmark.target=${TARGET_NORMALIZED}"
   echo "benchmark.kafka_topics=${topic_list}"
+  echo "benchmark.postgres_sink_tables=${target_table_list}"
   echo "benchmark.mode=${BENCH_MODE}"
   echo "benchmark.initial_rows=${initial_rows}"
   echo "benchmark.live_insert_rows=${live_insert_rows}"
@@ -1620,7 +1836,12 @@ MD
   echo "benchmark.live_write_chunk_rows=${LIVE_WRITE_CHUNK_ROWS}"
   echo "benchmark.live_write_sleep_ms=${LIVE_WRITE_SLEEP_MS}"
   echo "benchmark.slatedb_flush_interval_ms=${SLATEDB_FLUSH_INTERVAL_MS}"
-  echo "benchmark.expected_kafka_messages=${expected_messages}"
+  echo "benchmark.expected_kafka_messages=${expected_kafka_messages_report}"
+  echo "benchmark.observed_kafka_messages=${observed_kafka_messages}"
+  echo "benchmark.expected_postgres_sink_rows=${expected_sink_rows}"
+  echo "benchmark.observed_postgres_sink_rows=${sink_observed_rows}"
+  echo "benchmark.expected_postgres_sink_updated_rows=${expected_postgres_updated_rows}"
+  echo "benchmark.observed_postgres_sink_updated_rows=${postgres_sink_updated_rows_observed}"
   echo "benchmark.postgres_load_seconds=${load_seconds}"
   echo "benchmark.postgres_live_write_seconds=${live_write_seconds}"
   echo "benchmark.end_to_end_seconds=${end_to_end_seconds}"
@@ -1630,15 +1851,23 @@ MD
   echo "benchmark.kafka_pre_stream_wait_seconds=${kafka_pre_stream_wait_seconds}"
   echo "benchmark.kafka_stream_seconds=${kafka_stream_seconds}"
   echo "benchmark.kafka_post_stream_wait_seconds=${kafka_post_stream_wait_seconds}"
+  echo "benchmark.postgres_sink_wait_seconds=${sink_wait_seconds}"
+  echo "benchmark.target_observation_seconds=${target_observation_seconds}"
   echo "benchmark.kafka_stream_rows_per_second=${kafka_stream_rows_per_second}"
   echo "benchmark.kafka_stream_source_rows_per_second=${kafka_stream_source_rows_per_second}"
   echo "benchmark.kafka_stream_mb_per_second=${kafka_stream_mb_per_second}"
+  echo "benchmark.kafka_key_bytes=${kafka_key_bytes}"
+  echo "benchmark.kafka_value_bytes=${kafka_value_bytes}"
+  echo "benchmark.kafka_total_bytes=${kafka_total_bytes}"
+  echo "benchmark.kafka_wall_mb_per_second=${kafka_wall_mb_per_second}"
   echo "benchmark.harness_overhead_seconds=${harness_overhead_seconds}"
   echo "benchmark.harness_overhead_percent=${harness_overhead_percent}"
   echo "benchmark.consumer_wall_source_rows_per_second=${consumer_wall_source_rows_per_second}"
   echo "benchmark.message_multiplier=${message_multiplier}"
   echo "benchmark.postgres_load_rows_per_second=${postgres_load_rows_per_second}"
   echo "benchmark.postgres_live_write_rows_per_second=${postgres_live_write_rows_per_second}"
+  echo "benchmark.postgres_sink_rows_per_second=${sink_rows_per_second}"
+  echo "benchmark.target_observed_records_per_second=${target_observed_records_per_second}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"

@@ -9,21 +9,15 @@ ARTIFACT_ROOT="${ARTIFACT_ROOT:-${REPO_ROOT}/target/cdc_bench_matrix/${RUN_ID}}"
 ROWS_LIST="${ROWS_LIST:-1000 100000 1000000}"
 DATASET="${DATASET:-synthetic-orders}"
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-0.01}"
-PIPELINE_FORMATS="${PIPELINE_FORMATS:-floe-json debezium-json arrow-ipc}"
-if [[ -z "${BENCH_MODES+x}" ]]; then
-  case "${DATASET}" in
-    tpch-all)
-      BENCH_MODES="snapshot"
-      ;;
-    tpch-top2)
-      BENCH_MODES="snapshot live_insert"
-      ;;
-    *)
-      BENCH_MODES="snapshot live_insert snapshot_live_update"
-      ;;
-  esac
+TARGETS="${TARGETS:-kafka}"
+PIPELINE_FORMATS="${PIPELINE_FORMATS:-}"
+DURABLE_REPLICATION_BUFFER="${DURABLE_REPLICATION_BUFFER:-true}"
+DURABLE_REPLICATION_BUFFERS="${DURABLE_REPLICATION_BUFFERS:-${DURABLE_REPLICATION_BUFFER}}"
+BENCH_MODES_EXPLICIT=0
+if [[ -n "${BENCH_MODES+x}" && -n "${BENCH_MODES}" ]]; then
+  BENCH_MODES_EXPLICIT=1
 else
-  BENCH_MODES="${BENCH_MODES:-snapshot live_insert snapshot_live_update}"
+  BENCH_MODES=""
 fi
 TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
@@ -67,9 +61,52 @@ env_value() {
   awk -F= -v key="${key}" '$1 == key { print substr($0, length(key) + 2); exit }' "${file}"
 }
 
+formats_for_target() {
+  local target="$1"
+  if [[ -n "${PIPELINE_FORMATS}" ]]; then
+    printf '%s\n' "${PIPELINE_FORMATS}"
+    return
+  fi
+  case "${target}" in
+    kafka)
+      printf '%s\n' "floe-json debezium-json arrow-ipc"
+      ;;
+    postgres)
+      printf '%s\n' "floe-json"
+      ;;
+    *)
+      echo "unsupported TARGETS entry '${target}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+modes_for_target() {
+  local target="$1"
+  if [[ "${BENCH_MODES_EXPLICIT}" == "1" ]]; then
+    printf '%s\n' "${BENCH_MODES}"
+    return
+  fi
+  case "${DATASET}" in
+    tpch-all|tpch-lineitem|tpch-lineitem-flat)
+      printf '%s\n' "snapshot"
+      ;;
+    tpch-top2)
+      printf '%s\n' "snapshot live_insert"
+      ;;
+    *)
+      if [[ "${target}" == "postgres" ]]; then
+        printf '%s\n' "snapshot live_insert"
+      else
+        printf '%s\n' "snapshot live_insert snapshot_live_update"
+      fi
+      ;;
+  esac
+}
+
 write_headers() {
   cat >"${SUMMARY_CSV}" <<CSV
-status,mode,format,rows,source_rows,expected_messages,observed_messages,end_to_end_seconds,end_to_end_source_rows_per_second,kafka_stream_seconds,kafka_stream_messages_per_second,kafka_stream_source_rows_per_second,consumer_wall_source_rows_per_second,kafka_pre_stream_wait_seconds,harness_overhead_seconds,harness_overhead_percent,message_multiplier,postgres_load_rows_per_second,postgres_live_write_rows_per_second,total_bytes,wall_mb_per_second,stream_mb_per_second,artifact_dir
+status,target,durable_buffer,mode,format,rows,source_rows,expected_messages,observed_messages,expected_postgres_sink_rows,observed_postgres_sink_rows,end_to_end_seconds,end_to_end_source_rows_per_second,target_observation_seconds,target_observed_records_per_second,kafka_stream_seconds,kafka_stream_messages_per_second,kafka_stream_source_rows_per_second,consumer_wall_source_rows_per_second,kafka_pre_stream_wait_seconds,postgres_sink_wait_seconds,postgres_sink_rows_per_second,harness_overhead_seconds,harness_overhead_percent,message_multiplier,postgres_load_rows_per_second,postgres_live_write_rows_per_second,total_bytes,wall_mb_per_second,stream_mb_per_second,artifact_dir
 CSV
   : >"${SUMMARY_JSONL}"
   cat >"${SUMMARY_MD}" <<MD
@@ -83,9 +120,13 @@ Dataset: \`${DATASET}\`
 
 TPC-H scale factor: \`${TPCH_SCALE_FACTOR}\`
 
-Formats: \`${PIPELINE_FORMATS}\`
+Targets: \`${TARGETS}\`
 
-Modes: \`${BENCH_MODES}\`
+Formats: \`${PIPELINE_FORMATS:-auto}\`
+
+Modes: \`${BENCH_MODES:-auto}\`
+
+Durable buffer modes: \`${DURABLE_REPLICATION_BUFFERS}\`
 
 Live write chunk rows: \`${LIVE_WRITE_CHUNK_ROWS}\`
 
@@ -111,8 +152,8 @@ Floe pgwire port: \`${FLOE_PG_PORT}\`
 
 Floe admin port: \`${FLOE_ADMIN_PORT}\`
 
-| Status | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | End-to-End (s) | E2E Source Rows/s | Kafka Stream (s) | Stream Msgs/s | Stream Source Rows/s | Consumer Wall Source Rows/s | Pre-Stream Wait (s) | Harness Overhead (s) | Harness Overhead % | Msg Multiplier | PG Load Rows/s | PG Live Write Rows/s | Total Bytes | Wall MB/s | Stream MB/s | Artifacts |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Status | Target | Durable Buffer | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | Expected PG Sink Rows | Observed PG Sink Rows | End-to-End (s) | E2E Source Rows/s | Target Observation (s) | Target Records/s | Kafka Stream (s) | Stream Msgs/s | Stream Source Rows/s | Consumer Wall Source Rows/s | Pre-Stream Wait (s) | PG Sink Wait (s) | PG Sink Rows/s | Harness Overhead (s) | Harness Overhead % | Msg Multiplier | PG Load Rows/s | PG Live Write Rows/s | Total Bytes | Wall MB/s | Stream MB/s | Artifacts |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 MD
 }
 
@@ -123,10 +164,12 @@ write_json_summary() {
     --arg git_commit "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" \
     --arg git_branch "$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" \
     --arg rows_list "${ROWS_LIST}" \
+    --arg targets "${TARGETS}" \
+    --arg durable_replication_buffers "${DURABLE_REPLICATION_BUFFERS}" \
     --arg dataset "${DATASET}" \
     --arg tpch_scale_factor "${TPCH_SCALE_FACTOR}" \
-    --arg pipeline_formats "${PIPELINE_FORMATS}" \
-    --arg bench_modes "${BENCH_MODES}" \
+    --arg pipeline_formats "${PIPELINE_FORMATS:-auto}" \
+    --arg bench_modes "${BENCH_MODES:-auto}" \
     --arg timeout_secs "${TIMEOUT_SECS}" \
     --arg build_release "${BUILD_RELEASE}" \
     --arg live_write_chunk_rows "${LIVE_WRITE_CHUNK_ROWS}" \
@@ -166,10 +209,12 @@ write_json_summary() {
       },
       config: {
         rows_list: words($rows_list) | map(tonumber),
+        targets: words($targets),
+        durable_replication_buffers: words($durable_replication_buffers) | map(maybe_bool(.)),
         dataset: $dataset,
         tpch_scale_factor: maybe_num($tpch_scale_factor),
-        pipeline_formats: words($pipeline_formats),
-        bench_modes: words($bench_modes),
+        pipeline_formats: (if $pipeline_formats == "auto" then "auto" else words($pipeline_formats) end),
+        bench_modes: (if $bench_modes == "auto" then "auto" else words($bench_modes) end),
         timeout_secs: maybe_num($timeout_secs),
         build_release: maybe_bool($build_release),
         live_write_chunk_rows: maybe_num($live_write_chunk_rows),
@@ -209,7 +254,9 @@ write_reproduce_command() {
     printf 'ROWS_LIST=%q \\\n' "${ROWS_LIST}"
     printf 'DATASET=%q \\\n' "${DATASET}"
     printf 'TPCH_SCALE_FACTOR=%q \\\n' "${TPCH_SCALE_FACTOR}"
+    printf 'TARGETS=%q \\\n' "${TARGETS}"
     printf 'PIPELINE_FORMATS=%q \\\n' "${PIPELINE_FORMATS}"
+    printf 'DURABLE_REPLICATION_BUFFERS=%q \\\n' "${DURABLE_REPLICATION_BUFFERS}"
     printf 'BENCH_MODES=%q \\\n' "${BENCH_MODES}"
     printf 'TIMEOUT_SECS=%q \\\n' "${TIMEOUT_SECS}"
     printf 'BUILD_RELEASE=%q \\\n' "${BUILD_RELEASE}"
@@ -234,42 +281,55 @@ write_reproduce_command() {
 append_result() {
   local status="$1"
   local run_dir="$2"
-  local mode="$3"
-  local format="$4"
-  local rows="$5"
+  local target="$3"
+  local durable_buffer="$4"
+  local mode="$5"
+  local format="$6"
+  local rows="$7"
   local summary="${run_dir}/summary.env"
-  local counter="${run_dir}/kafka-counter.log"
 
-  local source_rows expected observed seconds rows_per_second stream_seconds stream_rows_per_second stream_source_rows_per_second consumer_wall_source_rows_per_second pre_stream_wait harness_overhead harness_overhead_percent message_multiplier postgres_load_rows_per_second postgres_live_write_rows_per_second total_bytes wall_mb_per_second stream_mb_per_second
+  local source_rows expected observed expected_sink observed_sink seconds rows_per_second target_observation_seconds target_observed_records_per_second stream_seconds stream_rows_per_second stream_source_rows_per_second consumer_wall_source_rows_per_second pre_stream_wait sink_wait_seconds sink_rows_per_second harness_overhead harness_overhead_percent message_multiplier postgres_load_rows_per_second postgres_live_write_rows_per_second total_bytes wall_mb_per_second stream_mb_per_second
   source_rows="$(env_value "${summary}" benchmark.source_rows)"
   expected="$(env_value "${summary}" benchmark.expected_kafka_messages)"
-  observed="$(env_value "${counter}" cdc_counter.observed_messages)"
+  observed="$(env_value "${summary}" benchmark.observed_kafka_messages)"
+  expected_sink="$(env_value "${summary}" benchmark.expected_postgres_sink_rows)"
+  observed_sink="$(env_value "${summary}" benchmark.observed_postgres_sink_rows)"
   seconds="$(env_value "${summary}" benchmark.end_to_end_seconds)"
   rows_per_second="$(env_value "${summary}" benchmark.end_to_end_rows_per_second)"
+  target_observation_seconds="$(env_value "${summary}" benchmark.target_observation_seconds)"
+  target_observed_records_per_second="$(env_value "${summary}" benchmark.target_observed_records_per_second)"
   stream_seconds="$(env_value "${summary}" benchmark.kafka_stream_seconds)"
   stream_rows_per_second="$(env_value "${summary}" benchmark.kafka_stream_rows_per_second)"
   stream_source_rows_per_second="$(env_value "${summary}" benchmark.kafka_stream_source_rows_per_second)"
   consumer_wall_source_rows_per_second="$(env_value "${summary}" benchmark.consumer_wall_source_rows_per_second)"
   pre_stream_wait="$(env_value "${summary}" benchmark.kafka_pre_stream_wait_seconds)"
+  sink_wait_seconds="$(env_value "${summary}" benchmark.postgres_sink_wait_seconds)"
+  sink_rows_per_second="$(env_value "${summary}" benchmark.postgres_sink_rows_per_second)"
   harness_overhead="$(env_value "${summary}" benchmark.harness_overhead_seconds)"
   harness_overhead_percent="$(env_value "${summary}" benchmark.harness_overhead_percent)"
   message_multiplier="$(env_value "${summary}" benchmark.message_multiplier)"
   postgres_load_rows_per_second="$(env_value "${summary}" benchmark.postgres_load_rows_per_second)"
   postgres_live_write_rows_per_second="$(env_value "${summary}" benchmark.postgres_live_write_rows_per_second)"
-  total_bytes="$(env_value "${counter}" cdc_counter.total_bytes)"
-  wall_mb_per_second="$(env_value "${counter}" cdc_counter.wall_mb_per_second)"
+  total_bytes="$(env_value "${summary}" benchmark.kafka_total_bytes)"
+  wall_mb_per_second="$(env_value "${summary}" benchmark.kafka_wall_mb_per_second)"
   stream_mb_per_second="$(env_value "${summary}" benchmark.kafka_stream_mb_per_second)"
 
   source_rows="${source_rows:-}"
   expected="${expected:-}"
   observed="${observed:-}"
+  expected_sink="${expected_sink:-}"
+  observed_sink="${observed_sink:-}"
   seconds="${seconds:-}"
   rows_per_second="${rows_per_second:-}"
+  target_observation_seconds="${target_observation_seconds:-}"
+  target_observed_records_per_second="${target_observed_records_per_second:-}"
   stream_seconds="${stream_seconds:-}"
   stream_rows_per_second="${stream_rows_per_second:-}"
   stream_source_rows_per_second="${stream_source_rows_per_second:-}"
   consumer_wall_source_rows_per_second="${consumer_wall_source_rows_per_second:-}"
   pre_stream_wait="${pre_stream_wait:-}"
+  sink_wait_seconds="${sink_wait_seconds:-}"
+  sink_rows_per_second="${sink_rows_per_second:-}"
   harness_overhead="${harness_overhead:-}"
   harness_overhead_percent="${harness_overhead_percent:-}"
   message_multiplier="${message_multiplier:-}"
@@ -279,21 +339,29 @@ append_result() {
   wall_mb_per_second="${wall_mb_per_second:-}"
   stream_mb_per_second="${stream_mb_per_second:-}"
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${status}" \
+    "${target}" \
+    "${durable_buffer}" \
     "${mode}" \
     "${format}" \
     "${rows}" \
     "${source_rows}" \
     "${expected}" \
     "${observed}" \
+    "${expected_sink}" \
+    "${observed_sink}" \
     "${seconds}" \
     "${rows_per_second}" \
+    "${target_observation_seconds}" \
+    "${target_observed_records_per_second}" \
     "${stream_seconds}" \
     "${stream_rows_per_second}" \
     "${stream_source_rows_per_second}" \
     "${consumer_wall_source_rows_per_second}" \
     "${pre_stream_wait}" \
+    "${sink_wait_seconds}" \
+    "${sink_rows_per_second}" \
     "${harness_overhead}" \
     "${harness_overhead_percent}" \
     "${message_multiplier}" \
@@ -304,21 +372,29 @@ append_result() {
     "${stream_mb_per_second}" \
     "${run_dir}" >>"${SUMMARY_CSV}"
 
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
+  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
     "${status}" \
+    "${target}" \
+    "${durable_buffer}" \
     "${mode}" \
     "${format}" \
     "${rows}" \
     "${source_rows:-n/a}" \
     "${expected:-n/a}" \
     "${observed:-n/a}" \
+    "${expected_sink:-n/a}" \
+    "${observed_sink:-n/a}" \
     "${seconds:-n/a}" \
     "${rows_per_second:-n/a}" \
+    "${target_observation_seconds:-n/a}" \
+    "${target_observed_records_per_second:-n/a}" \
     "${stream_seconds:-n/a}" \
     "${stream_rows_per_second:-n/a}" \
     "${stream_source_rows_per_second:-n/a}" \
     "${consumer_wall_source_rows_per_second:-n/a}" \
     "${pre_stream_wait:-n/a}" \
+    "${sink_wait_seconds:-n/a}" \
+    "${sink_rows_per_second:-n/a}" \
     "${harness_overhead:-n/a}" \
     "${harness_overhead_percent:-n/a}" \
     "${message_multiplier:-n/a}" \
@@ -333,6 +409,8 @@ append_result() {
   if [[ -f "${run_summary_json}" ]] && jq empty "${run_summary_json}" >/dev/null 2>&1; then
     jq -c \
       --arg status "${status}" \
+      --arg target "${target}" \
+      --arg durable_buffer "${durable_buffer}" \
       --arg mode "${mode}" \
       --arg format "${format}" \
       --arg rows "${rows}" \
@@ -341,6 +419,8 @@ append_result() {
       . + {
         matrix: {
           status: $status,
+          target: $target,
+          durable_buffer: ($durable_buffer == "true"),
           mode: $mode,
           pipeline_format: $format,
           requested_rows: ($rows | tonumber),
@@ -351,6 +431,8 @@ append_result() {
   else
     jq -nc \
       --arg status "${status}" \
+      --arg target "${target}" \
+      --arg durable_buffer "${durable_buffer}" \
       --arg mode "${mode}" \
       --arg format "${format}" \
       --arg rows "${rows}" \
@@ -359,6 +441,8 @@ append_result() {
         schema_version: 1,
         matrix: {
           status: $status,
+          target: $target,
+          durable_buffer: ($durable_buffer == "true"),
           mode: $mode,
           pipeline_format: $format,
           requested_rows: ($rows | tonumber),
@@ -374,17 +458,25 @@ append_result() {
 write_headers
 write_reproduce_command
 
-for mode in ${BENCH_MODES}; do
-  for format in ${PIPELINE_FORMATS}; do
-    for rows in ${ROWS_LIST}; do
-      run_dir="${ARTIFACT_ROOT}/${mode}/${format}/${rows}"
+for target in ${TARGETS}; do
+  target="${target,,}"
+  target="${target//-/_}"
+  target_formats="$(formats_for_target "${target}")"
+  target_modes="$(modes_for_target "${target}")"
+  for durable_buffer in ${DURABLE_REPLICATION_BUFFERS}; do
+    for mode in ${target_modes}; do
+      for format in ${target_formats}; do
+        for rows in ${ROWS_LIST}; do
+          run_dir="${ARTIFACT_ROOT}/${target}/durable-${durable_buffer}/${mode}/${format}/${rows}"
       mkdir -p "${run_dir}"
-      log "running mode=${mode} format=${format} rows=${rows}"
+      log "running target=${target} durable_buffer=${durable_buffer} mode=${mode} format=${format} rows=${rows}"
       if (
         cd "${REPO_ROOT}"
         ARTIFACT_DIR="${run_dir}" \
         DATASET="${DATASET}" \
         TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR}" \
+        TARGET="${target}" \
+        DURABLE_REPLICATION_BUFFER="${durable_buffer}" \
         BENCH_MODE="${mode}" \
         PIPELINE_FORMAT="${format}" \
         ROWS="${rows}" \
@@ -404,9 +496,9 @@ for mode in ${BENCH_MODES}; do
         FLOE_ADMIN_PORT="${FLOE_ADMIN_PORT}" \
         scripts/postgres_cdc_perf_local.sh
       ) >"${run_dir}/matrix-run.log" 2>&1; then
-        append_result "ok" "${run_dir}" "${mode}" "${format}" "${rows}"
+        append_result "ok" "${run_dir}" "${target}" "${durable_buffer}" "${mode}" "${format}" "${rows}"
       else
-        append_result "failed" "${run_dir}" "${mode}" "${format}" "${rows}"
+        append_result "failed" "${run_dir}" "${target}" "${durable_buffer}" "${mode}" "${format}" "${rows}"
         log "failed; see ${run_dir}/matrix-run.log"
         if [[ "${STOP_ON_FAIL}" == "1" ]]; then
           exit 1
@@ -414,6 +506,8 @@ for mode in ${BENCH_MODES}; do
       fi
     done
   done
+done
+done
 done
 
 write_json_summary
