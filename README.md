@@ -30,6 +30,8 @@ Optional inputs:
   `cargo run -- run --input-file /path/to/events.json --input-source nexmark_bid`
 - Kafka ingest:
   `cargo run -- run --kafka-brokers localhost:9092 --kafka-topics nexmark_bid`
+- Postgres CDC ingest, configured through SQL or config files, uses native
+  logical replication with `pgoutput`.
 - Connector config file (TOML/YAML/JSON):
   `cargo run -- run --config /path/to/connectors.toml`
 - Validate config + SQL planning without startup side effects:
@@ -66,6 +68,10 @@ Observability:
   - `floe_ingest_ticks_total{result=...}`
   - `floe_source_offset_lag{source=...,partition=...}`
   - `floe_mv_freshness_seconds{view=...}`
+  - `floe_postgres_cdc_source_lag_bytes{source=...,slot=...}`
+  - `floe_postgres_cdc_table_lag_bytes{source=...,slot=...,table=...}`
+  - `floe_cdc_buffer_pending_records{pipeline=...}`
+  - `floe_cdc_buffer_pending_bytes{pipeline=...}`
   - `floe_runtime_errors_total{component=...}`
 
 ### Storage tuning (SlateDB)
@@ -106,10 +112,58 @@ Tradeoffs:
 ## Architecture Overview
 
 1. Append-style connectors emit `AppendIngestEvent` payloads (file, Kafka, or generator).
-2. Events are decoded into typed rows via `SourceRowDecoder`.
-3. Outer streams feed the DBSP runtime built from DataFusion logical plans.
-4. Materialized views are managed in the executor and exposed via pgwire TAIL.
-5. State is stored in SlateDB (in-memory by default, filesystem when configured).
+2. Native Postgres CDC uses transaction/change batches and replication pipelines
+   instead of the append-ingest event path.
+3. Events and CDC changes are decoded into typed rows via planner/runtime
+   source definitions.
+4. Outer streams feed the DBSP runtime built from DataFusion logical plans.
+5. Materialized views are managed in the executor and exposed via pgwire TAIL.
+6. State is stored in SlateDB (in-memory by default, filesystem when configured).
+
+## Postgres CDC Alpha Surface
+
+Postgres CDC is an alpha feature for single-node deployments. It supports:
+
+- `CREATE SOURCE ... WITH (connector = 'postgres-cdc', connection = ...,
+  slot.name = ..., publication.name = ...)` using native `pgoutput` logical
+  replication.
+- `CREATE TABLE ... FROM <source> TABLE '<schema.table>'` bindings for CDC
+  source tables.
+- Materialized views over CDC-backed tables, including snapshot backfill, WAL
+  handoff, inserts, updates, deletes, joins, and aggregates.
+- `CREATE REPLICATION PIPELINE ... INTO KAFKA` with `floe-json`,
+  `debezium-json`, or experimental `arrow-ipc` payloads.
+- `CREATE REPLICATION PIPELINE ... INTO POSTGRES` with `floe-json` payloads.
+- Optional durable replication buffers with bounded pending bytes, records,
+  transactions, and age limits.
+- Postgres materialized-view sinks in `upsert` and `append_only` modes.
+- Admin inspection under `/debug/cdc/replication` and DLQ list, inspect, retry,
+  batch retry, and discard endpoints under `/debug/cdc/replication/dlq`.
+
+Current requirements and limitations:
+
+- The Postgres publication and logical replication slot must exist before the
+  node starts.
+- CDC tables need primary-key metadata for update/delete and target upsert
+  semantics.
+- Schema evolution is fail-fast or compatibility-policy limited; online product
+  schema migration is not complete.
+- Common scalar types are covered, but broader Postgres fidelity such as UUID,
+  JSONB, arrays, bytea, enums/domains, intervals, and range types is still being
+  expanded.
+- Source/target HA failover, reconciliation/drift checks, stable operator CLI
+  UX, and larger published performance baselines are follow-up product work.
+- Arrow IPC Kafka output is internal/experimental and should not be used for
+  public apples-to-apples format claims without calling that out.
+
+Useful validation entry points:
+
+- `scripts/run_postgres_cdc_pgoutput_e2e.sh`
+- `scripts/run_postgres_cdc_binary_e2e.sh`
+- `cargo test -p floe-cdc-pg --test postgres_pgoutput_e2e`
+- `FLOE_ACCEPTANCE_PG_DSN=... cargo test -p floe-node --test ga_acceptance -- --ignored`
+- `scripts/postgres_cdc_perf_local.sh`
+- `scripts/postgres_cdc_perf_matrix.sh`
 
 ## Workspace Modules and Ownership
 
@@ -143,17 +197,12 @@ Repo hygiene checker:
 bash scripts/repo_hygiene.sh
 ```
 
-Policy details and exception process:
+Canonical full validation sequence:
 
-- `reports/REPO_HYGIENE_POLICY.md`
+```bash
+bash scripts/validate_workspace.sh
+```
 
-Additional operational documentation:
-
-- `docs/production_readiness.md`: production exit checklist and quick operator runbook.
-- `docs/runtime_config.md`: config-first schema, precedence rules, and examples.
-- `docs/storage_data_directory.md`: `--data-dir` behavior and safe reset procedure.
-- `docs/operator_runbook.md`: production-like startup/restart/troubleshooting guide.
-- `docs/ga_contract.md`: connector/sink delivery guarantees and GA limitations.
-- `docs/supported_features.md`: explicit SQL/connectors/sinks support matrix.
-- `docs/local_deploy.md`: local compose deploy (Kafka + Postgres + Floe).
-- Canonical full validation sequence: `scripts/validate_workspace.sh`.
+This repository currently tracks README and scripts as the committed operational
+surface. The `docs/` directory is ignored by `.gitignore`, so local files there
+are not part of the published repository unless that policy changes.
