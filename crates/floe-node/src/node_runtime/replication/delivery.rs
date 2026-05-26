@@ -52,7 +52,8 @@ impl ReplicationPipelineRuntime {
         plan: &ReplicationPipelineRuntimePlan,
         records: &[CdcBufferRecord],
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-        match &plan.target {
+        let started_at = std::time::Instant::now();
+        let result = match &plan.target {
             ReplicationPipelineRuntimeTarget::Kafka { .. } => {
                 let writer = self
                     .kafka_writers_by_pipeline
@@ -74,7 +75,15 @@ impl ReplicationPipelineRuntime {
                     })?;
                 writer.send_records(records).await
             }
-        }
+        };
+        crate::metrics::record_cdc_replication_target_write(
+            &plan.name,
+            target_kind(plan),
+            if result.is_ok() { "success" } else { "failure" },
+            records.len(),
+            started_at.elapsed().as_millis() as u64,
+        );
+        result
     }
 
     pub(super) async fn mark_manifest_delivered(

@@ -294,8 +294,9 @@ impl ReplicationPipelineRuntime {
         let mut snapshots = Vec::new();
         for plans in self.pipelines_by_source.values() {
             for plan in plans {
+                let now_unix_ms = current_unix_time_ms();
                 let stats = buffer_store
-                    .stats(&plan.name, current_unix_time_ms())
+                    .stats(&plan.name, now_unix_ms)
                     .await
                     .with_context(|| {
                         format!(
@@ -303,6 +304,41 @@ impl ReplicationPipelineRuntime {
                             plan.name
                         )
                     })?;
+                let dlq_entries = storage
+                    .replication_pipeline_dlq_entries(&plan.name)
+                    .await
+                    .with_context(|| {
+                        format!("load replication pipeline '{}' DLQ entries", plan.name)
+                    })?;
+                let mut dlq_pending_entries = 0usize;
+                let mut dlq_replayed_entries = 0usize;
+                let mut dlq_discarded_entries = 0usize;
+                let mut oldest_dlq_pending_age_ms = None;
+                for entry in &dlq_entries {
+                    match entry.status() {
+                        ReplicationPipelineDlqStatus::Pending => {
+                            dlq_pending_entries = dlq_pending_entries.saturating_add(1);
+                            let age_ms = now_unix_ms.saturating_sub(entry.created_at_unix_ms());
+                            oldest_dlq_pending_age_ms = Some(
+                                oldest_dlq_pending_age_ms
+                                    .map_or(age_ms, |oldest| std::cmp::max(oldest, age_ms)),
+                            );
+                        }
+                        ReplicationPipelineDlqStatus::Replayed => {
+                            dlq_replayed_entries = dlq_replayed_entries.saturating_add(1);
+                        }
+                        ReplicationPipelineDlqStatus::Discarded => {
+                            dlq_discarded_entries = dlq_discarded_entries.saturating_add(1);
+                        }
+                    }
+                }
+                crate::metrics::record_cdc_replication_dlq_stats(
+                    &plan.name,
+                    dlq_pending_entries,
+                    dlq_replayed_entries,
+                    dlq_discarded_entries,
+                    oldest_dlq_pending_age_ms,
+                );
                 let checkpoint = storage
                     .replication_pipeline_checkpoint(&plan.name)
                     .await
@@ -340,6 +376,10 @@ impl ReplicationPipelineRuntime {
                     pending_records: stats.pending_records(),
                     pending_bytes: stats.pending_bytes(),
                     oldest_pending_age_ms: stats.oldest_pending_age_ms(),
+                    dlq_pending_entries,
+                    dlq_replayed_entries,
+                    dlq_discarded_entries,
+                    oldest_dlq_pending_age_ms,
                     replaying: replaying_by_pipeline
                         .get(&plan.name)
                         .copied()

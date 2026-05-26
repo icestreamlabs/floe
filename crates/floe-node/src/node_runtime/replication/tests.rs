@@ -807,6 +807,16 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
         )
         .await
         .unwrap();
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
+        "snapshot-entry-1",
+        "0/16B6C40",
+        "pg-xid-76",
+        current_unix_time_ms().saturating_sub(50),
+    )
+    .await
+    .expect("persist pending DLQ entry");
 
     let snapshots = runtime.status_snapshots(&storage).await.unwrap();
     let snapshot = snapshots.first().expect("snapshot");
@@ -818,6 +828,10 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
     assert_eq!(snapshot.pending_records(), manifest.record_count());
     assert!(snapshot.pending_bytes() > 0);
     assert!(snapshot.oldest_pending_age_ms().is_some());
+    assert_eq!(snapshot.dlq_pending_entries(), 1);
+    assert_eq!(snapshot.dlq_replayed_entries(), 0);
+    assert_eq!(snapshot.dlq_discarded_entries(), 0);
+    assert!(snapshot.oldest_dlq_pending_age_ms().is_some());
     assert!(snapshot.replaying());
     assert_eq!(snapshot.last_error(), Some("kafka unavailable"));
     assert_eq!(
@@ -879,6 +893,10 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
     assert_eq!(debug_pipeline.pending_records, manifest.record_count());
     assert!(debug_pipeline.pending_bytes > 0);
     assert!(debug_pipeline.oldest_pending_age_ms.is_some());
+    assert_eq!(debug_pipeline.dlq_pending_entries, 1);
+    assert_eq!(debug_pipeline.dlq_replayed_entries, 0);
+    assert_eq!(debug_pipeline.dlq_discarded_entries, 0);
+    assert!(debug_pipeline.oldest_dlq_pending_age_ms.is_some());
     assert!(debug_pipeline.replaying);
     assert_eq!(
         debug_pipeline.last_error.as_deref(),
@@ -1124,6 +1142,100 @@ async fn durable_pipeline_buffers_source_progress_when_target_is_down() {
         .await
         .expect("pending after restart replay");
     assert_eq!(still_pending.len(), 2);
+}
+
+#[tokio::test]
+async fn distinct_pipeline_failure_does_not_skip_unrelated_durable_pipeline() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let mut fail_fast_plan = test_plan("orders_fail_fast", table_id.clone(), "public.orders");
+    fail_fast_plan.buffer_mode = ReplicationPipelineRuntimeBufferMode::NoBuffer;
+    fail_fast_plan.error_policy =
+        CatalogReplicationErrorPolicy::new(CatalogReplicationErrorPolicyMode::FailFast, None);
+    fail_fast_plan.target = ReplicationPipelineRuntimeTarget::Kafka {
+        brokers: "localhost:9092".to_string(),
+        topic: "orders_fail_fast".to_string(),
+    };
+
+    let mut durable_plan = test_plan("orders_retry", table_id.clone(), "public.orders");
+    durable_plan.target = ReplicationPipelineRuntimeTarget::Kafka {
+        brokers: "localhost:9092".to_string(),
+        topic: "orders_retry".to_string(),
+    };
+
+    let runtime = test_runtime_with_plans(vec![fail_fast_plan.clone(), durable_plan.clone()]);
+    let storage = SlateCatalog::in_memory().await.unwrap();
+    let schemas = HashMap::from([(table_id.clone(), durable_plan.schema.clone())]);
+    let source_id = CdcSourceId::new("pg_main").unwrap();
+    let transaction = TransactionBatch::new(
+        source_id.clone(),
+        Some(CdcTransactionId::new("pg-xid-700").unwrap()),
+        None,
+        floe_cdc_core::CdcSourcePosition::postgres("0/16B7000", None).unwrap(),
+        vec![
+            ChangeBatch::new(
+                table_id,
+                vec![CdcChange::Insert {
+                    row: row(7, "open"),
+                }],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let error = runtime
+        .run_transaction(&source_id, &schemas, &transaction, Some(&storage))
+        .await
+        .expect_err("fail-fast target should make the source transaction fail");
+    assert!(error.to_string().contains("has no Kafka writer"));
+
+    let buffer_store = storage.cdc_buffer_store();
+    let durable_pending = buffer_store
+        .pending_transactions(&durable_plan.name, 10)
+        .await
+        .expect("durable pipeline pending transactions");
+    assert_eq!(durable_pending.len(), 1);
+    assert_eq!(
+        durable_pending[0].source_position(),
+        transaction.commit_position()
+    );
+    assert_eq!(
+        durable_pending[0]
+            .transaction_id()
+            .map(CdcTransactionId::as_str),
+        Some("pg-xid-700")
+    );
+
+    let fail_fast_pending = buffer_store
+        .pending_transactions(&fail_fast_plan.name, 10)
+        .await
+        .expect("fail-fast pipeline pending transactions");
+    assert!(fail_fast_pending.is_empty());
+    assert_eq!(
+        storage
+            .replication_pipeline_checkpoint(&fail_fast_plan.name)
+            .await
+            .expect("fail-fast checkpoint"),
+        None
+    );
+
+    let durable_checkpoint = storage
+        .replication_pipeline_checkpoint(&durable_plan.name)
+        .await
+        .expect("durable checkpoint")
+        .expect("durable checkpoint");
+    assert_eq!(
+        durable_checkpoint.source_position(),
+        transaction.commit_position()
+    );
+    assert_eq!(
+        durable_checkpoint.target_state()["target.delivery.status"],
+        "failed"
+    );
+    assert_eq!(
+        durable_checkpoint.target_state()["target.delivery.replay_may_duplicate"],
+        "true"
+    );
 }
 
 #[tokio::test]
@@ -1784,11 +1896,22 @@ fn test_plan(
 }
 
 fn test_runtime_with_plan(plan: ReplicationPipelineRuntimePlan) -> ReplicationPipelineRuntime {
+    test_runtime_with_plans(vec![plan])
+}
+
+fn test_runtime_with_plans(
+    plans: Vec<ReplicationPipelineRuntimePlan>,
+) -> ReplicationPipelineRuntime {
+    let mut pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>> =
+        HashMap::new();
+    for plan in plans {
+        pipelines_by_source
+            .entry(CdcSourceId::new(plan.source_name.clone()).unwrap())
+            .or_default()
+            .push(plan);
+    }
     ReplicationPipelineRuntime {
-        pipelines_by_source: HashMap::from([(
-            CdcSourceId::new(plan.source_name.clone()).unwrap(),
-            vec![plan],
-        )]),
+        pipelines_by_source,
         kafka_writers_by_pipeline: HashMap::new(),
         postgres_writers_by_pipeline: HashMap::new(),
         buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),

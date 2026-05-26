@@ -23,6 +23,10 @@ pub(in crate::node_runtime) struct ReplicationPipelineStatusSnapshot {
     pub(super) pending_records: usize,
     pub(super) pending_bytes: usize,
     pub(super) oldest_pending_age_ms: Option<u64>,
+    pub(super) dlq_pending_entries: usize,
+    pub(super) dlq_replayed_entries: usize,
+    pub(super) dlq_discarded_entries: usize,
+    pub(super) oldest_dlq_pending_age_ms: Option<u64>,
     pub(super) replaying: bool,
     pub(super) source_backpressure_active: bool,
     pub(super) last_error: Option<String>,
@@ -82,6 +86,22 @@ impl ReplicationPipelineStatusSnapshot {
         self.oldest_pending_age_ms
     }
 
+    pub(super) fn dlq_pending_entries(&self) -> usize {
+        self.dlq_pending_entries
+    }
+
+    pub(super) fn dlq_replayed_entries(&self) -> usize {
+        self.dlq_replayed_entries
+    }
+
+    pub(super) fn dlq_discarded_entries(&self) -> usize {
+        self.dlq_discarded_entries
+    }
+
+    pub(super) fn oldest_dlq_pending_age_ms(&self) -> Option<u64> {
+        self.oldest_dlq_pending_age_ms
+    }
+
     pub(super) fn replaying(&self) -> bool {
         self.replaying
     }
@@ -124,6 +144,10 @@ pub(super) fn cdc_replication_debug_state_from_snapshots(
                 pending_records: snapshot.pending_records(),
                 pending_bytes: snapshot.pending_bytes(),
                 oldest_pending_age_ms: snapshot.oldest_pending_age_ms(),
+                dlq_pending_entries: snapshot.dlq_pending_entries(),
+                dlq_replayed_entries: snapshot.dlq_replayed_entries(),
+                dlq_discarded_entries: snapshot.dlq_discarded_entries(),
+                oldest_dlq_pending_age_ms: snapshot.oldest_dlq_pending_age_ms(),
                 replaying: snapshot.replaying(),
                 source_backpressure_active: snapshot.source_backpressure_active(),
                 last_error: snapshot.last_error().map(str::to_string),

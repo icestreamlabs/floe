@@ -435,6 +435,33 @@ static CDC_REPLICATION_TARGET_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock
     .expect("register floe_cdc_replication_target_failures_total")
 });
 
+static CDC_REPLICATION_TARGET_WRITE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_replication_target_write_latency_ms",
+        "Time spent delivering CDC replication records to a target in milliseconds",
+        &["pipeline", "target_kind", "result"]
+    )
+    .expect("register floe_cdc_replication_target_write_latency_ms")
+});
+
+static CDC_REPLICATION_TARGET_WRITE_BATCH_RECORDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_replication_target_write_batch_records",
+        "CDC replication target write batch size in records",
+        &["pipeline", "target_kind", "result"]
+    )
+    .expect("register floe_cdc_replication_target_write_batch_records")
+});
+
+static CDC_REPLICATION_TARGET_WRITE_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_replication_target_write_records_total",
+        "Total CDC replication records delivered or attempted by pipeline, target kind, and result",
+        &["pipeline", "target_kind", "result"]
+    )
+    .expect("register floe_cdc_replication_target_write_records_total")
+});
+
 static CDC_REPLICATION_DLQ_REPLAYS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_replication_dlq_replays_total",
@@ -442,6 +469,24 @@ static CDC_REPLICATION_DLQ_REPLAYS_TOTAL: LazyLock<IntCounterVec> = LazyLock::ne
         &["pipeline", "result"]
     )
     .expect("register floe_cdc_replication_dlq_replays_total")
+});
+
+static CDC_REPLICATION_DLQ_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_replication_dlq_entries",
+        "CDC replication DLQ entries by pipeline and status",
+        &["pipeline", "status"]
+    )
+    .expect("register floe_cdc_replication_dlq_entries")
+});
+
+static CDC_REPLICATION_DLQ_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_replication_dlq_oldest_pending_age_ms",
+        "Oldest pending CDC replication DLQ entry age in milliseconds",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_replication_dlq_oldest_pending_age_ms")
 });
 
 static POSTGRES_CDC_METRIC_STATE: LazyLock<Mutex<PostgresCdcMetricState>> =
@@ -817,10 +862,54 @@ pub(crate) fn inc_cdc_replication_target_failure(
         .inc();
 }
 
+pub(crate) fn record_cdc_replication_target_write(
+    pipeline: &str,
+    target_kind: &str,
+    result: &str,
+    records: usize,
+    latency_ms: u64,
+) {
+    let label_values = &[pipeline, target_kind, result];
+    CDC_REPLICATION_TARGET_WRITE_LATENCY_MS
+        .with_label_values(label_values)
+        .observe(latency_ms as f64);
+    CDC_REPLICATION_TARGET_WRITE_BATCH_RECORDS
+        .with_label_values(label_values)
+        .observe(records as f64);
+    CDC_REPLICATION_TARGET_WRITE_RECORDS_TOTAL
+        .with_label_values(label_values)
+        .inc_by(u64::try_from(records).unwrap_or(u64::MAX));
+}
+
 pub(crate) fn inc_cdc_replication_dlq_replay(pipeline: &str, result: &str) {
     CDC_REPLICATION_DLQ_REPLAYS_TOTAL
         .with_label_values(&[pipeline, result])
         .inc();
+}
+
+pub(crate) fn record_cdc_replication_dlq_stats(
+    pipeline: &str,
+    pending: usize,
+    replayed: usize,
+    discarded: usize,
+    oldest_pending_age_ms: Option<u64>,
+) {
+    CDC_REPLICATION_DLQ_ENTRIES
+        .with_label_values(&[pipeline, "pending"])
+        .set(i64::try_from(pending).unwrap_or(i64::MAX));
+    CDC_REPLICATION_DLQ_ENTRIES
+        .with_label_values(&[pipeline, "replayed"])
+        .set(i64::try_from(replayed).unwrap_or(i64::MAX));
+    CDC_REPLICATION_DLQ_ENTRIES
+        .with_label_values(&[pipeline, "discarded"])
+        .set(i64::try_from(discarded).unwrap_or(i64::MAX));
+    CDC_REPLICATION_DLQ_OLDEST_PENDING_AGE_MS
+        .with_label_values(&[pipeline])
+        .set(
+            oldest_pending_age_ms
+                .map(|age_ms| i64::try_from(age_ms).unwrap_or(i64::MAX))
+                .unwrap_or(0),
+        );
 }
 
 pub(crate) fn init() {
@@ -872,7 +961,12 @@ pub(crate) fn init() {
     let _ = &*CDC_REPLICATION_REPLAYING;
     let _ = &*CDC_REPLICATION_TARGET_ERROR;
     let _ = &*CDC_REPLICATION_TARGET_FAILURES_TOTAL;
+    let _ = &*CDC_REPLICATION_TARGET_WRITE_LATENCY_MS;
+    let _ = &*CDC_REPLICATION_TARGET_WRITE_BATCH_RECORDS;
+    let _ = &*CDC_REPLICATION_TARGET_WRITE_RECORDS_TOTAL;
     let _ = &*CDC_REPLICATION_DLQ_REPLAYS_TOTAL;
+    let _ = &*CDC_REPLICATION_DLQ_ENTRIES;
+    let _ = &*CDC_REPLICATION_DLQ_OLDEST_PENDING_AGE_MS;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
 }
 
@@ -985,8 +1079,10 @@ mod tests {
         record_cdc_replication_replaying(pipeline, true);
         record_cdc_replication_target_error(pipeline, true);
         inc_cdc_replication_target_failure(pipeline, "kafka", "retryable");
+        record_cdc_replication_target_write(pipeline, "kafka", "failure", 7, 13);
         inc_cdc_replication_dlq_replay(pipeline, "success");
         inc_cdc_replication_dlq_replay(pipeline, "failure");
+        record_cdc_replication_dlq_stats(pipeline, 2, 3, 4, Some(5));
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -1003,10 +1099,31 @@ mod tests {
             "floe_cdc_replication_target_failures_total{class=\"retryable\",pipeline=\"pipe_metrics_test\",target_kind=\"kafka\"} 1"
         ));
         assert!(body.contains(
+            "floe_cdc_replication_target_write_latency_ms_count{pipeline=\"pipe_metrics_test\",result=\"failure\",target_kind=\"kafka\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_target_write_batch_records_sum{pipeline=\"pipe_metrics_test\",result=\"failure\",target_kind=\"kafka\"} 7"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_target_write_records_total{pipeline=\"pipe_metrics_test\",result=\"failure\",target_kind=\"kafka\"} 7"
+        ));
+        assert!(body.contains(
             "floe_cdc_replication_dlq_replays_total{pipeline=\"pipe_metrics_test\",result=\"success\"} 1"
         ));
         assert!(body.contains(
             "floe_cdc_replication_dlq_replays_total{pipeline=\"pipe_metrics_test\",result=\"failure\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_entries{pipeline=\"pipe_metrics_test\",status=\"pending\"} 2"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_entries{pipeline=\"pipe_metrics_test\",status=\"replayed\"} 3"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_entries{pipeline=\"pipe_metrics_test\",status=\"discarded\"} 4"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_oldest_pending_age_ms{pipeline=\"pipe_metrics_test\"} 5"
         ));
         assert!(body.contains("floe_cdc_buffer_pending_objects{pipeline=\"pipe_metrics_test\"} 2"));
         assert!(body.contains(
