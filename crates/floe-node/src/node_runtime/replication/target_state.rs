@@ -47,6 +47,21 @@ impl DeliveryStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TargetFailureClass {
+    Retryable,
+    Permanent,
+}
+
+impl TargetFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct TargetStateBuilder {
     state: BTreeMap<String, String>,
@@ -233,6 +248,14 @@ impl TargetStateBuilder {
         self
     }
 
+    pub(super) fn failure_class(&mut self, class: TargetFailureClass) -> &mut Self {
+        self.state.insert(
+            "target.failure.class".to_string(),
+            class.as_str().to_string(),
+        );
+        self
+    }
+
     pub(super) fn build(self) -> BTreeMap<String, String> {
         self.state
     }
@@ -270,11 +293,13 @@ pub(super) fn failed_target_state(
     manifest: &CdcBufferedTransactionManifest,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
+    let class = classify_target_write_failure(plan, err);
     let mut builder = TargetStateBuilder::for_buffered_manifest(plan, manifest);
     builder
         .buffer_status(BufferStatus::Durable)
         .delivery_status(DeliveryStatus::Failed)
         .replay_may_duplicate(true)
+        .failure_class(class)
         .last_error(err);
     builder.build()
 }
@@ -287,7 +312,7 @@ pub(super) fn dead_lettered_target_state(
 ) -> BTreeMap<String, String> {
     let mut builder = TargetStateBuilder::for_buffered_manifest(plan, manifest);
     builder.buffer_status(BufferStatus::DeadLettered);
-    add_dead_letter_state(&mut builder, dlq_entry, err);
+    add_dead_letter_state(&mut builder, plan, dlq_entry, err);
     builder.build()
 }
 
@@ -326,18 +351,21 @@ pub(super) fn direct_dead_lettered_target_state(
         BTreeMap::new(),
     );
     let mut builder = TargetStateBuilder::from_state(state);
-    add_dead_letter_state(&mut builder, dlq_entry, err);
+    add_dead_letter_state(&mut builder, plan, dlq_entry, err);
     builder.build()
 }
 
 fn add_dead_letter_state(
     builder: &mut TargetStateBuilder,
+    plan: &ReplicationPipelineRuntimePlan,
     dlq_entry: &ReplicationPipelineDlqEntry,
     err: &anyhow::Error,
 ) {
+    let class = classify_target_write_failure(plan, err);
     builder
         .delivery_status(DeliveryStatus::DeadLettered)
         .replay_may_duplicate(false)
+        .failure_class(class)
         .dlq_entry(dlq_entry)
         .last_error(err);
 }
@@ -346,12 +374,81 @@ pub(super) fn dead_letter_target_state(
     plan: &ReplicationPipelineRuntimePlan,
     err: &anyhow::Error,
 ) -> BTreeMap<String, String> {
+    let class = classify_target_write_failure(plan, err);
     let mut builder = TargetStateBuilder::new();
     builder
         .target_kind(target_kind(plan))
         .delivery_status(DeliveryStatus::DeadLettered)
+        .failure_class(class)
         .last_error(err);
     builder.build()
+}
+
+pub(super) fn classify_target_write_failure(
+    plan: &ReplicationPipelineRuntimePlan,
+    err: &anyhow::Error,
+) -> TargetFailureClass {
+    match &plan.target {
+        ReplicationPipelineRuntimeTarget::Kafka { .. } => classify_kafka_target_write_failure(err),
+        ReplicationPipelineRuntimeTarget::Postgres { .. } => {
+            classify_postgres_target_write_failure(err)
+        }
+    }
+}
+
+fn classify_kafka_target_write_failure(err: &anyhow::Error) -> TargetFailureClass {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    if message.contains("has no kafka writer")
+        || message.contains("message size too large")
+        || message.contains("invalid topic")
+        || message.contains("unknown topic or partition")
+    {
+        TargetFailureClass::Permanent
+    } else {
+        TargetFailureClass::Retryable
+    }
+}
+
+fn classify_postgres_target_write_failure(err: &anyhow::Error) -> TargetFailureClass {
+    if let Some(class) = postgres_sqlstate_failure_class(err) {
+        return class;
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    if message.contains("has no postgres writer")
+        || message.contains("permission denied")
+        || message.contains("does not exist")
+        || message.contains("duplicate key")
+        || message.contains("violates")
+        || message.contains("invalid input syntax")
+        || message.contains("type mismatch")
+        || message.contains("cannot be null")
+    {
+        TargetFailureClass::Permanent
+    } else {
+        TargetFailureClass::Retryable
+    }
+}
+
+fn postgres_sqlstate_failure_class(err: &anyhow::Error) -> Option<TargetFailureClass> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<tokio_postgres::Error>())
+        .and_then(|err| err.code())
+        .map(|code| match code.code() {
+            "08000" | "08001" | "08003" | "08004" | "08006" | "08007" | "40001" | "40P01"
+            | "53300" | "55P03" | "57014" | "57P01" | "57P02" | "57P03" => {
+                TargetFailureClass::Retryable
+            }
+            sqlstate
+                if sqlstate.starts_with("22")
+                    || sqlstate.starts_with("23")
+                    || sqlstate.starts_with("28")
+                    || sqlstate.starts_with("3D")
+                    || sqlstate.starts_with("42") =>
+            {
+                TargetFailureClass::Permanent
+            }
+            _ => TargetFailureClass::Retryable,
+        })
 }
 
 pub(super) fn target_kind(plan: &ReplicationPipelineRuntimePlan) -> &'static str {

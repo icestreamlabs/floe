@@ -2,7 +2,9 @@ use super::encoding::{
     encode_debezium_pipeline_records, encode_pipeline_buffer_records,
     encode_pipeline_transaction_records, encode_pipeline_transaction_records_with_metadata,
 };
-use super::target_state::{delivered_target_state, failed_target_state};
+use super::target_state::{
+    TargetFailureClass, classify_target_write_failure, delivered_target_state, failed_target_state,
+};
 use super::writers::{
     PostgresParamValue, PostgresReplicationPipelineWriter, parse_floe_json_record_key,
     parse_floe_json_record_value, postgres_key_params_from_json, postgres_row_params_from_json,
@@ -713,7 +715,47 @@ async fn target_checkpoint_state_makes_partial_delivery_explicit() {
     assert_eq!(failed["buffer.status"], "durable");
     assert_eq!(failed["target.delivery.status"], "failed");
     assert_eq!(failed["target.delivery.replay_may_duplicate"], "true");
+    assert_eq!(failed["target.failure.class"], "retryable");
     assert!(failed["target.last_error"].contains("kafka unavailable"));
+}
+
+#[test]
+fn target_write_failure_classifies_transient_and_permanent_errors() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let kafka_plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+    assert_eq!(
+        classify_target_write_failure(&kafka_plan, &anyhow!("kafka broker unavailable")),
+        TargetFailureClass::Retryable
+    );
+    assert_eq!(
+        classify_target_write_failure(
+            &kafka_plan,
+            &anyhow!("replication pipeline 'orders_pipe' has no Kafka writer")
+        ),
+        TargetFailureClass::Permanent
+    );
+
+    let mut postgres_plan = test_plan("orders_pg_pipe", table_id, "public.orders");
+    postgres_plan.target = ReplicationPipelineRuntimeTarget::Postgres {
+        connection: "host=localhost user=floe".to_string(),
+        table: "public.orders".to_string(),
+    };
+    assert_eq!(
+        classify_target_write_failure(
+            &postgres_plan,
+            &anyhow!("connect replication pipeline Postgres target: connection refused")
+        ),
+        TargetFailureClass::Retryable
+    );
+    assert_eq!(
+        classify_target_write_failure(
+            &postgres_plan,
+            &anyhow!(
+                "upsert CDC row into replication pipeline Postgres target public.orders: permission denied for table orders"
+            )
+        ),
+        TargetFailureClass::Permanent
+    );
 }
 
 #[tokio::test]
@@ -1159,8 +1201,16 @@ async fn durable_pipeline_dead_letters_and_advances_when_policy_allows() {
         "false"
     );
     assert_eq!(
+        checkpoint.target_state()["target.failure.class"],
+        "permanent"
+    );
+    assert_eq!(
         checkpoint.target_state()["target.dlq.id"],
         dlq_entry.dlq_id()
+    );
+    assert_eq!(
+        dlq_entry.target_state()["target.failure.class"],
+        "permanent"
     );
     assert!(checkpoint.target_state()["target.last_error"].contains("has no Kafka writer"));
 }
@@ -1233,6 +1283,10 @@ async fn replay_dead_letters_pending_buffer_when_policy_allows() {
     assert_eq!(
         checkpoint.target_state()["target.delivery.status"],
         "dead_lettered"
+    );
+    assert_eq!(
+        checkpoint.target_state()["target.failure.class"],
+        "permanent"
     );
     assert_eq!(
         storage
