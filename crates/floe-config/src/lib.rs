@@ -261,6 +261,8 @@ impl Default for PostgresCdcSnapshotConfig {
 pub struct ReplicationBufferCleanupConfig {
     #[serde(default = "default_replication_buffer_delivered_retention_ms")]
     pub delivered_retention_ms: u64,
+    #[serde(default = "default_replication_buffer_orphan_retention_ms")]
+    pub orphan_retention_ms: u64,
     #[serde(default = "default_replication_buffer_cleanup_interval_ms")]
     pub cleanup_interval_ms: u64,
 }
@@ -268,6 +270,7 @@ pub struct ReplicationBufferCleanupConfig {
 impl ReplicationBufferCleanupConfig {
     pub const DEFAULT: Self = Self {
         delivered_retention_ms: DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS,
+        orphan_retention_ms: DEFAULT_REPLICATION_BUFFER_ORPHAN_RETENTION_MS,
         cleanup_interval_ms: DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS,
     };
 }
@@ -387,6 +390,7 @@ impl ReplicationArrowIpcCompressionConfig {
 }
 
 const DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS: u64 = 5_000;
+const DEFAULT_REPLICATION_BUFFER_ORPHAN_RETENTION_MS: u64 = 60_000;
 const DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const DEFAULT_REPLICATION_KAFKA_MESSAGE_MAX_BYTES: usize = 10_485_760;
@@ -408,6 +412,10 @@ const DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS: u64 = 500;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
+}
+
+fn default_replication_buffer_orphan_retention_ms() -> u64 {
+    DEFAULT_REPLICATION_BUFFER_ORPHAN_RETENTION_MS
 }
 
 fn default_replication_buffer_cleanup_interval_ms() -> u64 {
@@ -1216,6 +1224,7 @@ mod tests {
         let input = r#"
             [replication.buffer_cleanup]
             delivered_retention_ms = 1000
+            orphan_retention_ms = 5000
             cleanup_interval_ms = 250
         "#;
 
@@ -1225,6 +1234,7 @@ mod tests {
             config.replication.buffer_cleanup.delivered_retention_ms,
             1000
         );
+        assert_eq!(config.replication.buffer_cleanup.orphan_retention_ms, 5000);
         assert_eq!(config.replication.buffer_cleanup.cleanup_interval_ms, 250);
     }
 

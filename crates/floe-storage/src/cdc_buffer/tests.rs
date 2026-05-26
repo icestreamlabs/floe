@@ -406,6 +406,54 @@ async fn integrity_report_detects_missing_and_orphan_payload_objects() {
 }
 
 #[tokio::test]
+async fn orphan_payload_cleanup_respects_age_and_keeps_referenced_payloads() {
+    let store = test_store("cdc-buffer-orphan-cleanup").await;
+    let append = append("0/10", 1000, vec![record(1)]);
+    let manifest = store.append_transaction(&append).await.expect("append");
+    let referenced_key = manifest
+        .payload_object_key()
+        .expect("referenced payload object key")
+        .to_string();
+    let orphan_key = payload_object_key("pipe", "old-orphan-transaction");
+    let orphan_payload = vec![5, 6, 7, 8, 9];
+    let object_store = store.object_store.as_ref().expect("object store");
+    object_store
+        .put(
+            &ObjectPath::from(orphan_key.clone()),
+            orphan_payload.clone().into(),
+        )
+        .await
+        .expect("write orphan payload");
+
+    let early = store
+        .cleanup_orphan_payload_objects("pipe", u64::MAX, 0)
+        .await
+        .expect("early orphan cleanup");
+    assert_eq!(early.deleted_objects(), 0);
+    assert_eq!(early.deleted_bytes(), 0);
+
+    let cleaned = store
+        .cleanup_orphan_payload_objects("pipe", 1, u64::MAX)
+        .await
+        .expect("orphan cleanup");
+    assert_eq!(cleaned.deleted_objects(), 1);
+    assert_eq!(cleaned.deleted_bytes(), orphan_payload.len());
+    assert!(
+        object_store
+            .head(&ObjectPath::from(orphan_key))
+            .await
+            .is_err()
+    );
+    assert!(
+        object_store
+            .head(&ObjectPath::from(referenced_key))
+            .await
+            .is_ok()
+    );
+    assert_eq!(store.records(&manifest).await.unwrap(), vec![record(1)]);
+}
+
+#[tokio::test]
 async fn appends_and_replays_record_headers() {
     let store = test_store("cdc-buffer-record-headers").await;
     let record = record(1)

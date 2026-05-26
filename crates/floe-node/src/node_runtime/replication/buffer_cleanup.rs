@@ -30,17 +30,34 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        let orphan_summary = buffer_store
+            .cleanup_orphan_payload_objects(
+                &plan.name,
+                self.settings.buffer_cleanup.orphan_retention_ms,
+                now,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "cleanup replication pipeline '{}' orphan buffer payload objects",
+                    plan.name
+                )
+            })?;
         crate::metrics::record_cdc_buffer_cleanup(
             &plan.name,
             summary.deleted_transactions(),
             summary.deleted_records(),
-            summary.deleted_bytes(),
+            summary
+                .deleted_bytes()
+                .saturating_add(orphan_summary.deleted_bytes()),
             cleanup_started_at.elapsed().as_millis() as u64,
         );
         crate::metrics::inc_cdc_buffer_object_op(
             &plan.name,
             "delete",
-            summary.deleted_transactions(),
+            summary
+                .deleted_transactions()
+                .saturating_add(orphan_summary.deleted_objects()),
         );
         Ok(())
     }
@@ -56,28 +73,46 @@ impl ReplicationPipelineRuntime {
                 let cleanup_store = buffer_store.clone();
                 let pipeline_name = plan.name.clone();
                 let delivered_retention_ms = self.settings.buffer_cleanup.delivered_retention_ms;
+                let orphan_retention_ms = self.settings.buffer_cleanup.orphan_retention_ms;
                 tokio::spawn(async move {
                     let cleanup_started_at = Instant::now();
-                    match cleanup_store
-                        .cleanup_delivered(
-                            &pipeline_name,
-                            CdcBufferCleanupPolicy::new(delivered_retention_ms),
-                            now,
-                        )
-                        .await
-                    {
+                    let cleanup_result = async {
+                        let summary = cleanup_store
+                            .cleanup_delivered(
+                                &pipeline_name,
+                                CdcBufferCleanupPolicy::new(delivered_retention_ms),
+                                now,
+                            )
+                            .await?;
+                        let orphan_summary = cleanup_store
+                            .cleanup_orphan_payload_objects(
+                                &pipeline_name,
+                                orphan_retention_ms,
+                                now,
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((summary, orphan_summary))
+                    }
+                    .await;
+                    match cleanup_result {
                         Ok(summary) => {
                             crate::metrics::record_cdc_buffer_cleanup(
                                 &pipeline_name,
-                                summary.deleted_transactions(),
-                                summary.deleted_records(),
-                                summary.deleted_bytes(),
+                                summary.0.deleted_transactions(),
+                                summary.0.deleted_records(),
+                                summary
+                                    .0
+                                    .deleted_bytes()
+                                    .saturating_add(summary.1.deleted_bytes()),
                                 cleanup_started_at.elapsed().as_millis() as u64,
                             );
                             crate::metrics::inc_cdc_buffer_object_op(
                                 &pipeline_name,
                                 "delete",
-                                summary.deleted_transactions(),
+                                summary
+                                    .0
+                                    .deleted_transactions()
+                                    .saturating_add(summary.1.deleted_objects()),
                             );
                         }
                         Err(err) => {
