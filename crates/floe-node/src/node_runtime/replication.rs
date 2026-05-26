@@ -13,6 +13,23 @@ use floe_storage::{
     SlateCatalog, decode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReplicationPipelineDlqRetryBatchOutcome {
+    pub(crate) pipeline: String,
+    pub(crate) requested_limit: usize,
+    pub(crate) attempted: usize,
+    pub(crate) replayed: Vec<ReplicationPipelineDlqEntry>,
+    pub(crate) failed: Vec<ReplicationPipelineDlqRetryFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReplicationPipelineDlqRetryFailure {
+    pub(crate) dlq_id: String,
+    pub(crate) error: String,
+    pub(crate) entry: Option<ReplicationPipelineDlqEntry>,
+}
 
 pub(crate) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
@@ -104,6 +121,68 @@ impl ReplicationPipelineRuntime {
         else {
             return Ok(None);
         };
+        self.retry_loaded_dlq_entry(storage, plan, entry)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn retry_pending_dlq_entries(
+        &self,
+        storage: &SlateCatalog,
+        pipeline_name: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<ReplicationPipelineDlqRetryBatchOutcome>> {
+        anyhow::ensure!(limit > 0, "DLQ retry limit must be greater than zero");
+        let Some(plan) = self.plan_by_name(pipeline_name) else {
+            return Ok(None);
+        };
+        let mut entries = storage
+            .replication_pipeline_dlq_entries(pipeline_name)
+            .await?;
+        entries.retain(|entry| entry.status() == ReplicationPipelineDlqStatus::Pending);
+        entries.sort_by(|left, right| {
+            left.created_at_unix_ms()
+                .cmp(&right.created_at_unix_ms())
+                .then_with(|| left.dlq_id().cmp(right.dlq_id()))
+        });
+        entries.truncate(limit);
+
+        let mut outcome = ReplicationPipelineDlqRetryBatchOutcome {
+            pipeline: pipeline_name.to_string(),
+            requested_limit: limit,
+            attempted: 0,
+            replayed: Vec::new(),
+            failed: Vec::new(),
+        };
+        for entry in entries {
+            outcome.attempted = outcome.attempted.saturating_add(1);
+            let dlq_id = entry.dlq_id().to_string();
+            match self.retry_loaded_dlq_entry(storage, plan, entry).await {
+                Ok(entry) => outcome.replayed.push(entry),
+                Err(err) => {
+                    let error = err.to_string();
+                    let entry = storage
+                        .replication_pipeline_dlq_entry(pipeline_name, &dlq_id)
+                        .await?;
+                    outcome.failed.push(ReplicationPipelineDlqRetryFailure {
+                        dlq_id,
+                        error,
+                        entry,
+                    });
+                }
+            }
+        }
+        Ok(Some(outcome))
+    }
+
+    async fn retry_loaded_dlq_entry(
+        &self,
+        storage: &SlateCatalog,
+        plan: &ReplicationPipelineRuntimePlan,
+        entry: ReplicationPipelineDlqEntry,
+    ) -> anyhow::Result<ReplicationPipelineDlqEntry> {
+        let pipeline_name = entry.pipeline_name().to_string();
+        let dlq_id = entry.dlq_id().to_string();
         anyhow::ensure!(
             entry.status() == ReplicationPipelineDlqStatus::Pending,
             "replication pipeline '{}' DLQ entry {} is {}, not pending",
@@ -129,8 +208,8 @@ impl ReplicationPipelineRuntime {
         })?;
         let attempted_entry = storage
             .record_replication_pipeline_dlq_retry_attempt(
-                pipeline_name,
-                dlq_id,
+                &pipeline_name,
+                &dlq_id,
                 current_unix_time_ms(),
             )
             .await?
@@ -140,17 +219,26 @@ impl ReplicationPipelineRuntime {
                 self.clear_last_target_error(&plan.name);
                 let replayed = storage
                     .update_replication_pipeline_dlq_entry_status_with_reason(
-                        pipeline_name,
-                        dlq_id,
+                        &pipeline_name,
+                        &dlq_id,
                         ReplicationPipelineDlqStatus::Replayed,
                         Some("manual retry delivered to target".to_string()),
                         current_unix_time_ms(),
                     )
                     .await?;
-                Ok(replayed.or(Some(attempted_entry)))
+                Ok(replayed.unwrap_or(attempted_entry))
             }
             Err(err) => {
                 self.record_target_write_failure(plan, &err);
+                storage
+                    .update_replication_pipeline_dlq_entry_status_with_reason(
+                        &pipeline_name,
+                        &dlq_id,
+                        ReplicationPipelineDlqStatus::Pending,
+                        Some(format!("manual retry failed: {err:#}")),
+                        current_unix_time_ms(),
+                    )
+                    .await?;
                 Err(err).with_context(|| {
                     format!("retry replication pipeline '{pipeline_name}' DLQ entry {dlq_id}")
                 })

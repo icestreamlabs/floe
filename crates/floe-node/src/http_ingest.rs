@@ -38,6 +38,9 @@ use tokio_util::sync::CancellationToken;
 use crate::node_runtime::ReplicationPipelineRuntime;
 use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch_with_commit_ack};
 
+const DEFAULT_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 100;
+const MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 1_000;
+
 #[derive(Debug, Clone)]
 pub struct HttpIngestConfig {
     pub host: String,
@@ -178,6 +181,12 @@ struct CdcReplicationDlqActionRequest {
     reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CdcReplicationDlqBatchRetryQuery {
+    pipeline: String,
+    limit: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct CdcReplicationDlqListResponse {
     pipeline: String,
@@ -241,6 +250,10 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route(
             "/debug/cdc/replication/dlq",
             get(debug_cdc_replication_dlq_list_admin),
+        )
+        .route(
+            "/debug/cdc/replication/dlq/retry",
+            post(debug_cdc_replication_dlq_retry_batch_admin),
         )
         .route(
             "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
@@ -590,6 +603,57 @@ async fn debug_cdc_replication_dlq_retry_admin(
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "DLQ entry or pipeline not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn debug_cdc_replication_dlq_retry_batch_admin(
+    State(state): State<HttpAdminState>,
+    Query(query): Query<CdcReplicationDlqBatchRetryQuery>,
+) -> impl IntoResponse {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT);
+    if limit == 0 || limit > MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "retry limit must be between 1 and {}",
+                    MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    let Some(runtime) = &state.replication_runtime else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "CDC replication runtime unavailable"})),
+        )
+            .into_response();
+    };
+    match runtime
+        .retry_pending_dlq_entries(storage, &query.pipeline, limit)
+        .await
+    {
+        Ok(Some(outcome)) => (StatusCode::OK, Json(outcome)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pipeline not found"})),
         )
             .into_response(),
         Err(err) => (
@@ -1224,6 +1288,10 @@ mod tests {
                 get(debug_cdc_replication_dlq_list_admin),
             )
             .route(
+                "/debug/cdc/replication/dlq/retry",
+                post(debug_cdc_replication_dlq_retry_batch_admin),
+            )
+            .route(
                 "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
                 get(debug_cdc_replication_dlq_entry_admin),
             )
@@ -1248,6 +1316,14 @@ mod tests {
             .expect("request");
         let response = app.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/debug/cdc/replication/dlq/retry?pipeline=orders_pipe&limit=0")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let payload = json!({"reason": "operator confirmed duplicate"});
         let request = Request::builder()

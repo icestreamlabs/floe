@@ -1251,38 +1251,16 @@ async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
     let runtime = test_runtime_with_plan(plan.clone());
     let storage = SlateCatalog::in_memory().await.unwrap();
     let dlq_id = "entry-1";
-    let payload_object_key = storage
-        .put_replication_pipeline_dlq_payload(
-            &plan.name,
-            dlq_id,
-            floe_storage::encode_cdc_buffer_records_payload(&[CdcBufferRecord::new(
-                Some(br#"{"id":1}"#.to_vec()),
-                Some(br#"{"id":1,"status":"open"}"#.to_vec()),
-            )])
-            .expect("encode records"),
-        )
-        .await
-        .expect("persist payload");
-    let entry = ReplicationPipelineDlqEntry::new(
-        &plan.name,
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
         dlq_id,
-        &plan.source_name,
-        floe_cdc_core::CdcSourcePosition::postgres("0/16B6E00", None).unwrap(),
-        Some(CdcTransactionId::new("pg-xid-401").unwrap()),
-        "kafka_delivery",
-        "broker unavailable",
-        1,
-        Some(payload_object_key),
-        Some("kafka_records".to_string()),
-        24,
-        BTreeMap::new(),
+        "0/16B6E00",
+        "pg-xid-401",
         current_unix_time_ms(),
     )
-    .unwrap();
-    storage
-        .put_replication_pipeline_dlq_entry(entry)
-        .await
-        .expect("persist entry");
+    .await
+    .expect("persist entry");
 
     let err = runtime
         .retry_dlq_entry(&storage, &plan.name, dlq_id)
@@ -1296,6 +1274,106 @@ async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
         .expect("entry exists");
     assert_eq!(attempted.status(), ReplicationPipelineDlqStatus::Pending);
     assert_eq!(attempted.attempt_count(), 2);
+    assert!(
+        attempted
+            .status_reason()
+            .expect("retry failure reason")
+            .contains("manual retry failed")
+    );
+}
+
+#[tokio::test]
+async fn retry_pending_dlq_entries_respects_limit_and_skips_resolved_entries() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let plan = test_plan("orders_pipe", table_id, "public.orders");
+    let runtime = test_runtime_with_plan(plan.clone());
+    let storage = SlateCatalog::in_memory().await.unwrap();
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
+        "entry-1",
+        "0/16B6E00",
+        "pg-xid-501",
+        1_700_000_000_000,
+    )
+    .await
+    .expect("persist first entry");
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
+        "entry-2",
+        "0/16B6E10",
+        "pg-xid-502",
+        1_700_000_000_001,
+    )
+    .await
+    .expect("persist second entry");
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
+        "entry-3",
+        "0/16B6E20",
+        "pg-xid-503",
+        1_700_000_000_002,
+    )
+    .await
+    .expect("persist third entry");
+    persist_test_dlq_entry(
+        &storage,
+        &plan,
+        "entry-4",
+        "0/16B6E30",
+        "pg-xid-504",
+        1_700_000_000_003,
+    )
+    .await
+    .expect("persist fourth entry");
+    storage
+        .update_replication_pipeline_dlq_entry_status_with_reason(
+            &plan.name,
+            "entry-4",
+            ReplicationPipelineDlqStatus::Discarded,
+            Some("operator skipped duplicate".to_string()),
+            1_700_000_000_004,
+        )
+        .await
+        .expect("discard entry");
+
+    let outcome = runtime
+        .retry_pending_dlq_entries(&storage, &plan.name, 2)
+        .await
+        .expect("retry batch")
+        .expect("pipeline exists");
+    assert_eq!(outcome.attempted, 2);
+    assert!(outcome.replayed.is_empty());
+    assert_eq!(outcome.failed.len(), 2);
+    assert_eq!(outcome.failed[0].dlq_id, "entry-1");
+    assert_eq!(outcome.failed[1].dlq_id, "entry-2");
+
+    let first = storage
+        .replication_pipeline_dlq_entry(&plan.name, "entry-1")
+        .await
+        .expect("load first")
+        .expect("first exists");
+    let second = storage
+        .replication_pipeline_dlq_entry(&plan.name, "entry-2")
+        .await
+        .expect("load second")
+        .expect("second exists");
+    let third = storage
+        .replication_pipeline_dlq_entry(&plan.name, "entry-3")
+        .await
+        .expect("load third")
+        .expect("third exists");
+    let fourth = storage
+        .replication_pipeline_dlq_entry(&plan.name, "entry-4")
+        .await
+        .expect("load fourth")
+        .expect("fourth exists");
+    assert_eq!(first.attempt_count(), 2);
+    assert_eq!(second.attempt_count(), 2);
+    assert_eq!(third.attempt_count(), 1);
+    assert_eq!(fourth.status(), ReplicationPipelineDlqStatus::Discarded);
 }
 
 #[tokio::test]
@@ -1565,6 +1643,43 @@ fn test_runtime_with_plan(plan: ReplicationPipelineRuntimePlan) -> ReplicationPi
         last_target_error_by_pipeline: Mutex::new(HashMap::new()),
         settings: FloeReplicationConfig::default(),
     }
+}
+
+async fn persist_test_dlq_entry(
+    storage: &SlateCatalog,
+    plan: &ReplicationPipelineRuntimePlan,
+    dlq_id: &str,
+    lsn: &str,
+    transaction_id: &str,
+    created_at_unix_ms: u64,
+) -> anyhow::Result<ReplicationPipelineDlqEntry> {
+    let payload = floe_storage::encode_cdc_buffer_records_payload(&[CdcBufferRecord::new(
+        Some(br#"{"id":1}"#.to_vec()),
+        Some(br#"{"id":1,"status":"open"}"#.to_vec()),
+    )])?;
+    let payload_bytes = payload.len();
+    let payload_object_key = storage
+        .put_replication_pipeline_dlq_payload(&plan.name, dlq_id, payload)
+        .await?;
+    let entry = ReplicationPipelineDlqEntry::new(
+        &plan.name,
+        dlq_id,
+        &plan.source_name,
+        floe_cdc_core::CdcSourcePosition::postgres(lsn, None)?,
+        Some(CdcTransactionId::new(transaction_id)?),
+        "kafka_delivery",
+        "broker unavailable",
+        1,
+        Some(payload_object_key),
+        Some("kafka_records".to_string()),
+        payload_bytes,
+        BTreeMap::new(),
+        created_at_unix_ms,
+    )?;
+    storage
+        .put_replication_pipeline_dlq_entry(entry.clone())
+        .await?;
+    Ok(entry)
 }
 
 fn row(id: i64, status: &str) -> CdcRow {
