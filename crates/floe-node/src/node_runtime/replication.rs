@@ -31,6 +31,52 @@ pub(crate) struct ReplicationPipelineDlqRetryFailure {
     pub(crate) entry: Option<ReplicationPipelineDlqEntry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplicationPipelineReconciliationOptions {
+    pub(crate) max_rows: usize,
+    pub(crate) full_scan: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReplicationPipelineReconciliationReport {
+    pub(crate) pipeline: String,
+    pub(crate) source: String,
+    pub(crate) upstream_table: String,
+    pub(crate) target_kind: String,
+    pub(crate) target_table: Option<String>,
+    pub(crate) checkpoint_position: Option<String>,
+    pub(crate) checkpoint_lsn_bytes: Option<u64>,
+    pub(crate) pending_transactions: usize,
+    pub(crate) pending_records: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) full_scan: bool,
+    pub(crate) status: String,
+    pub(crate) source_observation: Option<ReplicationPipelineReconciliationObservation>,
+    pub(crate) target_observation: Option<ReplicationPipelineReconciliationObservation>,
+    pub(crate) drift: Vec<ReplicationPipelineReconciliationDrift>,
+    pub(crate) next_steps: Vec<String>,
+    pub(crate) observed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReplicationPipelineReconciliationObservation {
+    pub(crate) table: String,
+    pub(crate) row_count: Option<u64>,
+    pub(crate) row_count_lower_bound: Option<u64>,
+    pub(crate) exact: bool,
+    pub(crate) observed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ReplicationPipelineReconciliationDrift {
+    pub(crate) kind: String,
+    pub(crate) source_table: String,
+    pub(crate) target_table: String,
+    pub(crate) source_count: Option<u64>,
+    pub(crate) target_count: Option<u64>,
+    pub(crate) detail: String,
+}
+
 pub(crate) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<writers::KafkaReplicationPipelineWriter>>,
@@ -104,6 +150,104 @@ impl ReplicationPipelineRuntime {
         self.pipelines_by_source
             .get(source_id)
             .is_some_and(|plans| !plans.is_empty())
+    }
+
+    pub(crate) async fn reconcile_pipeline(
+        &self,
+        storage: &SlateCatalog,
+        pipeline_name: &str,
+        options: ReplicationPipelineReconciliationOptions,
+    ) -> anyhow::Result<Option<ReplicationPipelineReconciliationReport>> {
+        anyhow::ensure!(
+            options.max_rows > 0,
+            "CDC reconciliation max_rows must be greater than zero"
+        );
+        let Some(plan) = self.plan_by_name(pipeline_name) else {
+            return Ok(None);
+        };
+        let observed_at_unix_ms = current_unix_time_ms();
+        let buffer_stats = storage
+            .cdc_buffer_store()
+            .stats(&plan.name, observed_at_unix_ms)
+            .await
+            .with_context(|| format!("load CDC buffer stats for pipeline '{}'", plan.name))?;
+        let checkpoint = storage
+            .replication_pipeline_checkpoint(&plan.name)
+            .await
+            .with_context(|| {
+                format!(
+                    "load replication pipeline '{}' checkpoint for reconciliation",
+                    plan.name
+                )
+            })?;
+        let checkpoint_position = checkpoint
+            .as_ref()
+            .map(|checkpoint| encoding::source_position_key(checkpoint.source_position()));
+        let checkpoint_lsn_bytes = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| postgres_position_lsn_bytes(checkpoint.source_position()));
+        let target_kind = target_kind(plan).to_string();
+        let mut report = ReplicationPipelineReconciliationReport {
+            pipeline: plan.name.clone(),
+            source: plan.source_name.clone(),
+            upstream_table: plan.upstream_table.clone(),
+            target_kind,
+            target_table: None,
+            checkpoint_position,
+            checkpoint_lsn_bytes,
+            pending_transactions: buffer_stats.pending_transactions(),
+            pending_records: buffer_stats.pending_records(),
+            max_rows: options.max_rows,
+            full_scan: options.full_scan,
+            status: "unsupported_target".to_string(),
+            source_observation: None,
+            target_observation: None,
+            drift: Vec::new(),
+            next_steps: Vec::new(),
+            observed_at_unix_ms,
+        };
+
+        let ReplicationPipelineRuntimeTarget::Postgres {
+            connection: target_connection,
+            table: target_table,
+        } = &plan.target
+        else {
+            report.next_steps.push(
+                "Row-count reconciliation is currently available for Postgres replication targets"
+                    .to_string(),
+            );
+            return Ok(Some(report));
+        };
+        report.target_table = Some(target_table.clone());
+
+        let source_observation = observe_postgres_table_for_reconciliation(
+            &plan.source_connection,
+            &plan.upstream_table,
+            options,
+            "source",
+        )
+        .await?;
+        let target_observation = observe_postgres_table_for_reconciliation(
+            target_connection,
+            target_table,
+            options,
+            "target",
+        )
+        .await?;
+        let outcome = reconciliation_outcome(
+            &plan.upstream_table,
+            target_table,
+            &source_observation,
+            &target_observation,
+            buffer_stats.pending_transactions(),
+            buffer_stats.pending_records(),
+        );
+        report.status = outcome.status;
+        report.drift = outcome.drift;
+        report.next_steps = outcome.next_steps;
+        report.source_observation = Some(source_observation);
+        report.target_observation = Some(target_observation);
+        Ok(Some(report))
     }
 
     pub(crate) async fn retry_dlq_entry_with_reason(
@@ -1091,6 +1235,125 @@ fn manual_retry_status_reason(base: &str, operator_reason: Option<&str>) -> Stri
         return base.to_string();
     };
     format!("{base}; operator_reason={operator_reason}")
+}
+
+struct ReplicationPipelineReconciliationOutcome {
+    status: String,
+    drift: Vec<ReplicationPipelineReconciliationDrift>,
+    next_steps: Vec<String>,
+}
+
+async fn observe_postgres_table_for_reconciliation(
+    connection: &str,
+    table: &str,
+    options: ReplicationPipelineReconciliationOptions,
+    role: &str,
+) -> anyhow::Result<ReplicationPipelineReconciliationObservation> {
+    let quoted_table = writers::quote_postgres_qualified_name(table)?;
+    let (client, connection_task) = tokio_postgres::connect(connection, tokio_postgres::NoTls)
+        .await
+        .with_context(|| format!("connect Postgres {role} for CDC reconciliation"))?;
+    let task_role = role.to_string();
+    let task_table = table.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = connection_task.await {
+            tracing::debug!(
+                role = %task_role,
+                table = %task_table,
+                error = %err,
+                "Postgres reconciliation connection closed"
+            );
+        }
+    });
+
+    let observed_at_unix_ms = current_unix_time_ms();
+    let row_count = if options.full_scan {
+        let sql = format!("SELECT count(*)::bigint FROM {quoted_table}");
+        query_postgres_row_count(&client, &sql).await?
+    } else {
+        let limit = options.max_rows.saturating_add(1);
+        let sql = format!(
+            "SELECT count(*)::bigint FROM (SELECT 1 FROM {quoted_table} LIMIT {limit}) AS floe_reconcile_count"
+        );
+        query_postgres_row_count(&client, &sql).await?
+    };
+    let limit_exceeded = !options.full_scan && row_count > options.max_rows as u64;
+
+    Ok(ReplicationPipelineReconciliationObservation {
+        table: table.to_string(),
+        row_count: (!limit_exceeded).then_some(row_count),
+        row_count_lower_bound: limit_exceeded.then_some(row_count),
+        exact: !limit_exceeded,
+        observed_at_unix_ms,
+    })
+}
+
+async fn query_postgres_row_count(
+    client: &tokio_postgres::Client,
+    sql: &str,
+) -> anyhow::Result<u64> {
+    let row = client
+        .query_one(sql, &[])
+        .await
+        .context("query Postgres reconciliation row count")?;
+    let count: i64 = row.get(0);
+    u64::try_from(count).context("Postgres reconciliation row count was negative")
+}
+
+fn reconciliation_outcome(
+    source_table: &str,
+    target_table: &str,
+    source: &ReplicationPipelineReconciliationObservation,
+    target: &ReplicationPipelineReconciliationObservation,
+    pending_transactions: usize,
+    pending_records: usize,
+) -> ReplicationPipelineReconciliationOutcome {
+    if !source.exact || !target.exact {
+        return ReplicationPipelineReconciliationOutcome {
+            status: "bounded".to_string(),
+            drift: Vec::new(),
+            next_steps: vec![
+                "The table exceeded max_rows; rerun with a higher max_rows or full_scan=true for an exact count"
+                    .to_string(),
+            ],
+        };
+    }
+    if pending_transactions > 0 || pending_records > 0 {
+        return ReplicationPipelineReconciliationOutcome {
+            status: "pending_target_delivery".to_string(),
+            drift: Vec::new(),
+            next_steps: vec![
+                "The replication pipeline still has pending buffered records; retry reconciliation after it catches up"
+                    .to_string(),
+            ],
+        };
+    }
+    if source.row_count == target.row_count {
+        return ReplicationPipelineReconciliationOutcome {
+            status: "ok".to_string(),
+            drift: Vec::new(),
+            next_steps: vec!["Row counts match at the observed pipeline checkpoint".to_string()],
+        };
+    }
+
+    ReplicationPipelineReconciliationOutcome {
+        status: "drift".to_string(),
+        drift: vec![ReplicationPipelineReconciliationDrift {
+            kind: "row_count_mismatch".to_string(),
+            source_table: source_table.to_string(),
+            target_table: target_table.to_string(),
+            source_count: source.row_count,
+            target_count: target.row_count,
+            detail: format!(
+                "source row count {:?} does not match target row count {:?}",
+                source.row_count, target.row_count
+            ),
+        }],
+        next_steps: vec![
+            "Inspect the pipeline DLQ and target error state, then retry or discard DLQ entries before rerunning reconciliation"
+                .to_string(),
+        ],
+    }
 }
 
 fn current_unix_time_ms() -> u64 {

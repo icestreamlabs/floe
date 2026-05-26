@@ -164,6 +164,7 @@ pub(super) async fn postgres_cdc_runtime_plan(
         pipeline_plans.push(replication_pipeline_runtime_plan_from_catalog(
             pipeline,
             schema,
+            connection_string.to_string(),
             database_name.clone(),
             schema_evolution_policy,
         )?);
@@ -223,6 +224,7 @@ fn replication_pipeline_schema_from_registry(
 fn replication_pipeline_runtime_plan_from_catalog(
     pipeline: &CatalogReplicationPipelineDefinition,
     schema: CdcTableSchema,
+    source_connection: String,
     database_name: String,
     schema_evolution_policy: PostgresSchemaEvolutionPolicy,
 ) -> anyhow::Result<ReplicationPipelineRuntimePlan> {
@@ -244,6 +246,7 @@ fn replication_pipeline_runtime_plan_from_catalog(
     Ok(ReplicationPipelineRuntimePlan {
         name: pipeline.name().to_string(),
         source_name: pipeline.source_name().to_string(),
+        source_connection,
         database_name,
         upstream_table: pipeline.upstream_table().to_string(),
         table_id,

@@ -193,6 +193,7 @@ impl std::fmt::Debug for InitialPostgresSnapshot {
 struct ReplicationPipelineRuntimePlan {
     name: String,
     source_name: String,
+    source_connection: String,
     database_name: String,
     upstream_table: String,
     table_id: CdcTableId,
@@ -267,8 +268,10 @@ use catalog::*;
 use command::*;
 use ingest::*;
 pub(crate) use orchestration::run;
-pub(crate) use replication::ReplicationPipelineRuntime;
 use replication::*;
+pub(crate) use replication::{
+    ReplicationPipelineReconciliationOptions, ReplicationPipelineRuntime,
+};
 use shutdown::*;
 use startup::*;
 

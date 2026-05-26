@@ -1246,7 +1246,7 @@ fn postgres_value_expr(
     }
 }
 
-fn quote_postgres_qualified_name(name: &str) -> anyhow::Result<String> {
+pub(super) fn quote_postgres_qualified_name(name: &str) -> anyhow::Result<String> {
     let parts = name
         .split('.')
         .map(str::trim)

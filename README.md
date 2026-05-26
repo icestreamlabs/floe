@@ -168,8 +168,8 @@ Current requirements and limitations:
     the CDC primary key before rows are applied.
 - Common scalar types are covered; arrays, enums/domains, intervals, and range
   types remain deferred.
-- Source/target HA failover, reconciliation/drift checks, richer operator CLI
-  UX, and larger published performance baselines are follow-up product work.
+- Source/target HA failover, richer operator CLI UX, and larger published
+  performance baselines are follow-up product work.
 - Full HA discovery is not implemented in alpha: source failover requires the
   configured connection string to resolve to the new writer, and the promoted
   Postgres instance must retain a compatible logical slot/publication. Target
@@ -194,6 +194,11 @@ Postgres CDC operator endpoints:
   `{ "reason": "...", "operator": "..." }`.
 - `POST /ops/cdc/replication/dlq/{pipeline}/{dlq_id}/discard` discards one DLQ
   entry. The JSON body must include `reason` and may include `operator`.
+- `POST /ops/cdc/replication/{pipeline}/reconcile?max_rows=100000` compares a
+  Postgres source table to a Postgres replication target using bounded row-count
+  observations and the latest pipeline checkpoint. It reports `ok`, `drift`,
+  `bounded`, `pending_target_delivery`, or `unsupported_target`. It never runs
+  an unbounded `COUNT(*)` unless `full_scan=true` is passed explicitly.
 
 Operator output avoids connector connection strings and does not return raw DLQ
 payload bytes; DLQ metadata may include payload object keys, formats, and byte

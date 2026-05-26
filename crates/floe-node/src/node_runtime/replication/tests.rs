@@ -61,6 +61,7 @@ fn pipeline_snapshot_records_use_read_operation() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -107,6 +108,7 @@ fn pipeline_debezium_records_are_buffered_as_encoded_kafka_payloads() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -236,6 +238,7 @@ fn pipeline_floe_json_records_encode_compact_row_messages() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -336,6 +339,7 @@ fn kafka_json_encoders_cover_string_backed_postgres_types_and_timestamps() {
     let mut plan = ReplicationPipelineRuntimePlan {
         name: "orders_pipe".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: table_id.clone(),
@@ -611,6 +615,7 @@ fn pipeline_arrow_ipc_records_encode_batches_without_json() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -672,6 +677,7 @@ fn pipeline_arrow_ipc_records_encode_columnar_snapshot_without_json() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -731,6 +737,7 @@ fn pipeline_transaction_records_include_all_matching_snapshot_chunks() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: "public.orders".to_string(),
         table_id: CdcTableId::new("orders").unwrap(),
@@ -1035,6 +1042,104 @@ async fn target_checkpoint_state_makes_partial_delivery_explicit() {
     assert!(sensitive["target.last_error"].contains("password = [redacted]"));
     assert!(!sensitive["target.last_error"].contains("secret"));
     assert!(!sensitive["target.last_error"].contains("topsecret"));
+}
+
+#[test]
+fn reconciliation_outcome_reports_success_and_drift() {
+    let source = ReplicationPipelineReconciliationObservation {
+        table: "public.orders".to_string(),
+        row_count: Some(3),
+        row_count_lower_bound: None,
+        exact: true,
+        observed_at_unix_ms: 10,
+    };
+    let matching_target = ReplicationPipelineReconciliationObservation {
+        table: "public.orders_copy".to_string(),
+        row_count: Some(3),
+        row_count_lower_bound: None,
+        exact: true,
+        observed_at_unix_ms: 11,
+    };
+    let ok = reconciliation_outcome(
+        "public.orders",
+        "public.orders_copy",
+        &source,
+        &matching_target,
+        0,
+        0,
+    );
+    assert_eq!(ok.status, "ok");
+    assert!(ok.drift.is_empty());
+
+    let drift_target = ReplicationPipelineReconciliationObservation {
+        row_count: Some(2),
+        ..matching_target
+    };
+    let drift = reconciliation_outcome(
+        "public.orders",
+        "public.orders_copy",
+        &source,
+        &drift_target,
+        0,
+        0,
+    );
+    assert_eq!(drift.status, "drift");
+    assert_eq!(
+        drift.drift,
+        vec![ReplicationPipelineReconciliationDrift {
+            kind: "row_count_mismatch".to_string(),
+            source_table: "public.orders".to_string(),
+            target_table: "public.orders_copy".to_string(),
+            source_count: Some(3),
+            target_count: Some(2),
+            detail: "source row count Some(3) does not match target row count Some(2)".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn reconciliation_outcome_reports_bounded_and_pending_states() {
+    let bounded_source = ReplicationPipelineReconciliationObservation {
+        table: "public.orders".to_string(),
+        row_count: None,
+        row_count_lower_bound: Some(101),
+        exact: false,
+        observed_at_unix_ms: 10,
+    };
+    let target = ReplicationPipelineReconciliationObservation {
+        table: "public.orders_copy".to_string(),
+        row_count: Some(100),
+        row_count_lower_bound: None,
+        exact: true,
+        observed_at_unix_ms: 11,
+    };
+    let bounded = reconciliation_outcome(
+        "public.orders",
+        "public.orders_copy",
+        &bounded_source,
+        &target,
+        0,
+        0,
+    );
+    assert_eq!(bounded.status, "bounded");
+    assert!(bounded.drift.is_empty());
+
+    let source = ReplicationPipelineReconciliationObservation {
+        row_count: Some(100),
+        row_count_lower_bound: None,
+        exact: true,
+        ..bounded_source
+    };
+    let pending = reconciliation_outcome(
+        "public.orders",
+        "public.orders_copy",
+        &source,
+        &target,
+        1,
+        7,
+    );
+    assert_eq!(pending.status, "pending_target_delivery");
+    assert!(pending.drift.is_empty());
 }
 
 #[test]
@@ -2213,6 +2318,7 @@ fn test_plan(
     ReplicationPipelineRuntimePlan {
         name: name.to_string(),
         source_name: "pg_main".to_string(),
+        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
         database_name: "postgres".to_string(),
         upstream_table: upstream_table.to_string(),
         table_id: table_id.clone(),

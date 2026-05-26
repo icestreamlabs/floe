@@ -35,15 +35,17 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::node_runtime::ReplicationPipelineRuntime;
+use crate::node_runtime::{ReplicationPipelineReconciliationOptions, ReplicationPipelineRuntime};
 use floe_node_core::source::{
     AppendIngestEvent, AppendIngestEventSender, send_batch_with_commit_ack,
 };
 
 const DEFAULT_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 100;
 const DEFAULT_CDC_REPLICATION_DLQ_LIST_LIMIT: usize = 100;
+const DEFAULT_CDC_REPLICATION_RECONCILE_MAX_ROWS: usize = 100_000;
 const MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 1_000;
 const MAX_CDC_REPLICATION_DLQ_LIST_LIMIT: usize = 1_000;
+const MAX_CDC_REPLICATION_RECONCILE_MAX_ROWS: usize = 10_000_000;
 
 #[derive(Debug, Clone)]
 pub struct HttpIngestConfig {
@@ -203,6 +205,12 @@ struct CdcReplicationDlqBatchRetryQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct CdcReplicationReconcileQuery {
+    max_rows: Option<usize>,
+    full_scan: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct CdcReplicationDlqListResponse {
     pipeline: String,
@@ -306,6 +314,14 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route(
             "/ops/cdc/replication/dlq/:pipeline/:dlq_id/retry",
             post(debug_cdc_replication_dlq_retry_admin),
+        )
+        .route(
+            "/debug/cdc/replication/:pipeline/reconcile",
+            post(debug_cdc_replication_reconcile_admin),
+        )
+        .route(
+            "/ops/cdc/replication/:pipeline/reconcile",
+            post(debug_cdc_replication_reconcile_admin),
         )
         .route("/debug/storage/flush", post(debug_storage_flush_admin))
         .route("/mv", get(subscribe_sse_admin))
@@ -728,6 +744,65 @@ async fn debug_cdc_replication_dlq_retry_batch_admin(
         .await
     {
         Ok(Some(outcome)) => (StatusCode::OK, Json(outcome)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pipeline not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn debug_cdc_replication_reconcile_admin(
+    State(state): State<HttpAdminState>,
+    Path(pipeline): Path<String>,
+    Query(query): Query<CdcReplicationReconcileQuery>,
+) -> impl IntoResponse {
+    let max_rows = query
+        .max_rows
+        .unwrap_or(DEFAULT_CDC_REPLICATION_RECONCILE_MAX_ROWS);
+    if max_rows == 0 || max_rows > MAX_CDC_REPLICATION_RECONCILE_MAX_ROWS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "reconcile max_rows must be between 1 and {}",
+                    MAX_CDC_REPLICATION_RECONCILE_MAX_ROWS
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    let Some(runtime) = &state.replication_runtime else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "CDC replication runtime unavailable"})),
+        )
+            .into_response();
+    };
+    match runtime
+        .reconcile_pipeline(
+            storage,
+            &pipeline,
+            ReplicationPipelineReconciliationOptions {
+                max_rows,
+                full_scan: query.full_scan.unwrap_or(false),
+            },
+        )
+        .await
+    {
+        Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "pipeline not found"})),
@@ -1518,6 +1593,47 @@ mod tests {
             discarded.status_reason(),
             Some("operator confirmed duplicate (operator: ops@example.com)")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_cdc_replication_reconcile_validates_bounds_and_runtime() {
+        let storage = SlateCatalog::in_memory().await.expect("storage");
+        let state = HttpAdminState {
+            cancel: CancellationToken::new(),
+            health: HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
+                cdc_replication_debug: None,
+            },
+            storage_db: None,
+            storage_catalog: Some(Arc::new(storage)),
+            replication_runtime: None,
+            materialized_views: None,
+        };
+        let app = Router::new()
+            .route(
+                "/ops/cdc/replication/:pipeline/reconcile",
+                post(debug_cdc_replication_reconcile_admin),
+            )
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ops/cdc/replication/orders_pipe/reconcile?max_rows=0")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ops/cdc/replication/orders_pipe/reconcile?max_rows=10")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
