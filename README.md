@@ -137,8 +137,9 @@ Postgres CDC is an alpha feature for single-node deployments. It supports:
 - Optional durable replication buffers with bounded pending bytes, records,
   transactions, and age limits.
 - Postgres materialized-view sinks in `upsert` and `append_only` modes.
-- Admin inspection under `/debug/cdc/replication` and DLQ list, inspect, retry,
-  batch retry, and discard endpoints under `/debug/cdc/replication/dlq`.
+- Operator inspection under `/ops/cdc/replication` and DLQ list, inspect,
+  retry, batch retry, and discard endpoints under `/ops/cdc/replication/dlq`.
+  The older `/debug/cdc/replication` paths remain engineering aliases.
 
 Current requirements and limitations:
 
@@ -161,10 +162,30 @@ Current requirements and limitations:
     the CDC primary key before rows are applied.
 - Common scalar types are covered; arrays, enums/domains, intervals, and range
   types remain deferred.
-- Source/target HA failover, reconciliation/drift checks, stable operator CLI
+- Source/target HA failover, reconciliation/drift checks, richer operator CLI
   UX, and larger published performance baselines are follow-up product work.
 - Arrow IPC Kafka output is internal/experimental and should not be used for
   public apples-to-apples format claims without calling that out.
+
+Postgres CDC operator endpoints:
+
+- `GET /ops/cdc/replication` lists pipelines with source lag, target state,
+  durable buffer stats, DLQ summary, replay state, and latest target error.
+- `GET /ops/cdc/replication/dlq?pipeline=...&status=pending&limit=100&offset=0`
+  lists DLQ entries with bounded pagination and optional status filtering.
+- `GET /ops/cdc/replication/dlq/{pipeline}/{dlq_id}` inspects a single DLQ
+  entry.
+- `POST /ops/cdc/replication/dlq/{pipeline}/{dlq_id}/retry` retries one DLQ
+  entry. The JSON body may include `{ "reason": "...", "operator": "..." }`.
+- `POST /ops/cdc/replication/dlq/retry?pipeline=...&limit=100` retries a
+  bounded batch of pending DLQ entries. The JSON body may include
+  `{ "reason": "...", "operator": "..." }`.
+- `POST /ops/cdc/replication/dlq/{pipeline}/{dlq_id}/discard` discards one DLQ
+  entry. The JSON body must include `reason` and may include `operator`.
+
+Operator output avoids connector connection strings and does not return raw DLQ
+payload bytes; DLQ metadata may include payload object keys, formats, and byte
+counts for recovery/audit workflows.
 
 Postgres CDC type compatibility:
 

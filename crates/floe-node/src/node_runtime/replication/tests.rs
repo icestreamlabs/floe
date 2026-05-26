@@ -1025,6 +1025,16 @@ async fn target_checkpoint_state_makes_partial_delivery_explicit() {
     assert_eq!(failed["target.delivery.replay_may_duplicate"], "true");
     assert_eq!(failed["target.failure.class"], "retryable");
     assert!(failed["target.last_error"].contains("kafka unavailable"));
+
+    let sensitive = failed_target_state(
+        &plan,
+        &manifest,
+        &anyhow!("connect postgres://floe:secret@localhost/floe failed with password = topsecret"),
+    );
+    assert!(sensitive["target.last_error"].contains("postgres://[redacted]@localhost/floe"));
+    assert!(sensitive["target.last_error"].contains("password = [redacted]"));
+    assert!(!sensitive["target.last_error"].contains("secret"));
+    assert!(!sensitive["target.last_error"].contains("topsecret"));
 }
 
 #[test]
@@ -1801,7 +1811,7 @@ async fn restart_replays_pending_buffer_to_dlq_and_retries_dlq_entry() {
 
     let retry_runtime = test_runtime_with_plan(plan.clone());
     let outcome = retry_runtime
-        .retry_pending_dlq_entries(&storage, &plan.name, 10)
+        .retry_pending_dlq_entries_with_reason(&storage, &plan.name, 10, None)
         .await
         .expect("manual retry after restart")
         .expect("pipeline exists");
@@ -1843,7 +1853,12 @@ async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
     .expect("persist entry");
 
     let err = runtime
-        .retry_dlq_entry(&storage, &plan.name, dlq_id)
+        .retry_dlq_entry_with_reason(
+            &storage,
+            &plan.name,
+            dlq_id,
+            Some("operator requested replay".to_string()),
+        )
         .await
         .expect_err("retry should fail without a writer");
     assert!(err.to_string().contains("retry replication pipeline"));
@@ -1854,12 +1869,9 @@ async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
         .expect("entry exists");
     assert_eq!(attempted.status(), ReplicationPipelineDlqStatus::Pending);
     assert_eq!(attempted.attempt_count(), 2);
-    assert!(
-        attempted
-            .status_reason()
-            .expect("retry failure reason")
-            .contains("manual retry failed")
-    );
+    let status_reason = attempted.status_reason().expect("retry failure reason");
+    assert!(status_reason.contains("manual retry failed"));
+    assert!(status_reason.contains("operator_reason=operator requested replay"));
 }
 
 #[tokio::test]
@@ -1920,7 +1932,7 @@ async fn retry_pending_dlq_entries_respects_limit_and_skips_resolved_entries() {
         .expect("discard entry");
 
     let outcome = runtime
-        .retry_pending_dlq_entries(&storage, &plan.name, 2)
+        .retry_pending_dlq_entries_with_reason(&storage, &plan.name, 2, None)
         .await
         .expect("retry batch")
         .expect("pipeline exists");

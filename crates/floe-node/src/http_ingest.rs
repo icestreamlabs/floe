@@ -41,7 +41,9 @@ use floe_node_core::source::{
 };
 
 const DEFAULT_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 100;
+const DEFAULT_CDC_REPLICATION_DLQ_LIST_LIMIT: usize = 100;
 const MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 1_000;
+const MAX_CDC_REPLICATION_DLQ_LIST_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct HttpIngestConfig {
@@ -183,11 +185,13 @@ struct CdcReplicationDlqListQuery {
     pipeline: String,
     status: Option<ReplicationPipelineDlqStatus>,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct CdcReplicationDlqActionRequest {
     reason: Option<String>,
+    operator: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +204,9 @@ struct CdcReplicationDlqBatchRetryQuery {
 struct CdcReplicationDlqListResponse {
     pipeline: String,
     status: Option<ReplicationPipelineDlqStatus>,
+    offset: usize,
+    limit: usize,
+    total_matching: usize,
     count: usize,
     oldest_pending_age_ms: Option<u64>,
     entries: Vec<ReplicationPipelineDlqEntry>,
@@ -256,8 +263,13 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route("/readyz", get(admin_readyz))
         .route("/debug/watermarks", get(debug_watermarks_admin))
         .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
+        .route("/ops/cdc/replication", get(debug_cdc_replication_admin))
         .route(
             "/debug/cdc/replication/dlq",
+            get(debug_cdc_replication_dlq_list_admin),
+        )
+        .route(
+            "/ops/cdc/replication/dlq",
             get(debug_cdc_replication_dlq_list_admin),
         )
         .route(
@@ -265,7 +277,15 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
             post(debug_cdc_replication_dlq_retry_batch_admin),
         )
         .route(
+            "/ops/cdc/replication/dlq/retry",
+            post(debug_cdc_replication_dlq_retry_batch_admin),
+        )
+        .route(
             "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
+            get(debug_cdc_replication_dlq_entry_admin),
+        )
+        .route(
+            "/ops/cdc/replication/dlq/:pipeline/:dlq_id",
             get(debug_cdc_replication_dlq_entry_admin),
         )
         .route(
@@ -273,7 +293,15 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
             post(debug_cdc_replication_dlq_discard_admin),
         )
         .route(
+            "/ops/cdc/replication/dlq/:pipeline/:dlq_id/discard",
+            post(debug_cdc_replication_dlq_discard_admin),
+        )
+        .route(
             "/debug/cdc/replication/dlq/:pipeline/:dlq_id/retry",
+            post(debug_cdc_replication_dlq_retry_admin),
+        )
+        .route(
+            "/ops/cdc/replication/dlq/:pipeline/:dlq_id/retry",
             post(debug_cdc_replication_dlq_retry_admin),
         )
         .route("/debug/storage/flush", post(debug_storage_flush_admin))
@@ -460,6 +488,22 @@ async fn debug_cdc_replication_dlq_list_admin(
     State(state): State<HttpAdminState>,
     Query(query): Query<CdcReplicationDlqListQuery>,
 ) -> impl IntoResponse {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CDC_REPLICATION_DLQ_LIST_LIMIT);
+    if limit == 0 || limit > MAX_CDC_REPLICATION_DLQ_LIST_LIMIT {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "list limit must be between 1 and {}",
+                    MAX_CDC_REPLICATION_DLQ_LIST_LIMIT
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let offset = query.offset.unwrap_or(0);
     let Some(storage) = &state.storage_catalog else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -483,18 +527,28 @@ async fn debug_cdc_replication_dlq_list_admin(
     if let Some(status) = query.status {
         entries.retain(|entry| entry.status() == status);
     }
-    entries.sort_by_key(|entry| entry.created_at_unix_ms());
+    entries.sort_by(|left, right| {
+        left.created_at_unix_ms()
+            .cmp(&right.created_at_unix_ms())
+            .then_with(|| left.dlq_id().cmp(right.dlq_id()))
+    });
     let oldest_pending_age_ms = entries
         .iter()
         .filter(|entry| entry.status() == ReplicationPipelineDlqStatus::Pending)
         .map(|entry| current_unix_time_ms().saturating_sub(entry.created_at_unix_ms()))
         .min();
-    if let Some(limit) = query.limit {
-        entries.truncate(limit);
-    }
+    let total_matching = entries.len();
+    let entries = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
     let response = CdcReplicationDlqListResponse {
         pipeline: query.pipeline,
         status: query.status,
+        offset,
+        limit,
+        total_matching,
         count: entries.len(),
         oldest_pending_age_ms,
         entries,
@@ -548,8 +602,8 @@ async fn debug_cdc_replication_dlq_discard_admin(
             .into_response();
     };
     let reason = payload
-        .and_then(|Json(payload)| payload.reason)
-        .filter(|reason| !reason.trim().is_empty());
+        .map(|Json(payload)| payload)
+        .and_then(cdc_replication_action_reason);
     let Some(reason) = reason else {
         return (
             StatusCode::BAD_REQUEST,
@@ -588,6 +642,7 @@ async fn debug_cdc_replication_dlq_discard_admin(
 async fn debug_cdc_replication_dlq_retry_admin(
     State(state): State<HttpAdminState>,
     Path((pipeline, dlq_id)): Path<(String, String)>,
+    payload: Option<Json<CdcReplicationDlqActionRequest>>,
 ) -> impl IntoResponse {
     let Some(storage) = &state.storage_catalog else {
         return (
@@ -603,7 +658,13 @@ async fn debug_cdc_replication_dlq_retry_admin(
         )
             .into_response();
     };
-    match runtime.retry_dlq_entry(storage, &pipeline, &dlq_id).await {
+    let reason = payload
+        .map(|Json(payload)| payload)
+        .and_then(cdc_replication_action_reason);
+    match runtime
+        .retry_dlq_entry_with_reason(storage, &pipeline, &dlq_id, reason)
+        .await
+    {
         Ok(Some(entry)) => (
             StatusCode::OK,
             Json(CdcReplicationDlqEntryResponse { entry }),
@@ -625,6 +686,7 @@ async fn debug_cdc_replication_dlq_retry_admin(
 async fn debug_cdc_replication_dlq_retry_batch_admin(
     State(state): State<HttpAdminState>,
     Query(query): Query<CdcReplicationDlqBatchRetryQuery>,
+    payload: Option<Json<CdcReplicationDlqActionRequest>>,
 ) -> impl IntoResponse {
     let limit = query
         .limit
@@ -655,8 +717,11 @@ async fn debug_cdc_replication_dlq_retry_batch_admin(
         )
             .into_response();
     };
+    let reason = payload
+        .map(|Json(payload)| payload)
+        .and_then(cdc_replication_action_reason);
     match runtime
-        .retry_pending_dlq_entries(storage, &query.pipeline, limit)
+        .retry_pending_dlq_entries_with_reason(storage, &query.pipeline, limit, reason)
         .await
     {
         Ok(Some(outcome)) => (StatusCode::OK, Json(outcome)).into_response(),
@@ -670,6 +735,21 @@ async fn debug_cdc_replication_dlq_retry_batch_admin(
             Json(serde_json::json!({"error": err.to_string()})),
         )
             .into_response(),
+    }
+}
+
+fn cdc_replication_action_reason(request: CdcReplicationDlqActionRequest) -> Option<String> {
+    let reason = request.reason?.trim().to_string();
+    if reason.is_empty() {
+        return None;
+    }
+    let Some(operator) = request.operator.map(|operator| operator.trim().to_string()) else {
+        return Some(reason);
+    };
+    if operator.is_empty() {
+        Some(reason)
+    } else {
+        Some(format!("{reason} (operator: {operator})"))
     }
 }
 
@@ -1248,14 +1328,22 @@ mod tests {
         };
         let app = Router::new()
             .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
+            .route("/ops/cdc/replication", get(debug_cdc_replication_admin))
             .with_state(state);
         let request = Request::builder()
             .method("GET")
-            .uri("/debug/cdc/replication")
+            .uri("/ops/cdc/replication")
             .body(Body::empty())
             .expect("request");
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("orders_pipe"));
+        assert!(!body.contains("postgres://"));
+        assert!(!body.contains("connection"));
     }
 
     #[tokio::test]
@@ -1284,6 +1372,29 @@ mod tests {
             .put_replication_pipeline_dlq_entry(dlq_entry)
             .await
             .expect("persist dlq entry");
+        let second_entry = ReplicationPipelineDlqEntry::new(
+            "orders_pipe",
+            "entry-2",
+            "pg_main",
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C60", None).expect("position"),
+            Some(floe_cdc_core::CdcTransactionId::new("pg-xid-2").expect("transaction")),
+            "postgres_delivery",
+            "permission denied",
+            1,
+            Some("payloads/entry-2.bin".to_string()),
+            Some("kafka_records".to_string()),
+            128,
+            BTreeMap::from([(
+                "target.delivery.status".to_string(),
+                "dead_lettered".to_string(),
+            )]),
+            current_unix_time_ms().saturating_add(1),
+        )
+        .expect("second dlq entry");
+        storage
+            .put_replication_pipeline_dlq_entry(second_entry)
+            .await
+            .expect("persist second dlq entry");
         let state = HttpAdminState {
             cancel: CancellationToken::new(),
             health: HttpIngestHealth {
@@ -1304,7 +1415,15 @@ mod tests {
                 get(debug_cdc_replication_dlq_list_admin),
             )
             .route(
+                "/ops/cdc/replication/dlq",
+                get(debug_cdc_replication_dlq_list_admin),
+            )
+            .route(
                 "/debug/cdc/replication/dlq/retry",
+                post(debug_cdc_replication_dlq_retry_batch_admin),
+            )
+            .route(
+                "/ops/cdc/replication/dlq/retry",
                 post(debug_cdc_replication_dlq_retry_batch_admin),
             )
             .route(
@@ -1312,22 +1431,43 @@ mod tests {
                 get(debug_cdc_replication_dlq_entry_admin),
             )
             .route(
+                "/ops/cdc/replication/dlq/:pipeline/:dlq_id",
+                get(debug_cdc_replication_dlq_entry_admin),
+            )
+            .route(
                 "/debug/cdc/replication/dlq/:pipeline/:dlq_id/discard",
                 post(debug_cdc_replication_dlq_discard_admin),
+            )
+            .route(
+                "/ops/cdc/replication/dlq/:pipeline/:dlq_id/discard",
+                post(debug_cdc_replication_dlq_discard_admin),
+            )
+            .route(
+                "/ops/cdc/replication/dlq/:pipeline/:dlq_id/retry",
+                post(debug_cdc_replication_dlq_retry_admin),
             )
             .with_state(state);
 
         let request = Request::builder()
             .method("GET")
-            .uri("/debug/cdc/replication/dlq?pipeline=orders_pipe&status=pending")
+            .uri("/ops/cdc/replication/dlq?pipeline=orders_pipe&status=pending&offset=1&limit=1")
             .body(Body::empty())
             .expect("request");
         let response = app.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["offset"], 1);
+        assert_eq!(value["limit"], 1);
+        assert_eq!(value["total_matching"], 2);
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["entries"][0]["dlq_id"], "entry-2");
 
         let request = Request::builder()
             .method("GET")
-            .uri("/debug/cdc/replication/dlq/orders_pipe/entry-1")
+            .uri("/ops/cdc/replication/dlq/orders_pipe/entry-1")
             .body(Body::empty())
             .expect("request");
         let response = app.clone().oneshot(request).await.expect("response");
@@ -1335,16 +1475,27 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/debug/cdc/replication/dlq/retry?pipeline=orders_pipe&limit=0")
+            .uri("/ops/cdc/replication/dlq/retry?pipeline=orders_pipe&limit=0")
             .body(Body::empty())
             .expect("request");
         let response = app.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let payload = json!({"reason": "operator confirmed duplicate"});
         let request = Request::builder()
             .method("POST")
-            .uri("/debug/cdc/replication/dlq/orders_pipe/entry-1/discard")
+            .uri("/ops/cdc/replication/dlq/orders_pipe/entry-1/retry")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let payload = json!({
+            "reason": "operator confirmed duplicate",
+            "operator": "ops@example.com"
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ops/cdc/replication/dlq/orders_pipe/entry-1/discard")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(payload.to_string()))
             .expect("request");
@@ -1359,7 +1510,7 @@ mod tests {
         assert_eq!(discarded.status(), ReplicationPipelineDlqStatus::Discarded);
         assert_eq!(
             discarded.status_reason(),
-            Some("operator confirmed duplicate")
+            Some("operator confirmed duplicate (operator: ops@example.com)")
         );
     }
 

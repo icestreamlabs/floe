@@ -106,11 +106,12 @@ impl ReplicationPipelineRuntime {
             .is_some_and(|plans| !plans.is_empty())
     }
 
-    pub(crate) async fn retry_dlq_entry(
+    pub(crate) async fn retry_dlq_entry_with_reason(
         &self,
         storage: &SlateCatalog,
         pipeline_name: &str,
         dlq_id: &str,
+        operator_reason: Option<String>,
     ) -> anyhow::Result<Option<ReplicationPipelineDlqEntry>> {
         let Some(plan) = self.plan_by_name(pipeline_name) else {
             return Ok(None);
@@ -121,16 +122,17 @@ impl ReplicationPipelineRuntime {
         else {
             return Ok(None);
         };
-        self.retry_loaded_dlq_entry(storage, plan, entry)
+        self.retry_loaded_dlq_entry(storage, plan, entry, operator_reason.as_deref())
             .await
             .map(Some)
     }
 
-    pub(crate) async fn retry_pending_dlq_entries(
+    pub(crate) async fn retry_pending_dlq_entries_with_reason(
         &self,
         storage: &SlateCatalog,
         pipeline_name: &str,
         limit: usize,
+        operator_reason: Option<String>,
     ) -> anyhow::Result<Option<ReplicationPipelineDlqRetryBatchOutcome>> {
         anyhow::ensure!(limit > 0, "DLQ retry limit must be greater than zero");
         let Some(plan) = self.plan_by_name(pipeline_name) else {
@@ -157,7 +159,10 @@ impl ReplicationPipelineRuntime {
         for entry in entries {
             outcome.attempted = outcome.attempted.saturating_add(1);
             let dlq_id = entry.dlq_id().to_string();
-            match self.retry_loaded_dlq_entry(storage, plan, entry).await {
+            match self
+                .retry_loaded_dlq_entry(storage, plan, entry, operator_reason.as_deref())
+                .await
+            {
                 Ok(entry) => outcome.replayed.push(entry),
                 Err(err) => {
                     let error = err.to_string();
@@ -180,6 +185,7 @@ impl ReplicationPipelineRuntime {
         storage: &SlateCatalog,
         plan: &ReplicationPipelineRuntimePlan,
         entry: ReplicationPipelineDlqEntry,
+        operator_reason: Option<&str>,
     ) -> anyhow::Result<ReplicationPipelineDlqEntry> {
         let pipeline_name = entry.pipeline_name().to_string();
         let dlq_id = entry.dlq_id().to_string();
@@ -223,7 +229,10 @@ impl ReplicationPipelineRuntime {
                         &pipeline_name,
                         &dlq_id,
                         ReplicationPipelineDlqStatus::Replayed,
-                        Some("manual retry delivered to target".to_string()),
+                        Some(manual_retry_status_reason(
+                            "manual retry delivered to target",
+                            operator_reason,
+                        )),
                         current_unix_time_ms(),
                     )
                     .await?;
@@ -237,7 +246,10 @@ impl ReplicationPipelineRuntime {
                         &pipeline_name,
                         &dlq_id,
                         ReplicationPipelineDlqStatus::Pending,
-                        Some(format!("manual retry failed: {err:#}")),
+                        Some(manual_retry_status_reason(
+                            &format!("manual retry failed: {err:#}"),
+                            operator_reason,
+                        )),
                         current_unix_time_ms(),
                     )
                     .await?;
@@ -1069,6 +1081,16 @@ impl ReplicationPipelineRuntime {
         self.set_source_backpressure_state(&plan.name, false);
         Ok(())
     }
+}
+
+fn manual_retry_status_reason(base: &str, operator_reason: Option<&str>) -> String {
+    let Some(operator_reason) = operator_reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    else {
+        return base.to_string();
+    };
+    format!("{base}; operator_reason={operator_reason}")
 }
 
 fn current_unix_time_ms() -> u64 {

@@ -488,13 +488,102 @@ fn hex_component(bytes: &[u8]) -> String {
 
 pub(super) fn truncate_target_error(message: &str) -> String {
     const MAX_ERROR_LEN: usize = 512;
-    if message.len() <= MAX_ERROR_LEN {
-        return message.to_string();
+    let redacted = redact_sensitive_target_text(message);
+    if redacted.len() <= MAX_ERROR_LEN {
+        return redacted;
     }
-    let mut truncated = message
+    let mut truncated = redacted
         .chars()
         .take(MAX_ERROR_LEN.saturating_sub(3))
         .collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn redact_sensitive_target_text(message: &str) -> String {
+    let redacted = redact_uri_userinfo(message);
+    redact_secret_assignments(&redacted)
+}
+
+fn redact_uri_userinfo(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut cursor = 0;
+    while let Some(relative_scheme) = message[cursor..].find("://") {
+        let scheme_idx = cursor + relative_scheme;
+        let authority_start = scheme_idx + 3;
+        let rest = &message[authority_start..];
+        let authority_end = authority_start
+            + rest
+                .find(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(ch, '"' | '\'' | ')' | '(' | ',' | ';' | '}' | ']')
+                })
+                .unwrap_or(rest.len());
+        if let Some(relative_at) = message[authority_start..authority_end].find('@') {
+            let at_idx = authority_start + relative_at;
+            redacted.push_str(&message[cursor..authority_start]);
+            redacted.push_str("[redacted]@");
+            cursor = at_idx + 1;
+        } else {
+            redacted.push_str(&message[cursor..authority_end]);
+            cursor = authority_end;
+        }
+    }
+    redacted.push_str(&message[cursor..]);
+    redacted
+}
+
+fn redact_secret_assignments(message: &str) -> String {
+    const SECRET_KEYS: &[&str] = &["password", "passwd", "pwd", "sslpassword"];
+    let mut redacted = message.to_string();
+    for key in SECRET_KEYS {
+        redacted = redact_secret_assignment_key(&redacted, key);
+    }
+    redacted
+}
+
+fn redact_secret_assignment_key(message: &str, key: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    let mut redacted = String::with_capacity(message.len());
+    let mut cursor = 0;
+    while let Some(relative_key) = lower[cursor..].find(key) {
+        let key_start = cursor + relative_key;
+        let key_end = key_start + key.len();
+        if !is_key_boundary(message, key_start, key_end) {
+            redacted.push_str(&message[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
+        let mut separator = key_end;
+        while separator < message.len() && message.as_bytes()[separator].is_ascii_whitespace() {
+            separator += 1;
+        }
+        if separator >= message.len() || !matches!(message.as_bytes()[separator], b'=' | b':') {
+            redacted.push_str(&message[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
+        let mut value_start = separator + 1;
+        while value_start < message.len() && message.as_bytes()[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let value_end = message[value_start..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '&' | ',' | ';' | ')' | '}'))
+            .map_or(message.len(), |relative_end| value_start + relative_end);
+        redacted.push_str(&message[cursor..value_start]);
+        redacted.push_str("[redacted]");
+        cursor = value_end;
+    }
+    redacted.push_str(&message[cursor..]);
+    redacted
+}
+
+fn is_key_boundary(message: &str, key_start: usize, key_end: usize) -> bool {
+    let before_is_boundary = key_start == 0
+        || !message.as_bytes()[key_start - 1].is_ascii_alphanumeric()
+            && message.as_bytes()[key_start - 1] != b'_';
+    let after_is_boundary = key_end == message.len()
+        || !message.as_bytes()[key_end].is_ascii_alphanumeric()
+            && message.as_bytes()[key_end] != b'_';
+    before_is_boundary && after_is_boundary
 }

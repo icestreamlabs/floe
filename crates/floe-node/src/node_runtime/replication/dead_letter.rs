@@ -5,7 +5,9 @@ use floe_storage::{
 };
 
 use super::super::ReplicationPipelineRuntimePlan;
-use super::target_state::{dead_letter_target_state, replication_pipeline_dlq_id, target_kind};
+use super::target_state::{
+    dead_letter_target_state, replication_pipeline_dlq_id, target_kind, truncate_target_error,
+};
 use super::{current_unix_time_ms, encoding};
 
 pub(super) async fn persist_dead_letter_records(
@@ -36,7 +38,7 @@ pub(super) async fn persist_dead_letter_records(
         source_position.clone(),
         transaction_id.cloned(),
         format!("{}_delivery", target_kind(plan)),
-        format!("{err:#}"),
+        truncate_target_error(&format!("{err:#}")),
         1,
         Some(payload_object_key),
         Some("kafka_records".to_string()),
