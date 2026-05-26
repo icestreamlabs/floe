@@ -7,6 +7,7 @@ use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
 use datafusion::logical_expr::expr::WildcardOptions;
 use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
+use datafusion::logical_expr::logical_plan::Sort as LogicalSort;
 use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, JoinType, LogicalPlanBuilder, ScalarFunctionImplementation, ScalarUDF,
@@ -128,6 +129,22 @@ fn qualified(table: &'static TableDescriptor, column: &str) -> String {
     format!("{}.{}", table.name, column)
 }
 
+fn select_predicate_in_unary_chain(
+    circuit_plan: &super::CircuitPlan,
+    mut node_id: usize,
+) -> Option<String> {
+    loop {
+        let node = circuit_plan.node(node_id)?;
+        if let DbspNodeKind::Select(select) = &node.kind {
+            return Some(format!("{:?}", select.predicate().expression().expr()));
+        }
+        if node.inputs.len() != 1 {
+            return None;
+        }
+        node_id = node.inputs[0];
+    }
+}
+
 #[test]
 fn count_star_maps_to_untyped_count() {
     #[allow(deprecated)]
@@ -202,6 +219,139 @@ fn plans_scan_pushdown_filter_and_projection() {
     }
 }
 
+#[tokio::test]
+async fn pushes_filter_through_subquery_projection_alias() {
+    let plan = sql_plan("SELECT p FROM (SELECT price AS p, auction FROM bid) q WHERE p > 10").await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+
+    let project = match &root.kind {
+        DbspNodeKind::Project(project) => project,
+        other => panic!("expected Project root, found {other:?}"),
+    };
+    assert_eq!(project.output_schema().field(0).unwrap().name, "p");
+
+    let predicate = select_predicate_in_unary_chain(&circuit_plan, root.id)
+        .expect("pushed Select below projection alias");
+    assert!(
+        predicate.contains("price"),
+        "predicate should be rewritten onto the base column, got {predicate}",
+    );
+}
+
+#[test]
+fn merges_consecutive_projection_nodes() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "price")).alias("p"),
+            col(qualified(bid, "auction")).alias("a"),
+        ])
+        .unwrap()
+        .project(vec![col("p").alias("price_alias")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let project_count = circuit_plan
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, DbspNodeKind::Project(_)))
+        .count();
+    assert_eq!(project_count, 1);
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    let project = match &root.kind {
+        DbspNodeKind::Project(project) => project,
+        other => panic!("expected Project root, found {other:?}"),
+    };
+    assert_eq!(
+        project.output_schema().field(0).unwrap().name,
+        "price_alias"
+    );
+}
+
+#[test]
+fn pushes_filter_and_projection_into_union_inputs() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let left = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .union(right)
+        .unwrap()
+        .filter(col("price").gt(lit(100_i64)))
+        .unwrap()
+        .project(vec![col("auction")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+
+    let union = match &root.kind {
+        DbspNodeKind::Union(union) => union,
+        other => panic!("expected Union root, found {other:?}"),
+    };
+    assert_eq!(union.output_schema().len(), 1);
+    assert_eq!(root.inputs.len(), 2);
+
+    for input_id in &root.inputs {
+        let project = circuit_plan.node(*input_id).expect("union input");
+        let select_id = match &project.kind {
+            DbspNodeKind::Project(_) => *project.inputs.first().expect("project input"),
+            other => panic!("expected Project below Union, found {other:?}"),
+        };
+        let select = circuit_plan.node(select_id).expect("select input");
+        assert!(matches!(select.kind, DbspNodeKind::Select(_)));
+    }
+}
+
+#[test]
+fn flattens_nested_union_nodes() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let first = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let second = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let third = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(first)
+        .union(second)
+        .unwrap()
+        .union(third)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    match &root.kind {
+        DbspNodeKind::Union(_) => assert_eq!(root.inputs.len(), 3),
+        other => panic!("expected flattened Union root, found {other:?}"),
+    }
+}
+
 #[test]
 fn plans_inner_join() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
@@ -239,6 +389,63 @@ fn plans_inner_join() {
         }
         other => panic!("expected join node, found {other:?}"),
     }
+}
+
+#[test]
+fn infers_join_key_predicates_for_opposite_input() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Inner,
+            (
+                vec![qualified(person, "id")],
+                vec![qualified(auction, "seller")],
+            ),
+            None,
+        )
+        .unwrap()
+        .filter(col(qualified(person, "id")).gt(lit(10_i64)))
+        .unwrap()
+        .project(vec![
+            col(qualified(person, "name")),
+            col(qualified(auction, "item_name")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let join_node = circuit_plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, DbspNodeKind::Join(_)))
+        .expect("join node");
+    assert_eq!(join_node.inputs.len(), 2);
+
+    assert!(
+        select_predicate_in_unary_chain(&circuit_plan, join_node.inputs[0]).is_some(),
+        "left-side predicate should be pushed below the join",
+    );
+
+    let right_predicate = select_predicate_in_unary_chain(&circuit_plan, join_node.inputs[1])
+        .expect("inferred Select on right join input");
+    assert!(
+        right_predicate.contains("seller"),
+        "right-side inferred predicate should target seller, got {right_predicate}",
+    );
 }
 
 #[test]
@@ -564,6 +771,31 @@ fn plans_aggregate_and_topn() {
     match &root.kind {
         DbspNodeKind::TopN(topn) => {
             assert_eq!(topn.output_schema().len(), 4);
+        }
+        other => panic!("expected TopN node, found {other:?}"),
+    }
+}
+
+#[test]
+fn lowers_sort_fetch_to_topn() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let input = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let plan = datafusion::logical_expr::LogicalPlan::Sort(LogicalSort {
+        expr: vec![col(qualified(bid, "price")).sort(false, true)],
+        input: Arc::new(input),
+        fetch: Some(5),
+    });
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    match &root.kind {
+        DbspNodeKind::TopN(topn) => {
+            assert_eq!(topn.limit(), 5);
+            assert_eq!(topn.order_by().len(), 1);
         }
         other => panic!("expected TopN node, found {other:?}"),
     }

@@ -26,6 +26,7 @@ use super::expr::{
     combine_filters, extract_alias, extract_join_keys_and_residual, map_aggregate_expr,
     normalize_expr,
 };
+use super::logical_optimizer::optimize_logical_plan;
 
 pub struct CircuitPlanner {
     config: PlannerConfig,
@@ -37,8 +38,9 @@ impl CircuitPlanner {
     }
 
     pub fn plan(&self, plan: &LogicalPlan) -> Result<CircuitPlan, PlannerError> {
+        let plan = optimize_logical_plan(plan)?;
         let mut ctx = PlannerContext::new(&self.config);
-        let planned = ctx.plan_node(plan)?;
+        let planned = ctx.plan_node(&plan)?;
         Ok(CircuitPlan {
             root: planned.id,
             nodes: ctx.into_reachable_nodes(planned.id)?,
@@ -230,6 +232,26 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Aggregate(aggregate) => self.plan_aggregate(aggregate),
             LogicalPlan::Sort(sort) => {
                 let input = self.plan_node(&sort.input)?;
+                if let Some(fetch) = sort.fetch {
+                    let order_by = self.map_sort_expressions(&sort.expr, input.schema.clone())?;
+                    let topn = DbspTopNNode::try_new(
+                        input.schema.clone(),
+                        Vec::new(),
+                        order_by,
+                        fetch,
+                        0,
+                    )?;
+                    let output_schema = topn.output_schema().clone();
+                    let id = self.add_node(
+                        vec![input.id],
+                        DbspNodeKind::TopN(topn),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
                 let id = self.add_node(
                     vec![input.id],
                     DbspNodeKind::Passthrough,
@@ -1390,6 +1412,8 @@ fn split_join_filter(
     let mut right_pushdown = Vec::new();
     let mut remaining = Vec::new();
     let mut required_columns = BTreeSet::new();
+    let left_to_right_keys = join_key_column_mapping(join, JoinInputSide::Left);
+    let right_to_left_keys = join_key_column_mapping(join, JoinInputSide::Right);
 
     for conjunct in conjuncts {
         let columns = expression_output_columns(&conjunct, output_schema)?;
@@ -1397,16 +1421,26 @@ fn split_join_filter(
         let references_left = columns.iter().any(|column_idx| *column_idx < left_width);
         let references_right = columns.iter().any(|column_idx| *column_idx >= left_width);
         match (references_left, references_right) {
-            (true, false) => left_pushdown.push(rewrite_join_output_expr_for_side(
-                conjunct,
-                join,
-                JoinInputSide::Left,
-            )?),
-            (false, true) => right_pushdown.push(rewrite_join_output_expr_for_side(
-                conjunct,
-                join,
-                JoinInputSide::Right,
-            )?),
+            (true, false) => {
+                let left_predicate =
+                    rewrite_join_output_expr_for_side(conjunct, join, JoinInputSide::Left)?;
+                if let Some(right_predicate) =
+                    rewrite_key_predicate_for_opposite_side(&left_predicate, &left_to_right_keys)?
+                {
+                    right_pushdown.push(right_predicate);
+                }
+                left_pushdown.push(left_predicate);
+            }
+            (false, true) => {
+                let right_predicate =
+                    rewrite_join_output_expr_for_side(conjunct, join, JoinInputSide::Right)?;
+                if let Some(left_predicate) =
+                    rewrite_key_predicate_for_opposite_side(&right_predicate, &right_to_left_keys)?
+                {
+                    left_pushdown.push(left_predicate);
+                }
+                right_pushdown.push(right_predicate);
+            }
             _ => remaining.push(conjunct),
         }
     }
@@ -1493,6 +1527,55 @@ fn rewrite_join_output_expr_for_side(
         })
         .map(|result| result.data)
         .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+fn join_key_column_mapping(
+    join: &DbspJoinNode,
+    from_side: JoinInputSide,
+) -> HashMap<String, String> {
+    let mut mapping = HashMap::new();
+    for key in &join.keys {
+        let (from, to) = match from_side {
+            JoinInputSide::Left => (key.left_expression().expr(), key.right_expression().expr()),
+            JoinInputSide::Right => (key.right_expression().expr(), key.left_expression().expr()),
+        };
+        let (Expr::Column(from), Expr::Column(to)) = (from, to) else {
+            continue;
+        };
+        mapping.insert(from.name.clone(), to.name.clone());
+    }
+    mapping
+}
+
+fn rewrite_key_predicate_for_opposite_side(
+    predicate: &Expr,
+    key_mapping: &HashMap<String, String>,
+) -> Result<Option<Expr>, PlannerError> {
+    if predicate.is_volatile() || key_mapping.is_empty() {
+        return Ok(None);
+    }
+
+    let mut saw_key_column = false;
+    let mut can_rewrite = true;
+    let rewritten = predicate
+        .clone()
+        .transform_up(|expr| match expr {
+            Expr::Column(column) => {
+                let Some(target_name) = key_mapping.get(&column.name) else {
+                    can_rewrite = false;
+                    return Ok(Transformed::no(Expr::Column(column)));
+                };
+                saw_key_column = true;
+                Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                    target_name.clone(),
+                ))))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .map(|result| result.data)
+        .map_err(|err| PlannerError::AnalysisError(err.into()))?;
+
+    Ok((can_rewrite && saw_key_column).then_some(rewritten))
 }
 
 fn add_required_expression_columns(

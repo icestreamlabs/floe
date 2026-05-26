@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod error;
 mod expr;
+mod logical_optimizer;
 
 pub use circuit::{CircuitNode, CircuitPlan};
 pub use config::PlannerConfig;
