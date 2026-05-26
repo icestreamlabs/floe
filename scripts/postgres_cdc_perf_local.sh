@@ -60,6 +60,8 @@ POSTGRES_SETTINGS_LOG="${ARTIFACT_DIR}/postgres-settings.txt"
 KAFKA_TOPIC_LOG="${ARTIFACT_DIR}/kafka-topic.txt"
 POSTGRES_SLOT_LOG="${ARTIFACT_DIR}/postgres-slot.log"
 DOCKER_STATS_LOG="${ARTIFACT_DIR}/docker-stats.log"
+FLOE_METRICS_LOG="${ARTIFACT_DIR}/floe-metrics.prom"
+CDC_REPLICATION_DEBUG_JSON="${ARTIFACT_DIR}/cdc-replication-debug.json"
 SUMMARY_ENV="${ARTIFACT_DIR}/summary.env"
 SUMMARY_JSON="${ARTIFACT_DIR}/summary.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
@@ -346,6 +348,61 @@ write_docker_stats() {
       ps -p "${observed_pid}" -o pid=,pcpu=,pmem=,rss=,vsz=,etime=,command=
     } >>"${DOCKER_STATS_LOG}" 2>&1 || true
   fi
+}
+
+capture_floe_observability() {
+  : >"${FLOE_METRICS_LOG}"
+  printf '{}\n' >"${CDC_REPLICATION_DEBUG_JSON}"
+
+  if [[ -z "${node_pid}" ]] || ! kill -0 "${node_pid}" >/dev/null 2>&1; then
+    return
+  fi
+
+  curl -fsS --max-time 5 "http://127.0.0.1:${FLOE_ADMIN_PORT}/metrics" \
+    >"${FLOE_METRICS_LOG}" 2>/dev/null || true
+
+  local debug_tmp="${CDC_REPLICATION_DEBUG_JSON}.tmp"
+  if curl -fsS --max-time 5 "http://127.0.0.1:${FLOE_ADMIN_PORT}/debug/cdc/replication" \
+    >"${debug_tmp}" 2>/dev/null && jq . "${debug_tmp}" >"${CDC_REPLICATION_DEBUG_JSON}" 2>/dev/null; then
+    rm -f "${debug_tmp}"
+  else
+    rm -f "${debug_tmp}"
+    printf '{}\n' >"${CDC_REPLICATION_DEBUG_JSON}"
+  fi
+}
+
+prom_metric_sum_matching() {
+  local metric="$1"
+  local label_regex="${2:-}"
+  local file="${3:-${FLOE_METRICS_LOG}}"
+  if [[ ! -s "${file}" ]]; then
+    return
+  fi
+  awk -v metric="${metric}" -v label_regex="${label_regex}" '
+    $1 ~ "^" metric "(\\{|$)" {
+      if (label_regex != "" && $0 !~ label_regex) {
+        next
+      }
+      value = $NF
+      if (value ~ /^[-+]?[0-9.]+([eE][-+]?[0-9]+)?$/) {
+        sum += value
+        seen = 1
+      }
+    }
+    END {
+      if (seen) {
+        if (sum == int(sum)) {
+          printf "%.0f", sum
+        } else {
+          printf "%.6f", sum
+        }
+      }
+    }
+  ' "${file}"
+}
+
+prom_metric_sum() {
+  prom_metric_sum_matching "$1" "" "${2:-${FLOE_METRICS_LOG}}"
 }
 
 postgres_target_table_for_upstream() {
@@ -1040,6 +1097,7 @@ write_replication_pipeline_sql() {
 require_cmd docker
 require_cmd cargo
 require_cmd jq
+require_cmd curl
 
 upstream_tables=()
 pipeline_names=()
@@ -1466,6 +1524,7 @@ else
   sink_rows_per_second="$(awk "BEGIN { printf \"%.0f\", ${source_rows} / (${sink_wait_seconds} > 0.001 ? ${sink_wait_seconds} : 0.001) }")"
 fi
 node_finished_ns="$(date +%s%N)"
+capture_floe_observability
 write_postgres_slot_info
 write_docker_stats
 
@@ -1528,6 +1587,57 @@ case "${TARGET_NORMALIZED}" in
     target_observed_records_per_second="${sink_rows_per_second}"
     ;;
 esac
+cdc_buffer_pending_records="$(prom_metric_sum floe_cdc_buffer_pending_records)"
+cdc_buffer_pending_bytes="$(prom_metric_sum floe_cdc_buffer_pending_bytes)"
+cdc_buffer_appended_records="$(prom_metric_sum floe_cdc_buffer_appended_records_total)"
+cdc_buffer_appended_bytes="$(prom_metric_sum floe_cdc_buffer_appended_bytes_total)"
+cdc_buffer_append_latency_count="$(prom_metric_sum floe_cdc_buffer_append_latency_ms_count)"
+cdc_buffer_append_latency_sum_ms="$(prom_metric_sum floe_cdc_buffer_append_latency_ms_sum)"
+cdc_buffer_forced_flushes="$(prom_metric_sum floe_cdc_buffer_forced_flushes_total)"
+cdc_buffer_flush_latency_count="$(prom_metric_sum floe_cdc_buffer_flush_latency_ms_count)"
+cdc_buffer_flush_latency_sum_ms="$(prom_metric_sum floe_cdc_buffer_flush_latency_ms_sum)"
+cdc_buffer_replayed_records="$(prom_metric_sum floe_cdc_buffer_replayed_records_total)"
+cdc_buffer_replay_latency_count="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_count 'phase="total"')"
+cdc_buffer_replay_latency_sum_ms="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_sum 'phase="total"')"
+cdc_buffer_replay_delivery_latency_count="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_count 'phase="target_delivery"')"
+cdc_buffer_replay_delivery_latency_sum_ms="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_sum 'phase="target_delivery"')"
+cdc_buffer_replay_payload_load_latency_count="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_count 'phase="payload_load"')"
+cdc_buffer_replay_payload_load_latency_sum_ms="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_sum 'phase="payload_load"')"
+cdc_buffer_replay_encode_latency_count="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_count 'phase="encode"')"
+cdc_buffer_replay_encode_latency_sum_ms="$(prom_metric_sum_matching floe_cdc_buffer_replay_latency_ms_sum 'phase="encode"')"
+cdc_buffer_object_create_count="$(prom_metric_sum_matching floe_cdc_buffer_object_ops_total 'operation="create"')"
+cdc_buffer_object_get_count="$(prom_metric_sum_matching floe_cdc_buffer_object_ops_total 'operation="get"')"
+cdc_buffer_object_delete_count="$(prom_metric_sum_matching floe_cdc_buffer_object_ops_total 'operation="delete"')"
+cdc_buffer_drain_attempts="$(prom_metric_sum floe_cdc_buffer_drain_attempts_total)"
+if [[ -s "${FLOE_METRICS_LOG}" ]]; then
+  for metric_var in \
+    cdc_buffer_pending_records \
+    cdc_buffer_pending_bytes \
+    cdc_buffer_appended_records \
+    cdc_buffer_appended_bytes \
+    cdc_buffer_append_latency_count \
+    cdc_buffer_append_latency_sum_ms \
+    cdc_buffer_forced_flushes \
+    cdc_buffer_flush_latency_count \
+    cdc_buffer_flush_latency_sum_ms \
+    cdc_buffer_replayed_records \
+    cdc_buffer_replay_latency_count \
+    cdc_buffer_replay_latency_sum_ms \
+    cdc_buffer_replay_delivery_latency_count \
+    cdc_buffer_replay_delivery_latency_sum_ms \
+    cdc_buffer_replay_payload_load_latency_count \
+    cdc_buffer_replay_payload_load_latency_sum_ms \
+    cdc_buffer_replay_encode_latency_count \
+    cdc_buffer_replay_encode_latency_sum_ms \
+    cdc_buffer_object_create_count \
+    cdc_buffer_object_get_count \
+    cdc_buffer_object_delete_count \
+    cdc_buffer_drain_attempts; do
+    if [[ -z "${!metric_var}" ]]; then
+      printf -v "${metric_var}" '0'
+    fi
+  done
+fi
 
 row_counts_json="$(
   for idx in "${!upstream_tables[@]}"; do
@@ -1612,6 +1722,28 @@ write_summary_json() {
     --arg kafka_total_bytes "${kafka_total_bytes}" \
     --arg kafka_stream_mb_per_second "${kafka_stream_mb_per_second}" \
     --arg kafka_wall_mb_per_second "${kafka_wall_mb_per_second}" \
+    --arg cdc_buffer_pending_records "${cdc_buffer_pending_records}" \
+    --arg cdc_buffer_pending_bytes "${cdc_buffer_pending_bytes}" \
+    --arg cdc_buffer_appended_records "${cdc_buffer_appended_records}" \
+    --arg cdc_buffer_appended_bytes "${cdc_buffer_appended_bytes}" \
+    --arg cdc_buffer_append_latency_count "${cdc_buffer_append_latency_count}" \
+    --arg cdc_buffer_append_latency_sum_ms "${cdc_buffer_append_latency_sum_ms}" \
+    --arg cdc_buffer_forced_flushes "${cdc_buffer_forced_flushes}" \
+    --arg cdc_buffer_flush_latency_count "${cdc_buffer_flush_latency_count}" \
+    --arg cdc_buffer_flush_latency_sum_ms "${cdc_buffer_flush_latency_sum_ms}" \
+    --arg cdc_buffer_replayed_records "${cdc_buffer_replayed_records}" \
+    --arg cdc_buffer_replay_latency_count "${cdc_buffer_replay_latency_count}" \
+    --arg cdc_buffer_replay_latency_sum_ms "${cdc_buffer_replay_latency_sum_ms}" \
+    --arg cdc_buffer_replay_delivery_latency_count "${cdc_buffer_replay_delivery_latency_count}" \
+    --arg cdc_buffer_replay_delivery_latency_sum_ms "${cdc_buffer_replay_delivery_latency_sum_ms}" \
+    --arg cdc_buffer_replay_payload_load_latency_count "${cdc_buffer_replay_payload_load_latency_count}" \
+    --arg cdc_buffer_replay_payload_load_latency_sum_ms "${cdc_buffer_replay_payload_load_latency_sum_ms}" \
+    --arg cdc_buffer_replay_encode_latency_count "${cdc_buffer_replay_encode_latency_count}" \
+    --arg cdc_buffer_replay_encode_latency_sum_ms "${cdc_buffer_replay_encode_latency_sum_ms}" \
+    --arg cdc_buffer_object_create_count "${cdc_buffer_object_create_count}" \
+    --arg cdc_buffer_object_get_count "${cdc_buffer_object_get_count}" \
+    --arg cdc_buffer_object_delete_count "${cdc_buffer_object_delete_count}" \
+    --arg cdc_buffer_drain_attempts "${cdc_buffer_drain_attempts}" \
     --arg harness_overhead_percent "${harness_overhead_percent}" \
     --arg artifact_dir "${ARTIFACT_DIR}" \
     --arg node_stdout "${NODE_STDOUT}" \
@@ -1624,6 +1756,9 @@ write_summary_json() {
     --arg postgres_slot_log "${POSTGRES_SLOT_LOG}" \
     --arg kafka_topic_log "${KAFKA_TOPIC_LOG}" \
     --arg docker_stats_log "${DOCKER_STATS_LOG}" \
+    --arg floe_metrics_log "${FLOE_METRICS_LOG}" \
+    --arg cdc_replication_debug_json "${CDC_REPLICATION_DEBUG_JSON}" \
+    --slurpfile cdc_replication_debug "${CDC_REPLICATION_DEBUG_JSON}" \
     '
     def maybe_num($value): if $value == "" then null else ($value | tonumber) end;
     def maybe_bool($value):
@@ -1735,6 +1870,33 @@ write_summary_json() {
         kafka_value_bytes: maybe_num($kafka_value_bytes),
         kafka_total_bytes: maybe_num($kafka_total_bytes)
       },
+      cdc_replication: {
+        durable_buffer: {
+          pending_records: maybe_num($cdc_buffer_pending_records),
+          pending_bytes: maybe_num($cdc_buffer_pending_bytes),
+          appended_records: maybe_num($cdc_buffer_appended_records),
+          appended_bytes: maybe_num($cdc_buffer_appended_bytes),
+          append_latency_count: maybe_num($cdc_buffer_append_latency_count),
+          append_latency_sum_ms: maybe_num($cdc_buffer_append_latency_sum_ms),
+          forced_flushes: maybe_num($cdc_buffer_forced_flushes),
+          flush_latency_count: maybe_num($cdc_buffer_flush_latency_count),
+          flush_latency_sum_ms: maybe_num($cdc_buffer_flush_latency_sum_ms),
+          replayed_records: maybe_num($cdc_buffer_replayed_records),
+          replay_latency_count: maybe_num($cdc_buffer_replay_latency_count),
+          replay_latency_sum_ms: maybe_num($cdc_buffer_replay_latency_sum_ms),
+          replay_delivery_latency_count: maybe_num($cdc_buffer_replay_delivery_latency_count),
+          replay_delivery_latency_sum_ms: maybe_num($cdc_buffer_replay_delivery_latency_sum_ms),
+          replay_payload_load_latency_count: maybe_num($cdc_buffer_replay_payload_load_latency_count),
+          replay_payload_load_latency_sum_ms: maybe_num($cdc_buffer_replay_payload_load_latency_sum_ms),
+          replay_encode_latency_count: maybe_num($cdc_buffer_replay_encode_latency_count),
+          replay_encode_latency_sum_ms: maybe_num($cdc_buffer_replay_encode_latency_sum_ms),
+          object_create_count: maybe_num($cdc_buffer_object_create_count),
+          object_get_count: maybe_num($cdc_buffer_object_get_count),
+          object_delete_count: maybe_num($cdc_buffer_object_delete_count),
+          drain_attempts: maybe_num($cdc_buffer_drain_attempts)
+        },
+        debug: ($cdc_replication_debug[0] // null)
+      },
       artifacts: {
         summary_env: ($artifact_dir + "/summary.env"),
         summary_json: ($artifact_dir + "/summary.json"),
@@ -1748,7 +1910,9 @@ write_summary_json() {
         postgres_settings_log: $postgres_settings_log,
         postgres_slot_log: $postgres_slot_log,
         kafka_topic_log: $kafka_topic_log,
-        docker_stats_log: $docker_stats_log
+        docker_stats_log: $docker_stats_log,
+        floe_metrics_log: $floe_metrics_log,
+        cdc_replication_debug_json: $cdc_replication_debug_json
       }
     }
     ' >"${SUMMARY_JSON}"
@@ -1798,6 +1962,13 @@ Artifact directory: \`${ARTIFACT_DIR}\`
 | Postgres sink rows/s | ${sink_rows_per_second:-} |
 | Kafka total bytes | ${kafka_total_bytes:-} |
 | Kafka stream MB/s | ${kafka_stream_mb_per_second:-} |
+| CDC buffer appended records | ${cdc_buffer_appended_records:-} |
+| CDC buffer appended bytes | ${cdc_buffer_appended_bytes:-} |
+| CDC buffer append latency sum ms | ${cdc_buffer_append_latency_sum_ms:-} |
+| CDC buffer forced flushes | ${cdc_buffer_forced_flushes:-} |
+| CDC buffer flush latency sum ms | ${cdc_buffer_flush_latency_sum_ms:-} |
+| CDC buffer replayed records | ${cdc_buffer_replayed_records:-} |
+| CDC buffer replay latency sum ms | ${cdc_buffer_replay_latency_sum_ms:-} |
 
 Machine-readable report: \`${SUMMARY_JSON}\`
 MD
@@ -1868,6 +2039,28 @@ MD
   echo "benchmark.postgres_live_write_rows_per_second=${postgres_live_write_rows_per_second}"
   echo "benchmark.postgres_sink_rows_per_second=${sink_rows_per_second}"
   echo "benchmark.target_observed_records_per_second=${target_observed_records_per_second}"
+  echo "benchmark.cdc_buffer_pending_records=${cdc_buffer_pending_records}"
+  echo "benchmark.cdc_buffer_pending_bytes=${cdc_buffer_pending_bytes}"
+  echo "benchmark.cdc_buffer_appended_records=${cdc_buffer_appended_records}"
+  echo "benchmark.cdc_buffer_appended_bytes=${cdc_buffer_appended_bytes}"
+  echo "benchmark.cdc_buffer_append_latency_count=${cdc_buffer_append_latency_count}"
+  echo "benchmark.cdc_buffer_append_latency_sum_ms=${cdc_buffer_append_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_forced_flushes=${cdc_buffer_forced_flushes}"
+  echo "benchmark.cdc_buffer_flush_latency_count=${cdc_buffer_flush_latency_count}"
+  echo "benchmark.cdc_buffer_flush_latency_sum_ms=${cdc_buffer_flush_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_replayed_records=${cdc_buffer_replayed_records}"
+  echo "benchmark.cdc_buffer_replay_latency_count=${cdc_buffer_replay_latency_count}"
+  echo "benchmark.cdc_buffer_replay_latency_sum_ms=${cdc_buffer_replay_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_replay_delivery_latency_count=${cdc_buffer_replay_delivery_latency_count}"
+  echo "benchmark.cdc_buffer_replay_delivery_latency_sum_ms=${cdc_buffer_replay_delivery_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_replay_payload_load_latency_count=${cdc_buffer_replay_payload_load_latency_count}"
+  echo "benchmark.cdc_buffer_replay_payload_load_latency_sum_ms=${cdc_buffer_replay_payload_load_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_replay_encode_latency_count=${cdc_buffer_replay_encode_latency_count}"
+  echo "benchmark.cdc_buffer_replay_encode_latency_sum_ms=${cdc_buffer_replay_encode_latency_sum_ms}"
+  echo "benchmark.cdc_buffer_object_create_count=${cdc_buffer_object_create_count}"
+  echo "benchmark.cdc_buffer_object_get_count=${cdc_buffer_object_get_count}"
+  echo "benchmark.cdc_buffer_object_delete_count=${cdc_buffer_object_delete_count}"
+  echo "benchmark.cdc_buffer_drain_attempts=${cdc_buffer_drain_attempts}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"
@@ -1879,6 +2072,8 @@ MD
   echo "benchmark.postgres_slot_log=${POSTGRES_SLOT_LOG}"
   echo "benchmark.kafka_topic_log=${KAFKA_TOPIC_LOG}"
   echo "benchmark.docker_stats_log=${DOCKER_STATS_LOG}"
+  echo "benchmark.floe_metrics_log=${FLOE_METRICS_LOG}"
+  echo "benchmark.cdc_replication_debug_json=${CDC_REPLICATION_DEBUG_JSON}"
   echo "benchmark.summary_json=${SUMMARY_JSON}"
   echo "benchmark.summary_md=${SUMMARY_MD}"
 } | tee "${SUMMARY_ENV}"

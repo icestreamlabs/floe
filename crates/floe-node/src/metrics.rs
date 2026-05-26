@@ -327,6 +327,33 @@ static CDC_BUFFER_OBJECT_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register floe_cdc_buffer_object_ops_total")
 });
 
+static CDC_BUFFER_APPENDED_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_appended_records_total",
+        "Number of records appended to each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_appended_records_total")
+});
+
+static CDC_BUFFER_APPENDED_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_appended_bytes_total",
+        "Approximate payload bytes appended to each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_appended_bytes_total")
+});
+
+static CDC_BUFFER_APPEND_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_buffer_append_latency_ms",
+        "Time spent appending a transaction to each CDC replication buffer in milliseconds",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_append_latency_ms")
+});
+
 static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_forced_flushes_total",
@@ -334,6 +361,15 @@ static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
         &["pipeline"]
     )
     .expect("register floe_cdc_buffer_forced_flushes_total")
+});
+
+static CDC_BUFFER_FLUSH_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_buffer_flush_latency_ms",
+        "Time spent flushing each CDC replication buffer in milliseconds",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_flush_latency_ms")
 });
 
 static CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -352,6 +388,24 @@ static CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::
         &["pipeline"]
     )
     .expect("register floe_cdc_buffer_source_backpressure_active")
+});
+
+static CDC_BUFFER_REPLAYED_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_replayed_records_total",
+        "Number of records replayed from each CDC replication buffer",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_replayed_records_total")
+});
+
+static CDC_BUFFER_REPLAY_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_buffer_replay_latency_ms",
+        "Time spent replaying records from each CDC replication buffer in milliseconds",
+        &["pipeline", "phase"]
+    )
+    .expect("register floe_cdc_buffer_replay_latency_ms")
 });
 
 static CDC_REPLICATION_REPLAYING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -663,10 +717,33 @@ pub(crate) fn inc_cdc_buffer_object_op(pipeline: &str, operation: &str, count: u
         .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
 }
 
+pub(crate) fn record_cdc_buffer_append(
+    pipeline: &str,
+    records: usize,
+    bytes: usize,
+    latency_ms: u64,
+) {
+    CDC_BUFFER_APPENDED_RECORDS_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(records).unwrap_or(u64::MAX));
+    CDC_BUFFER_APPENDED_BYTES_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
+    CDC_BUFFER_APPEND_LATENCY_MS
+        .with_label_values(&[pipeline])
+        .observe(latency_ms as f64);
+}
+
 pub(crate) fn inc_cdc_buffer_forced_flush(pipeline: &str) {
     CDC_BUFFER_FORCED_FLUSHES_TOTAL
         .with_label_values(&[pipeline])
         .inc();
+}
+
+pub(crate) fn observe_cdc_buffer_flush_latency_ms(pipeline: &str, latency_ms: u64) {
+    CDC_BUFFER_FLUSH_LATENCY_MS
+        .with_label_values(&[pipeline])
+        .observe(latency_ms as f64);
 }
 
 pub(crate) fn inc_cdc_buffer_drain_attempt(pipeline: &str) {
@@ -679,6 +756,25 @@ pub(crate) fn record_cdc_buffer_source_backpressure_active(pipeline: &str, activ
     CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE
         .with_label_values(&[pipeline])
         .set(if active { 1 } else { 0 });
+}
+
+pub(crate) fn record_cdc_buffer_replay(pipeline: &str, delivered_records: usize, latency_ms: u64) {
+    CDC_BUFFER_REPLAYED_RECORDS_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(delivered_records).unwrap_or(u64::MAX));
+    CDC_BUFFER_REPLAY_LATENCY_MS
+        .with_label_values(&[pipeline, "total"])
+        .observe(latency_ms as f64);
+}
+
+pub(crate) fn observe_cdc_buffer_replay_phase_latency_ms(
+    pipeline: &str,
+    phase: &str,
+    latency_ms: u64,
+) {
+    CDC_BUFFER_REPLAY_LATENCY_MS
+        .with_label_values(&[pipeline, phase])
+        .observe(latency_ms as f64);
 }
 
 pub(crate) fn record_cdc_replication_replaying(pipeline: &str, replaying: bool) {
@@ -730,9 +826,15 @@ pub(crate) fn init() {
     let _ = &*CDC_BUFFER_PENDING_BYTES;
     let _ = &*CDC_BUFFER_OLDEST_PENDING_AGE_MS;
     let _ = &*CDC_BUFFER_OBJECT_OPS_TOTAL;
+    let _ = &*CDC_BUFFER_APPENDED_RECORDS_TOTAL;
+    let _ = &*CDC_BUFFER_APPENDED_BYTES_TOTAL;
+    let _ = &*CDC_BUFFER_APPEND_LATENCY_MS;
     let _ = &*CDC_BUFFER_FORCED_FLUSHES_TOTAL;
+    let _ = &*CDC_BUFFER_FLUSH_LATENCY_MS;
     let _ = &*CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL;
     let _ = &*CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE;
+    let _ = &*CDC_BUFFER_REPLAYED_RECORDS_TOTAL;
+    let _ = &*CDC_BUFFER_REPLAY_LATENCY_MS;
     let _ = &*CDC_REPLICATION_REPLAYING;
     let _ = &*CDC_REPLICATION_TARGET_ERROR;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
@@ -837,8 +939,12 @@ mod tests {
         inc_cdc_buffer_object_op(pipeline, "create", 2);
         inc_cdc_buffer_object_op(pipeline, "get", 1);
         inc_cdc_buffer_object_op(pipeline, "delete", 1);
+        record_cdc_buffer_append(pipeline, 10, 2048, 7);
         inc_cdc_buffer_forced_flush(pipeline);
+        observe_cdc_buffer_flush_latency_ms(pipeline, 3);
         inc_cdc_buffer_drain_attempt(pipeline);
+        record_cdc_buffer_replay(pipeline, 4, 11);
+        observe_cdc_buffer_replay_phase_latency_ms(pipeline, "target_delivery", 5);
         record_cdc_buffer_source_backpressure_active(pipeline, true);
         record_cdc_replication_replaying(pipeline, true);
         record_cdc_replication_target_error(pipeline, true);
@@ -865,11 +971,42 @@ mod tests {
             "floe_cdc_buffer_object_ops_total{operation=\"delete\",pipeline=\"pipe_metrics_test\"} 1"
         ));
         assert!(
+            body.contains(
+                "floe_cdc_buffer_appended_records_total{pipeline=\"pipe_metrics_test\"} 10"
+            )
+        );
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_appended_bytes_total{pipeline=\"pipe_metrics_test\"} 2048"
+            )
+        );
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_append_latency_ms_count{pipeline=\"pipe_metrics_test\"} 1"
+            )
+        );
+        assert!(
             body.contains("floe_cdc_buffer_forced_flushes_total{pipeline=\"pipe_metrics_test\"} 1")
+        );
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_flush_latency_ms_count{pipeline=\"pipe_metrics_test\"} 1"
+            )
         );
         assert!(
             body.contains("floe_cdc_buffer_drain_attempts_total{pipeline=\"pipe_metrics_test\"} 1")
         );
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_replayed_records_total{pipeline=\"pipe_metrics_test\"} 4"
+            )
+        );
+        assert!(body.contains(
+            "floe_cdc_buffer_replay_latency_ms_count{phase=\"total\",pipeline=\"pipe_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_replay_latency_ms_count{phase=\"target_delivery\",pipeline=\"pipe_metrics_test\"} 1"
+        ));
         assert!(body.contains(
             "floe_cdc_buffer_source_backpressure_active{pipeline=\"pipe_metrics_test\"} 1"
         ));

@@ -49,14 +49,25 @@ impl ReplicationPipelineRuntime {
         let mut delivered_transactions = 0usize;
         for manifest in pending {
             attempted_transactions = attempted_transactions.saturating_add(1);
+            let replay_started_at = Instant::now();
             let records =
                 load_manifest_records(plan, buffer_store, &manifest, self.settings.perf_log)
                     .await?;
-            let delivery_started_at = self.settings.perf_log.then(Instant::now);
+            let delivery_started_at = Instant::now();
             let delivered = self
                 .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
                 .await?;
-            let delivery_elapsed = elapsed_or_zero(delivery_started_at);
+            let delivery_elapsed = delivery_started_at.elapsed();
+            crate::metrics::observe_cdc_buffer_replay_phase_latency_ms(
+                &plan.name,
+                "target_delivery",
+                delivery_elapsed.as_millis() as u64,
+            );
+            crate::metrics::record_cdc_buffer_replay(
+                &plan.name,
+                delivered,
+                replay_started_at.elapsed().as_millis() as u64,
+            );
             log_replication_replay_delivery_perf(
                 self.settings.perf_log,
                 plan,
@@ -106,7 +117,7 @@ pub(super) async fn load_manifest_records(
     manifest: &CdcBufferedTransactionManifest,
     perf_enabled: bool,
 ) -> anyhow::Result<Vec<CdcBufferRecord>> {
-    let payload_load_started_at = perf_enabled.then(Instant::now);
+    let payload_load_started_at = Instant::now();
     let records = match manifest.payload_format() {
         CdcBufferPayloadFormat::KafkaRecords => {
             let records = buffer_store.records(manifest).await.with_context(|| {
@@ -135,10 +146,21 @@ pub(super) async fn load_manifest_records(
                     )
                 })?;
             record_object_store_get(plan, manifest);
-            let payload_load_elapsed = elapsed_or_zero(payload_load_started_at);
-            let encode_started_at = perf_enabled.then(Instant::now);
+            let payload_load_elapsed = payload_load_started_at.elapsed();
+            crate::metrics::observe_cdc_buffer_replay_phase_latency_ms(
+                &plan.name,
+                "payload_load",
+                payload_load_elapsed.as_millis() as u64,
+            );
+            let encode_started_at = Instant::now();
             let mut records =
                 encoding::encode_floe_json_buffered_change_batches(plan, &plan.schema, &batches)?;
+            let encode_elapsed = encode_started_at.elapsed();
+            crate::metrics::observe_cdc_buffer_replay_phase_latency_ms(
+                &plan.name,
+                "encode",
+                encode_elapsed.as_millis() as u64,
+            );
             encoding::add_replication_record_metadata(
                 plan,
                 manifest.source_position(),
@@ -151,18 +173,24 @@ pub(super) async fn load_manifest_records(
                 plan,
                 manifest,
                 payload_load_elapsed,
-                elapsed_or_zero(encode_started_at),
+                encode_elapsed,
                 records.len(),
             );
             records
         }
     };
     if manifest.payload_format() == CdcBufferPayloadFormat::KafkaRecords {
+        let payload_load_elapsed = payload_load_started_at.elapsed();
+        crate::metrics::observe_cdc_buffer_replay_phase_latency_ms(
+            &plan.name,
+            "payload_load",
+            payload_load_elapsed.as_millis() as u64,
+        );
         log_replication_replay_payload_perf(
             perf_enabled,
             plan,
             manifest,
-            elapsed_or_zero(payload_load_started_at),
+            payload_load_elapsed,
             Duration::ZERO,
             records.len(),
         );
@@ -177,10 +205,4 @@ fn record_object_store_get(
     if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
         crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
     }
-}
-
-fn elapsed_or_zero(started_at: Option<Instant>) -> Duration {
-    started_at
-        .map(|started_at| started_at.elapsed())
-        .unwrap_or(Duration::ZERO)
 }

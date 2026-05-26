@@ -778,6 +778,101 @@ fn update_native_postgres_applied_lsn(
     Ok(())
 }
 
+fn build_tick_commit_for_checkpoint(
+    epoch: u64,
+    frontier: u64,
+    checkpoint_manager: &CheckpointManager,
+    mv_versions: &[MaterializedViewTickVersion],
+    committed_kafka_offsets: &HashMap<(Arc<str>, i32), i64>,
+) -> TickCommit {
+    TickCommit::new(
+        epoch,
+        frontier,
+        checkpoint_manager.snapshot_offsets(),
+        mv_versions.to_vec(),
+        checkpoint_manager.snapshot_sink_cursors(),
+    )
+    .with_kafka_offsets(checkpoint_kafka_offsets(committed_kafka_offsets))
+    .with_operator_states(checkpoint_operator_states())
+}
+
+fn checkpoint_kafka_offsets(
+    committed_kafka_offsets: &HashMap<(Arc<str>, i32), i64>,
+) -> Vec<KafkaCheckpointOffset> {
+    let mut offsets = committed_kafka_offsets
+        .iter()
+        .map(|((topic, partition), offset)| KafkaCheckpointOffset {
+            topic: topic.to_string(),
+            partition: *partition,
+            offset: *offset,
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then(left.partition.cmp(&right.partition))
+    });
+    offsets
+}
+
+fn checkpoint_operator_states() -> Vec<floe_executor::checkpoint::DbspHandleRecord> {
+    dbsp::snapshot_operator_states()
+        .into_iter()
+        .map(|handle| {
+            floe_executor::checkpoint::DbspHandleRecord::operator_state(
+                handle.name,
+                handle.namespace,
+                handle.version,
+            )
+        })
+        .collect()
+}
+
+fn record_postgres_cdc_lsn_progress(
+    committed_postgres_lsns: &mut HashMap<String, (u64, String)>,
+    tick_postgres_lsns: &HashMap<String, (u64, String)>,
+    tick_postgres_sources: &HashMap<String, String>,
+    tick_postgres_table_lsns: &[(String, String, String, u64)],
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+) {
+    advance_postgres_cdc_commit_state(committed_postgres_lsns, tick_postgres_lsns);
+    for (slot, (lsn_value, _)) in tick_postgres_lsns {
+        if let Some(source) = tick_postgres_sources.get(slot) {
+            metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
+            record_postgres_cdc_debug_lsn(
+                cdc_replication_debug,
+                source,
+                slot,
+                None,
+                Some(*lsn_value),
+            );
+        }
+    }
+    for (source, slot, table, lsn_value) in tick_postgres_table_lsns {
+        metrics::record_postgres_cdc_table_applied_lsn(source, slot, table, *lsn_value);
+    }
+}
+
+fn notify_postgres_cdc_commit_senders(
+    epoch: u64,
+    committed_postgres_lsns: &HashMap<String, (u64, String)>,
+    tick_postgres_lsns: &HashMap<String, (u64, String)>,
+    senders: &[watch::Sender<PostgresCdcCommit>],
+) {
+    if tick_postgres_lsns.is_empty() || senders.is_empty() {
+        return;
+    }
+    let postgres_commit_start = Instant::now();
+    let commit = build_postgres_cdc_commit(epoch, committed_postgres_lsns);
+    for sender in senders {
+        let _ = sender.send(commit.clone());
+    }
+    metrics::observe_tick_phase_latency_ms(
+        "postgres_cdc_commit_notify",
+        postgres_commit_start.elapsed().as_millis() as u64,
+    );
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
     init_tracing();
     metrics::init();
@@ -2443,33 +2538,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 }
                 if stateful_transaction.is_none() {
                     if pipeline_records > 0 {
-                        advance_postgres_cdc_commit_state(
+                        record_postgres_cdc_lsn_progress(
                             &mut committed_postgres_lsns,
                             &tick_postgres_lsns,
+                            &tick_postgres_sources,
+                            &tick_postgres_table_lsns,
+                            &cdc_replication_debug_for_task,
                         );
-                        for (slot, (lsn_value, _)) in &tick_postgres_lsns {
-                            if let Some(source) = tick_postgres_sources.get(slot) {
-                                metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
-                                record_postgres_cdc_debug_lsn(
-                                    &cdc_replication_debug_for_task,
-                                    source,
-                                    slot,
-                                    None,
-                                    Some(*lsn_value),
-                                );
-                            }
-                        }
-                        for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {
-                            metrics::record_postgres_cdc_table_applied_lsn(
-                                source, slot, table, *lsn_value,
-                            );
-                        }
-                        if !postgres_cdc_commit_senders_for_task.is_empty() {
-                            let commit = build_postgres_cdc_commit(epoch, &committed_postgres_lsns);
-                            for sender in &postgres_cdc_commit_senders_for_task {
-                                let _ = sender.send(commit.clone());
-                            }
-                        }
+                        notify_postgres_cdc_commit_senders(
+                            epoch,
+                            &committed_postgres_lsns,
+                            &tick_postgres_lsns,
+                            &postgres_cdc_commit_senders_for_task,
+                        );
                         metrics::record_checkpoint_age_seconds(0);
                         last_checkpoint_commit_at = Instant::now();
                     }
@@ -2701,6 +2782,80 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             );
 
             if decoded_rows_len == 0 {
+                // Replication-only CDC tables still need their staged CDC state and LSN feedback
+                // committed even when no DBSP source rows are emitted.
+                if !tick_postgres_lsns.is_empty() || cdc_staged_writes.is_some() {
+                    epoch = pending_epoch;
+                    let mv_versions =
+                        collect_mv_versions_for_commit(&mv_for_task, &mut last_mv_versions);
+                    let frontier = watermark_for_task
+                        .load(Ordering::Relaxed)
+                        .max(0)
+                        .try_into()
+                        .unwrap_or(0_u64);
+                    let tick_commit = build_tick_commit_for_checkpoint(
+                        epoch,
+                        frontier,
+                        &checkpoint_manager,
+                        &mv_versions,
+                        &committed_kafka_offsets,
+                    );
+                    let checkpoint_write_start = Instant::now();
+                    let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
+                        checkpoint_manager
+                            .persist_tick_commit_with_source_batches_and_staged_writes(
+                                tick_commit,
+                                &[],
+                                staged_writes,
+                            )
+                            .await
+                    } else {
+                        checkpoint_manager
+                            .persist_tick_commit_with_source_batches(tick_commit, &[])
+                            .await
+                    };
+                    if let Err(err) = checkpoint_result {
+                        metrics::observe_tick_phase_latency_ms(
+                            "checkpoint_write",
+                            checkpoint_write_start.elapsed().as_millis() as u64,
+                        );
+                        tracing::error!(
+                            epoch,
+                            error = %err,
+                            "failed to persist CDC-only tick commit"
+                        );
+                        record_runtime_failure(
+                            &failure_for_executor,
+                            format!("failed to persist CDC-only tick commit {epoch}: {err}"),
+                        );
+                        executor_cancel.cancel();
+                        break 'executor;
+                    }
+                    metrics::observe_tick_phase_latency_ms(
+                        "checkpoint_write",
+                        checkpoint_write_start.elapsed().as_millis() as u64,
+                    );
+                    record_postgres_cdc_lsn_progress(
+                        &mut committed_postgres_lsns,
+                        &tick_postgres_lsns,
+                        &tick_postgres_sources,
+                        &tick_postgres_table_lsns,
+                        &cdc_replication_debug_for_task,
+                    );
+                    notify_postgres_cdc_commit_senders(
+                        epoch,
+                        &committed_postgres_lsns,
+                        &tick_postgres_lsns,
+                        &postgres_cdc_commit_senders_for_task,
+                    );
+                    for mv_version in &mv_versions {
+                        mv_last_update_at_ms
+                            .insert(mv_version.view.clone(), current_unix_time_ms());
+                    }
+                    metrics::record_last_committed_tick(epoch);
+                    metrics::record_checkpoint_age_seconds(0);
+                    last_checkpoint_commit_at = Instant::now();
+                }
                 continue;
             }
             let mut registry = outer_for_task.lock().await;
@@ -2863,38 +3018,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 &mut next_committed_kafka_offsets,
                 &tick_kafka_offsets,
             );
-            let mut kafka_offsets = next_committed_kafka_offsets
-                .iter()
-                .map(|((topic, partition), offset)| KafkaCheckpointOffset {
-                    topic: topic.to_string(),
-                    partition: *partition,
-                    offset: *offset,
-                })
-                .collect::<Vec<_>>();
-            kafka_offsets.sort_by(|left, right| {
-                left.topic
-                    .cmp(&right.topic)
-                    .then(left.partition.cmp(&right.partition))
-            });
-            let tick_commit = TickCommit::new(
+            let tick_commit = build_tick_commit_for_checkpoint(
                 epoch,
                 frontier,
-                checkpoint_manager.snapshot_offsets(),
-                mv_versions.clone(),
-                checkpoint_manager.snapshot_sink_cursors(),
-            )
-            .with_kafka_offsets(kafka_offsets)
-            .with_operator_states(
-                dbsp::snapshot_operator_states()
-                    .into_iter()
-                    .map(|handle| {
-                        floe_executor::checkpoint::DbspHandleRecord::operator_state(
-                            handle.name,
-                            handle.namespace,
-                            handle.version,
-                        )
-                    })
-                    .collect(),
+                &checkpoint_manager,
+                &mv_versions,
+                &next_committed_kafka_offsets,
             );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
             let source_journal_commit_batches: Vec<_> = source_journal_batches
@@ -2990,22 +3119,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 mv_last_update_at_ms.insert(mv_version.view.clone(), committed_at_ms);
             }
             advance_kafka_offset_commit_state(&mut committed_kafka_offsets, &tick_kafka_offsets);
-            advance_postgres_cdc_commit_state(&mut committed_postgres_lsns, &tick_postgres_lsns);
-            for (slot, (lsn_value, _)) in &tick_postgres_lsns {
-                if let Some(source) = tick_postgres_sources.get(slot) {
-                    metrics::record_postgres_cdc_durable_lsn(source, slot, *lsn_value);
-                    record_postgres_cdc_debug_lsn(
-                        &cdc_replication_debug_for_task,
-                        source,
-                        slot,
-                        None,
-                        Some(*lsn_value),
-                    );
-                }
-            }
-            for (source, slot, table, lsn_value) in &tick_postgres_table_lsns {
-                metrics::record_postgres_cdc_table_applied_lsn(source, slot, table, *lsn_value);
-            }
+            record_postgres_cdc_lsn_progress(
+                &mut committed_postgres_lsns,
+                &tick_postgres_lsns,
+                &tick_postgres_sources,
+                &tick_postgres_table_lsns,
+                &cdc_replication_debug_for_task,
+            );
             record_mv_freshness_metrics(&mv_last_update_at_ms, current_unix_time_ms());
             metrics::record_last_committed_tick(epoch);
             metrics::record_checkpoint_age_seconds(0);
@@ -3050,17 +3170,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     kafka_commit_start.elapsed().as_millis() as u64,
                 );
             }
-            if !tick_postgres_lsns.is_empty() && !postgres_cdc_commit_senders_for_task.is_empty() {
-                let postgres_commit_start = Instant::now();
-                let commit = build_postgres_cdc_commit(epoch, &committed_postgres_lsns);
-                for sender in &postgres_cdc_commit_senders_for_task {
-                    let _ = sender.send(commit.clone());
-                }
-                metrics::observe_tick_phase_latency_ms(
-                    "postgres_cdc_commit_notify",
-                    postgres_commit_start.elapsed().as_millis() as u64,
-                );
-            }
+            notify_postgres_cdc_commit_senders(
+                epoch,
+                &committed_postgres_lsns,
+                &tick_postgres_lsns,
+                &postgres_cdc_commit_senders_for_task,
+            );
             let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
             metrics::observe_tick_latency_ms(tick_latency_ms);
             tracing::debug!(tick_latency_ms, "connector tick completed");

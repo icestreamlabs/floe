@@ -8,7 +8,8 @@ use floe_config::ReplicationConfig as FloeReplicationConfig;
 #[cfg(test)]
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
-    CdcBufferPayloadFormat, CdcBufferStore, ReplicationPipelineCheckpoint, SlateCatalog,
+    CdcBufferPayloadFormat, CdcBufferStore, CdcBufferedTransactionManifest,
+    ReplicationPipelineCheckpoint, SlateCatalog,
 };
 use futures::future::join_all;
 
@@ -245,22 +246,27 @@ impl ReplicationPipelineRuntime {
                     .iter()
                     .any(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
             {
-                let flush_started_at = self.settings.perf_log.then(Instant::now);
+                let flush_started_at = Instant::now();
                 storage
                     .cdc_buffer_store()
                     .flush()
                     .await
                     .context("flush chunked replication buffer appends")?;
+                let flush_elapsed = flush_started_at.elapsed();
                 for plan in plans.iter().filter(|plan| {
                     plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable
                 }) {
                     crate::metrics::inc_cdc_buffer_forced_flush(&plan.name);
+                    crate::metrics::observe_cdc_buffer_flush_latency_ms(
+                        &plan.name,
+                        flush_elapsed.as_millis() as u64,
+                    );
                 }
-                if let Some(started_at) = flush_started_at {
+                if self.settings.perf_log {
                     tracing::info!(
                         source = %source_id.as_str(),
                         chunks = chunk_count,
-                        flush_ms = started_at.elapsed().as_millis() as u64,
+                        flush_ms = flush_elapsed.as_millis() as u64,
                         "postgres cdc chunked replication buffer flush completed"
                     );
                 }
@@ -276,23 +282,28 @@ impl ReplicationPipelineRuntime {
             let written = self
                 .run_transaction_for_plans(plans, schemas, transaction, Some(storage), false)
                 .await?;
-            let flush_started_at = self.settings.perf_log.then(Instant::now);
+            let flush_started_at = Instant::now();
             storage
                 .cdc_buffer_store()
                 .flush()
                 .await
                 .context("flush replication buffer appends")?;
+            let flush_elapsed = flush_started_at.elapsed();
             for plan in plans
                 .iter()
                 .filter(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
             {
                 crate::metrics::inc_cdc_buffer_forced_flush(&plan.name);
+                crate::metrics::observe_cdc_buffer_flush_latency_ms(
+                    &plan.name,
+                    flush_elapsed.as_millis() as u64,
+                );
             }
-            if let Some(started_at) = flush_started_at {
+            if self.settings.perf_log {
                 tracing::info!(
                     source = %source_id.as_str(),
                     records = written,
-                    flush_ms = started_at.elapsed().as_millis() as u64,
+                    flush_ms = flush_elapsed.as_millis() as u64,
                     "postgres cdc replication buffer flush completed"
                 );
             }
@@ -483,7 +494,7 @@ impl ReplicationPipelineRuntime {
                 false
             };
             if has_pending_after_guardrail {
-                let append_started_at = perf_enabled.then(Instant::now);
+                let append_started_at = Instant::now();
                 let manifest = append_buffer_transaction(
                     &buffer_store,
                     &prepared_append.append,
@@ -496,10 +507,8 @@ impl ReplicationPipelineRuntime {
                         plan.name
                     )
                 })?;
-                let append_elapsed = append_started_at
-                    .map(|started_at| started_at.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                log_replication_buffer_append_perf(perf_enabled, plan, &manifest, append_elapsed);
+                let append_elapsed = append_started_at.elapsed();
+                record_replication_buffer_append(perf_enabled, plan, &manifest, append_elapsed);
                 storage
                     .put_replication_pipeline_checkpoint_without_durable_wait(
                         ReplicationPipelineCheckpoint::new(
@@ -640,7 +649,7 @@ impl ReplicationPipelineRuntime {
                         );
                         return Ok(record_count);
                     }
-                    let append_started_at = perf_enabled.then(Instant::now);
+                    let append_started_at = Instant::now();
                     let manifest = append_buffer_transaction(
                         &buffer_store,
                         &prepared_append.append,
@@ -653,15 +662,8 @@ impl ReplicationPipelineRuntime {
                             plan.name
                         )
                     })?;
-                    let append_elapsed = append_started_at
-                        .map(|started_at| started_at.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    log_replication_buffer_append_perf(
-                        perf_enabled,
-                        plan,
-                        &manifest,
-                        append_elapsed,
-                    );
+                    let append_elapsed = append_started_at.elapsed();
+                    record_replication_buffer_append(perf_enabled, plan, &manifest, append_elapsed);
                     self.mark_manifest_delivery_failed(plan, storage, &manifest, err)
                         .await?;
                     record_buffer_stats(&buffer_store, &plan.name).await?;
@@ -845,6 +847,21 @@ fn current_unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn record_replication_buffer_append(
+    perf_enabled: bool,
+    plan: &ReplicationPipelineRuntimePlan,
+    manifest: &CdcBufferedTransactionManifest,
+    append_elapsed: Duration,
+) {
+    crate::metrics::record_cdc_buffer_append(
+        &plan.name,
+        manifest.record_count(),
+        manifest.payload_bytes(),
+        append_elapsed.as_millis() as u64,
+    );
+    log_replication_buffer_append_perf(perf_enabled, plan, manifest, append_elapsed);
 }
 
 mod buffer;
