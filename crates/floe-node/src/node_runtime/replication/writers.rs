@@ -622,14 +622,35 @@ impl PostgresReplicationPipelineWriter {
                 );
             }
         });
-        self.validate_target_compatibility(&client).await?;
+        let target_info = self.validate_target_compatibility(&client).await?;
+        let dynamic_insert_sql = postgres_upsert_sql_with_target(
+            &self.schema,
+            &self.target_table_name,
+            Some(&target_info),
+        )?;
+        let dynamic_delete_sql = postgres_delete_sql_with_target(
+            &self.schema,
+            &self.target_table_name,
+            Some(&target_info),
+        )?;
+        let insert_sql = if dynamic_insert_sql == self.insert_sql {
+            self.insert_sql.as_str()
+        } else {
+            dynamic_insert_sql.as_str()
+        };
+        let delete_sql = if dynamic_delete_sql == self.delete_sql {
+            self.delete_sql.as_str()
+        } else {
+            dynamic_delete_sql.as_str()
+        };
 
         let transaction = client
             .transaction()
             .await
             .context("start replication pipeline Postgres target transaction")?;
         for record in records {
-            self.apply_record(&transaction, record).await?;
+            self.apply_record(&transaction, record, &insert_sql, &delete_sql)
+                .await?;
         }
         transaction
             .commit()
@@ -642,6 +663,8 @@ impl PostgresReplicationPipelineWriter {
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
         record: &CdcBufferRecord,
+        insert_sql: &str,
+        delete_sql: &str,
     ) -> anyhow::Result<()> {
         let value = parse_floe_json_record_value(record)?;
         let deleted = value
@@ -656,7 +679,7 @@ impl PostgresReplicationPipelineWriter {
                 .map(PostgresParamValue::as_tosql)
                 .collect::<Vec<_>>();
             transaction
-                .execute(&self.delete_sql, &refs)
+                .execute(delete_sql, &refs)
                 .await
                 .with_context(|| {
                     format!(
@@ -673,7 +696,7 @@ impl PostgresReplicationPipelineWriter {
             .map(PostgresParamValue::as_tosql)
             .collect::<Vec<_>>();
         transaction
-            .execute(&self.insert_sql, &refs)
+            .execute(insert_sql, &refs)
             .await
             .with_context(|| {
                 format!(
@@ -695,13 +718,14 @@ impl PostgresReplicationPipelineWriter {
     async fn validate_target_compatibility(
         &self,
         client: &tokio_postgres::Client,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PostgresTargetTableInfo> {
         let target_info = load_postgres_target_table_info(client, &self.target_table_name).await?;
         validate_postgres_target_table_compatibility(
             &self.schema,
             &self.target_table_name,
             &target_info,
-        )
+        )?;
+        Ok(target_info)
     }
 }
 
@@ -747,6 +771,12 @@ impl PostgresTargetTableInfo {
             columns,
             unique_indexes,
         }
+    }
+
+    fn column(&self, name: &str) -> Option<&PostgresTargetColumnInfo> {
+        self.columns
+            .iter()
+            .find(|target_column| target_column.name == name)
     }
 }
 
@@ -837,11 +867,7 @@ pub(super) fn validate_postgres_target_table_compatibility(
     let mut seen_cdc_columns = HashSet::new();
     for column in schema.columns() {
         seen_cdc_columns.insert(column.name());
-        let Some(target_column) = target
-            .columns
-            .iter()
-            .find(|target_column| target_column.name == column.name())
-        else {
+        let Some(target_column) = target.column(column.name()) else {
             return Err(anyhow!(
                 "replication pipeline Postgres target table '{table}' is missing CDC column '{}'; add the column or point the pipeline at a migrated table before resuming",
                 column.name()
@@ -885,15 +911,22 @@ pub(super) fn validate_postgres_target_table_compatibility(
 }
 
 fn postgres_type_is_compatible(data_type: &ColumnType, postgres_type: &str) -> bool {
-    let postgres_type = postgres_type
-        .trim_start_matches("pg_catalog.")
-        .to_ascii_lowercase();
+    let postgres_type = normalized_postgres_type(postgres_type);
     match data_type {
         ColumnType::Int64 => matches!(postgres_type.as_str(), "bigint" | "integer" | "smallint"),
         ColumnType::Bool => matches!(postgres_type.as_str(), "boolean"),
         ColumnType::Utf8 => matches!(
             postgres_type.as_str(),
-            "text" | "character varying" | "character" | "varchar" | "bpchar" | "name"
+            "text"
+                | "character varying"
+                | "character"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "bytea"
         ),
         ColumnType::TimestampMillis => matches!(
             postgres_type.as_str(),
@@ -907,6 +940,12 @@ fn postgres_type_is_compatible(data_type: &ColumnType, postgres_type: &str) -> b
             matches!(postgres_type.as_str(), "numeric" | "decimal")
         }
     }
+}
+
+fn normalized_postgres_type(postgres_type: &str) -> String {
+    postgres_type
+        .trim_start_matches("pg_catalog.")
+        .to_ascii_lowercase()
 }
 
 fn is_kafka_queue_full(err: &KafkaError) -> bool {
@@ -1080,6 +1119,14 @@ fn json_scalar_string(column: &str, value: &serde_json::Value) -> anyhow::Result
 }
 
 fn postgres_upsert_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<String> {
+    postgres_upsert_sql_with_target(schema, table, None)
+}
+
+pub(super) fn postgres_upsert_sql_with_target(
+    schema: &CdcTableSchema,
+    table: &str,
+    target: Option<&PostgresTargetTableInfo>,
+) -> anyhow::Result<String> {
     let table = quote_postgres_qualified_name(table)?;
     let columns = schema
         .columns()
@@ -1090,7 +1137,13 @@ fn postgres_upsert_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<S
         .columns()
         .iter()
         .enumerate()
-        .map(|(idx, column)| postgres_value_expr(idx + 1, column.data_type()))
+        .map(|(idx, column)| {
+            postgres_value_expr(
+                idx + 1,
+                column.data_type(),
+                target.and_then(|target| target.column(column.name())),
+            )
+        })
         .collect::<Vec<_>>();
     let primary_keys = schema
         .primary_key()
@@ -1127,6 +1180,14 @@ fn postgres_upsert_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<S
 }
 
 fn postgres_delete_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<String> {
+    postgres_delete_sql_with_target(schema, table, None)
+}
+
+pub(super) fn postgres_delete_sql_with_target(
+    schema: &CdcTableSchema,
+    table: &str,
+    target: Option<&PostgresTargetTableInfo>,
+) -> anyhow::Result<String> {
     let table = quote_postgres_qualified_name(table)?;
     let predicates = schema
         .primary_key()
@@ -1144,7 +1205,11 @@ fn postgres_delete_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<S
             Ok(format!(
                 "{} = {}",
                 quote_postgres_ident(column.name()),
-                postgres_value_expr(idx + 1, column.data_type())
+                postgres_value_expr(
+                    idx + 1,
+                    column.data_type(),
+                    target.and_then(|target| target.column(column.name())),
+                )
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1154,7 +1219,11 @@ fn postgres_delete_sql(schema: &CdcTableSchema, table: &str) -> anyhow::Result<S
     ))
 }
 
-fn postgres_value_expr(param_idx: usize, data_type: &ColumnType) -> String {
+fn postgres_value_expr(
+    param_idx: usize,
+    data_type: &ColumnType,
+    target_column: Option<&PostgresTargetColumnInfo>,
+) -> String {
     match data_type {
         ColumnType::TimestampMillis => {
             format!("to_timestamp(${param_idx}::double precision / 1000.0)")
@@ -1163,7 +1232,17 @@ fn postgres_value_expr(param_idx: usize, data_type: &ColumnType) -> String {
         ColumnType::Decimal128 { .. } | ColumnType::Numeric => {
             format!("${param_idx}::numeric")
         }
-        ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => format!("${param_idx}"),
+        ColumnType::Utf8 => match target_column
+            .map(|column| normalized_postgres_type(&column.postgres_type))
+            .as_deref()
+        {
+            Some("uuid") => format!("${param_idx}::uuid"),
+            Some("json") => format!("${param_idx}::json"),
+            Some("jsonb") => format!("${param_idx}::jsonb"),
+            Some("bytea") => format!("${param_idx}::bytea"),
+            _ => format!("${param_idx}"),
+        },
+        ColumnType::Int64 | ColumnType::Bool => format!("${param_idx}"),
     }
 }
 

@@ -8,8 +8,8 @@ use super::target_state::{
 use super::writers::{
     PostgresParamValue, PostgresReplicationPipelineWriter, PostgresTargetColumnInfo,
     PostgresTargetTableInfo, parse_floe_json_record_key, parse_floe_json_record_value,
-    postgres_key_params_from_json, postgres_row_params_from_json,
-    validate_postgres_target_table_compatibility,
+    postgres_delete_sql_with_target, postgres_key_params_from_json, postgres_row_params_from_json,
+    postgres_upsert_sql_with_target, validate_postgres_target_table_compatibility,
 };
 use super::*;
 use floe_cdc_core::{
@@ -296,6 +296,99 @@ fn pipeline_floe_json_records_encode_compact_row_messages() {
 }
 
 #[test]
+fn kafka_json_encoders_cover_string_backed_postgres_types_and_timestamps() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let schema = CdcTableSchema::new(
+        table_id.clone(),
+        UpstreamTableRef::new("public", "orders").unwrap(),
+        vec![
+            CdcColumn::new("id", ColumnType::Utf8, false).unwrap(),
+            CdcColumn::new("payload", ColumnType::Utf8, true).unwrap(),
+            CdcColumn::new("blob", ColumnType::Utf8, true).unwrap(),
+            CdcColumn::new("updated_at", ColumnType::TimestampMillis, true).unwrap(),
+        ],
+        CdcPrimaryKey::new(["id"]).unwrap(),
+    )
+    .unwrap();
+    let batch = ChangeBatch::new(
+        table_id.clone(),
+        vec![CdcChange::Insert {
+            row: CdcRow::new([
+                Some(RowValue::Utf8(
+                    "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                )),
+                Some(RowValue::Utf8(r#"{"state":"paid"}"#.to_string())),
+                Some(RowValue::Utf8(r#"\xdeadbeef"#.to_string())),
+                Some(RowValue::TimestampMillis(1_704_165_845_678)),
+            ])
+            .unwrap(),
+        }],
+    )
+    .unwrap();
+    let transaction = TransactionBatch::new(
+        CdcSourceId::new("pg_main").unwrap(),
+        Some(CdcTransactionId::new("pg-xid-91").unwrap()),
+        None,
+        floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+        vec![batch.clone()],
+    )
+    .unwrap();
+    let mut plan = ReplicationPipelineRuntimePlan {
+        name: "orders_pipe".to_string(),
+        source_name: "pg_main".to_string(),
+        database_name: "postgres".to_string(),
+        upstream_table: "public.orders".to_string(),
+        table_id: table_id.clone(),
+        schema: schema.clone(),
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
+        target: ReplicationPipelineRuntimeTarget::Kafka {
+            brokers: "localhost:9092".to_string(),
+            topic: "orders".to_string(),
+        },
+        format: ReplicationPipelineRuntimeFormat::FloeJson,
+        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
+        buffer_policy: CatalogReplicationBufferPolicy::default(),
+        error_policy: CatalogReplicationErrorPolicy::default(),
+        emit_tombstones: false,
+        include_transaction_metadata: false,
+    };
+
+    let floe_records =
+        encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction).unwrap();
+    let floe_key = kafka_record_key_json(&floe_records[0]);
+    let floe_value = kafka_record_value_json(&floe_records[0]).unwrap();
+    assert_eq!(
+        floe_key,
+        serde_json::json!({"id": "550e8400-e29b-41d4-a716-446655440000"})
+    );
+    assert_eq!(floe_value["payload"], r#"{"state":"paid"}"#);
+    assert_eq!(floe_value["blob"], r#"\xdeadbeef"#);
+    assert_eq!(floe_value["updated_at"], 1_704_165_845_678_i64);
+
+    plan.format = ReplicationPipelineRuntimeFormat::DebeziumJson;
+    let debezium_records =
+        encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction).unwrap();
+    let debezium_value = kafka_record_value_json(&debezium_records[0]).unwrap();
+    assert_eq!(
+        debezium_value["payload"]["after"]["id"],
+        "550e8400-e29b-41d4-a716-446655440000"
+    );
+    assert_eq!(
+        debezium_value["payload"]["after"]["payload"],
+        r#"{"state":"paid"}"#
+    );
+    assert_eq!(debezium_value["payload"]["after"]["blob"], r#"\xdeadbeef"#);
+    assert_eq!(
+        debezium_value["payload"]["after"]["updated_at"],
+        1_704_165_845_678_i64
+    );
+    assert_eq!(
+        debezium_value["schema"]["fields"][1]["fields"][3]["name"],
+        "io.debezium.time.Timestamp"
+    );
+}
+
+#[test]
 fn postgres_target_writer_builds_upsert_and_delete_sql() {
     let schema = CdcTableSchema::new(
         CdcTableId::new("orders").unwrap(),
@@ -475,6 +568,42 @@ fn postgres_target_compatibility_rejects_incompatible_required_columns() {
     )
     .expect_err("nullable source into not-null target should fail");
     assert!(format!("{err:#}").contains("CDC schema allows NULL"));
+}
+
+#[test]
+fn postgres_target_sql_casts_string_backed_native_types() {
+    let schema = CdcTableSchema::new(
+        CdcTableId::new("orders").unwrap(),
+        UpstreamTableRef::new("public", "orders").unwrap(),
+        vec![
+            CdcColumn::new("id", ColumnType::Utf8, false).unwrap(),
+            CdcColumn::new("payload", ColumnType::Utf8, true).unwrap(),
+            CdcColumn::new("blob", ColumnType::Utf8, true).unwrap(),
+        ],
+        CdcPrimaryKey::new(["id"]).unwrap(),
+    )
+    .unwrap();
+    let target = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "uuid", true, false, false),
+            PostgresTargetColumnInfo::new("payload", "jsonb", false, false, false),
+            PostgresTargetColumnInfo::new("blob", "bytea", false, false, false),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+
+    validate_postgres_target_table_compatibility(&schema, "public.orders_copy", &target)
+        .expect("string-backed native target types should be compatible");
+    assert_eq!(
+        postgres_upsert_sql_with_target(&schema, "public.orders_copy", Some(&target))
+            .expect("upsert sql"),
+        "INSERT INTO \"public\".\"orders_copy\" (\"id\", \"payload\", \"blob\") VALUES ($1::uuid, $2::jsonb, $3::bytea) ON CONFLICT (\"id\") DO UPDATE SET \"payload\" = EXCLUDED.\"payload\", \"blob\" = EXCLUDED.\"blob\""
+    );
+    assert_eq!(
+        postgres_delete_sql_with_target(&schema, "public.orders_copy", Some(&target))
+            .expect("delete sql"),
+        "DELETE FROM \"public\".\"orders_copy\" WHERE \"id\" = $1::uuid"
+    );
 }
 
 #[test]

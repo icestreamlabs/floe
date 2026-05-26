@@ -2110,6 +2110,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "dbsp-storage",
  "floe-cdc",
  "floe-cdc-core",

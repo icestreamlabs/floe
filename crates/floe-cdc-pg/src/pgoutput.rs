@@ -3,6 +3,7 @@ use std::str;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
+use chrono::{DateTime, NaiveDateTime};
 use floe_cdc_core::{
     CdcChange, CdcColumn, CdcPrimaryKey, CdcRow, CdcRowKey, CdcTableId, CdcTableSchema,
     UpstreamTableRef,
@@ -17,10 +18,16 @@ const PG_INT2_OID: u32 = 21;
 const PG_INT4_OID: u32 = 23;
 const PG_INT8_OID: u32 = 20;
 const PG_TEXT_OID: u32 = 25;
+const PG_BYTEA_OID: u32 = 17;
 const PG_BPCHAR_OID: u32 = 1042;
 const PG_VARCHAR_OID: u32 = 1043;
 const PG_DATE_OID: u32 = 1082;
+const PG_TIMESTAMP_OID: u32 = 1114;
+const PG_TIMESTAMPTZ_OID: u32 = 1184;
 const PG_NUMERIC_OID: u32 = 1700;
+const PG_UUID_OID: u32 = 2950;
+const PG_JSON_OID: u32 = 114;
+const PG_JSONB_OID: u32 = 3802;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PostgresRelationId(u32);
@@ -621,8 +628,10 @@ fn column_type_for_oid(type_oid: u32, type_modifier: i32) -> Result<ColumnType> 
     match type_oid {
         PG_BOOL_OID => Ok(ColumnType::Bool),
         PG_INT2_OID | PG_INT4_OID | PG_INT8_OID => Ok(ColumnType::Int64),
-        PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(ColumnType::Utf8),
+        PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID | PG_UUID_OID | PG_JSON_OID | PG_JSONB_OID
+        | PG_BYTEA_OID => Ok(ColumnType::Utf8),
         PG_DATE_OID => Ok(ColumnType::DateDays),
+        PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => Ok(ColumnType::TimestampMillis),
         PG_NUMERIC_OID => {
             numeric_type_from_typmod(type_modifier).unwrap_or(Ok(ColumnType::Numeric))
         }
@@ -672,8 +681,11 @@ fn parse_text_row_value(column: &PgOutputColumn, value: &str) -> Result<RowValue
                 )
             })
         }
-        PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID => Ok(RowValue::Utf8(value.to_string())),
+        PG_TEXT_OID | PG_BPCHAR_OID | PG_VARCHAR_OID | PG_UUID_OID | PG_JSON_OID | PG_JSONB_OID
+        | PG_BYTEA_OID => Ok(RowValue::Utf8(value.to_string())),
         PG_DATE_OID => parse_pg_date_days(value).map(RowValue::DateDays),
+        PG_TIMESTAMP_OID => parse_pg_timestamp_millis(value).map(RowValue::TimestampMillis),
+        PG_TIMESTAMPTZ_OID => parse_pg_timestamptz_millis(value).map(RowValue::TimestampMillis),
         PG_NUMERIC_OID => match numeric_type_from_typmod(column.type_modifier()) {
             Some(Ok(ColumnType::Decimal128 { scale, .. })) => {
                 parse_decimal_text_to_i128(value, scale).map(RowValue::Decimal128)
@@ -750,6 +762,44 @@ fn parse_pg_date_days(value: &str) -> Result<i32> {
         "invalid Postgres date value '{value}'"
     );
     Ok(days_from_civil(year, month, day))
+}
+
+fn parse_pg_timestamp_millis(value: &str) -> Result<i64> {
+    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .with_context(|| format!("decode Postgres timestamp value '{value}'"))?;
+    Ok(parsed.and_utc().timestamp_millis())
+}
+
+fn parse_pg_timestamptz_millis(value: &str) -> Result<i64> {
+    if let Some(normalized) = normalize_pg_short_timezone_offset(value)
+        && let Ok(parsed) = DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%:z")
+    {
+        return Ok(parsed.timestamp_millis());
+    }
+    for pattern in [
+        "%Y-%m-%d %H:%M:%S%.f%:z",
+        "%Y-%m-%d %H:%M:%S%.f%z",
+        "%Y-%m-%d %H:%M:%S%.f %:z",
+        "%Y-%m-%d %H:%M:%S%.f %z",
+    ] {
+        if let Ok(parsed) = DateTime::parse_from_str(value, pattern) {
+            return Ok(parsed.timestamp_millis());
+        }
+    }
+    bail!("decode Postgres timestamptz value '{value}'")
+}
+
+fn normalize_pg_short_timezone_offset(value: &str) -> Option<String> {
+    let (idx, sign) = value
+        .char_indices()
+        .skip("YYYY-MM-DD".len())
+        .find(|(_, ch)| *ch == '+' || *ch == '-')?;
+    let suffix = &value[idx + sign.len_utf8()..];
+    if suffix.len() == 2 && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(format!("{}{}{}:00", &value[..idx], sign, suffix))
+    } else {
+        None
+    }
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
@@ -872,6 +922,7 @@ mod tests {
     const PG_JSON_TEST_OID: u32 = 114;
     const PG_JSONB_TEST_OID: u32 = 3802;
     const PG_UUID_TEST_OID: u32 = 2950;
+    const PG_BYTEA_TEST_OID: u32 = 17;
 
     fn relation_message() -> Bytes {
         orders_relation_message()
@@ -1074,6 +1125,22 @@ mod tests {
                 expected_value: RowValue::DateDays(1),
             },
             SupportedTypeCase {
+                name: "timestamp",
+                type_oid: PG_TIMESTAMP_TEST_OID,
+                type_modifier: -1,
+                sample: "2024-01-02 03:04:05.678",
+                expected_type: ColumnType::TimestampMillis,
+                expected_value: RowValue::TimestampMillis(1_704_164_645_678),
+            },
+            SupportedTypeCase {
+                name: "timestamptz",
+                type_oid: PG_TIMESTAMPTZ_TEST_OID,
+                type_modifier: -1,
+                sample: "2024-01-02 03:04:05.678+00",
+                expected_type: ColumnType::TimestampMillis,
+                expected_value: RowValue::TimestampMillis(1_704_164_645_678),
+            },
+            SupportedTypeCase {
                 name: "numeric",
                 type_oid: PG_NUMERIC_OID,
                 type_modifier: -1,
@@ -1091,6 +1158,38 @@ mod tests {
                     scale: 2,
                 },
                 expected_value: RowValue::Decimal128(12_345),
+            },
+            SupportedTypeCase {
+                name: "uuid",
+                type_oid: PG_UUID_TEST_OID,
+                type_modifier: -1,
+                sample: "550e8400-e29b-41d4-a716-446655440000",
+                expected_type: ColumnType::Utf8,
+                expected_value: RowValue::Utf8("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            },
+            SupportedTypeCase {
+                name: "json",
+                type_oid: PG_JSON_TEST_OID,
+                type_modifier: -1,
+                sample: r#"{"state":"paid"}"#,
+                expected_type: ColumnType::Utf8,
+                expected_value: RowValue::Utf8(r#"{"state":"paid"}"#.to_string()),
+            },
+            SupportedTypeCase {
+                name: "jsonb",
+                type_oid: PG_JSONB_TEST_OID,
+                type_modifier: -1,
+                sample: r#"{"state": "paid"}"#,
+                expected_type: ColumnType::Utf8,
+                expected_value: RowValue::Utf8(r#"{"state": "paid"}"#.to_string()),
+            },
+            SupportedTypeCase {
+                name: "bytea",
+                type_oid: PG_BYTEA_TEST_OID,
+                type_modifier: -1,
+                sample: r#"\xdeadbeef"#,
+                expected_type: ColumnType::Utf8,
+                expected_value: RowValue::Utf8(r#"\xdeadbeef"#.to_string()),
             },
         ] {
             let column = PgOutputColumn {
@@ -1112,11 +1211,6 @@ mod tests {
         for (name, type_oid) in [
             ("float4", PG_FLOAT4_TEST_OID),
             ("float8", PG_FLOAT8_TEST_OID),
-            ("timestamp", PG_TIMESTAMP_TEST_OID),
-            ("timestamptz", PG_TIMESTAMPTZ_TEST_OID),
-            ("json", PG_JSON_TEST_OID),
-            ("jsonb", PG_JSONB_TEST_OID),
-            ("uuid", PG_UUID_TEST_OID),
         ] {
             let err = column_type_for_oid(type_oid, -1).expect_err(name);
             assert!(

@@ -1804,7 +1804,9 @@ fn postgres_column_type(
     match udt_name.as_str() {
         "int8" | "int4" | "int2" => Ok(ColumnType::Int64),
         "bool" => Ok(ColumnType::Bool),
-        "text" | "varchar" | "bpchar" | "name" => Ok(ColumnType::Utf8),
+        "text" | "varchar" | "bpchar" | "name" | "uuid" | "json" | "jsonb" | "bytea" => {
+            Ok(ColumnType::Utf8)
+        }
         "timestamp" | "timestamptz" => Ok(ColumnType::TimestampMillis),
         "date" => Ok(ColumnType::DateDays),
         "numeric" => decimal128_type_from_precision_scale(numeric_precision, numeric_scale)
@@ -1836,7 +1838,10 @@ fn postgres_type_compatible(
     match expected {
         ColumnType::Int64 => matches!(udt_name.as_str(), "int8" | "int4" | "int2"),
         ColumnType::Bool => udt_name == "bool",
-        ColumnType::Utf8 => matches!(udt_name.as_str(), "text" | "varchar" | "bpchar" | "name"),
+        ColumnType::Utf8 => matches!(
+            udt_name.as_str(),
+            "text" | "varchar" | "bpchar" | "name" | "uuid" | "json" | "jsonb" | "bytea"
+        ),
         ColumnType::TimestampMillis => {
             matches!(udt_name.as_str(), "timestamp" | "timestamptz")
                 || matches!(
@@ -2183,7 +2188,8 @@ fn snapshot_select_expr(column: &CdcColumn) -> String {
         ColumnType::DateDays => format!("({quoted} - DATE '1970-01-01')::int AS {quoted}"),
         ColumnType::Decimal128 { .. } => format!("{quoted}::text AS {quoted}"),
         ColumnType::Numeric => format!("{quoted}::text AS {quoted}"),
-        ColumnType::Int64 | ColumnType::Bool | ColumnType::Utf8 => quoted,
+        ColumnType::Utf8 => format!("{quoted}::text AS {quoted}"),
+        ColumnType::Int64 | ColumnType::Bool => quoted,
     }
 }
 
@@ -2557,6 +2563,18 @@ mod tests {
             ColumnType::Utf8
         );
         assert_eq!(
+            postgres_column_type("uuid", "uuid", None, None)?,
+            ColumnType::Utf8
+        );
+        assert_eq!(
+            postgres_column_type("jsonb", "jsonb", None, None)?,
+            ColumnType::Utf8
+        );
+        assert_eq!(
+            postgres_column_type("bytea", "bytea", None, None)?,
+            ColumnType::Utf8
+        );
+        assert_eq!(
             postgres_column_type("date", "date", None, None)?,
             ColumnType::DateDays
         );
@@ -2628,11 +2646,11 @@ mod tests {
         );
         assert_eq!(
             snapshot_table_query(&snapshot_test_schema(), &chunks[0]),
-            r#"SELECT "id", "status" FROM "public"."orders" WHERE "id" >= 1 AND "id" < 5"#
+            r#"SELECT "id", "status"::text AS "status" FROM "public"."orders" WHERE "id" >= 1 AND "id" < 5"#
         );
         assert_eq!(
             snapshot_table_query(&snapshot_test_schema(), &chunks[2]),
-            r#"SELECT "id", "status" FROM "public"."orders" WHERE "id" >= 9"#
+            r#"SELECT "id", "status"::text AS "status" FROM "public"."orders" WHERE "id" >= 9"#
         );
     }
 

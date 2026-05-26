@@ -159,13 +159,31 @@ Current requirements and limitations:
   - Postgres replication targets are checked for required columns, compatible
     types/nullability, extra required target columns, and a unique index matching
     the CDC primary key before rows are applied.
-- Common scalar types are covered, but broader Postgres fidelity such as UUID,
-  JSONB, arrays, bytea, enums/domains, intervals, and range types is still being
-  expanded.
+- Common scalar types are covered; arrays, enums/domains, intervals, and range
+  types remain deferred.
 - Source/target HA failover, reconciliation/drift checks, stable operator CLI
   UX, and larger published performance baselines are follow-up product work.
 - Arrow IPC Kafka output is internal/experimental and should not be used for
   public apples-to-apples format claims without calling that out.
+
+Postgres CDC type compatibility:
+
+| Postgres type family | Floe CDC representation | Source decode | Kafka JSON | Postgres target |
+| --- | --- | --- | --- | --- |
+| `bool` | `Bool` | supported | boolean | supported |
+| `int2`, `int4`, `int8` | `Int64` | supported | number | supported |
+| `text`, `varchar`, `bpchar`, `name` | `Utf8` | supported | string | supported |
+| `uuid` | `Utf8` canonical string | supported | string | supported with `uuid` target cast |
+| `json`, `jsonb` | `Utf8` JSON text | supported | string | supported with `json`/`jsonb` target cast |
+| `bytea` | `Utf8` Postgres bytea text (`\\x...`) | supported | string | supported with `bytea` target cast |
+| `date` | `DateDays` | supported | days since epoch | supported |
+| `timestamp`, `timestamptz` | `TimestampMillis` | supported | epoch milliseconds | supported |
+| `numeric(p,s)` with `p <= 38` | `Decimal128` | supported | decimal string | supported |
+| unconstrained `numeric` / larger precision | `Numeric` string | supported | string | supported |
+| `float4`, `float8` | none | rejected | n/a | n/a |
+| arrays, ranges, multiranges | none | rejected/deferred | n/a | n/a |
+| enums/domains | none | rejected/deferred | n/a | n/a |
+| `time`, `timetz`, `interval` | none | rejected/deferred | n/a | n/a |
 
 Useful validation entry points:
 
