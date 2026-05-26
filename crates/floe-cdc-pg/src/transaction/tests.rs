@@ -19,8 +19,9 @@ use std::time::Duration;
 use crate::pgoutput_test_messages::{
     TEST_PG_INT8_OID as PG_INT8_OID, TEST_PG_TEXT_OID as PG_TEXT_OID,
     id_status_relation_message as relation_message, insert_id_status_message as insert_message,
-    insert_text_message as insert_message_with_values,
-    relation_message_with_column_specs as relation_message_with_columns, truncate_message,
+    insert_text_message as insert_message_with_values, put_null_value, put_text_value, put_u8,
+    put_u16, put_u32, relation_message_with_column_specs as relation_message_with_columns,
+    truncate_message,
 };
 use crate::{
     PgOutputMessage, PostgresCdcConfig, PostgresLsn, PostgresReplicationEvent,
@@ -53,6 +54,45 @@ fn commit(end_lsn: u64) -> PostgresReplicationEvent {
         end_lsn: PostgresLsn::from_u64(end_lsn),
         commit_time_micros: 102,
     }
+}
+
+fn text_tuple(values: impl IntoIterator<Item = Option<String>>) -> Vec<u8> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    put_u16(&mut out, values.len() as u16);
+    for value in values {
+        match value {
+            Some(value) => put_text_value(&mut out, &value),
+            None => put_null_value(&mut out),
+        }
+    }
+    out
+}
+
+fn update_key_message(relation_id: u32, old_id: i64, new_id: i64, status: &str) -> Bytes {
+    let mut out = Vec::new();
+    put_u8(&mut out, b'U');
+    put_u32(&mut out, relation_id);
+    put_u8(&mut out, b'K');
+    out.extend_from_slice(&text_tuple([Some(old_id.to_string()), None]));
+    put_u8(&mut out, b'N');
+    out.extend_from_slice(&text_tuple([
+        Some(new_id.to_string()),
+        Some(status.to_string()),
+    ]));
+    Bytes::from(out)
+}
+
+fn id_status_key(id: i64) -> CdcRowKey {
+    CdcRowKey::new([RowValue::Int64(id)]).expect("row key")
+}
+
+fn id_status_row(id: i64, status: &str) -> CdcRow {
+    CdcRow::new([
+        Some(RowValue::Int64(id)),
+        Some(RowValue::Utf8(status.to_string())),
+    ])
+    .expect("row")
 }
 
 fn router() -> PostgresTableRouter {
@@ -436,6 +476,59 @@ fn groups_multiple_tables_in_one_source_transaction() {
 }
 
 #[test]
+fn preserves_multi_row_order_within_one_source_transaction() {
+    let mut assembler =
+        PostgresTransactionAssembler::new(CdcSourceId::new("pg_main").expect("source"), router());
+
+    assembler
+        .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+        .expect("relation");
+    assembler.accept_event(begin(64)).expect("begin");
+    assembler
+        .accept_event(xlog(insert_message(RELATION_ID, 1, "first")))
+        .expect("first insert");
+    assembler
+        .accept_event(xlog(insert_message(RELATION_ID, 2, "second")))
+        .expect("second insert");
+    assembler
+        .accept_event(xlog(update_key_message(RELATION_ID, 1, 3, "third")))
+        .expect("primary-key update");
+
+    let transaction = assembler
+        .accept_event(commit(43))
+        .expect("commit")
+        .expect("transaction");
+
+    assert_eq!(transaction.change_batches().len(), 1);
+    let observed = transaction.change_batches()[0]
+        .changes()
+        .iter()
+        .map(|change| match change {
+            CdcChange::Insert { row } => {
+                let id = row.values()[0].as_ref().expect("id");
+                let status = row.values()[1].as_ref().expect("status");
+                format!("insert:{id:?}:{status:?}")
+            }
+            CdcChange::Update { key, after, .. } => {
+                let key = key.as_ref().expect("key").values()[0].clone();
+                let id = after.values()[0].as_ref().expect("id");
+                let status = after.values()[1].as_ref().expect("status");
+                format!("update:{key:?}->{id:?}:{status:?}")
+            }
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            "insert:Int64(1):Utf8(\"first\")",
+            "insert:Int64(2):Utf8(\"second\")",
+            "update:Int64(1)->Int64(3):Utf8(\"third\")",
+        ]
+    );
+}
+
+#[test]
 fn groups_multi_relation_truncate_in_one_source_transaction() {
     let mut router = router();
     router.insert(
@@ -569,6 +662,66 @@ async fn applier_returns_feedback_lsn_only_after_table_apply() {
         Some(PostgresLsn::from_u64(60))
     );
     assert_eq!(lag.table_lags()[0].table_lag_bytes(), Some(0));
+}
+
+#[tokio::test]
+async fn applier_moves_primary_key_updates_between_keys() {
+    let source_id = CdcSourceId::new("pg_main").expect("source id");
+    let table_store = test_store("pg-cdc-applier-primary-key-update").await;
+    let mut applier =
+        PostgresCdcEventApplier::new(source_id.clone(), table_store.clone(), orders_schemas());
+
+    applier
+        .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+        .await
+        .expect("relation");
+    applier.accept_event(begin(65)).await.expect("begin insert");
+    applier
+        .accept_event(xlog(insert_message(RELATION_ID, 1, "open")))
+        .await
+        .expect("insert");
+    applier
+        .accept_event(commit(100))
+        .await
+        .expect("commit insert");
+
+    applier.accept_event(begin(66)).await.expect("begin update");
+    applier
+        .accept_event(xlog(update_key_message(RELATION_ID, 1, 2, "paid")))
+        .await
+        .expect("primary-key update");
+    let outcome = applier
+        .accept_event(commit(120))
+        .await
+        .expect("commit update");
+
+    assert_eq!(
+        table_store
+            .load_row(
+                &CdcTableId::new("orders").expect("table id"),
+                &id_status_key(1)
+            )
+            .await
+            .expect("load old key"),
+        None
+    );
+    assert_eq!(
+        table_store
+            .load_row(
+                &CdcTableId::new("orders").expect("table id"),
+                &id_status_key(2)
+            )
+            .await
+            .expect("load new key"),
+        Some(id_status_row(2, "paid"))
+    );
+    let deltas = outcome.apply_result().expect("apply result").table_deltas()[0].deltas();
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas[0].diff(), -1);
+    assert_eq!(deltas[0].row(), &id_status_row(1, "open"));
+    assert_eq!(deltas[1].diff(), 1);
+    assert_eq!(deltas[1].row(), &id_status_row(2, "paid"));
+    assert_eq!(outcome.feedback_lsn(), Some(PostgresLsn::from_u64(120)));
 }
 
 #[tokio::test]

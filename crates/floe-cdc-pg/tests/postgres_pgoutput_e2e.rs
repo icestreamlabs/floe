@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,156 @@ use object_store::memory::InMemory;
 use slatedb::Db;
 use tokio::time::{Instant, timeout};
 use tokio_postgres::NoTls;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+enum ConformanceArea {
+    SnapshotHandoff,
+    MultiTransactionOrdering,
+    MultiRowTransactionOrder,
+    RestartCheckpointProgression,
+    ToastUnchangedValues,
+    DeleteUpdatePrimaryKey,
+    ReplicaIdentity,
+    CoreTypeMapping,
+    DebeziumEnvelope,
+    UnsupportedCases,
+}
+
+struct ConformanceCase {
+    id: &'static str,
+    areas: &'static [ConformanceArea],
+    evidence: &'static [&'static str],
+}
+
+const POSTGRES_CDC_CONFORMANCE_MATRIX: &[ConformanceCase] = &[
+    ConformanceCase {
+        id: "snapshot_stream_handoff",
+        areas: &[
+            ConformanceArea::SnapshotHandoff,
+            ConformanceArea::MultiTransactionOrdering,
+        ],
+        evidence: &[
+            "postgres_cdc_shared_source_snapshot_converges_to_wal_stream",
+            "postgres_cdc_sql_source_table_snapshot_backfill_acceptance",
+            "postgres_pgoutput_stream_updates_cdc_table_state",
+        ],
+    },
+    ConformanceCase {
+        id: "wal_transaction_order",
+        areas: &[
+            ConformanceArea::MultiTransactionOrdering,
+            ConformanceArea::MultiRowTransactionOrder,
+        ],
+        evidence: &[
+            "preserves_multi_row_order_within_one_source_transaction",
+            "groups_multiple_tables_in_one_source_transaction",
+            "applier_returns_feedback_lsn_only_after_table_apply",
+        ],
+    },
+    ConformanceCase {
+        id: "restart_checkpoint_progression",
+        areas: &[ConformanceArea::RestartCheckpointProgression],
+        evidence: &[
+            "postgres_cdc_table_restart_resumes_from_committed_lsn",
+            "reconnect_loop_reloads_checkpoint_as_next_start_lsn",
+            "reconnect_loop_replays_inflight_wal_transaction_from_durable_checkpoint",
+        ],
+    },
+    ConformanceCase {
+        id: "toast_partial_rows",
+        areas: &[ConformanceArea::ToastUnchangedValues],
+        evidence: &[
+            "postgres_pgoutput_completes_unchanged_toast_values",
+            "decodes_update_with_unchanged_toast_marker",
+            "resolves_unchanged_toast_columns_from_previous_row",
+        ],
+    },
+    ConformanceCase {
+        id: "delete_update_primary_key",
+        areas: &[ConformanceArea::DeleteUpdatePrimaryKey],
+        evidence: &[
+            "postgres_pgoutput_stream_updates_cdc_table_state",
+            "applier_moves_primary_key_updates_between_keys",
+            "applies_insert_update_and_delete_with_atomic_checkpoint",
+        ],
+    },
+    ConformanceCase {
+        id: "replica_identity",
+        areas: &[ConformanceArea::ReplicaIdentity],
+        evidence: &[
+            "decodes_replica_identity_modes_and_reports_unsupported_identity",
+            "decodes_replica_identity_full_update_with_before_image",
+            "validate_upstream_table_schema rejects REPLICA IDENTITY NOTHING",
+        ],
+    },
+    ConformanceCase {
+        id: "core_type_mapping",
+        areas: &[ConformanceArea::CoreTypeMapping],
+        evidence: &[
+            "pgoutput_type_compatibility_matrix_is_explicit",
+            "postgres_cdc_type_mapping_covers_claimed_common_types",
+            "postgres_cdc_type_coverage_to_postgres_sink_acceptance",
+        ],
+    },
+    ConformanceCase {
+        id: "debezium_envelope",
+        areas: &[ConformanceArea::DebeziumEnvelope],
+        evidence: &[
+            "pipeline_debezium_records_validate_actual_kafka_shape",
+            "envelope_payload_exposes_debezium_compatibility_fields",
+            "pipeline_debezium_records_are_buffered_as_encoded_kafka_payloads",
+        ],
+    },
+    ConformanceCase {
+        id: "unsupported_cases",
+        areas: &[ConformanceArea::UnsupportedCases],
+        evidence: &[
+            "schema_policy_rejects_incompatible_type_changes",
+            "schema_policy_rejects_dropped_columns",
+            "truncate_is_rejected_without_mutating_checkpoint",
+            "pgoutput_type_compatibility_matrix_is_explicit",
+        ],
+    },
+];
+
+#[test]
+fn postgres_cdc_conformance_matrix_tracks_required_semantics() {
+    let mut ids = HashSet::new();
+    for case in POSTGRES_CDC_CONFORMANCE_MATRIX {
+        assert!(
+            ids.insert(case.id),
+            "duplicate conformance case {}",
+            case.id
+        );
+        assert!(!case.areas.is_empty(), "case {} has no areas", case.id);
+        assert!(
+            !case.evidence.is_empty(),
+            "case {} has no test evidence",
+            case.id
+        );
+    }
+
+    for required in [
+        ConformanceArea::SnapshotHandoff,
+        ConformanceArea::MultiTransactionOrdering,
+        ConformanceArea::MultiRowTransactionOrder,
+        ConformanceArea::RestartCheckpointProgression,
+        ConformanceArea::ToastUnchangedValues,
+        ConformanceArea::DeleteUpdatePrimaryKey,
+        ConformanceArea::ReplicaIdentity,
+        ConformanceArea::CoreTypeMapping,
+        ConformanceArea::DebeziumEnvelope,
+        ConformanceArea::UnsupportedCases,
+    ] {
+        assert!(
+            POSTGRES_CDC_CONFORMANCE_MATRIX
+                .iter()
+                .any(|case| case.areas.contains(&required)),
+            "conformance matrix is missing {:?}",
+            required
+        );
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires logical-replication Postgres; run scripts/run_postgres_cdc_pgoutput_e2e.sh"]

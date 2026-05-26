@@ -155,6 +155,81 @@ fn pipeline_debezium_records_are_buffered_as_encoded_kafka_payloads() {
 }
 
 #[test]
+fn pipeline_debezium_records_validate_actual_kafka_shape() {
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::DebeziumJson;
+    plan.emit_tombstones = true;
+    plan.include_transaction_metadata = true;
+    let schema = schema(plan.table_id.clone());
+    let batch = ChangeBatch::new(
+        plan.table_id.clone(),
+        vec![
+            CdcChange::Insert {
+                row: row(1, "open"),
+            },
+            CdcChange::Update {
+                key: None,
+                before: Some(row(1, "open")),
+                after: row(1, "paid"),
+            },
+            CdcChange::Delete {
+                key: None,
+                before: Some(row(2, "void")),
+            },
+        ],
+    )
+    .unwrap();
+    let transaction = TransactionBatch::new(
+        CdcSourceId::new("pg_main").unwrap(),
+        Some(CdcTransactionId::new("pg-xid-55").unwrap()),
+        None,
+        floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).unwrap(),
+        vec![batch.clone()],
+    )
+    .unwrap();
+
+    let records = encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction)
+        .expect("encode debezium kafka records");
+
+    assert_eq!(records.len(), 4);
+    let insert_key = kafka_record_key_json(&records[0]);
+    let insert_value = kafka_record_value_json(&records[0]).expect("insert value");
+    let update_value = kafka_record_value_json(&records[1]).expect("update value");
+    let delete_key = kafka_record_key_json(&records[2]);
+    let delete_value = kafka_record_value_json(&records[2]).expect("delete value");
+
+    assert_eq!(insert_key["payload"], serde_json::json!({"id": 1}));
+    assert_eq!(
+        insert_value["schema"]["name"],
+        "pg_main.public.orders.Envelope"
+    );
+    assert_eq!(insert_value["payload"]["op"], "c");
+    assert_eq!(insert_value["payload"]["before"], serde_json::Value::Null);
+    assert_eq!(insert_value["payload"]["after"]["status"], "open");
+    assert_eq!(insert_value["payload"]["source"]["connector"], "postgresql");
+    assert_eq!(insert_value["payload"]["source"]["db"], "postgres");
+    assert_eq!(insert_value["payload"]["source"]["schema"], "public");
+    assert_eq!(insert_value["payload"]["source"]["table"], "orders");
+    assert_eq!(insert_value["payload"]["source"]["txId"], 55);
+    assert_eq!(insert_value["payload"]["source"]["lsn"], 23_817_296);
+    assert_eq!(insert_value["payload"]["transaction"]["id"], "pg-xid-55");
+    assert_eq!(insert_value["payload"]["transaction"]["total_order"], 0);
+
+    assert_eq!(update_value["payload"]["op"], "u");
+    assert_eq!(update_value["payload"]["before"]["status"], "open");
+    assert_eq!(update_value["payload"]["after"]["status"], "paid");
+    assert_eq!(update_value["payload"]["transaction"]["total_order"], 1);
+
+    assert_eq!(delete_key["payload"], serde_json::json!({"id": 2}));
+    assert_eq!(delete_value["payload"]["op"], "d");
+    assert_eq!(delete_value["payload"]["before"]["status"], "void");
+    assert_eq!(delete_value["payload"]["after"], serde_json::Value::Null);
+    assert_eq!(delete_value["payload"]["transaction"]["total_order"], 2);
+    assert_eq!(kafka_record_key_json(&records[3]), delete_key);
+    assert_eq!(records[3].value(), None);
+}
+
+#[test]
 fn pipeline_floe_json_records_encode_compact_row_messages() {
     let plan = ReplicationPipelineRuntimePlan {
         name: "p".to_string(),
@@ -1856,6 +1931,16 @@ fn parses_arrow_ipc_compression_override() {
     );
     assert_eq!(ReplicationArrowIpcCompressionConfig::parse("none"), None);
     assert_eq!(ReplicationArrowIpcCompressionConfig::parse("bogus"), None);
+}
+
+fn kafka_record_key_json(record: &CdcBufferRecord) -> serde_json::Value {
+    serde_json::from_slice(record.key().expect("key")).expect("decode key JSON")
+}
+
+fn kafka_record_value_json(record: &CdcBufferRecord) -> Option<serde_json::Value> {
+    record
+        .value()
+        .map(|value| serde_json::from_slice(value).expect("decode value JSON"))
 }
 
 fn schema(table_id: CdcTableId) -> CdcTableSchema {

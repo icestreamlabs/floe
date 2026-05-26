@@ -105,12 +105,21 @@ pub(crate) fn relation_message_with_columns(
     table: &str,
     columns: &[PgOutputTestColumn],
 ) -> Bytes {
+    relation_message_with_identity_and_columns(relation_id, table, b'd', columns)
+}
+
+pub(crate) fn relation_message_with_identity_and_columns(
+    relation_id: u32,
+    table: &str,
+    replica_identity: u8,
+    columns: &[PgOutputTestColumn],
+) -> Bytes {
     let mut out = Vec::new();
     put_u8(&mut out, b'R');
     put_u32(&mut out, relation_id);
     put_cstring(&mut out, "public");
     put_cstring(&mut out, table);
-    put_u8(&mut out, b'd');
+    put_u8(&mut out, replica_identity);
     put_u16(&mut out, columns.len() as u16);
 
     for column in columns {
@@ -133,6 +142,19 @@ pub(crate) fn relation_message_with_column_specs(
         .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(*name, *type_oid, *is_key))
         .collect();
     relation_message_with_columns(relation_id, table, &columns)
+}
+
+pub(crate) fn relation_message_with_identity_and_column_specs(
+    relation_id: u32,
+    table: &str,
+    replica_identity: u8,
+    columns: &[(&'static str, u32, bool)],
+) -> Bytes {
+    let columns: Vec<PgOutputTestColumn> = columns
+        .iter()
+        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(*name, *type_oid, *is_key))
+        .collect();
+    relation_message_with_identity_and_columns(relation_id, table, replica_identity, &columns)
 }
 
 pub(crate) fn truncate_message(relation_ids: impl IntoIterator<Item = u32>) -> Bytes {
