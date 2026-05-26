@@ -102,7 +102,7 @@ modes_for_target() {
 
 write_headers() {
   cat >"${SUMMARY_CSV}" <<CSV
-status,target,durable_buffer,mode,format,rows,source_rows,expected_messages,observed_messages,expected_postgres_sink_rows,observed_postgres_sink_rows,expected_postgres_sink_updated_rows,observed_postgres_sink_updated_rows,end_to_end_seconds,end_to_end_source_rows_per_second,target_observation_seconds,target_observed_records_per_second,kafka_stream_seconds,kafka_stream_messages_per_second,kafka_stream_source_rows_per_second,consumer_wall_source_rows_per_second,kafka_pre_stream_wait_seconds,postgres_sink_wait_seconds,postgres_sink_rows_per_second,harness_overhead_seconds,harness_overhead_percent,message_multiplier,postgres_load_rows_per_second,postgres_live_write_rows_per_second,total_bytes,wall_mb_per_second,stream_mb_per_second,cdc_buffer_appended_records,cdc_buffer_appended_bytes,cdc_buffer_forced_flushes,cdc_buffer_flush_latency_sum_ms,cdc_buffer_replayed_records,cdc_buffer_replay_latency_sum_ms,artifact_dir
+status,target,durable_buffer,mode,format,rows,source_rows,expected_messages,observed_messages,expected_postgres_sink_rows,observed_postgres_sink_rows,expected_postgres_sink_updated_rows,observed_postgres_sink_updated_rows,end_to_end_seconds,end_to_end_source_rows_per_second,target_observation_seconds,target_observed_records_per_second,kafka_stream_seconds,kafka_stream_messages_per_second,kafka_stream_source_rows_per_second,consumer_wall_source_rows_per_second,kafka_pre_stream_wait_seconds,postgres_sink_wait_seconds,postgres_sink_rows_per_second,harness_overhead_seconds,harness_overhead_percent,message_multiplier,postgres_load_rows_per_second,postgres_live_write_rows_per_second,total_bytes,wall_mb_per_second,stream_mb_per_second,cdc_buffer_appended_records,cdc_buffer_appended_bytes,cdc_buffer_forced_flushes,cdc_buffer_flush_latency_sum_ms,cdc_buffer_replayed_records,cdc_buffer_replay_latency_sum_ms,cdc_target_write_success_records,cdc_target_write_failure_records,cdc_target_write_latency_count,cdc_target_write_latency_sum_ms,cdc_target_write_latency_avg_ms,cdc_target_write_batch_records_sum,artifact_dir
 CSV
   : >"${SUMMARY_JSONL}"
   cat >"${SUMMARY_MD}" <<MD
@@ -148,8 +148,8 @@ Floe pgwire port: \`${FLOE_PG_PORT}\`
 
 Floe admin port: \`${FLOE_ADMIN_PORT}\`
 
-| Status | Target | Durable Buffer | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | Expected PG Sink Rows | Observed PG Sink Rows | Expected PG Updated Rows | Observed PG Updated Rows | End-to-End (s) | E2E Source Rows/s | Target Observation (s) | Target Records/s | Kafka Stream (s) | Stream Msgs/s | Stream Source Rows/s | Consumer Wall Source Rows/s | Pre-Stream Wait (s) | PG Sink Wait (s) | PG Sink Rows/s | Harness Overhead (s) | Harness Overhead % | Msg Multiplier | PG Load Rows/s | PG Live Write Rows/s | Total Bytes | Wall MB/s | Stream MB/s | CDC Buffer Appended Records | CDC Buffer Appended Bytes | CDC Buffer Flushes | CDC Buffer Flush Latency Sum ms | CDC Buffer Replayed Records | CDC Buffer Replay Latency Sum ms | Artifacts |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Status | Target | Durable Buffer | Mode | Format | Rows | Source Rows | Expected Msgs | Observed Msgs | Expected PG Sink Rows | Observed PG Sink Rows | Expected PG Updated Rows | Observed PG Updated Rows | End-to-End (s) | E2E Source Rows/s | Target Observation (s) | Target Records/s | Kafka Stream (s) | Stream Msgs/s | Stream Source Rows/s | Consumer Wall Source Rows/s | Pre-Stream Wait (s) | PG Sink Wait (s) | PG Sink Rows/s | Harness Overhead (s) | Harness Overhead % | Msg Multiplier | PG Load Rows/s | PG Live Write Rows/s | Total Bytes | Wall MB/s | Stream MB/s | CDC Buffer Appended Records | CDC Buffer Appended Bytes | CDC Buffer Flushes | CDC Buffer Flush Latency Sum ms | CDC Buffer Replayed Records | CDC Buffer Replay Latency Sum ms | CDC Target Write Success Records | CDC Target Write Failure Records | CDC Target Write Latency Count | CDC Target Write Latency Sum ms | CDC Target Write Latency Avg ms | CDC Target Write Batch Records Sum | Artifacts |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 MD
 }
 
@@ -284,7 +284,7 @@ append_result() {
   local rows="$7"
   local summary="${run_dir}/summary.env"
 
-  local source_rows expected observed expected_sink observed_sink expected_sink_updated observed_sink_updated seconds rows_per_second target_observation_seconds target_observed_records_per_second stream_seconds stream_rows_per_second stream_source_rows_per_second consumer_wall_source_rows_per_second pre_stream_wait sink_wait_seconds sink_rows_per_second harness_overhead harness_overhead_percent message_multiplier postgres_load_rows_per_second postgres_live_write_rows_per_second total_bytes wall_mb_per_second stream_mb_per_second cdc_buffer_appended_records cdc_buffer_appended_bytes cdc_buffer_forced_flushes cdc_buffer_flush_latency_sum_ms cdc_buffer_replayed_records cdc_buffer_replay_latency_sum_ms
+  local source_rows expected observed expected_sink observed_sink expected_sink_updated observed_sink_updated seconds rows_per_second target_observation_seconds target_observed_records_per_second stream_seconds stream_rows_per_second stream_source_rows_per_second consumer_wall_source_rows_per_second pre_stream_wait sink_wait_seconds sink_rows_per_second harness_overhead harness_overhead_percent message_multiplier postgres_load_rows_per_second postgres_live_write_rows_per_second total_bytes wall_mb_per_second stream_mb_per_second cdc_buffer_appended_records cdc_buffer_appended_bytes cdc_buffer_forced_flushes cdc_buffer_flush_latency_sum_ms cdc_buffer_replayed_records cdc_buffer_replay_latency_sum_ms cdc_target_write_success_records cdc_target_write_failure_records cdc_target_write_latency_count cdc_target_write_latency_sum_ms cdc_target_write_latency_avg_ms cdc_target_write_batch_records_sum
   source_rows="$(env_value "${summary}" benchmark.source_rows)"
   expected="$(env_value "${summary}" benchmark.expected_kafka_messages)"
   observed="$(env_value "${summary}" benchmark.observed_kafka_messages)"
@@ -317,6 +317,12 @@ append_result() {
   cdc_buffer_flush_latency_sum_ms="$(env_value "${summary}" benchmark.cdc_buffer_flush_latency_sum_ms)"
   cdc_buffer_replayed_records="$(env_value "${summary}" benchmark.cdc_buffer_replayed_records)"
   cdc_buffer_replay_latency_sum_ms="$(env_value "${summary}" benchmark.cdc_buffer_replay_latency_sum_ms)"
+  cdc_target_write_success_records="$(env_value "${summary}" benchmark.cdc_target_write_success_records)"
+  cdc_target_write_failure_records="$(env_value "${summary}" benchmark.cdc_target_write_failure_records)"
+  cdc_target_write_latency_count="$(env_value "${summary}" benchmark.cdc_target_write_latency_count)"
+  cdc_target_write_latency_sum_ms="$(env_value "${summary}" benchmark.cdc_target_write_latency_sum_ms)"
+  cdc_target_write_latency_avg_ms="$(env_value "${summary}" benchmark.cdc_target_write_latency_avg_ms)"
+  cdc_target_write_batch_records_sum="$(env_value "${summary}" benchmark.cdc_target_write_batch_records_sum)"
 
   source_rows="${source_rows:-}"
   expected="${expected:-}"
@@ -350,8 +356,14 @@ append_result() {
   cdc_buffer_flush_latency_sum_ms="${cdc_buffer_flush_latency_sum_ms:-}"
   cdc_buffer_replayed_records="${cdc_buffer_replayed_records:-}"
   cdc_buffer_replay_latency_sum_ms="${cdc_buffer_replay_latency_sum_ms:-}"
+  cdc_target_write_success_records="${cdc_target_write_success_records:-}"
+  cdc_target_write_failure_records="${cdc_target_write_failure_records:-}"
+  cdc_target_write_latency_count="${cdc_target_write_latency_count:-}"
+  cdc_target_write_latency_sum_ms="${cdc_target_write_latency_sum_ms:-}"
+  cdc_target_write_latency_avg_ms="${cdc_target_write_latency_avg_ms:-}"
+  cdc_target_write_batch_records_sum="${cdc_target_write_batch_records_sum:-}"
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${status}" \
     "${target}" \
     "${durable_buffer}" \
@@ -390,9 +402,15 @@ append_result() {
     "${cdc_buffer_flush_latency_sum_ms}" \
     "${cdc_buffer_replayed_records}" \
     "${cdc_buffer_replay_latency_sum_ms}" \
+    "${cdc_target_write_success_records}" \
+    "${cdc_target_write_failure_records}" \
+    "${cdc_target_write_latency_count}" \
+    "${cdc_target_write_latency_sum_ms}" \
+    "${cdc_target_write_latency_avg_ms}" \
+    "${cdc_target_write_batch_records_sum}" \
     "${run_dir}" >>"${SUMMARY_CSV}"
 
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
+  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
     "${status}" \
     "${target}" \
     "${durable_buffer}" \
@@ -431,6 +449,12 @@ append_result() {
     "${cdc_buffer_flush_latency_sum_ms:-n/a}" \
     "${cdc_buffer_replayed_records:-n/a}" \
     "${cdc_buffer_replay_latency_sum_ms:-n/a}" \
+    "${cdc_target_write_success_records:-n/a}" \
+    "${cdc_target_write_failure_records:-n/a}" \
+    "${cdc_target_write_latency_count:-n/a}" \
+    "${cdc_target_write_latency_sum_ms:-n/a}" \
+    "${cdc_target_write_latency_avg_ms:-n/a}" \
+    "${cdc_target_write_batch_records_sum:-n/a}" \
     "${run_dir}" >>"${SUMMARY_MD}"
 
   local run_summary_json="${run_dir}/summary.json"

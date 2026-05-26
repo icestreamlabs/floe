@@ -17,7 +17,7 @@ use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
 use rdkafka::types::RDKafkaTopic;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::{Statement, types::ToSql};
 
 use super::super::ReplicationPipelineRuntimeBufferMode;
 use super::target_state::TargetStateBuilder;
@@ -648,8 +648,20 @@ impl PostgresReplicationPipelineWriter {
             .transaction()
             .await
             .context("start replication pipeline Postgres target transaction")?;
+        let insert_statement = transaction.prepare(insert_sql).await.with_context(|| {
+            format!(
+                "prepare CDC upsert statement for replication pipeline Postgres target {}",
+                self.target_table
+            )
+        })?;
+        let delete_statement = transaction.prepare(delete_sql).await.with_context(|| {
+            format!(
+                "prepare CDC delete statement for replication pipeline Postgres target {}",
+                self.target_table
+            )
+        })?;
         for record in records {
-            self.apply_record(&transaction, record, &insert_sql, &delete_sql)
+            self.apply_record(&transaction, record, &insert_statement, &delete_statement)
                 .await?;
         }
         transaction
@@ -663,8 +675,8 @@ impl PostgresReplicationPipelineWriter {
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
         record: &CdcBufferRecord,
-        insert_sql: &str,
-        delete_sql: &str,
+        insert_statement: &Statement,
+        delete_statement: &Statement,
     ) -> anyhow::Result<()> {
         let value = parse_floe_json_record_value(record)?;
         let deleted = value
@@ -679,7 +691,7 @@ impl PostgresReplicationPipelineWriter {
                 .map(PostgresParamValue::as_tosql)
                 .collect::<Vec<_>>();
             transaction
-                .execute(delete_sql, &refs)
+                .execute(delete_statement, &refs)
                 .await
                 .with_context(|| {
                     format!(
@@ -696,7 +708,7 @@ impl PostgresReplicationPipelineWriter {
             .map(PostgresParamValue::as_tosql)
             .collect::<Vec<_>>();
         transaction
-            .execute(insert_sql, &refs)
+            .execute(insert_statement, &refs)
             .await
             .with_context(|| {
                 format!(

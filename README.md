@@ -74,6 +74,8 @@ Observability:
   - `floe_postgres_cdc_table_lag_bytes{source=...,slot=...,table=...}`
   - `floe_cdc_buffer_pending_records{pipeline=...}`
   - `floe_cdc_buffer_pending_bytes{pipeline=...}`
+  - `floe_cdc_replication_target_write_records_total{pipeline=...,target_kind=...,result=...}`
+  - `floe_cdc_replication_target_write_latency_ms{pipeline=...,target_kind=...,result=...}`
   - `floe_runtime_errors_total{component=...}`
 
 ### Storage tuning (SlateDB)
@@ -168,8 +170,7 @@ Current requirements and limitations:
     the CDC primary key before rows are applied.
 - Common scalar types are covered; arrays, enums/domains, intervals, and range
   types remain deferred.
-- Source/target HA failover, richer operator CLI UX, and larger published
-  performance baselines are follow-up product work.
+- Richer operator CLI UX is follow-up product work.
 - Full HA discovery is not implemented in alpha: source failover requires the
   configured connection string to resolve to the new writer, and the promoted
   Postgres instance must retain a compatible logical slot/publication. Target
@@ -204,6 +205,47 @@ Operator output avoids connector connection strings and does not return raw DLQ
 payload bytes; DLQ metadata may include payload object keys, formats, and byte
 counts for recovery/audit workflows.
 
+Postgres CDC performance baselines:
+
+- Run repeatable baseline artifacts from `main` before comparing a feature
+  branch:
+
+  ```bash
+  git checkout main
+  git pull --ff-only
+  PROFILE=baseline scripts/postgres_cdc_perf_guardrails.sh
+  ```
+
+- `PROFILE=baseline` covers Kafka and Postgres targets, durable buffer on/off,
+  and `snapshot`, `live_insert`, and `snapshot_live_update` modes for the
+  synthetic orders dataset. `PROFILE=postgres-sink` narrows the matrix to the
+  Postgres target bottleneck path. `PROFILE=soak` runs longer live-write and
+  update scenarios with durable buffers enabled. `PROFILE=smoke` is the quick
+  harness check.
+- Matrix artifacts land under `target/cdc_bench_guardrails/` by default and
+  include `summary.json`, `summary.csv`, `summary.md`, per-run `summary.json`,
+  `reproduce.sh`, Floe Prometheus metrics, CDC replication state, Postgres slot
+  state, Docker stats, and system/build metadata.
+- Compare the same profile on the feature branch on the same host. The alpha
+  performance boundary is the current `main` result for the same profile and
+  hardware, not a checked-in numeric SLA.
+- Timing fields have distinct meanings:
+  - `end_to_end_source_rows_per_second`: node startup through target
+    observation.
+  - `target_observed_records_per_second`: wall-clock target catch-up rate
+    (`Kafka` counter or Postgres sink wait).
+  - `kafka_stream_source_rows_per_second`: Kafka stream window only, excluding
+    pre-stream wait.
+  - `postgres_sink_rows_per_second`: Postgres replication target catch-up,
+    including upsert/update/delete delivery.
+  - `cdc_replication.target_write.*`: target write Prometheus totals and
+    latency sums collected from Floe.
+- The general Postgres target path uses transactional prepared
+  upsert/delete statements. Binary `COPY` is not used for the product path
+  because general CDC requires primary-key conflict handling, deletes, and
+  updates; an insert-only staging/COPY/merge fast path should be justified by
+  `PROFILE=postgres-sink` artifacts before it is added.
+
 Postgres CDC type compatibility:
 
 | Postgres type family | Floe CDC representation | Source decode | Kafka JSON | Postgres target |
@@ -231,6 +273,7 @@ Useful validation entry points:
 - `FLOE_ACCEPTANCE_PG_DSN=... cargo test -p floe-node --test ga_acceptance -- --ignored`
 - `scripts/postgres_cdc_perf_local.sh`
 - `scripts/postgres_cdc_perf_matrix.sh`
+- `PROFILE=smoke scripts/postgres_cdc_perf_guardrails.sh`
 
 ## Workspace Modules and Ownership
 

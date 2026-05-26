@@ -603,7 +603,7 @@ async fn validate_postgres_cdc_table_read_privileges(
         let table_name = qualified_table_name(upstream);
         let can_select: bool = client
             .query_one(
-                "SELECT has_table_privilege($1::regclass, 'SELECT')",
+                "SELECT COALESCE(has_table_privilege(to_regclass($1), 'SELECT'), false)",
                 &[&table_name],
             )
             .await

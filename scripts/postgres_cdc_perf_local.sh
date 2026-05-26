@@ -1609,6 +1609,11 @@ cdc_buffer_object_create_count="$(prom_metric_sum_matching floe_cdc_buffer_objec
 cdc_buffer_object_get_count="$(prom_metric_sum_matching floe_cdc_buffer_object_ops_total 'operation="get"')"
 cdc_buffer_object_delete_count="$(prom_metric_sum_matching floe_cdc_buffer_object_ops_total 'operation="delete"')"
 cdc_buffer_drain_attempts="$(prom_metric_sum floe_cdc_buffer_drain_attempts_total)"
+cdc_target_write_success_records="$(prom_metric_sum_matching floe_cdc_replication_target_write_records_total 'result="success"')"
+cdc_target_write_failure_records="$(prom_metric_sum_matching floe_cdc_replication_target_write_records_total 'result="failure"')"
+cdc_target_write_latency_count="$(prom_metric_sum_matching floe_cdc_replication_target_write_latency_ms_count 'result="success"')"
+cdc_target_write_latency_sum_ms="$(prom_metric_sum_matching floe_cdc_replication_target_write_latency_ms_sum 'result="success"')"
+cdc_target_write_batch_records_sum="$(prom_metric_sum_matching floe_cdc_replication_target_write_batch_records_sum 'result="success"')"
 if [[ -s "${FLOE_METRICS_LOG}" ]]; then
   for metric_var in \
     cdc_buffer_pending_records \
@@ -1632,11 +1637,20 @@ if [[ -s "${FLOE_METRICS_LOG}" ]]; then
     cdc_buffer_object_create_count \
     cdc_buffer_object_get_count \
     cdc_buffer_object_delete_count \
-    cdc_buffer_drain_attempts; do
+    cdc_buffer_drain_attempts \
+    cdc_target_write_success_records \
+    cdc_target_write_failure_records \
+    cdc_target_write_latency_count \
+    cdc_target_write_latency_sum_ms \
+    cdc_target_write_batch_records_sum; do
     if [[ -z "${!metric_var}" ]]; then
       printf -v "${metric_var}" '0'
     fi
   done
+fi
+cdc_target_write_latency_avg_ms=""
+if [[ -n "${cdc_target_write_latency_count}" && "${cdc_target_write_latency_count}" != "0" ]]; then
+  cdc_target_write_latency_avg_ms="$(awk "BEGIN { printf \"%.3f\", ${cdc_target_write_latency_sum_ms:-0} / ${cdc_target_write_latency_count} }")"
 fi
 
 row_counts_json="$(
@@ -1744,6 +1758,12 @@ write_summary_json() {
     --arg cdc_buffer_object_get_count "${cdc_buffer_object_get_count}" \
     --arg cdc_buffer_object_delete_count "${cdc_buffer_object_delete_count}" \
     --arg cdc_buffer_drain_attempts "${cdc_buffer_drain_attempts}" \
+    --arg cdc_target_write_success_records "${cdc_target_write_success_records}" \
+    --arg cdc_target_write_failure_records "${cdc_target_write_failure_records}" \
+    --arg cdc_target_write_latency_count "${cdc_target_write_latency_count}" \
+    --arg cdc_target_write_latency_sum_ms "${cdc_target_write_latency_sum_ms}" \
+    --arg cdc_target_write_latency_avg_ms "${cdc_target_write_latency_avg_ms}" \
+    --arg cdc_target_write_batch_records_sum "${cdc_target_write_batch_records_sum}" \
     --arg harness_overhead_percent "${harness_overhead_percent}" \
     --arg artifact_dir "${ARTIFACT_DIR}" \
     --arg node_stdout "${NODE_STDOUT}" \
@@ -1895,6 +1915,14 @@ write_summary_json() {
           object_delete_count: maybe_num($cdc_buffer_object_delete_count),
           drain_attempts: maybe_num($cdc_buffer_drain_attempts)
         },
+        target_write: {
+          success_records: maybe_num($cdc_target_write_success_records),
+          failure_records: maybe_num($cdc_target_write_failure_records),
+          latency_count: maybe_num($cdc_target_write_latency_count),
+          latency_sum_ms: maybe_num($cdc_target_write_latency_sum_ms),
+          latency_avg_ms: maybe_num($cdc_target_write_latency_avg_ms),
+          batch_records_sum: maybe_num($cdc_target_write_batch_records_sum)
+        },
         debug: ($cdc_replication_debug[0] // null)
       },
       artifacts: {
@@ -1969,6 +1997,12 @@ Artifact directory: \`${ARTIFACT_DIR}\`
 | CDC buffer flush latency sum ms | ${cdc_buffer_flush_latency_sum_ms:-} |
 | CDC buffer replayed records | ${cdc_buffer_replayed_records:-} |
 | CDC buffer replay latency sum ms | ${cdc_buffer_replay_latency_sum_ms:-} |
+| CDC target write success records | ${cdc_target_write_success_records:-} |
+| CDC target write failure records | ${cdc_target_write_failure_records:-} |
+| CDC target write latency count | ${cdc_target_write_latency_count:-} |
+| CDC target write latency sum ms | ${cdc_target_write_latency_sum_ms:-} |
+| CDC target write latency avg ms | ${cdc_target_write_latency_avg_ms:-} |
+| CDC target write batch records sum | ${cdc_target_write_batch_records_sum:-} |
 
 Machine-readable report: \`${SUMMARY_JSON}\`
 MD
@@ -2061,6 +2095,12 @@ MD
   echo "benchmark.cdc_buffer_object_get_count=${cdc_buffer_object_get_count}"
   echo "benchmark.cdc_buffer_object_delete_count=${cdc_buffer_object_delete_count}"
   echo "benchmark.cdc_buffer_drain_attempts=${cdc_buffer_drain_attempts}"
+  echo "benchmark.cdc_target_write_success_records=${cdc_target_write_success_records}"
+  echo "benchmark.cdc_target_write_failure_records=${cdc_target_write_failure_records}"
+  echo "benchmark.cdc_target_write_latency_count=${cdc_target_write_latency_count}"
+  echo "benchmark.cdc_target_write_latency_sum_ms=${cdc_target_write_latency_sum_ms}"
+  echo "benchmark.cdc_target_write_latency_avg_ms=${cdc_target_write_latency_avg_ms}"
+  echo "benchmark.cdc_target_write_batch_records_sum=${cdc_target_write_batch_records_sum}"
   echo "benchmark.artifact_dir=${ARTIFACT_DIR}"
   echo "benchmark.node_stdout=${NODE_STDOUT}"
   echo "benchmark.node_stderr=${NODE_STDERR}"
