@@ -1299,6 +1299,106 @@ async fn replay_dead_letters_pending_buffer_when_policy_allows() {
 }
 
 #[tokio::test]
+async fn restart_replays_pending_buffer_to_dlq_and_retries_dlq_entry() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+    plan.error_policy = CatalogReplicationErrorPolicy::new(
+        CatalogReplicationErrorPolicyMode::DeadLetterAndContinue,
+        None,
+    );
+    let storage = SlateCatalog::in_memory().await.unwrap();
+    let transaction = TransactionBatch::new(
+        CdcSourceId::new("pg_main").unwrap(),
+        Some(CdcTransactionId::new("pg-xid-601").unwrap()),
+        None,
+        floe_cdc_core::CdcSourcePosition::postgres("0/16B6F00", None).unwrap(),
+        vec![
+            ChangeBatch::new(
+                table_id,
+                vec![CdcChange::Insert {
+                    row: row(6, "ready"),
+                }],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let prepared = prepare_replication_buffer_append(
+        &plan,
+        &transaction,
+        vec![CdcBufferRecord::new(
+            Some(br#"{"id":6}"#.to_vec()),
+            Some(br#"{"id":6,"status":"ready"}"#.to_vec()),
+        )],
+    )
+    .expect("prepare pending transaction");
+    let buffer_store = storage.cdc_buffer_store();
+    buffer_store
+        .append_transaction(&prepared.append)
+        .await
+        .expect("append pending transaction before restart");
+    assert_eq!(
+        buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending before restart")
+            .len(),
+        1
+    );
+
+    let restarted_runtime = test_runtime_with_plan(plan.clone());
+    assert_eq!(
+        restarted_runtime
+            .replay_buffered(&storage)
+            .await
+            .expect("restart replay should dead-letter pending transaction"),
+        1
+    );
+    assert!(
+        buffer_store
+            .pending_transactions(&plan.name, 10)
+            .await
+            .expect("pending after restart replay")
+            .is_empty()
+    );
+    let dlq_entry = storage
+        .replication_pipeline_dlq_entries(&plan.name)
+        .await
+        .expect("dlq entries after restart replay")
+        .into_iter()
+        .next()
+        .expect("dlq entry");
+    assert_eq!(dlq_entry.status(), ReplicationPipelineDlqStatus::Pending);
+    assert_eq!(dlq_entry.attempt_count(), 1);
+    assert_eq!(dlq_entry.source_position(), transaction.commit_position());
+
+    let retry_runtime = test_runtime_with_plan(plan.clone());
+    let outcome = retry_runtime
+        .retry_pending_dlq_entries(&storage, &plan.name, 10)
+        .await
+        .expect("manual retry after restart")
+        .expect("pipeline exists");
+    assert_eq!(outcome.attempted, 1);
+    assert!(outcome.replayed.is_empty());
+    assert_eq!(outcome.failed.len(), 1);
+    assert_eq!(outcome.failed[0].dlq_id, dlq_entry.dlq_id());
+    let retried = storage
+        .replication_pipeline_dlq_entry(&plan.name, dlq_entry.dlq_id())
+        .await
+        .expect("load retried dlq entry")
+        .expect("retried dlq entry");
+    assert_eq!(retried.status(), ReplicationPipelineDlqStatus::Pending);
+    assert_eq!(retried.attempt_count(), 2);
+    assert!(
+        retried
+            .status_reason()
+            .expect("retry failure reason")
+            .contains("manual retry failed")
+    );
+}
+
+#[tokio::test]
 async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
     let table_id = CdcTableId::new("orders").unwrap();
     let plan = test_plan("orders_pipe", table_id, "public.orders");
