@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -86,9 +87,10 @@ use crate::{cli, http_ingest, metrics, sinks};
 use floe_config as config;
 use floe_config::{
     ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
-    PostgresCdcSnapshotConfig, SinkConfig, SinkSpec, SourceJournalConfig,
-    apply_connector_properties, load_config, materialized_view_definitions_from_config,
-    normalize_connectors, normalize_sinks, sink_spec_from_sql,
+    PostgresCdcReconnectConfig, PostgresCdcSnapshotConfig, SinkConfig, SinkSpec,
+    SourceJournalConfig, apply_connector_properties, load_config,
+    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
+    sink_spec_from_sql,
 };
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -116,6 +118,26 @@ const CHECKPOINT_GRAPH_ID: &str = "floe_runtime";
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
+
+#[derive(Debug)]
+struct ReconnectablePostgresCdcError(anyhow::Error);
+
+impl fmt::Display for ReconnectablePostgresCdcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for ReconnectablePostgresCdcError {}
+
+fn reconnectable_postgres_cdc_error(err: anyhow::Error) -> anyhow::Error {
+    anyhow!(ReconnectablePostgresCdcError(err))
+}
+
+fn is_reconnectable_postgres_cdc_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.is::<ReconnectablePostgresCdcError>())
+}
 
 struct ConnectorQueue {
     id: usize,
@@ -279,9 +301,51 @@ async fn initialize_postgres_cdc_debug_sources<'a>(
             next_source.durable_lsn = existing_source.durable_lsn.clone();
             next_source.durable_lsn_bytes = existing_source.durable_lsn_bytes;
             next_source.source_lag_bytes = existing_source.source_lag_bytes;
+            next_source.connected = existing_source.connected;
+            next_source.reconnect_attempts = existing_source.reconnect_attempts;
+            next_source.last_error = existing_source.last_error.clone();
         }
     }
     state.postgres_sources = next_sources;
+    state.updated_at_unix_ms = current_unix_time_ms();
+}
+
+fn record_postgres_cdc_debug_connection_state(
+    shared: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    source: &str,
+    slot: &str,
+    connected: bool,
+    reconnect_attempts: u64,
+    last_error: Option<String>,
+) {
+    let Ok(mut state) = shared.try_write() else {
+        return;
+    };
+    let source_idx = match state
+        .postgres_sources
+        .iter()
+        .position(|source_state| source_state.source == source)
+    {
+        Some(source_idx) => source_idx,
+        None => {
+            state
+                .postgres_sources
+                .push(http_ingest::PostgresCdcDebugSourceState {
+                    source: source.to_string(),
+                    slot: Some(slot.to_string()),
+                    ..http_ingest::PostgresCdcDebugSourceState::default()
+                });
+            state.postgres_sources.len() - 1
+        }
+    };
+    let source_state = state
+        .postgres_sources
+        .get_mut(source_idx)
+        .expect("Postgres CDC debug source index is valid");
+    source_state.slot = Some(slot.to_string());
+    source_state.connected = connected;
+    source_state.reconnect_attempts = reconnect_attempts;
+    source_state.last_error = last_error;
     state.updated_at_unix_ms = current_unix_time_ms();
 }
 

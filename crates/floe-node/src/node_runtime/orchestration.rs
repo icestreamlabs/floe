@@ -519,6 +519,7 @@ async fn run_native_postgres_cdc_connector(
     mut config: PostgresCdcSourceConfig,
     runtime_plan: PostgresCdcRuntimePlan,
     snapshot_settings: PostgresCdcSnapshotConfig,
+    reconnect_settings: PostgresCdcReconnectConfig,
     table_store: CdcTableStore,
     cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
@@ -570,17 +571,189 @@ async fn run_native_postgres_cdc_connector(
         );
     }
     if let Some(wal_stream) = initial_snapshot.wal_stream {
-        return forward_buffered_postgres_wal_stream(wal_stream, sender, cancel).await;
-    }
-    let start_lsn = stored_slot_start_lsn(&connection_string, &slot)
+        match forward_buffered_postgres_wal_stream(
+            wal_stream,
+            sender.clone(),
+            config.commit_lsn_rx.as_mut(),
+            &cancel,
+        )
         .await
-        .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
-    let replication_config = replication_config_from_connection_string(
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if cancel.is_cancelled() => return Err(err),
+            Err(err) if !is_reconnectable_postgres_cdc_error(&err) => return Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    source = %runtime_plan.source_id.as_str(),
+                    slot = %slot,
+                    error = %err,
+                    "buffered Postgres CDC WAL stream failed; reconnecting from durable checkpoint"
+                );
+            }
+        }
+    }
+    let reconnect_policy = PostgresCdcRuntimeReconnectPolicy::from_config(reconnect_settings);
+    run_native_postgres_cdc_wal_stream_with_reconnect(
         &connection_string,
         &slot,
         &publication,
-        start_lsn,
-    )?;
+        &runtime_plan,
+        &table_store,
+        &cdc_replication_debug,
+        sender,
+        config.commit_lsn_rx.as_mut(),
+        &cancel,
+        reconnect_policy,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PostgresCdcRuntimeReconnectPolicy {
+    pub(super) max_reconnects: usize,
+    pub(super) retry_base: Duration,
+    pub(super) retry_max_backoff: Duration,
+}
+
+impl PostgresCdcRuntimeReconnectPolicy {
+    fn from_config(config: PostgresCdcReconnectConfig) -> Self {
+        Self {
+            max_reconnects: config.max_reconnects,
+            retry_base: Duration::from_millis(config.retry_base_ms),
+            retry_max_backoff: Duration::from_millis(config.retry_max_backoff_ms),
+        }
+    }
+
+    pub(super) fn backoff_for_reconnect(self, reconnect_idx: usize) -> Duration {
+        let base_ms = self.retry_base.as_millis() as u64;
+        let max_ms = self.retry_max_backoff.as_millis() as u64;
+        let factor = if reconnect_idx >= 63 {
+            u64::MAX
+        } else {
+            1_u64 << reconnect_idx
+        };
+        Duration::from_millis(base_ms.saturating_mul(factor).min(max_ms))
+    }
+}
+
+async fn run_native_postgres_cdc_wal_stream_with_reconnect(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    table_store: &CdcTableStore,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    mut commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    cancel: &CancellationToken,
+    policy: PostgresCdcRuntimeReconnectPolicy,
+) -> anyhow::Result<()> {
+    let mut reconnects = 0usize;
+    loop {
+        match run_native_postgres_cdc_wal_stream_once(
+            connection_string,
+            slot,
+            publication,
+            runtime_plan,
+            table_store,
+            cdc_replication_debug,
+            sender.clone(),
+            commit_lsn_rx.as_deref_mut(),
+            cancel,
+            reconnects as u64,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if cancel.is_cancelled() => return Err(err),
+            Err(err) if !is_reconnectable_postgres_cdc_error(&err) => return Err(err),
+            Err(err) if reconnects < policy.max_reconnects => {
+                let backoff = policy.backoff_for_reconnect(reconnects);
+                reconnects = reconnects.saturating_add(1);
+                metrics::record_postgres_cdc_source_connected(
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    false,
+                );
+                metrics::inc_postgres_cdc_reconnect(
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    "scheduled",
+                );
+                record_postgres_cdc_debug_connection_state(
+                    cdc_replication_debug,
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    false,
+                    reconnects as u64,
+                    Some(
+                        "Postgres CDC stream disconnected; reconnecting from durable checkpoint"
+                            .to_string(),
+                    ),
+                );
+                tracing::warn!(
+                    source = %runtime_plan.source_id.as_str(),
+                    slot,
+                    reconnects,
+                    max_reconnects = policy.max_reconnects,
+                    retry_delay_ms = backoff.as_millis() as u64,
+                    error = %err,
+                    "Postgres CDC stream failed; reconnecting from durable checkpoint"
+                );
+                if !backoff.is_zero() {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Err(anyhow!("cancelled before Postgres CDC reconnect"));
+                        }
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                }
+            }
+            Err(err) => {
+                metrics::record_postgres_cdc_source_connected(
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    false,
+                );
+                metrics::inc_postgres_cdc_reconnect(
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    "exhausted",
+                );
+                record_postgres_cdc_debug_connection_state(
+                    cdc_replication_debug,
+                    runtime_plan.source_id.as_str(),
+                    slot,
+                    false,
+                    reconnects as u64,
+                    Some("Postgres CDC stream reconnect attempts exhausted".to_string()),
+                );
+                return Err(err).with_context(|| {
+                    format!("Postgres CDC stream failed after {reconnects} reconnect attempt(s)")
+                });
+            }
+        }
+    }
+}
+
+async fn run_native_postgres_cdc_wal_stream_once(
+    connection_string: &str,
+    slot: &str,
+    publication: &str,
+    runtime_plan: &PostgresCdcRuntimePlan,
+    table_store: &CdcTableStore,
+    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    mut commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    cancel: &CancellationToken,
+    reconnect_attempts: u64,
+) -> anyhow::Result<()> {
+    let start_lsn = stored_slot_start_lsn(connection_string, slot)
+        .await
+        .map_err(reconnectable_postgres_cdc_error)
+        .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
+    let replication_config =
+        replication_config_from_connection_string(connection_string, slot, publication, start_lsn)?;
     let replication_config = config_with_stored_cdc_checkpoint(
         replication_config,
         &table_store,
@@ -596,7 +769,17 @@ async fn run_native_postgres_cdc_connector(
     );
     let mut replication = PostgresReplicationClient::connect(&replication_config)
         .await
+        .map_err(reconnectable_postgres_cdc_error)
         .context("connect native Postgres CDC transaction stream")?;
+    metrics::record_postgres_cdc_source_connected(runtime_plan.source_id.as_str(), slot, true);
+    record_postgres_cdc_debug_connection_state(
+        cdc_replication_debug,
+        runtime_plan.source_id.as_str(),
+        slot,
+        true,
+        reconnect_attempts,
+        None,
+    );
     tracing::info!(
         source = %runtime_plan.source_id.as_str(),
         slot = %slot,
@@ -610,19 +793,22 @@ async fn run_native_postgres_cdc_connector(
         runtime_plan.schema_evolution_policy,
     );
     let mut last_committed_tick_id = 0_u64;
+    let mut last_enqueued_lsn = None;
 
     let result = async {
         loop {
             update_native_postgres_applied_lsn(
                 &mut replication,
-                config.commit_lsn_rx.as_mut(),
-                &config.slot,
+                commit_lsn_rx.as_deref_mut(),
+                slot,
                 &mut last_committed_tick_id,
             )?;
 
             let event = tokio::select! {
                 _ = cancel.cancelled() => break,
-                event = replication.recv() => event.context("receive native Postgres CDC event")?,
+                event = replication.recv() => event
+                    .map_err(reconnectable_postgres_cdc_error)
+                    .context("receive native Postgres CDC event")?,
             };
             let Some(event) = event else {
                 break;
@@ -675,14 +861,15 @@ async fn run_native_postgres_cdc_connector(
             };
             tracing::debug!(
                 source = %runtime_plan.source_id.as_str(),
-                slot = %config.slot,
+                slot = %slot,
                 change_batches = transaction.change_batches().len(),
                 commit_position = ?transaction.commit_position(),
                 "assembled native Postgres CDC transaction"
             );
+            let transaction_lsn = PostgresLsn::from_source_position(transaction.commit_position())?;
             sender
                 .send(QueuedCdcTransaction {
-                    slot: config.slot.clone(),
+                    slot: slot.to_string(),
                     source_id: runtime_plan.source_id.clone(),
                     transaction,
                 })
@@ -690,6 +877,7 @@ async fn run_native_postgres_cdc_connector(
                 .map_err(|err| {
                     anyhow!("failed to enqueue native Postgres CDC transaction: {err}")
                 })?;
+            last_enqueued_lsn = Some(transaction_lsn);
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -697,14 +885,18 @@ async fn run_native_postgres_cdc_connector(
 
     replication.stop();
     let shutdown_result = replication.shutdown().await;
-    result?;
+    if let Err(err) = result {
+        wait_for_enqueued_postgres_cdc_lsn(commit_lsn_rx, slot, last_enqueued_lsn, cancel).await?;
+        return Err(err);
+    }
     shutdown_result
 }
 
 async fn forward_buffered_postgres_wal_stream(
     mut stream: BufferedPostgresWalStream,
     sender: mpsc::Sender<QueuedCdcTransaction>,
-    cancel: CancellationToken,
+    commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     tracing::info!(
         slot = %stream.slot,
@@ -712,6 +904,7 @@ async fn forward_buffered_postgres_wal_stream(
         "forwarding buffered Postgres CDC WAL stream after durable initial snapshot"
     );
 
+    let mut last_enqueued_lsn = None;
     loop {
         let transaction = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -720,6 +913,8 @@ async fn forward_buffered_postgres_wal_stream(
         let Some(transaction) = transaction else {
             break;
         };
+        let transaction_lsn =
+            PostgresLsn::from_source_position(transaction.transaction.commit_position())?;
         if let Err(err) = sender.send(transaction).await {
             stream.task.abort();
             let _ = stream.task.await;
@@ -727,13 +922,39 @@ async fn forward_buffered_postgres_wal_stream(
                 "failed to enqueue buffered native Postgres CDC transaction: {err}"
             ));
         }
+        last_enqueued_lsn = Some(transaction_lsn);
     }
 
-    match stream.task.await {
+    let stream_result = match stream.task.await {
         Ok(result) => result,
         Err(err) if err.is_cancelled() && cancel.is_cancelled() => Ok(()),
         Err(err) => Err(anyhow!("buffered Postgres CDC WAL task failed: {err}")),
+    };
+    if let Err(err) = stream_result {
+        wait_for_enqueued_postgres_cdc_lsn(commit_lsn_rx, &stream.slot, last_enqueued_lsn, cancel)
+            .await?;
+        return Err(err);
     }
+    Ok(())
+}
+
+async fn wait_for_enqueued_postgres_cdc_lsn(
+    receiver: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    slot: &str,
+    target_lsn: Option<PostgresLsn>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let Some(target_lsn) = target_lsn else {
+        return Ok(());
+    };
+    super::postgres_snapshot::wait_for_postgres_cdc_commit(
+        receiver,
+        slot,
+        target_lsn,
+        cancel,
+        "queued Postgres CDC transactions to become durable before reconnect",
+    )
+    .await
 }
 
 fn postgres_replication_event_frontier_lsn(
@@ -2176,11 +2397,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let table_store = cdc_table_store.clone();
                 let cdc_replication_debug = Arc::clone(&cdc_replication_debug);
                 let snapshot_settings = postgres_cdc_settings.snapshot;
+                let reconnect_settings = postgres_cdc_settings.reconnect;
                 connector_handles.push(tokio::spawn(async move {
                     if let Err(err) = run_native_postgres_cdc_connector(
                         config,
                         runtime_plan,
                         snapshot_settings,
+                        reconnect_settings,
                         table_store,
                         cdc_replication_debug,
                         transaction_sender,

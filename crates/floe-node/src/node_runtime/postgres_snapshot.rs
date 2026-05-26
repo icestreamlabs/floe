@@ -1193,7 +1193,9 @@ async fn buffer_postgres_wal_stream(
                     changed.context("buffered Postgres CDC feedback release channel closed")?;
                     continue;
                 }
-                event = replication.recv() => event.context("receive buffered native Postgres CDC event")?,
+                event = replication.recv() => event
+                    .map_err(reconnectable_postgres_cdc_error)
+                    .context("receive buffered native Postgres CDC event")?,
             };
             let Some(event) = event else {
                 break;
@@ -1266,7 +1268,8 @@ async fn buffer_postgres_wal_stream(
                 &wal_pressure_tx,
                 runtime_plan.source_id.as_str(),
                 &slot,
-                sender.max_capacity()
+                sender
+                    .max_capacity()
                     .saturating_sub(sender.capacity())
                     .saturating_add(1),
                 sender.max_capacity(),
@@ -2457,8 +2460,25 @@ async fn wait_for_postgres_snapshot_commit(
     target_lsn: PostgresLsn,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    wait_for_postgres_cdc_commit(
+        receiver,
+        slot,
+        target_lsn,
+        cancel,
+        "initial Postgres snapshot durability",
+    )
+    .await
+}
+
+pub(super) async fn wait_for_postgres_cdc_commit(
+    receiver: Option<&mut watch::Receiver<PostgresCdcCommit>>,
+    slot: &str,
+    target_lsn: PostgresLsn,
+    cancel: &CancellationToken,
+    operation: &str,
+) -> Result<()> {
     let Some(receiver) = receiver else {
-        bail!("cannot wait for initial Postgres snapshot durability without commit receiver");
+        bail!("cannot wait for {operation} without Postgres CDC commit receiver");
     };
 
     loop {
@@ -2469,10 +2489,12 @@ async fn wait_for_postgres_snapshot_commit(
 
         tokio::select! {
             _ = cancel.cancelled() => {
-                bail!("cancelled while waiting for initial Postgres snapshot durability");
+                bail!("cancelled while waiting for {operation}");
             }
             changed = receiver.changed() => {
-                changed.context("Postgres CDC commit channel closed before initial snapshot became durable")?;
+                changed.with_context(|| {
+                    format!("Postgres CDC commit channel closed before {operation} completed")
+                })?;
             }
         }
     }

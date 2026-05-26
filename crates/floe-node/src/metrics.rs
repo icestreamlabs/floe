@@ -180,6 +180,24 @@ static POSTGRES_CDC_SOURCE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register floe_postgres_cdc_source_lag_bytes")
 });
 
+static POSTGRES_CDC_SOURCE_CONNECTED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_postgres_cdc_source_connected",
+        "Whether the Postgres CDC replication stream is currently connected",
+        &["source", "slot"]
+    )
+    .expect("register floe_postgres_cdc_source_connected")
+});
+
+static POSTGRES_CDC_RECONNECTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_postgres_cdc_reconnects_total",
+        "Postgres CDC source reconnect attempts by source, slot, and result",
+        &["source", "slot", "result"]
+    )
+    .expect("register floe_postgres_cdc_reconnects_total")
+});
+
 static POSTGRES_CDC_TABLE_LAST_APPLIED_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_table_last_applied_lsn",
@@ -715,6 +733,18 @@ pub(crate) fn record_postgres_cdc_durable_lsn(source: &str, slot: &str, lsn: u64
     }
 }
 
+pub(crate) fn record_postgres_cdc_source_connected(source: &str, slot: &str, connected: bool) {
+    POSTGRES_CDC_SOURCE_CONNECTED
+        .with_label_values(&[source, slot])
+        .set(if connected { 1 } else { 0 });
+}
+
+pub(crate) fn inc_postgres_cdc_reconnect(source: &str, slot: &str, result: &str) {
+    POSTGRES_CDC_RECONNECTS_TOTAL
+        .with_label_values(&[source, slot, result])
+        .inc();
+}
+
 pub(crate) fn record_postgres_cdc_table_applied_lsn(
     source: &str,
     slot: &str,
@@ -1152,6 +1182,8 @@ mod tests {
         );
         record_postgres_cdc_snapshot_concurrency(source, slot, 2, 1, 4);
         record_postgres_cdc_snapshot_wal_buffer_fill(source, slot, 3, 4);
+        record_postgres_cdc_source_connected(source, slot, true);
+        inc_postgres_cdc_reconnect(source, slot, "scheduled");
         inc_postgres_cdc_snapshot_concurrency_adjustment(
             source,
             slot,
@@ -1195,6 +1227,12 @@ mod tests {
         ));
         assert!(body.contains(
             "floe_postgres_cdc_snapshot_wal_buffer_fill_percent{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 75"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_source_connected{slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_postgres_cdc_reconnects_total{result=\"scheduled\",slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 1"
         ));
         assert!(body.contains(
             "floe_postgres_cdc_snapshot_concurrency_adjustments_total{direction=\"decrease\",reason=\"wal_buffer_high\",slot=\"slot_metrics_test\",source=\"pg_metrics_test\"} 1"

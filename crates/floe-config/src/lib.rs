@@ -210,6 +210,29 @@ pub struct ReplicationConfig {
 pub struct PostgresCdcConfig {
     #[serde(default)]
     pub snapshot: PostgresCdcSnapshotConfig,
+    #[serde(default)]
+    pub reconnect: PostgresCdcReconnectConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresCdcReconnectConfig {
+    #[serde(default = "default_postgres_cdc_reconnect_max_reconnects")]
+    pub max_reconnects: usize,
+    #[serde(default = "default_postgres_cdc_reconnect_retry_base_ms")]
+    pub retry_base_ms: u64,
+    #[serde(default = "default_postgres_cdc_reconnect_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
+}
+
+impl Default for PostgresCdcReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_reconnects: DEFAULT_POSTGRES_CDC_RECONNECT_MAX_RECONNECTS,
+            retry_base_ms: DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_BASE_MS,
+            retry_max_backoff_ms: DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_MAX_BACKOFF_MS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -409,6 +432,9 @@ const DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_HIGH_WATERMARK_PERCENT: usize = 7
 const DEFAULT_POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_LOW_WATERMARK_PERCENT: usize = 25;
 const DEFAULT_POSTGRES_CDC_SNAPSHOT_SLOW_SCAN_MS: u64 = 30_000;
 const DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS: u64 = 500;
+const DEFAULT_POSTGRES_CDC_RECONNECT_MAX_RECONNECTS: usize = 10;
+const DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_BASE_MS: u64 = 1_000;
+const DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_MAX_BACKOFF_MS: u64 = 30_000;
 
 fn default_replication_buffer_delivered_retention_ms() -> u64 {
     DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
@@ -496,6 +522,18 @@ fn default_postgres_cdc_snapshot_slow_scan_ms() -> u64 {
 
 fn default_postgres_cdc_snapshot_controller_interval_ms() -> u64 {
     DEFAULT_POSTGRES_CDC_SNAPSHOT_CONTROLLER_INTERVAL_MS
+}
+
+fn default_postgres_cdc_reconnect_max_reconnects() -> usize {
+    DEFAULT_POSTGRES_CDC_RECONNECT_MAX_RECONNECTS
+}
+
+fn default_postgres_cdc_reconnect_retry_base_ms() -> u64 {
+    DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_BASE_MS
+}
+
+fn default_postgres_cdc_reconnect_retry_max_backoff_ms() -> u64 {
+    DEFAULT_POSTGRES_CDC_RECONNECT_RETRY_MAX_BACKOFF_MS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1130,6 +1168,7 @@ mod tests {
                     wal_buffer_high_watermark_percent: 0,
                     ..PostgresCdcSnapshotConfig::default()
                 },
+                ..PostgresCdcConfig::default()
             },
             ..NodeConfig::default()
         };
@@ -1381,6 +1420,43 @@ mod tests {
         assert_eq!(snapshot.slow_scan_ms, 12_000);
         assert_eq!(snapshot.controller_interval_ms, 250);
         assert!(snapshot.perf_log);
+    }
+
+    #[test]
+    fn load_config_accepts_postgres_cdc_reconnect_section() {
+        let input = r#"
+            [postgres_cdc.reconnect]
+            max_reconnects = 3
+            retry_base_ms = 250
+            retry_max_backoff_ms = 4000
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+        let reconnect = config.postgres_cdc.reconnect;
+
+        assert_eq!(reconnect.max_reconnects, 3);
+        assert_eq!(reconnect.retry_base_ms, 250);
+        assert_eq!(reconnect.retry_max_backoff_ms, 4_000);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_postgres_cdc_reconnect_backoff() {
+        let config = NodeConfig {
+            postgres_cdc: PostgresCdcConfig {
+                reconnect: PostgresCdcReconnectConfig {
+                    retry_base_ms: 5_000,
+                    retry_max_backoff_ms: 1_000,
+                    ..PostgresCdcReconnectConfig::default()
+                },
+                ..PostgresCdcConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+
+        let err = validate_node_config(&config).expect_err("validation should fail");
+        assert!(err.to_string().contains(
+            "postgres_cdc.reconnect.retry_max_backoff_ms must be >= postgres_cdc.reconnect.retry_base_ms"
+        ));
     }
 
     #[test]

@@ -219,6 +219,20 @@ fn validate_postgres_cdc_config(postgres_cdc: &PostgresCdcConfig) -> Result<()> 
         snapshot.controller_interval_ms,
         "postgres_cdc.snapshot.controller_interval_ms",
     )?;
+    let reconnect = &postgres_cdc.reconnect;
+    ensure_positive_u64(
+        reconnect.retry_base_ms,
+        "postgres_cdc.reconnect.retry_base_ms",
+    )?;
+    ensure_positive_u64(
+        reconnect.retry_max_backoff_ms,
+        "postgres_cdc.reconnect.retry_max_backoff_ms",
+    )?;
+    if reconnect.retry_max_backoff_ms < reconnect.retry_base_ms {
+        bail!(
+            "postgres_cdc.reconnect.retry_max_backoff_ms must be >= postgres_cdc.reconnect.retry_base_ms"
+        );
+    }
     Ok(())
 }
 

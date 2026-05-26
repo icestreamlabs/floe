@@ -69,6 +69,8 @@ Observability:
   - `floe_source_offset_lag{source=...,partition=...}`
   - `floe_mv_freshness_seconds{view=...}`
   - `floe_postgres_cdc_source_lag_bytes{source=...,slot=...}`
+  - `floe_postgres_cdc_source_connected{source=...,slot=...}`
+  - `floe_postgres_cdc_reconnects_total{source=...,slot=...,result=...}`
   - `floe_postgres_cdc_table_lag_bytes{source=...,slot=...,table=...}`
   - `floe_cdc_buffer_pending_records{pipeline=...}`
   - `floe_cdc_buffer_pending_bytes{pipeline=...}`
@@ -146,6 +148,10 @@ Current requirements and limitations:
 - The Postgres publication and logical replication slot are auto-created by
   default when possible. Use `publication.create = false` or
   `slot.create = false` to require manually managed objects.
+- Source CDC reconnect retries the configured connection string from the last
+  durable LSN. Configure `[postgres_cdc.reconnect]` with `max_reconnects`,
+  `retry_base_ms`, and `retry_max_backoff_ms`; set `max_reconnects = 0` for
+  fail-fast behavior.
 - CDC tables need primary-key metadata for update/delete and target upsert
   semantics.
 - Schema evolution has an explicit alpha contract:
@@ -164,13 +170,19 @@ Current requirements and limitations:
   types remain deferred.
 - Source/target HA failover, reconciliation/drift checks, richer operator CLI
   UX, and larger published performance baselines are follow-up product work.
+- Full HA discovery is not implemented in alpha: source failover requires the
+  configured connection string to resolve to the new writer, and the promoted
+  Postgres instance must retain a compatible logical slot/publication. Target
+  Postgres sinks and replication pipelines retry the configured endpoint; use a
+  stable proxy/DNS name for writer changes.
 - Arrow IPC Kafka output is internal/experimental and should not be used for
   public apples-to-apples format claims without calling that out.
 
 Postgres CDC operator endpoints:
 
-- `GET /ops/cdc/replication` lists pipelines with source lag, target state,
-  durable buffer stats, DLQ summary, replay state, and latest target error.
+- `GET /ops/cdc/replication` lists pipelines with source lag,
+  source connection/reconnect state, target state, durable buffer stats, DLQ
+  summary, replay state, and latest target error.
 - `GET /ops/cdc/replication/dlq?pipeline=...&status=pending&limit=100&offset=0`
   lists DLQ entries with bounded pagination and optional status filtering.
 - `GET /ops/cdc/replication/dlq/{pipeline}/{dlq_id}` inspects a single DLQ
