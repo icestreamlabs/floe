@@ -142,8 +142,9 @@ Postgres CDC is an alpha feature for single-node deployments. It supports:
 
 Current requirements and limitations:
 
-- The Postgres publication and logical replication slot must exist before the
-  node starts.
+- The Postgres publication and logical replication slot are auto-created by
+  default when possible. Use `publication.create = false` or
+  `slot.create = false` to require manually managed objects.
 - CDC tables need primary-key metadata for update/delete and target upsert
   semantics.
 - Schema evolution is fail-fast or compatibility-policy limited; online product

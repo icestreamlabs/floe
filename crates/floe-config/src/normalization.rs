@@ -345,6 +345,8 @@ impl ConnectorSpec {
                 include_tables,
                 include_schema_in_source,
                 schema_evolution_policy,
+                auto_create_slot,
+                auto_create_publication,
                 ..
             } => {
                 let mut props = vec![("slot".to_string(), slot.clone())];
@@ -364,6 +366,15 @@ impl ConnectorSpec {
                     props.push((
                         "schema_evolution_policy".to_string(),
                         schema_evolution_policy.as_str().to_string(),
+                    ));
+                }
+                if let Some(auto_create_slot) = auto_create_slot {
+                    props.push(("auto_create_slot".to_string(), auto_create_slot.to_string()));
+                }
+                if let Some(auto_create_publication) = auto_create_publication {
+                    props.push((
+                        "auto_create_publication".to_string(),
+                        auto_create_publication.to_string(),
                     ));
                 }
                 props

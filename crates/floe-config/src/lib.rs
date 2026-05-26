@@ -562,6 +562,10 @@ pub enum ConnectorConfig {
         include_schema_in_source: Option<bool>,
         #[serde(default)]
         schema_evolution_policy: Option<PostgresCdcSchemaEvolutionPolicy>,
+        #[serde(default)]
+        auto_create_slot: Option<bool>,
+        #[serde(default)]
+        auto_create_publication: Option<bool>,
     },
 }
 
@@ -1377,6 +1381,32 @@ mod tests {
         assert_eq!(snapshot.slow_scan_ms, 12_000);
         assert_eq!(snapshot.controller_interval_ms, 250);
         assert!(snapshot.perf_log);
+    }
+
+    #[test]
+    fn load_config_accepts_postgres_cdc_setup_policy() {
+        let input = r#"
+            [[connectors]]
+            type = "postgres_cdc"
+            connection = "postgres://postgres:postgres@localhost/postgres"
+            slot = "floe_slot"
+            publication = "floe_pub"
+            auto_create_slot = false
+            auto_create_publication = true
+        "#;
+
+        let config = parse_toml_config(input).expect("parse toml");
+        let ConnectorConfig::PostgresCdc {
+            auto_create_slot,
+            auto_create_publication,
+            ..
+        } = &config.connectors[0]
+        else {
+            panic!("expected postgres cdc connector");
+        };
+
+        assert_eq!(*auto_create_slot, Some(false));
+        assert_eq!(*auto_create_publication, Some(true));
     }
 
     #[test]

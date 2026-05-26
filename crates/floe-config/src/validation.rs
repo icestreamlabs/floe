@@ -329,6 +329,8 @@ fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
             include_tables,
             include_schema_in_source: _,
             schema_evolution_policy: _,
+            auto_create_slot: _,
+            auto_create_publication: _,
         } => {
             ensure_optional_non_empty(name.as_deref(), &format!("connectors[{index}].name"))?;
             ensure_non_empty(connection, &format!("connectors[{index}].connection"))?;

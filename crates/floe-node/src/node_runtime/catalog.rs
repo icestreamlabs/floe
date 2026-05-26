@@ -22,15 +22,17 @@ pub(super) fn catalog_source_definition_from_sql(
     definition: &CreateSourceDefinition,
 ) -> anyhow::Result<CatalogSourceDefinition> {
     let connector = match definition.connector() {
-        SourceConnector::PostgresCdc(options) => CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
+        SourceConnector::PostgresCdc(options) => {
+            CatalogSourceConnector::PostgresCdc(PostgresCdcSourceDefinition::new_with_setup_policy(
                 options.connection(),
                 options.slot(),
                 options.publication().map(ToString::to_string),
                 options.include_schema_in_source(),
                 options.schema_evolution_policy(),
-            )?,
-        ),
+                options.auto_create_slot(),
+                options.auto_create_publication(),
+            )?)
+        }
     };
     CatalogSourceDefinition::new(definition.name(), connector)
 }

@@ -467,6 +467,8 @@ pub(super) async fn ensure_postgres_cdc_publication_and_slot(
     slot: &str,
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
+    auto_create_slot: bool,
+    auto_create_publication: bool,
 ) -> Result<()> {
     let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
         .await
@@ -482,6 +484,8 @@ pub(super) async fn ensure_postgres_cdc_publication_and_slot(
         slot,
         publication,
         runtime_plan,
+        auto_create_slot,
+        auto_create_publication,
     )
     .await;
     drop(client);
@@ -494,7 +498,12 @@ async fn ensure_postgres_cdc_publication_and_slot_with_client(
     slot: &str,
     publication: &str,
     runtime_plan: &PostgresCdcRuntimePlan,
+    auto_create_slot: bool,
+    auto_create_publication: bool,
 ) -> Result<()> {
+    validate_postgres_cdc_prerequisites(client).await?;
+    validate_postgres_cdc_table_read_privileges(client, runtime_plan).await?;
+
     let publication_exists: bool = client
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
@@ -504,6 +513,10 @@ async fn ensure_postgres_cdc_publication_and_slot_with_client(
         .with_context(|| format!("check Postgres CDC publication '{publication}'"))?
         .get(0);
     if !publication_exists {
+        ensure!(
+            auto_create_publication,
+            "Postgres CDC publication '{publication}' does not exist; create it manually or set publication.create=true / auto_create_publication=true"
+        );
         let schemas = sorted_snapshot_schemas(&runtime_plan.schemas);
         ensure!(
             !schemas.is_empty(),
@@ -538,6 +551,10 @@ async fn ensure_postgres_cdc_publication_and_slot_with_client(
             plugin
         ),
         None => {
+            ensure!(
+                auto_create_slot,
+                "Postgres CDC logical replication slot '{slot}' does not exist; create it manually or set slot.create=true / auto_create_slot=true"
+            );
             tracing::debug!(
                 source = %runtime_plan.source_id.as_str(),
                 slot = %slot,
@@ -546,6 +563,65 @@ async fn ensure_postgres_cdc_publication_and_slot_with_client(
         }
     }
 
+    Ok(())
+}
+
+async fn validate_postgres_cdc_prerequisites(client: &tokio_postgres::Client) -> Result<()> {
+    let wal_level: String = client
+        .query_one("SHOW wal_level", &[])
+        .await
+        .context("check Postgres wal_level for CDC setup")?
+        .get(0);
+    ensure!(
+        wal_level.eq_ignore_ascii_case("logical"),
+        "Postgres CDC requires wal_level=logical; current wal_level is '{wal_level}'"
+    );
+
+    let can_replicate: bool = client
+        .query_one(
+            "SELECT rolsuper OR rolreplication
+             FROM pg_roles
+             WHERE rolname = current_user",
+            &[],
+        )
+        .await
+        .context("check Postgres CDC user replication privilege")?
+        .get(0);
+    ensure!(
+        can_replicate,
+        "Postgres CDC user must have REPLICATION privilege or be a superuser to use logical replication slots"
+    );
+    Ok(())
+}
+
+async fn validate_postgres_cdc_table_read_privileges(
+    client: &tokio_postgres::Client,
+    runtime_plan: &PostgresCdcRuntimePlan,
+) -> Result<()> {
+    for schema in sorted_snapshot_schemas(&runtime_plan.schemas) {
+        let upstream = schema.upstream_table();
+        let table_name = qualified_table_name(upstream);
+        let can_select: bool = client
+            .query_one(
+                "SELECT has_table_privilege($1::regclass, 'SELECT')",
+                &[&table_name],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "check Postgres CDC SELECT privilege on '{}.{}'",
+                    upstream.schema(),
+                    upstream.table()
+                )
+            })?
+            .get(0);
+        ensure!(
+            can_select,
+            "Postgres CDC user must have SELECT privilege on table '{}.{}'",
+            upstream.schema(),
+            upstream.table()
+        );
+    }
     Ok(())
 }
 

@@ -13,6 +13,8 @@ pub struct PostgresCdcSourceConfig {
     pub connection_string: String,
     pub slot: String,
     pub publication: String,
+    pub auto_create_slot: bool,
+    pub auto_create_publication: bool,
     pub commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
 }
 
@@ -131,6 +133,8 @@ mod tests {
             connection_string: "postgres://floe:secret@localhost:5432/postgres".to_string(),
             slot: "floe_slot".to_string(),
             publication: DEFAULT_POSTGRES_PUBLICATION.to_string(),
+            auto_create_slot: true,
+            auto_create_publication: true,
             commit_lsn_rx: None,
         }
     }

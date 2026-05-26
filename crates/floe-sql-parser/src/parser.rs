@@ -95,8 +95,8 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
         .to_ascii_lowercase()
         .replace('-', "_");
     let connector = match connector.as_str() {
-        "postgres_cdc" => SourceConnector::PostgresCdc(
-            PostgresCdcSourceOptions::new_with_schema_evolution_policy(
+        "postgres_cdc" => {
+            SourceConnector::PostgresCdc(PostgresCdcSourceOptions::new_with_setup_policy(
                 postgres_connection_string_from_options(&options)?,
                 option_any(&options, &["slot.name", "slot"])
                     .ok_or_else(|| anyhow!("CREATE SOURCE postgres-cdc requires slot.name/slot"))?
@@ -107,8 +107,26 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
                     .map(|value| parse_bool_option("include_schema_in_source", value))
                     .transpose()?,
                 postgres_schema_evolution_policy_from_options(&options)?,
-            )?,
-        ),
+                option_any(
+                    &options,
+                    &["slot.create", "slot.auto_create", "auto_create_slot"],
+                )
+                .map(|value| parse_bool_option("slot.create", value))
+                .transpose()?
+                .unwrap_or(true),
+                option_any(
+                    &options,
+                    &[
+                        "publication.create",
+                        "publication.auto_create",
+                        "auto_create_publication",
+                    ],
+                )
+                .map(|value| parse_bool_option("publication.create", value))
+                .transpose()?
+                .unwrap_or(true),
+            )?)
+        }
         other => return Err(anyhow!("unsupported source connector type '{other}'")),
     };
 

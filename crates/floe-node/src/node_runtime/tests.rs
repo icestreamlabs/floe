@@ -684,7 +684,9 @@ fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
             connection = 'postgres://postgres:postgres@localhost/postgres',
             slot.name = 'floe_slot',
             publication.name = 'floe_pub',
-            schema.evolution = 'apply-compatible-additions'
+            schema.evolution = 'apply-compatible-additions',
+            slot.create = false,
+            publication.create = true
         )",
     )
     .expect("parse create source");
@@ -704,6 +706,8 @@ fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
         postgres.schema_evolution_policy(),
         CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions
     );
+    assert!(!postgres.auto_create_slot());
+    assert!(postgres.auto_create_publication());
 }
 
 #[test]
@@ -711,12 +715,14 @@ fn materialized_view_validation_rejects_raw_cdc_source_references() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
+            PostgresCdcSourceDefinition::new_with_setup_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
                 CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
+                false,
+                true,
             )
             .expect("postgres source"),
         ),
@@ -745,12 +751,14 @@ fn materialized_view_validation_accepts_cdc_table_references() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
+            PostgresCdcSourceDefinition::new_with_setup_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
                 CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
+                false,
+                true,
             )
             .expect("postgres source"),
         ),
@@ -834,12 +842,14 @@ fn catalog_postgres_source_connector_merges_include_tables() {
     let source = CatalogSourceDefinition::new(
         "pg_main",
         CatalogSourceConnector::PostgresCdc(
-            PostgresCdcSourceDefinition::new_with_schema_evolution_policy(
+            PostgresCdcSourceDefinition::new_with_setup_policy(
                 "postgres://postgres:postgres@localhost/postgres",
                 "floe_slot",
                 Some("floe_pub".to_string()),
                 Some(false),
                 CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible,
+                false,
+                true,
             )
             .expect("postgres source"),
         ),
@@ -868,6 +878,8 @@ fn catalog_postgres_source_connector_merges_include_tables() {
         include_tables,
         include_schema_in_source,
         schema_evolution_policy,
+        auto_create_slot,
+        auto_create_publication,
         ..
     } = &connector_specs[0].config
     else {
@@ -888,6 +900,8 @@ fn catalog_postgres_source_connector_merges_include_tables() {
         schema_evolution_policy.as_ref().copied(),
         Some(CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible)
     );
+    assert_eq!(auto_create_slot.as_ref().copied(), Some(false));
+    assert_eq!(auto_create_publication.as_ref().copied(), Some(true));
 }
 
 #[test]

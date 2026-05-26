@@ -130,6 +130,10 @@ pub struct PostgresCdcSourceDefinition {
     include_schema_in_source: Option<bool>,
     #[serde(default = "default_postgres_cdc_schema_evolution_policy")]
     schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+    #[serde(default = "default_true")]
+    auto_create_slot: bool,
+    #[serde(default = "default_true")]
+    auto_create_publication: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -244,6 +248,10 @@ fn default_replication_buffer_mode() -> ReplicationBufferMode {
 
 fn default_postgres_cdc_schema_evolution_policy() -> PostgresCdcSchemaEvolutionPolicy {
     PostgresCdcSchemaEvolutionPolicy::FailFast
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl<'de> Deserialize<'de> for TableDefinition {
@@ -373,6 +381,26 @@ impl PostgresCdcSourceDefinition {
         include_schema_in_source: Option<bool>,
         schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
     ) -> Result<Self> {
+        Self::new_with_setup_policy(
+            connection,
+            slot,
+            publication,
+            include_schema_in_source,
+            schema_evolution_policy,
+            true,
+            true,
+        )
+    }
+
+    pub fn new_with_setup_policy(
+        connection: impl Into<String>,
+        slot: impl Into<String>,
+        publication: Option<String>,
+        include_schema_in_source: Option<bool>,
+        schema_evolution_policy: PostgresCdcSchemaEvolutionPolicy,
+        auto_create_slot: bool,
+        auto_create_publication: bool,
+    ) -> Result<Self> {
         let connection = connection.into();
         let slot = slot.into();
         ensure!(
@@ -389,6 +417,8 @@ impl PostgresCdcSourceDefinition {
             publication,
             include_schema_in_source,
             schema_evolution_policy,
+            auto_create_slot,
+            auto_create_publication,
         })
     }
 
@@ -410,6 +440,14 @@ impl PostgresCdcSourceDefinition {
 
     pub fn schema_evolution_policy(&self) -> PostgresCdcSchemaEvolutionPolicy {
         self.schema_evolution_policy
+    }
+
+    pub fn auto_create_slot(&self) -> bool {
+        self.auto_create_slot
+    }
+
+    pub fn auto_create_publication(&self) -> bool {
+        self.auto_create_publication
     }
 }
 

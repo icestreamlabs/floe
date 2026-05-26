@@ -501,6 +501,8 @@ pub(super) fn merge_catalog_source_connectors(
                     include_tables: Some(include_tables),
                     include_schema_in_source: postgres.include_schema_in_source(),
                     schema_evolution_policy: Some(postgres.schema_evolution_policy()),
+                    auto_create_slot: Some(postgres.auto_create_slot()),
+                    auto_create_publication: Some(postgres.auto_create_publication()),
                 }
             }
         };
@@ -531,6 +533,8 @@ async fn run_native_postgres_cdc_connector(
         &slot,
         &publication,
         &runtime_plan,
+        config.auto_create_slot,
+        config.auto_create_publication,
     )
     .await?;
     let initial_snapshot = super::postgres_snapshot::run_initial_postgres_snapshot_if_needed(
@@ -2130,6 +2134,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 connection,
                 slot,
                 publication,
+                auto_create_slot,
+                auto_create_publication,
                 ..
             } => {
                 let publication = publication.unwrap_or_else(default_postgres_publication);
@@ -2155,6 +2161,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     connection_string: connection,
                     slot,
                     publication,
+                    auto_create_slot: auto_create_slot.unwrap_or(true),
+                    auto_create_publication: auto_create_publication.unwrap_or(true),
                     commit_lsn_rx: Some(commit_rx),
                 };
                 tracing::info!(

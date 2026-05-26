@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[path = "support/ports.rs"]
 mod ports;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -1330,6 +1330,142 @@ async fn postgres_cdc_sql_source_table_mv_acceptance() -> Result<()> {
             .await
             .context("insert SQL CDC row")?;
         wait_for_mv_price_count_at_least(pg_port, &mv_name, 41, 123, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication};"))
+        .await;
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+        .await;
+    test_result
+}
+
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_auto_creates_publication_and_slot_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pg_port = find_unused_port()?;
+    let table = format!("nexmark_bid_auto_setup_{run_id}");
+    let source_name = format!("pg_auto_setup_{run_id}");
+    let mv_name = format!("mv_floe_cdc_auto_setup_{run_id}");
+    let slot = format!("floe_acceptance_auto_setup_{run_id}");
+    let publication = format!("floe_acceptance_auto_setup_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir.path().join("empty.json");
+    std::fs::write(&config_path, "{}").context("write empty config")?;
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for SQL CDC auto setup acceptance")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres SQL CDC auto setup connection closed");
+        }
+    });
+
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {publication};
+             DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+               auction BIGINT PRIMARY KEY,
+               bidder BIGINT NOT NULL,
+               price BIGINT NOT NULL,
+               channel TEXT,
+               url TEXT,
+               date_time BIGINT NOT NULL,
+               extra TEXT
+             );"
+        ))
+        .await
+        .context("prepare SQL CDC auto setup table")?;
+    let _ = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+
+    let sql = format!(
+        "CREATE SOURCE {source_name} WITH (
+            connector = 'postgres-cdc',
+            connection = '{dsn}',
+            slot.name = '{slot}',
+            publication.name = '{publication}',
+            slot.create = true,
+            publication.create = true
+         );
+         CREATE TABLE {table} (
+            auction BIGINT PRIMARY KEY,
+            bidder BIGINT NOT NULL,
+            price BIGINT NOT NULL,
+            channel TEXT,
+            url TEXT,
+            date_time BIGINT NOT NULL,
+            extra TEXT
+         ) FROM {source_name} TABLE 'public.{table}';
+         CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} AS
+         SELECT auction, bidder, price FROM {table}"
+    );
+    let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} \
+                     (auction, bidder, price, channel, url, date_time, extra) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                ),
+                &[
+                    &51_i64,
+                    &951_i64,
+                    &151_i64,
+                    &"web",
+                    &"http://example.com",
+                    &1_700_000_051_i64,
+                    &"auto_setup",
+                ],
+            )
+            .await
+            .context("insert SQL CDC auto setup row")?;
+        wait_for_mv_price_count_at_least(pg_port, &mv_name, 51, 151, 1).await?;
+
+        let publication_exists: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+                &[&publication],
+            )
+            .await
+            .context("check auto-created publication")?
+            .get(0);
+        let slot_plugin = client
+            .query_opt(
+                "SELECT plugin FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .context("check auto-created slot")?
+            .map(|row| row.get::<_, Option<String>>(0))
+            .flatten();
+
+        ensure!(publication_exists, "publication was not auto-created");
+        ensure!(
+            slot_plugin.as_deref() == Some("pgoutput"),
+            "slot was not auto-created with pgoutput"
+        );
         Ok::<(), anyhow::Error>(())
     }
     .await;
