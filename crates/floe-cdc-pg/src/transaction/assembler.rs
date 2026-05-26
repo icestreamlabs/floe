@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, anyhow, bail};
 use floe_cdc_core::{
@@ -6,13 +6,17 @@ use floe_cdc_core::{
     CdcTransactionId, ChangeBatch, TransactionBatch,
 };
 
-use crate::{PgOutputCdcChange, PgOutputDecoder, PostgresLsn, PostgresReplicationEvent};
+use crate::{
+    PgOutputCdcChange, PgOutputDecoder, PostgresLsn, PostgresReplicaIdentity,
+    PostgresReplicationEvent,
+};
 
 use super::router::PostgresTableRouter;
 use super::schema_evolution::{
-    PostgresSchemaEvolutionObservation, PostgresSchemaEvolutionOutcome,
-    PostgresSchemaEvolutionPolicy, SchemaEvolution, classify_schema_evolution,
-    project_change_to_schema, schema_versions_for_schemas,
+    PostgresObservedSchemaVersion, PostgresSchemaEvolutionObservation,
+    PostgresSchemaEvolutionOutcome, PostgresSchemaEvolutionPolicy, SchemaEvolution,
+    classify_schema_evolution, project_change_to_schema, push_schema_history,
+    schema_versions_for_schemas,
 };
 
 pub struct PostgresTransactionAssembler {
@@ -23,6 +27,8 @@ pub struct PostgresTransactionAssembler {
     schemas: HashMap<CdcTableId, CdcTableSchema>,
     schema_policy: PostgresSchemaEvolutionPolicy,
     schema_versions: CdcSchemaVersionMap,
+    schema_history: HashMap<CdcTableId, VecDeque<PostgresObservedSchemaVersion>>,
+    replica_identity_by_table: HashMap<CdcTableId, PostgresReplicaIdentity>,
     schema_observations: Vec<PostgresSchemaEvolutionObservation>,
 }
 
@@ -36,6 +42,8 @@ impl PostgresTransactionAssembler {
             schemas: HashMap::new(),
             schema_policy: PostgresSchemaEvolutionPolicy::FailFast,
             schema_versions: CdcSchemaVersionMap::new(),
+            schema_history: HashMap::new(),
+            replica_identity_by_table: HashMap::new(),
             schema_observations: Vec::new(),
         }
     }
@@ -55,6 +63,8 @@ impl PostgresTransactionAssembler {
             schemas,
             schema_policy,
             schema_versions,
+            schema_history: HashMap::new(),
+            replica_identity_by_table: HashMap::new(),
             schema_observations: Vec::new(),
         }
     }
@@ -92,6 +102,14 @@ impl PostgresTransactionAssembler {
     pub fn reset_stream_state(&mut self) {
         self.decoder = PgOutputDecoder::new();
         self.current = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schema_history_len_for_test(&self, table_id: &CdcTableId) -> usize {
+        self.schema_history
+            .get(table_id)
+            .map(VecDeque::len)
+            .unwrap_or_default()
     }
 
     fn begin(&mut self, xid: u32) -> Result<()> {
@@ -140,18 +158,58 @@ impl PostgresTransactionAssembler {
         let Some(table_id) = self.router.get(&upstream_table).cloned() else {
             return Ok(());
         };
-        let Some(catalog_schema) = self.schemas.get(&table_id) else {
+        let Some(catalog_schema) = self.schemas.get(&table_id).cloned() else {
             return Ok(());
         };
-        let observed_schema = relation.to_cdc_schema(table_id.clone())?;
         let catalog_schema_version = catalog_schema.stable_fingerprint();
+        let observed_schema = match relation.to_cdc_schema(table_id.clone()) {
+            Ok(schema) => schema,
+            Err(err) => {
+                let reason = format!(
+                    "replica identity {:?} cannot provide a CDC key: {err:#}",
+                    relation.replica_identity()
+                );
+                self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
+                    table_id.clone(),
+                    upstream_table.clone(),
+                    self.schema_policy,
+                    PostgresSchemaEvolutionOutcome::Incompatible,
+                    Vec::new(),
+                    Some(reason.clone()),
+                    catalog_schema_version,
+                    catalog_schema_version,
+                ));
+                bail!(
+                    "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
+                    table_id.as_str()
+                );
+            }
+        };
         let observed_schema_version = observed_schema.stable_fingerprint();
+        if let Err(err) = self.accept_replica_identity(&table_id, relation.replica_identity()) {
+            let reason = err.to_string();
+            self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
+                table_id.clone(),
+                upstream_table.clone(),
+                self.schema_policy,
+                PostgresSchemaEvolutionOutcome::Incompatible,
+                Vec::new(),
+                Some(reason.clone()),
+                catalog_schema_version,
+                observed_schema_version,
+            ));
+            bail!(
+                "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
+                table_id.as_str()
+            );
+        }
         let catalog_column_count = catalog_schema.columns().len();
         let observed_column_count = observed_schema.columns().len();
-        match classify_schema_evolution(catalog_schema, &observed_schema) {
+        match classify_schema_evolution(&catalog_schema, &observed_schema) {
             SchemaEvolution::Unchanged => {
                 self.schema_versions
                     .insert(table_id.as_str().to_string(), catalog_schema_version);
+                self.record_schema_history(table_id, &observed_schema);
                 Ok(())
             }
             SchemaEvolution::CompatibleAddition { added_columns } => match self.schema_policy {
@@ -214,6 +272,7 @@ impl PostgresTransactionAssembler {
                     );
                     self.schema_versions
                         .insert(table_id.as_str().to_string(), observed_schema_version);
+                    self.record_schema_history(table_id, &observed_schema);
                     Ok(())
                 }
             },
@@ -246,6 +305,39 @@ impl PostgresTransactionAssembler {
                 )
             }
         }
+    }
+
+    fn accept_replica_identity(
+        &mut self,
+        table_id: &CdcTableId,
+        observed: PostgresReplicaIdentity,
+    ) -> Result<()> {
+        match observed {
+            PostgresReplicaIdentity::Default
+            | PostgresReplicaIdentity::Index
+            | PostgresReplicaIdentity::Full => {}
+            PostgresReplicaIdentity::Nothing => {
+                bail!("replica identity NOTHING cannot safely decode updates or deletes")
+            }
+            PostgresReplicaIdentity::Unknown(value) => {
+                bail!("unsupported replica identity mode 0x{value:02x}")
+            }
+        }
+        if let Some(previous) = self.replica_identity_by_table.get(table_id)
+            && *previous != observed
+        {
+            bail!("replica identity changed from {previous:?} to {observed:?}");
+        }
+        self.replica_identity_by_table
+            .insert(table_id.clone(), observed);
+        Ok(())
+    }
+
+    fn record_schema_history(&mut self, table_id: CdcTableId, schema: &CdcTableSchema) {
+        push_schema_history(
+            self.schema_history.entry(table_id).or_default(),
+            PostgresObservedSchemaVersion::from_schema(schema),
+        );
     }
 
     fn record_schema_evolution_observation(

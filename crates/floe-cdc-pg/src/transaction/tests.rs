@@ -21,8 +21,9 @@ use crate::pgoutput_test_messages::{
     id_status_relation_message as relation_message, insert_id_status_message as insert_message,
     insert_text_message as insert_message_with_values, put_null_value, put_text_value, put_u8,
     put_u16, put_u32, relation_message_with_column_specs as relation_message_with_columns,
-    truncate_message,
+    relation_message_with_identity_and_column_specs, truncate_message,
 };
+use crate::transaction::schema_evolution::POSTGRES_SCHEMA_HISTORY_LIMIT;
 use crate::{
     PgOutputMessage, PostgresCdcConfig, PostgresLsn, PostgresReplicationEvent,
     decode_pgoutput_message,
@@ -437,6 +438,160 @@ fn schema_policy_rejects_reordered_columns() {
         .expect_err("reordered columns should fail");
 
     assert!(format!("{err:#}").contains("column 0 changed"));
+}
+
+#[test]
+fn schema_policy_rejects_primary_key_changes() {
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        CdcSourceId::new("pg_main").expect("source id"),
+        router(),
+        orders_schemas(),
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+    );
+    let err = assembler
+        .accept_event(xlog(relation_message_with_columns(
+            RELATION_ID,
+            "orders",
+            &[("id", PG_INT8_OID, false), ("status", PG_TEXT_OID, true)],
+        )))
+        .expect_err("primary key change should fail");
+
+    assert!(format!("{err:#}").contains("primary key changed"));
+}
+
+#[test]
+fn schema_policy_rejects_replica_identity_changes() {
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        CdcSourceId::new("pg_main").expect("source id"),
+        router(),
+        orders_schemas(),
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+    );
+    assembler
+        .accept_event(xlog(relation_message_with_identity_and_column_specs(
+            RELATION_ID,
+            "orders",
+            b'd',
+            &[("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)],
+        )))
+        .expect("initial relation");
+
+    let err = assembler
+        .accept_event(xlog(relation_message_with_identity_and_column_specs(
+            RELATION_ID,
+            "orders",
+            b'f',
+            &[("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)],
+        )))
+        .expect_err("replica identity change should fail");
+
+    assert!(format!("{err:#}").contains("replica identity changed"));
+    let observations = assembler.drain_schema_evolution_observations();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].outcome(),
+        PostgresSchemaEvolutionOutcome::Incompatible
+    );
+}
+
+#[test]
+fn in_flight_transaction_decodes_each_relation_schema_version() {
+    let source_id = CdcSourceId::new("pg_main").expect("source id");
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        source_id,
+        router(),
+        orders_schemas(),
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+    );
+
+    assembler.accept_event(begin(70)).expect("begin");
+    assembler
+        .accept_event(xlog(relation_message(RELATION_ID, "orders")))
+        .expect("initial relation");
+    assembler
+        .accept_event(xlog(insert_message(RELATION_ID, 1, "before")))
+        .expect("insert before schema change");
+    let evolved_relation = relation_message_with_columns(
+        RELATION_ID,
+        "orders",
+        &[
+            ("id", PG_INT8_OID, true),
+            ("status", PG_TEXT_OID, false),
+            ("note", PG_TEXT_OID, false),
+        ],
+    );
+    assembler
+        .accept_event(xlog(evolved_relation.clone()))
+        .expect("compatible relation");
+    assembler
+        .accept_event(xlog(insert_message_with_values(
+            RELATION_ID,
+            &[
+                "2".to_string(),
+                "after".to_string(),
+                "projected".to_string(),
+            ],
+        )))
+        .expect("insert after schema change");
+    let transaction = assembler
+        .accept_event(commit(140))
+        .expect("commit")
+        .expect("transaction");
+
+    assert_eq!(
+        transaction.change_batches()[0].changes(),
+        &[
+            CdcChange::Insert {
+                row: id_status_row(1, "before")
+            },
+            CdcChange::Insert {
+                row: id_status_row(2, "after")
+            },
+        ]
+    );
+    let PgOutputMessage::Relation(observed_relation) =
+        decode_pgoutput_message(evolved_relation).expect("decode relation")
+    else {
+        panic!("expected relation");
+    };
+    let observed_schema = observed_relation
+        .to_cdc_schema(CdcTableId::new("orders").expect("table id"))
+        .expect("observed schema");
+    assert_eq!(
+        transaction.schema_versions().get("orders").copied(),
+        Some(observed_schema.stable_fingerprint())
+    );
+}
+
+#[test]
+fn schema_history_is_bounded_for_repeated_relation_versions() {
+    let table_id = CdcTableId::new("orders").expect("table id");
+    let mut assembler = PostgresTransactionAssembler::with_schemas(
+        CdcSourceId::new("pg_main").expect("source id"),
+        router(),
+        orders_schemas(),
+        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+    );
+
+    for added in 0..(POSTGRES_SCHEMA_HISTORY_LIMIT + 8) {
+        let mut borrowed = vec![("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)];
+        borrowed.extend((0..added).map(|idx| {
+            let name: &'static str = Box::leak(format!("note_{idx}").into_boxed_str());
+            (name, PG_TEXT_OID, false)
+        }));
+        assembler
+            .accept_event(xlog(relation_message_with_columns(
+                RELATION_ID,
+                "orders",
+                &borrowed,
+            )))
+            .expect("compatible relation");
+    }
+
+    assert_eq!(
+        assembler.schema_history_len_for_test(&table_id),
+        POSTGRES_SCHEMA_HISTORY_LIMIT
+    );
 }
 
 #[test]

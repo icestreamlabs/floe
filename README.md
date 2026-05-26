@@ -147,8 +147,18 @@ Current requirements and limitations:
   `slot.create = false` to require manually managed objects.
 - CDC tables need primary-key metadata for update/delete and target upsert
   semantics.
-- Schema evolution is fail-fast or compatibility-policy limited; online product
-  schema migration is not complete.
+- Schema evolution has an explicit alpha contract:
+  - `schema_evolution = 'fail_fast'` rejects any observed schema change.
+  - `ignore_compatible` and `apply_compatible_additions` allow nullable,
+    non-key columns appended to the upstream table and continue projecting rows
+    into the catalog schema used by materialized views and replication sinks.
+  - Drop/reorder/type/primary-key/replica-identity changes fail closed.
+  - Non-key nullability/default changes are not carried in `pgoutput` relation
+    metadata; Floe enforces the catalog schema on rows and fails if an upstream
+    change starts emitting incompatible NULLs.
+  - Postgres replication targets are checked for required columns, compatible
+    types/nullability, extra required target columns, and a unique index matching
+    the CDC primary key before rows are applied.
 - Common scalar types are covered, but broader Postgres fidelity such as UUID,
   JSONB, arrays, bytea, enums/domains, intervals, and range types is still being
   expanded.

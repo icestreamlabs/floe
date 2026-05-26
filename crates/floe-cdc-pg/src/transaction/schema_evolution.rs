@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, anyhow};
 use floe_cdc_core::{
@@ -6,6 +6,8 @@ use floe_cdc_core::{
 };
 
 use crate::PgOutputCdcChange;
+
+pub(super) const POSTGRES_SCHEMA_HISTORY_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresSchemaEvolutionPolicy {
@@ -114,6 +116,43 @@ pub(super) enum SchemaEvolution {
     Unchanged,
     CompatibleAddition { added_columns: Vec<String> },
     Incompatible(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PostgresObservedSchemaVersion {
+    version: u64,
+    column_count: usize,
+    primary_key_columns: Vec<String>,
+}
+
+impl PostgresObservedSchemaVersion {
+    pub(super) fn from_schema(schema: &CdcTableSchema) -> Self {
+        Self {
+            version: schema.stable_fingerprint(),
+            column_count: schema.columns().len(),
+            primary_key_columns: schema.primary_key().columns().to_vec(),
+        }
+    }
+
+    pub(super) fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+pub(super) fn push_schema_history(
+    history: &mut VecDeque<PostgresObservedSchemaVersion>,
+    observed: PostgresObservedSchemaVersion,
+) {
+    if history
+        .back()
+        .is_some_and(|existing| existing.version() == observed.version())
+    {
+        return;
+    }
+    history.push_back(observed);
+    while history.len() > POSTGRES_SCHEMA_HISTORY_LIMIT {
+        history.pop_front();
+    }
 }
 
 pub(super) fn classify_schema_evolution(

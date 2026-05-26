@@ -6,8 +6,10 @@ use super::target_state::{
     TargetFailureClass, classify_target_write_failure, delivered_target_state, failed_target_state,
 };
 use super::writers::{
-    PostgresParamValue, PostgresReplicationPipelineWriter, parse_floe_json_record_key,
-    parse_floe_json_record_value, postgres_key_params_from_json, postgres_row_params_from_json,
+    PostgresParamValue, PostgresReplicationPipelineWriter, PostgresTargetColumnInfo,
+    PostgresTargetTableInfo, parse_floe_json_record_key, parse_floe_json_record_value,
+    postgres_key_params_from_json, postgres_row_params_from_json,
+    validate_postgres_target_table_compatibility,
 };
 use super::*;
 use floe_cdc_core::{
@@ -371,6 +373,108 @@ fn postgres_target_params_decode_floe_json_records() {
         postgres_key_params_from_json(&schema, &key).expect("key params"),
         vec![PostgresParamValue::Int64(Some(7))]
     );
+}
+
+#[test]
+fn postgres_target_compatibility_accepts_matching_table() {
+    let schema = schema(CdcTableId::new("orders").unwrap());
+    let target = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("status", "text", false, false, false),
+            PostgresTargetColumnInfo::new(
+                "created_at",
+                "timestamp with time zone",
+                true,
+                true,
+                false,
+            ),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+
+    validate_postgres_target_table_compatibility(&schema, "public.orders_copy", &target)
+        .expect("compatible target");
+}
+
+#[test]
+fn postgres_target_compatibility_rejects_missing_columns_and_pk_index() {
+    let schema = schema(CdcTableId::new("orders").unwrap());
+    let missing_column = PostgresTargetTableInfo::new(
+        vec![PostgresTargetColumnInfo::new(
+            "id", "bigint", true, false, false,
+        )],
+        vec![vec!["id".to_string()]],
+    );
+    let err = validate_postgres_target_table_compatibility(
+        &schema,
+        "public.orders_copy",
+        &missing_column,
+    )
+    .expect_err("missing CDC column should fail");
+    assert!(format!("{err:#}").contains("missing CDC column 'status'"));
+
+    let missing_pk = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("status", "text", false, false, false),
+        ],
+        Vec::new(),
+    );
+    let err =
+        validate_postgres_target_table_compatibility(&schema, "public.orders_copy", &missing_pk)
+            .expect_err("missing PK index should fail");
+    assert!(format!("{err:#}").contains("no unique index matching CDC primary key"));
+}
+
+#[test]
+fn postgres_target_compatibility_rejects_incompatible_required_columns() {
+    let schema = schema(CdcTableId::new("orders").unwrap());
+    let incompatible_status = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("status", "integer", false, false, false),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+    let err = validate_postgres_target_table_compatibility(
+        &schema,
+        "public.orders_copy",
+        &incompatible_status,
+    )
+    .expect_err("type mismatch should fail");
+    assert!(format!("{err:#}").contains("has type 'integer'"));
+
+    let required_extra = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("status", "text", false, false, false),
+            PostgresTargetColumnInfo::new("tenant_id", "bigint", true, false, false),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+    let err = validate_postgres_target_table_compatibility(
+        &schema,
+        "public.orders_copy",
+        &required_extra,
+    )
+    .expect_err("required extra column should fail");
+    assert!(format!("{err:#}").contains("required column 'tenant_id'"));
+
+    let not_null_status = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("status", "text", true, false, false),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+    let err = validate_postgres_target_table_compatibility(
+        &schema,
+        "public.orders_copy",
+        &not_null_status,
+    )
+    .expect_err("nullable source into not-null target should fail");
+    assert!(format!("{err:#}").contains("CDC schema allows NULL"));
 }
 
 #[test]

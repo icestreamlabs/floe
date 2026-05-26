@@ -76,6 +76,7 @@ impl Drop for KafkaNativeTopic {
 
 pub(super) struct PostgresReplicationPipelineWriter {
     connection: String,
+    target_table_name: String,
     target_table: String,
     pub(super) insert_sql: String,
     pub(super) delete_sql: String,
@@ -593,6 +594,7 @@ impl PostgresReplicationPipelineWriter {
         encoding::validate_floe_json_schema(&schema)?;
         Ok(Self {
             connection: connection.to_string(),
+            target_table_name: table.to_string(),
             target_table,
             insert_sql: postgres_upsert_sql(&schema, table)?,
             delete_sql: postgres_delete_sql(&schema, table)?,
@@ -620,6 +622,7 @@ impl PostgresReplicationPipelineWriter {
                 );
             }
         });
+        self.validate_target_compatibility(&client).await?;
 
         let transaction = client
             .transaction()
@@ -687,6 +690,222 @@ impl PostgresReplicationPipelineWriter {
             .postgres_table(&self.target_table)
             .postgres_records_applied(records);
         target_state.build()
+    }
+
+    async fn validate_target_compatibility(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> anyhow::Result<()> {
+        let target_info = load_postgres_target_table_info(client, &self.target_table_name).await?;
+        validate_postgres_target_table_compatibility(
+            &self.schema,
+            &self.target_table_name,
+            &target_info,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PostgresTargetColumnInfo {
+    name: String,
+    postgres_type: String,
+    not_null: bool,
+    has_default: bool,
+    generated: bool,
+}
+
+impl PostgresTargetColumnInfo {
+    pub(super) fn new(
+        name: impl Into<String>,
+        postgres_type: impl Into<String>,
+        not_null: bool,
+        has_default: bool,
+        generated: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            postgres_type: postgres_type.into(),
+            not_null,
+            has_default,
+            generated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PostgresTargetTableInfo {
+    columns: Vec<PostgresTargetColumnInfo>,
+    unique_indexes: Vec<Vec<String>>,
+}
+
+impl PostgresTargetTableInfo {
+    pub(super) fn new(
+        columns: Vec<PostgresTargetColumnInfo>,
+        unique_indexes: Vec<Vec<String>>,
+    ) -> Self {
+        Self {
+            columns,
+            unique_indexes,
+        }
+    }
+}
+
+async fn load_postgres_target_table_info(
+    client: &tokio_postgres::Client,
+    table: &str,
+) -> anyhow::Result<PostgresTargetTableInfo> {
+    let table_exists = client
+        .query_one("SELECT to_regclass($1)::text", &[&table])
+        .await
+        .with_context(|| format!("look up replication pipeline Postgres target table {table}"))?;
+    let regclass: Option<String> = table_exists.get(0);
+    anyhow::ensure!(
+        regclass.is_some(),
+        "replication pipeline Postgres target table '{table}' does not exist"
+    );
+
+    let column_rows = client
+        .query(
+            "
+            SELECT
+                a.attname,
+                a.atttypid::regtype::text,
+                a.attnotnull,
+                d.adbin IS NOT NULL AS has_default,
+                a.attgenerated <> '' AS generated
+            FROM pg_attribute a
+            LEFT JOIN pg_attrdef d
+                ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = to_regclass($1)
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+            ",
+            &[&table],
+        )
+        .await
+        .with_context(|| {
+            format!("load replication pipeline Postgres target table {table} columns")
+        })?;
+    let columns = column_rows
+        .into_iter()
+        .map(|row| {
+            PostgresTargetColumnInfo::new(
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, bool>(2),
+                row.get::<_, bool>(3),
+                row.get::<_, bool>(4),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let unique_rows = client
+        .query(
+            "
+            SELECT array_agg(a.attname ORDER BY indexed_columns.ord)::text[] AS columns
+            FROM pg_index i
+            JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS indexed_columns(attnum, ord)
+                ON true
+            JOIN pg_attribute a
+                ON a.attrelid = i.indrelid AND a.attnum = indexed_columns.attnum
+            WHERE i.indrelid = to_regclass($1)
+              AND i.indisunique
+              AND i.indpred IS NULL
+              AND i.indexprs IS NULL
+            GROUP BY i.indexrelid
+            ",
+            &[&table],
+        )
+        .await
+        .with_context(|| {
+            format!("load replication pipeline Postgres target table {table} unique indexes")
+        })?;
+    let unique_indexes = unique_rows
+        .into_iter()
+        .map(|row| row.get::<_, Vec<String>>(0))
+        .collect::<Vec<_>>();
+
+    Ok(PostgresTargetTableInfo::new(columns, unique_indexes))
+}
+
+pub(super) fn validate_postgres_target_table_compatibility(
+    schema: &CdcTableSchema,
+    table: &str,
+    target: &PostgresTargetTableInfo,
+) -> anyhow::Result<()> {
+    let mut seen_cdc_columns = HashSet::new();
+    for column in schema.columns() {
+        seen_cdc_columns.insert(column.name());
+        let Some(target_column) = target
+            .columns
+            .iter()
+            .find(|target_column| target_column.name == column.name())
+        else {
+            return Err(anyhow!(
+                "replication pipeline Postgres target table '{table}' is missing CDC column '{}'; add the column or point the pipeline at a migrated table before resuming",
+                column.name()
+            ));
+        };
+        anyhow::ensure!(
+            postgres_type_is_compatible(column.data_type(), &target_column.postgres_type),
+            "replication pipeline Postgres target table '{table}' column '{}' has type '{}' but CDC schema expects {:?}; migrate the target column before resuming",
+            column.name(),
+            target_column.postgres_type,
+            column.data_type()
+        );
+        anyhow::ensure!(
+            !column.nullable() || !target_column.not_null,
+            "replication pipeline Postgres target table '{table}' column '{}' is NOT NULL but CDC schema allows NULL; relax the target constraint or backfill a non-null source contract before resuming",
+            column.name()
+        );
+    }
+
+    for target_column in &target.columns {
+        if seen_cdc_columns.contains(target_column.name.as_str()) {
+            continue;
+        }
+        anyhow::ensure!(
+            !target_column.not_null || target_column.has_default || target_column.generated,
+            "replication pipeline Postgres target table '{table}' has required column '{}' that is not present in the CDC schema; add a default/generated expression, make it nullable, or include it in the CDC source before resuming",
+            target_column.name
+        );
+    }
+
+    let primary_key = schema.primary_key().columns().to_vec();
+    anyhow::ensure!(
+        target
+            .unique_indexes
+            .iter()
+            .any(|unique_index| unique_index == &primary_key),
+        "replication pipeline Postgres target table '{table}' has no unique index matching CDC primary key {:?}; create the matching primary key or unique index before resuming",
+        primary_key
+    );
+    Ok(())
+}
+
+fn postgres_type_is_compatible(data_type: &ColumnType, postgres_type: &str) -> bool {
+    let postgres_type = postgres_type
+        .trim_start_matches("pg_catalog.")
+        .to_ascii_lowercase();
+    match data_type {
+        ColumnType::Int64 => matches!(postgres_type.as_str(), "bigint" | "integer" | "smallint"),
+        ColumnType::Bool => matches!(postgres_type.as_str(), "boolean"),
+        ColumnType::Utf8 => matches!(
+            postgres_type.as_str(),
+            "text" | "character varying" | "character" | "varchar" | "bpchar" | "name"
+        ),
+        ColumnType::TimestampMillis => matches!(
+            postgres_type.as_str(),
+            "timestamp with time zone"
+                | "timestamp without time zone"
+                | "timestamptz"
+                | "timestamp"
+        ),
+        ColumnType::DateDays => matches!(postgres_type.as_str(), "date"),
+        ColumnType::Decimal128 { .. } | ColumnType::Numeric => {
+            matches!(postgres_type.as_str(), "numeric" | "decimal")
+        }
     }
 }
 

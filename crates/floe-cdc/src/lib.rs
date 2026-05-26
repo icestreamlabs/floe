@@ -20,9 +20,9 @@ mod tests {
     use dbsp_storage::storage::{KeyValueTable, SlateTable};
     use floe_cdc_core::{
         CdcChange, CdcCheckpoint, CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey,
-        CdcRow, CdcRowKey, CdcSourceDefinition, CdcSourceId, CdcSourcePosition, CdcTableDefinition,
-        CdcTableId, CdcTableSchema, CdcTransactionId, ChangeBatch, TransactionBatch,
-        UpstreamTableRef,
+        CdcRow, CdcRowKey, CdcSchemaVersionMap, CdcSourceDefinition, CdcSourceId,
+        CdcSourcePosition, CdcTableDefinition, CdcTableId, CdcTableSchema, CdcTransactionId,
+        ChangeBatch, TransactionBatch, UpstreamTableRef,
     };
     use floe_core::RowValue;
     use floe_core::catalog::ColumnType;
@@ -693,7 +693,8 @@ mod tests {
                 )
                 .expect("batch"),
             ],
-        );
+        )
+        .with_schema_versions(CdcSchemaVersionMap::from([("orders".to_string(), 42)]));
         let checkpoint = store
             .apply_transaction(&schemas(schema), &transaction)
             .await
@@ -702,6 +703,7 @@ mod tests {
             .clone();
 
         let reloaded = CdcTableStore::new(table);
+        assert_eq!(checkpoint.schema_versions().get("orders"), Some(&42));
         assert_eq!(
             reloaded
                 .load_checkpoint(transaction.source_id())
