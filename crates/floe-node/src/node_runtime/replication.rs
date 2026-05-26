@@ -9,11 +9,12 @@ use floe_config::ReplicationConfig as FloeReplicationConfig;
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
     CdcBufferPayloadFormat, CdcBufferStore, CdcBufferedTransactionManifest,
-    ReplicationPipelineCheckpoint, SlateCatalog,
+    ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry, ReplicationPipelineDlqStatus,
+    SlateCatalog, decode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
 
-pub(super) struct ReplicationPipelineRuntime {
+pub(crate) struct ReplicationPipelineRuntime {
     pipelines_by_source: HashMap<CdcSourceId, Vec<ReplicationPipelineRuntimePlan>>,
     kafka_writers_by_pipeline: HashMap<String, Arc<writers::KafkaReplicationPipelineWriter>>,
     postgres_writers_by_pipeline: HashMap<String, Arc<writers::PostgresReplicationPipelineWriter>>,
@@ -86,6 +87,82 @@ impl ReplicationPipelineRuntime {
         self.pipelines_by_source
             .get(source_id)
             .is_some_and(|plans| !plans.is_empty())
+    }
+
+    pub(crate) async fn retry_dlq_entry(
+        &self,
+        storage: &SlateCatalog,
+        pipeline_name: &str,
+        dlq_id: &str,
+    ) -> anyhow::Result<Option<ReplicationPipelineDlqEntry>> {
+        let Some(plan) = self.plan_by_name(pipeline_name) else {
+            return Ok(None);
+        };
+        let Some(entry) = storage
+            .replication_pipeline_dlq_entry(pipeline_name, dlq_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            entry.status() == ReplicationPipelineDlqStatus::Pending,
+            "replication pipeline '{}' DLQ entry {} is {}, not pending",
+            pipeline_name,
+            dlq_id,
+            entry.status().as_str()
+        );
+        let payload_object_key = entry.payload_object_key().ok_or_else(|| {
+            anyhow!(
+                "replication pipeline '{}' DLQ entry {} has no payload object key",
+                pipeline_name,
+                dlq_id
+            )
+        })?;
+        let payload = storage
+            .replication_pipeline_dlq_payload(payload_object_key)
+            .await
+            .with_context(|| {
+                format!("load replication pipeline '{pipeline_name}' DLQ payload {dlq_id}")
+            })?;
+        let records = decode_cdc_buffer_records_payload(&payload).with_context(|| {
+            format!("decode replication pipeline '{pipeline_name}' DLQ payload {dlq_id}")
+        })?;
+        let attempted_entry = storage
+            .record_replication_pipeline_dlq_retry_attempt(
+                pipeline_name,
+                dlq_id,
+                current_unix_time_ms(),
+            )
+            .await?
+            .unwrap_or(entry);
+        match self.send_records_to_target(plan, &records).await {
+            Ok(_) => {
+                self.clear_last_target_error(&plan.name);
+                let replayed = storage
+                    .update_replication_pipeline_dlq_entry_status_with_reason(
+                        pipeline_name,
+                        dlq_id,
+                        ReplicationPipelineDlqStatus::Replayed,
+                        Some("manual retry delivered to target".to_string()),
+                        current_unix_time_ms(),
+                    )
+                    .await?;
+                Ok(replayed.or(Some(attempted_entry)))
+            }
+            Err(err) => {
+                self.record_target_write_failure(plan, &err);
+                Err(err).with_context(|| {
+                    format!("retry replication pipeline '{pipeline_name}' DLQ entry {dlq_id}")
+                })
+            }
+        }
+    }
+
+    fn plan_by_name(&self, pipeline_name: &str) -> Option<&ReplicationPipelineRuntimePlan> {
+        self.pipelines_by_source
+            .values()
+            .flatten()
+            .find(|plan| plan.name == pipeline_name)
     }
 
     pub(super) async fn replay_buffered(&self, storage: &SlateCatalog) -> anyhow::Result<usize> {

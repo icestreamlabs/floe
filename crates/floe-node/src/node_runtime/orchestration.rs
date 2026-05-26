@@ -1697,26 +1697,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         watermark_debug: Some(Arc::clone(&watermark_debug)),
         cdc_replication_debug: Some(Arc::clone(&cdc_replication_debug)),
     };
-    let admin_config = HttpAdminConfig {
-        host: run_args.http_host.clone(),
-        port: admin_port,
-        health: admin_health,
-        storage_db: Some(db.clone()),
-        materialized_views: Some(Arc::clone(&mv_registry)),
-    };
-    let admin_cancel = service_cancel.clone();
-    let runtime_cancel_for_admin = runtime_cancel.clone();
-    let failure_for_admin = Arc::clone(&runtime_failure);
-    let admin_handle: JoinHandle<()> = tokio::spawn(async move {
-        if let Err(err) = http_ingest::run_admin_server(admin_config, admin_cancel.clone()).await {
-            tracing::error!(error = %err, "admin HTTP server failed");
-            record_runtime_failure(
-                &failure_for_admin,
-                format!("admin HTTP server failed: {err}"),
-            );
-            runtime_cancel_for_admin.cancel();
-        }
-    });
     let connector_count = connector_specs.len();
     tracing::info!(
         connector_count,
@@ -1834,6 +1814,28 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+    });
+    let admin_config = HttpAdminConfig {
+        host: run_args.http_host.clone(),
+        port: admin_port,
+        health: admin_health,
+        storage_db: Some(db.clone()),
+        storage_catalog: Some(storage.clone()),
+        replication_runtime: Some(Arc::clone(&replication_pipeline_runtime)),
+        materialized_views: Some(Arc::clone(&mv_registry)),
+    };
+    let admin_cancel = service_cancel.clone();
+    let runtime_cancel_for_admin = runtime_cancel.clone();
+    let failure_for_admin = Arc::clone(&runtime_failure);
+    let admin_handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(err) = http_ingest::run_admin_server(admin_config, admin_cancel.clone()).await {
+            tracing::error!(error = %err, "admin HTTP server failed");
+            record_runtime_failure(
+                &failure_for_admin,
+                format!("admin HTTP server failed: {err}"),
+            );
+            runtime_cancel_for_admin.cancel();
         }
     });
     let source_names_by_id = Arc::new(

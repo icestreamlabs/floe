@@ -15,6 +15,7 @@ use floe_cdc_core::{
 use floe_config::ReplicationArrowIpcCompressionConfig;
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
+use std::collections::BTreeMap;
 
 #[test]
 fn materialized_transaction_filters_non_materialized_batches() {
@@ -1241,6 +1242,60 @@ async fn replay_dead_letters_pending_buffer_when_policy_allows() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn retry_dlq_entry_records_attempt_when_target_still_fails() {
+    let table_id = CdcTableId::new("orders").unwrap();
+    let plan = test_plan("orders_pipe", table_id, "public.orders");
+    let runtime = test_runtime_with_plan(plan.clone());
+    let storage = SlateCatalog::in_memory().await.unwrap();
+    let dlq_id = "entry-1";
+    let payload_object_key = storage
+        .put_replication_pipeline_dlq_payload(
+            &plan.name,
+            dlq_id,
+            floe_storage::encode_cdc_buffer_records_payload(&[CdcBufferRecord::new(
+                Some(br#"{"id":1}"#.to_vec()),
+                Some(br#"{"id":1,"status":"open"}"#.to_vec()),
+            )])
+            .expect("encode records"),
+        )
+        .await
+        .expect("persist payload");
+    let entry = ReplicationPipelineDlqEntry::new(
+        &plan.name,
+        dlq_id,
+        &plan.source_name,
+        floe_cdc_core::CdcSourcePosition::postgres("0/16B6E00", None).unwrap(),
+        Some(CdcTransactionId::new("pg-xid-401").unwrap()),
+        "kafka_delivery",
+        "broker unavailable",
+        1,
+        Some(payload_object_key),
+        Some("kafka_records".to_string()),
+        24,
+        BTreeMap::new(),
+        current_unix_time_ms(),
+    )
+    .unwrap();
+    storage
+        .put_replication_pipeline_dlq_entry(entry)
+        .await
+        .expect("persist entry");
+
+    let err = runtime
+        .retry_dlq_entry(&storage, &plan.name, dlq_id)
+        .await
+        .expect_err("retry should fail without a writer");
+    assert!(err.to_string().contains("retry replication pipeline"));
+    let attempted = storage
+        .replication_pipeline_dlq_entry(&plan.name, dlq_id)
+        .await
+        .expect("load entry")
+        .expect("entry exists");
+    assert_eq!(attempted.status(), ReplicationPipelineDlqStatus::Pending);
+    assert_eq!(attempted.attempt_count(), 2);
 }
 
 #[tokio::test]

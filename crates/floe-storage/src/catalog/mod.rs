@@ -81,6 +81,8 @@ pub struct ReplicationPipelineDlqEntry {
     target_state: BTreeMap<String, String>,
     #[serde(default)]
     status: ReplicationPipelineDlqStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status_reason: Option<String>,
     created_at_unix_ms: u64,
     last_updated_at_unix_ms: u64,
 }
@@ -201,6 +203,7 @@ impl ReplicationPipelineDlqEntry {
             payload_bytes,
             target_state,
             status: ReplicationPipelineDlqStatus::Pending,
+            status_reason: None,
             created_at_unix_ms,
             last_updated_at_unix_ms: created_at_unix_ms,
         };
@@ -260,6 +263,10 @@ impl ReplicationPipelineDlqEntry {
         self.status
     }
 
+    pub fn status_reason(&self) -> Option<&str> {
+        self.status_reason.as_deref()
+    }
+
     pub fn created_at_unix_ms(&self) -> u64 {
         self.created_at_unix_ms
     }
@@ -274,6 +281,25 @@ impl ReplicationPipelineDlqEntry {
         last_updated_at_unix_ms: u64,
     ) -> Self {
         self.status = status;
+        self.status_reason = None;
+        self.last_updated_at_unix_ms = last_updated_at_unix_ms;
+        self
+    }
+
+    pub fn with_status_reason(
+        mut self,
+        status: ReplicationPipelineDlqStatus,
+        reason: Option<String>,
+        last_updated_at_unix_ms: u64,
+    ) -> Self {
+        self.status = status;
+        self.status_reason = reason.filter(|reason| !reason.trim().is_empty());
+        self.last_updated_at_unix_ms = last_updated_at_unix_ms;
+        self
+    }
+
+    pub fn record_attempt(mut self, last_updated_at_unix_ms: u64) -> Self {
+        self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_updated_at_unix_ms = last_updated_at_unix_ms;
         self
     }
@@ -838,6 +864,44 @@ impl SlateCatalog {
         Ok(Some(entry))
     }
 
+    pub async fn update_replication_pipeline_dlq_entry_status_with_reason(
+        &self,
+        pipeline_name: &str,
+        dlq_id: &str,
+        status: ReplicationPipelineDlqStatus,
+        reason: Option<String>,
+        last_updated_at_unix_ms: u64,
+    ) -> Result<Option<ReplicationPipelineDlqEntry>> {
+        let Some(entry) = self
+            .replication_pipeline_dlq_entry(pipeline_name, dlq_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let entry = entry.with_status_reason(status, reason, last_updated_at_unix_ms);
+        self.put_replication_pipeline_dlq_entry(entry.clone())
+            .await?;
+        Ok(Some(entry))
+    }
+
+    pub async fn record_replication_pipeline_dlq_retry_attempt(
+        &self,
+        pipeline_name: &str,
+        dlq_id: &str,
+        last_updated_at_unix_ms: u64,
+    ) -> Result<Option<ReplicationPipelineDlqEntry>> {
+        let Some(entry) = self
+            .replication_pipeline_dlq_entry(pipeline_name, dlq_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let entry = entry.record_attempt(last_updated_at_unix_ms);
+        self.put_replication_pipeline_dlq_entry(entry.clone())
+            .await?;
+        Ok(Some(entry))
+    }
+
     pub async fn put_replication_pipeline_dlq_payload(
         &self,
         pipeline_name: &str,
@@ -1311,6 +1375,42 @@ mod tests {
         assert_eq!(
             updated_dlq_entry.last_updated_at_unix_ms(),
             1_700_000_000_002
+        );
+        assert_eq!(updated_dlq_entry.status_reason(), None);
+
+        let attempted_dlq_entry = catalog
+            .record_replication_pipeline_dlq_retry_attempt(
+                "pg_orders_to_kafka",
+                "0_16B6C50_tx_7",
+                1_700_000_000_003,
+            )
+            .await
+            .expect("record retry attempt")
+            .expect("dlq entry exists");
+        assert_eq!(attempted_dlq_entry.attempt_count(), 3);
+        assert_eq!(
+            attempted_dlq_entry.last_updated_at_unix_ms(),
+            1_700_000_000_003
+        );
+
+        let discarded_dlq_entry = catalog
+            .update_replication_pipeline_dlq_entry_status_with_reason(
+                "pg_orders_to_kafka",
+                "0_16B6C50_tx_7",
+                ReplicationPipelineDlqStatus::Discarded,
+                Some("operator skipped duplicate".to_string()),
+                1_700_000_000_004,
+            )
+            .await
+            .expect("discard dlq entry")
+            .expect("dlq entry exists");
+        assert_eq!(
+            discarded_dlq_entry.status(),
+            ReplicationPipelineDlqStatus::Discarded
+        );
+        assert_eq!(
+            discarded_dlq_entry.status_reason(),
+            Some("operator skipped duplicate")
         );
     }
 

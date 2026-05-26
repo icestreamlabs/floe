@@ -7,7 +7,7 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -25,6 +25,7 @@ use floe_executor::MaterializedViewRegistry;
 use floe_executor::mv_changelog::{
     MvChangelogBatch, MvChangelogParams, MvChangelogStream, execute_mv_changelog,
 };
+use floe_storage::{ReplicationPipelineDlqEntry, ReplicationPipelineDlqStatus, SlateCatalog};
 use futures::Stream;
 use prometheus::{Encoder, TextEncoder};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::node_runtime::ReplicationPipelineRuntime;
 use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch_with_commit_ack};
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,8 @@ pub struct HttpAdminConfig {
     pub port: u16,
     pub health: HttpIngestHealth,
     pub storage_db: Option<Arc<Db>>,
+    pub storage_catalog: Option<Arc<SlateCatalog>>,
+    pub replication_runtime: Option<Arc<ReplicationPipelineRuntime>>,
     pub materialized_views: Option<Arc<MaterializedViewRegistry>>,
 }
 
@@ -146,6 +150,8 @@ struct HttpAdminState {
     cancel: CancellationToken,
     health: HttpIngestHealth,
     storage_db: Option<Arc<Db>>,
+    storage_catalog: Option<Arc<SlateCatalog>>,
+    replication_runtime: Option<Arc<ReplicationPipelineRuntime>>,
     materialized_views: Option<Arc<MaterializedViewRegistry>>,
 }
 
@@ -158,6 +164,32 @@ struct IngestQuery {
 struct SubscribeQuery {
     with_snapshot: Option<bool>,
     as_of: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CdcReplicationDlqListQuery {
+    pipeline: String,
+    status: Option<ReplicationPipelineDlqStatus>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct CdcReplicationDlqActionRequest {
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CdcReplicationDlqListResponse {
+    pipeline: String,
+    status: Option<ReplicationPipelineDlqStatus>,
+    count: usize,
+    oldest_pending_age_ms: Option<u64>,
+    entries: Vec<ReplicationPipelineDlqEntry>,
+}
+
+#[derive(Serialize)]
+struct CdcReplicationDlqEntryResponse {
+    entry: ReplicationPipelineDlqEntry,
 }
 
 pub async fn run_http_ingest(
@@ -197,6 +229,8 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         cancel: cancel.clone(),
         health: config.health,
         storage_db: config.storage_db,
+        storage_catalog: config.storage_catalog,
+        replication_runtime: config.replication_runtime,
         materialized_views: config.materialized_views,
     };
     let app = Router::new()
@@ -204,6 +238,22 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
         .route("/readyz", get(admin_readyz))
         .route("/debug/watermarks", get(debug_watermarks_admin))
         .route("/debug/cdc/replication", get(debug_cdc_replication_admin))
+        .route(
+            "/debug/cdc/replication/dlq",
+            get(debug_cdc_replication_dlq_list_admin),
+        )
+        .route(
+            "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
+            get(debug_cdc_replication_dlq_entry_admin),
+        )
+        .route(
+            "/debug/cdc/replication/dlq/:pipeline/:dlq_id/discard",
+            post(debug_cdc_replication_dlq_discard_admin),
+        )
+        .route(
+            "/debug/cdc/replication/dlq/:pipeline/:dlq_id/retry",
+            post(debug_cdc_replication_dlq_retry_admin),
+        )
         .route("/debug/storage/flush", post(debug_storage_flush_admin))
         .route("/mv", get(subscribe_sse_admin))
         .route("/metrics", get(metrics))
@@ -384,6 +434,172 @@ async fn debug_cdc_replication_admin(State(state): State<HttpAdminState>) -> imp
     (StatusCode::OK, Json(snapshot)).into_response()
 }
 
+async fn debug_cdc_replication_dlq_list_admin(
+    State(state): State<HttpAdminState>,
+    Query(query): Query<CdcReplicationDlqListQuery>,
+) -> impl IntoResponse {
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    let mut entries = match storage
+        .replication_pipeline_dlq_entries(&query.pipeline)
+        .await
+    {
+        Ok(entries) => entries,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(status) = query.status {
+        entries.retain(|entry| entry.status() == status);
+    }
+    entries.sort_by_key(|entry| entry.created_at_unix_ms());
+    let oldest_pending_age_ms = entries
+        .iter()
+        .filter(|entry| entry.status() == ReplicationPipelineDlqStatus::Pending)
+        .map(|entry| current_unix_time_ms().saturating_sub(entry.created_at_unix_ms()))
+        .min();
+    if let Some(limit) = query.limit {
+        entries.truncate(limit);
+    }
+    let response = CdcReplicationDlqListResponse {
+        pipeline: query.pipeline,
+        status: query.status,
+        count: entries.len(),
+        oldest_pending_age_ms,
+        entries,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn debug_cdc_replication_dlq_entry_admin(
+    State(state): State<HttpAdminState>,
+    Path((pipeline, dlq_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    match storage
+        .replication_pipeline_dlq_entry(&pipeline, &dlq_id)
+        .await
+    {
+        Ok(Some(entry)) => (
+            StatusCode::OK,
+            Json(CdcReplicationDlqEntryResponse { entry }),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "DLQ entry not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn debug_cdc_replication_dlq_discard_admin(
+    State(state): State<HttpAdminState>,
+    Path((pipeline, dlq_id)): Path<(String, String)>,
+    payload: Option<Json<CdcReplicationDlqActionRequest>>,
+) -> impl IntoResponse {
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    let reason = payload
+        .and_then(|Json(payload)| payload.reason)
+        .filter(|reason| !reason.trim().is_empty());
+    let Some(reason) = reason else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "discard reason is required"})),
+        )
+            .into_response();
+    };
+    match storage
+        .update_replication_pipeline_dlq_entry_status_with_reason(
+            &pipeline,
+            &dlq_id,
+            ReplicationPipelineDlqStatus::Discarded,
+            Some(reason),
+            current_unix_time_ms(),
+        )
+        .await
+    {
+        Ok(Some(entry)) => (
+            StatusCode::OK,
+            Json(CdcReplicationDlqEntryResponse { entry }),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "DLQ entry not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn debug_cdc_replication_dlq_retry_admin(
+    State(state): State<HttpAdminState>,
+    Path((pipeline, dlq_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(storage) = &state.storage_catalog else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage catalog unavailable"})),
+        )
+            .into_response();
+    };
+    let Some(runtime) = &state.replication_runtime else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "CDC replication runtime unavailable"})),
+        )
+            .into_response();
+    };
+    match runtime.retry_dlq_entry(storage, &pipeline, &dlq_id).await {
+        Ok(Some(entry)) => (
+            StatusCode::OK,
+            Json(CdcReplicationDlqEntryResponse { entry }),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "DLQ entry or pipeline not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn debug_storage_flush_admin(State(state): State<HttpAdminState>) -> impl IntoResponse {
     let Some(db) = &state.storage_db else {
         return (
@@ -481,6 +697,14 @@ async fn metrics() -> impl IntoResponse {
         header::HeaderValue::from_static("text/plain; version=0.0.4"),
     );
     response
+}
+
+fn current_unix_time_ms() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 struct MvSseStream {
@@ -938,6 +1162,8 @@ mod tests {
                 cdc_replication_debug: Some(snapshot),
             },
             storage_db: None,
+            storage_catalog: None,
+            replication_runtime: None,
             materialized_views: None,
         };
         let app = Router::new()
@@ -950,6 +1176,99 @@ mod tests {
             .expect("request");
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_cdc_replication_dlq_lists_inspects_and_discards_entries() {
+        let storage = SlateCatalog::in_memory().await.expect("storage");
+        let dlq_entry = ReplicationPipelineDlqEntry::new(
+            "orders_pipe",
+            "entry-1",
+            "pg_main",
+            floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+            Some(floe_cdc_core::CdcTransactionId::new("pg-xid-1").expect("transaction")),
+            "postgres_delivery",
+            "permission denied",
+            1,
+            Some("payloads/entry-1.bin".to_string()),
+            Some("kafka_records".to_string()),
+            128,
+            BTreeMap::from([(
+                "target.delivery.status".to_string(),
+                "dead_lettered".to_string(),
+            )]),
+            current_unix_time_ms(),
+        )
+        .expect("dlq entry");
+        storage
+            .put_replication_pipeline_dlq_entry(dlq_entry)
+            .await
+            .expect("persist dlq entry");
+        let state = HttpAdminState {
+            cancel: CancellationToken::new(),
+            health: HttpIngestHealth {
+                executor_running: Arc::new(AtomicBool::new(true)),
+                storage_reachable: Arc::new(AtomicBool::new(true)),
+                runtime_ready: Arc::new(AtomicBool::new(true)),
+                watermark_debug: None,
+                cdc_replication_debug: None,
+            },
+            storage_db: None,
+            storage_catalog: Some(Arc::new(storage.clone())),
+            replication_runtime: None,
+            materialized_views: None,
+        };
+        let app = Router::new()
+            .route(
+                "/debug/cdc/replication/dlq",
+                get(debug_cdc_replication_dlq_list_admin),
+            )
+            .route(
+                "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
+                get(debug_cdc_replication_dlq_entry_admin),
+            )
+            .route(
+                "/debug/cdc/replication/dlq/:pipeline/:dlq_id/discard",
+                post(debug_cdc_replication_dlq_discard_admin),
+            )
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/debug/cdc/replication/dlq?pipeline=orders_pipe&status=pending")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/debug/cdc/replication/dlq/orders_pipe/entry-1")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload = json!({"reason": "operator confirmed duplicate"});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/debug/cdc/replication/dlq/orders_pipe/entry-1/discard")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let discarded = storage
+            .replication_pipeline_dlq_entry("orders_pipe", "entry-1")
+            .await
+            .expect("load entry")
+            .expect("entry exists");
+        assert_eq!(discarded.status(), ReplicationPipelineDlqStatus::Discarded);
+        assert_eq!(
+            discarded.status_reason(),
+            Some("operator confirmed duplicate")
+        );
     }
 
     #[tokio::test]
@@ -966,6 +1285,8 @@ mod tests {
                 cdc_replication_debug: None,
             },
             storage_db: None,
+            storage_catalog: None,
+            replication_runtime: None,
             materialized_views: Some(registry),
         };
         let app = Router::new()

@@ -245,6 +245,7 @@ use catalog::*;
 use command::*;
 use ingest::*;
 pub(crate) use orchestration::run;
+pub(crate) use replication::ReplicationPipelineRuntime;
 use replication::*;
 use shutdown::*;
 use startup::*;
