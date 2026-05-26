@@ -1257,6 +1257,45 @@ mod tests {
     }
 
     #[test]
+    fn replication_buffer_defaults_are_object_store_oriented() {
+        let cleanup = ReplicationBufferCleanupConfig::default();
+        assert_eq!(
+            cleanup.delivered_retention_ms,
+            DEFAULT_REPLICATION_BUFFER_DELIVERED_RETENTION_MS
+        );
+        assert_eq!(
+            cleanup.orphan_retention_ms,
+            DEFAULT_REPLICATION_BUFFER_ORPHAN_RETENTION_MS
+        );
+        assert_eq!(
+            cleanup.cleanup_interval_ms,
+            DEFAULT_REPLICATION_BUFFER_CLEANUP_INTERVAL_MS
+        );
+        assert!(cleanup.cleanup_interval_ms >= 500);
+        assert!(cleanup.delivered_retention_ms >= 500);
+        assert!(cleanup.orphan_retention_ms >= cleanup.cleanup_interval_ms);
+
+        let limits = ReplicationBufferLimitsConfig::default();
+        assert_eq!(
+            limits.max_pending_bytes,
+            DEFAULT_REPLICATION_BUFFER_MAX_PENDING_BYTES
+        );
+        assert!(limits.max_pending_bytes >= 1024 * 1024);
+
+        let encoding = ReplicationEncodingConfig::default();
+        assert_eq!(
+            encoding.arrow_ipc_rows_per_record,
+            DEFAULT_REPLICATION_ARROW_IPC_ROWS_PER_RECORD
+        );
+        assert_eq!(
+            encoding.snapshot_batches_per_chunk,
+            DEFAULT_REPLICATION_SNAPSHOT_BATCHES_PER_CHUNK
+        );
+        assert!(encoding.arrow_ipc_rows_per_record >= 1024);
+        assert!(encoding.snapshot_batches_per_chunk >= 1);
+    }
+
+    #[test]
     fn load_config_accepts_replication_kafka_section() {
         let input = r#"
             [replication.kafka]

@@ -373,6 +373,23 @@ async fn stats_report_size_and_oldest_age() {
 }
 
 #[tokio::test]
+async fn stats_account_payload_bytes_separately_from_manifest_metadata() {
+    let store = test_store("cdc-buffer-stats-exclude-metadata").await;
+    let schema_versions = CdcSchemaVersionMap::from_iter(
+        (0..128).map(|idx| (format!("schema_version_metadata_key_{idx:03}"), idx)),
+    );
+    let append = append("0/10", 1000, vec![record(1)]).with_schema_versions(schema_versions);
+    let manifest = store.append_transaction(&append).await.expect("append");
+
+    let stats = store.stats("pipe", 2000).await.expect("stats");
+
+    assert_eq!(stats.pending_transactions(), 1);
+    assert_eq!(stats.pending_records(), manifest.record_count());
+    assert_eq!(stats.pending_bytes(), manifest.payload_bytes());
+    assert!(serde_json::to_vec(&manifest).unwrap().len() > manifest.payload_bytes());
+}
+
+#[tokio::test]
 async fn integrity_report_detects_missing_and_orphan_payload_objects() {
     let store = test_store("cdc-buffer-integrity").await;
     let append = append("0/10", 1000, vec![record(1)]);
@@ -406,6 +423,48 @@ async fn integrity_report_detects_missing_and_orphan_payload_objects() {
 }
 
 #[tokio::test]
+async fn metadata_without_payload_is_reported_and_does_not_advance_delivery() {
+    let store = test_store("cdc-buffer-missing-payload-restart").await;
+    let append = append("0/10", 1000, vec![record(1)]);
+    let manifest = store.append_transaction(&append).await.expect("append");
+    let referenced_key = manifest
+        .payload_object_key()
+        .expect("referenced payload object key")
+        .to_string();
+    store
+        .object_store
+        .as_ref()
+        .expect("object store")
+        .delete(&ObjectPath::from(referenced_key))
+        .await
+        .expect("delete referenced payload");
+
+    let recovered = reopened_store(&store);
+    let pending = recovered
+        .pending_transactions("pipe", 10)
+        .await
+        .expect("pending after restart");
+    assert_eq!(pending, vec![manifest.clone()]);
+    let error = recovered
+        .records(&manifest)
+        .await
+        .expect_err("missing payload should fail replay");
+    assert!(error.to_string().contains("load CDC buffer payload object"));
+    assert_eq!(
+        recovered
+            .delivery_frontier("pipe")
+            .await
+            .expect("delivery frontier"),
+        None
+    );
+
+    let report = recovered.integrity_report("pipe").await.expect("integrity");
+    assert_eq!(report.pending_payload_objects(), 1);
+    assert_eq!(report.missing_payload_objects(), 1);
+    assert_eq!(report.orphan_payload_objects(), 0);
+}
+
+#[tokio::test]
 async fn orphan_payload_cleanup_respects_age_and_keeps_referenced_payloads() {
     let store = test_store("cdc-buffer-orphan-cleanup").await;
     let append = append("0/10", 1000, vec![record(1)]);
@@ -425,14 +484,15 @@ async fn orphan_payload_cleanup_respects_age_and_keeps_referenced_payloads() {
         .await
         .expect("write orphan payload");
 
-    let early = store
+    let recovered = reopened_store(&store);
+    let early = recovered
         .cleanup_orphan_payload_objects("pipe", u64::MAX, 0)
         .await
         .expect("early orphan cleanup");
     assert_eq!(early.deleted_objects(), 0);
     assert_eq!(early.deleted_bytes(), 0);
 
-    let cleaned = store
+    let cleaned = recovered
         .cleanup_orphan_payload_objects("pipe", 1, u64::MAX)
         .await
         .expect("orphan cleanup");
@@ -450,7 +510,7 @@ async fn orphan_payload_cleanup_respects_age_and_keeps_referenced_payloads() {
             .await
             .is_ok()
     );
-    assert_eq!(store.records(&manifest).await.unwrap(), vec![record(1)]);
+    assert_eq!(recovered.records(&manifest).await.unwrap(), vec![record(1)]);
 }
 
 #[tokio::test]
