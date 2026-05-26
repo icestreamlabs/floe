@@ -526,6 +526,117 @@ async fn postgres_cdc_mv_to_postgres_sink_acceptance() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
 #[serial_test::serial(postgres_cdc_acceptance)]
+async fn postgres_cdc_replication_pipeline_to_postgres_acceptance() -> Result<()> {
+    let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
+        .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
+    let escaped_dsn = sql_string_literal(&dsn);
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let source_name = format!("pg_repl_source_{run_id}");
+    let source_table = format!("floe_repl_orders_{run_id}");
+    let target_table = format!("floe_repl_target_{run_id}");
+    let pipeline_name = format!("pg_repl_to_pg_{run_id}");
+    let slot = format!("floe_repl_pg_{run_id}");
+    let publication = format!("floe_repl_pg_pub_{run_id}");
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let data_dir = temp_dir.path().join("data");
+    let config_path = temp_dir
+        .path()
+        .join("postgres_replication_pipeline_acceptance.json");
+    std::fs::write(&config_path, "{}").context("write empty acceptance config")?;
+
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+        .await
+        .context("connect to postgres for replication pipeline target setup")?;
+    let _connection_task = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(
+                error = %err,
+                "postgres replication pipeline target setup connection closed"
+            );
+        }
+    });
+
+    cleanup_postgres_sink_acceptance(&client, &publication, &slot, &source_table, &target_table)
+        .await;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {source_table} (
+               id BIGINT PRIMARY KEY,
+               amount BIGINT NOT NULL,
+               note TEXT
+             );
+             CREATE TABLE {target_table} (
+               id BIGINT PRIMARY KEY,
+               amount BIGINT NOT NULL,
+               note TEXT
+             );
+             CREATE PUBLICATION {publication} FOR TABLE {source_table};"
+        ))
+        .await
+        .context("prepare Postgres replication pipeline target tables")?;
+
+    let sql = format!(
+        "CREATE SOURCE {source_name} WITH (
+            connector = 'postgres-cdc',
+            connection = '{escaped_dsn}',
+            slot.name = '{slot}',
+            publication.name = '{publication}'
+         );
+         CREATE REPLICATION PIPELINE {pipeline_name}
+         FROM {source_name} TABLE public.{source_table}
+         INTO POSTGRES WITH (
+            connection = '{escaped_dsn}',
+            table = 'public.{target_table}',
+            format = 'floe-json',
+            durable_buffer = true
+         );"
+    );
+    let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
+
+    let test_result = async {
+        sleep(Duration::from_millis(500)).await;
+        client
+            .execute(
+                &format!("INSERT INTO {source_table} (id, amount, note) VALUES ($1, $2, $3)"),
+                &[&1_i64, &100_i64, &"open"],
+            )
+            .await
+            .context("insert source row for Postgres replication pipeline")?;
+        wait_for_postgres_sink_row(&client, &target_table, 1, 100, Some("open")).await?;
+
+        client
+            .execute(
+                &format!("UPDATE {source_table} SET amount = $1, note = $2 WHERE id = $3"),
+                &[&175_i64, &Option::<&str>::None, &1_i64],
+            )
+            .await
+            .context("update source row for Postgres replication pipeline")?;
+        wait_for_postgres_sink_row(&client, &target_table, 1, 175, None).await?;
+
+        client
+            .execute(
+                &format!("DELETE FROM {source_table} WHERE id = $1"),
+                &[&1_i64],
+            )
+            .await
+            .context("delete source row for Postgres replication pipeline")?;
+        wait_for_postgres_sink_absent(&client, &target_table, 1).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_child(&mut child, "INT").await;
+    cleanup_postgres_sink_acceptance(&client, &publication, &slot, &source_table, &target_table)
+        .await;
+    test_result
+}
+
+#[tokio::test]
+#[ignore = "requires native logical-replication Postgres; set FLOE_ACCEPTANCE_PG_DSN"]
+#[serial_test::serial(postgres_cdc_acceptance)]
 async fn postgres_cdc_type_coverage_to_postgres_sink_acceptance() -> Result<()> {
     let dsn = std::env::var("FLOE_ACCEPTANCE_PG_DSN")
         .context("set FLOE_ACCEPTANCE_PG_DSN for CDC acceptance")?;
