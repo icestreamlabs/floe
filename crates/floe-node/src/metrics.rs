@@ -426,6 +426,24 @@ static CDC_REPLICATION_TARGET_ERROR: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register floe_cdc_replication_target_error")
 });
 
+static CDC_REPLICATION_TARGET_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_replication_target_failures_total",
+        "CDC replication target delivery failures by pipeline, target kind, and failure class",
+        &["pipeline", "target_kind", "class"]
+    )
+    .expect("register floe_cdc_replication_target_failures_total")
+});
+
+static CDC_REPLICATION_DLQ_REPLAYS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_replication_dlq_replays_total",
+        "Manual CDC replication DLQ replay attempts by pipeline and result",
+        &["pipeline", "result"]
+    )
+    .expect("register floe_cdc_replication_dlq_replays_total")
+});
+
 static POSTGRES_CDC_METRIC_STATE: LazyLock<Mutex<PostgresCdcMetricState>> =
     LazyLock::new(|| Mutex::new(PostgresCdcMetricState::default()));
 
@@ -789,6 +807,22 @@ pub(crate) fn record_cdc_replication_target_error(pipeline: &str, failed: bool) 
         .set(if failed { 1 } else { 0 });
 }
 
+pub(crate) fn inc_cdc_replication_target_failure(
+    pipeline: &str,
+    target_kind: &str,
+    failure_class: &str,
+) {
+    CDC_REPLICATION_TARGET_FAILURES_TOTAL
+        .with_label_values(&[pipeline, target_kind, failure_class])
+        .inc();
+}
+
+pub(crate) fn inc_cdc_replication_dlq_replay(pipeline: &str, result: &str) {
+    CDC_REPLICATION_DLQ_REPLAYS_TOTAL
+        .with_label_values(&[pipeline, result])
+        .inc();
+}
+
 pub(crate) fn init() {
     let _ = &*INGEST_QUEUE_DEPTH;
     let _ = &*INGEST_DECODE_LATENCY_MS;
@@ -837,6 +871,8 @@ pub(crate) fn init() {
     let _ = &*CDC_BUFFER_REPLAY_LATENCY_MS;
     let _ = &*CDC_REPLICATION_REPLAYING;
     let _ = &*CDC_REPLICATION_TARGET_ERROR;
+    let _ = &*CDC_REPLICATION_TARGET_FAILURES_TOTAL;
+    let _ = &*CDC_REPLICATION_DLQ_REPLAYS_TOTAL;
     let _ = &*POSTGRES_CDC_METRIC_STATE;
 }
 
@@ -948,6 +984,9 @@ mod tests {
         record_cdc_buffer_source_backpressure_active(pipeline, true);
         record_cdc_replication_replaying(pipeline, true);
         record_cdc_replication_target_error(pipeline, true);
+        inc_cdc_replication_target_failure(pipeline, "kafka", "retryable");
+        inc_cdc_replication_dlq_replay(pipeline, "success");
+        inc_cdc_replication_dlq_replay(pipeline, "failure");
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -960,6 +999,15 @@ mod tests {
         assert!(
             body.contains("floe_cdc_replication_target_error{pipeline=\"pipe_metrics_test\"} 1")
         );
+        assert!(body.contains(
+            "floe_cdc_replication_target_failures_total{class=\"retryable\",pipeline=\"pipe_metrics_test\",target_kind=\"kafka\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_replays_total{pipeline=\"pipe_metrics_test\",result=\"success\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_replication_dlq_replays_total{pipeline=\"pipe_metrics_test\",result=\"failure\"} 1"
+        ));
         assert!(body.contains("floe_cdc_buffer_pending_objects{pipeline=\"pipe_metrics_test\"} 2"));
         assert!(body.contains(
             "floe_cdc_buffer_object_ops_total{operation=\"create\",pipeline=\"pipe_metrics_test\"} 2"

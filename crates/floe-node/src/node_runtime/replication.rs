@@ -216,6 +216,7 @@ impl ReplicationPipelineRuntime {
             .unwrap_or(entry);
         match self.send_records_to_target(plan, &records).await {
             Ok(_) => {
+                crate::metrics::inc_cdc_replication_dlq_replay(&pipeline_name, "success");
                 self.clear_last_target_error(&plan.name);
                 let replayed = storage
                     .update_replication_pipeline_dlq_entry_status_with_reason(
@@ -229,6 +230,7 @@ impl ReplicationPipelineRuntime {
                 Ok(replayed.unwrap_or(attempted_entry))
             }
             Err(err) => {
+                crate::metrics::inc_cdc_replication_dlq_replay(&pipeline_name, "failure");
                 self.record_target_write_failure(plan, &err);
                 storage
                     .update_replication_pipeline_dlq_entry_status_with_reason(

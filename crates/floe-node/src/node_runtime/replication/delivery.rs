@@ -7,8 +7,8 @@ use floe_storage::{
 use super::super::{ReplicationPipelineRuntimePlan, ReplicationPipelineRuntimeTarget};
 use super::dead_letter::persist_dead_letter_records;
 use super::target_state::{
-    dead_lettered_target_state, delivered_target_state, failed_target_state,
-    replication_pipeline_uses_dlq,
+    classify_target_write_failure, dead_lettered_target_state, delivered_target_state,
+    failed_target_state, replication_pipeline_uses_dlq, target_kind,
 };
 use super::{ReplicationPipelineRuntime, current_unix_time_ms};
 
@@ -198,7 +198,13 @@ impl ReplicationPipelineRuntime {
         plan: &ReplicationPipelineRuntimePlan,
         err: &anyhow::Error,
     ) {
+        let failure_class = classify_target_write_failure(plan, err);
         self.set_last_target_error(&plan.name, format!("{err:#}"));
+        crate::metrics::inc_cdc_replication_target_failure(
+            &plan.name,
+            target_kind(plan),
+            failure_class.as_str(),
+        );
         match &plan.target {
             ReplicationPipelineRuntimeTarget::Kafka { .. } => {
                 crate::metrics::inc_sink_failure(&plan.name, "kafka_replication");
