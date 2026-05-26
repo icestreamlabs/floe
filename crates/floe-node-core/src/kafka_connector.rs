@@ -18,8 +18,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
-use crate::source::SourceEventSender;
-use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
+use crate::source::AppendIngestEventSender;
+use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
 
 static KAFKA_CONNECTOR_TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 256;
@@ -123,7 +123,7 @@ impl KafkaConnector {
         })
     }
 
-    pub async fn run(config: KafkaConnectorConfig, sender: SourceEventSender) -> Result<()> {
+    pub async fn run(config: KafkaConnectorConfig, sender: AppendIngestEventSender) -> Result<()> {
         let mut connector = KafkaConnector::new(config, Vec::new(), HashMap::new())?;
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
@@ -137,7 +137,7 @@ impl KafkaConnector {
             .set("enable.auto.offset.store", "false");
     }
 
-    fn handle_message(&self, message: &BorrowedMessage<'_>) -> Result<Vec<SourceEvent>> {
+    fn handle_message(&self, message: &BorrowedMessage<'_>) -> Result<Vec<AppendIngestEvent>> {
         let payload = match message.payload() {
             Some(payload) => payload,
             None => {
@@ -423,7 +423,7 @@ fn parse_floe_json_events(
     payload: &[u8],
     default_source: Option<&str>,
     topic: &str,
-) -> Result<Vec<SourceEvent>> {
+) -> Result<Vec<AppendIngestEvent>> {
     let message: FloeJsonMessage =
         serde_json::from_slice(payload).context("floe json payload must be valid json")?;
 
@@ -446,15 +446,15 @@ fn parse_floe_json_event(
     event: FloeJsonEvent,
     default_source: Option<&str>,
     topic: &str,
-) -> Result<SourceEvent> {
+) -> Result<AppendIngestEvent> {
     match event {
         FloeJsonEvent::Wrapped { source, data } => {
             ensure!(data.is_object(), "event payload must be an object");
-            Ok(SourceEvent::new(source, data))
+            Ok(AppendIngestEvent::new(source, data))
         }
         FloeJsonEvent::Payload(payload) => {
             let source = default_source.unwrap_or(topic);
-            Ok(SourceEvent::new(source, payload))
+            Ok(AppendIngestEvent::new(source, payload))
         }
     }
 }
@@ -465,7 +465,7 @@ fn parse_direct_default_source_payload_event(
     definitions: &[SourceDefinition],
     lookup: &DirectDecodeLookup,
     default_source_id: Option<usize>,
-) -> Result<Option<SourceEvent>> {
+) -> Result<Option<AppendIngestEvent>> {
     let Some(source_name) = default_source else {
         return Ok(None);
     };
@@ -483,9 +483,9 @@ fn parse_direct_default_source_payload_event(
     .deserialize(&mut deserializer)
     .map_err(|err| anyhow::anyhow!("direct default-source floe_json decode failed: {err}"))?;
     let mut event = if let Some(source_id) = default_source_id {
-        SourceEvent::preencoded_for_source_id(source_id, encoded_row)
+        AppendIngestEvent::preencoded_for_source_id(source_id, encoded_row)
     } else {
-        SourceEvent::preencoded(source_name, encoded_row)
+        AppendIngestEvent::preencoded(source_name, encoded_row)
     };
     if let Some(event_time_ms) = event_ts {
         event = event.with_event_time_ms(event_time_ms);
@@ -500,7 +500,7 @@ fn parse_direct_floe_json_event(
     definitions: &[SourceDefinition],
     lookup: &DirectDecodeLookup,
     default_source_id: Option<usize>,
-) -> Result<Option<SourceEvent>> {
+) -> Result<Option<AppendIngestEvent>> {
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     DirectFloeJsonEventSeed {
         default_source,
@@ -522,7 +522,7 @@ struct DirectFloeJsonEventSeed<'a> {
 }
 
 impl<'de> DeserializeSeed<'de> for DirectFloeJsonEventSeed<'_> {
-    type Value = Option<SourceEvent>;
+    type Value = Option<AppendIngestEvent>;
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
@@ -537,7 +537,7 @@ struct DirectFloeJsonEventVisitor<'a> {
 }
 
 impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
-    type Value = Option<SourceEvent>;
+    type Value = Option<AppendIngestEvent>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a single floe_json source/data wrapper object")
@@ -606,9 +606,9 @@ impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
             return Ok(None);
         };
         let mut event = if let Some(source_id) = source_id {
-            SourceEvent::preencoded_for_source_id(source_id, encoded_row)
+            AppendIngestEvent::preencoded_for_source_id(source_id, encoded_row)
         } else {
-            SourceEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row)
+            AppendIngestEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row)
         };
         if let Some(event_time_ms) = event_ts {
             event = event.with_event_time_ms(event_time_ms);
@@ -983,7 +983,7 @@ fn parse_debezium_events(
     default_source: Option<&str>,
     topic: &str,
     message_key: Option<&[u8]>,
-) -> Result<Vec<SourceEvent>> {
+) -> Result<Vec<AppendIngestEvent>> {
     let object = value
         .as_object()
         .context("debezium payload must be a JSON object")?;
@@ -1035,7 +1035,7 @@ fn parse_debezium_events(
         row.insert("__floe_key".to_string(), key_value);
     }
 
-    Ok(vec![SourceEvent::new(source, Value::Object(row))])
+    Ok(vec![AppendIngestEvent::new(source, Value::Object(row))])
 }
 
 impl KafkaConnector {
@@ -1202,7 +1202,7 @@ mod tests {
         )
         .expect("direct parse")
         .expect("direct event");
-        let expected_event = SourceEvent::new(
+        let expected_event = AppendIngestEvent::new(
             "nexmark_bid",
             json!({
                 "auction": 100,
@@ -1254,7 +1254,7 @@ mod tests {
         )
         .expect("direct parse")
         .expect("direct event");
-        let expected_event = SourceEvent::new(
+        let expected_event = AppendIngestEvent::new(
             "nexmark_bid",
             json!({
                 "auction": 100,
@@ -1315,7 +1315,7 @@ mod tests {
             definition,
             Some(Arc::from([true, true, true, false])),
         );
-        let expected_event = SourceEvent::new(
+        let expected_event = AppendIngestEvent::new(
             "nexmark_bid",
             json!({
                 "auction": 100,

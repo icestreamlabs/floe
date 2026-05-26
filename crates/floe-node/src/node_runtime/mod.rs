@@ -120,22 +120,22 @@ const DEFAULT_WATERMARK_IDLE_SOURCE_MS: u64 = 30_000;
 struct ConnectorQueue {
     id: usize,
     name: String,
-    pending: VecDeque<QueuedSourceEvent>,
+    pending: VecDeque<QueuedAppendIngestEvent>,
 }
 
-struct QueuedSourceEvent {
-    event: core_source::SourceEvent,
+struct QueuedAppendIngestEvent {
+    event: core_source::AppendIngestEvent,
     commit_ack: Option<core_source::CommitAck>,
 }
 
-struct SelectedSourceEvent {
+struct SelectedAppendIngestEvent {
     source_id: Option<usize>,
-    event: core_source::SourceEvent,
+    event: core_source::AppendIngestEvent,
     commit_ack: Option<core_source::CommitAck>,
 }
 
 struct BatchSelection {
-    batch: Vec<SelectedSourceEvent>,
+    batch: Vec<SelectedAppendIngestEvent>,
     per_connector_counts: Vec<usize>,
 }
 

@@ -28,7 +28,7 @@ use dbsp::join::TransientJoinInputBatch;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::StreamCursor;
 use dbsp::stream::util::materialize_zset_handle;
-use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceEvent};
+use floe_core::source::{AppendIngestEvent, SourceColumn, SourceDataType, SourceDefinition};
 use object_store::memory::InMemory;
 use serde_json::{Value, json};
 use slatedb::Db;
@@ -2996,10 +2996,10 @@ fn required_mask(
 }
 
 fn encode_event(decoder: &SourceRowDecoder, payload: Value, source: &str) -> Vec<u8> {
-    let event = SourceEvent::new(source, payload);
+    let event = AppendIngestEvent::new(source, payload);
     decoder
         .encode_row_key(&event)
-        .expect("encode source event")
+        .expect("encode append ingest event")
         .0
 }
 

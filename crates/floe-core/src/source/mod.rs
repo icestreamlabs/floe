@@ -193,78 +193,89 @@ impl SourceRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SourceEvent {
+pub struct AppendIngestEvent {
     source: String,
-    body: SourceEventBody,
-    resume_token: Option<SourceResumeToken>,
-    event_time_ms: Option<u64>,
-    source_id: Option<usize>,
-    kafka_topic: Option<Arc<str>>,
-    kafka_partition: Option<i32>,
-    kafka_offset: Option<i64>,
+    payload: AppendIngestPayload,
+    metadata: AppendIngestMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum SourceEventBody {
+pub enum AppendIngestPayload {
     Json(Value),
     PreencodedRowKey(Vec<u8>),
     Empty,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AppendIngestMetadata {
+    source_id: Option<usize>,
+    resume_token: Option<AppendIngestResumeToken>,
+    event_time_ms: Option<u64>,
+    connector_position: Option<AppendIngestConnectorPosition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppendIngestConnectorPosition {
+    Kafka {
+        topic: Arc<str>,
+        partition: i32,
+        offset: i64,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
-struct SourceEventSerde {
+struct AppendIngestEventSerde {
     source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resume_token: Option<SourceResumeToken>,
+    resume_token: Option<AppendIngestResumeToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_time_ms: Option<u64>,
 }
 
-impl Serialize for SourceEvent {
+impl Serialize for AppendIngestEvent {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        SourceEventSerde {
+        AppendIngestEventSerde {
             source: self.source.clone(),
-            payload: match &self.body {
-                SourceEventBody::Json(payload) => Some(payload.clone()),
-                SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+            payload: match &self.payload {
+                AppendIngestPayload::Json(payload) => Some(payload.clone()),
+                AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
             },
-            resume_token: self.resume_token.clone(),
-            event_time_ms: self.event_time_ms,
+            resume_token: self.metadata.resume_token.clone(),
+            event_time_ms: self.metadata.event_time_ms,
         }
         .serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for SourceEvent {
+impl<'de> Deserialize<'de> for AppendIngestEvent {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let decoded = SourceEventSerde::deserialize(deserializer)?;
+        let decoded = AppendIngestEventSerde::deserialize(deserializer)?;
         Ok(Self {
             source: decoded.source,
-            body: decoded
+            payload: decoded
                 .payload
-                .map(SourceEventBody::Json)
-                .unwrap_or(SourceEventBody::Empty),
-            resume_token: decoded.resume_token,
-            event_time_ms: decoded.event_time_ms,
-            source_id: None,
-            kafka_topic: None,
-            kafka_partition: None,
-            kafka_offset: None,
+                .map(AppendIngestPayload::Json)
+                .unwrap_or(AppendIngestPayload::Empty),
+            metadata: AppendIngestMetadata {
+                resume_token: decoded.resume_token,
+                event_time_ms: decoded.event_time_ms,
+                ..AppendIngestMetadata::default()
+            },
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SourceResumeToken {
+pub enum AppendIngestResumeToken {
     Kafka {
         topic: String,
         partition: i32,
@@ -281,43 +292,52 @@ pub enum SourceResumeToken {
     },
 }
 
-impl SourceEvent {
+impl AppendIngestMetadata {
+    pub fn source_id(&self) -> Option<usize> {
+        self.source_id
+    }
+
+    pub fn resume_token(&self) -> Option<&AppendIngestResumeToken> {
+        self.resume_token.as_ref()
+    }
+
+    pub fn event_time_ms(&self) -> Option<u64> {
+        self.event_time_ms
+    }
+
+    pub fn connector_position(&self) -> Option<&AppendIngestConnectorPosition> {
+        self.connector_position.as_ref()
+    }
+}
+
+/// Append-style row ingest envelope for file, object-store, generator, Kafka,
+/// HTTP, and connector-SDK inputs. Native CDC paths use transaction/change
+/// batches instead of this type.
+impl AppendIngestEvent {
     pub fn new(source: impl Into<String>, payload: Value) -> Self {
         Self {
             source: source.into(),
-            body: SourceEventBody::Json(payload),
-            resume_token: None,
-            event_time_ms: None,
-            source_id: None,
-            kafka_topic: None,
-            kafka_partition: None,
-            kafka_offset: None,
+            payload: AppendIngestPayload::Json(payload),
+            metadata: AppendIngestMetadata::default(),
         }
     }
 
     pub fn preencoded(source: impl Into<String>, preencoded_row_key: Vec<u8>) -> Self {
         Self {
             source: source.into(),
-            body: SourceEventBody::PreencodedRowKey(preencoded_row_key),
-            resume_token: None,
-            event_time_ms: None,
-            source_id: None,
-            kafka_topic: None,
-            kafka_partition: None,
-            kafka_offset: None,
+            payload: AppendIngestPayload::PreencodedRowKey(preencoded_row_key),
+            metadata: AppendIngestMetadata::default(),
         }
     }
 
     pub fn preencoded_for_source_id(source_id: usize, preencoded_row_key: Vec<u8>) -> Self {
         Self {
             source: String::new(),
-            body: SourceEventBody::PreencodedRowKey(preencoded_row_key),
-            resume_token: None,
-            event_time_ms: None,
-            source_id: Some(source_id),
-            kafka_topic: None,
-            kafka_partition: None,
-            kafka_offset: None,
+            payload: AppendIngestPayload::PreencodedRowKey(preencoded_row_key),
+            metadata: AppendIngestMetadata {
+                source_id: Some(source_id),
+                ..AppendIngestMetadata::default()
+            },
         }
     }
 
@@ -326,75 +346,83 @@ impl SourceEvent {
     }
 
     pub fn source_id(&self) -> Option<usize> {
-        self.source_id
+        self.metadata.source_id
+    }
+
+    pub fn metadata(&self) -> &AppendIngestMetadata {
+        &self.metadata
     }
 
     pub fn payload(&self) -> Option<&Value> {
-        match &self.body {
-            SourceEventBody::Json(payload) => Some(payload),
-            SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+        match &self.payload {
+            AppendIngestPayload::Json(payload) => Some(payload),
+            AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
         }
     }
 
-    pub fn resume_token(&self) -> Option<&SourceResumeToken> {
-        self.resume_token.as_ref()
+    pub fn resume_token(&self) -> Option<&AppendIngestResumeToken> {
+        self.metadata.resume_token.as_ref()
     }
 
-    pub fn with_resume_token(mut self, resume_token: SourceResumeToken) -> Self {
-        self.resume_token = Some(resume_token);
+    pub fn with_resume_token(mut self, resume_token: AppendIngestResumeToken) -> Self {
+        self.metadata.resume_token = Some(resume_token);
         self
     }
 
     pub fn with_kafka_position(mut self, topic: Arc<str>, partition: i32, offset: i64) -> Self {
-        self.kafka_topic = Some(topic);
-        self.kafka_partition = Some(partition);
-        self.kafka_offset = Some(offset);
+        self.metadata.connector_position = Some(AppendIngestConnectorPosition::Kafka {
+            topic,
+            partition,
+            offset,
+        });
         self
     }
 
     pub fn kafka_position(&self) -> Option<(&Arc<str>, i32, i64)> {
-        Some((
-            self.kafka_topic.as_ref()?,
-            self.kafka_partition?,
-            self.kafka_offset?,
-        ))
+        match self.metadata.connector_position.as_ref()? {
+            AppendIngestConnectorPosition::Kafka {
+                topic,
+                partition,
+                offset,
+            } => Some((topic, *partition, *offset)),
+        }
     }
 
     pub fn event_time_ms(&self) -> Option<u64> {
-        self.event_time_ms
+        self.metadata.event_time_ms
     }
 
     pub fn with_event_time_ms(mut self, event_time_ms: u64) -> Self {
-        self.event_time_ms = Some(event_time_ms);
+        self.metadata.event_time_ms = Some(event_time_ms);
         self
     }
 
     pub fn preencoded_row_key(&self) -> Option<&[u8]> {
-        match &self.body {
-            SourceEventBody::PreencodedRowKey(row_key) => Some(row_key.as_slice()),
-            SourceEventBody::Json(_) | SourceEventBody::Empty => None,
+        match &self.payload {
+            AppendIngestPayload::PreencodedRowKey(row_key) => Some(row_key.as_slice()),
+            AppendIngestPayload::Json(_) | AppendIngestPayload::Empty => None,
         }
     }
 
     pub fn with_preencoded_row_key(mut self, preencoded_row_key: Vec<u8>) -> Self {
-        self.body = SourceEventBody::PreencodedRowKey(preencoded_row_key);
+        self.payload = AppendIngestPayload::PreencodedRowKey(preencoded_row_key);
         self
     }
 
     pub fn take_preencoded_row_key(&mut self) -> Option<Vec<u8>> {
-        match std::mem::replace(&mut self.body, SourceEventBody::Empty) {
-            SourceEventBody::PreencodedRowKey(row_key) => Some(row_key),
+        match std::mem::replace(&mut self.payload, AppendIngestPayload::Empty) {
+            AppendIngestPayload::PreencodedRowKey(row_key) => Some(row_key),
             other => {
-                self.body = other;
+                self.payload = other;
                 None
             }
         }
     }
 
     pub fn into_payload(self) -> Option<Value> {
-        match self.body {
-            SourceEventBody::Json(payload) => Some(payload),
-            SourceEventBody::PreencodedRowKey(_) | SourceEventBody::Empty => None,
+        match self.payload {
+            AppendIngestPayload::Json(payload) => Some(payload),
+            AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
         }
     }
 
@@ -455,8 +483,8 @@ mod tests {
     }
 
     #[test]
-    fn source_event_serializes_to_json() {
-        let event = SourceEvent::new("nexmark_person", json!({"id": 42}));
+    fn append_ingest_event_serializes_to_json() {
+        let event = AppendIngestEvent::new("nexmark_person", json!({"id": 42}));
         let serialized = event.to_json_string().expect("json serialization");
 
         assert!(serialized.contains("nexmark_person"));
@@ -465,12 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn source_event_body_separates_json_and_preencoded_rows() {
-        let json_event = SourceEvent::new("orders", json!({"id": 7}));
+    fn append_ingest_payload_separates_json_and_preencoded_rows() {
+        let json_event = AppendIngestEvent::new("orders", json!({"id": 7}));
         assert_eq!(json_event.payload(), Some(&json!({"id": 7})));
         assert!(json_event.preencoded_row_key().is_none());
 
-        let mut preencoded = SourceEvent::preencoded_for_source_id(3, vec![1, 2, 3]);
+        let mut preencoded = AppendIngestEvent::preencoded_for_source_id(3, vec![1, 2, 3]);
         assert_eq!(preencoded.source_id(), Some(3));
         assert!(preencoded.payload().is_none());
         assert_eq!(preencoded.preencoded_row_key(), Some(&[1, 2, 3][..]));
@@ -480,23 +508,24 @@ mod tests {
     }
 
     #[test]
-    fn source_event_serde_keeps_external_shape() {
-        let event = SourceEvent::new("orders", json!({"id": 7}))
-            .with_resume_token(SourceResumeToken::File { cursor: 11 })
+    fn append_ingest_event_serde_keeps_external_shape() {
+        let event = AppendIngestEvent::new("orders", json!({"id": 7}))
+            .with_resume_token(AppendIngestResumeToken::File { cursor: 11 })
             .with_event_time_ms(99);
 
-        let encoded = serde_json::to_value(&event).expect("serialize source event");
+        let encoded = serde_json::to_value(&event).expect("serialize append ingest event");
         assert_eq!(encoded["source"], "orders");
         assert_eq!(encoded["payload"], json!({"id": 7}));
         assert_eq!(encoded["event_time_ms"], 99);
 
-        let decoded: SourceEvent = serde_json::from_value(encoded).expect("decode source event");
+        let decoded: AppendIngestEvent =
+            serde_json::from_value(encoded).expect("decode append ingest event");
         assert_eq!(decoded.source(), "orders");
         assert_eq!(decoded.payload(), Some(&json!({"id": 7})));
         assert_eq!(decoded.event_time_ms(), Some(99));
         assert!(matches!(
             decoded.resume_token(),
-            Some(SourceResumeToken::File { cursor: 11 })
+            Some(AppendIngestResumeToken::File { cursor: 11 })
         ));
     }
 

@@ -68,12 +68,12 @@ fn default_run_args() -> cli::RunArgs {
     }
 }
 
-fn event(source: &str, id: i64) -> core_source::SourceEvent {
-    core_source::SourceEvent::new(source, json!({ "id": id }))
+fn event(source: &str, id: i64) -> core_source::AppendIngestEvent {
+    core_source::AppendIngestEvent::new(source, json!({ "id": id }))
 }
 
-fn queued_event(source: &str, id: i64) -> QueuedSourceEvent {
-    QueuedSourceEvent {
+fn queued_event(source: &str, id: i64) -> QueuedAppendIngestEvent {
+    QueuedAppendIngestEvent {
         event: event(source, id),
         commit_ack: None,
     }
@@ -81,7 +81,7 @@ fn queued_event(source: &str, id: i64) -> QueuedSourceEvent {
 
 #[test]
 fn build_batch_limits_per_connector() {
-    let pending_events = core_source::PendingEventCounter::default();
+    let pending_events = core_source::PendingAppendIngestEventCounter::default();
     pending_events.record_enqueue(4);
     let mut queues = vec![
         ConnectorQueue {
@@ -118,7 +118,7 @@ fn build_batch_limits_per_connector() {
 
 #[test]
 fn build_batch_limits_per_source() {
-    let pending_events = core_source::PendingEventCounter::default();
+    let pending_events = core_source::PendingAppendIngestEventCounter::default();
     pending_events.record_enqueue(3);
     let mut queues = vec![ConnectorQueue {
         id: 0,

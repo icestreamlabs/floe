@@ -105,7 +105,7 @@ Tradeoffs:
 
 ## Architecture Overview
 
-1. Connectors emit `SourceEvent` payloads (file, Kafka, or generator).
+1. Append-style connectors emit `AppendIngestEvent` payloads (file, Kafka, or generator).
 2. Events are decoded into typed rows via `SourceRowDecoder`.
 3. Outer streams feed the DBSP runtime built from DataFusion logical plans.
 4. Materialized views are managed in the executor and exposed via pgwire TAIL.

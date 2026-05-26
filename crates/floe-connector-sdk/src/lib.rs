@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use floe_core::source::{SourceDefinition, SourceEvent};
+use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceCheckpoint {
@@ -124,6 +124,10 @@ pub trait SchemaMapper: Send + Sync {
     ) -> Result<serde_json::Value>;
 }
 
-pub trait EventDecoder: Send + Sync {
-    fn decode(&self, payload: &[u8], default_source: Option<&str>) -> Result<Vec<SourceEvent>>;
+pub trait AppendIngestEventDecoder: Send + Sync {
+    fn decode(
+        &self,
+        payload: &[u8],
+        default_source: Option<&str>,
+    ) -> Result<Vec<AppendIngestEvent>>;
 }

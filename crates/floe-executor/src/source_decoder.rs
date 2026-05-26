@@ -6,7 +6,7 @@ use datafusion::arrow::array::{
     TimestampMillisecondArray,
 };
 use floe_core::RowValue;
-use floe_core::source::{SourceDataType, SourceDefinition, SourceEvent};
+use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
 use serde_json::Value;
 
 use crate::stream_types::Timestamp;
@@ -55,7 +55,10 @@ impl SourceRowDecoder {
         &self.definition
     }
 
-    pub fn encode_row_key(&self, event: &SourceEvent) -> Result<(Vec<u8>, Option<Timestamp>)> {
+    pub fn encode_row_key(
+        &self,
+        event: &AppendIngestEvent,
+    ) -> Result<(Vec<u8>, Option<Timestamp>)> {
         if event.source() != self.definition.name() {
             bail!(
                 "event source {} does not match definition {}",
@@ -63,7 +66,7 @@ impl SourceRowDecoder {
                 self.definition.name()
             );
         }
-        let payload = SourceEvent::payload(event)
+        let payload = AppendIngestEvent::payload(event)
             .require_payload("source payload must be present for encoded events")?;
         let object = payload
             .as_object()
@@ -606,7 +609,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "nexmark_bid",
             json!({
                 "auction": 100,
@@ -648,7 +651,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "flags",
             json!({
                 "id": 1,
@@ -683,7 +686,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition.clone());
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "lineitem",
             json!({
                 "shipdate": 10471,
@@ -778,7 +781,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new("orders", json!({"id": 1}));
+        let event = AppendIngestEvent::new("orders", json!({"id": 1}));
         let err = decoder
             .encode_row_key(&event)
             .expect_err("missing price should fail");
@@ -797,7 +800,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new("orders", json!({"id": "oops"}));
+        let event = AppendIngestEvent::new("orders", json!({"id": "oops"}));
         let err = decoder
             .encode_row_key(&event)
             .expect_err("type mismatch should fail");
@@ -815,7 +818,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new("orders", json!({"id": null, "note": null}));
+        let event = AppendIngestEvent::new("orders", json!({"id": null, "note": null}));
         let err = decoder
             .encode_row_key(&event)
             .expect_err("null id should fail");
@@ -838,7 +841,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "orders",
             json!({
                 "id": 42,
@@ -878,7 +881,7 @@ mod tests {
             definition,
             Some(Arc::from([true, false, true])),
         );
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "orders",
             json!({
                 "id": 42,
@@ -910,7 +913,7 @@ mod tests {
         )
         .expect("definition");
         let decoder = SourceRowDecoder::new(definition);
-        let event = SourceEvent::new(
+        let event = AppendIngestEvent::new(
             "orders",
             json!({
                 "id": 42,

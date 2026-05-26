@@ -4,8 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::source::{SourceEventBatch, SourceEventSender, send_batch, send_event};
-use floe_core::source::{SourceDefinition, SourceEvent};
+use crate::source::{AppendIngestEventBatch, AppendIngestEventSender, send_batch, send_event};
+use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
 const MAX_PENDING_EVENTS_BEFORE_YIELD: usize = 65_536;
 const MAX_CONSECUTIVE_EMITTED_TICKS_BEFORE_YIELD: usize = 8;
@@ -13,15 +13,15 @@ const MAX_CONSECUTIVE_EMITTED_TICKS_BEFORE_YIELD: usize = 8;
 /// Context shared with connector implementations for event emission.
 #[derive(Clone)]
 pub struct ConnectorContext {
-    sender: SourceEventSender,
+    sender: AppendIngestEventSender,
 }
 
 impl ConnectorContext {
-    pub fn new(sender: SourceEventSender) -> Self {
+    pub fn new(sender: AppendIngestEventSender) -> Self {
         Self { sender }
     }
 
-    pub fn sender(&self) -> &SourceEventSender {
+    pub fn sender(&self) -> &AppendIngestEventSender {
         &self.sender
     }
 
@@ -31,15 +31,15 @@ impl ConnectorContext {
 
     pub async fn send_event(
         &self,
-        event: SourceEvent,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<SourceEventBatch>> {
+        event: AppendIngestEvent,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<AppendIngestEventBatch>> {
         send_event(&self.sender, event).await
     }
 
     pub async fn send_batch(
         &self,
-        events: SourceEventBatch,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<SourceEventBatch>> {
+        events: AppendIngestEventBatch,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<AppendIngestEventBatch>> {
         send_batch(&self.sender, events).await
     }
 }

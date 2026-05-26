@@ -82,23 +82,25 @@ pub(super) fn record_mv_freshness_metrics(last_update_at_ms: &HashMap<String, u6
 }
 
 pub(super) fn event_resume_offset(
-    token: Option<&core_source::SourceResumeToken>,
+    token: Option<&core_source::AppendIngestResumeToken>,
 ) -> Option<(u32, u64)> {
     match token? {
-        core_source::SourceResumeToken::Kafka {
+        core_source::AppendIngestResumeToken::Kafka {
             partition, offset, ..
         } => {
             let partition = u32::try_from(*partition).ok()?;
             let offset = u64::try_from(*offset).ok()?;
             Some((partition, offset))
         }
-        core_source::SourceResumeToken::File { cursor }
-        | core_source::SourceResumeToken::Generator { position: cursor }
-        | core_source::SourceResumeToken::ObjectStore { cursor } => Some((0, *cursor)),
+        core_source::AppendIngestResumeToken::File { cursor }
+        | core_source::AppendIngestResumeToken::Generator { position: cursor }
+        | core_source::AppendIngestResumeToken::ObjectStore { cursor } => Some((0, *cursor)),
     }
 }
 
-pub(super) fn event_fast_resume_offset(event: &core_source::SourceEvent) -> Option<(u32, u64)> {
+pub(super) fn event_fast_resume_offset(
+    event: &core_source::AppendIngestEvent,
+) -> Option<(u32, u64)> {
     let (_, partition, offset) = event.kafka_position()?;
     let partition = u32::try_from(partition).ok()?;
     let offset = u64::try_from(offset).ok()?;
@@ -106,17 +108,17 @@ pub(super) fn event_fast_resume_offset(event: &core_source::SourceEvent) -> Opti
 }
 
 pub(super) fn event_fast_kafka_offset(
-    event: &core_source::SourceEvent,
+    event: &core_source::AppendIngestEvent,
 ) -> Option<(Arc<str>, i32, i64)> {
     let (topic, partition, offset) = event.kafka_position()?;
     Some((Arc::clone(topic), partition, offset))
 }
 
 pub(super) fn event_kafka_offset(
-    token: Option<&core_source::SourceResumeToken>,
+    token: Option<&core_source::AppendIngestResumeToken>,
 ) -> Option<(Arc<str>, i32, i64)> {
     match token? {
-        core_source::SourceResumeToken::Kafka {
+        core_source::AppendIngestResumeToken::Kafka {
             topic,
             partition,
             offset,
@@ -200,19 +202,22 @@ pub(super) fn current_unix_time_ms() -> u64 {
 }
 
 pub(super) async fn recv_from_ready(
-    receiver: &mut core_source::RoutedSourceEventReceiver,
+    receiver: &mut core_source::RoutedAppendIngestEventReceiver,
     queues: &mut [ConnectorQueue],
 ) -> bool {
     let Some(batch) = receiver.recv().await else {
         return false;
     };
     if let Some(queue) = queues.get_mut(batch.connector_id) {
-        queue
-            .pending
-            .extend(batch.events.into_iter().map(|event| QueuedSourceEvent {
-                event,
-                commit_ack: batch.commit_ack.clone(),
-            }));
+        queue.pending.extend(
+            batch
+                .events
+                .into_iter()
+                .map(|event| QueuedAppendIngestEvent {
+                    event,
+                    commit_ack: batch.commit_ack.clone(),
+                }),
+        );
     }
     true
 }
@@ -241,19 +246,19 @@ pub(super) fn drain_cdc_ready(
 }
 
 pub(super) fn drain_ready(
-    receiver: &mut core_source::RoutedSourceEventReceiver,
+    receiver: &mut core_source::RoutedAppendIngestEventReceiver,
     queues: &mut [ConnectorQueue],
 ) {
     loop {
         match receiver.try_recv() {
             Ok(batch) => {
                 if let Some(queue) = queues.get_mut(batch.connector_id) {
-                    queue
-                        .pending
-                        .extend(batch.events.into_iter().map(|event| QueuedSourceEvent {
+                    queue.pending.extend(batch.events.into_iter().map(|event| {
+                        QueuedAppendIngestEvent {
                             event,
                             commit_ack: batch.commit_ack.clone(),
-                        }));
+                        }
+                    }));
                 }
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -269,7 +274,7 @@ pub(super) fn build_batch(
     max_batch: usize,
     max_per_source: usize,
     max_per_connector: usize,
-    pending_events: &core_source::PendingEventCounter,
+    pending_events: &core_source::PendingAppendIngestEventCounter,
 ) -> BatchSelection {
     let mut batch = Vec::with_capacity(max_batch);
     let mut per_source_counts = vec![0usize; source_count];
@@ -280,7 +285,7 @@ pub(super) fn build_batch(
         .max()
         .map_or(0, |id| id + 1);
     let mut per_connector_counts = vec![0usize; per_connector_count_len];
-    let mut deferred: Vec<VecDeque<QueuedSourceEvent>> =
+    let mut deferred: Vec<VecDeque<QueuedAppendIngestEvent>> =
         (0..queues.len()).map(|_| VecDeque::new()).collect();
     let connector_count = queues.len();
     for step in 0..connector_count {
@@ -309,7 +314,7 @@ pub(super) fn build_batch(
             }
             *count += 1;
             *per_connector += 1;
-            batch.push(SelectedSourceEvent {
+            batch.push(SelectedAppendIngestEvent {
                 source_id,
                 event: queued.event,
                 commit_ack: queued.commit_ack,

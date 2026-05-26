@@ -1,17 +1,19 @@
-pub use floe_core::source::{SourceDefinition, SourceEvent, SourceRegistry, SourceResumeToken};
+pub use floe_core::source::{
+    AppendIngestEvent, AppendIngestResumeToken, SourceDefinition, SourceRegistry,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-pub type SourceEventBatch = Vec<SourceEvent>;
-pub type SourceEventReceiver = mpsc::Receiver<SourceEventBatch>;
-pub type RoutedSourceEventReceiver = mpsc::Receiver<RoutedSourceEventBatch>;
+pub type AppendIngestEventBatch = Vec<AppendIngestEvent>;
+pub type AppendIngestEventReceiver = mpsc::Receiver<AppendIngestEventBatch>;
+pub type RoutedAppendIngestEventReceiver = mpsc::Receiver<RoutedAppendIngestEventBatch>;
 
 #[derive(Debug)]
-pub struct RoutedSourceEventBatch {
+pub struct RoutedAppendIngestEventBatch {
     pub connector_id: usize,
-    pub events: SourceEventBatch,
+    pub events: AppendIngestEventBatch,
     pub commit_ack: Option<CommitAck>,
 }
 
@@ -56,11 +58,11 @@ impl CommitAck {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct PendingEventCounter {
+pub struct PendingAppendIngestEventCounter {
     pending: Arc<AtomicUsize>,
 }
 
-impl PendingEventCounter {
+impl PendingAppendIngestEventCounter {
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::Acquire)
     }
@@ -85,24 +87,24 @@ impl PendingEventCounter {
 }
 
 #[derive(Clone)]
-pub enum SourceEventSender {
+pub enum AppendIngestEventSender {
     Direct {
-        sender: mpsc::Sender<SourceEventBatch>,
-        pending: PendingEventCounter,
+        sender: mpsc::Sender<AppendIngestEventBatch>,
+        pending: PendingAppendIngestEventCounter,
     },
     Routed {
         connector_id: usize,
-        sender: mpsc::Sender<RoutedSourceEventBatch>,
-        pending: PendingEventCounter,
+        sender: mpsc::Sender<RoutedAppendIngestEventBatch>,
+        pending: PendingAppendIngestEventCounter,
     },
 }
 
-pub fn channel(capacity: usize) -> (SourceEventSender, SourceEventReceiver) {
+pub fn channel(capacity: usize) -> (AppendIngestEventSender, AppendIngestEventReceiver) {
     let (sender, receiver) = mpsc::channel(capacity);
     (
-        SourceEventSender::Direct {
+        AppendIngestEventSender::Direct {
             sender,
-            pending: PendingEventCounter::default(),
+            pending: PendingAppendIngestEventCounter::default(),
         },
         receiver,
     )
@@ -111,49 +113,49 @@ pub fn channel(capacity: usize) -> (SourceEventSender, SourceEventReceiver) {
 pub fn routed_channel(
     capacity: usize,
 ) -> (
-    mpsc::Sender<RoutedSourceEventBatch>,
-    RoutedSourceEventReceiver,
+    mpsc::Sender<RoutedAppendIngestEventBatch>,
+    RoutedAppendIngestEventReceiver,
 ) {
     mpsc::channel(capacity)
 }
 
 pub fn routed_sender(
     connector_id: usize,
-    sender: mpsc::Sender<RoutedSourceEventBatch>,
-    pending: PendingEventCounter,
-) -> SourceEventSender {
-    SourceEventSender::Routed {
+    sender: mpsc::Sender<RoutedAppendIngestEventBatch>,
+    pending: PendingAppendIngestEventCounter,
+) -> AppendIngestEventSender {
+    AppendIngestEventSender::Routed {
         connector_id,
         sender,
         pending,
     }
 }
 
-impl SourceEventSender {
+impl AppendIngestEventSender {
     pub fn pending_events(&self) -> usize {
         match self {
-            SourceEventSender::Direct { pending, .. }
-            | SourceEventSender::Routed { pending, .. } => pending.pending(),
+            AppendIngestEventSender::Direct { pending, .. }
+            | AppendIngestEventSender::Routed { pending, .. } => pending.pending(),
         }
     }
 }
 
 pub async fn send_event(
-    sender: &SourceEventSender,
-    event: SourceEvent,
-) -> Result<(), SendError<SourceEventBatch>> {
+    sender: &AppendIngestEventSender,
+    event: AppendIngestEvent,
+) -> Result<(), SendError<AppendIngestEventBatch>> {
     send_batch(sender, vec![event]).await
 }
 
 pub async fn send_batch(
-    sender: &SourceEventSender,
-    events: SourceEventBatch,
-) -> Result<(), SendError<SourceEventBatch>> {
+    sender: &AppendIngestEventSender,
+    events: AppendIngestEventBatch,
+) -> Result<(), SendError<AppendIngestEventBatch>> {
     if events.is_empty() {
         return Ok(());
     }
     match sender {
-        SourceEventSender::Direct { sender, pending } => {
+        AppendIngestEventSender::Direct { sender, pending } => {
             let count = events.len();
             pending.record_enqueue(count);
             if let Err(err) = sender.send(events).await {
@@ -162,7 +164,7 @@ pub async fn send_batch(
             }
             Ok(())
         }
-        SourceEventSender::Routed {
+        AppendIngestEventSender::Routed {
             connector_id,
             sender,
             pending,
@@ -170,7 +172,7 @@ pub async fn send_batch(
             let count = events.len();
             pending.record_enqueue(count);
             if let Err(err) = sender
-                .send(RoutedSourceEventBatch {
+                .send(RoutedAppendIngestEventBatch {
                     connector_id: *connector_id,
                     events,
                     commit_ack: None,
@@ -186,16 +188,16 @@ pub async fn send_batch(
 }
 
 pub async fn send_batch_with_commit_ack(
-    sender: &SourceEventSender,
-    events: SourceEventBatch,
-) -> Result<CommitAckReceiver, SendError<SourceEventBatch>> {
+    sender: &AppendIngestEventSender,
+    events: AppendIngestEventBatch,
+) -> Result<CommitAckReceiver, SendError<AppendIngestEventBatch>> {
     if events.is_empty() {
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(Ok(()));
         return Ok(rx);
     }
     match sender {
-        SourceEventSender::Direct { sender, pending } => {
+        AppendIngestEventSender::Direct { sender, pending } => {
             let count = events.len();
             pending.record_enqueue(count);
             if let Err(err) = sender.send(events).await {
@@ -206,7 +208,7 @@ pub async fn send_batch_with_commit_ack(
             let _ = tx.send(Ok(()));
             Ok(rx)
         }
-        SourceEventSender::Routed {
+        AppendIngestEventSender::Routed {
             connector_id,
             sender,
             pending,
@@ -215,7 +217,7 @@ pub async fn send_batch_with_commit_ack(
             let (ack_tx, ack_rx) = oneshot::channel();
             pending.record_enqueue(count);
             if let Err(err) = sender
-                .send(RoutedSourceEventBatch {
+                .send(RoutedAppendIngestEventBatch {
                     connector_id: *connector_id,
                     events,
                     commit_ack: Some(CommitAck::new(count, ack_tx)),

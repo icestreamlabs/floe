@@ -36,7 +36,9 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::node_runtime::ReplicationPipelineRuntime;
-use floe_node_core::source::{SourceEvent, SourceEventSender, send_batch_with_commit_ack};
+use floe_node_core::source::{
+    AppendIngestEvent, AppendIngestEventSender, send_batch_with_commit_ack,
+};
 
 const DEFAULT_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 100;
 const MAX_CDC_REPLICATION_DLQ_BATCH_RETRY_LIMIT: usize = 1_000;
@@ -149,7 +151,7 @@ pub struct CdcReplicationDebugPipelineState {
 
 #[derive(Clone)]
 struct HttpIngestState {
-    sender: SourceEventSender,
+    sender: AppendIngestEventSender,
     default_source: Option<String>,
     cancel: CancellationToken,
     health: Option<HttpIngestHealth>,
@@ -210,7 +212,7 @@ struct CdcReplicationDlqEntryResponse {
 
 pub async fn run_http_ingest(
     config: HttpIngestConfig,
-    sender: SourceEventSender,
+    sender: AppendIngestEventSender,
     cancel: CancellationToken,
 ) -> Result<()> {
     let state = HttpIngestState {
@@ -966,7 +968,7 @@ fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
     }
 }
 
-fn parse_events(value: Value, default_source: Option<&str>) -> Result<Vec<SourceEvent>> {
+fn parse_events(value: Value, default_source: Option<&str>) -> Result<Vec<AppendIngestEvent>> {
     match value {
         Value::Array(items) => {
             if items.is_empty() {
@@ -982,7 +984,7 @@ fn parse_events(value: Value, default_source: Option<&str>) -> Result<Vec<Source
     }
 }
 
-fn parse_event(value: Value, default_source: Option<&str>) -> Result<SourceEvent> {
+fn parse_event(value: Value, default_source: Option<&str>) -> Result<AppendIngestEvent> {
     let object = value
         .as_object()
         .context("event payload must be a JSON object")?;
@@ -990,11 +992,11 @@ fn parse_event(value: Value, default_source: Option<&str>) -> Result<SourceEvent
     if let (Some(source), Some(payload)) = (object.get("source"), object.get("data")) {
         let source = source.as_str().context("event source must be a string")?;
         ensure!(payload.is_object(), "event payload must be an object");
-        return Ok(SourceEvent::new(source, payload.clone()));
+        return Ok(AppendIngestEvent::new(source, payload.clone()));
     }
 
     let source = default_source.context("event payload missing source")?;
-    Ok(SourceEvent::new(source, value))
+    Ok(AppendIngestEvent::new(source, value))
 }
 
 #[cfg(test)]
@@ -1024,9 +1026,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_ingest_accepts_events() {
-        let (tx, mut rx) = mpsc::channel::<Vec<SourceEvent>>(4);
+        let (tx, mut rx) = mpsc::channel::<Vec<AppendIngestEvent>>(4);
         let state = HttpIngestState {
-            sender: SourceEventSender::Direct {
+            sender: AppendIngestEventSender::Direct {
                 sender: tx,
                 pending: Default::default(),
             },
@@ -1057,7 +1059,7 @@ mod tests {
     async fn http_ingest_waits_for_commit_ack() {
         let (tx, mut rx) = mpsc::channel(4);
         let state = HttpIngestState {
-            sender: SourceEventSender::Routed {
+            sender: AppendIngestEventSender::Routed {
                 connector_id: 0,
                 sender: tx,
                 pending: Default::default(),
@@ -1099,7 +1101,7 @@ mod tests {
     async fn healthz_reports_unavailable_when_executor_stops() {
         let (tx, _rx) = mpsc::channel(1);
         let state = HttpIngestState {
-            sender: SourceEventSender::Direct {
+            sender: AppendIngestEventSender::Direct {
                 sender: tx,
                 pending: Default::default(),
             },
@@ -1147,7 +1149,7 @@ mod tests {
             }],
         }));
         let state = HttpIngestState {
-            sender: SourceEventSender::Direct {
+            sender: AppendIngestEventSender::Direct {
                 sender: tx,
                 pending: Default::default(),
             },

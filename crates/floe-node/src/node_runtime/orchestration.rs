@@ -1896,7 +1896,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let (connector_sender, connector_receiver) = core_source::routed_channel(queue_capacity);
     let (cdc_transaction_sender, cdc_transaction_receiver) =
         mpsc::channel::<QueuedCdcTransaction>(queue_capacity);
-    let pending_event_counter = core_source::PendingEventCounter::default();
+    let pending_event_counter = core_source::PendingAppendIngestEventCounter::default();
     let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
@@ -2649,7 +2649,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     raw_batch_size = batch_len
                 );
                 let _decode_guard = decode_span.enter();
-                for SelectedSourceEvent {
+                for SelectedAppendIngestEvent {
                     source_id,
                     mut event,
                     commit_ack,
@@ -2727,11 +2727,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                                 tracing::warn!(
                                     source = %source_name,
                                     error = %err,
-                                    "failed to encode source event"
+                                    "failed to encode append ingest event"
                                 );
                                 if let Some(ack) = commit_ack {
                                     ack.record_failed(format!(
-                                        "failed to encode source event for '{source_name}': {err}"
+                                        "failed to encode append ingest event for '{source_name}': {err}"
                                     ))
                                     .await;
                                 }

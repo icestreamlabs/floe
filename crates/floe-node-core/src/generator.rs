@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use floe_core::source::{
-    SourceColumn, SourceDataType, SourceDefinition, SourceEvent, SourceResumeToken,
+    AppendIngestEvent, AppendIngestResumeToken, SourceColumn, SourceDataType, SourceDefinition,
 };
 use nexmark::EventGenerator;
 use nexmark::config::NexmarkConfig;
@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
-use crate::source::SourceEventSender;
+use crate::source::AppendIngestEventSender;
 use crate::source::send_event;
 
 const CONNECTOR_NAME: &str = "nexmark";
@@ -120,13 +120,17 @@ pub fn definitions() -> Result<Vec<SourceDefinition>> {
     Ok(vec![person, auction, bid])
 }
 
-pub async fn run(config: Config, sender: SourceEventSender) -> Result<()> {
+pub async fn run(config: Config, sender: AppendIngestEventSender) -> Result<()> {
     let mut connector = NexmarkConnector::new(config)?;
     let ctx = ConnectorContext::new(sender);
     run_connector(&mut connector, &ctx, CancellationToken::new()).await
 }
 
-async fn forward_event(sender: &SourceEventSender, event: &Event, position: u64) -> Result<()> {
+async fn forward_event(
+    sender: &AppendIngestEventSender,
+    event: &Event,
+    position: u64,
+) -> Result<()> {
     match event {
         Event::Person(person) => {
             send_payload(sender, PERSON_SOURCE_NAME, person, "person", position).await
@@ -139,7 +143,7 @@ async fn forward_event(sender: &SourceEventSender, event: &Event, position: u64)
 }
 
 async fn send_payload<T>(
-    sender: &SourceEventSender,
+    sender: &AppendIngestEventSender,
     source: &str,
     payload: &T,
     entity: &str,
@@ -150,8 +154,8 @@ where
 {
     let json = serde_json::to_value(payload)
         .with_context(|| format!("failed to serialize {entity} event"))?;
-    let event =
-        SourceEvent::new(source, json).with_resume_token(SourceResumeToken::Generator { position });
+    let event = AppendIngestEvent::new(source, json)
+        .with_resume_token(AppendIngestResumeToken::Generator { position });
     send_event(sender, event)
         .await
         .map_err(|err| anyhow!("failed to enqueue event for source {source}: {err}"))?;

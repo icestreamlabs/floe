@@ -6,9 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::event_parser::parse_event_line;
-use crate::source::SourceEventSender;
+use crate::source::AppendIngestEventSender;
 use crate::source::send_event;
-use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
+use floe_core::source::{AppendIngestEvent, AppendIngestResumeToken, SourceDefinition};
 
 #[derive(Debug, Clone)]
 pub struct FileConnectorConfig {
@@ -19,7 +19,7 @@ pub struct FileConnectorConfig {
 pub struct FileConnector {
     config: FileConnectorConfig,
     definitions: Vec<SourceDefinition>,
-    events: Vec<SourceEvent>,
+    events: Vec<AppendIngestEvent>,
     cursor: usize,
 }
 
@@ -33,7 +33,7 @@ impl FileConnector {
         }
     }
 
-    pub async fn run(config: FileConnectorConfig, sender: SourceEventSender) -> Result<()> {
+    pub async fn run(config: FileConnectorConfig, sender: AppendIngestEventSender) -> Result<()> {
         let mut connector = FileConnector::new(config, Vec::new());
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
@@ -71,7 +71,7 @@ impl Connector for FileConnector {
             .context("file connector cursor out of bounds")?;
         let cursor = u64::try_from(self.cursor).unwrap_or(u64::MAX);
         self.cursor = self.cursor.saturating_add(1);
-        let event = event.with_resume_token(SourceResumeToken::File { cursor });
+        let event = event.with_resume_token(AppendIngestResumeToken::File { cursor });
         send_event(ctx.sender(), event)
             .await
             .context("failed to send file connector event")?;
@@ -84,7 +84,7 @@ impl Connector for FileConnector {
     }
 }
 
-async fn load_events(config: &FileConnectorConfig) -> Result<Vec<SourceEvent>> {
+async fn load_events(config: &FileConnectorConfig) -> Result<Vec<AppendIngestEvent>> {
     let path = config.path.clone();
     let default_source = config.default_source.clone();
     tokio::task::spawn_blocking(move || read_events(path, default_source))
@@ -92,7 +92,7 @@ async fn load_events(config: &FileConnectorConfig) -> Result<Vec<SourceEvent>> {
         .context("join file connector reader")?
 }
 
-fn read_events(path: PathBuf, default_source: Option<String>) -> Result<Vec<SourceEvent>> {
+fn read_events(path: PathBuf, default_source: Option<String>) -> Result<Vec<AppendIngestEvent>> {
     let reader: Box<dyn std::io::BufRead> = if path.as_os_str() == "-" {
         Box::new(std::io::BufReader::new(std::io::stdin()))
     } else {

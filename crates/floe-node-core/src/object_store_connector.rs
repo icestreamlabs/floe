@@ -7,9 +7,9 @@ use url::Url;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::event_parser::parse_event_line;
-use crate::source::SourceEventSender;
+use crate::source::AppendIngestEventSender;
 use crate::source::send_event;
-use floe_core::source::{SourceDefinition, SourceEvent, SourceResumeToken};
+use floe_core::source::{AppendIngestEvent, AppendIngestResumeToken, SourceDefinition};
 
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConnectorConfig {
@@ -20,7 +20,7 @@ pub struct ObjectStoreConnectorConfig {
 pub struct ObjectStoreConnector {
     config: ObjectStoreConnectorConfig,
     definitions: Vec<SourceDefinition>,
-    events: Vec<SourceEvent>,
+    events: Vec<AppendIngestEvent>,
     cursor: usize,
 }
 
@@ -34,7 +34,10 @@ impl ObjectStoreConnector {
         }
     }
 
-    pub async fn run(config: ObjectStoreConnectorConfig, sender: SourceEventSender) -> Result<()> {
+    pub async fn run(
+        config: ObjectStoreConnectorConfig,
+        sender: AppendIngestEventSender,
+    ) -> Result<()> {
         let mut connector = ObjectStoreConnector::new(config, Vec::new());
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
@@ -72,7 +75,7 @@ impl Connector for ObjectStoreConnector {
             .context("object store connector cursor out of bounds")?;
         let cursor = u64::try_from(self.cursor).unwrap_or(u64::MAX);
         self.cursor = self.cursor.saturating_add(1);
-        let event = event.with_resume_token(SourceResumeToken::ObjectStore { cursor });
+        let event = event.with_resume_token(AppendIngestResumeToken::ObjectStore { cursor });
         send_event(ctx.sender(), event)
             .await
             .context("failed to send object store event")?;
@@ -85,7 +88,7 @@ impl Connector for ObjectStoreConnector {
     }
 }
 
-async fn load_events(config: &ObjectStoreConnectorConfig) -> Result<Vec<SourceEvent>> {
+async fn load_events(config: &ObjectStoreConnectorConfig) -> Result<Vec<AppendIngestEvent>> {
     let url = Url::parse(&config.url).context("parse object store url")?;
     let (store, prefix) = parse_url(&url).context("resolve object store from url")?;
     let default_source = config.default_source.as_deref();
@@ -113,7 +116,7 @@ async fn read_object(
     store: &dyn ObjectStore,
     location: &Path,
     default_source: Option<&str>,
-) -> Result<Vec<SourceEvent>> {
+) -> Result<Vec<AppendIngestEvent>> {
     let bytes = store
         .get(location)
         .await
@@ -199,7 +202,7 @@ mod tests {
         assert_eq!(first_batch[0].source(), "nexmark_bid");
         assert_eq!(
             first_batch[0].resume_token(),
-            Some(&SourceResumeToken::ObjectStore { cursor: 0 })
+            Some(&AppendIngestResumeToken::ObjectStore { cursor: 0 })
         );
 
         let second = connector.tick(&ctx).await.expect("second tick");
@@ -207,7 +210,7 @@ mod tests {
         let second_batch = rx.recv().await.expect("second batch");
         assert_eq!(
             second_batch[0].resume_token(),
-            Some(&SourceResumeToken::ObjectStore { cursor: 1 })
+            Some(&AppendIngestResumeToken::ObjectStore { cursor: 1 })
         );
 
         let done = connector.tick(&ctx).await.expect("finished tick");

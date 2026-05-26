@@ -18,7 +18,7 @@ static INGEST_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
 static INGEST_DECODE_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(HistogramOpts::new(
         "floe_ingest_decode_latency_ms",
-        "Time spent decoding a batch of source events in milliseconds",
+        "Time spent decoding a batch of append ingest events in milliseconds",
     ))
     .expect("register floe_ingest_decode_latency_ms")
 });
