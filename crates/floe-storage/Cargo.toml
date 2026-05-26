@@ -9,6 +9,7 @@ floe-core = { path = "../floe-core" }
 anyhow = { workspace = true }
 arrow-ipc = "57.1.0"
 arrow-schema = { workspace = true }
+futures = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

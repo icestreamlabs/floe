@@ -832,6 +832,9 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
     assert_eq!(snapshot.dlq_replayed_entries(), 0);
     assert_eq!(snapshot.dlq_discarded_entries(), 0);
     assert!(snapshot.oldest_dlq_pending_age_ms().is_some());
+    assert_eq!(snapshot.missing_payload_objects(), 0);
+    assert_eq!(snapshot.orphan_payload_objects(), 0);
+    assert_eq!(snapshot.orphan_payload_bytes(), 0);
     assert!(snapshot.replaying());
     assert_eq!(snapshot.last_error(), Some("kafka unavailable"));
     assert_eq!(
@@ -897,6 +900,9 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
     assert_eq!(debug_pipeline.dlq_replayed_entries, 0);
     assert_eq!(debug_pipeline.dlq_discarded_entries, 0);
     assert!(debug_pipeline.oldest_dlq_pending_age_ms.is_some());
+    assert_eq!(debug_pipeline.missing_payload_objects, 0);
+    assert_eq!(debug_pipeline.orphan_payload_objects, 0);
+    assert_eq!(debug_pipeline.orphan_payload_bytes, 0);
     assert!(debug_pipeline.replaying);
     assert_eq!(
         debug_pipeline.last_error.as_deref(),

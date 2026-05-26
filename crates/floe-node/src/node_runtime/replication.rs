@@ -304,6 +304,26 @@ impl ReplicationPipelineRuntime {
                             plan.name
                         )
                     })?;
+                let limits = effective_replication_buffer_limits(
+                    plan,
+                    ReplicationBufferLimits::from_config(self.settings.buffer_limits),
+                );
+                record_buffer_cap_utilization(&plan.name, &stats, limits);
+                let integrity = buffer_store
+                    .integrity_report(&plan.name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "load CDC buffer integrity report for replication pipeline '{}'",
+                            plan.name
+                        )
+                    })?;
+                crate::metrics::record_cdc_buffer_integrity(
+                    &plan.name,
+                    integrity.missing_payload_objects(),
+                    integrity.orphan_payload_objects(),
+                    integrity.orphan_payload_bytes(),
+                );
                 let dlq_entries = storage
                     .replication_pipeline_dlq_entries(&plan.name)
                     .await
@@ -380,6 +400,9 @@ impl ReplicationPipelineRuntime {
                     dlq_replayed_entries,
                     dlq_discarded_entries,
                     oldest_dlq_pending_age_ms,
+                    missing_payload_objects: integrity.missing_payload_objects(),
+                    orphan_payload_objects: integrity.orphan_payload_objects(),
+                    orphan_payload_bytes: integrity.orphan_payload_bytes(),
                     replaying: replaying_by_pipeline
                         .get(&plan.name)
                         .copied()
@@ -1090,7 +1113,8 @@ use buffer::{ReplicationBufferLimitViolation, effective_u64_limit, effective_usi
 use buffer::{
     ReplicationBufferLimits, append_buffer_transaction, buffer_limit_violation,
     effective_replication_buffer_limits, estimated_buffer_payload_bytes,
-    log_replication_buffer_backpressure, prepare_replication_buffer_append, record_buffer_stats,
+    log_replication_buffer_backpressure, prepare_replication_buffer_append,
+    record_buffer_cap_utilization, record_buffer_stats,
 };
 use config::{
     FLOE_HEADER_IDEMPOTENCY_KEY, FLOE_HEADER_PIPELINE, FLOE_HEADER_RECORD_SEQUENCE,

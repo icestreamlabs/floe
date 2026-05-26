@@ -27,6 +27,9 @@ pub(in crate::node_runtime) struct ReplicationPipelineStatusSnapshot {
     pub(super) dlq_replayed_entries: usize,
     pub(super) dlq_discarded_entries: usize,
     pub(super) oldest_dlq_pending_age_ms: Option<u64>,
+    pub(super) missing_payload_objects: usize,
+    pub(super) orphan_payload_objects: usize,
+    pub(super) orphan_payload_bytes: usize,
     pub(super) replaying: bool,
     pub(super) source_backpressure_active: bool,
     pub(super) last_error: Option<String>,
@@ -102,6 +105,18 @@ impl ReplicationPipelineStatusSnapshot {
         self.oldest_dlq_pending_age_ms
     }
 
+    pub(super) fn missing_payload_objects(&self) -> usize {
+        self.missing_payload_objects
+    }
+
+    pub(super) fn orphan_payload_objects(&self) -> usize {
+        self.orphan_payload_objects
+    }
+
+    pub(super) fn orphan_payload_bytes(&self) -> usize {
+        self.orphan_payload_bytes
+    }
+
     pub(super) fn replaying(&self) -> bool {
         self.replaying
     }
@@ -148,6 +163,9 @@ pub(super) fn cdc_replication_debug_state_from_snapshots(
                 dlq_replayed_entries: snapshot.dlq_replayed_entries(),
                 dlq_discarded_entries: snapshot.dlq_discarded_entries(),
                 oldest_dlq_pending_age_ms: snapshot.oldest_dlq_pending_age_ms(),
+                missing_payload_objects: snapshot.missing_payload_objects(),
+                orphan_payload_objects: snapshot.orphan_payload_objects(),
+                orphan_payload_bytes: snapshot.orphan_payload_bytes(),
                 replaying: snapshot.replaying(),
                 source_backpressure_active: snapshot.source_backpressure_active(),
                 last_error: snapshot.last_error().map(str::to_string),

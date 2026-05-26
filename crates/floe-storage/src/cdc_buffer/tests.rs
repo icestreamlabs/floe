@@ -1,4 +1,6 @@
-use super::keys::{payload_blob_key, payload_key, payload_prefix, pending_manifest_key};
+use super::keys::{
+    payload_blob_key, payload_key, payload_object_key, payload_prefix, pending_manifest_key,
+};
 use super::payload_codec::{
     CDC_BUFFER_PAYLOAD_MAGIC_V1, decode_payload_records, encode_optional_bytes,
     encode_payload_records,
@@ -368,6 +370,39 @@ async fn stats_report_size_and_oldest_age() {
     assert_eq!(stats.pending_records(), 3);
     assert_eq!(stats.oldest_pending_age_ms(), Some(1500));
     assert!(stats.pending_bytes() > 0);
+}
+
+#[tokio::test]
+async fn integrity_report_detects_missing_and_orphan_payload_objects() {
+    let store = test_store("cdc-buffer-integrity").await;
+    let append = append("0/10", 1000, vec![record(1)]);
+    let manifest = store.append_transaction(&append).await.expect("append");
+    let referenced_key = manifest
+        .payload_object_key()
+        .expect("referenced payload object key")
+        .to_string();
+    let orphan_key = payload_object_key("pipe", "orphan-transaction");
+    let orphan_payload = vec![1, 2, 3, 4];
+    let object_store = store.object_store.as_ref().expect("object store");
+    object_store
+        .put(
+            &ObjectPath::from(orphan_key.clone()),
+            orphan_payload.clone().into(),
+        )
+        .await
+        .expect("write orphan payload");
+    object_store
+        .delete(&ObjectPath::from(referenced_key))
+        .await
+        .expect("delete referenced payload");
+
+    let report = store.integrity_report("pipe").await.expect("integrity");
+
+    assert_eq!(report.pending_payload_objects(), 1);
+    assert_eq!(report.delivered_payload_objects(), 0);
+    assert_eq!(report.missing_payload_objects(), 1);
+    assert_eq!(report.orphan_payload_objects(), 1);
+    assert_eq!(report.orphan_payload_bytes(), orphan_payload.len());
 }
 
 #[tokio::test]

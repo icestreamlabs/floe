@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::{Context, anyhow};
 use floe_storage::{CdcBufferCleanupPolicy, CdcBufferStore};
 
@@ -14,6 +16,7 @@ impl ReplicationPipelineRuntime {
         if !self.claim_cleanup_due(&plan.name, now)? {
             return Ok(());
         }
+        let cleanup_started_at = Instant::now();
         let summary = buffer_store
             .cleanup_delivered(
                 &plan.name,
@@ -27,6 +30,13 @@ impl ReplicationPipelineRuntime {
                     plan.name
                 )
             })?;
+        crate::metrics::record_cdc_buffer_cleanup(
+            &plan.name,
+            summary.deleted_transactions(),
+            summary.deleted_records(),
+            summary.deleted_bytes(),
+            cleanup_started_at.elapsed().as_millis() as u64,
+        );
         crate::metrics::inc_cdc_buffer_object_op(
             &plan.name,
             "delete",
@@ -47,6 +57,7 @@ impl ReplicationPipelineRuntime {
                 let pipeline_name = plan.name.clone();
                 let delivered_retention_ms = self.settings.buffer_cleanup.delivered_retention_ms;
                 tokio::spawn(async move {
+                    let cleanup_started_at = Instant::now();
                     match cleanup_store
                         .cleanup_delivered(
                             &pipeline_name,
@@ -56,6 +67,13 @@ impl ReplicationPipelineRuntime {
                         .await
                     {
                         Ok(summary) => {
+                            crate::metrics::record_cdc_buffer_cleanup(
+                                &pipeline_name,
+                                summary.deleted_transactions(),
+                                summary.deleted_records(),
+                                summary.deleted_bytes(),
+                                cleanup_started_at.elapsed().as_millis() as u64,
+                            );
                             crate::metrics::inc_cdc_buffer_object_op(
                                 &pipeline_name,
                                 "delete",

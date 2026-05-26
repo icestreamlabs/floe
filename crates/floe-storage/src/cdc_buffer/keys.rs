@@ -69,6 +69,13 @@ pub(super) fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> 
     )
 }
 
+pub(super) fn payload_object_prefix(pipeline_name: &str) -> String {
+    format!(
+        "floe_cdc_buffer_blobs/v1/pipeline/{}/",
+        hex_component(pipeline_name.as_bytes())
+    )
+}
+
 #[cfg(test)]
 pub(super) fn payload_key(
     pipeline_name: &str,

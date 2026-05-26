@@ -2318,6 +2318,7 @@ dependencies = [
  "arrow-schema",
  "floe-cdc-core",
  "floe-core",
+ "futures",
  "object_store",
  "serde",
  "serde_json",

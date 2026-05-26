@@ -1,9 +1,12 @@
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use floe_cdc_core::{CdcSchemaVersionMap, CdcSourcePosition, CdcTransactionId, ChangeBatch};
-use object_store::ObjectStore;
+use futures::StreamExt;
+use object_store::path::Path as ObjectPath;
+use object_store::{Error as ObjectStoreError, ObjectStore};
 use serde::{Deserialize, Serialize};
 use slatedb::config::{ScanOptions, WriteOptions};
 use slatedb::{Db, Error as SlateError, WriteBatch};
@@ -13,8 +16,8 @@ mod payload_codec;
 
 use keys::{
     delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_blob_key,
-    payload_object_key, payload_prefix, pending_manifest_key, pending_manifest_prefix,
-    source_frontier_key, transaction_key,
+    payload_object_key, payload_object_prefix, payload_prefix, pending_manifest_key,
+    pending_manifest_prefix, source_frontier_key, transaction_key,
 };
 pub use payload_codec::{decode_cdc_buffer_records_payload, encode_cdc_buffer_records_payload};
 use payload_codec::{
@@ -131,6 +134,15 @@ pub struct CdcBufferCleanupSummary {
     deleted_transactions: usize,
     deleted_records: usize,
     deleted_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdcBufferIntegrityReport {
+    pending_payload_objects: usize,
+    delivered_payload_objects: usize,
+    missing_payload_objects: usize,
+    orphan_payload_objects: usize,
+    orphan_payload_bytes: usize,
 }
 
 impl CdcBufferStore {
@@ -595,12 +607,116 @@ impl CdcBufferStore {
         Ok(summary)
     }
 
+    pub async fn integrity_report(&self, pipeline_name: &str) -> Result<CdcBufferIntegrityReport> {
+        let pending = self.pending_transactions(pipeline_name, usize::MAX).await?;
+        let delivered = self.delivered_transactions(pipeline_name).await?;
+        let mut referenced_object_keys = HashSet::new();
+        let mut report = CdcBufferIntegrityReport {
+            pending_payload_objects: 0,
+            delivered_payload_objects: 0,
+            missing_payload_objects: 0,
+            orphan_payload_objects: 0,
+            orphan_payload_bytes: 0,
+        };
+
+        for manifest in &pending {
+            self.record_manifest_payload_integrity(
+                manifest,
+                &mut referenced_object_keys,
+                &mut report.missing_payload_objects,
+            )
+            .await?;
+            if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
+                report.pending_payload_objects = report.pending_payload_objects.saturating_add(1);
+            }
+        }
+        for manifest in &delivered {
+            self.record_manifest_payload_integrity(
+                manifest,
+                &mut referenced_object_keys,
+                &mut report.missing_payload_objects,
+            )
+            .await?;
+            if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
+                report.delivered_payload_objects =
+                    report.delivered_payload_objects.saturating_add(1);
+            }
+        }
+
+        let object_prefix = payload_object_prefix(pipeline_name);
+        let mut objects = self
+            .payload_object_store()?
+            .list(Some(&ObjectPath::from(object_prefix.clone())));
+        while let Some(entry) = objects.next().await {
+            let entry = entry.with_context(|| {
+                format!("list CDC buffer payload objects under {object_prefix}")
+            })?;
+            let object_key = entry.location.to_string();
+            if !referenced_object_keys.contains(&object_key) {
+                report.orphan_payload_objects = report.orphan_payload_objects.saturating_add(1);
+                report.orphan_payload_bytes = report
+                    .orphan_payload_bytes
+                    .saturating_add(usize::try_from(entry.size).unwrap_or(usize::MAX));
+            }
+        }
+
+        Ok(report)
+    }
+
     fn payload_object_store(&self) -> Result<&Arc<dyn ObjectStore>> {
         self.object_store.as_ref().ok_or_else(|| {
             anyhow!(
                 "CDC buffer payload object store is not configured; use CdcBufferStore::with_object_store"
             )
         })
+    }
+
+    async fn delivered_transactions(
+        &self,
+        pipeline_name: &str,
+    ) -> Result<Vec<CdcBufferedTransactionManifest>> {
+        scan_prefix(&self.db, &delivered_manifest_prefix(pipeline_name))
+            .await?
+            .into_iter()
+            .map(|(_, value)| {
+                serde_json::from_slice::<CdcBufferedTransactionManifest>(&value)
+                    .context("decode CDC buffer delivered manifest")
+            })
+            .collect()
+    }
+
+    async fn record_manifest_payload_integrity(
+        &self,
+        manifest: &CdcBufferedTransactionManifest,
+        referenced_object_keys: &mut HashSet<String>,
+        missing_payload_objects: &mut usize,
+    ) -> Result<()> {
+        if manifest.payload_storage() != CdcBufferPayloadStorage::ObjectStore {
+            return Ok(());
+        }
+        let Some(payload_object_key) = manifest.payload_object_key() else {
+            *missing_payload_objects = missing_payload_objects.saturating_add(1);
+            return Ok(());
+        };
+        referenced_object_keys.insert(payload_object_key.to_string());
+        if !self.payload_object_exists(payload_object_key).await? {
+            *missing_payload_objects = missing_payload_objects.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    async fn payload_object_exists(&self, payload_object_key: &str) -> Result<bool> {
+        match self
+            .payload_object_store()?
+            .head(&ObjectPath::from(payload_object_key.to_string()))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+            Err(err) => Err(err).with_context(|| {
+                format!("inspect CDC buffer payload object '{payload_object_key}'")
+            }),
+        }
     }
 
     async fn object_payload(&self, manifest: &CdcBufferedTransactionManifest) -> Result<Vec<u8>> {
@@ -983,6 +1099,28 @@ impl CdcBufferCleanupSummary {
 
     pub fn deleted_bytes(&self) -> usize {
         self.deleted_bytes
+    }
+}
+
+impl CdcBufferIntegrityReport {
+    pub fn pending_payload_objects(&self) -> usize {
+        self.pending_payload_objects
+    }
+
+    pub fn delivered_payload_objects(&self) -> usize {
+        self.delivered_payload_objects
+    }
+
+    pub fn missing_payload_objects(&self) -> usize {
+        self.missing_payload_objects
+    }
+
+    pub fn orphan_payload_objects(&self) -> usize {
+        self.orphan_payload_objects
+    }
+
+    pub fn orphan_payload_bytes(&self) -> usize {
+        self.orphan_payload_bytes
     }
 }
 

@@ -318,6 +318,33 @@ static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|
     .expect("register floe_cdc_buffer_oldest_pending_age_ms")
 });
 
+static CDC_BUFFER_CAP_UTILIZATION_PERCENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_cap_utilization_percent",
+        "Percent utilization of configured CDC replication buffer caps",
+        &["pipeline", "limit"]
+    )
+    .expect("register floe_cdc_buffer_cap_utilization_percent")
+});
+
+static CDC_BUFFER_INTEGRITY_OBJECTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_integrity_objects",
+        "CDC replication buffer payload object integrity counts by state",
+        &["pipeline", "state"]
+    )
+    .expect("register floe_cdc_buffer_integrity_objects")
+});
+
+static CDC_BUFFER_ORPHAN_PAYLOAD_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "floe_cdc_buffer_orphan_payload_bytes",
+        "Total bytes in orphaned CDC replication buffer payload objects",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_orphan_payload_bytes")
+});
+
 static CDC_BUFFER_OBJECT_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_object_ops_total",
@@ -352,6 +379,42 @@ static CDC_BUFFER_APPEND_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["pipeline"]
     )
     .expect("register floe_cdc_buffer_append_latency_ms")
+});
+
+static CDC_BUFFER_CLEANUP_TRANSACTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_cleanup_transactions_total",
+        "Number of delivered CDC replication buffer transactions removed by cleanup",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_cleanup_transactions_total")
+});
+
+static CDC_BUFFER_CLEANUP_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_cleanup_records_total",
+        "Number of delivered CDC replication buffer records removed by cleanup",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_cleanup_records_total")
+});
+
+static CDC_BUFFER_CLEANUP_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "floe_cdc_buffer_cleanup_bytes_total",
+        "Number of delivered CDC replication buffer payload bytes removed by cleanup",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_cleanup_bytes_total")
+});
+
+static CDC_BUFFER_CLEANUP_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_cdc_buffer_cleanup_latency_ms",
+        "Time spent cleaning delivered CDC replication buffer payloads in milliseconds",
+        &["pipeline"]
+    )
+    .expect("register floe_cdc_buffer_cleanup_latency_ms")
 });
 
 static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -771,6 +834,55 @@ pub(crate) fn record_cdc_buffer_pending(
         .set(oldest_age_ms.map(i64_from_u64).unwrap_or(0));
 }
 
+pub(crate) fn record_cdc_buffer_cap_utilization(
+    pipeline: &str,
+    limit: &str,
+    used: usize,
+    configured_limit: usize,
+) {
+    let percent = if configured_limit == 0 {
+        0
+    } else {
+        used.saturating_mul(100) / configured_limit
+    };
+    CDC_BUFFER_CAP_UTILIZATION_PERCENT
+        .with_label_values(&[pipeline, limit])
+        .set(i64_from_usize(percent));
+}
+
+pub(crate) fn record_cdc_buffer_cap_utilization_u64(
+    pipeline: &str,
+    limit: &str,
+    used: u64,
+    configured_limit: u64,
+) {
+    let percent = if configured_limit == 0 {
+        0
+    } else {
+        used.saturating_mul(100) / configured_limit
+    };
+    CDC_BUFFER_CAP_UTILIZATION_PERCENT
+        .with_label_values(&[pipeline, limit])
+        .set(i64_from_u64(percent));
+}
+
+pub(crate) fn record_cdc_buffer_integrity(
+    pipeline: &str,
+    missing_payload_objects: usize,
+    orphan_payload_objects: usize,
+    orphan_payload_bytes: usize,
+) {
+    CDC_BUFFER_INTEGRITY_OBJECTS
+        .with_label_values(&[pipeline, "missing_payload"])
+        .set(i64_from_usize(missing_payload_objects));
+    CDC_BUFFER_INTEGRITY_OBJECTS
+        .with_label_values(&[pipeline, "orphan_payload"])
+        .set(i64_from_usize(orphan_payload_objects));
+    CDC_BUFFER_ORPHAN_PAYLOAD_BYTES
+        .with_label_values(&[pipeline])
+        .set(i64_from_usize(orphan_payload_bytes));
+}
+
 pub(crate) fn inc_cdc_buffer_object_op(pipeline: &str, operation: &str, count: usize) {
     if count == 0 {
         return;
@@ -793,6 +905,27 @@ pub(crate) fn record_cdc_buffer_append(
         .with_label_values(&[pipeline])
         .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
     CDC_BUFFER_APPEND_LATENCY_MS
+        .with_label_values(&[pipeline])
+        .observe(latency_ms as f64);
+}
+
+pub(crate) fn record_cdc_buffer_cleanup(
+    pipeline: &str,
+    transactions: usize,
+    records: usize,
+    bytes: usize,
+    latency_ms: u64,
+) {
+    CDC_BUFFER_CLEANUP_TRANSACTIONS_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(transactions).unwrap_or(u64::MAX));
+    CDC_BUFFER_CLEANUP_RECORDS_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(records).unwrap_or(u64::MAX));
+    CDC_BUFFER_CLEANUP_BYTES_TOTAL
+        .with_label_values(&[pipeline])
+        .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
+    CDC_BUFFER_CLEANUP_LATENCY_MS
         .with_label_values(&[pipeline])
         .observe(latency_ms as f64);
 }
@@ -948,10 +1081,17 @@ pub(crate) fn init() {
     let _ = &*CDC_BUFFER_PENDING_RECORDS;
     let _ = &*CDC_BUFFER_PENDING_BYTES;
     let _ = &*CDC_BUFFER_OLDEST_PENDING_AGE_MS;
+    let _ = &*CDC_BUFFER_CAP_UTILIZATION_PERCENT;
+    let _ = &*CDC_BUFFER_INTEGRITY_OBJECTS;
+    let _ = &*CDC_BUFFER_ORPHAN_PAYLOAD_BYTES;
     let _ = &*CDC_BUFFER_OBJECT_OPS_TOTAL;
     let _ = &*CDC_BUFFER_APPENDED_RECORDS_TOTAL;
     let _ = &*CDC_BUFFER_APPENDED_BYTES_TOTAL;
     let _ = &*CDC_BUFFER_APPEND_LATENCY_MS;
+    let _ = &*CDC_BUFFER_CLEANUP_TRANSACTIONS_TOTAL;
+    let _ = &*CDC_BUFFER_CLEANUP_RECORDS_TOTAL;
+    let _ = &*CDC_BUFFER_CLEANUP_BYTES_TOTAL;
+    let _ = &*CDC_BUFFER_CLEANUP_LATENCY_MS;
     let _ = &*CDC_BUFFER_FORCED_FLUSHES_TOTAL;
     let _ = &*CDC_BUFFER_FLUSH_LATENCY_MS;
     let _ = &*CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL;
@@ -1066,10 +1206,14 @@ mod tests {
         let pipeline = "pipe_metrics_test";
 
         record_cdc_buffer_pending(pipeline, 2, 10, 2048, Some(100));
+        record_cdc_buffer_cap_utilization(pipeline, "pending_bytes", 2048, 4096);
+        record_cdc_buffer_cap_utilization_u64(pipeline, "pending_age", 100, 200);
+        record_cdc_buffer_integrity(pipeline, 1, 2, 512);
         inc_cdc_buffer_object_op(pipeline, "create", 2);
         inc_cdc_buffer_object_op(pipeline, "get", 1);
         inc_cdc_buffer_object_op(pipeline, "delete", 1);
         record_cdc_buffer_append(pipeline, 10, 2048, 7);
+        record_cdc_buffer_cleanup(pipeline, 1, 4, 1024, 9);
         inc_cdc_buffer_forced_flush(pipeline);
         observe_cdc_buffer_flush_latency_ms(pipeline, 3);
         inc_cdc_buffer_drain_attempt(pipeline);
@@ -1174,6 +1318,39 @@ mod tests {
         ));
         assert!(body.contains(
             "floe_cdc_buffer_source_backpressure_active{pipeline=\"pipe_metrics_test\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_cap_utilization_percent{limit=\"pending_bytes\",pipeline=\"pipe_metrics_test\"} 50"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_cap_utilization_percent{limit=\"pending_age\",pipeline=\"pipe_metrics_test\"} 50"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_integrity_objects{pipeline=\"pipe_metrics_test\",state=\"missing_payload\"} 1"
+        ));
+        assert!(body.contains(
+            "floe_cdc_buffer_integrity_objects{pipeline=\"pipe_metrics_test\",state=\"orphan_payload\"} 2"
+        ));
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_orphan_payload_bytes{pipeline=\"pipe_metrics_test\"} 512"
+            )
+        );
+        assert!(body.contains(
+            "floe_cdc_buffer_cleanup_transactions_total{pipeline=\"pipe_metrics_test\"} 1"
+        ));
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_cleanup_records_total{pipeline=\"pipe_metrics_test\"} 4"
+            )
+        );
+        assert!(
+            body.contains(
+                "floe_cdc_buffer_cleanup_bytes_total{pipeline=\"pipe_metrics_test\"} 1024"
+            )
+        );
+        assert!(body.contains(
+            "floe_cdc_buffer_cleanup_latency_ms_count{pipeline=\"pipe_metrics_test\"} 1"
         ));
 
         record_cdc_replication_replaying(pipeline, false);

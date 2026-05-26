@@ -176,6 +176,45 @@ pub(super) async fn record_buffer_stats(
     Ok(())
 }
 
+pub(super) fn record_buffer_cap_utilization(
+    pipeline_name: &str,
+    stats: &CdcBufferStats,
+    limits: ReplicationBufferLimits,
+) {
+    if let Some(max_pending_bytes) = limits.max_pending_bytes {
+        crate::metrics::record_cdc_buffer_cap_utilization(
+            pipeline_name,
+            "pending_bytes",
+            stats.pending_bytes(),
+            max_pending_bytes,
+        );
+    }
+    if let Some(max_pending_records) = limits.max_pending_records {
+        crate::metrics::record_cdc_buffer_cap_utilization(
+            pipeline_name,
+            "pending_records",
+            stats.pending_records(),
+            max_pending_records,
+        );
+    }
+    if let Some(max_pending_transactions) = limits.max_pending_transactions {
+        crate::metrics::record_cdc_buffer_cap_utilization(
+            pipeline_name,
+            "pending_objects",
+            stats.pending_objects(),
+            max_pending_transactions,
+        );
+    }
+    if let Some(max_pending_age_ms) = limits.max_pending_age_ms {
+        crate::metrics::record_cdc_buffer_cap_utilization_u64(
+            pipeline_name,
+            "pending_age",
+            stats.oldest_pending_age_ms().unwrap_or(0),
+            max_pending_age_ms,
+        );
+    }
+}
+
 pub(super) fn effective_replication_buffer_limits(
     plan: &ReplicationPipelineRuntimePlan,
     defaults: ReplicationBufferLimits,
