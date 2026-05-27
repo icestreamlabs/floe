@@ -653,6 +653,27 @@ async fn q5_window_count_star_shape_is_source_batch_journal_eligible() {
 }
 
 #[tokio::test]
+async fn q5_window_count_star_shape_projects_group_key_and_count_directly() {
+    let logical = sql_plan_with_auction_and_bid(
+        "SELECT auction, COUNT(*) AS num \
+             FROM nexmark_bid \
+             GROUP BY auction, HOP(date_time, 2000, 10000)",
+    )
+    .await;
+    let planner = DbspPlanBuilder::new(nexmark_config());
+    let plan = planner.build(&logical).expect("circuit plan");
+
+    let shape = try_build_transient_source_window_count_star_root_shape(&plan, plan.root)
+        .expect("build q5 transient shape")
+        .expect("q5 transient shape");
+    assert!(shape.transform.is_none());
+    assert!(matches!(
+        shape.output_projection,
+        Some(TransientWindowCountOutputProjection::GroupKeyAndCount)
+    ));
+}
+
+#[tokio::test]
 async fn q7_window_incremental_shape_is_source_batch_journal_eligible() {
     let logical = sql_plan_with_auction_and_bid(
         "SELECT MAX(price) AS maxprice \

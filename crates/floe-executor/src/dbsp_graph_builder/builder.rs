@@ -1365,7 +1365,8 @@ struct TransientSourceWindowCountStarRootShape {
     source_root: TransientSourceRootMaterialization,
     window: dbsp::DbspWindowAggregateNode,
     optimized_nodes: Vec<usize>,
-    transform: Arc<DeltaTransformFn>,
+    transform: Option<Arc<DeltaTransformFn>>,
+    output_projection: Option<TransientWindowCountOutputProjection>,
 }
 
 #[derive(Clone)]
@@ -1381,6 +1382,11 @@ struct TransientWindowCountKey {
     start: i64,
     end: i64,
     key: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy)]
+enum TransientWindowCountOutputProjection {
+    GroupKeyAndCount,
 }
 
 #[derive(Clone)]
@@ -2023,7 +2029,8 @@ fn try_build_transient_source_window_count_star_root_shape(
                 source_root,
                 window: window.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+                transform: None,
+                output_projection: None,
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -2043,8 +2050,9 @@ fn try_build_transient_source_window_count_star_root_shape(
             else {
                 return Ok(None);
             };
-            shape.transform = compose_delta_transforms(
-                Arc::clone(&shape.transform),
+            fold_window_count_star_output_projection(&mut shape);
+            shape.transform = compose_optional_delta_transform(
+                shape.transform.take(),
                 build_filter_transform(select)?,
             );
             shape.optimized_nodes.push(root_idx);
@@ -2066,8 +2074,9 @@ fn try_build_transient_source_window_count_star_root_shape(
                 else {
                     return Ok(None);
                 };
-                shape.transform = compose_delta_transforms(
-                    Arc::clone(&shape.transform),
+                fold_window_count_star_output_projection(&mut shape);
+                shape.transform = compose_optional_delta_transform(
+                    shape.transform.take(),
                     build_filter_map_transform(select, project)?,
                 );
                 shape.optimized_nodes.push(input_idx);
@@ -2080,10 +2089,24 @@ fn try_build_transient_source_window_count_star_root_shape(
             else {
                 return Ok(None);
             };
-            shape.transform = compose_delta_transforms(
-                Arc::clone(&shape.transform),
-                build_map_transform(project)?,
-            );
+            if let Some(columns) = try_build_direct_row_projection(project)
+                && shape.transform.is_none()
+                && shape.output_projection.is_none()
+                && try_build_window_count_group_key_count_projection(
+                    columns.as_ref(),
+                    shape.window.aggregate.group_keys().len(),
+                )
+                .is_some()
+            {
+                shape.output_projection =
+                    Some(TransientWindowCountOutputProjection::GroupKeyAndCount);
+            } else {
+                fold_window_count_star_output_projection(&mut shape);
+                shape.transform = compose_optional_delta_transform(
+                    shape.transform.take(),
+                    build_map_transform(project)?,
+                );
+            }
             shape.optimized_nodes.push(root_idx);
             Ok(Some(shape))
         }
@@ -2116,7 +2139,8 @@ async fn try_build_transient_source_window_count_star_root_materialization(
         &shape.window,
         upstream,
         Arc::clone(&shape.source_root.transform),
-        Arc::clone(&shape.transform),
+        shape.transform.clone(),
+        shape.output_projection,
         watermark,
         cancel,
         task_events,
@@ -2129,6 +2153,58 @@ async fn try_build_transient_source_window_count_star_root_materialization(
         optimized_nodes: shape.optimized_nodes,
         receiver,
     }))
+}
+
+fn fold_window_count_star_output_projection(shape: &mut TransientSourceWindowCountStarRootShape) {
+    if let Some(output_projection) = shape.output_projection.take() {
+        let transform = match output_projection {
+            TransientWindowCountOutputProjection::GroupKeyAndCount => {
+                build_window_count_group_key_count_projection_transform()
+            }
+        };
+        shape.transform = compose_optional_delta_transform(shape.transform.take(), transform);
+    }
+}
+
+fn try_build_window_count_group_key_count_projection(
+    columns: &[usize],
+    group_key_count: usize,
+) -> Option<TransientWindowCountOutputProjection> {
+    if columns.len() != group_key_count + 1 {
+        return None;
+    }
+    let count_column = group_key_count + 2;
+    let expected_group_columns = 2..count_column;
+    if columns[..group_key_count]
+        .iter()
+        .copied()
+        .eq(expected_group_columns)
+        && columns[group_key_count] == count_column
+    {
+        Some(TransientWindowCountOutputProjection::GroupKeyAndCount)
+    } else {
+        None
+    }
+}
+
+fn build_window_count_group_key_count_projection_transform() -> Arc<DeltaTransformFn> {
+    Arc::new(move |deltas: &[(Vec<u8>, i64)]| {
+        let mut projected = HashMap::<Vec<u8>, i64>::with_capacity(deltas.len());
+        for (encoded, diff) in deltas {
+            if *diff == 0 {
+                continue;
+            }
+            let full_count = transient_encoded_row_declared_column_count(encoded)?;
+            if full_count < 3 {
+                bail!("transient window count output row has too few columns");
+            }
+            let columns = (2..full_count).collect::<Vec<_>>();
+            let projected_row = extract_encoded_row_columns(encoded, &columns, false)?
+                .ok_or_else(|| anyhow!("direct encoded projection unexpectedly returned null"))?;
+            merge_encoded_delta(&mut projected, projected_row, *diff);
+        }
+        Ok(projected.into_iter().collect())
+    })
 }
 
 fn try_build_transient_source_window_aggregate_root_shape(
@@ -2636,7 +2712,8 @@ async fn build_transient_window_count_star_receiver(
     window: &dbsp::DbspWindowAggregateNode,
     upstream: TransientSourceHandleStream,
     input_transform: Arc<DeltaTransformFn>,
-    output_transform: Arc<DeltaTransformFn>,
+    output_transform: Option<Arc<DeltaTransformFn>>,
+    output_projection: Option<TransientWindowCountOutputProjection>,
     watermark: Arc<AtomicI64>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
@@ -2667,6 +2744,7 @@ async fn build_transient_window_count_star_receiver(
         window,
         upstream_rx,
         output_transform,
+        output_projection,
         watermark,
         compact_count_state,
         cancel,
@@ -2681,7 +2759,8 @@ async fn build_transient_window_count_star_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
     mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
-    output_transform: Arc<DeltaTransformFn>,
+    output_transform: Option<Arc<DeltaTransformFn>>,
+    output_projection: Option<TransientWindowCountOutputProjection>,
     watermark: Arc<AtomicI64>,
     compact_count_state: bool,
     cancel: &CancellationToken,
@@ -2805,19 +2884,26 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         }
                     }
 
-                    let encoded_output = match encode_transient_window_count_output_deltas(updates) {
+                    let encoded_output = match encode_transient_window_count_output_deltas(
+                        updates,
+                        output_projection,
+                    ) {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
                     };
-                    let final_deltas = match output_transform(&encoded_output) {
-                        Ok(deltas) => deltas,
-                        Err(err) => {
-                            report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                            break;
+                    let final_deltas = if let Some(output_transform) = output_transform.as_ref() {
+                        match output_transform(&encoded_output) {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
                         }
+                    } else {
+                        encoded_output
                     };
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
@@ -3731,7 +3817,14 @@ fn decode_transient_window_count_state_key(row: &[u8]) -> Result<TransientWindow
 
 fn encode_transient_window_count_output_deltas(
     deltas: HashMap<(TransientWindowCountKey, i64), i64>,
+    projection: Option<TransientWindowCountOutputProjection>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
+    if matches!(
+        projection,
+        Some(TransientWindowCountOutputProjection::GroupKeyAndCount)
+    ) {
+        return encode_transient_window_count_group_key_count_output_deltas(deltas);
+    }
     let mut encoded = Vec::with_capacity(deltas.len());
     for ((key, count), diff) in deltas {
         if diff == 0 {
@@ -3744,6 +3837,67 @@ fn encode_transient_window_count_output_deltas(
         encoded.push((row, diff));
     }
     Ok(encoded)
+}
+
+fn encode_transient_window_count_group_key_count_output_deltas(
+    deltas: HashMap<(TransientWindowCountKey, i64), i64>,
+) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut projected = HashMap::<Vec<u8>, i64>::with_capacity(deltas.len());
+    for ((key, count), diff) in deltas {
+        if diff == 0 {
+            continue;
+        }
+        let row = encode_transient_window_group_key_count_output_row(&key.key, count)?;
+        merge_encoded_delta(&mut projected, row, diff);
+    }
+    Ok(projected.into_iter().collect())
+}
+
+fn merge_encoded_delta(map: &mut HashMap<Vec<u8>, i64>, row: Vec<u8>, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    match map.entry(row) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let merged = entry.get().saturating_add(delta);
+            if merged == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = merged;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(delta);
+        }
+    }
+}
+
+fn encode_transient_window_group_key_count_output_row(
+    group_key: &[u8],
+    count: i64,
+) -> Result<Vec<u8>> {
+    if group_key.len() < 4 {
+        bail!("transient window count group key is too short");
+    }
+    let group_key_count = transient_encoded_row_declared_column_count(group_key)?;
+    let output_count = group_key_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("too many columns in MV key"))?;
+    let output_count =
+        u32::try_from(output_count).map_err(|_| anyhow!("too many columns in MV key"))?;
+    let mut row = Vec::with_capacity(group_key.len() + 9);
+    row.extend_from_slice(&output_count.to_le_bytes());
+    row.extend_from_slice(&group_key[4..]);
+    row.push(0x01);
+    row.extend_from_slice(&count.to_le_bytes());
+    Ok(row)
+}
+
+fn transient_encoded_row_declared_column_count(row: &[u8]) -> Result<usize> {
+    if row.len() < 4 {
+        bail!("encoded key too short");
+    }
+    Ok(u32::from_le_bytes(row[0..4].try_into().unwrap()) as usize)
 }
 
 fn encode_transient_window_bounds(start: i64, end: i64) -> Result<Vec<u8>> {
