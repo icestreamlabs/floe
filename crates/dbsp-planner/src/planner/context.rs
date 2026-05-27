@@ -26,7 +26,7 @@ use super::expr::{
     combine_filters, extract_alias, extract_join_keys_and_residual, map_aggregate_expr,
     normalize_expr,
 };
-use super::logical_optimizer::optimize_logical_plan;
+use super::logical_optimizer::{OptimizerDiagnostics, optimize_logical_plan};
 
 pub struct CircuitPlanner {
     config: PlannerConfig,
@@ -38,13 +38,21 @@ impl CircuitPlanner {
     }
 
     pub fn plan(&self, plan: &LogicalPlan) -> Result<CircuitPlan, PlannerError> {
-        let plan = optimize_logical_plan(plan)?;
+        let plan = optimize_logical_plan(plan, &self.config)?.plan;
         let mut ctx = PlannerContext::new(&self.config);
         let planned = ctx.plan_node(&plan)?;
         Ok(CircuitPlan {
             root: planned.id,
             nodes: ctx.into_reachable_nodes(planned.id)?,
         })
+    }
+
+    pub fn optimize_logical_plan_with_diagnostics(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<(LogicalPlan, OptimizerDiagnostics), PlannerError> {
+        let optimized = optimize_logical_plan(plan, &self.config)?;
+        Ok((optimized.plan, optimized.diagnostics))
     }
 }
 

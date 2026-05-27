@@ -6,11 +6,15 @@
 
 pub mod circuit {
     pub use dbsp_circuit::circuit::*;
-    pub use dbsp_planner::{CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError};
+    pub use dbsp_planner::{
+        CircuitNode, CircuitPlan, CircuitPlanner, OptimizerDiagnostics, OptimizerRuleDiagnostics,
+        OptimizerStageDiagnostics, PlannerConfig, PlannerError,
+    };
 
     pub mod planner {
         pub use dbsp_planner::{
-            CircuitNode, CircuitPlan, CircuitPlanner, PlannerConfig, PlannerError,
+            CircuitNode, CircuitPlan, CircuitPlanner, OptimizerDiagnostics,
+            OptimizerRuleDiagnostics, OptimizerStageDiagnostics, PlannerConfig, PlannerError,
         };
     }
 }
@@ -33,7 +37,8 @@ pub use circuit::{
     DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate,
     DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode,
     DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef,
-    OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem, RowSchema, TableDescriptor,
+    OptimizerDiagnostics, OptimizerRuleDiagnostics, OptimizerStageDiagnostics, OrderExpr,
+    PlannerConfig, PlannerError, PrimaryKey, ProjectItem, RowSchema, TableDescriptor,
     nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
     nexmark_person_alias_table, nexmark_person_table,
 };

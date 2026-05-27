@@ -1827,6 +1827,7 @@ dependencies = [
  "datafusion-common",
  "dbsp-circuit",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

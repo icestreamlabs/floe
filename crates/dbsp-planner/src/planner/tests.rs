@@ -276,6 +276,68 @@ fn merges_consecutive_projection_nodes() {
 }
 
 #[test]
+fn optimizer_diagnostics_report_named_stages_and_rules() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "price")).alias("p"),
+            col(qualified(bid, "auction")).alias("a"),
+        ])
+        .unwrap()
+        .project(vec![col("p").alias("price_alias")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+
+    assert!(diagnostics.total_applications() > 0);
+    assert_eq!(diagnostics.rule_application_count("MergeProjections"), 1);
+    assert!(!diagnostics.max_passes_reached());
+    assert!(
+        diagnostics
+            .stages()
+            .iter()
+            .any(|stage| stage.name() == "Normalize")
+    );
+}
+
+#[test]
+fn can_disable_optimizer_rule_by_name() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "price")).alias("p"),
+            col(qualified(bid, "auction")).alias("a"),
+        ])
+        .unwrap()
+        .project(vec![col("p").alias("price_alias")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner =
+        CircuitPlanner::new(planner_config().with_disabled_optimizer_rule("MergeProjections"));
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+    assert_eq!(diagnostics.rule_application_count("MergeProjections"), 0);
+
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let project_count = circuit_plan
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, DbspNodeKind::Project(_)))
+        .count();
+    assert_eq!(project_count, 2);
+}
+
+#[test]
 fn pushes_filter_and_projection_into_union_inputs() {
     let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
@@ -707,6 +769,60 @@ fn plans_aggregate_over_distinct_subquery() {
     let input = *root.inputs.first().expect("aggregate input");
     let distinct_node = circuit_plan.node(input).expect("distinct input");
     assert!(matches!(distinct_node.kind, DbspNodeKind::Distinct(_)));
+}
+
+#[test]
+fn pushes_only_group_key_filters_below_aggregate() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .aggregate(
+            vec![col(qualified(bid, "auction"))],
+            vec![count(col(qualified(bid, "price"))).alias("bid_count")],
+        )
+        .unwrap()
+        .filter(
+            col("auction")
+                .gt(lit(10_i64))
+                .and(col("bid_count").gt(lit(1_i64))),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+    assert_eq!(
+        diagnostics.rule_application_count("FilterAggregateTranspose"),
+        1
+    );
+
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Select(_)));
+
+    let aggregate_id = *root.inputs.first().expect("root select input");
+    let aggregate = circuit_plan.node(aggregate_id).expect("aggregate");
+    assert!(matches!(aggregate.kind, DbspNodeKind::Aggregate(_)));
+
+    let pushed_select_id = *aggregate.inputs.first().expect("aggregate input");
+    let pushed_select = circuit_plan.node(pushed_select_id).expect("pushed select");
+    match &pushed_select.kind {
+        DbspNodeKind::Select(select) => {
+            let predicate = format!("{:?}", select.predicate().expression().expr());
+            assert!(
+                predicate.contains("auction"),
+                "expected group-key predicate below aggregate, got {predicate}",
+            );
+            assert!(
+                !predicate.contains("bid_count"),
+                "aggregate-result predicate should remain above aggregate, got {predicate}",
+            );
+        }
+        other => panic!("expected pushed Select below Aggregate, found {other:?}"),
+    }
 }
 
 #[test]
