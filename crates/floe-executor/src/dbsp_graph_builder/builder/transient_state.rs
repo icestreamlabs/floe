@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result};
 use dbsp::storage::KeyValueTable;
 use slatedb::WriteBatch;
@@ -9,7 +9,7 @@ use slatedb::config::ScanOptions;
 pub(super) struct PersistentTransientInputState {
     table: Option<Arc<dyn KeyValueTable>>,
     prefix: Vec<u8>,
-    rows: HashMap<Vec<u8>, i64>,
+    rows: AHashMap<Vec<u8>, i64>,
 }
 
 impl PersistentTransientInputState {
@@ -31,7 +31,7 @@ impl PersistentTransientInputState {
                 })?,
             None => Vec::new(),
         };
-        let mut rows = HashMap::with_capacity(entries.len());
+        let mut rows = AHashMap::with_capacity(entries.len());
         for (key, value) in entries {
             if value.len() != std::mem::size_of::<i64>() {
                 tracing::warn!(
@@ -77,8 +77,7 @@ impl PersistentTransientInputState {
             }
             let previous = self.rows.get(row).copied().unwrap_or(0);
             let next = previous.saturating_add(*diff);
-            let mut key = self.prefix.clone();
-            key.extend_from_slice(row);
+            let key = transient_helper_state_key(&self.prefix, row);
             if next == 0 {
                 self.rows.remove(row);
                 batch.delete(key);
@@ -98,7 +97,7 @@ impl PersistentTransientInputState {
         let next_rows = rows
             .into_iter()
             .filter(|(_, weight)| *weight != 0)
-            .collect::<HashMap<_, _>>();
+            .collect::<AHashMap<_, _>>();
         if self.rows == next_rows {
             return Ok(());
         }
@@ -106,15 +105,13 @@ impl PersistentTransientInputState {
         let mut batch = WriteBatch::new();
         for row in self.rows.keys() {
             if !next_rows.contains_key(row) {
-                let mut key = self.prefix.clone();
-                key.extend_from_slice(row);
+                let key = transient_helper_state_key(&self.prefix, row);
                 batch.delete(key);
             }
         }
         for (row, weight) in &next_rows {
             if self.rows.get(row).copied() != Some(*weight) {
-                let mut key = self.prefix.clone();
-                key.extend_from_slice(row);
+                let key = transient_helper_state_key(&self.prefix, row);
                 batch.put(key, weight.to_le_bytes());
             }
         }
@@ -133,4 +130,11 @@ fn transient_helper_state_prefix(graph_id: &str, label: &str) -> Vec<u8> {
     prefix.extend_from_slice(label.as_bytes());
     prefix.push(b'/');
     prefix
+}
+
+fn transient_helper_state_key(prefix: &[u8], row: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + row.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(row);
+    key
 }
