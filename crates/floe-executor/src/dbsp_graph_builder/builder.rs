@@ -1389,6 +1389,36 @@ enum TransientWindowCountOutputProjection {
     GroupKeyAndCount,
 }
 
+enum TransientWindowCountUpdates {
+    Full(HashMap<(TransientWindowCountKey, i64), i64>),
+    GroupKeyAndCount(HashMap<(Arc<[u8]>, i64), i64>),
+}
+
+impl TransientWindowCountUpdates {
+    fn new(projection: Option<TransientWindowCountOutputProjection>) -> Self {
+        match projection {
+            Some(TransientWindowCountOutputProjection::GroupKeyAndCount) => {
+                Self::GroupKeyAndCount(HashMap::new())
+            }
+            None => Self::Full(HashMap::new()),
+        }
+    }
+
+    fn merge(&mut self, key: &TransientWindowCountKey, count: i64, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        match self {
+            Self::Full(updates) => {
+                merge_i64_delta(updates, (key.clone(), count), delta);
+            }
+            Self::GroupKeyAndCount(updates) => {
+                merge_i64_delta(updates, (Arc::clone(&key.key), count), delta);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum TransientJoinPipelineStep {
     Transform(Arc<DeltaTransformFn>),
@@ -2820,6 +2850,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                 window_size,
                 window_slide,
                 transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
+                None,
                 &mut counts,
                 &mut eviction_schedule,
             )
@@ -2861,6 +2892,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         window_size,
                         window_slide,
                         transient_window_watermark_cutoff(&watermark, allowed_lateness_ms),
+                        output_projection,
                         &mut counts,
                         &mut eviction_schedule,
                     ) {
@@ -2884,10 +2916,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         }
                     }
 
-                    let encoded_output = match encode_transient_window_count_output_deltas(
-                        updates,
-                        output_projection,
-                    ) {
+                    let encoded_output = match encode_transient_window_count_output_deltas(updates) {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3605,11 +3634,10 @@ fn transient_window_watermark_cutoff(
     Some(watermark.saturating_sub(allowed_lateness_ms.max(0)))
 }
 
-fn merge_i64_delta(
-    map: &mut HashMap<TransientWindowCountKey, i64>,
-    key: TransientWindowCountKey,
-    delta: i64,
-) {
+fn merge_i64_delta<K>(map: &mut HashMap<K, i64>, key: K, delta: i64)
+where
+    K: Eq + std::hash::Hash,
+{
     if delta == 0 {
         return;
     }
@@ -3629,27 +3657,10 @@ fn merge_i64_delta(
     }
 }
 
-fn merge_count_delta(
-    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
-    key: TransientWindowCountKey,
-    count: i64,
-    diff: i64,
-) {
-    if diff == 0 {
-        return;
-    }
-    let pair = (key, count);
-    let entry = updates.entry(pair.clone()).or_insert(0);
-    *entry += diff;
-    if *entry == 0 {
-        updates.remove(&pair);
-    }
-}
-
 fn apply_transient_window_count_delta(
     counts: &mut HashMap<TransientWindowCountKey, i64>,
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
-    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
+    updates: &mut TransientWindowCountUpdates,
     key: TransientWindowCountKey,
     delta: i64,
 ) {
@@ -3662,10 +3673,10 @@ fn apply_transient_window_count_delta(
         return;
     }
     if old_count != 0 {
-        merge_count_delta(updates, key.clone(), old_count, -1);
+        updates.merge(&key, old_count, -1);
     }
     if new_count != 0 {
-        merge_count_delta(updates, key.clone(), new_count, 1);
+        updates.merge(&key, new_count, 1);
         if old_count == 0 {
             eviction_schedule
                 .entry(key.end)
@@ -3682,7 +3693,7 @@ fn transient_window_evict_expired_counts(
     cutoff: Option<i64>,
     counts: &mut HashMap<TransientWindowCountKey, i64>,
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
-    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
+    updates: &mut TransientWindowCountUpdates,
 ) {
     let Some(cutoff) = cutoff else {
         return;
@@ -3694,7 +3705,7 @@ fn transient_window_evict_expired_counts(
             let Some(old_count) = counts.remove(&key) else {
                 continue;
             };
-            merge_count_delta(updates, key, old_count, -1);
+            updates.merge(&key, old_count, -1);
         }
     }
 }
@@ -3706,9 +3717,10 @@ fn apply_transient_window_count_star_deltas(
     window_size: i64,
     window_slide: i64,
     cutoff: Option<i64>,
+    output_projection: Option<TransientWindowCountOutputProjection>,
     counts: &mut HashMap<TransientWindowCountKey, i64>,
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
-) -> Result<HashMap<(TransientWindowCountKey, i64), i64>> {
+) -> Result<TransientWindowCountUpdates> {
     let mut grouped_deltas: HashMap<TransientWindowCountKey, i64> = HashMap::new();
     let mut batch_group_key_intern: HashMap<Vec<u8>, Arc<[u8]>> = HashMap::new();
     for (row, weight) in input_deltas {
@@ -3754,7 +3766,7 @@ fn apply_transient_window_count_star_deltas(
         });
     }
 
-    let mut updates: HashMap<(TransientWindowCountKey, i64), i64> = HashMap::new();
+    let mut updates = TransientWindowCountUpdates::new(output_projection);
     for (key, delta) in grouped_deltas {
         apply_transient_window_count_delta(counts, eviction_schedule, &mut updates, key, delta);
     }
@@ -3816,15 +3828,14 @@ fn decode_transient_window_count_state_key(row: &[u8]) -> Result<TransientWindow
 }
 
 fn encode_transient_window_count_output_deltas(
-    deltas: HashMap<(TransientWindowCountKey, i64), i64>,
-    projection: Option<TransientWindowCountOutputProjection>,
+    deltas: TransientWindowCountUpdates,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
-    if matches!(
-        projection,
-        Some(TransientWindowCountOutputProjection::GroupKeyAndCount)
-    ) {
-        return encode_transient_window_count_group_key_count_output_deltas(deltas);
-    }
+    let deltas = match deltas {
+        TransientWindowCountUpdates::Full(deltas) => deltas,
+        TransientWindowCountUpdates::GroupKeyAndCount(deltas) => {
+            return encode_transient_window_count_group_key_count_output_deltas(deltas);
+        }
+    };
     let mut encoded = Vec::with_capacity(deltas.len());
     for ((key, count), diff) in deltas {
         if diff == 0 {
@@ -3840,14 +3851,14 @@ fn encode_transient_window_count_output_deltas(
 }
 
 fn encode_transient_window_count_group_key_count_output_deltas(
-    deltas: HashMap<(TransientWindowCountKey, i64), i64>,
+    deltas: HashMap<(Arc<[u8]>, i64), i64>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut projected = HashMap::<Vec<u8>, i64>::with_capacity(deltas.len());
     for ((key, count), diff) in deltas {
         if diff == 0 {
             continue;
         }
-        let row = encode_transient_window_group_key_count_output_row(&key.key, count)?;
+        let row = encode_transient_window_group_key_count_output_row(&key, count)?;
         merge_encoded_delta(&mut projected, row, diff);
     }
     Ok(projected.into_iter().collect())
