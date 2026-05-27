@@ -2172,6 +2172,7 @@ dependencies = [
 name = "floe-executor"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "arc-swap",
  "arrow-ipc",
