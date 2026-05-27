@@ -1195,6 +1195,26 @@ pub struct BuildOutputs {
     pub required_sources: BTreeSet<String>,
 }
 
+fn should_compact_transient_helper_state(
+    upstream: &TransientSourceHandleStream,
+    state_table: Option<&Arc<dyn KeyValueTable>>,
+) -> bool {
+    // Compact snapshots rewrite all helper state on every input batch. Keep that
+    // behavior opt-in so the steady-state path persists only incremental deltas.
+    upstream.recoverable() && state_table.is_some() && transient_compact_helper_state_env_enabled()
+}
+
+fn transient_compact_helper_state_env_enabled() -> bool {
+    std::env::var("FLOE_COMPACT_TRANSIENT_HELPER_STATE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn first_input(node: &CircuitNode, label: &str) -> Result<usize> {
     node.inputs
         .first()
@@ -2289,7 +2309,17 @@ async fn build_transient_aggregate_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_source_state = upstream.recoverable();
+    let state_label = state_label.into();
+    let compact_source_state =
+        should_compact_transient_helper_state(&upstream, state_table.as_ref());
+    tracing::info!(
+        graph_id,
+        state_label = %state_label,
+        recoverable = upstream.recoverable(),
+        helper_state_persistent = state_table.is_some(),
+        compact_source_state,
+        "configured transient aggregate helper state"
+    );
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-aggregate-source:{graph_id}"),
@@ -2613,7 +2643,17 @@ async fn build_transient_window_count_star_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_count_state = upstream.recoverable();
+    let state_label = state_label.into();
+    let compact_count_state =
+        should_compact_transient_helper_state(&upstream, state_table.as_ref());
+    tracing::info!(
+        graph_id,
+        state_label = %state_label,
+        recoverable = upstream.recoverable(),
+        helper_state_persistent = state_table.is_some(),
+        compact_count_state,
+        "configured transient window count-star helper state"
+    );
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-count-star-source:{graph_id}"),
@@ -2804,7 +2844,17 @@ async fn build_transient_window_incremental_receiver(
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
 ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let compact_source_state = upstream.recoverable();
+    let state_label = state_label.into();
+    let compact_source_state =
+        should_compact_transient_helper_state(&upstream, state_table.as_ref());
+    tracing::info!(
+        graph_id,
+        state_label = %state_label,
+        recoverable = upstream.recoverable(),
+        helper_state_persistent = state_table.is_some(),
+        compact_source_state,
+        "configured transient window aggregate helper state"
+    );
     let upstream_rx = build_transient_source_receiver(
         graph_id,
         format!("transient-window-aggregate-source:{graph_id}"),

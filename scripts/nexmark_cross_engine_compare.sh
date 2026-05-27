@@ -1357,38 +1357,57 @@ append_summary_row() {
   local engine="$1"
   local query_id="$2"
   local status="$3"
-  local total_ms="$4"
-  local produce_ms="$5"
-  local post_ms="$6"
-  local rows_per_sec="$7"
-  local input_rows="$8"
-  local result_rows="$9"
-  local notes="${10}"
+  local source_catchup_ms="$4"
+  local result_ready_ms="$5"
+  local produce_ms="$6"
+  local source_post_ms="$7"
+  local result_post_ms="$8"
+  local source_rows_per_sec="$9"
+  local result_rows_per_sec="${10}"
+  local input_rows="${11}"
+  local result_rows="${12}"
+  local notes="${13}"
 
-  local total_s="n/a"
+  local source_catchup_s="n/a"
+  local result_ready_s="n/a"
   local produce_s="n/a"
-  local post_s="n/a"
-  local total_ms_json=0
+  local source_post_s="n/a"
+  local result_post_s="n/a"
+  local source_catchup_ms_json=0
+  local result_ready_ms_json=0
   local produce_ms_json=0
-  local post_ms_json=0
-  local rows_per_sec_json=0
+  local source_post_ms_json=0
+  local result_post_ms_json=0
+  local source_rows_per_sec_json=0
+  local result_rows_per_sec_json=0
   local input_rows_json=0
   local result_rows_json=0
 
-  if [[ "${total_ms}" =~ ^[0-9]+$ ]]; then
-    total_s="$(awk "BEGIN { print ${total_ms}/1000 }")"
-    total_ms_json="${total_ms}"
+  if [[ "${source_catchup_ms}" =~ ^[0-9]+$ ]]; then
+    source_catchup_s="$(awk "BEGIN { print ${source_catchup_ms}/1000 }")"
+    source_catchup_ms_json="${source_catchup_ms}"
+  fi
+  if [[ "${result_ready_ms}" =~ ^[0-9]+$ ]]; then
+    result_ready_s="$(awk "BEGIN { print ${result_ready_ms}/1000 }")"
+    result_ready_ms_json="${result_ready_ms}"
   fi
   if [[ "${produce_ms}" =~ ^[0-9]+$ ]]; then
     produce_s="$(awk "BEGIN { print ${produce_ms}/1000 }")"
     produce_ms_json="${produce_ms}"
   fi
-  if [[ "${post_ms}" =~ ^[0-9]+$ ]]; then
-    post_s="$(awk "BEGIN { print ${post_ms}/1000 }")"
-    post_ms_json="${post_ms}"
+  if [[ "${source_post_ms}" =~ ^[0-9]+$ ]]; then
+    source_post_s="$(awk "BEGIN { print ${source_post_ms}/1000 }")"
+    source_post_ms_json="${source_post_ms}"
   fi
-  if [[ "${rows_per_sec}" =~ ^[0-9]+$ ]]; then
-    rows_per_sec_json="${rows_per_sec}"
+  if [[ "${result_post_ms}" =~ ^[0-9]+$ ]]; then
+    result_post_s="$(awk "BEGIN { print ${result_post_ms}/1000 }")"
+    result_post_ms_json="${result_post_ms}"
+  fi
+  if [[ "${source_rows_per_sec}" =~ ^[0-9]+$ ]]; then
+    source_rows_per_sec_json="${source_rows_per_sec}"
+  fi
+  if [[ "${result_rows_per_sec}" =~ ^[0-9]+$ ]]; then
+    result_rows_per_sec_json="${result_rows_per_sec}"
   fi
   if [[ "${input_rows}" =~ ^[0-9]+$ ]]; then
     input_rows_json="${input_rows}"
@@ -1397,18 +1416,22 @@ append_summary_row() {
     result_rows_json="${result_rows}"
   fi
 
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-    "${engine}" "${query_id}" "${status}" "${total_s}" "${produce_s}" "${post_s}" \
-    "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}" >> "${RESULTS_FILE}"
+  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+    "${engine}" "${query_id}" "${status}" "${source_catchup_s}" "${result_ready_s}" \
+    "${produce_s}" "${source_post_s}" "${result_post_s}" "${source_rows_per_sec}" \
+    "${result_rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}" >> "${RESULTS_FILE}"
 
   jq -n \
     --arg engine "${engine}" \
     --arg query_id "${query_id}" \
     --arg status "${status}" \
-    --argjson total_ms "${total_ms_json}" \
+    --argjson source_catchup_ms "${source_catchup_ms_json}" \
+    --argjson result_ready_ms "${result_ready_ms_json}" \
     --argjson produce_ms "${produce_ms_json}" \
-    --argjson post_produce_wait_ms "${post_ms_json}" \
-    --argjson input_rows_per_sec "${rows_per_sec_json}" \
+    --argjson source_post_produce_wait_ms "${source_post_ms_json}" \
+    --argjson result_post_produce_wait_ms "${result_post_ms_json}" \
+    --argjson source_catchup_input_rows_per_sec "${source_rows_per_sec_json}" \
+    --argjson result_ready_input_rows_per_sec "${result_rows_per_sec_json}" \
     --argjson input_rows "${input_rows_json}" \
     --argjson result_rows "${result_rows_json}" \
     --arg notes "${notes}" \
@@ -1417,12 +1440,16 @@ append_summary_row() {
       query_id: $query_id,
       status: $status,
       timing: {
-        total_ms: $total_ms,
+        source_catchup_ms: $source_catchup_ms,
+        result_ready_ms: $result_ready_ms,
         produce_ms: $produce_ms,
-        post_produce_wait_ms: $post_produce_wait_ms
+        source_post_produce_wait_ms: $source_post_produce_wait_ms,
+        result_post_produce_wait_ms: $result_post_produce_wait_ms
       },
       throughput: {
-        input_rows_per_sec: $input_rows_per_sec
+        source_catchup_input_rows_per_sec: $source_catchup_input_rows_per_sec,
+        result_ready_input_rows_per_sec: $result_ready_input_rows_per_sec,
+        input_rows_per_sec: $source_catchup_input_rows_per_sec
       },
       rows: {
         input_rows: $input_rows,
@@ -1437,7 +1464,7 @@ record_failure() {
   local query_id="$2"
   local notes="$3"
   local input_rows="$4"
-  append_summary_row "${engine}" "${query_id}" "failed" "" "" "" "n/a" "${input_rows}" "n/a" "${notes}"
+  append_summary_row "${engine}" "${query_id}" "failed" "" "" "" "" "" "n/a" "n/a" "${input_rows}" "n/a" "${notes}"
 }
 
 producer_topics_for_query() {
@@ -1996,18 +2023,19 @@ run_materialize_query() {
     notes="count_views_pgwire_indexed_views"
   fi
 
-  local start_ms end_ms total_ms rows_per_sec result_rows
+  local start_ms source_end_ms result_end_ms source_catchup_ms result_ready_ms result_post_ms
+  local source_rows_per_sec result_rows_per_sec result_rows
   start_ms="$(date +%s%3N)"
   produce_for_query_sources "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}"
   if ! poll_pg_source_counts "${MATERIALIZE_SQL_PORT}" materialize materialize "Materialize ${query_id}" "${specs[@]}"; then
     return 1
   fi
-  end_ms="$(date +%s%3N)"
-  total_ms=$((end_ms - start_ms))
-  if (( total_ms > 0 )); then
-    rows_per_sec=$((input_rows * 1000 / total_ms))
+  source_end_ms="$(date +%s%3N)"
+  source_catchup_ms=$((source_end_ms - start_ms))
+  if (( source_catchup_ms > 0 )); then
+    source_rows_per_sec=$((input_rows * 1000 / source_catchup_ms))
   else
-    rows_per_sec=0
+    source_rows_per_sec=0
   fi
 
   if ! poll_pg_result_rows_equals "${MATERIALIZE_SQL_PORT}" materialize materialize "${expected_result_rows}" benchmark_result; then
@@ -2019,6 +2047,17 @@ run_materialize_query() {
       printf 'query_id=%s\n' "${query_id}"
     } > "${artifact_dir}/correctness.error"
     return 1
+  fi
+  result_end_ms="$(date +%s%3N)"
+  result_ready_ms=$((result_end_ms - start_ms))
+  result_post_ms=$((result_ready_ms - PRODUCE_MS))
+  if (( result_post_ms < 0 )); then
+    result_post_ms=0
+  fi
+  if (( result_ready_ms > 0 )); then
+    result_rows_per_sec=$((input_rows * 1000 / result_ready_ms))
+  else
+    result_rows_per_sec=0
   fi
 
   result_rows="$(fetch_pg_scalar "${MATERIALIZE_SQL_PORT}" materialize materialize "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
@@ -2056,7 +2095,7 @@ run_materialize_query() {
     notes="${notes};content_sha256=${observed_hash:0:16}"
   fi
 
-  append_summary_row materialize "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
+  append_summary_row materialize "${query_id}" ok "${source_catchup_ms}" "${result_ready_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${result_post_ms}" "${source_rows_per_sec}" "${result_rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
 }
 
@@ -2235,18 +2274,19 @@ run_risingwave_query() {
     return 1
   fi
 
-  local start_ms end_ms total_ms rows_per_sec result_rows
+  local start_ms source_end_ms result_end_ms source_catchup_ms result_ready_ms result_post_ms
+  local source_rows_per_sec result_rows_per_sec result_rows
   start_ms="$(date +%s%3N)"
   produce_for_query_sources "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}"
   if ! poll_pg_source_counts "${RISINGWAVE_SQL_PORT}" root dev "RisingWave ${query_id}" "${specs[@]}"; then
     return 1
   fi
-  end_ms="$(date +%s%3N)"
-  total_ms=$((end_ms - start_ms))
-  if (( total_ms > 0 )); then
-    rows_per_sec=$((input_rows * 1000 / total_ms))
+  source_end_ms="$(date +%s%3N)"
+  source_catchup_ms=$((source_end_ms - start_ms))
+  if (( source_catchup_ms > 0 )); then
+    source_rows_per_sec=$((input_rows * 1000 / source_catchup_ms))
   else
-    rows_per_sec=0
+    source_rows_per_sec=0
   fi
 
   if ! poll_pg_result_rows_equals "${RISINGWAVE_SQL_PORT}" root dev "${expected_result_rows}" benchmark_result; then
@@ -2258,6 +2298,17 @@ run_risingwave_query() {
       printf 'query_id=%s\n' "${query_id}"
     } > "${artifact_dir}/correctness.error"
     return 1
+  fi
+  result_end_ms="$(date +%s%3N)"
+  result_ready_ms=$((result_end_ms - start_ms))
+  result_post_ms=$((result_ready_ms - PRODUCE_MS))
+  if (( result_post_ms < 0 )); then
+    result_post_ms=0
+  fi
+  if (( result_ready_ms > 0 )); then
+    result_rows_per_sec=$((input_rows * 1000 / result_ready_ms))
+  else
+    result_rows_per_sec=0
   fi
 
   result_rows="$(fetch_pg_scalar "${RISINGWAVE_SQL_PORT}" root dev "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
@@ -2295,7 +2346,7 @@ run_risingwave_query() {
   if [[ -n "${observed_hash}" ]]; then
     rw_notes="${rw_notes};content_sha256=${observed_hash:0:16}"
   fi
-  append_summary_row risingwave "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${rw_notes}"
+  append_summary_row risingwave "${query_id}" ok "${source_catchup_ms}" "${result_ready_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${result_post_ms}" "${source_rows_per_sec}" "${result_rows_per_sec}" "${input_rows}" "${result_rows}" "${rw_notes}"
   return 0
 }
 
@@ -2561,18 +2612,19 @@ run_feldera_query() {
     return 1
   fi
 
-  local start_ms end_ms total_ms rows_per_sec result_rows
+  local start_ms source_end_ms result_end_ms source_catchup_ms result_ready_ms result_post_ms
+  local source_rows_per_sec result_rows_per_sec result_rows
   start_ms="$(date +%s%3N)"
   produce_for_query_sources "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}"
   if ! poll_feldera_source_counts "${pipeline}" "${specs[@]}"; then
     return 1
   fi
-  end_ms="$(date +%s%3N)"
-  total_ms=$((end_ms - start_ms))
-  if (( total_ms > 0 )); then
-    rows_per_sec=$((input_rows * 1000 / total_ms))
+  source_end_ms="$(date +%s%3N)"
+  source_catchup_ms=$((source_end_ms - start_ms))
+  if (( source_catchup_ms > 0 )); then
+    source_rows_per_sec=$((input_rows * 1000 / source_catchup_ms))
   else
-    rows_per_sec=0
+    source_rows_per_sec=0
   fi
 
   if ! poll_feldera_result_rows_equals "${pipeline}" "${expected_result_rows}"; then
@@ -2589,6 +2641,17 @@ run_feldera_query() {
       printf 'query_id=%s\n' "${query_id}"
     } > "${artifact_dir}/correctness.error"
     return 1
+  fi
+  result_end_ms="$(date +%s%3N)"
+  result_ready_ms=$((result_end_ms - start_ms))
+  result_post_ms=$((result_ready_ms - PRODUCE_MS))
+  if (( result_post_ms < 0 )); then
+    result_post_ms=0
+  fi
+  if (( result_ready_ms > 0 )); then
+    result_rows_per_sec=$((input_rows * 1000 / result_ready_ms))
+  else
+    result_rows_per_sec=0
   fi
 
   local response
@@ -2635,7 +2698,7 @@ run_feldera_query() {
   if [[ -n "${observed_hash}" ]]; then
     notes="${notes};content_sha256=${observed_hash:0:16}"
   fi
-  append_summary_row feldera "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
+  append_summary_row feldera "${query_id}" ok "${source_catchup_ms}" "${result_ready_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${result_post_ms}" "${source_rows_per_sec}" "${result_rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
 
   curl -fsS -X POST "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}/shutdown" >/dev/null 2>&1 || true
   curl -fsS -X DELETE "http://127.0.0.1:${FELDERA_HTTP_PORT}/v0/pipelines/${pipeline}" >/dev/null 2>&1 || true
@@ -2962,19 +3025,20 @@ run_floe_query() {
     return 1
   fi
 
-  local start_ms end_ms total_ms rows_per_sec result_rows notes
+  local start_ms source_end_ms result_end_ms source_catchup_ms result_ready_ms result_post_ms
+  local source_rows_per_sec result_rows_per_sec result_rows notes
   start_ms="$(date +%s%3N)"
   produce_for_query_sources "${sources}" "${bid_topic}" "${auction_topic}" "${person_topic}"
   if ! poll_floe_query_completion "${query_id}" "${sources}" "${bid_group_id}" "${auction_group_id}" "${person_group_id}" "${bid_topic}" "${auction_topic}" "${person_topic}"; then
     stop_floe_process
     return 1
   fi
-  end_ms="$(date +%s%3N)"
-  total_ms=$((end_ms - start_ms))
-  if (( total_ms > 0 )); then
-    rows_per_sec=$((input_rows * 1000 / total_ms))
+  source_end_ms="$(date +%s%3N)"
+  source_catchup_ms=$((source_end_ms - start_ms))
+  if (( source_catchup_ms > 0 )); then
+    source_rows_per_sec=$((input_rows * 1000 / source_catchup_ms))
   else
-    rows_per_sec=0
+    source_rows_per_sec=0
   fi
 
   if ! poll_pg_result_rows_equals "${FLOE_PG_PORT}" postgres postgres "${expected_result_rows}" benchmark_result; then
@@ -2987,6 +3051,17 @@ run_floe_query() {
     } > "${artifact_dir}/correctness.error"
     stop_floe_process
     return 1
+  fi
+  result_end_ms="$(date +%s%3N)"
+  result_ready_ms=$((result_end_ms - start_ms))
+  result_post_ms=$((result_ready_ms - PRODUCE_MS))
+  if (( result_post_ms < 0 )); then
+    result_post_ms=0
+  fi
+  if (( result_ready_ms > 0 )); then
+    result_rows_per_sec=$((input_rows * 1000 / result_ready_ms))
+  else
+    result_rows_per_sec=0
   fi
 
   result_rows="$(fetch_pg_scalar "${FLOE_PG_PORT}" postgres postgres "SELECT COUNT(*)::BIGINT FROM benchmark_result")"
@@ -3185,7 +3260,7 @@ run_floe_query() {
   if [[ -n "${hotspot_note}" ]]; then
     notes="${notes};${hotspot_note}"
   fi
-  append_summary_row floe "${query_id}" ok "${total_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
+  append_summary_row floe "${query_id}" ok "${source_catchup_ms}" "${result_ready_ms}" "${PRODUCE_MS}" "${POST_PRODUCE_WAIT_MS}" "${result_post_ms}" "${source_rows_per_sec}" "${result_rows_per_sec}" "${input_rows}" "${result_rows}" "${notes}"
   return 0
 }
 
@@ -3317,8 +3392,8 @@ Engine selector: \`${ENGINE}\`
 Query selector: \`${QUERY_SELECTOR}\`
 Dataset rows: bid=\`${BID_ROWS}\`, auction=\`${AUCTION_ROWS}\`, person=\`${PERSON_ROWS}\`
 
-| Engine | Query | Status | Ingest Complete (s) | Produce (s) | Post-Produce Wait (s) | Input Rows/s | Input Rows | Result Rows | Notes |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Engine | Query | Status | Source Catchup (s) | Result Ready (s) | Produce (s) | Source Post-Produce Wait (s) | Result Post-Produce Wait (s) | Source Rows/s | Result Ready Rows/s | Input Rows | Result Rows | Notes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 EOF2
 
   : > "${RESULTS_JSONL}"
