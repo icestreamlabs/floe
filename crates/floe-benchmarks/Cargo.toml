@@ -13,6 +13,9 @@ anyhow = { workspace = true }
 floe-executor = { path = "../floe-executor" }
 floe-node-core = { path = "../floe-node-core" }
 floe-sql-parser = { path = "../floe-sql-parser" }
+hex = "0.4"
+serde_json = { workspace = true }
+sha2 = "0.10"
 slatedb = { workspace = true, features = ["aws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rdkafka = { workspace = true }
