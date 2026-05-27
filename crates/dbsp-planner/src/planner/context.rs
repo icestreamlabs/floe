@@ -1133,10 +1133,26 @@ impl<'cfg> PlannerContext<'cfg> {
                 Ok(Some(spec))
             }
             "session" => {
-                Err(PlannerError::UnsupportedPlan(
-                    "SESSION windows require session merge/split runtime state and are not yet supported"
-                        .to_string(),
-                ))
+                if !matches!(func.args.len(), 2 | 3) {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "SESSION requires (time_expr, gap_ms[, allowed_lateness_ms]) arguments"
+                            .to_string(),
+                    ));
+                }
+                let time_expr = normalize_expr(func.args[0].clone())?;
+                let gap_ms = self.parse_window_arg(&func.args[1])?;
+                let allowed_lateness_ms = if func.args.len() == 3 {
+                    self.parse_window_arg(&func.args[2])?
+                } else {
+                    DEFAULT_WINDOW_ALLOWED_LATENESS_MS
+                };
+                let spec = DbspWindowSpec::try_new(
+                    DbspWindowPolicy::Session { gap_ms },
+                    time_expr,
+                    input_schema,
+                    allowed_lateness_ms,
+                )?;
+                Ok(Some(spec))
             }
             _ => Ok(None),
         }

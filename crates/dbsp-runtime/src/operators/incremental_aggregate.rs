@@ -28,7 +28,7 @@ pub enum AggregateValueType {
     TimestampMillis,
     Utf8,
     DateDays,
-    Decimal128,
+    Decimal128 { precision: u8, scale: i8 },
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -53,20 +53,36 @@ impl AggregateValue {
         }
     }
 
-    pub(crate) fn as_numeric(&self) -> Option<i64> {
+    pub(crate) fn as_i64_numeric(&self) -> Option<i64> {
         match self {
             Self::Int64(value) | Self::TimestampMillis(value) => Some(*value),
             Self::Null(_) | Self::Utf8(_) | Self::DateDays(_) | Self::Decimal128(_) => None,
         }
     }
 
-    pub(crate) fn from_numeric(value: i64, value_type: &AggregateValueType) -> Self {
+    pub(crate) fn as_sum_numeric(&self) -> Option<i128> {
+        match self {
+            Self::Int64(value) | Self::TimestampMillis(value) => Some(i128::from(*value)),
+            Self::Decimal128(value) => Some(*value),
+            Self::Null(_) | Self::Utf8(_) | Self::DateDays(_) => None,
+        }
+    }
+
+    pub(crate) fn from_sum_numeric(value: i128, value_type: &AggregateValueType) -> Result<Self> {
         match value_type {
-            AggregateValueType::Int64 => Self::Int64(value),
-            AggregateValueType::TimestampMillis => Self::TimestampMillis(value),
-            AggregateValueType::Utf8 => Self::Utf8(value.to_string()),
-            AggregateValueType::DateDays => Self::DateDays(value as i32),
-            AggregateValueType::Decimal128 => Self::Decimal128(value as i128),
+            AggregateValueType::Int64 => i64::try_from(value)
+                .map(Self::Int64)
+                .context("incremental Int64 SUM overflow"),
+            AggregateValueType::TimestampMillis => i64::try_from(value)
+                .map(Self::TimestampMillis)
+                .context("incremental TimestampMillis SUM overflow"),
+            AggregateValueType::Decimal128 { precision, .. } => {
+                ensure_decimal_fits_precision(value, *precision)?;
+                Ok(Self::Decimal128(value))
+            }
+            AggregateValueType::Utf8 | AggregateValueType::DateDays => {
+                anyhow::bail!("unsupported numeric aggregate type {value_type:?}")
+            }
         }
     }
 
@@ -111,6 +127,7 @@ pub enum IncrementalAggregateSlotState {
     Avg { sum: i64, count: i64 },
     Min { current: Option<AggregateValue> },
     Max { current: Option<AggregateValue> },
+    DecimalSum { sum: i128, non_null_count: i64 },
 }
 
 impl IncrementalAggregateSlotState {
@@ -118,6 +135,12 @@ impl IncrementalAggregateSlotState {
         match kind {
             IncrementalAggregateSlotKind::Count => Self::Count { count: 0 },
             IncrementalAggregateSlotKind::CountDistinct => Self::CountDistinct { count: 0 },
+            IncrementalAggregateSlotKind::Sum(AggregateValueType::Decimal128 { .. }) => {
+                Self::DecimalSum {
+                    sum: 0,
+                    non_null_count: 0,
+                }
+            }
             IncrementalAggregateSlotKind::Sum(_) => Self::Sum {
                 sum: 0,
                 non_null_count: 0,
@@ -165,14 +188,14 @@ impl GroupedIncrementalAggregateState {
     pub(crate) fn output_values(
         &self,
         slot_kinds: &[IncrementalAggregateSlotKind],
-    ) -> Vec<AggregateValue> {
+    ) -> Result<Vec<AggregateValue>> {
         self.slots
             .iter()
             .zip(slot_kinds.iter())
             .map(|(slot, kind)| match (slot, kind) {
                 (IncrementalAggregateSlotState::Count { count }, _)
                 | (IncrementalAggregateSlotState::CountDistinct { count }, _) => {
-                    AggregateValue::Int64(*count)
+                    Ok(AggregateValue::Int64(*count))
                 }
                 (
                     IncrementalAggregateSlotState::Sum {
@@ -182,9 +205,22 @@ impl GroupedIncrementalAggregateState {
                     IncrementalAggregateSlotKind::Sum(value_type),
                 ) => {
                     if *non_null_count > 0 {
-                        AggregateValue::from_numeric(*sum, value_type)
+                        AggregateValue::from_sum_numeric(i128::from(*sum), value_type)
                     } else {
-                        AggregateValue::null(value_type)
+                        Ok(AggregateValue::null(value_type))
+                    }
+                }
+                (
+                    IncrementalAggregateSlotState::DecimalSum {
+                        sum,
+                        non_null_count,
+                    },
+                    IncrementalAggregateSlotKind::Sum(value_type),
+                ) => {
+                    if *non_null_count > 0 {
+                        AggregateValue::from_sum_numeric(*sum, value_type)
+                    } else {
+                        Ok(AggregateValue::null(value_type))
                     }
                 }
                 (
@@ -192,9 +228,9 @@ impl GroupedIncrementalAggregateState {
                     IncrementalAggregateSlotKind::Avg,
                 ) => {
                     if *count != 0 {
-                        AggregateValue::Int64(sum / count)
+                        Ok(AggregateValue::Int64(sum / count))
                     } else {
-                        AggregateValue::Null(AggregateValueType::Int64)
+                        Ok(AggregateValue::Null(AggregateValueType::Int64))
                     }
                 }
                 (
@@ -206,18 +242,51 @@ impl GroupedIncrementalAggregateState {
                     IncrementalAggregateSlotKind::Max(value_type),
                 ) => current
                     .clone()
-                    .unwrap_or_else(|| AggregateValue::null(value_type)),
+                    .map(Ok)
+                    .unwrap_or_else(|| Ok(AggregateValue::null(value_type))),
                 (other, kind) => {
                     tracing::warn!(
                         ?other,
                         ?kind,
                         "incremental aggregate slot state/kind mismatch"
                     );
-                    AggregateValue::Null(AggregateValueType::Int64)
+                    Ok(AggregateValue::Null(AggregateValueType::Int64))
                 }
             })
             .collect()
     }
+}
+
+fn ensure_decimal_fits_precision(value: i128, precision: u8) -> Result<()> {
+    let max_abs = 10_i128
+        .checked_pow(u32::from(precision))
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid Decimal128 precision {precision}"))?;
+    let abs = value
+        .checked_abs()
+        .ok_or_else(|| anyhow::anyhow!("Decimal128 SUM overflow"))?;
+    anyhow::ensure!(
+        abs <= max_abs,
+        "Decimal128 SUM overflow: value {value} exceeds precision {precision}"
+    );
+    Ok(())
+}
+
+fn checked_weighted_sum_delta(value: i128, weight: i64) -> Result<i128> {
+    value
+        .checked_mul(i128::from(weight))
+        .ok_or_else(|| anyhow::anyhow!("incremental SUM overflow while applying input weight"))
+}
+
+fn checked_add_sum(left: i128, right: i128) -> Result<i128> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("incremental SUM overflow"))
+}
+
+fn checked_add_i64_sum(left: i64, right: i128) -> Result<i64> {
+    let right = i64::try_from(right).context("incremental Int64 SUM overflow")?;
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("incremental Int64 SUM overflow"))
 }
 
 #[cfg(test)]
@@ -661,12 +730,24 @@ where
 
         #[derive(Clone, Debug)]
         enum AggregatedSlotDelta {
-            Count { delta: i64 },
+            Count {
+                delta: i64,
+            },
             CountDistinct,
-            Sum { sum_delta: i64, non_null_delta: i64 },
-            Avg { sum_delta: i64, count_delta: i64 },
-            Min { candidate: Option<AggregateValue> },
-            Max { candidate: Option<AggregateValue> },
+            Sum {
+                sum_delta: i128,
+                non_null_delta: i64,
+            },
+            Avg {
+                sum_delta: i64,
+                count_delta: i64,
+            },
+            Min {
+                candidate: Option<AggregateValue>,
+            },
+            Max {
+                candidate: Option<AggregateValue>,
+            },
         }
 
         #[derive(Clone, Debug)]
@@ -684,9 +765,12 @@ where
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
         let has_extrema = self.has_extrema();
-        let mut apply_value = |value: V, row_update: IncrementalAggregateRow<K>, weight: i64| {
+        let mut apply_value = |value: V,
+                               row_update: IncrementalAggregateRow<K>,
+                               weight: i64|
+         -> Result<()> {
             if weight == 0 {
-                return;
+                return Ok(());
             }
             if row_update.slots.len() != self.slot_kinds.len() {
                 tracing::warn!(
@@ -694,7 +778,7 @@ where
                     actual = row_update.slots.len(),
                     "incremental aggregate row evaluator returned unexpected slot vector width"
                 );
-                return;
+                return Ok(());
             }
             let key = row_update.key;
             let slots = row_update.slots;
@@ -723,7 +807,7 @@ where
             }
             affected_keys.insert(key.clone());
             if recompute_keys.contains(&key) {
-                return;
+                return Ok(());
             }
 
             let updates =
@@ -773,8 +857,11 @@ where
                         },
                         IncrementalAggregateSlotUpdate::Value(Some(value)),
                     ) => {
-                        if let Some(number) = value.as_numeric() {
-                            *sum_delta += number * weight;
+                        if let Some(number) = value.as_sum_numeric() {
+                            *sum_delta = checked_add_sum(
+                                *sum_delta,
+                                checked_weighted_sum_delta(number, weight)?,
+                            )?;
                             *non_null_delta += weight;
                         }
                     }
@@ -785,7 +872,7 @@ where
                         },
                         IncrementalAggregateSlotUpdate::Value(Some(value)),
                     ) => {
-                        if let Some(number) = value.as_numeric() {
+                        if let Some(number) = value.as_i64_numeric() {
                             *sum_delta += number * weight;
                             *count_delta += weight;
                         }
@@ -833,6 +920,7 @@ where
                     }
                 }
             }
+            Ok(())
         };
 
         let aggregate_updates_start = Instant::now();
@@ -847,7 +935,7 @@ where
             (self.row_evaluator)(delta_values)
         };
         for (value, row_update, weight) in row_updates {
-            apply_value(value, row_update, weight);
+            apply_value(value, row_update, weight)?;
         }
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
@@ -1024,7 +1112,20 @@ where
                                         non_null_delta,
                                     },
                                 ) => {
-                                    *sum += *sum_delta;
+                                    *sum = checked_add_i64_sum(*sum, *sum_delta)?;
+                                    *non_null_count += *non_null_delta;
+                                }
+                                (
+                                    IncrementalAggregateSlotState::DecimalSum {
+                                        sum,
+                                        non_null_count,
+                                    },
+                                    AggregatedSlotDelta::Sum {
+                                        sum_delta,
+                                        non_null_delta,
+                                    },
+                                ) => {
+                                    *sum = checked_add_sum(*sum, *sum_delta)?;
                                     *non_null_count += *non_null_delta;
                                 }
                                 (
@@ -1121,10 +1222,12 @@ where
 
                 let old_output = old_state
                     .as_ref()
-                    .map(|state| state.output_values(&self.slot_kinds));
+                    .map(|state| state.output_values(&self.slot_kinds))
+                    .transpose()?;
                 let new_output = new_state
                     .as_ref()
-                    .map(|state| state.output_values(&self.slot_kinds));
+                    .map(|state| state.output_values(&self.slot_kinds))
+                    .transpose()?;
                 match (old_output, new_output) {
                     (Some(old), Some(new)) if old == new => {}
                     (Some(old), Some(new)) => {
@@ -1214,7 +1317,7 @@ where
         slot_idx: usize,
         slot: &IncrementalAggregateSlotUpdate,
         weight: i64,
-    ) {
+    ) -> Result<()> {
         match (&self.slot_kinds[slot_idx], &mut state.slots[slot_idx], slot) {
             (
                 IncrementalAggregateSlotKind::Count,
@@ -1236,8 +1339,21 @@ where
                 },
                 IncrementalAggregateSlotUpdate::Value(Some(value)),
             ) => {
-                if let Some(number) = value.as_numeric() {
-                    *sum += number * weight;
+                if let Some(number) = value.as_sum_numeric() {
+                    *sum = checked_add_i64_sum(*sum, checked_weighted_sum_delta(number, weight)?)?;
+                    *non_null_count += weight;
+                }
+            }
+            (
+                IncrementalAggregateSlotKind::Sum(_),
+                IncrementalAggregateSlotState::DecimalSum {
+                    sum,
+                    non_null_count,
+                },
+                IncrementalAggregateSlotUpdate::Value(Some(value)),
+            ) => {
+                if let Some(number) = value.as_sum_numeric() {
+                    *sum = checked_add_sum(*sum, checked_weighted_sum_delta(number, weight)?)?;
                     *non_null_count += weight;
                 }
             }
@@ -1246,7 +1362,7 @@ where
                 IncrementalAggregateSlotState::Avg { sum, count },
                 IncrementalAggregateSlotUpdate::Value(Some(value)),
             ) => {
-                if let Some(number) = value.as_numeric() {
+                if let Some(number) = value.as_i64_numeric() {
                     *sum += number * weight;
                     *count += weight;
                 }
@@ -1297,6 +1413,7 @@ where
                 );
             }
         }
+        Ok(())
     }
 
     async fn recompute_group_state(
@@ -1345,7 +1462,7 @@ where
                             distinct_weights[slot_idx].remove(value);
                         }
                     }
-                    _ => self.apply_slot_update(&mut state, slot_idx, slot, weight),
+                    _ => self.apply_slot_update(&mut state, slot_idx, slot, weight)?,
                 }
             }
         }
@@ -1462,7 +1579,10 @@ where
                     continue;
                 };
                 state_deltas.insert((key.clone(), old_state.clone()), -1);
-                output_deltas.insert((key.clone(), old_state.output_values(&self.slot_kinds)), -1);
+                output_deltas.insert(
+                    (key.clone(), old_state.output_values(&self.slot_kinds)?),
+                    -1,
+                );
             }
         }
 
@@ -1868,6 +1988,138 @@ mod tests {
                     ),
                     1
                 ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_aggregate_tracks_decimal_sum_natively() {
+        let table = build_table("incremental-decimal-sum").await;
+        let input_dict = Arc::new(
+            Dictionary::<AggregateRow>::with_table(
+                table.clone(),
+                "incremental_decimal_input".to_string(),
+                None,
+            )
+            .await
+            .expect("create input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            "incremental_decimal_state".to_string(),
+        )
+        .await
+        .expect("create incremental aggregate state");
+        let output_dict = Arc::new(
+            Dictionary::<(i64, Vec<AggregateValue>)>::with_table(
+                table.clone(),
+                "incremental_decimal_output".to_string(),
+                None,
+            )
+            .await
+            .expect("create incremental aggregate output dictionary"),
+        );
+        let output = VersionedZSet::new(
+            output_dict,
+            table.clone(),
+            "incremental_decimal_output".to_string(),
+        )
+        .await
+        .expect("create incremental aggregate output");
+
+        let mut op = IncrementalAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &AggregateRow| {
+                Some(IncrementalAggregateRow {
+                    key: row.group_key,
+                    slots: vec![IncrementalAggregateSlotUpdate::Value(
+                        row.price
+                            .map(|value| AggregateValue::Decimal128(i128::from(value))),
+                    )],
+                })
+            }),
+            output,
+            vec![IncrementalAggregateSlotKind::Sum(
+                AggregateValueType::Decimal128 {
+                    precision: 18,
+                    scale: 2,
+                },
+            )],
+            None,
+            None,
+        );
+
+        let batch_one = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "incremental_decimal_input",
+            &[
+                (
+                    AggregateRow {
+                        group_key: 1,
+                        price: Some(1234),
+                        category: "a".to_string(),
+                    },
+                    1,
+                ),
+                (
+                    AggregateRow {
+                        group_key: 1,
+                        price: Some(566),
+                        category: "b".to_string(),
+                    },
+                    1,
+                ),
+            ],
+        )
+        .await;
+        let out_one = op
+            .on_step(0, std::slice::from_ref(&batch_one))
+            .await
+            .expect("run decimal aggregate t1")
+            .expect("decimal aggregate t1 output");
+        let mut cache = HashMap::new();
+        let delta_one = materialize_zset_handle::<(i64, Vec<AggregateValue>)>(
+            table.clone(),
+            &mut cache,
+            &out_one,
+        )
+        .await
+        .expect("materialize decimal aggregate t1");
+        assert_eq!(
+            delta_one,
+            HashMap::from([((1, vec![AggregateValue::Decimal128(1800)]), 1)])
+        );
+
+        let batch_two = stage_version(
+            input_dict,
+            table.clone(),
+            "incremental_decimal_input",
+            &[(
+                AggregateRow {
+                    group_key: 1,
+                    price: Some(566),
+                    category: "b".to_string(),
+                },
+                -1,
+            )],
+        )
+        .await;
+        let out_two = op
+            .on_step(1, std::slice::from_ref(&batch_two))
+            .await
+            .expect("run decimal aggregate t2")
+            .expect("decimal aggregate t2 output");
+        let delta_two =
+            materialize_zset_handle::<(i64, Vec<AggregateValue>)>(table, &mut cache, &out_two)
+                .await
+                .expect("materialize decimal aggregate t2");
+        assert_eq!(
+            delta_two,
+            HashMap::from([
+                ((1, vec![AggregateValue::Decimal128(1800)]), -1),
+                ((1, vec![AggregateValue::Decimal128(1234)]), 1),
             ])
         );
     }

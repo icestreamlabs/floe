@@ -15,7 +15,9 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
-use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspJoinType, DbspNodeKind};
+use dbsp_circuit::circuit::plan::{
+    DbspAggregateFunction, DbspJoinType, DbspNodeKind, DbspWindowPolicy,
+};
 use dbsp_circuit::circuit::tables::TableDescriptor;
 
 use super::expr::map_aggregate_expr;
@@ -1420,34 +1422,41 @@ async fn plans_tumble_grouping_with_allowed_lateness() {
 }
 
 #[tokio::test]
-async fn rejects_session_grouping_until_runtime_supports_session_state() {
+async fn plans_session_grouping_as_window_aggregate() {
     let sql = "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000)";
     let plan = sql_plan(sql).await;
 
     let planner = CircuitPlanner::new(planner_config());
-    let err = planner
-        .plan(&plan)
-        .expect_err("SESSION windows should not plan until runtime has session state");
-    assert!(
-        err.to_string().contains("SESSION windows require session"),
-        "{err}"
-    );
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    match &window.window.policy {
+        DbspWindowPolicy::Session { gap_ms } => assert_eq!(*gap_ms, 5_000),
+        other => panic!("expected session window, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn rejects_session_grouping_with_allowed_lateness() {
+async fn plans_session_grouping_with_allowed_lateness() {
     let sql = "SELECT bidder, COUNT(*) AS bid_count \
         FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000, 1200)";
     let plan = sql_plan(sql).await;
 
     let planner = CircuitPlanner::new(planner_config());
-    let err = planner
-        .plan(&plan)
-        .expect_err("SESSION windows should not plan until runtime has session state");
-    assert!(
-        err.to_string().contains("SESSION windows require session"),
-        "{err}"
-    );
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
+        DbspNodeKind::WindowAggregate(window) => Some(window),
+        _ => None,
+    });
+    let window = window.expect("expected WindowAggregate node");
+    match &window.window.policy {
+        DbspWindowPolicy::Session { gap_ms } => assert_eq!(*gap_ms, 5_000),
+        other => panic!("expected session window, got {other:?}"),
+    }
+    assert_eq!(window.window.allowed_lateness_ms, 1_200);
 }
 
 #[tokio::test]

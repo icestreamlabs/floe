@@ -22,6 +22,7 @@ pub mod operator_state_registry;
 pub mod operators;
 pub mod relation_state;
 pub mod semijoin;
+pub mod session_window_aggregate;
 pub mod stream;
 pub mod top1;
 pub mod topn;
@@ -72,6 +73,7 @@ pub use operators::union::UnionOp;
 pub use operators::window::{WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
 pub use semijoin::DbspSemiJoin;
+pub use session_window_aggregate::DbspSessionWindowAggregate;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };

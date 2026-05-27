@@ -271,6 +271,10 @@ fn transient_incremental_aggregate_state_snapshot_roundtrips() {
                     sum: 120,
                     non_null_count: 2,
                 },
+                dbsp::IncrementalAggregateSlotState::DecimalSum {
+                    sum: 12345,
+                    non_null_count: 2,
+                },
                 dbsp::IncrementalAggregateSlotState::Min {
                     current: Some(dbsp::AggregateValue::Int64(10)),
                 },
@@ -648,6 +652,29 @@ async fn q12_plan_source_requirements_prune_unused_source_columns() {
 }
 
 #[tokio::test]
+async fn session_window_plan_source_requirements_prune_unused_source_columns() {
+    let logical = sql_plan_with_auction_and_bid(
+        "SELECT bidder, COUNT(*) AS bid_count \
+             FROM nexmark_bid \
+             GROUP BY bidder, SESSION(date_time, 10000)",
+    )
+    .await;
+    let planner = DbspPlanBuilder::new(nexmark_config());
+    let plan = planner.build(&logical).expect("circuit plan");
+
+    let requirements = plan_source_requirements(&plan)
+        .expect("source requirements")
+        .expect("source requirements");
+    assert_eq!(
+        requirements,
+        vec![PlanSourceRequirements {
+            source_name: "nexmark_bid".to_string(),
+            required_columns: vec![1, 5],
+        }]
+    );
+}
+
+#[tokio::test]
 async fn q12_window_count_star_shape_is_source_batch_journal_eligible() {
     let logical = sql_plan_with_auction_and_bid(
         "SELECT bidder, COUNT(*) AS bid_count \
@@ -664,6 +691,29 @@ async fn q12_window_count_star_shape_is_source_batch_journal_eligible() {
     assert_eq!(
         transient_sources,
         BTreeSet::from(["nexmark_bid".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn session_window_count_star_shape_uses_normal_runtime_path() {
+    let logical = sql_plan_with_auction_and_bid(
+        "SELECT bidder, COUNT(*) AS bid_count \
+             FROM nexmark_bid \
+             GROUP BY bidder, SESSION(date_time, 10000)",
+    )
+    .await;
+    let planner = DbspPlanBuilder::new(nexmark_config());
+    let plan = planner.build(&logical).expect("circuit plan");
+
+    assert!(
+        source_batch_journal_root_sources(&plan)
+            .expect("source batch journal root sources")
+            .is_none()
+    );
+    assert!(
+        try_build_transient_source_window_count_star_root_shape(&plan, plan.root)
+            .expect("build session window count-star transient shape")
+            .is_none()
     );
 }
 
@@ -2970,6 +3020,27 @@ fn register_planner_test_udfs(ctx: &SessionContext) {
                     TypeSignature::Exact(vec![
                         DataType::Timestamp(TimeUnit::Millisecond, None),
                         DataType::Int64,
+                        DataType::Int64,
+                        DataType::Int64,
+                    ]),
+                ],
+                Volatility::Immutable,
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            Arc::clone(&passthrough_ts),
+        ),
+    ));
+    ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+        datafusion::logical_expr::expr_fn::SimpleScalarUDF::new_with_signature(
+            "session",
+            Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
+                        DataType::Int64,
+                    ]),
+                    TypeSignature::Exact(vec![
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
                         DataType::Int64,
                         DataType::Int64,
                     ]),
