@@ -17,7 +17,8 @@ const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
     "q17", "q18", "q19", "q20", "q21", "q22",
 ];
 const DEFAULT_FLOE_NEXMARK_BATCH_ROWS: u64 = 8_192;
-const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "full";
+const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "auto";
+const NEXMARK_BID_AUCTION_CARDINALITY: u64 = 10_000;
 
 fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
@@ -1274,16 +1275,22 @@ impl Harness {
             self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
             let observed = self.retry_floe_result_content_hash(target, artifact_dir)?;
             self.settle_floe_state_if_requested(artifact_dir)?;
-            self.stop_floe_process();
-            let expected = self.run_floe_validation_for_content(FloeValidationSpec {
-                query_id,
-                artifact_dir,
-                sources,
-                topics,
-                groups: &groups,
-                main_slatedb_name: main_slatedb_name.as_deref(),
-                expected_result_rows,
-            })?;
+            let expected = if let Some(expected) =
+                self.floe_offline_expected_content_fingerprint(query_id, sources, artifact_dir)?
+            {
+                expected
+            } else {
+                self.stop_floe_process();
+                self.run_floe_validation_for_content(FloeValidationSpec {
+                    query_id,
+                    artifact_dir,
+                    sources,
+                    topics,
+                    groups: &groups,
+                    main_slatedb_name: main_slatedb_name.as_deref(),
+                    expected_result_rows,
+                })?
+            };
             verify_result_content_hash(Engine::Floe, query_id, &observed, &expected, artifact_dir)?;
             content_hash_note = format!(";content_sha256={}", observed.short_hash());
         }
@@ -1540,6 +1547,27 @@ impl Harness {
         Err(last_error.unwrap_or_else(|| anyhow!("failed to compute Floe content hash")))
     }
 
+    fn floe_offline_expected_content_fingerprint(
+        &self,
+        query_id: &str,
+        sources: &[Source],
+        artifact_dir: &Path,
+    ) -> Result<Option<ContentFingerprint>> {
+        if query_id != "q5" || sources != [Source::Bid] {
+            return Ok(None);
+        }
+
+        let fingerprint = deterministic_nexmark_q5_fingerprint(self.config.bid_rows);
+        fs::write(
+            artifact_dir.join("expected_result.offline.txt"),
+            format!(
+                "oracle=deterministic_nexmark_q5\nbid_rows={}\nresult_rows={}\ncontent_sha256={}\n",
+                self.config.bid_rows, fingerprint.row_count, fingerprint.hash
+            ),
+        )?;
+        Ok(Some(fingerprint))
+    }
+
     fn run_floe_validation_for_content(
         &mut self,
         spec: FloeValidationSpec<'_>,
@@ -1561,14 +1589,12 @@ impl Harness {
             person: format!("{}_validation", groups.person),
         };
         let validation_config_path = validation_dir.join("floe_config.json");
+        let mut validation_config =
+            floe_config_json(&self.config, sources, topics, &validation_groups);
+        validation_config["storage"]["source_journal"] = json!("full");
         fs::write(
             &validation_config_path,
-            serde_json::to_vec_pretty(&floe_config_json(
-                &self.config,
-                sources,
-                topics,
-                &validation_groups,
-            ))?,
+            serde_json::to_vec_pretty(&validation_config)?,
         )?;
         let expected_query = floe_expected_query_text_for_source_tables(query_id, sources)?;
         let validation_program =
@@ -2477,7 +2503,7 @@ struct SummaryRow<'a> {
     notes: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ContentFingerprint {
     row_count: u64,
     hash: String,
@@ -3422,6 +3448,34 @@ fn fingerprint_lines(mut lines: Vec<String>) -> ContentFingerprint {
     }
 }
 
+fn deterministic_nexmark_q5_fingerprint(bid_rows: u64) -> ContentFingerprint {
+    let full_cycles = bid_rows / NEXMARK_BID_AUCTION_CARDINALITY;
+    let remainder = bid_rows % NEXMARK_BID_AUCTION_CARDINALITY;
+    let mut lines = (1..=NEXMARK_BID_AUCTION_CARDINALITY)
+        .map(|auction| {
+            let bids_for_auction = full_cycles + u64::from(auction <= remainder);
+            (format!("{auction}\t1"), bids_for_auction * 5)
+        })
+        .filter(|(_, repetitions)| *repetitions > 0)
+        .collect::<Vec<_>>();
+    lines.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
+    let mut row_count = 0_u64;
+    for (line, repetitions) in lines {
+        for _ in 0..repetitions {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        row_count += repetitions;
+    }
+
+    ContentFingerprint {
+        row_count,
+        hash: hex::encode(hasher.finalize()),
+    }
+}
+
 fn canonical_json_line(value: &serde_json::Value) -> Result<String> {
     let canonical = canonical_json_value(value);
     serde_json::to_string(&canonical).context("serialize canonical JSON row")
@@ -3646,6 +3700,32 @@ fn print_tail(path: PathBuf, lines: usize) {
         let tail = content.lines().rev().take(lines).collect::<Vec<_>>();
         for line in tail.into_iter().rev() {
             eprintln!("{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn explicit_q5_fingerprint(bid_rows: u64) -> ContentFingerprint {
+        let mut lines = Vec::new();
+        for bid_idx in 1..=bid_rows {
+            let auction = (bid_idx - 1) % NEXMARK_BID_AUCTION_CARDINALITY + 1;
+            for _ in 0..5 {
+                lines.push(format!("{auction}\t1"));
+            }
+        }
+        fingerprint_lines(lines)
+    }
+
+    #[test]
+    fn deterministic_q5_fingerprint_matches_explicit_rows() {
+        for bid_rows in [0, 1, 2, 10_000, 10_001] {
+            assert_eq!(
+                deterministic_nexmark_q5_fingerprint(bid_rows),
+                explicit_q5_fingerprint(bid_rows)
+            );
         }
     }
 }

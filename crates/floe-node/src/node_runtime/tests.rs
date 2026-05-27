@@ -1,7 +1,8 @@
 use super::*;
 use crate::node_runtime::orchestration::{
-    PostgresCdcRuntimeReconnectPolicy, merge_catalog_source_connectors, postgres_cdc_runtime_plan,
-    source_journal_required_sources, validate_materialized_views_do_not_query_raw_cdc_sources,
+    PostgresCdcRuntimeReconnectPolicy, kafka_metadata_journal_required_sources,
+    merge_catalog_source_connectors, postgres_cdc_runtime_plan, source_journal_required_sources,
+    validate_materialized_views_do_not_query_raw_cdc_sources,
 };
 use floe_sql_parser::parse_floe_statement;
 use serde_json::json;
@@ -590,11 +591,23 @@ fn source_journal_auto_skips_replayable_connector_sources() {
         BTreeSet::from(["file_source".to_string(), "http_source".to_string()])
     );
     assert_eq!(
+        kafka_metadata_journal_required_sources(&registry, &transient, SourceJournalConfig::Auto),
+        BTreeSet::from(["kafka_source".to_string()])
+    );
+    assert_eq!(
         source_journal_required_sources(&registry, &transient, SourceJournalConfig::Full),
         transient
     );
     assert!(
+        kafka_metadata_journal_required_sources(&registry, &transient, SourceJournalConfig::Full)
+            .is_empty()
+    );
+    assert!(
         source_journal_required_sources(&registry, &transient, SourceJournalConfig::None)
+            .is_empty()
+    );
+    assert!(
+        kafka_metadata_journal_required_sources(&registry, &transient, SourceJournalConfig::None)
             .is_empty()
     );
 }

@@ -20,9 +20,324 @@ pub(super) fn source_journal_required_sources(
     }
 }
 
+pub(super) fn kafka_metadata_journal_required_sources(
+    registry: &SourceRegistry,
+    transient_only_sources: &BTreeSet<String>,
+    mode: SourceJournalConfig,
+) -> BTreeSet<String> {
+    if mode != SourceJournalConfig::Auto {
+        return BTreeSet::new();
+    }
+    transient_only_sources
+        .iter()
+        .filter(|source| {
+            registry
+                .get(source.as_str())
+                .is_some_and(source_is_replayable_from_connector)
+        })
+        .cloned()
+        .collect()
+}
+
 fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
     definition.properties().iter().any(|(key, value)| {
         key.starts_with("connector.") && key.ends_with(".type") && value.as_str() == "kafka"
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_committed_source_journal_entries(
+    source_batch_journal: &SourceBatchJournal,
+    journal: &KafkaSourceJournal,
+    registry: &Arc<Mutex<OuterStreamRegistry>>,
+    max_tick_id: u64,
+    raw_journal_sources: &BTreeSet<String>,
+    kafka_metadata_sources: &BTreeSet<String>,
+    connector_specs: &[config::ConnectorSpec],
+    run_args: &cli::RunArgs,
+    definitions: &[SourceDefinition],
+    source_id_by_name: &HashMap<String, usize>,
+    source_names_by_id: &[String],
+    decoders_by_source_id: &[Option<SourceRowDecoder>],
+    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
+) -> anyhow::Result<(usize, usize)> {
+    let raw_entries = if raw_journal_sources.is_empty() {
+        Vec::new()
+    } else {
+        source_batch_journal
+            .load_committed_entries_up_to(max_tick_id, raw_journal_sources)
+            .await?
+    };
+    let kafka_entries = if kafka_metadata_sources.is_empty() {
+        Vec::new()
+    } else {
+        journal
+            .load_committed_entries_up_to(max_tick_id, kafka_metadata_sources)
+            .await?
+    };
+    let mut raw_entry_by_tick_and_source = BTreeMap::new();
+    for entry in raw_entries {
+        raw_entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
+    }
+    let mut kafka_entry_by_tick_and_source = BTreeMap::new();
+    for entry in kafka_entries {
+        kafka_entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
+    }
+
+    let replay_sources: BTreeSet<String> = raw_journal_sources
+        .union(kafka_metadata_sources)
+        .cloned()
+        .collect();
+    let mut replayed_raw = 0usize;
+    let mut replayed_kafka = 0usize;
+    for tick_id in 1..=max_tick_id {
+        for source in &replay_sources {
+            let deltas = if raw_journal_sources.contains(source) {
+                match raw_entry_by_tick_and_source.remove(&(tick_id, source.clone())) {
+                    Some(entry) => {
+                        replayed_raw = replayed_raw.saturating_add(1);
+                        entry.deltas
+                    }
+                    None => Vec::new(),
+                }
+            } else if kafka_metadata_sources.contains(source) {
+                match kafka_entry_by_tick_and_source.remove(&(tick_id, source.clone())) {
+                    Some(entry) => {
+                        replayed_kafka = replayed_kafka.saturating_add(1);
+                        replay_kafka_source_journal_entry(
+                            entry,
+                            connector_specs,
+                            run_args,
+                            definitions,
+                            source_id_by_name,
+                            source_names_by_id,
+                            decoders_by_source_id,
+                            required_columns_by_source,
+                        )
+                        .await?
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            registry
+                .lock()
+                .await
+                .replay_transient_batch(source, i64::try_from(tick_id).unwrap_or(i64::MAX), deltas)
+                .with_context(|| {
+                    format!("replay committed source journal for '{source}' at tick {tick_id}")
+                })?;
+        }
+    }
+    Ok((replayed_raw, replayed_kafka))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_kafka_source_journal_entry(
+    entry: floe_executor::source_journal::KafkaSourceJournalEntry,
+    connector_specs: &[config::ConnectorSpec],
+    run_args: &cli::RunArgs,
+    definitions: &[SourceDefinition],
+    source_id_by_name: &HashMap<String, usize>,
+    source_names_by_id: &[String],
+    decoders_by_source_id: &[Option<SourceRowDecoder>],
+    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
+) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+    let mut deltas = Vec::new();
+    for range in entry.ranges {
+        let config = kafka_replay_connector_config(
+            connector_specs,
+            run_args,
+            &range.topic,
+            source_id_by_name,
+        )?;
+        let replay_range = KafkaReplayRange {
+            source: entry.source.clone(),
+            tick_id: entry.tick_id,
+            max_event_time_ms: entry.max_event_time_ms,
+            topic: range.topic.clone(),
+            partition: range.partition,
+            start_offset: range.start_offset,
+            end_offset: range.end_offset,
+        };
+        let replayed = KafkaConnector::replay_range(
+            config,
+            definitions.to_vec(),
+            required_columns_by_source
+                .iter()
+                .map(|(source, columns)| (source.clone(), Arc::clone(columns)))
+                .collect(),
+            replay_range,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "replay kafka range {}[{}] {}..{} for source '{}' tick {}",
+                range.topic,
+                range.partition,
+                range.start_offset,
+                range.end_offset,
+                entry.source,
+                entry.tick_id
+            )
+        })?;
+        let mut replayed_range = encode_replayed_kafka_events_for_range(
+            &entry.source,
+            &range,
+            replayed.events,
+            source_id_by_name,
+            source_names_by_id,
+            decoders_by_source_id,
+        )?;
+        if replayed_range.row_count != range.row_count || replayed_range.checksum != range.checksum
+        {
+            return Err(anyhow!(
+                "kafka replay validation failed for source '{}' tick {} range {}[{}] {}..{}: expected rows/checksum {}/{:016x}, got {}/{:016x}",
+                entry.source,
+                entry.tick_id,
+                range.topic,
+                range.partition,
+                range.start_offset,
+                range.end_offset,
+                range.row_count,
+                range.checksum,
+                replayed_range.row_count,
+                replayed_range.checksum
+            ));
+        }
+        deltas.append(&mut replayed_range.deltas);
+    }
+    Ok(deltas)
+}
+
+struct ReplayedKafkaRangeDeltas {
+    deltas: Vec<(Vec<u8>, i64)>,
+    row_count: u64,
+    checksum: u64,
+}
+
+fn kafka_replay_connector_config(
+    connector_specs: &[config::ConnectorSpec],
+    run_args: &cli::RunArgs,
+    topic: &str,
+    source_id_by_name: &HashMap<String, usize>,
+) -> anyhow::Result<KafkaConnectorConfig> {
+    for connector in connector_specs {
+        let ConnectorConfig::Kafka {
+            brokers,
+            topics,
+            group_id,
+            default_source,
+            poll_ms,
+            max_messages_per_tick,
+            format,
+            ..
+        } = &connector.config
+        else {
+            continue;
+        };
+        if !topics.iter().any(|candidate| candidate == topic) {
+            continue;
+        }
+        let group_id = group_id
+            .clone()
+            .unwrap_or_else(|| run_args.kafka_group_id.clone());
+        let default_source_id = default_source
+            .as_deref()
+            .and_then(|source| source_id_by_name.get(source).copied());
+        return Ok(KafkaConnectorConfig {
+            brokers: brokers.clone(),
+            topics: topics.clone(),
+            group_id,
+            default_source: default_source.clone(),
+            default_source_id,
+            poll_timeout: Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms)),
+            max_messages_per_tick: max_messages_per_tick.unwrap_or(run_args.kafka_max_messages),
+            message_format: format.clone(),
+            commit_offsets_rx: None,
+            resume_from_offsets: Vec::new(),
+        });
+    }
+    Err(anyhow!(
+        "no kafka connector configured for replay topic '{topic}'"
+    ))
+}
+
+fn encode_replayed_kafka_events_for_range(
+    expected_source: &str,
+    range: &KafkaSourceJournalRange,
+    events: Vec<core_source::AppendIngestEvent>,
+    source_id_by_name: &HashMap<String, usize>,
+    source_names_by_id: &[String],
+    decoders_by_source_id: &[Option<SourceRowDecoder>],
+) -> anyhow::Result<ReplayedKafkaRangeDeltas> {
+    let mut deltas = Vec::new();
+    let mut row_count = 0u64;
+    let mut checksum = kafka_source_journal_initial_checksum();
+    for mut event in events {
+        let Some(source_id) = event
+            .source_id()
+            .or_else(|| source_id_by_name.get(event.source()).copied())
+        else {
+            continue;
+        };
+        let Some(source_name) = source_names_by_id.get(source_id) else {
+            continue;
+        };
+        if source_name != expected_source {
+            continue;
+        }
+        let Some((topic, partition, offset)) =
+            event_fast_kafka_offset(&event).or_else(|| event_kafka_offset(event.resume_token()))
+        else {
+            return Err(anyhow!(
+                "replayed kafka event for source '{expected_source}' missing kafka position"
+            ));
+        };
+        if topic.as_ref() != range.topic.as_str()
+            || partition != range.partition
+            || offset < range.start_offset
+            || offset > range.end_offset
+        {
+            return Err(anyhow!(
+                "replayed kafka event for source '{}' had unexpected position {}[{}] {}; expected {}[{}] {}..{}",
+                expected_source,
+                topic.as_ref(),
+                partition,
+                offset,
+                range.topic,
+                range.partition,
+                range.start_offset,
+                range.end_offset
+            ));
+        }
+        let encoded = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
+            preencoded_row_key
+        } else {
+            let Some(decoder) = decoders_by_source_id
+                .get(source_id)
+                .and_then(|decoder| decoder.as_ref())
+            else {
+                return Err(anyhow!(
+                    "missing decoder for replayed kafka source '{expected_source}'"
+                ));
+            };
+            decoder
+                .encode_row_key(&event)
+                .with_context(|| {
+                    format!("encode replayed kafka event for source '{expected_source}'")
+                })?
+                .0
+        };
+        row_count = row_count.saturating_add(1);
+        update_kafka_source_journal_checksum(&mut checksum, offset, &encoded);
+        deltas.push((encoded, 1));
+    }
+    Ok(ReplayedKafkaRangeDeltas {
+        deltas,
+        row_count,
+        checksum,
     })
 }
 
@@ -1477,6 +1792,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &transient_only_sources,
         source_journal_mode,
     );
+    let kafka_metadata_journal_required_sources = kafka_metadata_journal_required_sources(
+        &source_registry,
+        &transient_only_sources,
+        source_journal_mode,
+    );
+    let source_replay_covered_sources: BTreeSet<String> = source_journal_required_sources
+        .union(&kafka_metadata_journal_required_sources)
+        .cloned()
+        .collect();
     let source_journal_skipped_sources: BTreeSet<String> = transient_only_sources
         .difference(&source_journal_required_sources)
         .cloned()
@@ -1484,6 +1808,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     tracing::info!(
         mode = ?source_journal_mode,
         journaled_sources = ?source_journal_required_sources,
+        kafka_metadata_sources = ?kafka_metadata_journal_required_sources,
         skipped_sources = ?source_journal_skipped_sources,
         "resolved transient source journal policy"
     );
@@ -1619,6 +1944,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         metrics::record_last_committed_tick(tick_commit.tick_id);
     }
     let source_batch_journal = SourceBatchJournal::new(checkpoint_manager.store().table());
+    let kafka_source_journal = KafkaSourceJournal::new(checkpoint_manager.store().table());
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
         let mut registry =
@@ -1627,10 +1953,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .context("initialize outer DBSP streams for sources")?;
         for source in &transient_only_sources {
             registry.set_durable_enabled(source, false);
-            let recoverable = source_journal_required_sources.contains(source)
-                || source_registry
-                    .get(source.as_str())
-                    .is_some_and(source_is_replayable_from_connector);
+            let recoverable = source_replay_covered_sources.contains(source);
             registry.set_recoverable(source, recoverable);
         }
         registry
@@ -1826,65 +2149,22 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 enable_source_batch_journal,
                 restore_transient_helper_state: required_sources
                     .iter()
-                    .all(|source| source_journal_skipped_sources.contains(source)),
+                    .all(|source| !source_replay_covered_sources.contains(source)),
                 mv_retention,
                 watermark: Arc::clone(&event_watermark),
             })
             .await
             .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
     }
-    if let Some(tick_commit) = recovered_tick_commit.as_ref()
-        && !source_journal_required_sources.is_empty()
-    {
-        let replayed = {
-            let mut registry_guard = outer_registry.lock().await;
-            source_batch_journal
-                .replay_committed_entries_up_to(
-                    &mut registry_guard,
-                    tick_commit.tick_id,
-                    &source_journal_required_sources,
-                )
-                .await
-                .context("replay committed source batch journal entries")?
-        };
+    let mut replayed_committed_source_batches = false;
+    let connector_resume_only_sources: BTreeSet<String> = source_journal_skipped_sources
+        .difference(&kafka_metadata_journal_required_sources)
+        .cloned()
+        .collect();
+    if recovered_tick_commit.is_some() && !connector_resume_only_sources.is_empty() {
         tracing::info!(
-            replayed_entries = replayed,
-            committed_tick = tick_commit.tick_id,
-            journaled_sources = ?source_journal_required_sources,
-            "replayed committed source batch journal entries"
-        );
-        for mv_version in &tick_commit.mv_versions {
-            let Some(handle) = mv_registry.get(&mv_version.view) else {
-                continue;
-            };
-            if handle.latest_version().unwrap_or(-1) >= mv_version.version as i64 {
-                continue;
-            }
-            let mut rx = handle.version_watch();
-            let target_version = mv_version.version as i64;
-            tokio::time::timeout(Duration::from_secs(5), async move {
-                loop {
-                    if rx.borrow().unwrap_or(-1) >= target_version {
-                        break;
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "wait for replayed materialized view '{}' to reach version {}",
-                    mv_version.view, mv_version.version
-                )
-            })?;
-        }
-    }
-    if recovered_tick_commit.is_some() && !source_journal_skipped_sources.is_empty() {
-        tracing::info!(
-            replayable_sources = ?source_journal_skipped_sources,
-            "skipped source-batch journal replay for sources expected to resume from connector offsets"
+            sources = ?connector_resume_only_sources,
+            "skipped source-batch journal replay for sources expected to resume from connector offsets or helper state"
         );
     }
     let queue_capacity = run_args.ingest_queue_capacity;
@@ -2104,6 +2384,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>(),
     );
+    let kafka_metadata_journal_source_ids = Arc::new(
+        definitions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, definition)| {
+                kafka_metadata_journal_required_sources
+                    .contains(definition.name())
+                    .then_some(idx)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let kafka_metadata_journal_source_flags = Arc::new(
+        definitions
+            .iter()
+            .map(|definition| kafka_metadata_journal_required_sources.contains(definition.name()))
+            .collect::<Vec<_>>(),
+    );
     let cdc_schemas_by_source_id = Arc::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
@@ -2135,6 +2432,67 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .as_ref()
         .map(|commit| commit.kafka_offsets.clone())
         .unwrap_or_default();
+    if let Some(tick_commit) = recovered_tick_commit.as_ref()
+        && !source_replay_covered_sources.is_empty()
+    {
+        let (replayed_raw, replayed_kafka) = replay_committed_source_journal_entries(
+            &source_batch_journal,
+            &kafka_source_journal,
+            &outer_registry,
+            tick_commit.tick_id,
+            &source_journal_required_sources,
+            &kafka_metadata_journal_required_sources,
+            &connector_specs,
+            &run_args,
+            &definitions,
+            &source_id_by_name,
+            source_names_by_id.as_slice(),
+            decoders_by_source_id.as_slice(),
+            transient_required_columns_by_source.as_ref(),
+        )
+        .await
+        .context("replay committed source journal entries")?;
+        tracing::info!(
+            replayed_raw_entries = replayed_raw,
+            replayed_kafka_metadata_entries = replayed_kafka,
+            committed_tick = tick_commit.tick_id,
+            raw_journal_sources = ?source_journal_required_sources,
+            kafka_metadata_sources = ?kafka_metadata_journal_required_sources,
+            "replayed committed source journal entries"
+        );
+        replayed_committed_source_batches = true;
+    }
+    if let Some(tick_commit) = recovered_tick_commit.as_ref()
+        && replayed_committed_source_batches
+    {
+        for mv_version in &tick_commit.mv_versions {
+            let Some(handle) = mv_registry.get(&mv_version.view) else {
+                continue;
+            };
+            if handle.latest_version().unwrap_or(-1) >= mv_version.version as i64 {
+                continue;
+            }
+            let mut rx = handle.version_watch();
+            let target_version = mv_version.version as i64;
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    if rx.borrow().unwrap_or(-1) >= target_version {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "wait for replayed materialized view '{}' to reach version {}",
+                    mv_version.view, mv_version.version
+                )
+            })?;
+        }
+    }
 
     for (connector_id, connector) in connector_specs.into_iter().enumerate() {
         let sender = core_source::routed_sender(
@@ -2453,6 +2811,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
+    let kafka_metadata_journal_source_ids_for_task = Arc::clone(&kafka_metadata_journal_source_ids);
+    let kafka_metadata_journal_source_flags_for_task =
+        Arc::clone(&kafka_metadata_journal_source_flags);
     let source_id_by_name_for_task = source_id_by_name;
     let storage_for_replication_task = storage.clone();
     let replication_pipeline_runtime_for_task = Arc::clone(&replication_pipeline_runtime);
@@ -2601,6 +2962,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let mut decoded_counts = vec![0usize; source_count];
             let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
             let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
+            let mut tick_kafka_source_ranges =
+                vec![
+                    None::<HashMap<(Arc<str>, i32), KafkaSourceJournalRangeAccumulator>>;
+                    source_count
+                ];
             let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
             let mut tick_postgres_sources: HashMap<String, String> = HashMap::new();
             let mut tick_postgres_table_lsns: Vec<(String, String, String, u64)> = Vec::new();
@@ -2902,6 +3268,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         continue;
                     };
                     let source_name = source_names_by_id_for_task[source_id].as_str();
+                    let kafka_position = event_fast_kafka_offset(&event)
+                        .or_else(|| event_kafka_offset(event.resume_token()));
                     if let Some((partition, offset)) = event_fast_resume_offset(&event)
                         .or_else(|| event_resume_offset(event.resume_token()))
                     {
@@ -2911,9 +3279,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             .or_insert(0);
                         *entry = (*entry).max(offset);
                     }
-                    if let Some((topic, partition, offset)) = event_fast_kafka_offset(&event)
-                        .or_else(|| event_kafka_offset(event.resume_token()))
-                    {
+                    if let Some((topic, partition, offset)) = kafka_position.clone() {
                         let entry = tick_kafka_offsets.entry((topic, partition)).or_insert(0);
                         *entry = (*entry).max(offset);
                     }
@@ -2949,11 +3315,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     };
                     let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key()
                     {
+                        if kafka_metadata_journal_source_flags_for_task
+                            .get(source_id)
+                            .copied()
+                            .unwrap_or(false)
+                            && let Some((topic, partition, offset)) = kafka_position.clone()
+                        {
+                            observe_kafka_source_journal_row(
+                                &mut tick_kafka_source_ranges[source_id],
+                                topic,
+                                partition,
+                                offset,
+                                &preencoded_row_key,
+                            );
+                        }
                         encoded_rows.push((source_id, preencoded_row_key, commit_ack));
                         None
                     } else {
                         match decoder.encode_row_key(&event) {
                             Ok((encoded, event_ts)) => {
+                                if kafka_metadata_journal_source_flags_for_task
+                                    .get(source_id)
+                                    .copied()
+                                    .unwrap_or(false)
+                                    && let Some((topic, partition, offset)) = kafka_position.clone()
+                                {
+                                    observe_kafka_source_journal_row(
+                                        &mut tick_kafka_source_ranges[source_id],
+                                        topic,
+                                        partition,
+                                        offset,
+                                        &encoded,
+                                    );
+                                }
                                 encoded_rows.push((source_id, encoded, commit_ack));
                                 event_ts
                             }
@@ -3144,6 +3538,29 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     batch.deltas,
                 ));
             }
+            let mut kafka_metadata_journal_batches = Vec::new();
+            for &source_id in kafka_metadata_journal_source_ids_for_task.iter() {
+                let Some(ranges_by_partition) = tick_kafka_source_ranges[source_id].take() else {
+                    continue;
+                };
+                let mut ranges = ranges_by_partition
+                    .into_values()
+                    .map(KafkaSourceJournalRangeAccumulator::into_range)
+                    .collect::<Vec<_>>();
+                ranges.sort_by(|left, right| {
+                    left.topic
+                        .cmp(&right.topic)
+                        .then(left.partition.cmp(&right.partition))
+                });
+                if ranges.is_empty() {
+                    continue;
+                }
+                kafka_metadata_journal_batches.push((
+                    source_names_by_id_for_task[source_id].clone(),
+                    tick_source_max_event_ts[source_id],
+                    ranges,
+                ));
+            }
             drop(registry);
 
             if !changed {
@@ -3275,17 +3692,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let checkpoint_write_start = Instant::now();
             let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
                 checkpoint_manager
-                    .persist_tick_commit_with_source_batches_and_staged_writes(
+                    .persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
                         tick_commit,
                         &source_journal_commit_batches,
+                        &kafka_metadata_journal_batches,
                         staged_writes,
                     )
                     .await
             } else {
                 checkpoint_manager
-                    .persist_tick_commit_with_source_batches(
+                    .persist_tick_commit_with_source_batches_and_kafka_metadata(
                         tick_commit,
                         &source_journal_commit_batches,
+                        &kafka_metadata_journal_batches,
                     )
                     .await
             };

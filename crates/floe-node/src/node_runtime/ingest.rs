@@ -127,6 +127,61 @@ pub(super) fn event_kafka_offset(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct KafkaSourceJournalRangeAccumulator {
+    topic: Arc<str>,
+    partition: i32,
+    start_offset: i64,
+    end_offset: i64,
+    row_count: u64,
+    checksum: u64,
+}
+
+impl KafkaSourceJournalRangeAccumulator {
+    fn new(topic: Arc<str>, partition: i32, offset: i64) -> Self {
+        Self {
+            topic,
+            partition,
+            start_offset: offset,
+            end_offset: offset,
+            row_count: 0,
+            checksum: kafka_source_journal_initial_checksum(),
+        }
+    }
+
+    fn observe_row(&mut self, offset: i64, encoded_row: &[u8]) {
+        self.start_offset = self.start_offset.min(offset);
+        self.end_offset = self.end_offset.max(offset);
+        self.row_count = self.row_count.saturating_add(1);
+        update_kafka_source_journal_checksum(&mut self.checksum, offset, encoded_row);
+    }
+
+    pub(super) fn into_range(self) -> KafkaSourceJournalRange {
+        KafkaSourceJournalRange {
+            topic: self.topic.to_string(),
+            partition: self.partition,
+            start_offset: self.start_offset,
+            end_offset: self.end_offset,
+            row_count: self.row_count,
+            checksum: self.checksum,
+        }
+    }
+}
+
+pub(super) fn observe_kafka_source_journal_row(
+    ranges: &mut Option<HashMap<(Arc<str>, i32), KafkaSourceJournalRangeAccumulator>>,
+    topic: Arc<str>,
+    partition: i32,
+    offset: i64,
+    encoded_row: &[u8],
+) {
+    let entry = ranges
+        .get_or_insert_with(HashMap::new)
+        .entry((Arc::clone(&topic), partition))
+        .or_insert_with(|| KafkaSourceJournalRangeAccumulator::new(topic, partition, offset));
+    entry.observe_row(offset, encoded_row);
+}
+
 pub(super) fn advance_kafka_offset_commit_state(
     committed_offsets: &mut HashMap<(Arc<str>, i32), i64>,
     tick_offsets: &HashMap<(Arc<str>, i32), i64>,

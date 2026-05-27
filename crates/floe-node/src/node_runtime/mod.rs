@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +42,10 @@ use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
 };
-use floe_executor::source_journal::SourceBatchJournal;
+use floe_executor::source_journal::{
+    KafkaSourceJournal, KafkaSourceJournalRange, SourceBatchJournal,
+    kafka_source_journal_initial_checksum, update_kafka_source_journal_checksum,
+};
 use floe_executor::{
     BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
@@ -56,7 +59,8 @@ use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
 #[cfg(test)]
 use floe_node_core::generator;
 use floe_node_core::kafka_connector::{
-    KafkaConnector, KafkaConnectorConfig, KafkaOffsetCommit, KafkaTopicPartitionOffset,
+    KafkaConnector, KafkaConnectorConfig, KafkaOffsetCommit, KafkaReplayRange,
+    KafkaTopicPartitionOffset,
 };
 use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreConnectorConfig};
 use floe_node_core::planner::{

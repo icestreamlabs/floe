@@ -169,7 +169,9 @@ fn classify_key(key: &str) -> String {
         "materialized_view".to_string()
     } else if namespace == "floe_runtime" {
         "checkpoint".to_string()
-    } else if namespace.starts_with("source_journal") {
+    } else if namespace.starts_with("source_journal")
+        || namespace.starts_with("kafka_source_journal")
+    {
         "source_journal".to_string()
     } else if namespace.starts_with("codec/") {
         "codec".to_string()

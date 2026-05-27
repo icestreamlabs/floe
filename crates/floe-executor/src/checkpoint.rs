@@ -12,7 +12,9 @@ use crate::dbsp_bridge::DbspBridge;
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operator_state::OperatorStateHandle;
 use crate::outer_stream::{OuterStreamCheckpoint, OuterStreamRegistry};
-use crate::source_journal::append_entry_to_batch;
+use crate::source_journal::{
+    KafkaSourceJournalRange, append_entry_to_batch, append_kafka_source_metadata_entry_to_batch,
+};
 use crate::stream_types::{EncodedDeltaBatch, Timestamp};
 
 const CHECKPOINT_PREFIX: &str = "checkpoint";
@@ -299,8 +301,23 @@ impl CheckpointStore {
         commit: &TickCommit,
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
     ) -> Result<()> {
+        self.persist_tick_commit_with_source_batches_and_kafka_metadata(commit, source_batches, &[])
+            .await
+    }
+
+    pub async fn persist_tick_commit_with_source_batches_and_kafka_metadata(
+        &self,
+        commit: &TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        kafka_source_metadata: &[(String, Option<i64>, Vec<KafkaSourceJournalRange>)],
+    ) -> Result<()> {
         let mut batch = WriteBatch::new();
-        self.stage_tick_commit_with_source_batches(&mut batch, commit, source_batches)?;
+        self.stage_tick_commit_with_source_batches_and_kafka_metadata(
+            &mut batch,
+            commit,
+            source_batches,
+            kafka_source_metadata,
+        )?;
         self.table
             .write_batch(batch)
             .await
@@ -313,21 +330,55 @@ impl CheckpointStore {
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
         mut batch: WriteBatch,
     ) -> Result<()> {
-        self.stage_tick_commit_with_source_batches(&mut batch, commit, source_batches)?;
+        self.stage_tick_commit_with_source_batches_and_kafka_metadata(
+            &mut batch,
+            commit,
+            source_batches,
+            &[],
+        )?;
         self.table
             .write_batch(batch)
             .await
             .context("persist tick commit batch with staged writes")
     }
 
-    fn stage_tick_commit_with_source_batches(
+    pub async fn persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
+        &self,
+        commit: &TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        kafka_source_metadata: &[(String, Option<i64>, Vec<KafkaSourceJournalRange>)],
+        mut batch: WriteBatch,
+    ) -> Result<()> {
+        self.stage_tick_commit_with_source_batches_and_kafka_metadata(
+            &mut batch,
+            commit,
+            source_batches,
+            kafka_source_metadata,
+        )?;
+        self.table
+            .write_batch(batch)
+            .await
+            .context("persist tick commit batch with staged writes")
+    }
+
+    fn stage_tick_commit_with_source_batches_and_kafka_metadata(
         &self,
         batch: &mut WriteBatch,
         commit: &TickCommit,
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        kafka_source_metadata: &[(String, Option<i64>, Vec<KafkaSourceJournalRange>)],
     ) -> Result<()> {
         for (source, max_event_time_ms, deltas) in source_batches {
             append_entry_to_batch(batch, source, commit.tick_id, *max_event_time_ms, deltas)?;
+        }
+        for (source, max_event_time_ms, ranges) in kafka_source_metadata {
+            append_kafka_source_metadata_entry_to_batch(
+                batch,
+                source,
+                commit.tick_id,
+                *max_event_time_ms,
+                ranges,
+            )?;
         }
         let commit_key = self.tick_commit_key(commit.tick_id);
         let serialized = serde_json::to_vec(commit).context("serialize tick commit to JSON")?;
@@ -594,8 +645,22 @@ impl CheckpointManager {
         commit: TickCommit,
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
     ) -> Result<()> {
+        self.persist_tick_commit_with_source_batches_and_kafka_metadata(commit, source_batches, &[])
+            .await
+    }
+
+    pub async fn persist_tick_commit_with_source_batches_and_kafka_metadata(
+        &mut self,
+        commit: TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        kafka_source_metadata: &[(String, Option<i64>, Vec<KafkaSourceJournalRange>)],
+    ) -> Result<()> {
         self.store
-            .persist_tick_commit_with_source_batches(&commit, source_batches)
+            .persist_tick_commit_with_source_batches_and_kafka_metadata(
+                &commit,
+                source_batches,
+                kafka_source_metadata,
+            )
             .await?;
         for cursor in &commit.sink_cursors {
             self.sink_cursors
@@ -611,10 +676,27 @@ impl CheckpointManager {
         source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
         batch: WriteBatch,
     ) -> Result<()> {
+        self.persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
+            commit,
+            source_batches,
+            &[],
+            batch,
+        )
+        .await
+    }
+
+    pub async fn persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
+        &mut self,
+        commit: TickCommit,
+        source_batches: &[(String, Option<i64>, EncodedDeltaBatch)],
+        kafka_source_metadata: &[(String, Option<i64>, Vec<KafkaSourceJournalRange>)],
+        batch: WriteBatch,
+    ) -> Result<()> {
         self.store
-            .persist_tick_commit_with_source_batches_and_staged_writes(
+            .persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
                 &commit,
                 source_batches,
+                kafka_source_metadata,
                 batch,
             )
             .await?;

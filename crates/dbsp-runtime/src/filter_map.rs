@@ -112,11 +112,6 @@ impl DbspFilterMap {
         )
         .await?;
         stream.flush().await?;
-        {
-            let mut guard = state.lock().await;
-            guard.enable_live_output_replayable();
-        }
-
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
@@ -239,11 +234,6 @@ impl DbspFilterMap {
         )
         .await?;
         stream.flush().await?;
-        {
-            let mut guard = state.lock().await;
-            guard.enable_live_output_replayable();
-        }
-
         let writer = Arc::new(AsyncMutex::new(stream.clone()));
 
         let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
@@ -340,10 +330,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    fn enable_live_output_replayable(&mut self) {
-        self.output.enable_replayable_persistence();
-    }
-
     #[cfg(test)]
     fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
         self.logical_work.last_tick()
@@ -468,10 +454,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    fn enable_live_output_replayable(&mut self) {
-        self.output.enable_replayable_persistence();
-    }
-
     #[cfg(test)]
     fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
         self.logical_work.last_tick()
@@ -700,7 +682,9 @@ static NEXT_FILTER_MAP_ID: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::util::{delta_zset_handle_batch, materialize_zset_handle};
+    use crate::stream::util::{
+        delta_zset_handle_batch, materialize_zset_handle, publish_transient_zset_batch,
+    };
     use object_store::memory::InMemory;
     use slatedb::Db;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -877,7 +861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_map_state_on_step_projects_filters_and_replayable_output() {
+    async fn filter_map_state_on_step_projects_filters_and_persists_output() {
         let suffix = next_suffix();
         let db = build_db(suffix).await;
         let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
@@ -941,13 +925,21 @@ mod tests {
         assert_eq!(work2.output_delta_rows, 0);
         assert_eq!(work2.state_full_scan_count, 0);
 
-        state.enable_live_output_replayable();
         let input_h3 = stage_version(input_dict, table.clone(), input_ns.as_str(), &[(6, 2)]).await;
         let out_h3 = state.on_step(3, &input_h3).await.expect("state step 3");
         assert!(out_h3.version > 0);
+        for version in 1..=600 {
+            publish_transient_zset_batch(
+                &ZSetHandle {
+                    ns: format!("evict_filter_map_state_{suffix}_{version}"),
+                    version,
+                },
+                Arc::new(vec![(version as i64, 1)]),
+            );
+        }
         let out_rows_3 = delta_zset_handle_batch::<i64>(table, &mut HashMap::new(), &out_h3)
             .await
-            .expect("output rows 3");
+            .expect("output rows 3 after transient registry churn");
         assert_eq!(
             coalesce_rows(out_rows_3.as_ref()),
             HashMap::from([(60_i64, 2_i64)])
@@ -1032,7 +1024,6 @@ mod tests {
         assert_eq!(work2.output_delta_rows, 0);
         assert_eq!(work2.state_full_scan_count, 0);
 
-        state.enable_live_output_replayable();
         let input_h3 = stage_version(
             input_dict.clone(),
             table.clone(),
@@ -1045,6 +1036,23 @@ mod tests {
             .await
             .expect("batch state step 3");
         assert!(out_h3.version > 0);
+        for version in 1..=600 {
+            publish_transient_zset_batch(
+                &ZSetHandle {
+                    ns: format!("evict_filter_map_batch_{suffix}_{version}"),
+                    version,
+                },
+                Arc::new(vec![(version as i64, 1)]),
+            );
+        }
+        let out_rows_3 =
+            delta_zset_handle_batch::<i64>(table.clone(), &mut HashMap::new(), &out_h3)
+                .await
+                .expect("batch output rows 3 after transient registry churn");
+        assert_eq!(
+            coalesce_rows(out_rows_3.as_ref()),
+            HashMap::from([(500, 3)])
+        );
 
         let output_err_ns = format!("filter_map_batch_output_err_{suffix}");
         let output_err_dict = Arc::new(

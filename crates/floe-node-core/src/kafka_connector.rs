@@ -68,6 +68,25 @@ pub struct KafkaOffsetCommit {
     pub offsets: Vec<KafkaTopicPartitionOffset>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaReplayRange {
+    pub source: String,
+    pub tick_id: u64,
+    pub max_event_time_ms: Option<i64>,
+    pub topic: String,
+    pub partition: i32,
+    pub start_offset: i64,
+    pub end_offset: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaReplayBatch {
+    pub source: String,
+    pub tick_id: u64,
+    pub max_event_time_ms: Option<i64>,
+    pub events: Vec<AppendIngestEvent>,
+}
+
 pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
@@ -127,6 +146,119 @@ impl KafkaConnector {
         let mut connector = KafkaConnector::new(config, Vec::new(), HashMap::new())?;
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
+    }
+
+    pub async fn replay_range(
+        config: KafkaConnectorConfig,
+        definitions: Vec<SourceDefinition>,
+        required_columns_by_source: HashMap<String, Arc<[bool]>>,
+        range: KafkaReplayRange,
+    ) -> Result<KafkaReplayBatch> {
+        ensure!(
+            range.start_offset >= 0 && range.start_offset <= range.end_offset,
+            "invalid kafka replay range {}[{}] {}..{}",
+            range.topic,
+            range.partition,
+            range.start_offset,
+            range.end_offset
+        );
+        ensure!(
+            config.topics.iter().any(|topic| topic == &range.topic),
+            "kafka replay range topic '{}' is not owned by connector topics {:?}",
+            range.topic,
+            config.topics
+        );
+        let poll_timeout = config.poll_timeout.max(Duration::from_millis(100));
+        let idle_timeout = Duration::from_secs(30);
+        let connector =
+            KafkaConnector::new(config.clone(), definitions, required_columns_by_source)?;
+        let mut client_config = ClientConfig::new();
+        client_config
+            .set("bootstrap.servers", &config.brokers)
+            .set("group.id", format!("{}-replay", config.group_id))
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "none")
+            .set("enable.partition.eof", "true");
+        Self::apply_latency_fetch_config(&mut client_config);
+        let consumer: BaseConsumer = client_config
+            .create()
+            .context("create kafka replay consumer")?;
+        let mut assignment = TopicPartitionList::new();
+        assignment
+            .add_partition_offset(
+                &range.topic,
+                range.partition,
+                Offset::Offset(range.start_offset),
+            )
+            .with_context(|| {
+                format!(
+                    "assign kafka replay offset for {}[{}]",
+                    range.topic, range.partition
+                )
+            })?;
+        consumer
+            .assign(&assignment)
+            .context("assign kafka replay partition")?;
+
+        let mut events = Vec::new();
+        let mut idle_since = Instant::now();
+        loop {
+            match consumer.poll(poll_timeout) {
+                Some(Ok(message)) => {
+                    idle_since = Instant::now();
+                    if message.topic() != range.topic || message.partition() != range.partition {
+                        continue;
+                    }
+                    let offset = message.offset();
+                    if offset < range.start_offset {
+                        continue;
+                    }
+                    if offset > range.end_offset {
+                        break;
+                    }
+                    let mut parsed = connector.handle_message(&message)?;
+                    events.append(&mut parsed);
+                    if offset >= range.end_offset {
+                        break;
+                    }
+                }
+                Some(Err(err)) => {
+                    tracing::debug!(
+                        topic = %range.topic,
+                        partition = range.partition,
+                        error = %err,
+                        "kafka replay poll returned an error"
+                    );
+                    if idle_since.elapsed() >= idle_timeout {
+                        anyhow::bail!(
+                            "timed out replaying kafka range {}[{}] {}..{} after poll error: {err}",
+                            range.topic,
+                            range.partition,
+                            range.start_offset,
+                            range.end_offset
+                        );
+                    }
+                }
+                None => {
+                    if idle_since.elapsed() >= idle_timeout {
+                        anyhow::bail!(
+                            "timed out replaying kafka range {}[{}] {}..{}",
+                            range.topic,
+                            range.partition,
+                            range.start_offset,
+                            range.end_offset
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(KafkaReplayBatch {
+            source: range.source,
+            tick_id: range.tick_id,
+            max_event_time_ms: range.max_event_time_ms,
+            events,
+        })
     }
 
     fn apply_latency_fetch_config(client_config: &mut ClientConfig) {
