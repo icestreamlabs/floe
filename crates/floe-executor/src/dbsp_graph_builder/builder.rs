@@ -2821,6 +2821,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
         dbsp::DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
     };
     let allowed_lateness_ms = window.window.allowed_lateness_ms;
+    let track_evictions = allowed_lateness_ms != i64::MAX;
     let group_key_columns = Arc::new(group_key_columns);
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-window-count-star:{graph_id}");
@@ -2843,6 +2844,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                 restored_deltas,
                 &mut counts,
                 &mut eviction_schedule,
+                track_evictions,
             )
         } else {
             apply_transient_window_count_star_deltas(
@@ -2855,6 +2857,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                 None,
                 &mut counts,
                 &mut eviction_schedule,
+                track_evictions,
             )
             .map(|_| ())
         };
@@ -2897,6 +2900,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         output_projection,
                         &mut counts,
                         &mut eviction_schedule,
+                        track_evictions,
                     ) {
                         Ok(updates) => updates,
                         Err(err) => {
@@ -3629,6 +3633,9 @@ fn transient_window_watermark_cutoff(
     watermark: &AtomicI64,
     allowed_lateness_ms: i64,
 ) -> Option<i64> {
+    if allowed_lateness_ms == i64::MAX {
+        return None;
+    }
     let watermark = watermark.load(Ordering::Relaxed);
     if watermark < 0 {
         return None;
@@ -3666,6 +3673,7 @@ fn apply_transient_window_count_delta(
     updates: &mut TransientWindowCountUpdates,
     key: TransientWindowCountKey,
     delta: i64,
+    track_evictions: bool,
 ) {
     if delta == 0 {
         return;
@@ -3680,7 +3688,7 @@ fn apply_transient_window_count_delta(
     }
     if new_count != 0 {
         updates.merge(&key, new_count, 1);
-        if old_count == 0 {
+        if track_evictions && old_count == 0 {
             eviction_schedule
                 .entry(key.end)
                 .or_default()
@@ -3723,6 +3731,7 @@ fn apply_transient_window_count_star_deltas(
     output_projection: Option<TransientWindowCountOutputProjection>,
     counts: &mut AHashMap<TransientWindowCountKey, i64>,
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+    track_evictions: bool,
 ) -> Result<TransientWindowCountUpdates> {
     let mut grouped_deltas: AHashMap<TransientWindowCountKey, i64> = AHashMap::new();
     let mut batch_group_key_intern: AHashMap<Vec<u8>, Arc<[u8]>> = AHashMap::new();
@@ -3771,10 +3780,19 @@ fn apply_transient_window_count_star_deltas(
 
     let mut updates = TransientWindowCountUpdates::new(output_projection);
     for (key, delta) in grouped_deltas {
-        apply_transient_window_count_delta(counts, eviction_schedule, &mut updates, key, delta);
+        apply_transient_window_count_delta(
+            counts,
+            eviction_schedule,
+            &mut updates,
+            key,
+            delta,
+            track_evictions,
+        );
     }
 
-    transient_window_evict_expired_counts(cutoff, counts, eviction_schedule, &mut updates);
+    if track_evictions {
+        transient_window_evict_expired_counts(cutoff, counts, eviction_schedule, &mut updates);
+    }
     Ok(updates)
 }
 
@@ -3796,6 +3814,7 @@ fn restore_transient_window_count_state(
     rows: Vec<(Vec<u8>, i64)>,
     counts: &mut AHashMap<TransientWindowCountKey, i64>,
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+    track_evictions: bool,
 ) -> Result<()> {
     for (row, count) in rows {
         if count == 0 {
@@ -3803,7 +3822,9 @@ fn restore_transient_window_count_state(
         }
         let key = decode_transient_window_count_state_key(&row)?;
         counts.insert(key.clone(), count);
-        eviction_schedule.entry(key.end).or_default().push(key);
+        if track_evictions {
+            eviction_schedule.entry(key.end).or_default().push(key);
+        }
     }
     Ok(())
 }

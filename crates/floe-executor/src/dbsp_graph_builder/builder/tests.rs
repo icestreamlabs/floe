@@ -328,6 +328,41 @@ fn transient_window_incremental_aggregate_state_snapshot_roundtrips() {
 }
 
 #[test]
+fn transient_window_count_eviction_schedule_requires_finite_lateness() {
+    let key = TransientWindowCountKey {
+        start: 0,
+        end: 10_000,
+        key: Arc::<[u8]>::from([1_u8, 2, 3]),
+    };
+    let mut counts = AHashMap::new();
+    let mut eviction_schedule = std::collections::BTreeMap::new();
+    let mut updates = TransientWindowCountUpdates::new(None);
+
+    apply_transient_window_count_delta(
+        &mut counts,
+        &mut eviction_schedule,
+        &mut updates,
+        key.clone(),
+        1,
+        false,
+    );
+    assert!(eviction_schedule.is_empty());
+
+    let mut counts = AHashMap::new();
+    let mut eviction_schedule = std::collections::BTreeMap::new();
+    let mut updates = TransientWindowCountUpdates::new(None);
+    apply_transient_window_count_delta(
+        &mut counts,
+        &mut eviction_schedule,
+        &mut updates,
+        key,
+        1,
+        true,
+    );
+    assert_eq!(eviction_schedule.get(&10_000).map(Vec::len), Some(1));
+}
+
+#[test]
 fn benchmark_join_shape_still_matches_transient_join_root() {
     let logical = benchmark_join_logical_plan();
     let planner = DbspPlanBuilder::new(nexmark_config());
