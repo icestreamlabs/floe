@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::LogicalWorkSnapshot;
 use crate::handles::ZSetHandle;
 use anyhow::{Context, Result, anyhow};
 
@@ -29,6 +30,15 @@ pub trait DeltaOperator: Send {
     /// Stable operator identifier for runtime diagnostics.
     fn operator_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+
+    /// Logical foreground work observed during the last completed tick.
+    ///
+    /// Operators that have not yet been instrumented return `None`. This is
+    /// intentionally separate from latency metrics so incrementality tests can
+    /// assert deterministic work bounds directly.
+    fn logical_work(&self) -> Option<LogicalWorkSnapshot> {
+        None
     }
 }
 
@@ -118,6 +128,13 @@ pub struct Pipeline {
     operators: Vec<Box<dyn DeltaOperator>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorLogicalWork {
+    pub operator_index: usize,
+    pub operator_name: &'static str,
+    pub work: LogicalWorkSnapshot,
+}
+
 pub struct PipelineBuilder {
     inputs: Vec<Stream<ZSetHandle>>,
     ops: Vec<Box<dyn DeltaOperator>>,
@@ -154,6 +171,20 @@ impl PipelineBuilder {
 }
 
 impl Pipeline {
+    pub fn operator_logical_work(&self) -> Vec<OperatorLogicalWork> {
+        self.operators
+            .iter()
+            .enumerate()
+            .filter_map(|(operator_index, op)| {
+                op.logical_work().map(|work| OperatorLogicalWork {
+                    operator_index,
+                    operator_name: op.operator_name(),
+                    work,
+                })
+            })
+            .collect()
+    }
+
     pub async fn step_once(&mut self) -> anyhow::Result<i64> {
         let (ts, mut current) = self.runtime.next_handles().await?;
         let pipeline_start = Instant::now();

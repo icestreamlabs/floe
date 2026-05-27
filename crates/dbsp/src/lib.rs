@@ -42,6 +42,7 @@ pub use count_aggregate::{
     DbspCountAggregate, DbspTransientCountAggregate, TransientCountAggregateDistinctWeight,
     TransientCountAggregateGroupedState, TransientCountAggregateSnapshot,
 };
+pub use dbsp_runtime::{LogicalWorkCollector, LogicalWorkSnapshot};
 pub use distinct::DbspDistinct;
 pub use filter_map::DbspFilterMap;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};

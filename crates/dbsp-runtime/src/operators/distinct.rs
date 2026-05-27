@@ -38,6 +38,7 @@ where
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     integrated_cache: Option<HashMap<K, i64>>,
     append_only_input: bool,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K> DistinctOp<K>
@@ -64,6 +65,7 @@ where
             dict_cache: HashMap::new(),
             integrated_cache: None,
             append_only_input: false,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
@@ -75,9 +77,14 @@ where
         self.append_only_input = true;
     }
 
-    async fn ensure_integrated_cache(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
+    async fn ensure_integrated_cache(&mut self) -> Result<usize> {
         if self.integrated_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let materialized = self
@@ -86,8 +93,9 @@ where
             .materialize()
             .await
             .context("materialize integrated state for distinct cache")?;
+        let rebuild_rows = materialized.len();
         self.integrated_cache = Some(materialized);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     async fn apply_deltas_to_versioned(
@@ -203,14 +211,22 @@ where
             delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for distinct")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
 
         if delta_values.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        self.ensure_integrated_cache()
+        let rebuild_rows = self
+            .ensure_integrated_cache()
             .await
             .context("load distinct cache")?;
+        if rebuild_rows != 0 {
+            work.cache_rebuild_rows = work.cache_rebuild_rows.saturating_add(rebuild_rows as u64);
+            work.state_scan_rows = work.state_scan_rows.saturating_add(rebuild_rows as u64);
+            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+        }
 
         let mut delta_map = HashMap::new();
         for (key, diff_weight) in delta_values.iter() {
@@ -222,8 +238,15 @@ where
         }
 
         if delta_map.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.state_lookup_keys = work
+            .state_lookup_keys
+            .saturating_add(delta_map.len() as u64);
+        work.distinct_aux_rows_examined = work
+            .distinct_aux_rows_examined
+            .saturating_add(delta_map.len() as u64);
 
         let mut h_deltas = HashMap::new();
         let mut cache_updates = Vec::new();
@@ -258,6 +281,7 @@ where
         } else {
             &delta_map
         };
+        work.record_persisted_rows(state_deltas.len());
         let base_version = self.state.base_version_for_update();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
             &mut self.state.integrated,
@@ -280,8 +304,11 @@ where
         }
 
         if h_deltas.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.record_output_delta_rows(h_deltas.len());
+        work.record_persisted_rows(h_deltas.len());
 
         let h_handle = Self::apply_deltas_to_versioned(&mut self.output, &h_deltas, None, "output")
             .await
@@ -290,7 +317,12 @@ where
             &h_handle,
             Arc::new(h_deltas.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(h_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -666,5 +698,109 @@ mod tests {
 
             full_distinct = recompute_distinct;
         }
+    }
+
+    async fn run_distinct_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let delta_ns = format!("distinct_history_delta_{history_rows}");
+        let delta_dict = Arc::new(
+            Dictionary::<String>::with_table(table.clone(), delta_ns.clone(), None)
+                .await
+                .expect("build delta dictionary"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::<String>::with_table(
+                table.clone(),
+                format!("distinct_history_state_{history_rows}"),
+                None,
+            )
+            .await
+            .expect("build state dictionary"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<String>::with_table(
+                table.clone(),
+                format!("distinct_history_output_{history_rows}"),
+                None,
+            )
+            .await
+            .expect("build output dictionary"),
+        );
+
+        let integrated = VersionedZSet::new(
+            state_dict,
+            table.clone(),
+            format!("distinct_history_state_{history_rows}"),
+        )
+        .await
+        .expect("integrated state");
+        let output = VersionedZSet::new(
+            output_dict.clone(),
+            table.clone(),
+            format!("distinct_history_output_{history_rows}"),
+        )
+        .await
+        .expect("output state");
+        let state = RelationState {
+            latest_handle: ZSetHandle {
+                ns: format!("distinct_history_state_{history_rows}"),
+                version: 0,
+            },
+            integrated,
+        };
+        let mut op = DistinctOp::new(state, table.clone(), output);
+
+        let history = (0..history_rows)
+            .map(|idx| (format!("history-{idx}"), 1))
+            .collect::<Vec<_>>();
+        let seed = stage_version(delta_dict.clone(), table.clone(), &delta_ns, &history).await;
+        op.on_step(1, &[seed]).await.expect("seed distinct");
+
+        let fixed = stage_version(
+            delta_dict,
+            table.clone(),
+            &delta_ns,
+            &[("needle".to_string(), 1)],
+        )
+        .await;
+        let output_handle = op
+            .on_step(2, &[fixed])
+            .await
+            .expect("fixed distinct")
+            .expect("distinct output");
+        let mut cache = HashMap::new();
+        cache.insert(
+            format!("distinct_history_output_{history_rows}"),
+            output_dict,
+        );
+        let materialized = materialize_zset_handle::<String>(table, &mut cache, &output_handle)
+            .await
+            .expect("materialize fixed distinct");
+        assert_eq!(materialized, HashMap::from([("needle".to_string(), 1)]));
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn distinct_logical_work_uses_changed_values_not_unrelated_history() {
+        let baseline = run_distinct_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_distinct_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.state_lookup_keys, baseline.state_lookup_keys);
+            assert_eq!(
+                actual.distinct_aux_rows_examined,
+                baseline.distinct_aux_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_scan_rows, 0);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.state_lookup_keys, 1);
+        assert_eq!(baseline.distinct_aux_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
     }
 }

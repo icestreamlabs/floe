@@ -570,6 +570,8 @@ where
             }
         }
         let resolve_ms = resolve_start.elapsed().as_millis() as u64;
+        let rows_before_retain = aggregate.len();
+        aggregate.retain(|_, weight| *weight != 0);
 
         tracing::debug!(
             namespace = %self.namespace,
@@ -581,6 +583,7 @@ where
             delta_rows,
             resolve_calls,
             resolve_ms,
+            rows_before_retain,
             rows = aggregate.len(),
             total_ms = total_start.elapsed().as_millis() as u64,
             "versioned zset load_version_chain breakdown"

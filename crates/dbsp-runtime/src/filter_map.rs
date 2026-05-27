@@ -14,6 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::algebra::AbelianGroup;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -84,6 +85,7 @@ impl DbspFilterMap {
             table: table.clone(),
             output,
             dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         }));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
@@ -210,6 +212,7 @@ impl DbspFilterMap {
             table: table.clone(),
             output,
             dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         }));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
@@ -313,6 +316,7 @@ where
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, R> FilterMapState<K, R>
@@ -340,6 +344,11 @@ where
         self.output.enable_replayable_persistence();
     }
 
+    #[cfg(test)]
+    fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
     async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
@@ -348,6 +357,7 @@ where
                 .await
                 .context("load input delta for filter_map")?;
         let input_delta_rows = delta_values.len();
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(input_delta_rows);
         let load_ms = load_start.elapsed().as_millis() as u64;
 
         let transform_start = Instant::now();
@@ -377,8 +387,11 @@ where
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "filter_map operator timing (no output)"
             );
+            self.logical_work.finish_tick(work);
             return Ok(self.output.handle_for_version(0));
         }
+        work.record_output_delta_rows(output_delta_rows);
+        work.record_persisted_rows(output_delta_rows);
 
         let output_apply_start = Instant::now();
         let projected = projected.into_iter().collect::<Vec<_>>();
@@ -401,6 +414,7 @@ where
             total_ms = total_start.elapsed().as_millis() as u64,
             "filter_map operator timing"
         );
+        self.logical_work.finish_tick(work);
         Ok(output_handle)
     }
 }
@@ -430,6 +444,7 @@ where
     table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<R>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, R> FilterMapBatchState<K, R>
@@ -457,6 +472,11 @@ where
         self.output.enable_replayable_persistence();
     }
 
+    #[cfg(test)]
+    fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
     async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
         let total_start = Instant::now();
         let load_start = Instant::now();
@@ -465,6 +485,7 @@ where
                 .await
                 .context("load input delta for filter_map batch")?;
         let input_delta_rows = delta_values.len();
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(input_delta_rows);
         let load_ms = load_start.elapsed().as_millis() as u64;
 
         let transform_start = Instant::now();
@@ -485,8 +506,11 @@ where
                 total_ms = total_start.elapsed().as_millis() as u64,
                 "filter_map_batch operator timing (no output)"
             );
+            self.logical_work.finish_tick(work);
             return Ok(self.output.handle_for_version(0));
         }
+        work.record_output_delta_rows(output_delta_rows);
+        work.record_persisted_rows(output_delta_rows);
 
         let output_apply_start = Instant::now();
         let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
@@ -508,6 +532,7 @@ where
             total_ms = total_start.elapsed().as_millis() as u64,
             "filter_map_batch operator timing"
         );
+        self.logical_work.finish_tick(work);
         Ok(output_handle)
     }
 }
@@ -878,6 +903,7 @@ mod tests {
             table: table.clone(),
             output,
             dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         };
 
         let input_h1 = stage_version(
@@ -896,6 +922,10 @@ mod tests {
             coalesce_rows(out_rows_1.as_ref()),
             HashMap::from([(20_i64, 3_i64), (40_i64, -1_i64)])
         );
+        let work1 = state.last_logical_work();
+        assert_eq!(work1.input_delta_rows, 3);
+        assert_eq!(work1.output_delta_rows, 2);
+        assert_eq!(work1.persisted_rows, 2);
 
         let input_h2 = stage_version(
             input_dict.clone(),
@@ -906,6 +936,10 @@ mod tests {
         .await;
         let out_h2 = state.on_step(2, &input_h2).await.expect("state step 2");
         assert_eq!(out_h2.version, 0);
+        let work2 = state.last_logical_work();
+        assert_eq!(work2.input_delta_rows, 2);
+        assert_eq!(work2.output_delta_rows, 0);
+        assert_eq!(work2.state_full_scan_count, 0);
 
         state.enable_live_output_replayable();
         let input_h3 = stage_version(input_dict, table.clone(), input_ns.as_str(), &[(6, 2)]).await;
@@ -954,6 +988,7 @@ mod tests {
             table: table.clone(),
             output,
             dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         };
 
         let input_h1 = stage_version(
@@ -975,6 +1010,10 @@ mod tests {
             coalesce_rows(out_rows_1.as_ref()),
             HashMap::from([(100_i64, 2_i64), (300_i64, -1_i64)])
         );
+        let work1 = state.last_logical_work();
+        assert_eq!(work1.input_delta_rows, 3);
+        assert_eq!(work1.output_delta_rows, 2);
+        assert_eq!(work1.persisted_rows, 2);
 
         let input_h2 = stage_version(
             input_dict.clone(),
@@ -988,6 +1027,10 @@ mod tests {
             .await
             .expect("batch state step 2");
         assert_eq!(out_h2.version, 0);
+        let work2 = state.last_logical_work();
+        assert_eq!(work2.input_delta_rows, 2);
+        assert_eq!(work2.output_delta_rows, 0);
+        assert_eq!(work2.state_full_scan_count, 0);
 
         state.enable_live_output_replayable();
         let input_h3 = stage_version(
@@ -1022,6 +1065,7 @@ mod tests {
             table: table.clone(),
             output: output_err,
             dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         };
 
         let input_h_err = stage_version(input_dict, table, input_ns.as_str(), &[(-1, 1)]).await;
@@ -1030,5 +1074,77 @@ mod tests {
             .await
             .expect_err("batch transform should fail");
         assert!(err.to_string().contains("run filter_map batch transform"));
+    }
+
+    async fn run_filter_map_batch_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let suffix = next_suffix();
+        let db = build_db(suffix).await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db));
+
+        let input_ns = format!("filter_map_batch_history_input_{history_rows}_{suffix}");
+        let output_ns = format!("filter_map_batch_history_output_{history_rows}_{suffix}");
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<i64>::with_table(table.clone(), output_ns.clone(), None)
+                    .await
+                    .expect("output dict"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("output zset");
+        let mut state = FilterMapBatchState {
+            transform: Arc::new(|rows: &[(i64, i64)]| {
+                Ok(rows
+                    .iter()
+                    .filter_map(|(value, weight)| (value % 2 == 0).then_some((value * 10, *weight)))
+                    .collect::<Vec<_>>())
+            }),
+            table: table.clone(),
+            output,
+            dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
+        };
+
+        let history = (0..history_rows)
+            .map(|idx| (1_000_000 + idx * 2, 1))
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        state.on_step(1, &seed).await.expect("seed filter_map");
+
+        let fixed = stage_version(input_dict, table.clone(), &input_ns, &[(8, 1)]).await;
+        let output = state.on_step(2, &fixed).await.expect("fixed filter_map");
+        let materialized = delta_zset_handle_batch::<i64>(table, &mut HashMap::new(), &output)
+            .await
+            .expect("materialize fixed filter_map");
+        assert_eq!(
+            coalesce_rows(materialized.as_ref()),
+            HashMap::from([(80, 1)])
+        );
+
+        state.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn filter_map_batch_logical_work_is_delta_local() {
+        let baseline = run_filter_map_batch_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_filter_map_batch_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.persisted_rows, baseline.persisted_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
+        assert_eq!(baseline.persisted_rows, 1);
     }
 }

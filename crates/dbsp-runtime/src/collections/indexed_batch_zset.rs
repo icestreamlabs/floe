@@ -138,6 +138,31 @@ pub struct ApplyDeltaMetrics {
     pub persisted_records: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LookupMetrics {
+    pub lookup_keys: usize,
+    pub returned_rows: usize,
+    pub index_segments_examined: usize,
+    pub index_postings_examined: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+}
+
+impl LookupMetrics {
+    pub fn add_assign(&mut self, other: Self) {
+        self.lookup_keys = self.lookup_keys.saturating_add(other.lookup_keys);
+        self.returned_rows = self.returned_rows.saturating_add(other.returned_rows);
+        self.index_segments_examined = self
+            .index_segments_examined
+            .saturating_add(other.index_segments_examined);
+        self.index_postings_examined = self
+            .index_postings_examined
+            .saturating_add(other.index_postings_examined);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OrderedBytes, RangeKey};

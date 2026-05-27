@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -117,6 +117,7 @@ where
     slot_kinds: Vec<CountAggregateSlotKind>,
     distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, D>>,
     append_only_input: bool,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, V, D> CountAggregateOp<K, V, D>
@@ -194,7 +195,13 @@ where
             slot_kinds,
             distinct_index,
             append_only_input: false,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
     }
 
     pub fn enable_live_output_replayable(&mut self) {
@@ -205,9 +212,9 @@ where
         self.append_only_input = true;
     }
 
-    async fn ensure_state_cache(&mut self) -> Result<()> {
+    async fn ensure_state_cache(&mut self) -> Result<usize> {
         if self.state_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let materialized = self
@@ -217,13 +224,14 @@ where
             .await
             .context("materialize grouped-count integrated state")?;
         let mut cache = HashMap::new();
+        let rebuild_rows = materialized.len();
         for ((key, aggregate), weight) in materialized {
             if weight != 0 {
                 cache.insert(key, aggregate);
             }
         }
         self.state_cache = Some(cache);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64> {
@@ -337,6 +345,14 @@ where
         &mut self,
         delta_values: &[(V, i64)],
     ) -> Result<HashMap<(K, Vec<i64>), i64>> {
+        self.apply_delta_values_with_work(delta_values, None).await
+    }
+
+    async fn apply_delta_values_with_work(
+        &mut self,
+        delta_values: &[(V, i64)],
+        mut logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
+    ) -> Result<HashMap<(K, Vec<i64>), i64>> {
         if delta_values.is_empty() {
             return Ok(HashMap::new());
         }
@@ -421,6 +437,15 @@ where
             return Ok(HashMap::new());
         }
 
+        if let Some(work) = logical_work.as_deref_mut() {
+            let mut affected_groups = grouped_deltas.keys().cloned().collect::<HashSet<_>>();
+            for (distinct_key, _) in distinct_deltas.keys() {
+                affected_groups.insert(distinct_key.group_key.clone());
+            }
+            work.changed_groups = affected_groups.len() as u64;
+            work.distinct_aux_rows_examined = distinct_deltas.len() as u64;
+        }
+
         if !distinct_deltas.is_empty() {
             let distinct_index = self
                 .distinct_index
@@ -435,6 +460,12 @@ where
                     .value_weight_for_key_value(&distinct_key, &distinct_value)
                     .await
                     .context("load count aggregate distinct multiplicity")?;
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
+                    work.state_lookup_rows = work
+                        .state_lookup_rows
+                        .saturating_add((old_weight != 0) as u64);
+                }
                 let index_delta = if self.append_only_input {
                     if old_weight > 0 { 0 } else { 1 }
                 } else {
@@ -455,6 +486,9 @@ where
             }
 
             if !distinct_updates.is_empty() {
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.record_persisted_rows(distinct_updates.len());
+                }
                 distinct_index
                     .apply_deltas(distinct_updates)
                     .await
@@ -466,9 +500,19 @@ where
             return Ok(HashMap::new());
         }
 
-        self.ensure_state_cache()
+        let cache_rebuild_rows = self
+            .ensure_state_cache()
             .await
             .context("load grouped-count cache")?;
+        if cache_rebuild_rows != 0
+            && let Some(work) = logical_work.as_deref_mut()
+        {
+            work.cache_rebuild_rows = cache_rebuild_rows as u64;
+            work.state_full_scan_count = 1;
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(cache_rebuild_rows as u64);
+        }
 
         let mut state_deltas: HashMap<(K, GroupedCountState), i64> = HashMap::new();
         let mut output_deltas: HashMap<(K, Vec<i64>), i64> = HashMap::new();
@@ -481,6 +525,14 @@ where
 
             for (key, delta_state) in grouped_deltas {
                 let old_state = state_cache.get(&key).cloned();
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
+                    work.state_lookup_rows = work
+                        .state_lookup_rows
+                        .saturating_add(old_state.is_some() as u64);
+                    work.group_state_rows_examined =
+                        work.group_state_rows_examined.saturating_add(1);
+                }
                 let new_state = match old_state.as_ref() {
                     Some(old) => {
                         let next = old.apply_delta(&delta_state);
@@ -547,6 +599,10 @@ where
         )
         .await
         .context("update grouped-count integrated state")?;
+        if let Some(work) = logical_work {
+            work.record_persisted_rows(state_deltas.len());
+            work.aggregate_state_rows_updated = cache_updates.len() as u64;
+        }
         self.state.update_handle(new_integrated_handle);
 
         if let Some(state_cache) = self.state_cache.as_mut() {
@@ -727,21 +783,32 @@ where
             delta_zset_handle_batch::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for count aggregate")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
 
-        let output_deltas = self.apply_delta_values(delta_values.as_ref()).await?;
+        let output_deltas = self
+            .apply_delta_values_with_work(delta_values.as_ref(), Some(&mut work))
+            .await?;
         if output_deltas.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.record_output_delta_rows(output_deltas.len());
 
         let delta_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist grouped-count output delta")?;
+        work.record_persisted_rows(output_deltas.len());
         publish_transient_zset_batch(
             &delta_handle,
             Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(delta_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -1328,5 +1395,211 @@ mod tests {
                 .expect("distinct index after duplicate"),
             vec![(10, 1)]
         );
+    }
+
+    async fn run_grouped_count_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let table = build_table(&format!("grouped-count-history-{history_rows}")).await;
+        let input_ns = format!("grouped_count_history_{history_rows}_input");
+        let state_ns = format!("grouped_count_history_{history_rows}_state");
+        let output_ns = format!("grouped_count_history_{history_rows}_output");
+        let input_dict = Arc::new(
+            Dictionary::<CountRow>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("create count history input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedCountState)>::empty(table.clone(), state_ns)
+            .await
+            .expect("create count history state");
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<(i64, Vec<i64>)>::with_table(table.clone(), output_ns.clone(), None)
+                    .await
+                    .expect("create count history output dictionary"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("create count history output");
+
+        let mut op = CountAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &CountRow| {
+                Some(CountAggregateRow {
+                    key: row.group_key,
+                    slots: vec![CountAggregateSlotUpdate::Linear(1)],
+                })
+            }),
+            output,
+            vec![CountAggregateSlotKind::Linear],
+            None::<IndexedBatchZSet<DistinctGroupKey<i64>, i64>>,
+        );
+
+        let history = (0..history_rows)
+            .map(|idx| {
+                (
+                    CountRow {
+                        group_key: 1_000_000 + idx,
+                        value: Some(idx),
+                        flag: false,
+                    },
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, std::slice::from_ref(&seed))
+            .await
+            .expect("seed grouped-count history");
+
+        let fixed = CountRow {
+            group_key: 7,
+            value: Some(70),
+            flag: true,
+        };
+        let fixed_delta = stage_version(input_dict, table.clone(), &input_ns, &[(fixed, 1)]).await;
+        let output = op
+            .on_step(2, std::slice::from_ref(&fixed_delta))
+            .await
+            .expect("fixed grouped-count history")
+            .expect("grouped-count output");
+        let mut cache = HashMap::new();
+        let materialized = materialize_zset_handle::<(i64, Vec<i64>)>(table, &mut cache, &output)
+            .await
+            .expect("materialize grouped-count history output");
+        assert_eq!(materialized, HashMap::from([((7, vec![1]), 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn grouped_count_logical_work_uses_changed_groups_not_unrelated_history() {
+        let baseline = run_grouped_count_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_grouped_count_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_groups, baseline.changed_groups);
+            assert_eq!(
+                actual.group_state_rows_examined,
+                baseline.group_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_groups, 1);
+        assert_eq!(baseline.group_state_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
+    }
+
+    async fn run_grouped_count_distinct_history_probe(
+        history_rows: i64,
+    ) -> metrics::LogicalWorkSnapshot {
+        let table = build_table(&format!("grouped-count-distinct-history-{history_rows}")).await;
+        let input_ns = format!("grouped_count_distinct_history_{history_rows}_input");
+        let state_ns = format!("grouped_count_distinct_history_{history_rows}_state");
+        let output_ns = format!("grouped_count_distinct_history_{history_rows}_output");
+        let input_dict = Arc::new(
+            Dictionary::<CountRow>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("create distinct history input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedCountState)>::empty(table.clone(), state_ns)
+            .await
+            .expect("create distinct history state");
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<(i64, Vec<i64>)>::with_table(table.clone(), output_ns.clone(), None)
+                    .await
+                    .expect("create distinct history output dictionary"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("create distinct history output");
+
+        let mut op = CountAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &CountRow| {
+                Some(CountAggregateRow {
+                    key: row.group_key,
+                    slots: vec![CountAggregateSlotUpdate::Distinct(row.value)],
+                })
+            }),
+            output,
+            vec![CountAggregateSlotKind::Distinct],
+            Some(IndexedBatchZSet::new(
+                table.clone(),
+                format!("grouped_count_distinct_history_{history_rows}_index"),
+            )),
+        );
+
+        let history = (0..history_rows)
+            .map(|idx| {
+                (
+                    CountRow {
+                        group_key: 1_000_000 + idx,
+                        value: Some(idx),
+                        flag: false,
+                    },
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, std::slice::from_ref(&seed))
+            .await
+            .expect("seed grouped-count distinct history");
+
+        let fixed = CountRow {
+            group_key: 7,
+            value: Some(70),
+            flag: true,
+        };
+        let fixed_delta = stage_version(input_dict, table.clone(), &input_ns, &[(fixed, 1)]).await;
+        let output = op
+            .on_step(2, std::slice::from_ref(&fixed_delta))
+            .await
+            .expect("fixed grouped-count distinct history")
+            .expect("grouped-count distinct output");
+        let mut cache = HashMap::new();
+        let materialized = materialize_zset_handle::<(i64, Vec<i64>)>(table, &mut cache, &output)
+            .await
+            .expect("materialize grouped-count distinct history output");
+        assert_eq!(materialized, HashMap::from([((7, vec![1]), 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn grouped_count_distinct_logical_work_uses_changed_groups() {
+        let baseline = run_grouped_count_distinct_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_grouped_count_distinct_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_groups, baseline.changed_groups);
+            assert_eq!(
+                actual.distinct_aux_rows_examined,
+                baseline.distinct_aux_rows_examined
+            );
+            assert_eq!(
+                actual.group_state_rows_examined,
+                baseline.group_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_groups, 1);
+        assert_eq!(baseline.distinct_aux_rows_examined, 1);
+        assert_eq!(baseline.group_state_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
     }
 }

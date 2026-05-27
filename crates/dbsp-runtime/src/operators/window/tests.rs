@@ -1,5 +1,6 @@
 use super::*;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::metrics;
 use crate::storage::dictionary::Dictionary;
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{compute_delta, materialize_zset_handle};
@@ -604,4 +605,106 @@ async fn window_aggregate_evicts_expired_windows_on_watermark_advance() {
         )),
         Some(&-1)
     );
+}
+
+async fn run_window_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let input_ns = format!("window_history_{history_rows}_input");
+    let output_ns = format!("window_history_{history_rows}_output");
+    let state_ns = format!("window_history_{history_rows}_state");
+    let index_ns = format!("window_history_{history_rows}_index");
+
+    let input_dict = Arc::new(
+        Dictionary::<Row>::with_table(table.clone(), input_ns.clone(), None)
+            .await
+            .expect("input dict"),
+    );
+    let output_dict = Arc::new(
+        Dictionary::<(WindowKey<i64>, i64)>::with_table(table.clone(), output_ns.clone(), None)
+            .await
+            .expect("output dict"),
+    );
+    let state = RelationState::empty(table.clone(), state_ns)
+        .await
+        .expect("window state");
+    let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+        .await
+        .expect("output zset");
+    let index = IndexedBatchZSet::new(table.clone(), index_ns);
+    let key_extractor = Arc::new(|_row: &Row| Some(0_i64));
+    let time_extractor = Arc::new(|row: &Row| Some(*row));
+    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
+        Arc::new(|_key, values| {
+            let mut count = 0i64;
+            for (_row, weight) in values {
+                count += *weight;
+            }
+            (count != 0).then_some(count)
+        });
+    let watermark = Arc::new(AtomicI64::new(-1));
+
+    let mut op = WindowAggregateOp::new(
+        state,
+        index,
+        table.clone(),
+        key_extractor,
+        time_extractor,
+        aggregator,
+        output,
+        10,
+        10,
+        0,
+        watermark,
+    )
+    .expect("window aggregate op");
+
+    let mut history = (0..history_rows)
+        .map(|idx| (1_000_000 + idx * 10, 1))
+        .collect::<Vec<_>>();
+    history.push((11, 1));
+    let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+    op.on_step(1, &[seed]).await.expect("seed window history");
+
+    let fixed = stage_version(input_dict, table.clone(), &input_ns, &[(12, 1)]).await;
+    let output = op
+        .on_step(2, &[fixed])
+        .await
+        .expect("fixed window history")
+        .expect("window output");
+    let mut cache = HashMap::new();
+    cache.insert(output_ns, output_dict);
+    let materialized = materialize_zset_handle::<(WindowKey<i64>, i64)>(table, &mut cache, &output)
+        .await
+        .expect("materialize fixed window");
+    let window_key = WindowKey {
+        start: 10,
+        end: 20,
+        key: 0,
+    };
+    assert_eq!(
+        materialized,
+        HashMap::from([((window_key.clone(), 1), -1), ((window_key, 2), 1)])
+    );
+
+    op.last_logical_work()
+}
+
+#[tokio::test]
+async fn window_aggregate_logical_work_uses_changed_windows() {
+    let baseline = run_window_history_probe(8).await;
+    for history_rows in [128, 1024] {
+        let actual = run_window_history_probe(history_rows).await;
+        assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+        assert_eq!(actual.changed_windows, baseline.changed_windows);
+        assert_eq!(actual.window_rows_examined, baseline.window_rows_examined);
+        assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+        assert_eq!(actual.state_full_scan_count, 0);
+        assert_eq!(actual.cache_rebuild_rows, 0);
+    }
+
+    assert_eq!(baseline.input_delta_rows, 1);
+    assert_eq!(baseline.changed_windows, 1);
+    assert_eq!(baseline.window_rows_examined, 2);
+    assert_eq!(baseline.output_delta_rows, 2);
 }

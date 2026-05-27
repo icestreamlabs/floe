@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::LogicalWorkSnapshot;
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
@@ -38,6 +39,26 @@ impl DeltaOperator for PassthroughOp {
         inputs: &[ZSetHandle],
     ) -> anyhow::Result<Option<ZSetHandle>> {
         Ok(inputs.first().cloned())
+    }
+}
+
+struct WorkReportingOp {
+    work: LogicalWorkSnapshot,
+}
+
+#[async_trait]
+impl DeltaOperator for WorkReportingOp {
+    async fn on_step(
+        &mut self,
+        _ts: i64,
+        inputs: &[ZSetHandle],
+    ) -> anyhow::Result<Option<ZSetHandle>> {
+        self.work.input_delta_rows = inputs.len() as u64;
+        Ok(inputs.first().cloned())
+    }
+
+    fn logical_work(&self) -> Option<LogicalWorkSnapshot> {
+        Some(self.work)
     }
 }
 
@@ -217,4 +238,41 @@ async fn pipeline_propagates_explicit_empty_handles() {
     assert_eq!(collected[0].1[0].version, 0);
     assert_eq!(collected[1].0, 2);
     assert_eq!(collected[1].1[0].version, 0);
+}
+
+#[tokio::test]
+async fn pipeline_exposes_operator_logical_work() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
+
+    let dict = Arc::new(
+        Dictionary::<Vec<u8>>::with_table(table.clone(), "work_pipe", None)
+            .await
+            .expect("dict"),
+    );
+
+    let mut stream = ZSetStream::new(
+        dict,
+        table.clone(),
+        "work_pipe".to_string(),
+        StreamRetention::KeepLast { keep_last: 1 },
+    )
+    .await
+    .expect("stream");
+
+    let mut pipeline = single_input_pipeline(
+        stream.handle_stream().stream(),
+        vec![Box::new(WorkReportingOp {
+            work: LogicalWorkSnapshot::default(),
+        })],
+    );
+
+    stream.add_delta(vec![1], 1);
+    stream.flush().await.expect("flush t1");
+    pipeline.step_once().await.expect("process t1");
+
+    let work = pipeline.operator_logical_work();
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0].operator_index, 0);
+    assert_eq!(work[0].work.input_delta_rows, 1);
 }

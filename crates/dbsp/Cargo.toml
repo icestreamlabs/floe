@@ -27,5 +27,9 @@ name = "incremental_join"
 harness = false
 
 [[bench]]
+name = "incrementality_evidence"
+harness = false
+
+[[bench]]
 name = "materialization_metrics"
 harness = false

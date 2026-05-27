@@ -60,6 +60,7 @@ where
     partition_order_index: BTreeMap<P, BTreeMap<(O, K), i64>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
     key_parts: BatchKeyPartsFn<K, P, O>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, P, O> PartitionedTop1Op<K, P, O>
@@ -119,6 +120,7 @@ where
             partition_order_index: BTreeMap::new(),
             row_key_cache: HashMap::new(),
             key_parts,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
@@ -160,15 +162,30 @@ where
         keyed
     }
 
-    async fn ensure_partition_cache(&mut self, partition_key: &P) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
+    async fn ensure_partition_cache(
+        &mut self,
+        partition_key: &P,
+        logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
+    ) -> Result<()> {
         if self.partition_order_index.contains_key(partition_key) {
             return Ok(());
         }
-        let values = self
+        let (values, lookup_metrics) = self
             .input_index
-            .values_for_key(partition_key)
+            .values_for_key_with_metrics(partition_key)
             .await
             .context("load top1 partition values")?;
+        if let Some(work) = logical_work {
+            work.add_lookup_metrics(lookup_metrics);
+            work.partition_rows_examined = work
+                .partition_rows_examined
+                .saturating_add(values.len() as u64);
+        }
         let mut index: BTreeMap<(O, K), i64> = BTreeMap::new();
         for (row, weight) in values {
             if weight <= 0 {
@@ -339,7 +356,9 @@ where
             delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for top1")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
         if delta_values.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
@@ -354,6 +373,7 @@ where
             }
         }
         if delta_map.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
@@ -365,16 +385,19 @@ where
             index_updates.push((partition_key, key, diff_weight));
         }
         if affected_partitions.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.changed_partitions = affected_partitions.len() as u64;
 
         for partition_key in &affected_partitions {
-            self.ensure_partition_cache(partition_key)
+            self.ensure_partition_cache(partition_key, Some(&mut work))
                 .await
                 .context("seed top1 partition cache")?;
         }
 
         let input_index_persist_start = std::time::Instant::now();
+        work.record_persisted_rows(index_updates.len());
         self.input_index
             .apply_deltas(index_updates.iter().cloned())
             .await
@@ -392,6 +415,11 @@ where
         let mut output_delta = HashMap::new();
         for partition_key in affected_partitions {
             let old_top = self.partition_output_cache.get(&partition_key).cloned();
+            if let Some(partition_index) = self.partition_order_index.get(&partition_key) {
+                work.partition_rows_examined = work
+                    .partition_rows_examined
+                    .saturating_add(partition_index.len() as u64);
+            }
             let new_top = self.cached_partition_top1(&partition_key);
             if old_top == new_top {
                 continue;
@@ -410,18 +438,27 @@ where
         }
         output_delta.retain(|_, delta| *delta != 0);
         if output_delta.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.replacement_rows = output_delta.len() as u64;
+        work.record_output_delta_rows(output_delta.len());
 
         let output_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None, "output")
                 .await
                 .context("persist top1 output delta")?;
+        work.record_persisted_rows(output_delta.len());
         publish_transient_zset_batch(
             &output_handle,
             Arc::new(output_delta.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(output_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -576,5 +613,77 @@ mod tests {
         assert_eq!(rows.get(&11), Some(&-1));
         assert_eq!(rows.get(&12), Some(&1));
         assert_eq!(rows.len(), 2);
+    }
+
+    async fn run_top1_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let table = build_table(&format!("partitioned-top1-history-{history_rows}")).await;
+        let input_ns = format!("input_top1_history_{history_rows}");
+        let output_ns = format!("output_top1_history_{history_rows}");
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<i64>::with_table(table.clone(), output_ns.clone(), None)
+                    .await
+                    .expect("output dict"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("output zset");
+        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
+        let mut op = PartitionedTop1Op::new_with_key_extractor(
+            IndexedBatchZSet::new(table.clone(), format!("top1_history_index_{history_rows}")),
+            table.clone(),
+            output,
+            key_parts,
+        );
+
+        let mut history = (0..history_rows)
+            .map(|idx| ((10_000_000 + idx) * 10, 1))
+            .collect::<Vec<_>>();
+        history.push((72, 1));
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, &[seed]).await.expect("seed top1 history");
+
+        let fixed = stage_version(input_dict, table.clone(), &input_ns, &[(71, 1)]).await;
+        let output = op
+            .on_step(2, &[fixed])
+            .await
+            .expect("fixed top1 history")
+            .expect("top1 output");
+        let materialized = materialize_zset_handle::<i64>(table, &mut HashMap::new(), &output)
+            .await
+            .expect("materialize fixed top1");
+        assert_eq!(materialized, HashMap::from([(72, -1), (71, 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn partitioned_top1_logical_work_uses_changed_partitions() {
+        let baseline = run_top1_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_top1_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_partitions, baseline.changed_partitions);
+            assert_eq!(
+                actual.partition_rows_examined,
+                baseline.partition_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_partitions, 1);
+        assert_eq!(baseline.partition_rows_examined, 2);
+        assert_eq!(baseline.output_delta_rows, 2);
+        assert_eq!(baseline.replacement_rows, 2);
     }
 }

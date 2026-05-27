@@ -9,6 +9,7 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
+use crate::LogicalWorkSnapshot;
 use crate::collections::IndexedBatchZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::group_by::GroupByOp;
@@ -339,6 +340,10 @@ where
             .on_step(ts, inputs)
             .await
             .with_context(|| format!("aggregate {}", self.spec.name()))
+    }
+
+    fn logical_work(&self) -> Option<LogicalWorkSnapshot> {
+        self.inner.logical_work()
     }
 }
 

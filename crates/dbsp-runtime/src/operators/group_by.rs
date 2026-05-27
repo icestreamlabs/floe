@@ -62,6 +62,7 @@ where
     output: VersionedZSet<(K, A)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     aggregate_cache: Option<HashMap<K, A>>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, V, A> GroupByOp<K, V, A>
@@ -112,12 +113,18 @@ where
             output,
             dict_cache: HashMap::new(),
             aggregate_cache: None,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
-    async fn ensure_aggregate_cache(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
+    async fn ensure_aggregate_cache(&mut self) -> Result<usize> {
         if self.aggregate_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let materialized = self
@@ -127,13 +134,14 @@ where
             .await
             .context("materialize group-by integrated state")?;
         let mut cache = HashMap::new();
+        let rebuild_rows = materialized.len();
         for ((key, aggregate), weight) in materialized {
             if weight != 0 {
                 cache.insert(key, aggregate);
             }
         }
         self.aggregate_cache = Some(cache);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64>
@@ -279,13 +287,16 @@ where
             delta_zset_handle_batch::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for group-by")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
 
         if delta_values.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let coalesced = self.coalesce_deltas(delta_values.as_ref().clone());
         if coalesced.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
@@ -302,10 +313,13 @@ where
         }
 
         if updates.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.changed_groups = affected_keys.len() as u64;
 
         let index_persist_start = std::time::Instant::now();
+        work.record_persisted_rows(updates.len());
         self.index
             .apply_deltas(updates)
             .await
@@ -316,9 +330,17 @@ where
             index_persist_start.elapsed().as_millis() as u64,
         );
 
-        self.ensure_aggregate_cache()
+        let cache_rebuild_rows = self
+            .ensure_aggregate_cache()
             .await
             .context("load group-by cache")?;
+        if cache_rebuild_rows != 0 {
+            work.cache_rebuild_rows = cache_rebuild_rows as u64;
+            work.state_full_scan_count = 1;
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(cache_rebuild_rows as u64);
+        }
 
         let mut output_deltas: HashMap<(K, A), i64> = HashMap::new();
         let mut cache_updates = Vec::new();
@@ -329,11 +351,15 @@ where
                 .context("group-by cache missing")?;
 
             for key in &affected_keys {
-                let values = self
+                let (values, lookup_metrics) = self
                     .index
-                    .values_for_key(key)
+                    .values_for_key_with_metrics(key)
                     .await
                     .context("load group-by key values")?;
+                work.add_lookup_metrics(lookup_metrics);
+                work.group_state_rows_examined = work
+                    .group_state_rows_examined
+                    .saturating_add(values.len() as u64);
                 let new_value = (self.aggregator)(key, &values);
                 let old_value = aggregate_cache.get(key).cloned();
 
@@ -358,8 +384,11 @@ where
         }
 
         if output_deltas.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.aggregate_state_rows_updated = cache_updates.len() as u64;
+        work.record_output_delta_rows(output_deltas.len());
 
         let base_version = self.state.base_version_for_update();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
@@ -370,6 +399,7 @@ where
         )
         .await
         .context("update group-by integrated state")?;
+        work.record_persisted_rows(output_deltas.len());
         self.state.update_handle(new_integrated_handle);
 
         if let Some(aggregate_cache) = self.aggregate_cache.as_mut() {
@@ -386,11 +416,17 @@ where
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist group-by delta output")?;
+        work.record_persisted_rows(output_deltas.len());
         publish_transient_zset_batch(
             &delta_handle,
             Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(delta_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -738,5 +774,104 @@ mod tests {
 
             full_output = recompute;
         }
+    }
+
+    async fn run_group_by_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let prefix = format!("group_by_history_{history_rows}");
+        let input_ns = format!("{prefix}_input");
+        let output_ns = format!("{prefix}_output");
+        let state_ns = format!("{prefix}_state");
+
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<(i64, i64)>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .expect("output dict"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::<(i64, i64)>::with_table(table.clone(), state_ns.clone(), None)
+                .await
+                .expect("state dict"),
+        );
+
+        let state = RelationState {
+            integrated: VersionedZSet::new(state_dict, table.clone(), state_ns.clone())
+                .await
+                .expect("integrated state"),
+            latest_handle: ZSetHandle {
+                ns: state_ns,
+                version: 0,
+            },
+        };
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+            .await
+            .expect("output");
+        let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(*value));
+        let aggregator: Aggregator<i64, i64, i64> = Arc::new(|_, values| {
+            let sum = values
+                .iter()
+                .fold(0i64, |acc, (value, weight)| acc + value * weight);
+            (sum != 0).then_some(sum)
+        });
+        let mut op = GroupByOp::new(
+            state,
+            IndexedBatchZSet::new(table.clone(), format!("{prefix}_index")),
+            table.clone(),
+            key_extractor,
+            aggregator,
+            output,
+        );
+
+        let history = (0..history_rows)
+            .map(|idx| (1_000_000 + idx, 1))
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, &[seed]).await.expect("seed group-by");
+
+        let fixed = stage_version(input_dict, table.clone(), &input_ns, &[(7, 1)]).await;
+        let output = op
+            .on_step(2, &[fixed])
+            .await
+            .expect("fixed group-by")
+            .expect("group-by output");
+
+        let mut cache = HashMap::new();
+        cache.insert(output_ns, output_dict);
+        let materialized = materialize_zset_handle::<(i64, i64)>(table, &mut cache, &output)
+            .await
+            .expect("materialize fixed group-by");
+        assert_eq!(materialized, HashMap::from([((7, 7), 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn group_by_logical_work_uses_changed_groups_not_unrelated_history() {
+        let baseline = run_group_by_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_group_by_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_groups, baseline.changed_groups);
+            assert_eq!(
+                actual.group_state_rows_examined,
+                baseline.group_state_rows_examined
+            );
+            assert_eq!(actual.state_lookup_keys, baseline.state_lookup_keys);
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_groups, 1);
+        assert_eq!(baseline.group_state_rows_examined, 1);
+        assert_eq!(baseline.state_lookup_keys, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
     }
 }

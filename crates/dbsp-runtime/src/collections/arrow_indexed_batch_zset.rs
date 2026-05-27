@@ -22,7 +22,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator, 
 use crate::storage::segment::{ArrowSegmentStore, SegmentWriteStats, encode_segment_envelope};
 use crate::{handles::ZSetHandle, operator_state_registry};
 
-use super::indexed_batch_zset::{ApplyDeltaMetrics, RangeKey};
+use super::indexed_batch_zset::{ApplyDeltaMetrics, LookupMetrics, RangeKey};
 
 const LOOKUP_CACHE_SHARDS: usize = 64;
 const LOOKUP_CACHE_CAPACITY_PER_SHARD: usize = 2048;
@@ -555,8 +555,22 @@ where
     }
 
     pub async fn values_for_key(&self, key: &K) -> Result<Vec<(V, i64)>> {
+        self.values_for_key_with_metrics(key)
+            .await
+            .map(|(values, _)| values)
+    }
+
+    pub async fn values_for_key_with_metrics(
+        &self,
+        key: &K,
+    ) -> Result<(Vec<(V, i64)>, LookupMetrics)> {
+        let mut metrics = LookupMetrics {
+            lookup_keys: 1,
+            ..LookupMetrics::default()
+        };
+
         if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Ok(self
+            let values = self
                 .overlay_by_key
                 .lock()
                 .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?
@@ -565,19 +579,28 @@ where
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|(_, weight)| *weight != 0)
-                .collect());
+                .collect::<Vec<_>>();
+            metrics.returned_rows = values.len();
+            return Ok((values, metrics));
         }
 
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
         if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
-            return self.decode_value_weights(cached);
+            metrics.cache_hits = 1;
+            let values = self.decode_value_weights(cached)?;
+            metrics.returned_rows = values.len();
+            return Ok((values, metrics));
         }
 
-        let aggregate = self
-            .load_persisted_value_weights_for_key(&key_bytes)
+        metrics.cache_misses = 1;
+        let (aggregate, persisted_metrics) = self
+            .load_persisted_value_weights_for_key_with_metrics(&key_bytes)
             .await?;
+        metrics.add_assign(persisted_metrics);
         self.store_lookup_cache_for_key(&key_bytes, &aggregate)?;
-        self.decode_value_weights(aggregate)
+        let values = self.decode_value_weights(aggregate)?;
+        metrics.returned_rows = values.len();
+        Ok((values, metrics))
     }
 
     pub async fn value_weight_for_key_value(&self, key: &K, value: &V) -> Result<i64> {
@@ -859,10 +882,10 @@ where
         Ok(entries.len())
     }
 
-    async fn segment_refs_for_key(
+    async fn segment_refs_for_key_with_metrics(
         &self,
         key_bytes: &[u8],
-    ) -> Result<FastMap<u64, Vec<(u32, i64)>>> {
+    ) -> Result<(FastMap<u64, Vec<(u32, i64)>>, LookupMetrics)> {
         let entries = self
             .table
             .scan_prefix(
@@ -874,16 +897,22 @@ where
             .await
             .context("scan Arrow-index key prefix")?;
 
+        let mut metrics = LookupMetrics {
+            index_segments_examined: entries.len(),
+            ..LookupMetrics::default()
+        };
         let mut refs: FastMap<u64, Vec<(u32, i64)>> = FastMap::default();
         for (entry_key, entry_value) in entries {
             let (_key, segment_id) = self
                 .decode_index_key(&entry_key)
                 .context("decode Arrow-index key")?;
-            refs.entry(segment_id)
-                .or_default()
-                .extend(decode_index_postings(&entry_value)?);
+            let postings = decode_index_postings(&entry_value)?;
+            metrics.index_postings_examined = metrics
+                .index_postings_examined
+                .saturating_add(postings.len());
+            refs.entry(segment_id).or_default().extend(postings);
         }
-        Ok(refs)
+        Ok((refs, metrics))
     }
 
     async fn truncate_to_next_segment(&self, next_segment_id: u64) -> Result<()> {
@@ -1324,7 +1353,16 @@ where
         &self,
         key_bytes: &[u8],
     ) -> Result<ValueWeightMap> {
-        let refs = self.segment_refs_for_key(key_bytes).await?;
+        self.load_persisted_value_weights_for_key_with_metrics(key_bytes)
+            .await
+            .map(|(aggregate, _)| aggregate)
+    }
+
+    async fn load_persisted_value_weights_for_key_with_metrics(
+        &self,
+        key_bytes: &[u8],
+    ) -> Result<(ValueWeightMap, LookupMetrics)> {
+        let (refs, metrics) = self.segment_refs_for_key_with_metrics(key_bytes).await?;
         let mut aggregate: ValueWeightMap = FastMap::default();
 
         for (segment_id, postings) in refs {
@@ -1352,7 +1390,7 @@ where
             }
         }
 
-        Ok(aggregate)
+        Ok((aggregate, metrics))
     }
 
     async fn load_persisted_keys_for_value(

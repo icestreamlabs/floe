@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Timestamp};
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
+use dbsp::LogicalWorkSnapshot;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
@@ -104,6 +105,7 @@ pub struct MaterializedViewHandle {
     published_versions: RwLock<BTreeSet<i64>>,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
     version_times: RwLock<HashMap<i64, i64>>,
+    logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
     latest_version: RwLock<Option<i64>>,
     version_watch: watch::Sender<Option<i64>>,
     retention_keep_last: Option<usize>,
@@ -126,6 +128,7 @@ impl MaterializedViewHandle {
             published_versions: RwLock::new(BTreeSet::new()),
             versions: RwLock::new(HashMap::new()),
             version_times: RwLock::new(HashMap::new()),
+            logical_work: RwLock::new(BTreeMap::new()),
             latest_version: RwLock::new(None),
             version_watch: tx,
             retention_keep_last,
@@ -552,6 +555,41 @@ impl MaterializedViewHandle {
             .copied()
     }
 
+    pub fn record_logical_work(&self, version: i64, work: LogicalWorkSnapshot) {
+        let mut guard = self
+            .logical_work
+            .write()
+            .expect("materialized view logical work lock poisoned");
+        guard.insert(version, work);
+        if let Some(keep_last) = self.retention_keep_last
+            && keep_last > 0
+            && guard.len() > keep_last
+        {
+            let remove_count = guard.len().saturating_sub(keep_last);
+            let remove_versions = guard.keys().copied().take(remove_count).collect::<Vec<_>>();
+            for version in remove_versions {
+                guard.remove(&version);
+            }
+        }
+    }
+
+    pub fn logical_work_for(&self, version: i64) -> Option<LogicalWorkSnapshot> {
+        self.logical_work
+            .read()
+            .expect("materialized view logical work lock poisoned")
+            .get(&version)
+            .copied()
+    }
+
+    pub fn latest_logical_work(&self) -> Option<(i64, LogicalWorkSnapshot)> {
+        self.logical_work
+            .read()
+            .expect("materialized view logical work lock poisoned")
+            .iter()
+            .next_back()
+            .map(|(version, work)| (*version, *work))
+    }
+
     pub fn version_watch(&self) -> watch::Receiver<Option<i64>> {
         self.version_watch.subscribe()
     }
@@ -601,6 +639,10 @@ impl MaterializedViewHandle {
         for version in versions.into_iter().take(remove_count) {
             guard.remove(&version);
             times.remove(&version);
+            self.logical_work
+                .write()
+                .expect("materialized view logical work lock poisoned")
+                .remove(&version);
         }
     }
 

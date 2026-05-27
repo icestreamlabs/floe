@@ -10,6 +10,7 @@ use dbsp::storage::KeyValueTable;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::stream::runtime::DeltaOperator;
 use dbsp::stream::util::delta_zset_handle;
+use dbsp::{LogicalWorkCollector, LogicalWorkSnapshot};
 
 use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
 
@@ -19,6 +20,7 @@ pub struct MvSinkOp {
     pub registry: Arc<MaterializedViewRegistry>,
     pub table: Arc<dyn KeyValueTable>,
     dict_cache: HashMap<String, Arc<Dictionary<Vec<u8>>>>,
+    logical_work: LogicalWorkCollector,
 }
 
 impl MvSinkOp {
@@ -34,7 +36,13 @@ impl MvSinkOp {
             registry,
             table,
             dict_cache: HashMap::new(),
+            logical_work: LogicalWorkCollector::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> LogicalWorkSnapshot {
+        self.logical_work.last_tick()
     }
 
     async fn apply_deltas_to_versioned(
@@ -102,10 +110,13 @@ impl DeltaOperator for MvSinkOp {
             delta_zset_handle::<Vec<u8>>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("delta iterate mv sink delta")?;
+        let mut work = LogicalWorkSnapshot::from_input_delta_rows(delta_map.len());
 
         if delta_map.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(None);
         }
+        work.record_persisted_rows(delta_map.len());
 
         let dict = self.state.dictionary();
         let new_handle =
@@ -127,7 +138,12 @@ impl DeltaOperator for MvSinkOp {
         );
         view.set_dbsp_state(persisted);
 
+        self.logical_work.finish_tick(work);
         Ok(None)
+    }
+
+    fn logical_work(&self) -> Option<LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -190,5 +206,91 @@ mod tests {
         let persisted = view_handle.dbsp_state().expect("persisted state");
         assert_eq!(persisted.namespace(), "mv_sink_state");
         assert_eq!(persisted.version(), 1);
+
+        let work = op.last_logical_work();
+        assert_eq!(work.input_delta_rows, 1);
+        assert_eq!(work.persisted_rows, 1);
+        assert_eq!(work.state_full_scan_count, 0);
+    }
+
+    #[tokio::test]
+    async fn mv_sink_applies_retractions_and_canceling_deltas_delta_locally() {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(dbsp::storage::SlateTable::new(db.clone()));
+        let dict = Arc::new(
+            Dictionary::<Vec<u8>>::with_table(table.clone(), "mv_sink_retractions_input", None)
+                .await
+                .expect("build dictionary"),
+        );
+
+        let mut delta_stream = ZSetStream::new(
+            dict.clone(),
+            table.clone(),
+            "mv_sink_retractions_input".to_string(),
+            StreamRetention::KeepLast { keep_last: 2 },
+        )
+        .await
+        .expect("delta stream");
+
+        let integrated = VersionedZSet::new(
+            dict.clone(),
+            table.clone(),
+            "mv_sink_retractions_state".to_string(),
+        )
+        .await
+        .expect("integrated state");
+        let state = RelationState {
+            integrated,
+            latest_handle: ZSetHandle {
+                ns: "mv_sink_retractions_state".to_string(),
+                version: 0,
+            },
+        };
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let view_handle = registry.register("mv_sink_retractions_view");
+
+        let mut op = MvSinkOp::new(
+            state,
+            "mv_sink_retractions_view",
+            registry.clone(),
+            table.clone(),
+        );
+
+        delta_stream.add_delta(b"a".to_vec(), 1);
+        delta_stream.add_delta(b"b".to_vec(), 1);
+        let delta_handle = delta_stream.flush().await.expect("flush initial rows");
+        op.on_step(1, &[delta_handle])
+            .await
+            .expect("run initial mv sink");
+
+        delta_stream.add_delta(b"a".to_vec(), -1);
+        delta_stream.add_delta(b"c".to_vec(), 1);
+        delta_stream.add_delta(b"d".to_vec(), 1);
+        delta_stream.add_delta(b"d".to_vec(), -1);
+        let delta_handle = delta_stream.flush().await.expect("flush retractions");
+        op.on_step(2, &[delta_handle])
+            .await
+            .expect("run retraction mv sink");
+
+        let persisted = view_handle.dbsp_state().expect("persisted state");
+        let materialized = dbsp::handles::ZSetHandleView::new(
+            persisted.dictionary(),
+            persisted.table(),
+            persisted.namespace().to_string(),
+            persisted.version(),
+        )
+        .materialize()
+        .await
+        .expect("materialize mv sink state");
+        assert_eq!(materialized.get(b"a".as_ref()), None);
+        assert_eq!(materialized.get(b"b".as_ref()), Some(&1));
+        assert_eq!(materialized.get(b"c".as_ref()), Some(&1));
+        assert_eq!(materialized.get(b"d".as_ref()), None);
+
+        let work = op.last_logical_work();
+        assert_eq!(work.input_delta_rows, 2);
+        assert_eq!(work.persisted_rows, 2);
+        assert_eq!(work.state_full_scan_count, 0);
+        assert_eq!(work.cache_rebuild_rows, 0);
     }
 }

@@ -16,6 +16,7 @@ use slatedb::WriteBatch;
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -108,6 +109,7 @@ where
     allowed_lateness_ms: i64,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     aggregate_cache: Option<HashMap<WindowKey<K>, A>>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, V, A> WindowAggregateOp<K, V, A>
@@ -215,6 +217,7 @@ where
             allowed_lateness_ms,
             dict_cache: HashMap::new(),
             aggregate_cache: None,
+            logical_work: metrics::LogicalWorkCollector::default(),
         })
     }
 
@@ -262,9 +265,14 @@ where
         self.output.enable_replayable_persistence();
     }
 
-    async fn ensure_aggregate_cache(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
+    async fn ensure_aggregate_cache(&mut self) -> Result<usize> {
         if self.aggregate_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let materialized = self
@@ -274,13 +282,14 @@ where
             .await
             .context("materialize window aggregate state")?;
         let mut cache = HashMap::new();
+        let rebuild_rows = materialized.len();
         for ((key, aggregate), weight) in materialized {
             if weight != 0 {
                 cache.insert(key, aggregate);
             }
         }
         self.aggregate_cache = Some(cache);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64>
@@ -302,13 +311,27 @@ where
         &mut self,
         cutoff: Option<i64>,
         aggregate_updates: &mut HashMap<(WindowKey<K>, A), i64>,
+        logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
     ) -> Result<()> {
         let Some(cutoff) = cutoff else {
             return Ok(());
         };
-        self.ensure_aggregate_cache()
+        let cache_rebuild_rows = self
+            .ensure_aggregate_cache()
             .await
             .context("load window aggregate cache for eviction")?;
+        let mut logical_work = logical_work;
+        if cache_rebuild_rows != 0
+            && let Some(work) = logical_work.as_deref_mut()
+        {
+            work.cache_rebuild_rows = work
+                .cache_rebuild_rows
+                .saturating_add(cache_rebuild_rows as u64);
+            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(cache_rebuild_rows as u64);
+        }
         let aggregate_cache = self
             .aggregate_cache
             .as_mut()
@@ -322,6 +345,11 @@ where
         if expired_keys.is_empty() {
             return Ok(());
         }
+        if let Some(work) = logical_work.as_deref_mut() {
+            work.changed_windows = work
+                .changed_windows
+                .saturating_add(expired_keys.len() as u64);
+        }
 
         let mut index_updates = Vec::new();
         for key in expired_keys {
@@ -329,11 +357,17 @@ where
                 continue;
             };
             Self::merge_output_delta(aggregate_updates, key.clone(), old_value, -1);
-            let values = self
+            let (values, lookup_metrics) = self
                 .index
-                .values_for_key(&key)
+                .values_for_key_with_metrics(&key)
                 .await
                 .context("load window aggregate values for eviction")?;
+            if let Some(work) = logical_work.as_deref_mut() {
+                work.add_lookup_metrics(lookup_metrics);
+                work.window_rows_examined = work
+                    .window_rows_examined
+                    .saturating_add(values.len() as u64);
+            }
             for (row, weight) in values {
                 if weight != 0 {
                     index_updates.push((key.clone(), row, -weight));
@@ -342,6 +376,9 @@ where
         }
 
         if !index_updates.is_empty() {
+            if let Some(work) = logical_work {
+                work.record_persisted_rows(index_updates.len());
+            }
             self.index
                 .apply_deltas(index_updates)
                 .await
@@ -475,6 +512,7 @@ where
             delta_zset_handle::<V>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for window aggregate")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
         let delta_map = self.coalesce_deltas(delta_values);
         let cutoff = self.watermark_cutoff();
 
@@ -523,14 +561,25 @@ where
                 }
             }
 
+            work.record_persisted_rows(index_updates.len());
             self.index
                 .apply_deltas(index_updates)
                 .await
                 .context("update window aggregate index")?;
 
-            self.ensure_aggregate_cache()
+            let cache_rebuild_rows = self
+                .ensure_aggregate_cache()
                 .await
                 .context("load window aggregate cache")?;
+            if cache_rebuild_rows != 0 {
+                work.cache_rebuild_rows = work
+                    .cache_rebuild_rows
+                    .saturating_add(cache_rebuild_rows as u64);
+                work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+                work.state_scan_rows = work
+                    .state_scan_rows
+                    .saturating_add(cache_rebuild_rows as u64);
+            }
 
             let aggregate_cache = self
                 .aggregate_cache
@@ -540,9 +589,14 @@ where
             for key in affected_keys {
                 let values = self
                     .index
-                    .values_for_key(&key)
+                    .values_for_key_with_metrics(&key)
                     .await
                     .context("load window aggregate values")?;
+                let (values, lookup_metrics) = values;
+                work.add_lookup_metrics(lookup_metrics);
+                work.window_rows_examined = work
+                    .window_rows_examined
+                    .saturating_add(values.len() as u64);
                 let new_value = (self.aggregator)(&key.key, &values);
                 let old_value = aggregate_cache.get(&key).cloned();
 
@@ -574,9 +628,12 @@ where
                     (None, None) => {}
                 }
             }
+            work.changed_windows = work
+                .changed_windows
+                .saturating_add(keyed_deltas.len() as u64);
         }
 
-        self.evict_expired_windows(cutoff, &mut aggregate_updates)
+        self.evict_expired_windows(cutoff, &mut aggregate_updates, Some(&mut work))
             .await
             .context("evict expired windows")?;
 
@@ -595,8 +652,11 @@ where
         }
 
         if aggregate_updates.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.aggregate_state_rows_updated = aggregate_updates.len() as u64;
+        work.record_output_delta_rows(aggregate_updates.len());
 
         let base_version = self.state.base_version_for_update();
         let new_integrated_handle = Self::apply_deltas_to_versioned(
@@ -606,13 +666,20 @@ where
         )
         .await
         .context("update window aggregate state")?;
+        work.record_persisted_rows(aggregate_updates.len());
         self.state.update_handle(new_integrated_handle);
 
         let delta_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &aggregate_updates, None)
                 .await
                 .context("persist window aggregate output")?;
+        work.record_persisted_rows(aggregate_updates.len());
+        self.logical_work.finish_tick(work);
         Ok(Some(delta_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 

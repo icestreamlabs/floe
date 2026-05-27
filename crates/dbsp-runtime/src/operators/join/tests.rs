@@ -740,6 +740,135 @@ async fn join_operator_matches_full_recompute() {
     }
 }
 
+async fn run_join_history_invariance_probe(
+    unrelated_history_rows: i64,
+) -> crate::metrics::LogicalWorkSnapshot {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+    let left_state = RelationState::empty(
+        table.clone(),
+        format!("history_probe_left_state_{unrelated_history_rows}"),
+    )
+    .await
+    .expect("left state");
+    let right_state = RelationState::empty(
+        table.clone(),
+        format!("history_probe_right_state_{unrelated_history_rows}"),
+    )
+    .await
+    .expect("right state");
+
+    let mut op = JoinOp::new_without_output(
+        left_state,
+        right_state,
+        IndexedBatchZSet::new(
+            table.clone(),
+            format!("history_probe_left_index_{unrelated_history_rows}"),
+        ),
+        IndexedBatchZSet::new(
+            table.clone(),
+            format!("history_probe_right_index_{unrelated_history_rows}"),
+        ),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|value: &i64| Some(*value)),
+        Arc::new(|l: &i64, r: &i64| l == r),
+        Arc::new(project_sum),
+        table,
+        None,
+    );
+
+    let left_history = (0..unrelated_history_rows)
+        .map(|idx| (1_000_000 + idx, 1))
+        .collect::<Vec<_>>();
+    let mut right_history = (0..unrelated_history_rows)
+        .map(|idx| (2_000_000 + idx, 1))
+        .collect::<Vec<_>>();
+    right_history.push((7, 1));
+
+    op.on_step_transient_with_inputs(
+        1,
+        &[
+            empty_handle("history_probe_left_stream"),
+            empty_handle("history_probe_right_stream"),
+        ],
+        Some(JoinTransientInputs {
+            left: Some(Arc::new(left_history)),
+            right: Some(Arc::new(right_history)),
+            left_closed_keys: None,
+            right_closed_keys: None,
+        }),
+    )
+    .await
+    .expect("seed history");
+
+    let output = op
+        .on_step_transient_with_inputs(
+            2,
+            &[
+                empty_handle("history_probe_left_stream"),
+                empty_handle("history_probe_right_stream"),
+            ],
+            Some(JoinTransientInputs {
+                left: Some(Arc::new(vec![(7, 1)])),
+                right: Some(Arc::new(Vec::new())),
+                left_closed_keys: None,
+                right_closed_keys: None,
+            }),
+        )
+        .await
+        .expect("steady-state join")
+        .expect("steady-state output");
+    assert_eq!(batch_to_map(&output), HashMap::from([(14, 1)]));
+
+    op.last_logical_work()
+}
+
+#[tokio::test]
+async fn join_logical_work_is_independent_of_unrelated_history() {
+    let baseline = run_join_history_invariance_probe(8).await;
+
+    for unrelated_history_rows in [128, 1024] {
+        let actual = run_join_history_invariance_probe(unrelated_history_rows).await;
+        assert_eq!(actual.left_delta_rows, baseline.left_delta_rows);
+        assert_eq!(actual.right_delta_rows, baseline.right_delta_rows);
+        assert_eq!(actual.left_changed_keys, baseline.left_changed_keys);
+        assert_eq!(actual.right_changed_keys, baseline.right_changed_keys);
+        assert_eq!(
+            actual.left_state_rows_examined,
+            baseline.left_state_rows_examined
+        );
+        assert_eq!(
+            actual.right_state_rows_examined,
+            baseline.right_state_rows_examined
+        );
+        assert_eq!(
+            actual.delta_delta_rows_examined,
+            baseline.delta_delta_rows_examined
+        );
+        assert_eq!(actual.state_scan_rows, baseline.state_scan_rows);
+        assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+        assert_eq!(actual.join_output_rows, baseline.join_output_rows);
+        assert_eq!(
+            actual.index_postings_examined,
+            baseline.index_postings_examined
+        );
+        assert_eq!(actual.state_full_scan_count, 0);
+    }
+
+    assert_eq!(baseline.left_delta_rows, 1);
+    assert_eq!(baseline.right_delta_rows, 0);
+    assert_eq!(baseline.left_changed_keys, 1);
+    assert_eq!(baseline.right_changed_keys, 0);
+    assert_eq!(baseline.left_state_rows_examined, 0);
+    assert_eq!(baseline.right_state_rows_examined, 1);
+    assert_eq!(baseline.delta_delta_rows_examined, 0);
+    assert_eq!(baseline.state_scan_rows, 1);
+    assert_eq!(baseline.output_delta_rows, 1);
+    assert_eq!(baseline.join_output_rows, 1);
+    assert_eq!(baseline.index_postings_examined, 0);
+    assert_eq!(baseline.state_full_scan_count, 0);
+}
+
 #[tokio::test]
 async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
     let db = build_db().await;

@@ -31,6 +31,14 @@ type FastHashMap<K, V> = AHashMap<K, V>;
 type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
 static NEXT_JOIN_CLOSED_INDEX_ID: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Default)]
+struct JoinMapMetrics {
+    left_rows_examined: u64,
+    right_rows_examined: u64,
+    candidate_pairs_examined: u64,
+    output_rows: u64,
+}
+
 pub(crate) struct JoinStepResult<O> {
     pub(crate) delta_batch: Arc<Vec<(O, i64)>>,
     pub(crate) persisted_handle: Option<ZSetHandle>,
@@ -110,6 +118,7 @@ where
     persist_indexes: bool,
     left_retention: JoinInputRetention,
     right_retention: JoinInputRetention,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<L, R, O, K> JoinOp<L, R, O, K>
@@ -268,6 +277,7 @@ where
             persist_indexes: true,
             left_retention: JoinInputRetention::RetainAll,
             right_retention: JoinInputRetention::RetainAll,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
@@ -389,6 +399,7 @@ where
             persist_indexes: true,
             left_retention: JoinInputRetention::RetainAll,
             right_retention: JoinInputRetention::RetainAll,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
@@ -407,29 +418,41 @@ where
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
     fn join_entries_with_maps(
         &self,
         left: Option<&FastHashMap<L, i64>>,
         right: Option<&FastHashMap<R, i64>>,
         acc: &mut FastHashMap<O, i64>,
-    ) {
+    ) -> JoinMapMetrics {
+        let mut metrics = JoinMapMetrics::default();
         let (Some(left), Some(right)) = (left, right) else {
-            return;
+            return metrics;
         };
         for (lk, lw) in left {
             if *lw == 0 {
                 continue;
             }
+            metrics.left_rows_examined = metrics.left_rows_examined.saturating_add(1);
             for (rk, rw) in right {
                 if *rw == 0 {
                     continue;
                 }
+                metrics.right_rows_examined = metrics.right_rows_examined.saturating_add(1);
+                metrics.candidate_pairs_examined =
+                    metrics.candidate_pairs_examined.saturating_add(1);
                 if (self.predicate)(lk, rk) {
                     let out = (self.projector)(lk, rk);
                     *acc.entry(out).or_insert(0) += lw * rw;
+                    metrics.output_rows = metrics.output_rows.saturating_add(1);
                 }
             }
         }
+        metrics
     }
 
     fn stage_keyed_deltas<T>(
@@ -485,7 +508,7 @@ where
         index_store: &IndexedBatchZSet<K, T>,
         memory_index: &mut FastHashMap<K, FastHashMap<T, i64>>,
         keys: impl Iterator<Item = &K>,
-    ) -> Result<()>
+    ) -> Result<metrics::LogicalWorkSnapshot>
     where
         T: Archive
             + Clone
@@ -497,18 +520,24 @@ where
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
+        let mut work = metrics::LogicalWorkSnapshot::default();
         let mut missing_keys = Vec::new();
         for key in keys {
+            work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
             if !memory_index.contains_key(key) {
                 missing_keys.push(key.clone());
+            } else {
+                work.cache_hits = work.cache_hits.saturating_add(1);
             }
         }
 
         for key in missing_keys {
-            let values = index_store
-                .values_for_key(&key)
+            let (values, lookup_metrics) = index_store
+                .values_for_key_with_metrics(&key)
                 .await
                 .context("load join index entries into memory cache")?;
+            work.state_lookup_rows = work.state_lookup_rows.saturating_add(values.len() as u64);
+            work.add_lookup_metrics(lookup_metrics);
             let mut rows: FastHashMap<T, i64> = FastHashMap::new();
             for (row, weight) in values {
                 if weight == 0 {
@@ -531,26 +560,32 @@ where
             memory_index.insert(key, rows);
         }
 
-        Ok(())
+        Ok(work)
     }
 
     async fn seed_closed_memory_index_for_keys(
         index_store: &IndexedBatchZSet<K, ()>,
         memory_index: &mut FastHashMap<K, i64>,
         keys: impl Iterator<Item = &K>,
-    ) -> Result<()> {
+    ) -> Result<metrics::LogicalWorkSnapshot> {
+        let mut work = metrics::LogicalWorkSnapshot::default();
         let mut missing_keys = Vec::new();
         for key in keys {
+            work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
             if !memory_index.contains_key(key) {
                 missing_keys.push(key.clone());
+            } else {
+                work.cache_hits = work.cache_hits.saturating_add(1);
             }
         }
 
         for key in missing_keys {
-            let values = index_store
-                .values_for_key(&key)
+            let (values, lookup_metrics) = index_store
+                .values_for_key_with_metrics(&key)
                 .await
                 .context("load closed join key entries into memory cache")?;
+            work.state_lookup_rows = work.state_lookup_rows.saturating_add(values.len() as u64);
+            work.add_lookup_metrics(lookup_metrics);
             let weight = values
                 .into_iter()
                 .filter_map(|(_, weight)| (weight != 0).then_some(weight))
@@ -562,7 +597,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(work)
     }
 
     async fn apply_deltas_to_versioned<T>(
@@ -966,8 +1001,20 @@ where
             .context("load right delta for join")?;
             right_loaded.as_ref().as_slice()
         };
+        let mut work = metrics::LogicalWorkSnapshot {
+            input_delta_rows: left_delta_values
+                .len()
+                .saturating_add(right_delta_values.len()) as u64,
+            input_delta_batches: (!left_delta_values.is_empty()) as u64
+                + (!right_delta_values.is_empty()) as u64,
+            left_delta_rows: left_delta_values.len() as u64,
+            right_delta_rows: right_delta_values.len() as u64,
+            ..metrics::LogicalWorkSnapshot::default()
+        };
         let left_keyed = self.stage_keyed_deltas(left_delta_values, &self.left_key);
         let right_keyed = self.stage_keyed_deltas(right_delta_values, &self.right_key);
+        work.left_changed_keys = left_keyed.len() as u64;
+        work.right_changed_keys = right_keyed.len() as u64;
         let left_closed_key_updates = Self::coalesce_closed_key_updates(
             transient_inputs
                 .as_ref()
@@ -980,48 +1027,55 @@ where
         );
 
         if self.persist_indexes {
-            Self::seed_memory_index_for_keys(
-                &self.right_index,
-                &mut self.right_memory_index,
-                left_keyed.keys(),
-            )
-            .await
-            .context("seed right join memory index")?;
+            work.add_assign(
+                Self::seed_memory_index_for_keys(
+                    &self.right_index,
+                    &mut self.right_memory_index,
+                    left_keyed.keys(),
+                )
+                .await
+                .context("seed right join memory index")?,
+            );
             Self::seed_memory_index_for_keys(
                 &self.left_index,
                 &mut self.left_memory_index,
                 right_keyed.keys(),
             )
             .await
-            .context("seed left join memory index")?;
+            .context("seed left join memory index")
+            .map(|seed_work| work.add_assign(seed_work))?;
             Self::seed_memory_index_for_keys(
                 &self.left_index,
                 &mut self.left_memory_index,
                 right_closed_key_updates.keys(),
             )
             .await
-            .context("seed left join memory index for right closed keys")?;
+            .context("seed left join memory index for right closed keys")
+            .map(|seed_work| work.add_assign(seed_work))?;
             Self::seed_memory_index_for_keys(
                 &self.right_index,
                 &mut self.right_memory_index,
                 left_closed_key_updates.keys(),
             )
             .await
-            .context("seed right join memory index for left closed keys")?;
+            .context("seed right join memory index for left closed keys")
+            .map(|seed_work| work.add_assign(seed_work))?;
             Self::seed_closed_memory_index_for_keys(
                 &self.right_closed_index,
                 &mut self.right_closed_memory_index,
                 left_keyed.keys(),
             )
             .await
-            .context("seed right closed join key index")?;
+            .context("seed right closed join key index")
+            .map(|seed_work| work.add_assign(seed_work))?;
             Self::seed_closed_memory_index_for_keys(
                 &self.left_closed_index,
                 &mut self.left_closed_memory_index,
                 right_keyed.keys(),
             )
             .await
-            .context("seed left closed join key index")?;
+            .context("seed left closed join key index")
+            .map(|seed_work| work.add_assign(seed_work))?;
         }
 
         // Build output delta from pre-update state (A, B) and current deltas
@@ -1034,22 +1088,40 @@ where
         // ΔA ⋈ B
         if has_left {
             for (key, left_entries) in &left_keyed {
-                self.join_entries_with_maps(
+                let join_metrics = self.join_entries_with_maps(
                     Some(left_entries),
                     self.right_memory_index.get(key),
                     &mut delta_join,
                 );
+                work.right_state_rows_examined = work
+                    .right_state_rows_examined
+                    .saturating_add(join_metrics.right_rows_examined);
+                work.state_scan_rows = work
+                    .state_scan_rows
+                    .saturating_add(join_metrics.right_rows_examined);
+                work.join_output_rows = work
+                    .join_output_rows
+                    .saturating_add(join_metrics.output_rows);
             }
         }
 
         // A ⋈ ΔB
         if has_right {
             for (key, right_entries) in &right_keyed {
-                self.join_entries_with_maps(
+                let join_metrics = self.join_entries_with_maps(
                     self.left_memory_index.get(key),
                     Some(right_entries),
                     &mut delta_join,
                 );
+                work.left_state_rows_examined = work
+                    .left_state_rows_examined
+                    .saturating_add(join_metrics.left_rows_examined);
+                work.state_scan_rows = work
+                    .state_scan_rows
+                    .saturating_add(join_metrics.left_rows_examined);
+                work.join_output_rows = work
+                    .join_output_rows
+                    .saturating_add(join_metrics.output_rows);
             }
         }
 
@@ -1057,15 +1129,22 @@ where
         if has_left && has_right {
             for (key, left_entries) in &left_keyed {
                 if let Some(right_entries) = right_keyed.get(key) {
-                    self.join_entries_with_maps(
+                    let join_metrics = self.join_entries_with_maps(
                         Some(left_entries),
                         Some(right_entries),
                         &mut delta_join,
                     );
+                    work.delta_delta_rows_examined = work
+                        .delta_delta_rows_examined
+                        .saturating_add(join_metrics.candidate_pairs_examined);
+                    work.join_output_rows = work
+                        .join_output_rows
+                        .saturating_add(join_metrics.output_rows);
                 }
             }
         }
         delta_join.retain(|_, w| *w != 0);
+        work.record_output_delta_rows(delta_join.len());
 
         let left_retained_updates =
             self.retained_left_updates(&left_keyed, &right_keyed, &right_closed_key_updates);
@@ -1091,6 +1170,7 @@ where
 
         if self.persist_indexes {
             let left_updates = Self::flatten_keyed_updates(&left_retained_updates);
+            work.record_persisted_rows(left_updates.len());
             let left_index_persist_start = std::time::Instant::now();
             self.left_index
                 .apply_deltas(left_updates)
@@ -1105,6 +1185,7 @@ where
 
         if self.persist_indexes {
             let right_updates = Self::flatten_keyed_updates(&right_retained_updates);
+            work.record_persisted_rows(right_updates.len());
             let right_index_persist_start = std::time::Instant::now();
             self.right_index
                 .apply_deltas(right_updates)
@@ -1121,6 +1202,7 @@ where
             let left_closed_updates = left_closed_key_updates
                 .iter()
                 .map(|(key, weight)| (key.clone(), (), *weight));
+            work.record_persisted_rows(left_closed_key_updates.len());
             let left_closed_persist_start = std::time::Instant::now();
             self.left_closed_index
                 .apply_deltas(left_closed_updates)
@@ -1137,6 +1219,7 @@ where
             let right_closed_updates = right_closed_key_updates
                 .iter()
                 .map(|(key, weight)| (key.clone(), (), *weight));
+            work.record_persisted_rows(right_closed_key_updates.len());
             let right_closed_persist_start = std::time::Instant::now();
             self.right_closed_index
                 .apply_deltas(right_closed_updates)
@@ -1150,6 +1233,7 @@ where
         }
 
         if delta_join.is_empty() {
+            self.logical_work.finish_tick(work);
             return if persist_output {
                 let empty_handle = self
                     .output
@@ -1170,6 +1254,7 @@ where
                 .integrated
                 .current_handle()
                 .map(|handle| handle.version);
+            work.record_persisted_rows(delta_join.len());
             let new_integrated_handle = Self::apply_deltas_to_versioned(
                 &mut integrated.integrated,
                 &delta_join,
@@ -1193,6 +1278,7 @@ where
                 .output
                 .as_mut()
                 .context("join output persistence requested without configured output zset")?;
+            work.record_persisted_rows(delta_join.len());
             let persisted_handle =
                 Self::apply_deltas_to_versioned(output, &delta_join, None, "output")
                     .await
@@ -1203,6 +1289,7 @@ where
             None
         };
 
+        self.logical_work.finish_tick(work);
         Ok(Some(JoinStepResult {
             delta_batch,
             persisted_handle,
@@ -1274,6 +1361,10 @@ where
                 .persisted_handle
                 .context("join step persisted without output handle")?,
         ))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::SchemaRef;
+use dbsp::LogicalWorkSnapshot;
 use dbsp::RowSchema;
 use dbsp::StreamRetention;
 use dbsp::collections::CompactionPolicy;
@@ -1475,10 +1476,17 @@ impl DbspGraphBuilder {
     ) -> Result<()> {
         let ts_u64 = u64::try_from(ts.max(0)).unwrap_or(u64::MAX);
         if merged.is_empty() {
+            registry.record_logical_work(
+                ts,
+                LogicalWorkSnapshot::from_input_delta_rows(apply.delta_rows),
+            );
             registry.publish_logical_version(ts);
             registry.advance_authoritative_row_count_version(ts_u64);
             return Ok(());
         }
+        let mut work = LogicalWorkSnapshot::from_input_delta_rows(apply.delta_rows);
+        work.record_output_delta_rows(merged.len());
+        registry.record_logical_work(ts, work);
         let apply_stats = registry.append_shared_encoded_overlay_batch(ts_u64, Arc::clone(&merged));
         registry
             .apply_encoded_state_batch(ts_u64, merged.as_slice())
@@ -1716,6 +1724,9 @@ impl DbspGraphBuilder {
                     .apply_encoded_state_batch(version, deltas.as_ref())
                     .context("update authoritative materialized view state cache")?;
             }
+            let mut work = LogicalWorkSnapshot::from_input_delta_rows(apply.delta_rows);
+            work.record_output_delta_rows(deltas.len());
+            registry.record_logical_work(i64::try_from(version).unwrap_or(i64::MAX), work);
         }
         if !deltas.is_empty() {
             // Transient segment outputs are already batch-transformed; feed rows straight

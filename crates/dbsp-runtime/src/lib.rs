@@ -48,6 +48,7 @@ pub use incremental_aggregate::{
     TransientIncrementalAggregateInputWeight, TransientIncrementalAggregateSnapshot,
 };
 pub use join::DbspJoin;
+pub use metrics::{LogicalWorkCollector, LogicalWorkSnapshot};
 pub use operator_state_registry::{
     OperatorStateHandle, install_operator_state_restore, snapshot_operator_states,
 };

@@ -29,6 +29,43 @@ async fn arrow_indexed_lookup_aggregates_weights() {
 }
 
 #[tokio::test]
+async fn arrow_indexed_lookup_reports_index_work() {
+    let table = build_table("arrow-indexed-lookup-metrics").await;
+    let index = IndexedBatchZSet::<i64, i64>::new(table, "arrow_indexed_lookup_metrics");
+    index
+        .apply_deltas(vec![(1, 10, 1), (2, 20, 1)])
+        .await
+        .expect("apply first segment");
+    index
+        .apply_deltas(vec![(1, 11, 1)])
+        .await
+        .expect("apply second segment");
+
+    let (mut values, first_metrics) = index
+        .values_for_key_with_metrics(&1)
+        .await
+        .expect("first lookup");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1), (11, 1)]);
+    assert_eq!(first_metrics.lookup_keys, 1);
+    assert_eq!(first_metrics.returned_rows, 2);
+    assert_eq!(first_metrics.index_segments_examined, 2);
+    assert_eq!(first_metrics.index_postings_examined, 2);
+    assert_eq!(first_metrics.cache_hits, 0);
+    assert_eq!(first_metrics.cache_misses, 1);
+
+    let (_values, second_metrics) = index
+        .values_for_key_with_metrics(&1)
+        .await
+        .expect("cached lookup");
+    assert_eq!(second_metrics.lookup_keys, 1);
+    assert_eq!(second_metrics.index_segments_examined, 0);
+    assert_eq!(second_metrics.index_postings_examined, 0);
+    assert_eq!(second_metrics.cache_hits, 1);
+    assert_eq!(second_metrics.cache_misses, 0);
+}
+
+#[tokio::test]
 async fn arrow_indexed_cache_stays_consistent_across_updates() {
     let table = build_table("arrow-indexed-cache").await;
     let index = IndexedBatchZSet::<i64, i64>::new(table, "arrow_indexed_cache");

@@ -57,6 +57,7 @@ where
     key_parts: BatchKeyPartsFn<K, P, O>,
     limit: usize,
     offset: usize,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, P, O> TopNOp<K, P, O>
@@ -128,6 +129,7 @@ where
             key_parts,
             limit,
             offset,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
 
@@ -139,9 +141,14 @@ where
         self.output.enable_replayable_persistence();
     }
 
-    async fn ensure_input_cache(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
+    }
+
+    async fn ensure_input_cache(&mut self) -> Result<usize> {
         if self.input_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut materialized = self
@@ -151,8 +158,9 @@ where
             .await
             .context("materialize topn input state")?;
         materialized.retain(|_, weight| *weight != 0);
+        let rebuild_rows = materialized.len();
         self.input_cache = Some(materialized);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     fn compute_partition_topn(&self, partition_index: &BTreeMap<(O, K), i64>) -> HashMap<K, i64> {
@@ -192,15 +200,16 @@ where
         output
     }
 
-    async fn ensure_order_index(&mut self) -> Result<()> {
+    async fn ensure_order_index(&mut self) -> Result<usize> {
         if self.order_index.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let input_cache = self
             .input_cache
             .as_ref()
             .context("topn input cache missing while building order index")?;
+        let rebuild_rows = input_cache.len();
         let entries: Vec<(K, i64)> = input_cache
             .iter()
             .map(|(key, weight)| (key.clone(), *weight))
@@ -219,7 +228,7 @@ where
             }
         }
         self.order_index = Some(index);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     fn keys_for(&mut self, key: &K) -> (Option<P>, Option<O>) {
@@ -372,14 +381,26 @@ where
             delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, &delta_handle)
                 .await
                 .context("load delta for topn")?;
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
 
         if delta_values.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        self.ensure_input_cache()
+        let input_cache_rebuild_rows = self
+            .ensure_input_cache()
             .await
             .context("load topn input cache")?;
+        if input_cache_rebuild_rows != 0 {
+            work.cache_rebuild_rows = work
+                .cache_rebuild_rows
+                .saturating_add(input_cache_rebuild_rows as u64);
+            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(input_cache_rebuild_rows as u64);
+        }
 
         let mut delta_map = HashMap::new();
         for (key, diff_weight) in delta_values.iter() {
@@ -391,12 +412,23 @@ where
         }
 
         if delta_map.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
-        self.ensure_order_index()
+        let order_index_rebuild_rows = self
+            .ensure_order_index()
             .await
             .context("build topn order index")?;
+        if order_index_rebuild_rows != 0 {
+            work.cache_rebuild_rows = work
+                .cache_rebuild_rows
+                .saturating_add(order_index_rebuild_rows as u64);
+            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(order_index_rebuild_rows as u64);
+        }
 
         let mut cache_updates = Vec::new();
         for (key, diff_weight, partition_key, order_key) in self.keys_for_delta_map(&delta_map) {
@@ -423,6 +455,7 @@ where
         )
         .await
         .context("update topn input state")?;
+        work.record_persisted_rows(delta_map.len());
         self.state.update_handle(new_integrated_handle);
 
         if let Some(input_cache) = self.input_cache.as_mut() {
@@ -491,6 +524,7 @@ where
             }
             self.order_index = Some(order_index);
         }
+        work.changed_partitions = affected_partitions.len() as u64;
         for key in cache_prune {
             self.row_key_cache.remove(&key);
         }
@@ -501,6 +535,11 @@ where
             .context("topn order index missing after update")?;
         let mut output_delta = HashMap::new();
         for partition_key in affected_partitions {
+            if let Some(partition_index) = order_index.get(&partition_key) {
+                work.partition_rows_examined = work
+                    .partition_rows_examined
+                    .saturating_add(partition_index.len() as u64);
+            }
             let old_partition_output = self
                 .partition_output_cache
                 .get(&partition_key)
@@ -538,18 +577,27 @@ where
         }
 
         if output_delta.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.replacement_rows = output_delta.len() as u64;
+        work.record_output_delta_rows(output_delta.len());
 
         let output_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &output_delta, None, "output")
                 .await
                 .context("persist topn output delta")?;
+        work.record_persisted_rows(output_delta.len());
         publish_transient_zset_batch(
             &output_handle,
             Arc::new(output_delta.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(output_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -1073,5 +1121,91 @@ mod tests {
             .await
             .expect("materialize output t2");
         assert_eq!(out2_materialized, HashMap::from([(11, -1), (31, 1)]));
+    }
+
+    async fn run_topn_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {
+        let db = build_db().await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+        let input_ns = format!("topn_history_{history_rows}_input");
+        let output_ns = format!("topn_history_{history_rows}_output");
+        let state_ns = format!("topn_history_{history_rows}_state");
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .expect("output dict"),
+        );
+        let state_dict = Arc::new(
+            Dictionary::<i64>::with_table(table.clone(), state_ns.clone(), None)
+                .await
+                .expect("state dict"),
+        );
+
+        let state = RelationState {
+            integrated: VersionedZSet::new(state_dict, table.clone(), state_ns.clone())
+                .await
+                .expect("integrated state"),
+            latest_handle: ZSetHandle {
+                ns: state_ns,
+                version: 0,
+            },
+        };
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+            .await
+            .expect("output");
+        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value / 100));
+        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
+            Arc::new(|value| Some(*value % 100));
+        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+
+        let mut history = (0..history_rows)
+            .map(|idx| ((10_000 + idx) * 100, 1))
+            .collect::<Vec<_>>();
+        history.push((102, 1));
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, &[seed]).await.expect("seed topn history");
+
+        let fixed = stage_version(input_dict, table.clone(), &input_ns, &[(101, 1)]).await;
+        let output = op
+            .on_step(2, &[fixed])
+            .await
+            .expect("fixed topn history")
+            .expect("topn output");
+        let mut cache = HashMap::new();
+        cache.insert(output_ns, output_dict);
+        let materialized = materialize_zset_handle::<i64>(table, &mut cache, &output)
+            .await
+            .expect("materialize fixed topn");
+        assert_eq!(materialized, HashMap::from([(102, -1), (101, 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn topn_logical_work_uses_changed_partitions() {
+        let baseline = run_topn_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_topn_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_partitions, baseline.changed_partitions);
+            assert_eq!(
+                actual.partition_rows_examined,
+                baseline.partition_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_partitions, 1);
+        assert_eq!(baseline.partition_rows_examined, 2);
+        assert_eq!(baseline.output_delta_rows, 2);
+        assert_eq!(baseline.replacement_rows, 2);
     }
 }

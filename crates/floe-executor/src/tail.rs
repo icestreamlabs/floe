@@ -379,6 +379,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tail_delta_output_is_bounded_by_delta_not_snapshot_size() -> PgResult<()> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("tail-delta-bounded", store).await.expect("db"));
+        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
+        let mut dbsp_view = bridge
+            .new_view(
+                "mv_tail_delta_bounded",
+                StreamRetention::KeepLast { keep_last: 1 },
+            )
+            .await?;
+
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_tail_delta_bounded", build_schema());
+        let handle = registry.register("mv_tail_delta_bounded");
+
+        let initial_values = (0..100).collect::<Vec<_>>();
+        let handle1 = append_version(&mut dbsp_view, &initial_values).await?;
+        let latest_view = dbsp_view.latest_handle_view();
+        let (dict, table, ns, version) = latest_view.into_parts();
+        let state = DbspPersistedState::new(dict, table, ns, version);
+        handle.set_dbsp_state(state);
+        let handle1_version = handle1.version as i64;
+        handle.publish_version(handle1_version, handle1);
+
+        let ctx = SessionContext::new();
+        let params = TailParams {
+            mv_name: "mv_tail_delta_bounded".to_string(),
+            with_snapshot: false,
+            as_of: Some(handle1_version),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_tail(&ctx, registry.as_ref(), params, cancel.clone()).await?;
+
+        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (101, 1)]).await?;
+        let handle2_version = handle2.version as i64;
+        handle.publish_version(handle2_version, handle2);
+
+        let batch = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for bounded delta batch")
+            .expect("expected delta batch")?;
+        assert_eq!(batch.version, handle2_version);
+        assert_eq!(batch.batch.num_rows(), 2);
+        assert_eq!(batch.ops.len(), 2);
+        assert!(batch.ops.contains(&-1));
+        assert!(batch.ops.contains(&1));
+
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tail_emits_empty_batch_for_published_noop_version() -> PgResult<()> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("tail-empty-version", store).await.expect("db"));

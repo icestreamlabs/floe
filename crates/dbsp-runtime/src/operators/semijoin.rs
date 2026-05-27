@@ -13,6 +13,7 @@ use slatedb::WriteBatch;
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;
+use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
@@ -80,6 +81,7 @@ where
     output: VersionedZSet<L>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<L, R, K> SemiJoinOp<L, R, K>
@@ -177,7 +179,13 @@ where
             output,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
     }
 
     fn keyed_deltas<T>(
@@ -353,24 +361,42 @@ where
         )
         .await
         .context("load right delta for semijoin")?;
+        let mut work = metrics::LogicalWorkSnapshot {
+            input_delta_rows: left_delta_values
+                .len()
+                .saturating_add(right_delta_values.len()) as u64,
+            input_delta_batches: (!left_delta_values.is_empty()) as u64
+                + (!right_delta_values.is_empty()) as u64,
+            left_delta_rows: left_delta_values.len() as u64,
+            right_delta_rows: right_delta_values.len() as u64,
+            ..metrics::LogicalWorkSnapshot::default()
+        };
 
         let left_delta = self.coalesce_deltas(left_delta_values.as_ref().clone());
         let right_delta = self.coalesce_deltas(right_delta_values.as_ref().clone());
 
         if left_delta.is_empty() && right_delta.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
         let left_keyed = self.keyed_deltas(&left_delta, &self.left_key);
         let right_keyed = self.keyed_deltas(&right_delta, &self.right_key);
+        work.left_changed_keys = left_keyed.len() as u64;
+        work.right_changed_keys = right_keyed.len() as u64;
 
         let mut right_presence = HashMap::<K, (bool, bool)>::new();
         for (key, entries) in &right_keyed {
-            let existing = self
+            let (existing, lookup_metrics) = self
                 .right_index
-                .values_for_key(key)
+                .values_for_key_with_metrics(key)
                 .await
                 .context("load right index for semijoin")?;
+            work.add_lookup_metrics(lookup_metrics);
+            work.right_state_rows_examined = work
+                .right_state_rows_examined
+                .saturating_add(existing.len() as u64);
+            work.state_scan_rows = work.state_scan_rows.saturating_add(existing.len() as u64);
             let mut current_count = existing.into_iter().map(|(_, weight)| weight).sum::<i64>();
             let prev_present = current_count != 0;
             for (_, delta) in entries {
@@ -385,11 +411,16 @@ where
             if self.mode.active(*prev_present) == self.mode.active(*new_present) {
                 continue;
             }
-            let entries = self
+            let (entries, lookup_metrics) = self
                 .left_index
-                .values_for_key(key)
+                .values_for_key_with_metrics(key)
                 .await
                 .context("load left index for semijoin")?;
+            work.add_lookup_metrics(lookup_metrics);
+            work.left_state_rows_examined = work
+                .left_state_rows_examined
+                .saturating_add(entries.len() as u64);
+            work.state_scan_rows = work.state_scan_rows.saturating_add(entries.len() as u64);
             if !entries.is_empty() {
                 left_prev_by_key.insert(key.clone(), entries);
             }
@@ -400,10 +431,19 @@ where
             let right_present = match right_presence.get(key) {
                 Some((_, new_present)) => *new_present,
                 None => {
-                    self.right_index
-                        .values_for_key(key)
+                    let (right_values, lookup_metrics) = self
+                        .right_index
+                        .values_for_key_with_metrics(key)
                         .await
-                        .context("load right index for semijoin probe")?
+                        .context("load right index for semijoin probe")?;
+                    work.add_lookup_metrics(lookup_metrics);
+                    work.right_state_rows_examined = work
+                        .right_state_rows_examined
+                        .saturating_add(right_values.len() as u64);
+                    work.state_scan_rows = work
+                        .state_scan_rows
+                        .saturating_add(right_values.len() as u64);
+                    right_values
                         .into_iter()
                         .map(|(_, weight)| weight)
                         .sum::<i64>()
@@ -414,6 +454,7 @@ where
                 for (row, weight) in entries {
                     let entry = output_deltas.entry(row.clone()).or_insert(0);
                     *entry += *weight;
+                    work.join_output_rows = work.join_output_rows.saturating_add(1);
                     if *entry == 0 {
                         output_deltas.remove(row);
                     }
@@ -432,6 +473,7 @@ where
                 for (row, weight) in entries {
                     let entry = output_deltas.entry(row.clone()).or_insert(0);
                     *entry += multiplier * *weight;
+                    work.join_output_rows = work.join_output_rows.saturating_add(1);
                     if *entry == 0 {
                         output_deltas.remove(row);
                     }
@@ -451,6 +493,7 @@ where
         )
         .await
         .context("update left integrated state")?;
+        work.record_persisted_rows(left_delta.len());
         self.left_state.update_handle(new_left_handle);
 
         let mut left_updates = Vec::new();
@@ -464,6 +507,7 @@ where
                 .apply_deltas(left_updates)
                 .await
                 .context("update left semijoin index")?;
+            work.record_persisted_rows(left_keyed.values().map(Vec::len).sum::<usize>());
         }
 
         let mut right_updates = Vec::new();
@@ -477,11 +521,14 @@ where
                 .apply_deltas(right_updates)
                 .await
                 .context("update right semijoin index")?;
+            work.record_persisted_rows(right_keyed.values().map(Vec::len).sum::<usize>());
         }
 
         if output_deltas.is_empty() {
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.record_output_delta_rows(output_deltas.len());
 
         if let Some(integrated) = &mut self.integrated {
             let base = integrated
@@ -492,17 +539,24 @@ where
                 Self::apply_deltas_to_versioned(&mut integrated.integrated, &output_deltas, base)
                     .await
                     .context("update integrated semijoin state")?;
+            work.record_persisted_rows(output_deltas.len());
             integrated.update_handle(new_integrated_handle);
         }
 
         let delta_handle = Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None)
             .await
             .context("persist semijoin delta output")?;
+        work.record_persisted_rows(output_deltas.len());
         publish_transient_zset_batch(
             &delta_handle,
             Arc::new(output_deltas.into_iter().collect::<Vec<_>>()),
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(delta_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -779,5 +833,161 @@ mod tests {
     #[tokio::test]
     async fn antijoin_operator_matches_recompute() {
         run_semijoin_case(SemiJoinMode::Anti).await;
+    }
+
+    async fn run_semijoin_history_probe(
+        mode: SemiJoinMode,
+        history_rows: i64,
+    ) -> metrics::LogicalWorkSnapshot {
+        let suffix = next_test_suffix();
+        let db = build_db(suffix).await;
+        let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
+
+        let prefix = format!("semijoin_history_{mode:?}_{history_rows}_{suffix}");
+        let left_stream_ns = format!("{prefix}_left_stream");
+        let right_stream_ns = format!("{prefix}_right_stream");
+        let output_ns = format!("{prefix}_output");
+
+        let left_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), left_stream_ns.clone(), None)
+                .await
+                .expect("left dict"),
+        );
+        let right_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), right_stream_ns.clone(), None)
+                .await
+                .expect("right dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<Row>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .expect("output dict"),
+        );
+
+        let left_state = RelationState::empty(table.clone(), format!("{prefix}_left_state"))
+            .await
+            .expect("left state");
+        let right_state = RelationState::empty(table.clone(), format!("{prefix}_right_state"))
+            .await
+            .expect("right state");
+        let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
+            .await
+            .expect("output zset");
+
+        let mut op = SemiJoinOp::new(
+            left_state,
+            right_state,
+            IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
+            IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
+            Arc::new(|row: &Row| Some(row.0)),
+            Arc::new(|row: &Row| Some(row.0)),
+            mode,
+            table.clone(),
+            output,
+            None,
+        );
+
+        let left_history = (0..history_rows)
+            .map(|idx| ((1_000_000 + idx, idx), 1))
+            .collect::<Vec<_>>();
+        let mut right_history = (0..history_rows)
+            .map(|idx| ((2_000_000 + idx, idx), 1))
+            .collect::<Vec<_>>();
+        if mode == SemiJoinMode::Semi {
+            right_history.push(((7, 700), 1));
+        }
+
+        let left_seed = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            &left_stream_ns,
+            &left_history,
+        )
+        .await;
+        let right_seed = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            &right_stream_ns,
+            &right_history,
+        )
+        .await;
+        op.on_step(1, &[left_seed, right_seed])
+            .await
+            .expect("seed semijoin");
+
+        let fixed_left =
+            stage_version(left_dict, table.clone(), &left_stream_ns, &[((7, 701), 1)]).await;
+        let out = op
+            .on_step(
+                2,
+                &[
+                    fixed_left,
+                    ZSetHandle {
+                        ns: right_stream_ns,
+                        version: 0,
+                    },
+                ],
+            )
+            .await
+            .expect("fixed semijoin")
+            .expect("semijoin output");
+        let mut cache = HashMap::new();
+        cache.insert(output_ns, output_dict);
+        let materialized = materialize_zset_handle::<Row>(table, &mut cache, &out)
+            .await
+            .expect("materialize semijoin fixed output");
+        assert_eq!(materialized, HashMap::from([((7, 701), 1)]));
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn semijoin_logical_work_is_independent_of_unrelated_history() {
+        let baseline = run_semijoin_history_probe(SemiJoinMode::Semi, 8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_semijoin_history_probe(SemiJoinMode::Semi, history_rows).await;
+            assert_eq!(actual.left_delta_rows, baseline.left_delta_rows);
+            assert_eq!(actual.right_delta_rows, baseline.right_delta_rows);
+            assert_eq!(actual.left_changed_keys, baseline.left_changed_keys);
+            assert_eq!(
+                actual.right_state_rows_examined,
+                baseline.right_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_scan_rows, baseline.state_scan_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+        }
+
+        assert_eq!(baseline.left_delta_rows, 1);
+        assert_eq!(baseline.right_delta_rows, 0);
+        assert_eq!(baseline.left_changed_keys, 1);
+        assert_eq!(baseline.right_state_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
+        assert_eq!(baseline.state_scan_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn antijoin_logical_work_is_independent_of_unrelated_history() {
+        let baseline = run_semijoin_history_probe(SemiJoinMode::Anti, 8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_semijoin_history_probe(SemiJoinMode::Anti, history_rows).await;
+            assert_eq!(actual.left_delta_rows, baseline.left_delta_rows);
+            assert_eq!(actual.right_delta_rows, baseline.right_delta_rows);
+            assert_eq!(actual.left_changed_keys, baseline.left_changed_keys);
+            assert_eq!(
+                actual.right_state_rows_examined,
+                baseline.right_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_scan_rows, baseline.state_scan_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+        }
+
+        assert_eq!(baseline.left_delta_rows, 1);
+        assert_eq!(baseline.right_delta_rows, 0);
+        assert_eq!(baseline.left_changed_keys, 1);
+        assert_eq!(baseline.right_state_rows_examined, 0);
+        assert_eq!(baseline.output_delta_rows, 1);
+        assert_eq!(baseline.state_scan_rows, 0);
     }
 }

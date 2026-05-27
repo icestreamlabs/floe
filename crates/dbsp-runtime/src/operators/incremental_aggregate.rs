@@ -248,6 +248,7 @@ where
     distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
     input_index: Option<IndexedBatchZSet<K, V>>,
     append_only_input: bool,
+    logical_work: metrics::LogicalWorkCollector,
 }
 
 impl<K, V> IncrementalAggregateOp<K, V>
@@ -320,7 +321,13 @@ where
             distinct_index,
             input_index,
             append_only_input: false,
+            logical_work: metrics::LogicalWorkCollector::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
+        self.logical_work.last_tick()
     }
 
     pub fn enable_live_output_replayable(&mut self) {
@@ -340,9 +347,9 @@ where
         })
     }
 
-    async fn ensure_state_cache(&mut self) -> Result<()> {
+    async fn ensure_state_cache(&mut self) -> Result<usize> {
         if self.state_cache.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         let materialized = self
@@ -352,13 +359,14 @@ where
             .await
             .context("materialize incremental aggregate integrated state")?;
         let mut cache = HashMap::new();
+        let rebuild_rows = materialized.len();
         for ((key, aggregate), weight) in materialized {
             if weight != 0 {
                 cache.insert(key, aggregate);
             }
         }
         self.state_cache = Some(cache);
-        Ok(())
+        Ok(rebuild_rows)
     }
 
     pub(crate) async fn snapshot_grouped_state(
@@ -591,6 +599,14 @@ where
     pub async fn apply_delta_values(
         &mut self,
         delta_values: &[(V, i64)],
+    ) -> Result<HashMap<(K, Vec<AggregateValue>), i64>> {
+        self.apply_delta_values_with_work(delta_values, None).await
+    }
+
+    async fn apply_delta_values_with_work(
+        &mut self,
+        delta_values: &[(V, i64)],
+        mut logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
     ) -> Result<HashMap<(K, Vec<AggregateValue>), i64>> {
         let total_start = Instant::now();
         if delta_values.is_empty() {
@@ -841,11 +857,18 @@ where
             );
             return Ok(HashMap::new());
         }
+        if let Some(work) = logical_work.as_deref_mut() {
+            work.changed_groups = affected_keys.len() as u64;
+            work.distinct_aux_rows_examined = distinct_deltas.len() as u64;
+        }
 
         if let Some(input_index) = self.input_index.as_ref()
             && !index_updates.is_empty()
         {
             let input_index_start = Instant::now();
+            if let Some(work) = logical_work.as_deref_mut() {
+                work.record_persisted_rows(index_updates.len());
+            }
             input_index
                 .apply_deltas(index_updates)
                 .await
@@ -879,6 +902,12 @@ where
                     .value_weight_for_key_value(&distinct_key, &distinct_value)
                     .await
                     .context("load incremental aggregate distinct multiplicity")?;
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
+                    work.state_lookup_rows = work
+                        .state_lookup_rows
+                        .saturating_add((old_weight != 0) as u64);
+                }
                 let index_delta = if self.append_only_input {
                     if old_weight > 0 { 0 } else { 1 }
                 } else {
@@ -898,6 +927,9 @@ where
                 }
             }
             if !distinct_updates.is_empty() {
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.record_persisted_rows(distinct_updates.len());
+                }
                 distinct_index
                     .apply_deltas(distinct_updates)
                     .await
@@ -912,9 +944,19 @@ where
         }
 
         let ensure_cache_start = Instant::now();
-        self.ensure_state_cache()
+        let cache_rebuild_rows = self
+            .ensure_state_cache()
             .await
             .context("load incremental aggregate cache")?;
+        if cache_rebuild_rows != 0
+            && let Some(work) = logical_work.as_deref_mut()
+        {
+            work.cache_rebuild_rows = cache_rebuild_rows as u64;
+            work.state_full_scan_count = 1;
+            work.state_scan_rows = work
+                .state_scan_rows
+                .saturating_add(cache_rebuild_rows as u64);
+        }
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
             "step",
@@ -936,8 +978,16 @@ where
 
             for key in affected_keys {
                 let old_state = state_cache.get(&key).cloned();
+                if let Some(work) = logical_work.as_deref_mut() {
+                    work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
+                    work.state_lookup_rows = work
+                        .state_lookup_rows
+                        .saturating_add(old_state.is_some() as u64);
+                    work.group_state_rows_examined =
+                        work.group_state_rows_examined.saturating_add(1);
+                }
                 let new_state = if recompute_keys.contains(&key) {
-                    self.recompute_group_state(&key)
+                    self.recompute_group_state(&key, logical_work.as_deref_mut())
                         .await
                         .context("recompute incremental aggregate state for key")?
                 } else {
@@ -1112,6 +1162,10 @@ where
         )
         .await
         .context("update incremental aggregate integrated state")?;
+        if let Some(work) = logical_work {
+            work.record_persisted_rows(state_deltas.len());
+            work.aggregate_state_rows_updated = cache_updates.len() as u64;
+        }
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
             "step",
@@ -1240,15 +1294,22 @@ where
     async fn recompute_group_state(
         &self,
         key: &K,
+        logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
     ) -> Result<Option<GroupedIncrementalAggregateState>> {
         let input_index = self
             .input_index
             .as_ref()
             .context("incremental aggregate input index missing during recompute")?;
-        let values = input_index
-            .values_for_key(key)
+        let (values, lookup_metrics) = input_index
+            .values_for_key_with_metrics(key)
             .await
             .context("load incremental aggregate input values for recompute")?;
+        if let Some(work) = logical_work {
+            work.add_lookup_metrics(lookup_metrics);
+            work.extrema_rebuild_rows = work
+                .extrema_rebuild_rows
+                .saturating_add(values.len() as u64);
+        }
 
         if values.is_empty() {
             return Ok(None);
@@ -1344,9 +1405,12 @@ where
             "load_delta",
             load_delta_start.elapsed().as_millis() as u64,
         );
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(delta_values.len());
 
         let apply_values_start = Instant::now();
-        let output_deltas = self.apply_delta_values(delta_values.as_ref()).await?;
+        let output_deltas = self
+            .apply_delta_values_with_work(delta_values.as_ref(), Some(&mut work))
+            .await?;
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
             "step",
@@ -1360,14 +1424,17 @@ where
                 "on_step_total",
                 step_start.elapsed().as_millis() as u64,
             );
+            self.logical_work.finish_tick(work);
             return Ok(Some(self.output.handle_for_version(0)));
         }
+        work.record_output_delta_rows(output_deltas.len());
 
         let persist_output_start = Instant::now();
         let delta_handle =
             Self::apply_deltas_to_versioned(&mut self.output, &output_deltas, None, "output")
                 .await
                 .context("persist incremental aggregate output delta")?;
+        work.record_persisted_rows(output_deltas.len());
         metrics::observe_operator_phase_latency_ms(
             "incremental_aggregate",
             "step",
@@ -1384,7 +1451,12 @@ where
             "on_step_total",
             step_start.elapsed().as_millis() as u64,
         );
+        self.logical_work.finish_tick(work);
         Ok(Some(delta_handle))
+    }
+
+    fn logical_work(&self) -> Option<metrics::LogicalWorkSnapshot> {
+        Some(self.logical_work.last_tick())
     }
 }
 
@@ -1786,5 +1858,242 @@ mod tests {
                 (AggregateValue::Utf8("b".to_string()), 1),
             ]
         );
+    }
+
+    async fn run_incremental_count_history_probe(
+        history_rows: i64,
+    ) -> metrics::LogicalWorkSnapshot {
+        let table = build_table(&format!("incremental-count-history-{history_rows}")).await;
+        let input_ns = format!("incremental_count_history_{history_rows}_input");
+        let state_ns = format!("incremental_count_history_{history_rows}_state");
+        let output_ns = format!("incremental_count_history_{history_rows}_output");
+        let input_dict = Arc::new(
+            Dictionary::<AggregateRow>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("create incremental count history input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            state_ns,
+        )
+        .await
+        .expect("create incremental count history state");
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<(i64, Vec<AggregateValue>)>::with_table(
+                    table.clone(),
+                    output_ns.clone(),
+                    None,
+                )
+                .await
+                .expect("create incremental count history output dictionary"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("create incremental count history output");
+
+        let mut op = IncrementalAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &AggregateRow| {
+                Some(IncrementalAggregateRow {
+                    key: row.group_key,
+                    slots: vec![IncrementalAggregateSlotUpdate::Count(1)],
+                })
+            }),
+            output,
+            vec![IncrementalAggregateSlotKind::Count],
+            None,
+            None,
+        );
+
+        let history = (0..history_rows)
+            .map(|idx| {
+                (
+                    AggregateRow {
+                        group_key: 1_000_000 + idx,
+                        price: Some(idx),
+                        category: format!("h{idx}"),
+                    },
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, std::slice::from_ref(&seed))
+            .await
+            .expect("seed incremental count history");
+
+        let fixed = AggregateRow {
+            group_key: 7,
+            price: Some(70),
+            category: "fixed".to_string(),
+        };
+        let fixed_delta = stage_version(input_dict, table.clone(), &input_ns, &[(fixed, 1)]).await;
+        let output = op
+            .on_step(2, std::slice::from_ref(&fixed_delta))
+            .await
+            .expect("fixed incremental count history")
+            .expect("incremental count output");
+        let mut cache = HashMap::new();
+        let materialized =
+            materialize_zset_handle::<(i64, Vec<AggregateValue>)>(table, &mut cache, &output)
+                .await
+                .expect("materialize incremental count history output");
+        assert_eq!(
+            materialized,
+            HashMap::from([((7, vec![AggregateValue::Int64(1)]), 1)])
+        );
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn incremental_count_logical_work_uses_changed_groups() {
+        let baseline = run_incremental_count_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_incremental_count_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_groups, baseline.changed_groups);
+            assert_eq!(
+                actual.group_state_rows_examined,
+                baseline.group_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_groups, 1);
+        assert_eq!(baseline.group_state_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
+    }
+
+    async fn run_incremental_count_distinct_history_probe(
+        history_rows: i64,
+    ) -> metrics::LogicalWorkSnapshot {
+        let table = build_table(&format!(
+            "incremental-count-distinct-history-{history_rows}"
+        ))
+        .await;
+        let input_ns = format!("incremental_count_distinct_history_{history_rows}_input");
+        let state_ns = format!("incremental_count_distinct_history_{history_rows}_state");
+        let output_ns = format!("incremental_count_distinct_history_{history_rows}_output");
+        let input_dict = Arc::new(
+            Dictionary::<AggregateRow>::with_table(table.clone(), input_ns.clone(), None)
+                .await
+                .expect("create incremental distinct history input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            state_ns,
+        )
+        .await
+        .expect("create incremental distinct history state");
+        let output = VersionedZSet::new(
+            Arc::new(
+                Dictionary::<(i64, Vec<AggregateValue>)>::with_table(
+                    table.clone(),
+                    output_ns.clone(),
+                    None,
+                )
+                .await
+                .expect("create incremental distinct history output dictionary"),
+            ),
+            table.clone(),
+            output_ns,
+        )
+        .await
+        .expect("create incremental distinct history output");
+
+        let mut op = IncrementalAggregateOp::new(
+            state,
+            table.clone(),
+            Arc::new(|row: &AggregateRow| {
+                Some(IncrementalAggregateRow {
+                    key: row.group_key,
+                    slots: vec![IncrementalAggregateSlotUpdate::Value(Some(
+                        AggregateValue::Utf8(row.category.clone()),
+                    ))],
+                })
+            }),
+            output,
+            vec![IncrementalAggregateSlotKind::CountDistinct],
+            Some(IndexedBatchZSet::new(
+                table.clone(),
+                format!("incremental_count_distinct_history_{history_rows}_index"),
+            )),
+            None,
+        );
+
+        let history = (0..history_rows)
+            .map(|idx| {
+                (
+                    AggregateRow {
+                        group_key: 1_000_000 + idx,
+                        price: Some(idx),
+                        category: format!("h{idx}"),
+                    },
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed = stage_version(input_dict.clone(), table.clone(), &input_ns, &history).await;
+        op.on_step(1, std::slice::from_ref(&seed))
+            .await
+            .expect("seed incremental distinct history");
+
+        let fixed = AggregateRow {
+            group_key: 7,
+            price: Some(70),
+            category: "fixed".to_string(),
+        };
+        let fixed_delta = stage_version(input_dict, table.clone(), &input_ns, &[(fixed, 1)]).await;
+        let output = op
+            .on_step(2, std::slice::from_ref(&fixed_delta))
+            .await
+            .expect("fixed incremental distinct history")
+            .expect("incremental distinct output");
+        let mut cache = HashMap::new();
+        let materialized =
+            materialize_zset_handle::<(i64, Vec<AggregateValue>)>(table, &mut cache, &output)
+                .await
+                .expect("materialize incremental distinct history output");
+        assert_eq!(
+            materialized,
+            HashMap::from([((7, vec![AggregateValue::Int64(1)]), 1)])
+        );
+
+        op.last_logical_work()
+    }
+
+    #[tokio::test]
+    async fn incremental_count_distinct_logical_work_uses_changed_groups() {
+        let baseline = run_incremental_count_distinct_history_probe(8).await;
+        for history_rows in [128, 1024] {
+            let actual = run_incremental_count_distinct_history_probe(history_rows).await;
+            assert_eq!(actual.input_delta_rows, baseline.input_delta_rows);
+            assert_eq!(actual.changed_groups, baseline.changed_groups);
+            assert_eq!(
+                actual.distinct_aux_rows_examined,
+                baseline.distinct_aux_rows_examined
+            );
+            assert_eq!(
+                actual.group_state_rows_examined,
+                baseline.group_state_rows_examined
+            );
+            assert_eq!(actual.output_delta_rows, baseline.output_delta_rows);
+            assert_eq!(actual.state_full_scan_count, 0);
+            assert_eq!(actual.cache_rebuild_rows, 0);
+        }
+
+        assert_eq!(baseline.input_delta_rows, 1);
+        assert_eq!(baseline.changed_groups, 1);
+        assert_eq!(baseline.distinct_aux_rows_examined, 1);
+        assert_eq!(baseline.group_state_rows_examined, 1);
+        assert_eq!(baseline.output_delta_rows, 1);
     }
 }
