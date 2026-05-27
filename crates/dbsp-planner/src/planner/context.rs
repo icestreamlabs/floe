@@ -767,6 +767,7 @@ impl<'cfg> PlannerContext<'cfg> {
                 "joins must have at least one equi-key".to_string(),
             ));
         }
+        let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
 
         let residual = combine_filters(residuals);
         if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
@@ -1699,6 +1700,66 @@ fn rewrite_key_predicate_columns(
         })
         .map(|result| result.data)
         .map_err(|err| PlannerError::AnalysisError(err.into()))
+}
+
+fn prune_redundant_join_key_pairs(
+    key_pairs: Vec<(Expr, Expr)>,
+) -> Result<Vec<(Expr, Expr)>, PlannerError> {
+    let mut left_to_right = HashMap::new();
+    let mut right_to_left = HashMap::new();
+    for (left, right) in &key_pairs {
+        if let (Expr::Column(left), Expr::Column(right)) = (left, right) {
+            left_to_right
+                .entry(left.name.clone())
+                .or_insert_with(|| right.name.clone());
+            right_to_left
+                .entry(right.name.clone())
+                .or_insert_with(|| left.name.clone());
+        }
+    }
+    if left_to_right.is_empty() {
+        return Ok(key_pairs);
+    }
+
+    let mut pruned = Vec::with_capacity(key_pairs.len());
+    for (left, right) in key_pairs {
+        let direct_column_key = matches!((&left, &right), (Expr::Column(_), Expr::Column(_)));
+        let redundant = !direct_column_key
+            && (rewrite_join_key_columns(&left, &left_to_right)?
+                .is_some_and(|rewritten| rewritten == right)
+                || rewrite_join_key_columns(&right, &right_to_left)?
+                    .is_some_and(|rewritten| rewritten == left));
+        if !redundant {
+            pruned.push((left, right));
+        }
+    }
+    Ok(pruned)
+}
+
+fn rewrite_join_key_columns(
+    expression: &Expr,
+    column_mapping: &HashMap<String, String>,
+) -> Result<Option<Expr>, PlannerError> {
+    let mut saw_mapped_column = false;
+    let mut saw_unmapped_column = false;
+    let rewritten = expression
+        .clone()
+        .transform_up(|expr| match expr {
+            Expr::Column(column) => {
+                let Some(target_name) = column_mapping.get(&column.name) else {
+                    saw_unmapped_column = true;
+                    return Ok(Transformed::no(Expr::Column(column)));
+                };
+                saw_mapped_column = true;
+                Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                    target_name.clone(),
+                ))))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .map(|result| result.data)
+        .map_err(|err| PlannerError::AnalysisError(err.into()))?;
+    Ok((saw_mapped_column && !saw_unmapped_column).then_some(rewritten))
 }
 
 fn add_required_expression_columns(

@@ -619,6 +619,7 @@ impl DbspJoin {
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
         let table = left.table();
+        let persist_indexes = state_namespace.is_some();
         let join_id = state_namespace
             .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
@@ -642,22 +643,24 @@ impl DbspJoin {
             table.clone(),
             format!("join_right_closed_index_{join_id}"),
         );
-        left_index
-            .restore_committed_checkpoint()
-            .await
-            .context("restore committed left join index")?;
-        right_index
-            .restore_committed_checkpoint()
-            .await
-            .context("restore committed right join index")?;
-        left_closed_index
-            .restore_committed_checkpoint()
-            .await
-            .context("restore committed left closed join key index")?;
-        right_closed_index
-            .restore_committed_checkpoint()
-            .await
-            .context("restore committed right closed join key index")?;
+        if persist_indexes {
+            left_index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed left join index")?;
+            right_index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed right join index")?;
+            left_closed_index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed left closed join key index")?;
+            right_closed_index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed right closed join key index")?;
+        }
 
         let join_op = Arc::new(AsyncMutex::new(
             JoinOp::new_without_output_batch_with_closed_indexes(
@@ -688,7 +691,8 @@ impl DbspJoin {
                 table.clone(),
                 None,
             )
-            .with_input_retention(left_retention, right_retention),
+            .with_input_retention(left_retention, right_retention)
+            .with_persist_indexes(persist_indexes),
         ));
 
         let output_version = Arc::new(AtomicU64::new(0));

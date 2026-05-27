@@ -66,6 +66,9 @@ impl PersistentTransientInputState {
     }
 
     pub(super) async fn apply_deltas(&mut self, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
+        if self.table.is_none() {
+            return Ok(());
+        }
         if deltas.is_empty() {
             return Ok(());
         }
@@ -94,6 +97,9 @@ impl PersistentTransientInputState {
     }
 
     pub(super) async fn replace_with_snapshot(&mut self, rows: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        if self.table.is_none() {
+            return Ok(());
+        }
         let next_rows = rows
             .into_iter()
             .filter(|(_, weight)| *weight != 0)

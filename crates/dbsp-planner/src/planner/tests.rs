@@ -682,6 +682,39 @@ fn infers_join_key_predicates_for_ambiguous_equivalence_class() {
     );
 }
 
+#[tokio::test]
+async fn prunes_join_expression_key_redundant_with_direct_key() {
+    let plan = sql_plan(
+        "SELECT b.auction, a.seller \
+         FROM bid b JOIN auction a \
+         ON b.auction = a.id AND b.auction % 10000 = a.id % 10000",
+    )
+    .await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let join_nodes = circuit_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(join_nodes.len(), 1, "expected exactly one join");
+
+    let join = join_nodes[0];
+    assert_eq!(join.keys.len(), 1);
+    assert!(matches!(
+        join.keys[0].left_expression().expr(),
+        Expr::Column(column) if column.name == "auction"
+    ));
+    assert!(matches!(
+        join.keys[0].right_expression().expr(),
+        Expr::Column(column) if column.name == "id"
+    ));
+}
+
 #[test]
 fn plans_left_outer_join_with_nullable_right_columns() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -18,6 +19,7 @@ const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
 ];
 const DEFAULT_FLOE_NEXMARK_BATCH_ROWS: u64 = 8_192;
 const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "auto";
+const NEXMARK_BASE_TS_MS: i64 = 1_700_000_000_000;
 const NEXMARK_BID_AUCTION_CARDINALITY: u64 = 10_000;
 
 fn main() -> Result<()> {
@@ -1272,12 +1274,16 @@ impl Harness {
 
         let mut content_hash_note = String::new();
         if self.config.strict_result_content_check {
-            self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
-            let observed = self.retry_floe_result_content_hash(target, artifact_dir)?;
             self.settle_floe_state_if_requested(artifact_dir)?;
-            let expected = if let Some(expected) =
-                self.floe_offline_expected_content_fingerprint(query_id, sources, artifact_dir)?
-            {
+            let offline_expected =
+                self.floe_offline_expected_content_fingerprint(query_id, sources, artifact_dir)?;
+            let observed = if let Some(expected) = offline_expected.as_ref() {
+                self.retry_floe_result_content_hash_until_expected(target, artifact_dir, expected)?
+            } else {
+                self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
+                self.retry_floe_result_content_hash(target, artifact_dir)?
+            };
+            let expected = if let Some(expected) = offline_expected {
                 expected
             } else {
                 self.stop_floe_process();
@@ -1547,21 +1553,56 @@ impl Harness {
         Err(last_error.unwrap_or_else(|| anyhow!("failed to compute Floe content hash")))
     }
 
+    fn retry_floe_result_content_hash_until_expected(
+        &self,
+        target: PgTarget<'_>,
+        artifact_dir: &Path,
+        expected: &ContentFingerprint,
+    ) -> Result<ContentFingerprint> {
+        let attempts = self.config.strict_content_retry_attempts.max(1);
+        let delay = Duration::from_secs(self.config.strict_content_retry_delay_seconds);
+        let mut last = None;
+        for attempt in 1..=attempts {
+            self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
+            let observed = self.compute_floe_result_content_hash(
+                target,
+                artifact_dir,
+                &artifact_dir.join("benchmark_result.stderr.log"),
+                "benchmark_result",
+                "benchmark_result",
+            )?;
+            if observed == *expected {
+                return Ok(observed);
+            }
+            last = Some(observed);
+            if attempt < attempts && !delay.is_zero() {
+                thread::sleep(delay);
+            }
+        }
+        Ok(last.unwrap_or_else(|| ContentFingerprint {
+            row_count: 0,
+            hash: String::new(),
+        }))
+    }
+
     fn floe_offline_expected_content_fingerprint(
         &self,
         query_id: &str,
         sources: &[Source],
         artifact_dir: &Path,
     ) -> Result<Option<ContentFingerprint>> {
-        if query_id != "q5" || sources != [Source::Bid] {
-            return Ok(None);
-        }
-
-        let fingerprint = deterministic_nexmark_q5_fingerprint(self.config.bid_rows);
+        let fingerprint = match (query_id, sources) {
+            ("q5", [Source::Bid]) => deterministic_nexmark_q5_fingerprint(self.config.bid_rows),
+            ("q14", [Source::Bid]) => fingerprint_lines(Vec::new()),
+            ("q15", [Source::Bid]) => deterministic_nexmark_q15_fingerprint(self.config.bid_rows),
+            ("q16", [Source::Bid]) => deterministic_nexmark_q16_fingerprint(self.config.bid_rows),
+            ("q17", [Source::Bid]) => deterministic_nexmark_q17_fingerprint(self.config.bid_rows),
+            _ => return Ok(None),
+        };
         fs::write(
             artifact_dir.join("expected_result.offline.txt"),
             format!(
-                "oracle=deterministic_nexmark_q5\nbid_rows={}\nresult_rows={}\ncontent_sha256={}\n",
+                "oracle=deterministic_nexmark_{query_id}\nbid_rows={}\nresult_rows={}\ncontent_sha256={}\n",
                 self.config.bid_rows, fingerprint.row_count, fingerprint.hash
             ),
         )?;
@@ -1623,6 +1664,7 @@ impl Harness {
             db: "postgres",
         };
         self.poll_pg_result_rows_equals(target, expected_result_rows, "benchmark_result")?;
+        self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
         let expected = self.compute_floe_result_content_hash(
             target,
             &validation_dir,
@@ -3321,15 +3363,11 @@ fn floe_expected_query_text_for_source_tables(
                 .with_context(|| format!("portable query SQL for {query_id}"))?;
             Ok(wrap_query_with_source_ctes(query_text, sources, true))
         }
-        "q13" | "q21" | "q22" => {
+        "q13" => {
             let query_text = query_sql_portable(query_id)
                 .with_context(|| format!("portable query SQL for {query_id}"))?;
             Ok(wrap_query_with_source_ctes(query_text, sources, false))
         }
-        "q14" => Ok(r#"SELECT auction, bidder, price * 908 / 1000 AS price, CASE WHEN CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) >= 8 AND CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) <= 18 THEN 'dayTime' WHEN CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) <= 6 OR CAST(SUBSTR(CAST(date_time AS VARCHAR), 12, 2) AS BIGINT) >= 20 THEN 'nightTime' ELSE 'otherTime' END AS bid_time_type, date_time AS "dateTime", extra, LENGTH(extra) - LENGTH(REPLACE(extra, 'c', '')) AS c_counts FROM nexmark_bid WHERE price * 908 / 1000 > 1000000 AND price * 908 / 1000 < 50000000"#.to_string()),
-        "q15" => Ok(r#"SELECT SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM nexmark_bid GROUP BY SUBSTR(CAST(date_time AS VARCHAR), 1, 10)"#.to_string()),
-        "q16" => Ok(r#"SELECT channel, SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, MAX(SUBSTR(CAST(date_time AS VARCHAR), 12, 5)) AS minute, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM nexmark_bid GROUP BY channel, SUBSTR(CAST(date_time AS VARCHAR), 1, 10)"#.to_string()),
-        "q17" => Ok(r#"SELECT auction, SUBSTR(CAST(date_time AS VARCHAR), 1, 10) AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, CAST(AVG(price) AS BIGINT) AS avg_price, SUM(price) AS sum_price FROM nexmark_bid GROUP BY auction, SUBSTR(CAST(date_time AS VARCHAR), 1, 10)"#.to_string()),
         _ => {
             let query_text = query_sql_floe(query_id)
                 .with_context(|| format!("Floe query SQL for {query_id}"))?;
@@ -3473,6 +3511,235 @@ fn deterministic_nexmark_q5_fingerprint(bid_rows: u64) -> ContentFingerprint {
     ContentFingerprint {
         row_count,
         hash: hex::encode(hasher.finalize()),
+    }
+}
+
+fn deterministic_nexmark_q15_fingerprint(bid_rows: u64) -> ContentFingerprint {
+    #[derive(Default)]
+    struct Stats {
+        total_bids: u64,
+        rank1_bids: u64,
+        rank2_bids: u64,
+        rank3_bids: u64,
+        total_auctions: BTreeSet<i64>,
+        rank1_auctions: BTreeSet<i64>,
+        rank2_auctions: BTreeSet<i64>,
+        rank3_auctions: BTreeSet<i64>,
+    }
+
+    let mut stats_by_day = BTreeMap::<String, Stats>::new();
+    for bid_idx in 1..=bid_rows {
+        let row = deterministic_bid_row(bid_idx);
+        let stats = stats_by_day.entry(row.day).or_default();
+        stats.total_bids += 1;
+        stats.total_auctions.insert(row.auction);
+        match price_rank(row.price) {
+            1 => {
+                stats.rank1_bids += 1;
+                stats.rank1_auctions.insert(row.auction);
+            }
+            2 => {
+                stats.rank2_bids += 1;
+                stats.rank2_auctions.insert(row.auction);
+            }
+            3 => {
+                stats.rank3_bids += 1;
+                stats.rank3_auctions.insert(row.auction);
+            }
+            _ => unreachable!("validated price rank"),
+        }
+    }
+
+    fingerprint_lines(
+        stats_by_day
+            .into_iter()
+            .map(|(day, stats)| {
+                format!(
+                    "{day}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    stats.total_bids,
+                    stats.rank1_bids,
+                    stats.rank2_bids,
+                    stats.rank3_bids,
+                    stats.total_bids,
+                    stats.rank1_bids,
+                    stats.rank2_bids,
+                    stats.rank3_bids,
+                    stats.total_auctions.len(),
+                    stats.rank1_auctions.len(),
+                    stats.rank2_auctions.len(),
+                    stats.rank3_auctions.len()
+                )
+            })
+            .collect(),
+    )
+}
+
+fn deterministic_nexmark_q16_fingerprint(bid_rows: u64) -> ContentFingerprint {
+    #[derive(Default)]
+    struct Stats {
+        max_minute: Option<String>,
+        total_bids: u64,
+        rank1_bids: u64,
+        rank2_bids: u64,
+        rank3_bids: u64,
+        total_auctions: BTreeSet<i64>,
+        rank1_auctions: BTreeSet<i64>,
+        rank2_auctions: BTreeSet<i64>,
+        rank3_auctions: BTreeSet<i64>,
+    }
+
+    let mut stats_by_group = BTreeMap::<(String, String), Stats>::new();
+    for bid_idx in 1..=bid_rows {
+        let row = deterministic_bid_row(bid_idx);
+        let stats = stats_by_group
+            .entry((row.channel.to_string(), row.day))
+            .or_default();
+        stats.max_minute = Some(match stats.max_minute.take() {
+            Some(existing) => existing.max(row.minute),
+            None => row.minute,
+        });
+        stats.total_bids += 1;
+        stats.total_auctions.insert(row.auction);
+        match price_rank(row.price) {
+            1 => {
+                stats.rank1_bids += 1;
+                stats.rank1_auctions.insert(row.auction);
+            }
+            2 => {
+                stats.rank2_bids += 1;
+                stats.rank2_auctions.insert(row.auction);
+            }
+            3 => {
+                stats.rank3_bids += 1;
+                stats.rank3_auctions.insert(row.auction);
+            }
+            _ => unreachable!("validated price rank"),
+        }
+    }
+
+    fingerprint_lines(
+        stats_by_group
+            .into_iter()
+            .map(|((channel, day), stats)| {
+                let minute = stats.max_minute.unwrap_or_default();
+                format!(
+                    "{channel}\t{day}\t{minute}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    stats.total_bids,
+                    stats.rank1_bids,
+                    stats.rank2_bids,
+                    stats.rank3_bids,
+                    stats.total_bids,
+                    stats.rank1_bids,
+                    stats.rank2_bids,
+                    stats.rank3_bids,
+                    stats.total_auctions.len(),
+                    stats.rank1_auctions.len(),
+                    stats.rank2_auctions.len(),
+                    stats.rank3_auctions.len()
+                )
+            })
+            .collect(),
+    )
+}
+
+fn deterministic_nexmark_q17_fingerprint(bid_rows: u64) -> ContentFingerprint {
+    #[derive(Default)]
+    struct Stats {
+        total_bids: u64,
+        rank1_bids: u64,
+        rank2_bids: u64,
+        rank3_bids: u64,
+        min_price: Option<i64>,
+        max_price: Option<i64>,
+        sum_price: i64,
+    }
+
+    let mut stats_by_group = BTreeMap::<(i64, String), Stats>::new();
+    for bid_idx in 1..=bid_rows {
+        let row = deterministic_bid_row(bid_idx);
+        let stats = stats_by_group.entry((row.auction, row.day)).or_default();
+        stats.total_bids += 1;
+        match price_rank(row.price) {
+            1 => stats.rank1_bids += 1,
+            2 => stats.rank2_bids += 1,
+            3 => stats.rank3_bids += 1,
+            _ => unreachable!("validated price rank"),
+        }
+        stats.min_price = Some(
+            stats
+                .min_price
+                .map_or(row.price, |value| value.min(row.price)),
+        );
+        stats.max_price = Some(
+            stats
+                .max_price
+                .map_or(row.price, |value| value.max(row.price)),
+        );
+        stats.sum_price += row.price;
+    }
+
+    fingerprint_lines(
+        stats_by_group
+            .into_iter()
+            .map(|((auction, day), stats)| {
+                let avg_price = if stats.total_bids == 0 {
+                    0
+                } else {
+                    stats.sum_price / i64::try_from(stats.total_bids).unwrap_or(1)
+                };
+                format!(
+                    "{auction}\t{day}\t{}\t{}\t{}\t{}\t{}\t{}\t{avg_price}\t{}",
+                    stats.total_bids,
+                    stats.rank1_bids,
+                    stats.rank2_bids,
+                    stats.rank3_bids,
+                    stats.min_price.unwrap_or_default(),
+                    stats.max_price.unwrap_or_default(),
+                    stats.sum_price
+                )
+            })
+            .collect(),
+    )
+}
+
+struct DeterministicBidRow {
+    auction: i64,
+    price: i64,
+    channel: &'static str,
+    day: String,
+    minute: String,
+}
+
+fn deterministic_bid_row(bid_idx: u64) -> DeterministicBidRow {
+    let bid_idx_i64 = i64::try_from(bid_idx).unwrap_or(i64::MAX);
+    let auction =
+        i64::try_from((bid_idx - 1) % NEXMARK_BID_AUCTION_CARDINALITY + 1).unwrap_or(i64::MAX);
+    let price = 1_000 + (bid_idx_i64 % 50_000);
+    let channel = match bid_idx % 5 {
+        0 => "web",
+        1 => "apple",
+        2 => "google",
+        3 => "facebook",
+        _ => "baidu",
+    };
+    let timestamp = DateTime::<Utc>::from_timestamp_millis(NEXMARK_BASE_TS_MS + bid_idx_i64)
+        .expect("deterministic Nexmark timestamp is in range");
+    DeterministicBidRow {
+        auction,
+        price,
+        channel,
+        day: timestamp.format("%Y-%m-%d").to_string(),
+        minute: timestamp.format("%H:%M").to_string(),
+    }
+}
+
+fn price_rank(price: i64) -> u8 {
+    if price < 10_000 {
+        1
+    } else if price < 1_000_000 {
+        2
+    } else {
+        3
     }
 }
 
@@ -3726,6 +3993,17 @@ mod tests {
                 deterministic_nexmark_q5_fingerprint(bid_rows),
                 explicit_q5_fingerprint(bid_rows)
             );
+        }
+    }
+
+    #[test]
+    fn floe_validation_queries_use_supported_floe_surface_for_string_queries() {
+        for query_id in ["q14", "q15", "q16", "q17", "q21", "q22"] {
+            let query = floe_expected_query_text_for_source_tables(query_id, &[Source::Bid])
+                .expect("validation query");
+            let lower = query.to_ascii_lowercase();
+            assert!(!lower.contains("substr("), "{query_id}: {query}");
+            assert!(!lower.contains("split_part("), "{query_id}: {query}");
         }
     }
 }

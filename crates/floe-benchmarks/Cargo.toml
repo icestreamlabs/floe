@@ -10,6 +10,7 @@ allocator-jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 floe-executor = { path = "../floe-executor" }
 floe-node-core = { path = "../floe-node-core" }
 floe-sql-parser = { path = "../floe-sql-parser" }

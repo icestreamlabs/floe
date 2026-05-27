@@ -704,7 +704,7 @@ fn mv_snapshot_config_maps_optional_fields() {
 fn mv_snapshot_config_defaults_to_overlay_snapshot_defaults() {
     let mapped = mv_snapshot_config(&config::MvSnapshotConfig::default());
     assert_eq!(mapped.max_pending_batches, 16_384);
-    assert_eq!(mapped.max_pending_rows, 1_000_000);
+    assert_eq!(mapped.max_pending_rows, 4_000_000);
     assert_eq!(mapped.max_delay_ms, 10_000);
 }
 

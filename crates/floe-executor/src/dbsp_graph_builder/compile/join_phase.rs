@@ -1213,6 +1213,23 @@ impl DbspGraphBuilder {
                 let prepared_output_projection = prepared_output_projection.clone();
                 let projector_graph_id = projector_graph_id.clone();
                 move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+                    if let Some(plan) = prepared_output_projection.as_ref() {
+                        return match project_joined_encoded_rows_prepared(
+                            left_bytes,
+                            right_bytes,
+                            plan,
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(err) => {
+                                tracing::warn!(
+                                    graph_id = %projector_graph_id,
+                                    error = %err,
+                                    "failed to project join output columns directly"
+                                );
+                                Vec::new()
+                            }
+                        };
+                    }
                     let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
                         match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
                             Ok(Some(encoded)) => encoded,
@@ -1257,23 +1274,6 @@ impl DbspGraphBuilder {
                     } else {
                         right_bytes.clone()
                     };
-                    if let Some(plan) = prepared_output_projection.as_ref() {
-                        return match project_joined_encoded_rows_prepared(
-                            &left_encoded,
-                            &right_encoded,
-                            plan,
-                        ) {
-                            Ok(encoded) => encoded,
-                            Err(err) => {
-                                tracing::warn!(
-                                    graph_id = %projector_graph_id,
-                                    error = %err,
-                                    "failed to project join output columns directly"
-                                );
-                                Vec::new()
-                            }
-                        };
-                    }
                     match concat_encoded_rows(&left_encoded, &right_encoded) {
                         Ok(encoded) => encoded,
                         Err(err) => {

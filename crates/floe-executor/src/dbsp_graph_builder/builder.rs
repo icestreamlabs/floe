@@ -85,7 +85,7 @@ impl Default for OverlaySnapshotConfig {
     fn default() -> Self {
         Self {
             max_pending_batches: 16_384,
-            max_pending_rows: 1_000_000,
+            max_pending_rows: 4_000_000,
             max_delay_ms: 10_000,
         }
     }
