@@ -1380,7 +1380,7 @@ struct TransientSourceWindowAggregateRootShape {
 struct TransientWindowCountKey {
     start: i64,
     end: i64,
-    key: Vec<u8>,
+    key: Arc<[u8]>,
 }
 
 #[derive(Clone)]
@@ -3527,10 +3527,19 @@ fn merge_i64_delta(
     if delta == 0 {
         return;
     }
-    let entry = map.entry(key.clone()).or_insert(0);
-    *entry += delta;
-    if *entry == 0 {
-        map.remove(&key);
+
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let merged = entry.get().saturating_add(delta);
+            if merged == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = merged;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(delta);
+        }
     }
 }
 
@@ -3548,6 +3557,38 @@ fn merge_count_delta(
     *entry += diff;
     if *entry == 0 {
         updates.remove(&pair);
+    }
+}
+
+fn apply_transient_window_count_delta(
+    counts: &mut HashMap<TransientWindowCountKey, i64>,
+    eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
+    updates: &mut HashMap<(TransientWindowCountKey, i64), i64>,
+    key: TransientWindowCountKey,
+    delta: i64,
+) {
+    if delta == 0 {
+        return;
+    }
+    let old_count = counts.get(&key).copied().unwrap_or(0);
+    let new_count = old_count.saturating_add(delta);
+    if old_count == new_count {
+        return;
+    }
+    if old_count != 0 {
+        merge_count_delta(updates, key.clone(), old_count, -1);
+    }
+    if new_count != 0 {
+        merge_count_delta(updates, key.clone(), new_count, 1);
+        if old_count == 0 {
+            eviction_schedule
+                .entry(key.end)
+                .or_default()
+                .push(key.clone());
+        }
+        counts.insert(key, new_count);
+    } else {
+        counts.remove(&key);
     }
 }
 
@@ -3583,11 +3624,12 @@ fn apply_transient_window_count_star_deltas(
     eviction_schedule: &mut BTreeMap<i64, Vec<TransientWindowCountKey>>,
 ) -> Result<HashMap<(TransientWindowCountKey, i64), i64>> {
     let mut grouped_deltas: HashMap<TransientWindowCountKey, i64> = HashMap::new();
+    let mut batch_group_key_intern: HashMap<Vec<u8>, Arc<[u8]>> = HashMap::new();
     for (row, weight) in input_deltas {
         if weight == 0 {
             continue;
         }
-        let Some((key, event_ts)) = extract_encoded_row_columns_and_i64_like_column(
+        let Some((raw_key, event_ts)) = extract_encoded_row_columns_and_i64_like_column(
             &row,
             group_key_columns,
             time_column,
@@ -3605,13 +3647,21 @@ fn apply_transient_window_count_star_deltas(
         {
             continue;
         }
+        let key = match batch_group_key_intern.get(raw_key.as_slice()) {
+            Some(key) => Arc::clone(key),
+            None => {
+                let key = Arc::<[u8]>::from(raw_key.clone().into_boxed_slice());
+                batch_group_key_intern.insert(raw_key, Arc::clone(&key));
+                key
+            }
+        };
         transient_window_for_each_window(event_ts, window_size, window_slide, |start, end| {
             merge_i64_delta(
                 &mut grouped_deltas,
                 TransientWindowCountKey {
                     start,
                     end,
-                    key: key.clone(),
+                    key: Arc::clone(&key),
                 },
                 weight,
             );
@@ -3620,29 +3670,7 @@ fn apply_transient_window_count_star_deltas(
 
     let mut updates: HashMap<(TransientWindowCountKey, i64), i64> = HashMap::new();
     for (key, delta) in grouped_deltas {
-        if delta == 0 {
-            continue;
-        }
-        let old_count = counts.get(&key).copied().unwrap_or(0);
-        let new_count = old_count.saturating_add(delta);
-        if old_count == new_count {
-            continue;
-        }
-        if old_count != 0 {
-            merge_count_delta(&mut updates, key.clone(), old_count, -1);
-        }
-        if new_count != 0 {
-            merge_count_delta(&mut updates, key.clone(), new_count, 1);
-            if old_count == 0 {
-                eviction_schedule
-                    .entry(key.end)
-                    .or_default()
-                    .push(key.clone());
-            }
-            counts.insert(key, new_count);
-        } else {
-            counts.remove(&key);
-        }
+        apply_transient_window_count_delta(counts, eviction_schedule, &mut updates, key, delta);
     }
 
     transient_window_evict_expired_counts(cutoff, counts, eviction_schedule, &mut updates);
@@ -3694,7 +3722,11 @@ fn decode_transient_window_count_state_key(row: &[u8]) -> Result<TransientWindow
     let key_columns = (2..column_count).collect::<Vec<_>>();
     let key = extract_encoded_row_columns(row, &key_columns, false)?
         .ok_or_else(|| anyhow!("encoded window count state key unexpectedly null"))?;
-    Ok(TransientWindowCountKey { start, end, key })
+    Ok(TransientWindowCountKey {
+        start,
+        end,
+        key: Arc::<[u8]>::from(key.into_boxed_slice()),
+    })
 }
 
 fn encode_transient_window_count_output_deltas(
