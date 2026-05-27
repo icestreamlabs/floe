@@ -16,6 +16,8 @@ const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
     "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q12", "q13", "q14", "q15", "q16",
     "q17", "q18", "q19", "q20", "q21", "q22",
 ];
+const DEFAULT_FLOE_NEXMARK_BATCH_ROWS: u64 = 8_192;
+const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "full";
 
 fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
@@ -168,6 +170,7 @@ struct Config {
     floe_l0_sst_bytes: u64,
     floe_max_unflushed_bytes: u64,
     floe_slatedb_await_durable: String,
+    floe_source_journal: String,
     floe_object_store_db_name_prefix: Option<String>,
     floe_object_store_db_name: Option<String>,
     floe_admin_http_port: u16,
@@ -270,12 +273,21 @@ impl Config {
             floe_kafka_poll_ms: env_parse("FLOE_KAFKA_POLL_MS", 10)?,
             floe_kafka_max_messages_per_tick: env_parse(
                 "FLOE_KAFKA_MAX_MESSAGES_PER_TICK",
-                16_384,
+                DEFAULT_FLOE_NEXMARK_BATCH_ROWS,
             )?,
             floe_ingest_queue_capacity: env_parse("FLOE_INGEST_QUEUE_CAPACITY", 262_144)?,
-            floe_ingest_batch_size: env_parse("FLOE_INGEST_BATCH_SIZE", 16_384)?,
-            floe_ingest_batch_per_source: env_parse("FLOE_INGEST_BATCH_PER_SOURCE", 16_384)?,
-            floe_ingest_batch_per_connector: env_parse("FLOE_INGEST_BATCH_PER_CONNECTOR", 16_384)?,
+            floe_ingest_batch_size: env_parse(
+                "FLOE_INGEST_BATCH_SIZE",
+                DEFAULT_FLOE_NEXMARK_BATCH_ROWS,
+            )?,
+            floe_ingest_batch_per_source: env_parse(
+                "FLOE_INGEST_BATCH_PER_SOURCE",
+                DEFAULT_FLOE_NEXMARK_BATCH_ROWS,
+            )?,
+            floe_ingest_batch_per_connector: env_parse(
+                "FLOE_INGEST_BATCH_PER_CONNECTOR",
+                DEFAULT_FLOE_NEXMARK_BATCH_ROWS,
+            )?,
             floe_mv_retain_last: env_parse("FLOE_MV_RETAIN_LAST", 256)?,
             floe_mv_flush_enabled: env_bool("FLOE_MV_FLUSH_ENABLED", false),
             floe_mv_flush_max_pending_deltas: env_parse("FLOE_MV_FLUSH_MAX_PENDING_DELTAS", 0)?,
@@ -284,6 +296,7 @@ impl Config {
             floe_l0_sst_bytes: env_parse("FLOE_L0_SST_BYTES", 1_073_741_824)?,
             floe_max_unflushed_bytes: env_parse("FLOE_MAX_UNFLUSHED_BYTES", 8_589_934_592u64)?,
             floe_slatedb_await_durable: env_string("FLOE_SLATEDB_AWAIT_DURABLE", "false"),
+            floe_source_journal: env_string("FLOE_SOURCE_JOURNAL", DEFAULT_FLOE_SOURCE_JOURNAL),
             floe_object_store_db_name_prefix: env_nonempty("FLOE_OBJECT_STORE_DB_NAME_PREFIX"),
             floe_object_store_db_name: env_nonempty("FLOE_OBJECT_STORE_DB_NAME"),
             floe_admin_http_port: env_parse("FLOE_ADMIN_HTTP_PORT", 0)?,
@@ -3259,6 +3272,7 @@ fn floe_config_json(
         },
         "storage": {
             "await_durable": config.floe_slatedb_await_durable == "true",
+            "source_journal": config.floe_source_journal,
         }
     })
 }
@@ -3342,11 +3356,15 @@ fn wrap_query_with_source_ctes(
 }
 
 fn parse_row_count_value(value: &serde_json::Value) -> Option<u64> {
-    let rows = value.as_array()?;
-    let first = rows.first()?;
-    first
-        .get("ROW_COUNT")
-        .or_else(|| first.get("row_count"))
+    if let Some(rows) = value.as_array() {
+        return parse_row_count_row(rows.first()?);
+    }
+    parse_row_count_row(value)
+}
+
+fn parse_row_count_row(row: &serde_json::Value) -> Option<u64> {
+    row.get("ROW_COUNT")
+        .or_else(|| row.get("row_count"))
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
 }
 
