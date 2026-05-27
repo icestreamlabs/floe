@@ -4,7 +4,7 @@ pub mod row_reference;
 pub mod versioned_batch_zset;
 pub mod zset;
 
-pub use arrow_indexed_batch_zset::IndexedBatchZSet;
+pub use arrow_indexed_batch_zset::{DEFAULT_HOT_KEY_COMPACTION_THRESHOLD, IndexedBatchZSet};
 pub use indexed_batch_zset::{ApplyDeltaMetrics, LookupMetrics, OrderedBytes, RangeKey};
 pub use row_reference::{
     ForwardCompatPolicy, ROW_REFERENCE_V1, RowReference, RowReferenceV1, apply_reference_deltas,

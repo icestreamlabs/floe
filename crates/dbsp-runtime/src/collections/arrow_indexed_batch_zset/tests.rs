@@ -66,6 +66,42 @@ async fn arrow_indexed_lookup_reports_index_work() {
 }
 
 #[tokio::test]
+async fn arrow_indexed_hot_key_compaction_bounds_read_amplification() {
+    let table = build_table("arrow-indexed-hot-key-compaction").await;
+    let index = IndexedBatchZSet::<i64, i64>::with_hot_key_compaction_threshold(
+        table,
+        "arrow_indexed_hot_key_compaction",
+        2,
+    );
+    index
+        .apply_deltas(vec![(1, 10, 1)])
+        .await
+        .expect("apply first hot-key segment");
+    index
+        .apply_deltas(vec![(1, 11, 1)])
+        .await
+        .expect("apply second hot-key segment");
+    index
+        .apply_deltas(vec![(1, 12, 1)])
+        .await
+        .expect("apply third hot-key segment");
+
+    assert_eq!(
+        index
+            .estimated_read_amplification_for_key(&1)
+            .await
+            .expect("estimate read amplification"),
+        1
+    );
+    let mut values = index
+        .values_for_key(&1)
+        .await
+        .expect("lookup compacted key");
+    values.sort_unstable();
+    assert_eq!(values, vec![(10, 1), (11, 1), (12, 1)]);
+}
+
+#[tokio::test]
 async fn arrow_indexed_cache_stays_consistent_across_updates() {
     let table = build_table("arrow-indexed-cache").await;
     let index = IndexedBatchZSet::<i64, i64>::new(table, "arrow_indexed_cache");

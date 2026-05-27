@@ -4,6 +4,7 @@ use crate::encoding::{
     extract_encoded_row_columns_and_i64_like_column, extract_encoded_row_i64_like_column,
     extract_encoded_row_scalars,
 };
+use anyhow::bail;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -313,7 +314,9 @@ impl DbspGraphBuilder {
         let (window_size, window_slide) = match &node.window.policy {
             DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
             DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
-            DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
+            DbspWindowPolicy::Session { .. } => {
+                bail!("SESSION windows are not supported by the DBSP runtime")
+            }
         };
         let allowed_lateness_ms = node.window.allowed_lateness_ms;
 
@@ -457,6 +460,86 @@ impl DbspGraphBuilder {
                 .map_window_count_aggregate_output(
                     &graph_id,
                     &window_count_aggregate.stream(),
+                    task_events,
+                    "window-aggregate-project",
+                )
+                .await?;
+            return Ok(mapped);
+        }
+
+        if let Some(slot_kinds) = build_incremental_aggregate_slot_kinds(&aggregates) {
+            let key_columns = Arc::clone(&direct_group_key_columns);
+            let window_graph_id = graph_id.clone();
+            let window_extractor = move |delta_values: &[(Vec<u8>, i64)]| {
+                let mut extracted = Vec::with_capacity(delta_values.len());
+                for (bytes, weight) in delta_values {
+                    if *weight == 0 {
+                        continue;
+                    }
+                    match extract_encoded_row_columns_and_i64_like_column(
+                        bytes,
+                        key_columns.as_ref(),
+                        direct_time_column,
+                        false,
+                    ) {
+                        Ok(Some((key, event_ts))) => {
+                            extracted.push((bytes.clone(), *weight, key, event_ts));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %window_graph_id,
+                                error = %err,
+                                "failed to extract window incremental aggregate row"
+                            );
+                        }
+                    }
+                }
+                extracted
+            };
+
+            let row_evaluator = build_incremental_aggregate_row_evaluator(
+                Arc::clone(&eval_schema),
+                group_keys.clone(),
+                aggregates.clone(),
+                Arc::clone(&expression_columns),
+                graph_id.clone(),
+                "window aggregate",
+            );
+            let row_evaluator =
+                move |delta_values: &[(dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>, i64)]| {
+                    delta_values
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            row_evaluator(&row.value).map(|aggregate_row| {
+                                let aggregate_row = dbsp::IncrementalAggregateRow {
+                                    key: row.window_key.clone(),
+                                    slots: aggregate_row.slots,
+                                };
+                                (row.clone(), aggregate_row, *weight)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+            let window_incremental_aggregate =
+                dbsp::DbspWindowIncrementalAggregate::new_batch::<Vec<u8>, Vec<u8>, _, _>(
+                    &upstream,
+                    window_extractor,
+                    row_evaluator,
+                    slot_kinds,
+                    window_size,
+                    window_slide,
+                    allowed_lateness_ms,
+                    watermark,
+                    Some(Arc::clone(&window_error_handler)),
+                )
+                .await
+                .context("initialize DBSP window incremental aggregate")?;
+
+            let mapped = self
+                .map_window_incremental_aggregate_output(
+                    &graph_id,
+                    &window_incremental_aggregate.stream(),
                     task_events,
                     "window-aggregate-project",
                 )
@@ -844,6 +927,90 @@ impl DbspGraphBuilder {
         )
         .await
         .context("initialize window count aggregate output map")?;
+        Ok(mapped.stream())
+    }
+
+    async fn map_window_incremental_aggregate_output(
+        &self,
+        graph_id: &str,
+        aggregate_stream: &DeltaHandleStream,
+        task_events: &GraphTaskSender,
+        label_prefix: &str,
+    ) -> Result<DeltaHandleStream> {
+        let project_events = task_events.clone();
+        let project_label = format!("{label_prefix}:{graph_id}");
+        let project_graph_id = graph_id.to_string();
+        let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(
+                &project_events,
+                &project_graph_id,
+                project_label.clone(),
+                err,
+            );
+        });
+        let project_graph_id = graph_id.to_string();
+        let projector = move |pair: &(WindowKey<Vec<u8>>, Vec<dbsp::AggregateValue>)| -> Vec<u8> {
+            let encoded_window_bounds = match encode_window_bounds(pair.0.start, pair.0.end) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode window aggregate bounds"
+                    );
+                    return Vec::new();
+                }
+            };
+            let with_key = match concat_encoded_rows(&encoded_window_bounds, &pair.0.key) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate bounds and key"
+                    );
+                    return Vec::new();
+                }
+            };
+            let encoded_aggregate_values = match encode_incremental_aggregate_values(&pair.1) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to encode window incremental aggregate values"
+                    );
+                    return Vec::new();
+                }
+            };
+            match concat_encoded_rows(&with_key, &encoded_aggregate_values) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %project_graph_id,
+                        error = %err,
+                        "failed to concatenate window aggregate output values"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let transform = move |delta_values: &[(
+            (WindowKey<Vec<u8>>, Vec<dbsp::AggregateValue>),
+            i64,
+        )]|
+              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+            Ok(project_encoded_delta_batch(delta_values, &projector))
+        };
+
+        let mapped = DbspFilterMap::new_batch::<
+            (WindowKey<Vec<u8>>, Vec<dbsp::AggregateValue>),
+            Vec<u8>,
+            _,
+        >(aggregate_stream, transform, Some(project_error_handler))
+        .await
+        .context("initialize window incremental aggregate output map")?;
         Ok(mapped.stream())
     }
 
@@ -1587,14 +1754,14 @@ pub(crate) fn build_incremental_aggregate_slot_kinds(
             }
             DbspAggregateFunction::Count => dbsp::IncrementalAggregateSlotKind::Count,
             DbspAggregateFunction::Sum => dbsp::IncrementalAggregateSlotKind::Sum(
-                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+                aggregate_numeric_value_type_from_dbsp_type(agg.output_type())?,
             ),
             DbspAggregateFunction::Avg => dbsp::IncrementalAggregateSlotKind::Avg,
             DbspAggregateFunction::Min => dbsp::IncrementalAggregateSlotKind::Min(
-                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+                aggregate_ordered_value_type_from_dbsp_type(agg.output_type())?,
             ),
             DbspAggregateFunction::Max => dbsp::IncrementalAggregateSlotKind::Max(
-                aggregate_value_type_from_dbsp_type(agg.output_type())?,
+                aggregate_ordered_value_type_from_dbsp_type(agg.output_type())?,
             ),
         };
         slot_kinds.push(kind);
@@ -1919,6 +2086,10 @@ fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Resul
                 encoded.push(0x07);
             }
             dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => encoded.push(0x06),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::DateDays) => encoded.push(0x0A),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Decimal128) => {
+                encoded.push(0x0C);
+            }
             dbsp::AggregateValue::Int64(value) => append_encoded_i64(*value, &mut encoded),
             dbsp::AggregateValue::TimestampMillis(value) => {
                 append_encoded_timestamp(*value, &mut encoded);
@@ -1930,6 +2101,14 @@ fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Resul
                     .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
                 encoded.extend_from_slice(&len.to_le_bytes());
                 encoded.extend_from_slice(bytes);
+            }
+            dbsp::AggregateValue::DateDays(value) => {
+                encoded.push(0x09);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            dbsp::AggregateValue::Decimal128(value) => {
+                encoded.push(0x0B);
+                encoded.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
@@ -1956,14 +2135,29 @@ fn append_encoded_sum_like_value(
     Ok(())
 }
 
-fn aggregate_value_type_from_dbsp_type(
+fn aggregate_numeric_value_type_from_dbsp_type(
+    value_type: &DbspScalarType,
+) -> Option<dbsp::AggregateValueType> {
+    match value_type {
+        DbspScalarType::Int64 => Some(dbsp::AggregateValueType::Int64),
+        DbspScalarType::TimestampMillis => Some(dbsp::AggregateValueType::TimestampMillis),
+        DbspScalarType::Utf8
+        | DbspScalarType::Bool
+        | DbspScalarType::DateDays
+        | DbspScalarType::Decimal128 { .. } => None,
+    }
+}
+
+fn aggregate_ordered_value_type_from_dbsp_type(
     value_type: &DbspScalarType,
 ) -> Option<dbsp::AggregateValueType> {
     match value_type {
         DbspScalarType::Int64 => Some(dbsp::AggregateValueType::Int64),
         DbspScalarType::TimestampMillis => Some(dbsp::AggregateValueType::TimestampMillis),
         DbspScalarType::Utf8 => Some(dbsp::AggregateValueType::Utf8),
-        DbspScalarType::Bool | DbspScalarType::DateDays | DbspScalarType::Decimal128 { .. } => None,
+        DbspScalarType::DateDays => Some(dbsp::AggregateValueType::DateDays),
+        DbspScalarType::Decimal128 { .. } => Some(dbsp::AggregateValueType::Decimal128),
+        DbspScalarType::Bool => None,
     }
 }
 
@@ -1978,6 +2172,8 @@ fn incremental_aggregate_value_from_encoded_scalar(
             Some(dbsp::AggregateValue::TimestampMillis(*value))
         }
         Some(EncodedRowScalar::Utf8(value)) => Some(dbsp::AggregateValue::Utf8(value.clone())),
+        Some(EncodedRowScalar::DateDays(value)) => Some(dbsp::AggregateValue::DateDays(*value)),
+        Some(EncodedRowScalar::Decimal128(value)) => Some(dbsp::AggregateValue::Decimal128(*value)),
         None => None,
         other => {
             tracing::warn!(
@@ -2349,8 +2545,58 @@ mod tests {
         ));
 
         assert_eq!(
-            aggregate_value_type_from_dbsp_type(&DbspScalarType::Bool),
+            aggregate_ordered_value_type_from_dbsp_type(&DbspScalarType::Bool),
             None
+        );
+
+        let typed_input_schema = schema(vec![
+            ("shipdate", DbspScalarType::DateDays),
+            (
+                "amount",
+                DbspScalarType::Decimal128 {
+                    precision: 18,
+                    scale: 2,
+                },
+            ),
+        ]);
+        let typed_aggregate = DbspAggregateNode::try_new(
+            Arc::clone(&typed_input_schema),
+            vec![],
+            vec![
+                (
+                    DbspAggregateFunction::Min,
+                    Some(col("shipdate")),
+                    None,
+                    false,
+                    Some("min_shipdate".to_string()),
+                ),
+                (
+                    DbspAggregateFunction::Max,
+                    Some(col("amount")),
+                    None,
+                    false,
+                    Some("max_amount".to_string()),
+                ),
+            ],
+        )
+        .expect("typed aggregate node");
+        let typed_slot_kinds = build_incremental_aggregate_slot_kinds(typed_aggregate.aggregates())
+            .expect("typed incremental slot kinds");
+        assert!(matches!(
+            typed_slot_kinds[0],
+            dbsp::IncrementalAggregateSlotKind::Min(dbsp::AggregateValueType::DateDays)
+        ));
+        assert!(matches!(
+            typed_slot_kinds[1],
+            dbsp::IncrementalAggregateSlotKind::Max(dbsp::AggregateValueType::Decimal128)
+        ));
+        assert!(
+            aggregate_numeric_value_type_from_dbsp_type(&DbspScalarType::Decimal128 {
+                precision: 18,
+                scale: 2,
+            })
+            .is_none(),
+            "decimal SUM should stay on the generic aggregate path until decimal sum state is native"
         );
 
         let encoded_bounds = encode_window_bounds(10, 20).expect("encode bounds");

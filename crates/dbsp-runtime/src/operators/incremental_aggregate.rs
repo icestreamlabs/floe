@@ -27,6 +27,8 @@ pub enum AggregateValueType {
     Int64,
     TimestampMillis,
     Utf8,
+    DateDays,
+    Decimal128,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -35,6 +37,8 @@ pub enum AggregateValue {
     Int64(i64),
     TimestampMillis(i64),
     Utf8(String),
+    DateDays(i32),
+    Decimal128(i128),
 }
 
 impl AggregateValue {
@@ -43,6 +47,8 @@ impl AggregateValue {
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(right)),
             (Self::TimestampMillis(left), Self::TimestampMillis(right)) => Some(left.cmp(right)),
             (Self::Utf8(left), Self::Utf8(right)) => Some(left.cmp(right)),
+            (Self::DateDays(left), Self::DateDays(right)) => Some(left.cmp(right)),
+            (Self::Decimal128(left), Self::Decimal128(right)) => Some(left.cmp(right)),
             _ => None,
         }
     }
@@ -50,7 +56,7 @@ impl AggregateValue {
     pub(crate) fn as_numeric(&self) -> Option<i64> {
         match self {
             Self::Int64(value) | Self::TimestampMillis(value) => Some(*value),
-            Self::Null(_) | Self::Utf8(_) => None,
+            Self::Null(_) | Self::Utf8(_) | Self::DateDays(_) | Self::Decimal128(_) => None,
         }
     }
 
@@ -59,6 +65,8 @@ impl AggregateValue {
             AggregateValueType::Int64 => Self::Int64(value),
             AggregateValueType::TimestampMillis => Self::TimestampMillis(value),
             AggregateValueType::Utf8 => Self::Utf8(value.to_string()),
+            AggregateValueType::DateDays => Self::DateDays(value as i32),
+            AggregateValueType::Decimal128 => Self::Decimal128(value as i128),
         }
     }
 
@@ -1358,6 +1366,148 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) async fn evict_keys_where<F>(
+        &mut self,
+        predicate: F,
+    ) -> Result<HashMap<(K, Vec<AggregateValue>), i64>>
+    where
+        F: Fn(&K) -> bool,
+    {
+        self.ensure_state_cache()
+            .await
+            .context("load incremental aggregate cache for eviction")?;
+
+        let keys_to_evict = self
+            .state_cache
+            .as_ref()
+            .context("incremental aggregate cache missing during eviction")?
+            .keys()
+            .filter(|key| predicate(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if keys_to_evict.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        if let Some(distinct_index) = self.distinct_index.as_ref() {
+            let distinct_slots = self
+                .slot_kinds
+                .iter()
+                .enumerate()
+                .filter_map(|(slot_idx, kind)| {
+                    matches!(kind, IncrementalAggregateSlotKind::CountDistinct)
+                        .then_some(slot_idx as u32)
+                })
+                .collect::<Vec<_>>();
+            let mut distinct_updates = Vec::new();
+            for key in &keys_to_evict {
+                for slot in &distinct_slots {
+                    let distinct_key = DistinctGroupKey {
+                        group_key: key.clone(),
+                        slot: *slot,
+                    };
+                    let values = distinct_index
+                        .values_for_key(&distinct_key)
+                        .await
+                        .context("load incremental aggregate distinct values for eviction")?;
+                    for (value, weight) in values {
+                        if weight != 0 {
+                            distinct_updates.push((distinct_key.clone(), value, -weight));
+                        }
+                    }
+                }
+            }
+
+            if !distinct_updates.is_empty() {
+                distinct_index
+                    .apply_deltas(distinct_updates)
+                    .await
+                    .context("evict incremental aggregate distinct index entries")?;
+            }
+        }
+
+        if let Some(input_index) = self.input_index.as_ref() {
+            let mut input_updates = Vec::new();
+            for key in &keys_to_evict {
+                let values = input_index
+                    .values_for_key(key)
+                    .await
+                    .context("load incremental aggregate input values for eviction")?;
+                for (value, weight) in values {
+                    if weight != 0 {
+                        input_updates.push((key.clone(), value, -weight));
+                    }
+                }
+            }
+
+            if !input_updates.is_empty() {
+                input_index
+                    .apply_deltas(input_updates)
+                    .await
+                    .context("evict incremental aggregate input index entries")?;
+            }
+        }
+
+        let mut state_deltas: HashMap<(K, GroupedIncrementalAggregateState), i64> = HashMap::new();
+        let mut output_deltas: HashMap<(K, Vec<AggregateValue>), i64> = HashMap::new();
+        {
+            let state_cache = self
+                .state_cache
+                .as_ref()
+                .context("incremental aggregate cache missing during eviction")?;
+            for key in &keys_to_evict {
+                let Some(old_state) = state_cache.get(key).cloned() else {
+                    continue;
+                };
+                state_deltas.insert((key.clone(), old_state.clone()), -1);
+                output_deltas.insert((key.clone(), old_state.output_values(&self.slot_kinds)), -1);
+            }
+        }
+
+        if state_deltas.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let base_version = self.state.base_version_for_update();
+        let new_integrated_handle = Self::apply_deltas_to_versioned(
+            &mut self.state.integrated,
+            &state_deltas,
+            base_version,
+            "integrated",
+        )
+        .await
+        .context("evict incremental aggregate integrated state")?;
+        self.state.update_handle(new_integrated_handle);
+
+        if let Some(state_cache) = self.state_cache.as_mut() {
+            for key in keys_to_evict {
+                state_cache.remove(&key);
+            }
+        }
+
+        Ok(output_deltas)
+    }
+
+    pub(crate) async fn persist_output_deltas(
+        &mut self,
+        output_deltas: &HashMap<(K, Vec<AggregateValue>), i64>,
+    ) -> Result<ZSetHandle> {
+        Self::apply_deltas_to_versioned(&mut self.output, output_deltas, None, "output")
+            .await
+            .context("persist incremental aggregate output delta")
+    }
+
+    pub(crate) fn empty_output_handle(&self) -> ZSetHandle {
+        self.output.handle_for_version(0)
+    }
+
+    pub(crate) async fn state_entry_count(&mut self) -> Result<usize> {
+        self.ensure_state_cache()
+            .await
+            .context("load incremental aggregate cache for state size")?;
+        Ok(self.state_cache.as_ref().map_or(0, HashMap::len))
     }
 }
 

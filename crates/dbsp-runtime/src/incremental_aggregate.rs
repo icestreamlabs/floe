@@ -10,8 +10,8 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
+use crate::collections::{DEFAULT_HOT_KEY_COMPACTION_THRESHOLD, IndexedBatchZSet};
 use crate::ephemeral_state::build_ephemeral_state_table;
 use crate::handles::ZSetHandle;
 use crate::operators::incremental_aggregate::{
@@ -191,9 +191,10 @@ impl DbspIncrementalAggregate {
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::with_hot_key_compaction_threshold(
                     table.clone(),
                     format!("incremental_aggregate_distinct_{aggregate_id}"),
+                    DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
                 )
             });
         let input_index = slot_kinds
@@ -205,9 +206,10 @@ impl DbspIncrementalAggregate {
                 )
             })
             .then(|| {
-                IndexedBatchZSet::new(
+                IndexedBatchZSet::with_hot_key_compaction_threshold(
                     table.clone(),
                     format!("incremental_aggregate_index_{aggregate_id}"),
+                    DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
                 )
             });
 
@@ -423,6 +425,18 @@ where
     ) -> anyhow::Result<Vec<((K, Vec<AggregateValue>), i64)>> {
         let mut op = self.op.lock().await;
         let deltas = op.apply_delta_values(&delta_values).await?;
+        Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
+    }
+
+    pub async fn evict_keys_where<F>(
+        &self,
+        predicate: F,
+    ) -> anyhow::Result<Vec<((K, Vec<AggregateValue>), i64)>>
+    where
+        F: Fn(&K) -> bool,
+    {
+        let mut op = self.op.lock().await;
+        let deltas = op.evict_keys_where(predicate).await?;
         Ok(deltas.into_iter().filter(|(_, diff)| *diff != 0).collect())
     }
 

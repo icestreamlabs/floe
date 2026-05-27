@@ -29,6 +29,7 @@ pub mod union;
 pub mod window;
 pub mod window_count_aggregate;
 pub mod window_count_star_aggregate;
+pub mod window_incremental_aggregate;
 
 pub use dbsp_storage::storage;
 
@@ -80,3 +81,4 @@ pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
 pub use window_count_aggregate::{DbspWindowCountAggregate, WindowCountInput};
 pub use window_count_star_aggregate::DbspWindowCountStarAggregate;
+pub use window_incremental_aggregate::{DbspWindowIncrementalAggregate, WindowIncrementalInput};

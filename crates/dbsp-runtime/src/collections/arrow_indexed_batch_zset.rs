@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -28,6 +29,7 @@ const LOOKUP_CACHE_SHARDS: usize = 64;
 const LOOKUP_CACHE_CAPACITY_PER_SHARD: usize = 2048;
 const SEGMENT_CACHE_SHARDS: usize = 64;
 const SEGMENT_CACHE_CAPACITY_PER_SHARD: usize = 128;
+pub const DEFAULT_HOT_KEY_COMPACTION_THRESHOLD: usize = 64;
 
 type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 type ValueWeightMap = FastMap<Vec<u8>, i64>;
@@ -94,6 +96,7 @@ where
     overlay_by_key: Mutex<FastMap<K, TypedValueWeightMap<V>>>,
     overlay_by_value: Mutex<FastMap<V, TypedValueWeightMap<K>>>,
     persistence: IndexedStatePersistence,
+    hot_key_compaction_threshold: Option<usize>,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -125,6 +128,7 @@ where
             false,
             false,
             IndexedStatePersistence::Immediate,
+            None,
         )
     }
 
@@ -135,6 +139,7 @@ where
             false,
             false,
             IndexedStatePersistence::Replayable,
+            None,
         )
     }
 
@@ -145,6 +150,7 @@ where
             true,
             false,
             IndexedStatePersistence::Immediate,
+            None,
         )
     }
 
@@ -158,6 +164,7 @@ where
             true,
             false,
             IndexedStatePersistence::Replayable,
+            None,
         )
     }
 
@@ -168,6 +175,7 @@ where
             false,
             true,
             IndexedStatePersistence::Immediate,
+            None,
         )
     }
 
@@ -181,15 +189,23 @@ where
             false,
             true,
             IndexedStatePersistence::Replayable,
+            None,
         )
     }
 
     pub fn with_hot_key_compaction_threshold(
         table: Arc<dyn KeyValueTable>,
         namespace: impl Into<String>,
-        _threshold: usize,
+        threshold: usize,
     ) -> Self {
-        Self::new(table, namespace)
+        Self::build(
+            table,
+            namespace.into(),
+            false,
+            false,
+            IndexedStatePersistence::Immediate,
+            Some(threshold.max(1)),
+        )
     }
 
     pub fn engine_kind(&self) -> &'static str {
@@ -202,6 +218,7 @@ where
         reverse_enabled: bool,
         range_enabled: bool,
         persistence: IndexedStatePersistence,
+        hot_key_compaction_threshold: Option<usize>,
     ) -> Self {
         let namespace_hash = stable_namespace_hash(namespace.as_bytes());
         let mut base = format!("iba/{namespace_hash:016x}").into_bytes();
@@ -249,6 +266,7 @@ where
             overlay_by_key: Mutex::new(FastMap::default()),
             overlay_by_value: Mutex::new(FastMap::default()),
             persistence,
+            hot_key_compaction_threshold,
             _marker: PhantomData,
         }
     }
@@ -357,6 +375,7 @@ where
             return Ok(metrics);
         }
 
+        let touched_key_bytes = touched_updates.keys().cloned().collect::<Vec<_>>();
         for updates in touched_updates.values_mut() {
             updates.retain(|_, weight| *weight != 0);
         }
@@ -414,6 +433,10 @@ where
             }),
         )?;
         self.apply_lookup_cache_updates(&touched_updates)?;
+        drop(_segment_guard);
+        self.compact_hot_keys(&touched_key_bytes)
+            .await
+            .context("compact hot Arrow-index keys")?;
 
         metrics.coalesced_records = metrics.non_zero_input_records;
         metrics.persisted_records = encoded_rows.len();
@@ -864,22 +887,181 @@ where
     }
 
     pub async fn compact_l0_to_l1(&self) -> Result<usize> {
-        Ok(0)
+        if matches!(self.persistence, IndexedStatePersistence::Replayable)
+            || self.reverse_enabled
+            || self.range_enabled
+        {
+            return Ok(0);
+        }
+
+        let mut keys = HashSet::new();
+        for (entry_key, _) in self
+            .table
+            .scan_prefix(&self.index_prefix, &ScanOptions::default())
+            .await
+            .context("scan Arrow-index keys for compaction")?
+        {
+            let (key_bytes, _) = self
+                .decode_index_key(&entry_key)
+                .context("decode Arrow-index key during compaction")?;
+            keys.insert(key_bytes);
+        }
+
+        let mut compacted = 0usize;
+        for key_bytes in keys {
+            if self
+                .compact_key_bytes(&key_bytes)
+                .await
+                .context("compact Arrow-index key")?
+            {
+                compacted = compacted.saturating_add(1);
+            }
+        }
+        Ok(compacted)
     }
 
     pub async fn estimated_read_amplification_for_key(&self, key: &K) -> Result<usize> {
         let key_bytes = encode(key).context("encode key for Arrow-index amplification estimate")?;
+        self.estimated_read_amplification_for_key_bytes(&key_bytes)
+            .await
+    }
+
+    async fn estimated_read_amplification_for_key_bytes(&self, key_bytes: &[u8]) -> Result<usize> {
         let entries = self
             .table
             .scan_prefix(
                 &self
-                    .index_prefix_for_key(&key_bytes)
+                    .index_prefix_for_key(key_bytes)
                     .context("build Arrow-index key prefix for amplification")?,
                 &ScanOptions::default(),
             )
             .await
             .context("scan Arrow-index entries for amplification estimate")?;
         Ok(entries.len())
+    }
+
+    async fn compact_hot_keys(&self, key_bytes: &[Vec<u8>]) -> Result<()> {
+        let Some(threshold) = self.hot_key_compaction_threshold else {
+            return Ok(());
+        };
+        if matches!(self.persistence, IndexedStatePersistence::Replayable)
+            || self.reverse_enabled
+            || self.range_enabled
+        {
+            return Ok(());
+        }
+
+        let mut seen = HashSet::new();
+        for key in key_bytes {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let read_amplification = self
+                .estimated_read_amplification_for_key_bytes(key)
+                .await
+                .context("estimate Arrow-index hot-key read amplification")?;
+            if read_amplification > threshold {
+                self.compact_key_bytes(key)
+                    .await
+                    .context("compact Arrow-index hot key")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn compact_key_bytes(&self, key_bytes: &[u8]) -> Result<bool> {
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            return Ok(false);
+        }
+        if self.reverse_enabled || self.range_enabled {
+            return Ok(false);
+        }
+
+        let _segment_guard = self.segment_sequence_lock.lock().await;
+        let key_prefix = self
+            .index_prefix_for_key(key_bytes)
+            .context("build Arrow-index key prefix for compaction")?;
+        let entries = self
+            .table
+            .scan_prefix(&key_prefix, &ScanOptions::default())
+            .await
+            .context("scan Arrow-index key entries for compaction")?;
+        if entries.len() <= 1 {
+            return Ok(false);
+        }
+
+        let aggregate = self
+            .load_persisted_value_weights_for_key(key_bytes)
+            .await
+            .context("load Arrow-index key aggregate for compaction")?;
+        let mut write_batch = WriteBatch::new();
+        for (entry_key, _) in entries {
+            write_batch.delete(entry_key);
+        }
+
+        if aggregate.is_empty() {
+            self.table
+                .write_batch(write_batch)
+                .await
+                .context("delete empty Arrow-index key postings during compaction")?;
+            self.store_lookup_cache_for_key(key_bytes, &aggregate)?;
+            return Ok(true);
+        }
+
+        let segment_id = self.read_next_segment_id().await?;
+        write_batch.put(
+            self.segment_sequence_key.clone(),
+            segment_id.saturating_add(1).to_be_bytes(),
+        );
+
+        let rows = aggregate
+            .iter()
+            .map(|(value_bytes, weight)| (key_bytes.to_vec(), value_bytes.clone(), *weight))
+            .collect::<Vec<_>>();
+        let batch = self.record_batch_from_rows(&rows)?;
+        let tombstones = rows.iter().filter(|(_, _, weight)| *weight < 0).count();
+        let tombstone_ratio = tombstones as f64 / rows.len() as f64;
+        let key_hash = hash_bytes(key_bytes);
+        let stats = SegmentWriteStats::new(key_hash, key_hash, tombstone_ratio)
+            .context("build compacted Arrow-index segment stats")?;
+        let (segment_bytes, _) = encode_segment_envelope(Arc::clone(&self.schema), &[batch], stats)
+            .context("encode compacted Arrow-index segment envelope")?;
+        write_batch.put(
+            self.segment_store.key_for_segment(segment_id),
+            segment_bytes,
+        );
+
+        let postings = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, _, weight))| {
+                u32::try_from(idx)
+                    .map(|row_idx| (row_idx, *weight))
+                    .map_err(|_| anyhow!("row index overflow while compacting Arrow-index key"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        write_batch.put(
+            self.index_key(key_bytes, segment_id)
+                .context("build compacted Arrow-index posting key")?,
+            encode_index_postings(&postings),
+        );
+
+        self.table
+            .write_batch(write_batch)
+            .await
+            .context("persist compacted Arrow-index key")?;
+        self.record_checkpoint(segment_id.saturating_add(1));
+        self.insert_segment_cache(
+            segment_id,
+            Arc::new(CachedSegment {
+                values: rows
+                    .iter()
+                    .map(|(_, value_bytes, _)| value_bytes.clone())
+                    .collect(),
+            }),
+        )?;
+        self.store_lookup_cache_for_key(key_bytes, &aggregate)?;
+        Ok(true)
     }
 
     async fn segment_refs_for_key_with_metrics(

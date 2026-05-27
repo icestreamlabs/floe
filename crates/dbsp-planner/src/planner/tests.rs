@@ -1420,40 +1420,34 @@ async fn plans_tumble_grouping_with_allowed_lateness() {
 }
 
 #[tokio::test]
-async fn plans_session_grouping_as_window_aggregate() {
+async fn rejects_session_grouping_until_runtime_supports_session_state() {
     let sql = "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000)";
     let plan = sql_plan(sql).await;
 
     let planner = CircuitPlanner::new(planner_config());
-    let circuit_plan = planner.plan(&plan).expect("plan");
-    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
-        DbspNodeKind::WindowAggregate(window) => Some(window),
-        _ => None,
-    });
-    let window = window.expect("expected WindowAggregate node");
-    assert_eq!(window.window.allowed_lateness_ms, i64::MAX);
-    match &window.window.policy {
-        dbsp_circuit::circuit::plan::DbspWindowPolicy::Session { gap_ms } => {
-            assert_eq!(*gap_ms, 5_000);
-        }
-        other => panic!("expected session window, got {other:?}"),
-    }
+    let err = planner
+        .plan(&plan)
+        .expect_err("SESSION windows should not plan until runtime has session state");
+    assert!(
+        err.to_string().contains("SESSION windows require session"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
-async fn plans_session_grouping_with_allowed_lateness() {
+async fn rejects_session_grouping_with_allowed_lateness() {
     let sql = "SELECT bidder, COUNT(*) AS bid_count \
         FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000, 1200)";
     let plan = sql_plan(sql).await;
 
     let planner = CircuitPlanner::new(planner_config());
-    let circuit_plan = planner.plan(&plan).expect("plan");
-    let window = circuit_plan.nodes.iter().find_map(|node| match &node.kind {
-        DbspNodeKind::WindowAggregate(window) => Some(window),
-        _ => None,
-    });
-    let window = window.expect("expected WindowAggregate node");
-    assert_eq!(window.window.allowed_lateness_ms, 1_200);
+    let err = planner
+        .plan(&plan)
+        .expect_err("SESSION windows should not plan until runtime has session state");
+    assert!(
+        err.to_string().contains("SESSION windows require session"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
