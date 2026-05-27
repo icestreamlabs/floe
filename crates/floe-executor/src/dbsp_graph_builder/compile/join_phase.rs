@@ -1320,6 +1320,7 @@ impl DbspGraphBuilder {
             let _ = output_tx.send(TransientMaterializeBatch {
                 version,
                 deltas: Arc::new(filtered),
+                deltas_consolidated: false,
             });
         });
 

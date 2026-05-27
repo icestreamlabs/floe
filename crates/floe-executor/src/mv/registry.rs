@@ -5,6 +5,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Timestamp};
+use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::LogicalWorkSnapshot;
@@ -93,7 +94,7 @@ impl MaterializedViewRegistry {
 
 pub struct MaterializedViewHandle {
     name: String,
-    state: RwLock<HashMap<EncodedRow, Diff>>,
+    state: RwLock<EncodedStateMap>,
     state_row_count: RwLock<i64>,
     published_row_count: RwLock<i64>,
     state_row_count_version: RwLock<Option<i64>>,
@@ -111,12 +112,14 @@ pub struct MaterializedViewHandle {
     retention_keep_last: Option<usize>,
 }
 
+pub type EncodedStateMap = AHashMap<EncodedRow, Diff>;
+
 impl MaterializedViewHandle {
     fn new(name: String, retention_keep_last: Option<usize>) -> Self {
         let (tx, _rx) = watch::channel(None);
         Self {
             name,
-            state: RwLock::new(HashMap::new()),
+            state: RwLock::new(EncodedStateMap::default()),
             state_row_count: RwLock::new(0),
             published_row_count: RwLock::new(0),
             state_row_count_version: RwLock::new(None),
@@ -154,7 +157,7 @@ impl MaterializedViewHandle {
     }
 
     fn apply_encoded_locked(
-        state: &mut HashMap<EncodedRow, Diff>,
+        state: &mut EncodedStateMap,
         row_count: &mut i64,
         key: &[u8],
         diff: Diff,
@@ -188,7 +191,7 @@ impl MaterializedViewHandle {
         *self.watermark.read().expect("mutex poisoned")
     }
 
-    pub fn snapshot_encoded(&self) -> HashMap<EncodedRow, Diff> {
+    pub fn snapshot_encoded(&self) -> EncodedStateMap {
         self.state.read().expect("mutex poisoned").clone()
     }
 
@@ -297,20 +300,43 @@ impl MaterializedViewHandle {
     }
 
     pub fn apply_encoded_state_batch(&self, version: u64, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
+        self.apply_encoded_state_batch_inner(version, deltas, false)
+    }
+
+    pub fn apply_consolidated_encoded_state_batch(
+        &self,
+        version: u64,
+        deltas: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        self.apply_encoded_state_batch_inner(version, deltas, true)
+    }
+
+    fn apply_encoded_state_batch_inner(
+        &self,
+        version: u64,
+        deltas: &[(Vec<u8>, i64)],
+        deltas_consolidated: bool,
+    ) -> Result<()> {
         if !*self.state_authoritative.read().expect("mutex poisoned") {
             return Ok(());
         }
         {
             let mut state = self.state.write().expect("mutex poisoned");
             let mut row_count = self.state_row_count.write().expect("mutex poisoned");
-            let mut merged = HashMap::<&[u8], i64>::with_capacity(deltas.len());
-            for (key, diff) in deltas {
-                if *diff != 0 {
-                    *merged.entry(key.as_slice()).or_insert(0) += *diff;
+            if deltas_consolidated {
+                for (key, diff) in deltas {
+                    Self::apply_encoded_locked(&mut state, &mut row_count, key, *diff);
                 }
-            }
-            for (key, diff) in merged {
-                Self::apply_encoded_locked(&mut state, &mut row_count, key, diff);
+            } else {
+                let mut merged = HashMap::<&[u8], i64>::with_capacity(deltas.len());
+                for (key, diff) in deltas {
+                    if *diff != 0 {
+                        *merged.entry(key.as_slice()).or_insert(0) += *diff;
+                    }
+                }
+                for (key, diff) in merged {
+                    Self::apply_encoded_locked(&mut state, &mut row_count, key, diff);
+                }
             }
         }
         self.stage_authoritative_row_count_version(version);
@@ -946,6 +972,26 @@ mod tests {
         view.publish_logical_version(2);
         assert_eq!(view.authoritative_row_count_for(1), None);
         assert_eq!(view.authoritative_row_count_for(2), Some(0));
+    }
+
+    #[test]
+    fn authoritative_row_count_tracks_consolidated_encoded_state_batches() {
+        let registry = MaterializedViewRegistry::new();
+        let view = registry.register("mv_consolidated_count");
+        view.mark_state_authoritative();
+        view.publish_logical_version(1);
+
+        let first = encoded_i64_row(1);
+        let second = encoded_i64_row(2);
+        view.apply_consolidated_encoded_state_batch(1, &[(first.clone(), 1), (second, 2)])
+            .expect("apply consolidated batch");
+        assert_eq!(view.authoritative_row_count(), Some(3));
+        assert_eq!(view.snapshot_encoded().get(&first), Some(&1));
+
+        view.apply_consolidated_encoded_state_batch(2, &[(first.clone(), -1)])
+            .expect("apply consolidated delete");
+        assert_eq!(view.authoritative_row_count(), Some(2));
+        assert!(!view.snapshot_encoded().contains_key(&first));
     }
 
     #[test]

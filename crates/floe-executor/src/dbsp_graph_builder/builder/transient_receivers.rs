@@ -32,6 +32,7 @@ pub(super) fn build_transient_source_receiver(
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(input_deltas),
+                        deltas_consolidated: false,
                     }).is_err() {
                         break;
                     }
@@ -83,6 +84,7 @@ pub(super) fn build_transient_transform_receiver(
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(output_deltas),
+                        deltas_consolidated: false,
                     }).is_err() {
                         break;
                     }

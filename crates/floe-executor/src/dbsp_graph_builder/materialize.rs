@@ -44,6 +44,8 @@ pub(super) type DeltaTransformFn =
 pub(crate) struct TransientMaterializeBatch {
     pub version: i64,
     pub deltas: EncodedDeltaBatch,
+    /// True when deltas are already coalesced by encoded row.
+    pub deltas_consolidated: bool,
 }
 
 impl From<TransientSourceBatch> for TransientMaterializeBatch {
@@ -51,6 +53,7 @@ impl From<TransientSourceBatch> for TransientMaterializeBatch {
         Self {
             version: batch.version,
             deltas: batch.deltas,
+            deltas_consolidated: false,
         }
     }
 }
@@ -1418,6 +1421,7 @@ impl DbspGraphBuilder {
             ts,
             apply,
             deltas,
+            false,
             registry,
             pending_snapshot,
             view_label,
@@ -1448,16 +1452,20 @@ impl DbspGraphBuilder {
         );
         let _enter = update_span.enter();
         let apply_start = Instant::now();
-        let (apply, merged) = Self::transform_transient_batch(delta_transform, batch)
-            .await
-            .with_context(|| {
-                format!("apply transient source batch for materialized view '{view_label}' at {ts}")
-            })?;
+        let (apply, merged, deltas_consolidated) =
+            Self::transform_transient_batch(delta_transform, batch)
+                .await
+                .with_context(|| {
+                    format!(
+                        "apply transient source batch for materialized view '{view_label}' at {ts}"
+                    )
+                })?;
         Self::apply_encoded_overlay_batch(
             apply_start,
             ts,
             apply,
             merged,
+            deltas_consolidated,
             registry,
             pending_snapshot,
             view_label,
@@ -1470,6 +1478,7 @@ impl DbspGraphBuilder {
         ts: i64,
         apply: DeltaApplyStats,
         merged: EncodedDeltaBatch,
+        deltas_consolidated: bool,
         registry: &Arc<MaterializedViewHandle>,
         pending_snapshot: &mut PendingOverlaySnapshot,
         view_label: &str,
@@ -1488,11 +1497,23 @@ impl DbspGraphBuilder {
         work.record_output_delta_rows(merged.len());
         registry.record_logical_work(ts, work);
         let apply_stats = registry.append_shared_encoded_overlay_batch(ts_u64, Arc::clone(&merged));
-        registry
-            .apply_encoded_state_batch(ts_u64, merged.as_slice())
-            .with_context(|| {
-                format!("update overlay state cache for materialized view '{view_label}' at {ts}")
-            })?;
+        if deltas_consolidated {
+            registry
+                .apply_consolidated_encoded_state_batch(ts_u64, merged.as_slice())
+                .with_context(|| {
+                    format!(
+                        "update overlay state cache for materialized view '{view_label}' at {ts}"
+                    )
+                })?;
+        } else {
+            registry
+                .apply_encoded_state_batch(ts_u64, merged.as_slice())
+                .with_context(|| {
+                    format!(
+                        "update overlay state cache for materialized view '{view_label}' at {ts}"
+                    )
+                })?;
+        }
         registry.publish_logical_version(ts);
         pending_snapshot.record(ts, merged);
         let latency_ms = apply_start.elapsed().as_millis() as u64;
@@ -1749,7 +1770,7 @@ impl DbspGraphBuilder {
     async fn transform_transient_batch(
         delta_transform: Option<&Arc<DeltaTransformFn>>,
         batch: TransientMaterializeBatch,
-    ) -> Result<(DeltaApplyStats, EncodedDeltaBatch)> {
+    ) -> Result<(DeltaApplyStats, EncodedDeltaBatch, bool)> {
         let input_rows = batch.deltas.len();
         let input_bytes = batch
             .deltas
@@ -1776,6 +1797,7 @@ impl DbspGraphBuilder {
                 merge_ms: 0,
             },
             merged,
+            delta_transform.is_none() && batch.deltas_consolidated,
         ))
     }
 

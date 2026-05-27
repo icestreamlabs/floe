@@ -2522,6 +2522,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2600,6 +2601,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             if tx.send(TransientMaterializeBatch {
                                 version: batch.version,
                                 deltas: Arc::new(output_deltas),
+                                deltas_consolidated: false,
                             }).is_err() {
                                 break;
                             }
@@ -2701,6 +2703,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2797,6 +2800,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2890,6 +2894,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2979,6 +2984,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(output_deltas),
+                        deltas_consolidated: false,
                     }).is_err() {
                         break;
                     }

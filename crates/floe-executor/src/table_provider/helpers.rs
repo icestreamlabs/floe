@@ -47,13 +47,16 @@ pub(super) fn project_schema(
     Ok((Arc::new(Schema::new(fields)), indices))
 }
 
-pub(super) fn build_batches_from_encoded_snapshot(
-    snapshot: std::collections::HashMap<Vec<u8>, i64>,
+pub(super) fn build_batches_from_encoded_snapshot<I>(
+    snapshot: I,
     schema: SchemaRef,
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     mv_version: Option<u64>,
-) -> DFResult<(SchemaRef, Vec<RecordBatch>)> {
+) -> DFResult<(SchemaRef, Vec<RecordBatch>)>
+where
+    I: IntoIterator<Item = (Vec<u8>, i64)>,
+{
     let (projected_schema, projected_indices) = project_schema(&schema, projection)?;
     let mv_version_index = schema
         .fields()

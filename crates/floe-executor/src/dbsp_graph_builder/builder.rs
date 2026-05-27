@@ -2591,6 +2591,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2727,6 +2728,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
+                            deltas_consolidated: false,
                         }).is_err() {
                             break;
                         }
@@ -2943,6 +2945,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(final_deltas),
+                        deltas_consolidated: output_transform.is_none(),
                     }).is_err() {
                         break;
                     }
@@ -3322,6 +3325,7 @@ async fn build_transient_window_incremental_receiver_from_batches(
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(final_deltas),
+                        deltas_consolidated: false,
                     }).is_err() {
                         break;
                     }

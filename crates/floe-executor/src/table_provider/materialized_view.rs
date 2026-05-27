@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,7 +12,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use dbsp::handles::ZSetHandleView;
 
 use crate::materialized_view::{
-    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
+    DbspPersistedState, EncodedStateMap, MaterializedViewHandle, MaterializedViewRegistry,
 };
 
 use super::MV_VERSION_COLUMN;
@@ -116,10 +115,7 @@ impl MaterializedViewTableProvider {
         Ok(batches)
     }
 
-    async fn load_snapshot(
-        &self,
-        as_of_version: Option<u64>,
-    ) -> DFResult<(HashMap<Vec<u8>, i64>, u64)> {
+    async fn load_snapshot(&self, as_of_version: Option<u64>) -> DFResult<(EncodedStateMap, u64)> {
         let total_start = Instant::now();
         let view = self.registry.get(&self.view_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
@@ -172,10 +168,10 @@ impl MaterializedViewTableProvider {
                         self.materialize_dbsp_rows(state, Some(base_dbsp_version))
                             .await?
                     }
-                    None => HashMap::new(),
+                    None => EncodedStateMap::default(),
                 }
             } else {
-                HashMap::new()
+                EncodedStateMap::default()
             };
             for (key, diff) in overlay {
                 if diff == 0 {
@@ -206,7 +202,7 @@ impl MaterializedViewTableProvider {
                 view = %self.view_name,
                 "materialized view has no DBSP state when loading rows"
             );
-            return Ok((HashMap::new(), 0));
+            return Ok((EncodedStateMap::default(), 0));
         };
         let snapshot = if let Some(dbsp_version) =
             Self::resolve_dbsp_version(view.as_ref(), &state, target_version)
@@ -214,7 +210,7 @@ impl MaterializedViewTableProvider {
             self.materialize_dbsp_rows(state, Some(dbsp_version))
                 .await?
         } else {
-            HashMap::new()
+            EncodedStateMap::default()
         };
         self.maybe_seed_authoritative_row_count(view.as_ref(), target_version, &snapshot);
         tracing::info!(
@@ -289,7 +285,7 @@ impl MaterializedViewTableProvider {
         &self,
         view: &MaterializedViewHandle,
         version: u64,
-        snapshot: &HashMap<Vec<u8>, i64>,
+        snapshot: &EncodedStateMap,
     ) {
         if view.authoritative_row_count_for(version).is_some() {
             return;
@@ -313,7 +309,7 @@ impl MaterializedViewTableProvider {
         &self,
         state: DbspPersistedState,
         as_of_version: Option<u64>,
-    ) -> DFResult<HashMap<Vec<u8>, i64>> {
+    ) -> DFResult<EncodedStateMap> {
         let total_start = Instant::now();
         let target_version = as_of_version.unwrap_or(state.version());
         let handle_view = ZSetHandleView::new(
@@ -326,6 +322,7 @@ impl MaterializedViewTableProvider {
             .materialize()
             .await
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        let snapshot = snapshot.into_iter().collect::<EncodedStateMap>();
         tracing::debug!(
             view = %self.view_name,
             version = target_version,
