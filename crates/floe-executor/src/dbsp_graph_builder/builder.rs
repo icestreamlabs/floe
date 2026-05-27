@@ -3877,15 +3877,15 @@ fn encode_transient_window_count_output_deltas(
 fn encode_transient_window_count_group_key_count_output_deltas(
     deltas: AHashMap<(Arc<[u8]>, i64), i64>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
-    let mut projected = AHashMap::<Vec<u8>, i64>::with_capacity(deltas.len());
+    let mut projected = Vec::with_capacity(deltas.len());
     for ((key, count), diff) in deltas {
         if diff == 0 {
             continue;
         }
         let row = encode_transient_window_group_key_count_output_row(&key, count)?;
-        merge_encoded_delta(&mut projected, row, diff);
+        projected.push((row, diff));
     }
-    Ok(projected.into_iter().collect())
+    Ok(projected)
 }
 
 fn merge_encoded_delta<S>(map: &mut HashMap<Vec<u8>, i64, S>, row: Vec<u8>, delta: i64)
