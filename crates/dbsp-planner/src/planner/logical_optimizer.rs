@@ -7,7 +7,7 @@ use datafusion::logical_expr::logical_plan::{
     Aggregate, FetchType, Filter, Projection, SkipType, Sort, SubqueryAlias, Union,
 };
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, Result as DataFusionResult};
 
 use super::config::PlannerConfig;
@@ -47,6 +47,22 @@ impl OptimizerDiagnostics {
             .sum()
     }
 
+    pub fn stage_application_count(&self, stage_name: &str) -> usize {
+        self.stages
+            .iter()
+            .filter(|stage| stage.name == stage_name)
+            .map(OptimizerStageDiagnostics::total_applications)
+            .sum()
+    }
+
+    pub fn disabled_rules(&self) -> Vec<&'static str> {
+        let mut disabled = BTreeSet::new();
+        for stage in &self.stages {
+            disabled.extend(stage.disabled_rules.iter().copied());
+        }
+        disabled.into_iter().collect()
+    }
+
     pub fn max_passes_reached(&self) -> bool {
         self.stages.iter().any(|stage| stage.max_passes_reached)
     }
@@ -61,6 +77,7 @@ impl OptimizerDiagnostics {
             passes: 0,
             max_passes_reached: false,
             rules: Vec::new(),
+            disabled_rules: Vec::new(),
         });
         self.stages
             .last_mut()
@@ -71,10 +88,16 @@ impl OptimizerDiagnostics {
 impl fmt::Display for OptimizerDiagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for stage in &self.stages {
-            if stage.total_applications() == 0 {
+            if stage.total_applications() == 0
+                && stage.disabled_rules.is_empty()
+                && !stage.max_passes_reached
+            {
                 continue;
             }
             writeln!(f, "{}:", stage.name)?;
+            if !stage.disabled_rules.is_empty() {
+                writeln!(f, "  disabled {}", stage.disabled_rules.join(", "))?;
+            }
             for rule in &stage.rules {
                 writeln!(f, "  apply {} {} time(s)", rule.name, rule.count)?;
             }
@@ -96,6 +119,7 @@ pub struct OptimizerStageDiagnostics {
     passes: usize,
     max_passes_reached: bool,
     rules: Vec<OptimizerRuleDiagnostics>,
+    disabled_rules: Vec<&'static str>,
 }
 
 impl OptimizerStageDiagnostics {
@@ -115,8 +139,16 @@ impl OptimizerStageDiagnostics {
         &self.rules
     }
 
+    pub fn disabled_rules(&self) -> &[&'static str] {
+        &self.disabled_rules
+    }
+
     pub fn total_applications(&self) -> usize {
         self.rules.iter().map(|rule| rule.count).sum()
+    }
+
+    fn set_disabled_rules(&mut self, disabled_rules: Vec<&'static str>) {
+        self.disabled_rules = disabled_rules;
     }
 
     fn record_rule(&mut self, rule_name: &'static str) {
@@ -252,7 +284,10 @@ fn optimizer_stages() -> Vec<OptimizerStage> {
         OptimizerStage::fixed_point(
             "Prune",
             ApplyOrder::BottomUp,
-            vec![Box::new(ProjectAggregatePruneRule)],
+            vec![
+                Box::new(ProjectAggregatePruneRule),
+                Box::new(ProjectFilterAggregatePruneRule),
+            ],
         ),
         OptimizerStage::fixed_point(
             "FinalCleanup",
@@ -278,6 +313,15 @@ fn optimize_stage(
     config: &PlannerConfig,
     diagnostics: &mut OptimizerDiagnostics,
 ) -> DataFusionResult<LogicalPlan> {
+    let disabled_rules = stage
+        .rules
+        .iter()
+        .filter_map(|rule| (!config.optimizer_rule_enabled(rule.name())).then_some(rule.name()))
+        .collect();
+    diagnostics
+        .stage_mut(stage.name)
+        .set_disabled_rules(disabled_rules);
+
     if stage.rules.is_empty() {
         diagnostics.stage_mut(stage.name);
         return Ok(current);
@@ -449,7 +493,7 @@ impl LogicalOptimizerRule for FilterUnionTransposeRule {
     fn apply(
         &self,
         plan: LogicalPlan,
-        _ctx: &RuleContext<'_>,
+        ctx: &RuleContext<'_>,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
         let LogicalPlan::Filter(filter) = plan else {
             return Ok(Transformed::no(plan));
@@ -457,6 +501,11 @@ impl LogicalOptimizerRule for FilterUnionTransposeRule {
 
         if let LogicalPlan::Union(union) = filter.input.as_ref()
             && !filter.predicate.is_volatile()
+            && can_duplicate_expressions(
+                std::slice::from_ref(&filter.predicate),
+                union.inputs.len(),
+                ctx.config,
+            )
             && let Some(inputs) = union
                 .inputs
                 .iter()
@@ -587,63 +636,72 @@ impl LogicalOptimizerRule for ProjectAggregatePruneRule {
             return Ok(Transformed::no(LogicalPlan::Projection(projection)));
         };
 
-        if aggregate
-            .group_expr
-            .iter()
-            .any(|expr| matches!(expr, Expr::GroupingSet(_)))
-        {
+        let required_exprs = projection.expr.iter().collect::<Vec<_>>();
+        let Some(pruned) = prune_aggregate_for_expressions(aggregate, &required_exprs)? else {
             return Ok(Transformed::no(LogicalPlan::Projection(projection)));
-        }
-
-        let group_count = aggregate.group_expr.len();
-        let mut required_aggregate_indices = BTreeSet::new();
-        let mut resolved_columns = BTreeMap::new();
-
-        for expr in &projection.expr {
-            for column in expr.column_refs() {
-                let Some(index) = aggregate.schema.maybe_index_of_column(column) else {
-                    return Ok(Transformed::no(LogicalPlan::Projection(projection)));
-                };
-                resolved_columns.insert(column.clone(), index);
-                if index >= group_count {
-                    required_aggregate_indices.insert(index - group_count);
-                }
-            }
-        }
-
-        if required_aggregate_indices.len() == aggregate.aggr_expr.len() {
-            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
-        }
-        if group_count == 0 && required_aggregate_indices.is_empty() {
-            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
-        }
-
-        let mut old_to_new_indices = BTreeMap::new();
-        for group_idx in 0..group_count {
-            old_to_new_indices.insert(group_idx, group_idx);
-        }
-
-        let mut aggr_expr = Vec::with_capacity(required_aggregate_indices.len());
-        for (idx, expr) in aggregate.aggr_expr.iter().enumerate() {
-            if required_aggregate_indices.contains(&idx) {
-                old_to_new_indices.insert(group_count + idx, group_count + aggr_expr.len());
-                aggr_expr.push(expr.clone());
-            }
-        }
-        let aggregate = Aggregate::try_new(
-            Arc::clone(&aggregate.input),
-            aggregate.group_expr.clone(),
-            aggr_expr,
-        )?;
-        let projection_exprs = rewrite_projection_for_pruned_aggregate(
+        };
+        let projection_exprs = rewrite_exprs_for_pruned_aggregate(
             &projection.expr,
-            &resolved_columns,
-            &old_to_new_indices,
-            &aggregate,
+            &pruned.old_column_indices,
+            &pruned.old_to_new_indices,
+            &pruned.aggregate,
         )?;
         let projection = projection_with_schema(
             projection_exprs,
-            Arc::new(LogicalPlan::Aggregate(aggregate)),
+            Arc::new(LogicalPlan::Aggregate(pruned.aggregate)),
+            Arc::clone(&projection.schema),
+        )?;
+
+        Ok(Transformed::yes(LogicalPlan::Projection(projection)))
+    }
+}
+
+struct ProjectFilterAggregatePruneRule;
+
+impl LogicalOptimizerRule for ProjectFilterAggregatePruneRule {
+    fn name(&self) -> &'static str {
+        "ProjectFilterAggregatePrune"
+    }
+
+    fn apply(
+        &self,
+        plan: LogicalPlan,
+        _ctx: &RuleContext<'_>,
+    ) -> DataFusionResult<Transformed<LogicalPlan>> {
+        let LogicalPlan::Projection(projection) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        };
+        let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        };
+
+        let mut required_exprs = projection.expr.iter().collect::<Vec<_>>();
+        required_exprs.push(&filter.predicate);
+        let Some(pruned) = prune_aggregate_for_expressions(aggregate, &required_exprs)? else {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        };
+
+        let predicate = rewrite_expr_for_pruned_aggregate(
+            filter.predicate.clone(),
+            &pruned.old_column_indices,
+            &pruned.old_to_new_indices,
+            &pruned.aggregate,
+        )?;
+        let projection_exprs = rewrite_exprs_for_pruned_aggregate(
+            &projection.expr,
+            &pruned.old_column_indices,
+            &pruned.old_to_new_indices,
+            &pruned.aggregate,
+        )?;
+        let aggregate_plan = LogicalPlan::Aggregate(pruned.aggregate);
+        let filter = Filter::try_new(predicate, Arc::new(aggregate_plan))?;
+        let projection = projection_with_schema(
+            projection_exprs,
+            Arc::new(LogicalPlan::Filter(filter)),
             Arc::clone(&projection.schema),
         )?;
 
@@ -744,7 +802,7 @@ impl LogicalOptimizerRule for ProjectUnionTransposeRule {
     fn apply(
         &self,
         plan: LogicalPlan,
-        _ctx: &RuleContext<'_>,
+        ctx: &RuleContext<'_>,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
         let LogicalPlan::Projection(projection) = plan else {
             return Ok(Transformed::no(plan));
@@ -752,6 +810,7 @@ impl LogicalOptimizerRule for ProjectUnionTransposeRule {
 
         if let LogicalPlan::Union(union) = projection.input.as_ref()
             && projection.expr.iter().all(|expr| !expr.is_volatile())
+            && can_duplicate_expressions(&projection.expr, union.inputs.len(), ctx.config)
             && let Some(inputs) = union
                 .inputs
                 .iter()
@@ -860,7 +919,73 @@ fn rewrite_expr_through_projection(
     Ok(can_rewrite.then_some(rewritten))
 }
 
-fn rewrite_projection_for_pruned_aggregate(
+struct PrunedAggregate {
+    aggregate: Aggregate,
+    old_column_indices: BTreeMap<Column, usize>,
+    old_to_new_indices: BTreeMap<usize, usize>,
+}
+
+fn prune_aggregate_for_expressions(
+    aggregate: &Aggregate,
+    required_expressions: &[&Expr],
+) -> DataFusionResult<Option<PrunedAggregate>> {
+    if aggregate
+        .group_expr
+        .iter()
+        .any(|expr| matches!(expr, Expr::GroupingSet(_)))
+    {
+        return Ok(None);
+    }
+
+    let group_count = aggregate.group_expr.len();
+    let mut required_aggregate_indices = BTreeSet::new();
+    let mut old_column_indices = BTreeMap::new();
+
+    for expr in required_expressions {
+        for column in expr.column_refs() {
+            let Some(index) = aggregate.schema.maybe_index_of_column(column) else {
+                return Ok(None);
+            };
+            old_column_indices.insert(column.clone(), index);
+            if index >= group_count {
+                required_aggregate_indices.insert(index - group_count);
+            }
+        }
+    }
+
+    if required_aggregate_indices.len() == aggregate.aggr_expr.len() {
+        return Ok(None);
+    }
+    if group_count == 0 && required_aggregate_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let mut old_to_new_indices = BTreeMap::new();
+    for group_idx in 0..group_count {
+        old_to_new_indices.insert(group_idx, group_idx);
+    }
+
+    let mut aggr_expr = Vec::with_capacity(required_aggregate_indices.len());
+    for (idx, expr) in aggregate.aggr_expr.iter().enumerate() {
+        if required_aggregate_indices.contains(&idx) {
+            old_to_new_indices.insert(group_count + idx, group_count + aggr_expr.len());
+            aggr_expr.push(expr.clone());
+        }
+    }
+
+    let aggregate = Aggregate::try_new(
+        Arc::clone(&aggregate.input),
+        aggregate.group_expr.clone(),
+        aggr_expr,
+    )?;
+    Ok(Some(PrunedAggregate {
+        aggregate,
+        old_column_indices,
+        old_to_new_indices,
+    }))
+}
+
+fn rewrite_exprs_for_pruned_aggregate(
     expressions: &[Expr],
     old_column_indices: &BTreeMap<Column, usize>,
     old_to_new_indices: &BTreeMap<usize, usize>,
@@ -868,26 +993,40 @@ fn rewrite_projection_for_pruned_aggregate(
 ) -> DataFusionResult<Vec<Expr>> {
     expressions
         .iter()
+        .cloned()
         .map(|expr| {
-            expr.clone()
-                .transform_up(|expr| match expr {
-                    Expr::Column(column) => {
-                        let Some(old_index) = old_column_indices.get(&column).copied() else {
-                            return Ok(Transformed::no(Expr::Column(column)));
-                        };
-                        let Some(new_index) = old_to_new_indices.get(&old_index).copied() else {
-                            return Ok(Transformed::no(Expr::Column(column)));
-                        };
-                        let (_, field) = aggregate.schema.qualified_field(new_index);
-                        Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
-                            field.name().clone(),
-                        ))))
-                    }
-                    other => Ok(Transformed::no(other)),
-                })
-                .map(|result| result.data)
+            rewrite_expr_for_pruned_aggregate(
+                expr,
+                old_column_indices,
+                old_to_new_indices,
+                aggregate,
+            )
         })
         .collect()
+}
+
+fn rewrite_expr_for_pruned_aggregate(
+    expr: Expr,
+    old_column_indices: &BTreeMap<Column, usize>,
+    old_to_new_indices: &BTreeMap<usize, usize>,
+    aggregate: &Aggregate,
+) -> DataFusionResult<Expr> {
+    expr.transform_up(|expr| match expr {
+        Expr::Column(column) => {
+            let Some(old_index) = old_column_indices.get(&column).copied() else {
+                return Ok(Transformed::no(Expr::Column(column)));
+            };
+            let Some(new_index) = old_to_new_indices.get(&old_index).copied() else {
+                return Ok(Transformed::no(Expr::Column(column)));
+            };
+            let (_, field) = aggregate.schema.qualified_field(new_index);
+            Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                field.name().clone(),
+            ))))
+        }
+        other => Ok(Transformed::no(other)),
+    })
+    .map(|result| result.data)
 }
 
 fn rewrite_expr_through_aggregate_group_keys(
@@ -1049,4 +1188,23 @@ fn and_expr(left: Expr, right: Expr) -> Expr {
         op: Operator::And,
         right: Box::new(right),
     })
+}
+
+fn can_duplicate_expressions(exprs: &[Expr], input_count: usize, config: &PlannerConfig) -> bool {
+    if input_count > config.optimizer_max_duplicated_inputs() {
+        return false;
+    }
+
+    let expr_nodes = exprs.iter().map(expr_node_count).sum::<usize>();
+    expr_nodes.saturating_mul(input_count) <= config.optimizer_max_duplicated_expr_nodes()
+}
+
+fn expr_node_count(expr: &Expr) -> usize {
+    let mut count = 0;
+    expr.apply(|_| {
+        count += 1;
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("expression node counting is infallible");
+    count
 }

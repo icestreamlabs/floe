@@ -5,11 +5,16 @@ use datafusion::common::TableReference;
 
 use dbsp_circuit::circuit::tables::TableDescriptor;
 
+const DEFAULT_OPTIMIZER_MAX_DUPLICATED_INPUTS: usize = 8;
+const DEFAULT_OPTIMIZER_MAX_DUPLICATED_EXPR_NODES: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
     tables: HashMap<String, Arc<TableDescriptor>>,
     disabled_optimizer_rules: HashSet<String>,
     optimizer_diagnostics: bool,
+    optimizer_max_duplicated_inputs: usize,
+    optimizer_max_duplicated_expr_nodes: usize,
 }
 
 impl PlannerConfig {
@@ -18,6 +23,8 @@ impl PlannerConfig {
             tables: HashMap::new(),
             disabled_optimizer_rules: HashSet::new(),
             optimizer_diagnostics: false,
+            optimizer_max_duplicated_inputs: DEFAULT_OPTIMIZER_MAX_DUPLICATED_INPUTS,
+            optimizer_max_duplicated_expr_nodes: DEFAULT_OPTIMIZER_MAX_DUPLICATED_EXPR_NODES,
         }
     }
 
@@ -48,6 +55,10 @@ impl PlannerConfig {
         self.disabled_optimizer_rules.insert(rule_name.into());
     }
 
+    pub fn disabled_optimizer_rules(&self) -> impl Iterator<Item = &str> {
+        self.disabled_optimizer_rules.iter().map(String::as_str)
+    }
+
     pub fn with_optimizer_diagnostics(mut self, enabled: bool) -> Self {
         self.set_optimizer_diagnostics(enabled);
         self
@@ -55,6 +66,24 @@ impl PlannerConfig {
 
     pub fn set_optimizer_diagnostics(&mut self, enabled: bool) {
         self.optimizer_diagnostics = enabled;
+    }
+
+    pub fn with_optimizer_max_duplicated_inputs(mut self, max_inputs: usize) -> Self {
+        self.set_optimizer_max_duplicated_inputs(max_inputs);
+        self
+    }
+
+    pub fn set_optimizer_max_duplicated_inputs(&mut self, max_inputs: usize) {
+        self.optimizer_max_duplicated_inputs = max_inputs;
+    }
+
+    pub fn with_optimizer_max_duplicated_expr_nodes(mut self, max_nodes: usize) -> Self {
+        self.set_optimizer_max_duplicated_expr_nodes(max_nodes);
+        self
+    }
+
+    pub fn set_optimizer_max_duplicated_expr_nodes(&mut self, max_nodes: usize) {
+        self.optimizer_max_duplicated_expr_nodes = max_nodes;
     }
 
     pub(super) fn table(&self, name: &TableReference) -> Option<Arc<TableDescriptor>> {
@@ -70,6 +99,14 @@ impl PlannerConfig {
 
     pub(super) fn optimizer_diagnostics_enabled(&self) -> bool {
         self.optimizer_diagnostics
+    }
+
+    pub(super) fn optimizer_max_duplicated_inputs(&self) -> usize {
+        self.optimizer_max_duplicated_inputs
+    }
+
+    pub(super) fn optimizer_max_duplicated_expr_nodes(&self) -> usize {
+        self.optimizer_max_duplicated_expr_nodes
     }
 }
 

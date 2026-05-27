@@ -338,6 +338,38 @@ fn can_disable_optimizer_rule_by_name() {
 }
 
 #[test]
+fn optimizer_diagnostics_include_disabled_rules_and_stage_counts() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "price")).alias("p"),
+            col(qualified(bid, "auction")).alias("a"),
+        ])
+        .unwrap()
+        .project(vec![col("p").alias("price_alias")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner =
+        CircuitPlanner::new(planner_config().with_disabled_optimizer_rule("MergeProjections"));
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+
+    assert_eq!(diagnostics.rule_application_count("MergeProjections"), 0);
+    assert!(diagnostics.disabled_rules().contains(&"MergeProjections"));
+    assert_eq!(diagnostics.stage_application_count("Normalize"), 0);
+    let normalize = diagnostics
+        .stages()
+        .iter()
+        .find(|stage| stage.name() == "Normalize")
+        .expect("normalize stage diagnostics");
+    assert!(normalize.disabled_rules().contains(&"MergeProjections"));
+}
+
+#[test]
 fn pushes_filter_and_projection_into_union_inputs() {
     let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
@@ -378,6 +410,86 @@ fn pushes_filter_and_projection_into_union_inputs() {
         };
         let select = circuit_plan.node(select_id).expect("select input");
         assert!(matches!(select.kind, DbspNodeKind::Select(_)));
+    }
+}
+
+#[test]
+fn skips_union_filter_pushdown_when_duplication_input_gate_exceeded() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let left = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .union(right)
+        .unwrap()
+        .filter(col("price").gt(lit(100_i64)))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config().with_optimizer_max_duplicated_inputs(1));
+    let (optimized, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+
+    assert_eq!(
+        diagnostics.rule_application_count("FilterUnionTranspose"),
+        0
+    );
+    match optimized {
+        datafusion::logical_expr::LogicalPlan::Filter(filter) => {
+            assert!(matches!(
+                filter.input.as_ref(),
+                datafusion::logical_expr::LogicalPlan::Union(_)
+            ));
+        }
+        other => panic!("expected Filter over Union after gated pushdown, found {other:?}"),
+    }
+}
+
+#[test]
+fn skips_union_projection_pushdown_when_expression_duplication_gate_exceeded() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let left = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .union(right)
+        .unwrap()
+        .project(vec![col("auction")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config().with_optimizer_max_duplicated_expr_nodes(1));
+    let (optimized, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+
+    assert_eq!(
+        diagnostics.rule_application_count("ProjectUnionTranspose"),
+        0
+    );
+    match optimized {
+        datafusion::logical_expr::LogicalPlan::Projection(projection) => {
+            assert!(matches!(
+                projection.input.as_ref(),
+                datafusion::logical_expr::LogicalPlan::Union(_)
+            ));
+        }
+        other => panic!("expected Projection over Union after gated pushdown, found {other:?}"),
     }
 }
 
@@ -870,6 +982,49 @@ fn prunes_unused_aggregate_calls_under_projection() {
         .expect("aggregate node");
     assert_eq!(aggregate.aggregates().len(), 1);
     assert_eq!(aggregate.output_schema().len(), 2);
+}
+
+#[test]
+fn prunes_unused_aggregate_calls_through_aggregate_filter() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .aggregate(
+            vec![col(qualified(bid, "auction"))],
+            vec![
+                sum(col(qualified(bid, "price"))).alias("total_price"),
+                count(col(qualified(bid, "price"))).alias("bid_count"),
+                avg(col(qualified(bid, "price"))).alias("avg_price"),
+            ],
+        )
+        .unwrap()
+        .filter(col("bid_count").gt(lit(1_i64)))
+        .unwrap()
+        .project(vec![col("auction"), col("total_price")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+    assert_eq!(
+        diagnostics.rule_application_count("ProjectFilterAggregatePrune"),
+        1
+    );
+
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let aggregate = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Aggregate(aggregate) => Some(aggregate),
+            _ => None,
+        })
+        .expect("aggregate node");
+    assert_eq!(aggregate.aggregates().len(), 2);
+    assert_eq!(aggregate.output_schema().len(), 3);
 }
 
 #[test]
