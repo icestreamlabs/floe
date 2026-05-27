@@ -15,7 +15,9 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
-use dbsp_circuit::circuit::plan::{DbspAggregateFunction, DbspJoinType, DbspNodeKind};
+use dbsp_circuit::circuit::plan::{
+    DbspAggregateFunction, DbspJoinType, DbspNodeKind, DbspWindowPolicy,
+};
 use dbsp_circuit::circuit::tables::TableDescriptor;
 
 use super::expr::map_aggregate_expr;
@@ -1464,11 +1466,8 @@ async fn plans_session_grouping_as_window_aggregate() {
         _ => None,
     });
     let window = window.expect("expected WindowAggregate node");
-    assert_eq!(window.window.allowed_lateness_ms, i64::MAX);
     match &window.window.policy {
-        dbsp_circuit::circuit::plan::DbspWindowPolicy::Session { gap_ms } => {
-            assert_eq!(*gap_ms, 5_000);
-        }
+        DbspWindowPolicy::Session { gap_ms } => assert_eq!(*gap_ms, 5_000),
         other => panic!("expected session window, got {other:?}"),
     }
 }
@@ -1486,6 +1485,10 @@ async fn plans_session_grouping_with_allowed_lateness() {
         _ => None,
     });
     let window = window.expect("expected WindowAggregate node");
+    match &window.window.policy {
+        DbspWindowPolicy::Session { gap_ms } => assert_eq!(*gap_ms, 5_000),
+        other => panic!("expected session window, got {other:?}"),
+    }
     assert_eq!(window.window.allowed_lateness_ms, 1_200);
 }
 

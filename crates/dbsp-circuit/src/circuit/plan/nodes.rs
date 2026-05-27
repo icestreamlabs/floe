@@ -312,7 +312,9 @@ impl DbspAggregateFunction {
             DbspAggregateFunction::Sum => {
                 if matches!(
                     input_type,
-                    DbspScalarType::Int64 | DbspScalarType::TimestampMillis
+                    DbspScalarType::Int64
+                        | DbspScalarType::TimestampMillis
+                        | DbspScalarType::Decimal128 { .. }
                 ) {
                     Ok(input_type.clone())
                 } else {

@@ -22,6 +22,7 @@ pub mod operator_state_registry;
 pub mod operators;
 pub mod relation_state;
 pub mod semijoin;
+pub mod session_window_aggregate;
 pub mod stream;
 pub mod top1;
 pub mod topn;
@@ -29,6 +30,7 @@ pub mod union;
 pub mod window;
 pub mod window_count_aggregate;
 pub mod window_count_star_aggregate;
+pub mod window_incremental_aggregate;
 
 pub use dbsp_storage::storage;
 
@@ -71,6 +73,7 @@ pub use operators::union::UnionOp;
 pub use operators::window::{WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
 pub use semijoin::DbspSemiJoin;
+pub use session_window_aggregate::DbspSessionWindowAggregate;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
@@ -80,3 +83,4 @@ pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
 pub use window_count_aggregate::{DbspWindowCountAggregate, WindowCountInput};
 pub use window_count_star_aggregate::DbspWindowCountStarAggregate;
+pub use window_incremental_aggregate::{DbspWindowIncrementalAggregate, WindowIncrementalInput};

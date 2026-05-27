@@ -12,6 +12,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::DEFAULT_HOT_KEY_COMPACTION_THRESHOLD;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::join::{JoinInputRetention, JoinOp, JoinTransientInputs};
@@ -300,13 +301,15 @@ impl DbspJoin {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for join")?;
-        let left_index = crate::collections::IndexedBatchZSet::new(
+        let left_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("join_left_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
-        let right_index = crate::collections::IndexedBatchZSet::new(
+        let right_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("join_right_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
         left_index
             .restore_committed_checkpoint()
@@ -627,22 +630,28 @@ impl DbspJoin {
             RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
         let right_state =
             RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
-        let left_index = crate::collections::IndexedBatchZSet::new(
+        let left_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("join_left_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
-        let right_index = crate::collections::IndexedBatchZSet::new(
+        let right_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("join_right_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
-        let left_closed_index = crate::collections::IndexedBatchZSet::new(
-            table.clone(),
-            format!("join_left_closed_index_{join_id}"),
-        );
-        let right_closed_index = crate::collections::IndexedBatchZSet::new(
-            table.clone(),
-            format!("join_right_closed_index_{join_id}"),
-        );
+        let left_closed_index =
+            crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
+                table.clone(),
+                format!("join_left_closed_index_{join_id}"),
+                DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
+            );
+        let right_closed_index =
+            crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
+                table.clone(),
+                format!("join_right_closed_index_{join_id}"),
+                DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
+            );
         if persist_indexes {
             left_index
                 .restore_committed_checkpoint()

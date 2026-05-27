@@ -10,8 +10,8 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
-use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::VersionedZSet;
+use crate::collections::{DEFAULT_HOT_KEY_COMPACTION_THRESHOLD, IndexedBatchZSet};
 use crate::handles::ZSetHandle;
 use crate::operators::aggregate::{AggregateOp, AggregateSpec};
 use crate::relation_state::RelationState;
@@ -87,7 +87,11 @@ impl DbspAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for aggregate")?;
-        let index = IndexedBatchZSet::new(table.clone(), format!("aggregate_index_{aggregate_id}"));
+        let index = IndexedBatchZSet::with_hot_key_compaction_threshold(
+            table.clone(),
+            format!("aggregate_index_{aggregate_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
+        );
 
         let aggregate_op = Arc::new(AsyncMutex::new(AggregateOp::new(
             state,

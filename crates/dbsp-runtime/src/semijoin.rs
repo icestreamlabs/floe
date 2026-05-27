@@ -9,6 +9,7 @@ use rkyv::bytecheck::CheckBytes;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::algebra::AbelianGroup;
+use crate::collections::DEFAULT_HOT_KEY_COMPACTION_THRESHOLD;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
 use crate::operators::semijoin::{SemiJoinMode, SemiJoinOp};
@@ -208,13 +209,15 @@ impl DbspSemiJoin {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for semijoin")?;
-        let left_index = crate::collections::IndexedBatchZSet::new(
+        let left_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("semijoin_left_index_{semijoin_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
-        let right_index = crate::collections::IndexedBatchZSet::new(
+        let right_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("semijoin_right_index_{semijoin_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
         left_index
             .restore_committed_checkpoint()

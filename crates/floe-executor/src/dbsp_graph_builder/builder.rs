@@ -2820,7 +2820,9 @@ async fn build_transient_window_count_star_receiver_from_batches(
     let (window_size, window_slide) = match &window.window.policy {
         dbsp::DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
         dbsp::DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
-        dbsp::DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
+        dbsp::DbspWindowPolicy::Session { .. } => {
+            bail!("SESSION windows are not supported by the transient fixed-window receiver")
+        }
     };
     let allowed_lateness_ms = window.window.allowed_lateness_ms;
     let track_evictions = allowed_lateness_ms != i64::MAX;
@@ -3032,7 +3034,9 @@ async fn build_transient_window_incremental_receiver_from_batches(
     let (window_size, window_slide) = match &window.window.policy {
         dbsp::DbspWindowPolicy::Tumbling { size_ms } => (*size_ms, *size_ms),
         dbsp::DbspWindowPolicy::Hopping { size_ms, slide_ms } => (*size_ms, *slide_ms),
-        dbsp::DbspWindowPolicy::Session { gap_ms } => (*gap_ms, *gap_ms),
+        dbsp::DbspWindowPolicy::Session { .. } => {
+            bail!("SESSION windows are not supported by the transient fixed-window receiver")
+        }
     };
     let allowed_lateness_ms = window.window.allowed_lateness_ms;
     let slot_kinds = build_incremental_aggregate_slot_kinds(window.aggregate.aggregates())
@@ -3281,13 +3285,36 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             break;
                         }
                     }
-                    let aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
+                    let mut aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
                     };
+                    if let Some(cutoff) = cutoff {
+                        let evicted = match aggregate_processor
+                            .evict_keys_where(|key| match transient_window_encoded_key_end(key) {
+                                Ok(end) => end <= cutoff,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        graph_id = %graph_id,
+                                        error = %err,
+                                        "skipping malformed transient window aggregate key during eviction"
+                                    );
+                                    false
+                                }
+                            })
+                            .await
+                        {
+                            Ok(deltas) => deltas,
+                            Err(err) => {
+                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
+                                break;
+                            }
+                        };
+                        merge_incremental_aggregate_output_deltas(&mut aggregate_deltas, evicted);
+                    }
                     if compact_source_state {
                         let snapshot = match aggregate_processor.snapshot_state().await {
                             Ok(snapshot) => snapshot,
@@ -3597,6 +3624,9 @@ fn transient_window_resolved_expression_column_index(
 }
 
 fn is_transient_window_count_star_root(window: &dbsp::DbspWindowAggregateNode) -> bool {
+    if matches!(window.window.policy, dbsp::DbspWindowPolicy::Session { .. }) {
+        return false;
+    }
     let aggregates = window.aggregate.aggregates();
     aggregates.len() == 1
         && aggregates.iter().all(|agg| {
@@ -3611,6 +3641,9 @@ fn is_transient_window_count_star_root(window: &dbsp::DbspWindowAggregateNode) -
 }
 
 fn is_transient_window_incremental_root(window: &dbsp::DbspWindowAggregateNode) -> bool {
+    if matches!(window.window.policy, dbsp::DbspWindowPolicy::Session { .. }) {
+        return false;
+    }
     build_incremental_aggregate_slot_kinds(window.aggregate.aggregates()).is_some()
 }
 
@@ -3855,6 +3888,11 @@ fn decode_transient_window_count_state_key(row: &[u8]) -> Result<TransientWindow
     })
 }
 
+fn transient_window_encoded_key_end(row: &[u8]) -> Result<i64> {
+    extract_encoded_row_i64_like_column(row, 1)?
+        .ok_or_else(|| anyhow!("encoded window key end is null"))
+}
+
 fn encode_transient_window_count_output_deltas(
     deltas: TransientWindowCountUpdates,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
@@ -3989,12 +4027,17 @@ const AGGREGATE_VALUE_NULL_UTF8_TAG: u8 = 3;
 const AGGREGATE_VALUE_INT64_TAG: u8 = 4;
 const AGGREGATE_VALUE_TIMESTAMP_MILLIS_TAG: u8 = 5;
 const AGGREGATE_VALUE_UTF8_TAG: u8 = 6;
+const AGGREGATE_VALUE_NULL_DATE_DAYS_TAG: u8 = 7;
+const AGGREGATE_VALUE_NULL_DECIMAL128_TAG: u8 = 8;
+const AGGREGATE_VALUE_DATE_DAYS_TAG: u8 = 9;
+const AGGREGATE_VALUE_DECIMAL128_TAG: u8 = 10;
 const INCREMENTAL_AGGREGATE_SLOT_COUNT_TAG: u8 = 1;
 const INCREMENTAL_AGGREGATE_SLOT_COUNT_DISTINCT_TAG: u8 = 2;
 const INCREMENTAL_AGGREGATE_SLOT_SUM_TAG: u8 = 3;
 const INCREMENTAL_AGGREGATE_SLOT_AVG_TAG: u8 = 4;
 const INCREMENTAL_AGGREGATE_SLOT_MIN_TAG: u8 = 5;
 const INCREMENTAL_AGGREGATE_SLOT_MAX_TAG: u8 = 6;
+const INCREMENTAL_AGGREGATE_SLOT_DECIMAL_SUM_TAG: u8 = 7;
 
 fn encode_transient_count_aggregate_snapshot(
     snapshot: dbsp::TransientCountAggregateSnapshot<Vec<u8>, Vec<u8>>,
@@ -4258,6 +4301,14 @@ fn encode_incremental_aggregate_slot_state(
             dst.extend_from_slice(&sum.to_le_bytes());
             dst.extend_from_slice(&non_null_count.to_le_bytes());
         }
+        dbsp::IncrementalAggregateSlotState::DecimalSum {
+            sum,
+            non_null_count,
+        } => {
+            dst.push(INCREMENTAL_AGGREGATE_SLOT_DECIMAL_SUM_TAG);
+            dst.extend_from_slice(&sum.to_le_bytes());
+            dst.extend_from_slice(&non_null_count.to_le_bytes());
+        }
         dbsp::IncrementalAggregateSlotState::Avg { sum, count } => {
             dst.push(INCREMENTAL_AGGREGATE_SLOT_AVG_TAG);
             dst.extend_from_slice(&sum.to_le_bytes());
@@ -4293,6 +4344,12 @@ fn decode_incremental_aggregate_slot_state(
             sum: read_i64_le(bytes, cursor)?,
             non_null_count: read_i64_le(bytes, cursor)?,
         }),
+        INCREMENTAL_AGGREGATE_SLOT_DECIMAL_SUM_TAG => {
+            Ok(dbsp::IncrementalAggregateSlotState::DecimalSum {
+                sum: read_i128_le(bytes, cursor)?,
+                non_null_count: read_i64_le(bytes, cursor)?,
+            })
+        }
         INCREMENTAL_AGGREGATE_SLOT_AVG_TAG => Ok(dbsp::IncrementalAggregateSlotState::Avg {
             sum: read_i64_le(bytes, cursor)?,
             count: read_i64_le(bytes, cursor)?,
@@ -4343,6 +4400,14 @@ fn encode_aggregate_value(dst: &mut Vec<u8>, value: dbsp::AggregateValue) -> Res
         dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => {
             dst.push(AGGREGATE_VALUE_NULL_UTF8_TAG);
         }
+        dbsp::AggregateValue::Null(dbsp::AggregateValueType::DateDays) => {
+            dst.push(AGGREGATE_VALUE_NULL_DATE_DAYS_TAG);
+        }
+        dbsp::AggregateValue::Null(dbsp::AggregateValueType::Decimal128 { precision, scale }) => {
+            dst.push(AGGREGATE_VALUE_NULL_DECIMAL128_TAG);
+            dst.push(precision);
+            dst.push(scale as u8);
+        }
         dbsp::AggregateValue::Int64(value) => {
             dst.push(AGGREGATE_VALUE_INT64_TAG);
             dst.extend_from_slice(&value.to_le_bytes());
@@ -4354,6 +4419,14 @@ fn encode_aggregate_value(dst: &mut Vec<u8>, value: dbsp::AggregateValue) -> Res
         dbsp::AggregateValue::Utf8(value) => {
             dst.push(AGGREGATE_VALUE_UTF8_TAG);
             write_len_prefixed_bytes(dst, value.as_bytes())?;
+        }
+        dbsp::AggregateValue::DateDays(value) => {
+            dst.push(AGGREGATE_VALUE_DATE_DAYS_TAG);
+            dst.extend_from_slice(&value.to_le_bytes());
+        }
+        dbsp::AggregateValue::Decimal128(value) => {
+            dst.push(AGGREGATE_VALUE_DECIMAL128_TAG);
+            dst.extend_from_slice(&value.to_le_bytes());
         }
     }
     Ok(())
@@ -4370,6 +4443,15 @@ fn decode_aggregate_value(bytes: &[u8], cursor: &mut usize) -> Result<dbsp::Aggr
         AGGREGATE_VALUE_NULL_UTF8_TAG => {
             Ok(dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8))
         }
+        AGGREGATE_VALUE_NULL_DATE_DAYS_TAG => Ok(dbsp::AggregateValue::Null(
+            dbsp::AggregateValueType::DateDays,
+        )),
+        AGGREGATE_VALUE_NULL_DECIMAL128_TAG => Ok(dbsp::AggregateValue::Null(
+            dbsp::AggregateValueType::Decimal128 {
+                precision: read_u8(bytes, cursor)?,
+                scale: read_u8(bytes, cursor)? as i8,
+            },
+        )),
         AGGREGATE_VALUE_INT64_TAG => Ok(dbsp::AggregateValue::Int64(read_i64_le(bytes, cursor)?)),
         AGGREGATE_VALUE_TIMESTAMP_MILLIS_TAG => Ok(dbsp::AggregateValue::TimestampMillis(
             read_i64_le(bytes, cursor)?,
@@ -4379,6 +4461,28 @@ fn decode_aggregate_value(bytes: &[u8], cursor: &mut usize) -> Result<dbsp::Aggr
             Ok(dbsp::AggregateValue::Utf8(
                 String::from_utf8(value).context("decode aggregate UTF-8 value")?,
             ))
+        }
+        AGGREGATE_VALUE_DATE_DAYS_TAG => {
+            let end = cursor
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("date-days cursor overflow"))?;
+            if end > bytes.len() {
+                bail!("truncated aggregate date-days value");
+            }
+            let value = i32::from_le_bytes(bytes[*cursor..end].try_into().unwrap());
+            *cursor = end;
+            Ok(dbsp::AggregateValue::DateDays(value))
+        }
+        AGGREGATE_VALUE_DECIMAL128_TAG => {
+            let end = cursor
+                .checked_add(16)
+                .ok_or_else(|| anyhow!("decimal cursor overflow"))?;
+            if end > bytes.len() {
+                bail!("truncated aggregate decimal value");
+            }
+            let value = i128::from_le_bytes(bytes[*cursor..end].try_into().unwrap());
+            *cursor = end;
+            Ok(dbsp::AggregateValue::Decimal128(value))
         }
         other => bail!("unknown aggregate value tag {other}"),
     }
@@ -4434,6 +4538,17 @@ fn read_i64_le(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
     Ok(i64::from_le_bytes(chunk.try_into().unwrap()))
 }
 
+fn read_i128_le(bytes: &[u8], cursor: &mut usize) -> Result<i128> {
+    let end = cursor
+        .checked_add(16)
+        .ok_or_else(|| anyhow!("i128 cursor overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("truncated i128"))?;
+    *cursor = end;
+    Ok(i128::from_le_bytes(chunk.try_into().unwrap()))
+}
+
 fn encode_count_aggregate_output_deltas(
     deltas: Vec<((Vec<u8>, Vec<i64>), i64)>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
@@ -4464,6 +4579,28 @@ fn encode_incremental_aggregate_output_deltas(
     Ok(encoded)
 }
 
+fn merge_incremental_aggregate_output_deltas(
+    target: &mut Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
+    updates: Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
+) {
+    if updates.is_empty() {
+        return;
+    }
+
+    let mut merged = HashMap::<(Vec<u8>, Vec<dbsp::AggregateValue>), i64>::new();
+    for (row, delta) in target.drain(..).chain(updates) {
+        if delta == 0 {
+            continue;
+        }
+        let entry = merged.entry(row.clone()).or_insert(0);
+        *entry += delta;
+        if *entry == 0 {
+            merged.remove(&row);
+        }
+    }
+    target.extend(merged);
+}
+
 fn encode_i64_values(values: &[i64]) -> Result<Vec<u8>> {
     let count = u32::try_from(values.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
     let mut encoded = Vec::with_capacity(4 + (values.len() * 9));
@@ -4486,6 +4623,10 @@ fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Resul
                 encoded.push(0x07);
             }
             dbsp::AggregateValue::Null(dbsp::AggregateValueType::Utf8) => encoded.push(0x06),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::DateDays) => encoded.push(0x0A),
+            dbsp::AggregateValue::Null(dbsp::AggregateValueType::Decimal128 { .. }) => {
+                encoded.push(0x0C);
+            }
             dbsp::AggregateValue::Int64(value) => {
                 encoded.push(0x01);
                 encoded.extend_from_slice(&value.to_le_bytes());
@@ -4501,6 +4642,14 @@ fn encode_incremental_aggregate_values(values: &[dbsp::AggregateValue]) -> Resul
                     .map_err(|_| anyhow!("utf8 value too large for MV key"))?;
                 encoded.extend_from_slice(&len.to_le_bytes());
                 encoded.extend_from_slice(bytes);
+            }
+            dbsp::AggregateValue::DateDays(value) => {
+                encoded.push(0x09);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            dbsp::AggregateValue::Decimal128(value) => {
+                encoded.push(0x0B);
+                encoded.extend_from_slice(&value.to_le_bytes());
             }
         }
     }

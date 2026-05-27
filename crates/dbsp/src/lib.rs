@@ -26,7 +26,8 @@ pub mod semantic {
 pub use dbsp_runtime::{
     aggregate, algebra, collections, count_aggregate, distinct, filter_map, handles,
     incremental_aggregate, join, operator_state_registry, operators, relation_state, semijoin,
-    stream, top1, topn, union, window, window_count_aggregate, window_count_star_aggregate,
+    session_window_aggregate, stream, top1, topn, union, window, window_count_aggregate,
+    window_count_star_aggregate, window_incremental_aggregate,
 };
 pub use dbsp_storage::storage;
 
@@ -74,6 +75,7 @@ pub use operators::topn::TopNOp;
 pub use operators::window::WindowKey;
 pub use relation_state::RelationState;
 pub use semijoin::DbspSemiJoin;
+pub use session_window_aggregate::DbspSessionWindowAggregate;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
@@ -83,3 +85,4 @@ pub use union::DbspUnion;
 pub use window::DbspWindowAggregate;
 pub use window_count_aggregate::{DbspWindowCountAggregate, WindowCountInput};
 pub use window_count_star_aggregate::DbspWindowCountStarAggregate;
+pub use window_incremental_aggregate::{DbspWindowIncrementalAggregate, WindowIncrementalInput};
