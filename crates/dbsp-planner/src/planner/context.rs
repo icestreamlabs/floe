@@ -1262,10 +1262,19 @@ struct SplitJoinFilter {
     required_columns: BTreeSet<usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum JoinInputSide {
     Left,
     Right,
+}
+
+impl JoinInputSide {
+    fn opposite(self) -> Self {
+        match self {
+            JoinInputSide::Left => JoinInputSide::Right,
+            JoinInputSide::Right => JoinInputSide::Left,
+        }
+    }
 }
 
 fn combine_optional_filters(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> {
@@ -1432,8 +1441,8 @@ fn split_join_filter(
             (true, false) => {
                 let left_predicate =
                     rewrite_join_output_expr_for_side(conjunct, join, JoinInputSide::Left)?;
-                if let Some(right_predicate) =
-                    rewrite_key_predicate_for_opposite_side(&left_predicate, &left_to_right_keys)?
+                for right_predicate in
+                    rewrite_key_predicates_for_opposite_side(&left_predicate, &left_to_right_keys)?
                 {
                     right_pushdown.push(right_predicate);
                 }
@@ -1442,8 +1451,8 @@ fn split_join_filter(
             (false, true) => {
                 let right_predicate =
                     rewrite_join_output_expr_for_side(conjunct, join, JoinInputSide::Right)?;
-                if let Some(left_predicate) =
-                    rewrite_key_predicate_for_opposite_side(&right_predicate, &right_to_left_keys)?
+                for left_predicate in
+                    rewrite_key_predicates_for_opposite_side(&right_predicate, &right_to_left_keys)?
                 {
                     left_pushdown.push(left_predicate);
                 }
@@ -1540,40 +1549,148 @@ fn rewrite_join_output_expr_for_side(
 fn join_key_column_mapping(
     join: &DbspJoinNode,
     from_side: JoinInputSide,
-) -> HashMap<String, String> {
-    let mut mapping = HashMap::new();
+) -> HashMap<String, Vec<String>> {
+    let mut classes: Vec<BTreeSet<JoinKeyRef>> = Vec::new();
     for key in &join.keys {
-        let (from, to) = match from_side {
-            JoinInputSide::Left => (key.left_expression().expr(), key.right_expression().expr()),
-            JoinInputSide::Right => (key.right_expression().expr(), key.left_expression().expr()),
-        };
-        let (Expr::Column(from), Expr::Column(to)) = (from, to) else {
+        let (Expr::Column(left), Expr::Column(right)) =
+            (key.left_expression().expr(), key.right_expression().expr())
+        else {
             continue;
         };
-        mapping.insert(from.name.clone(), to.name.clone());
+        merge_join_key_refs(
+            &mut classes,
+            JoinKeyRef {
+                side: JoinInputSide::Left,
+                name: left.name.clone(),
+            },
+            JoinKeyRef {
+                side: JoinInputSide::Right,
+                name: right.name.clone(),
+            },
+        );
     }
+
+    let to_side = from_side.opposite();
+    let mut mapping: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for class in classes {
+        let targets = class
+            .iter()
+            .filter(|column| column.side == to_side)
+            .map(|column| column.name.clone())
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() {
+            continue;
+        }
+
+        for source in class.iter().filter(|column| column.side == from_side) {
+            mapping
+                .entry(source.name.clone())
+                .or_default()
+                .extend(targets.iter().cloned());
+        }
+    }
+
     mapping
+        .into_iter()
+        .map(|(source, targets)| (source, targets.into_iter().collect()))
+        .collect()
 }
 
-fn rewrite_key_predicate_for_opposite_side(
-    predicate: &Expr,
-    key_mapping: &HashMap<String, String>,
-) -> Result<Option<Expr>, PlannerError> {
-    if predicate.is_volatile() || key_mapping.is_empty() {
-        return Ok(None);
+fn merge_join_key_refs(
+    classes: &mut Vec<BTreeSet<JoinKeyRef>>,
+    left: JoinKeyRef,
+    right: JoinKeyRef,
+) {
+    let mut matched = Vec::new();
+    for (idx, class) in classes.iter().enumerate() {
+        if class.contains(&left) || class.contains(&right) {
+            matched.push(idx);
+        }
     }
 
-    let mut saw_key_column = false;
-    let mut can_rewrite = true;
-    let rewritten = predicate
+    if matched.is_empty() {
+        classes.push(BTreeSet::from([left, right]));
+        return;
+    }
+
+    let first = matched[0];
+    classes[first].insert(left);
+    classes[first].insert(right);
+    for idx in matched.into_iter().skip(1).rev() {
+        let other = classes.remove(idx);
+        classes[first].extend(other);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct JoinKeyRef {
+    side: JoinInputSide,
+    name: String,
+}
+
+fn rewrite_key_predicates_for_opposite_side(
+    predicate: &Expr,
+    key_mapping: &HashMap<String, Vec<String>>,
+) -> Result<Vec<Expr>, PlannerError> {
+    if predicate.is_volatile() || key_mapping.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let source_columns = predicate
+        .column_refs()
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<BTreeSet<_>>();
+    if source_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut target_sets = Vec::with_capacity(source_columns.len());
+    for source in &source_columns {
+        let Some(targets) = key_mapping.get(source) else {
+            return Ok(Vec::new());
+        };
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        target_sets.push((source.as_str(), targets.as_slice()));
+    }
+
+    if target_sets.iter().all(|(_, targets)| targets.len() == 1) {
+        let mapping = target_sets
+            .iter()
+            .map(|(source, targets)| ((*source).to_string(), targets[0].clone()))
+            .collect::<HashMap<_, _>>();
+        return rewrite_key_predicate_columns(predicate, &mapping).map(|expr| vec![expr]);
+    }
+
+    if target_sets.len() == 1 {
+        let (source, targets) = target_sets[0];
+        return targets
+            .iter()
+            .map(|target| {
+                rewrite_key_predicate_columns(
+                    predicate,
+                    &HashMap::from([(source.to_string(), target.clone())]),
+                )
+            })
+            .collect();
+    }
+
+    Ok(Vec::new())
+}
+
+fn rewrite_key_predicate_columns(
+    predicate: &Expr,
+    column_mapping: &HashMap<String, String>,
+) -> Result<Expr, PlannerError> {
+    predicate
         .clone()
         .transform_up(|expr| match expr {
             Expr::Column(column) => {
-                let Some(target_name) = key_mapping.get(&column.name) else {
-                    can_rewrite = false;
+                let Some(target_name) = column_mapping.get(&column.name) else {
                     return Ok(Transformed::no(Expr::Column(column)));
                 };
-                saw_key_column = true;
                 Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
                     target_name.clone(),
                 ))))
@@ -1581,9 +1698,7 @@ fn rewrite_key_predicate_for_opposite_side(
             other => Ok(Transformed::no(other)),
         })
         .map(|result| result.data)
-        .map_err(|err| PlannerError::AnalysisError(err.into()))?;
-
-    Ok((can_rewrite && saw_key_column).then_some(rewritten))
+        .map_err(|err| PlannerError::AnalysisError(err.into()))
 }
 
 fn add_required_expression_columns(

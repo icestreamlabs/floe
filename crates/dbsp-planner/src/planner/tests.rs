@@ -511,6 +511,66 @@ fn infers_join_key_predicates_for_opposite_input() {
 }
 
 #[test]
+fn infers_join_key_predicates_for_ambiguous_equivalence_class() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Inner,
+            (
+                vec![qualified(person, "id"), qualified(person, "id")],
+                vec![qualified(auction, "seller"), qualified(auction, "category")],
+            ),
+            None,
+        )
+        .unwrap()
+        .filter(col(qualified(person, "id")).gt(lit(10_i64)))
+        .unwrap()
+        .project(vec![col(qualified(person, "name"))])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let predicates = circuit_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            DbspNodeKind::Select(select) => {
+                Some(format!("{:?}", select.predicate().expression().expr()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let predicate = predicates
+        .iter()
+        .find(|predicate| predicate.contains("seller") && predicate.contains("category"))
+        .unwrap_or_else(|| {
+            panic!("expected inferred seller/category predicate, got {predicates:?}")
+        });
+    assert!(
+        predicate.contains("seller"),
+        "expected inferred seller predicate, got {predicate}",
+    );
+    assert!(
+        predicate.contains("category"),
+        "expected inferred category predicate, got {predicate}",
+    );
+}
+
+#[test]
 fn plans_left_outer_join_with_nullable_right_columns() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
@@ -772,6 +832,47 @@ fn plans_aggregate_over_distinct_subquery() {
 }
 
 #[test]
+fn prunes_unused_aggregate_calls_under_projection() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .aggregate(
+            vec![col(qualified(bid, "auction"))],
+            vec![
+                sum(col(qualified(bid, "price"))).alias("total_price"),
+                count(col(qualified(bid, "price"))).alias("bid_count"),
+                avg(col(qualified(bid, "price"))).alias("avg_price"),
+            ],
+        )
+        .unwrap()
+        .project(vec![col("auction"), col("total_price")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let (_plan, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+    assert_eq!(
+        diagnostics.rule_application_count("ProjectAggregatePrune"),
+        1
+    );
+
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let aggregate = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Aggregate(aggregate) => Some(aggregate),
+            _ => None,
+        })
+        .expect("aggregate node");
+    assert_eq!(aggregate.aggregates().len(), 1);
+    assert_eq!(aggregate.output_schema().len(), 2);
+}
+
+#[test]
 fn pushes_only_group_key_filters_below_aggregate() {
     let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
@@ -889,6 +990,34 @@ fn plans_aggregate_and_topn() {
             assert_eq!(topn.output_schema().len(), 4);
         }
         other => panic!("expected TopN node, found {other:?}"),
+    }
+}
+
+#[test]
+fn normalizes_limit_sort_to_sort_fetch_for_topn() {
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+
+    let plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .sort(vec![col(qualified(bid, "price")).sort(false, true)])
+        .unwrap()
+        .limit(0, Some(5))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let (optimized, diagnostics) = planner
+        .optimize_logical_plan_with_diagnostics(&plan)
+        .expect("optimize plan");
+    assert_eq!(
+        diagnostics.rule_application_count("LimitSortToSortFetch"),
+        1
+    );
+
+    match optimized {
+        datafusion::logical_expr::LogicalPlan::Sort(sort) => assert_eq!(sort.fetch, Some(5)),
+        other => panic!("expected normalized Sort(fetch), found {other:?}"),
     }
 }
 

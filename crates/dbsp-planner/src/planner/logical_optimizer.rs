@@ -1,8 +1,11 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
 use datafusion::logical_expr::expr::Alias;
-use datafusion::logical_expr::logical_plan::{Aggregate, Filter, Projection, SubqueryAlias, Union};
+use datafusion::logical_expr::logical_plan::{
+    Aggregate, FetchType, Filter, Projection, SkipType, Sort, SubqueryAlias, Union,
+};
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, Result as DataFusionResult};
@@ -246,7 +249,26 @@ fn optimizer_stages() -> Vec<OptimizerStage> {
                 Box::new(FlattenUnionsRule),
             ],
         ),
-        OptimizerStage::fixed_point("DbspPattern", ApplyOrder::TopDown, Vec::new()),
+        OptimizerStage::fixed_point(
+            "Prune",
+            ApplyOrder::BottomUp,
+            vec![Box::new(ProjectAggregatePruneRule)],
+        ),
+        OptimizerStage::fixed_point(
+            "FinalCleanup",
+            ApplyOrder::BottomUp,
+            vec![
+                Box::new(MergeFiltersRule),
+                Box::new(EliminateIdentityProjectionRule),
+                Box::new(MergeProjectionsRule),
+                Box::new(FlattenUnionsRule),
+            ],
+        ),
+        OptimizerStage::fixed_point(
+            "DbspPattern",
+            ApplyOrder::TopDown,
+            vec![Box::new(LimitSortToSortFetchRule)],
+        ),
     ]
 }
 
@@ -545,6 +567,135 @@ impl LogicalOptimizerRule for EliminateIdentityProjectionRule {
     }
 }
 
+struct ProjectAggregatePruneRule;
+
+impl LogicalOptimizerRule for ProjectAggregatePruneRule {
+    fn name(&self) -> &'static str {
+        "ProjectAggregatePrune"
+    }
+
+    fn apply(
+        &self,
+        plan: LogicalPlan,
+        _ctx: &RuleContext<'_>,
+    ) -> DataFusionResult<Transformed<LogicalPlan>> {
+        let LogicalPlan::Projection(projection) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let LogicalPlan::Aggregate(aggregate) = projection.input.as_ref() else {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        };
+
+        if aggregate
+            .group_expr
+            .iter()
+            .any(|expr| matches!(expr, Expr::GroupingSet(_)))
+        {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        }
+
+        let group_count = aggregate.group_expr.len();
+        let mut required_aggregate_indices = BTreeSet::new();
+        let mut resolved_columns = BTreeMap::new();
+
+        for expr in &projection.expr {
+            for column in expr.column_refs() {
+                let Some(index) = aggregate.schema.maybe_index_of_column(column) else {
+                    return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+                };
+                resolved_columns.insert(column.clone(), index);
+                if index >= group_count {
+                    required_aggregate_indices.insert(index - group_count);
+                }
+            }
+        }
+
+        if required_aggregate_indices.len() == aggregate.aggr_expr.len() {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        }
+        if group_count == 0 && required_aggregate_indices.is_empty() {
+            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+        }
+
+        let mut old_to_new_indices = BTreeMap::new();
+        for group_idx in 0..group_count {
+            old_to_new_indices.insert(group_idx, group_idx);
+        }
+
+        let mut aggr_expr = Vec::with_capacity(required_aggregate_indices.len());
+        for (idx, expr) in aggregate.aggr_expr.iter().enumerate() {
+            if required_aggregate_indices.contains(&idx) {
+                old_to_new_indices.insert(group_count + idx, group_count + aggr_expr.len());
+                aggr_expr.push(expr.clone());
+            }
+        }
+        let aggregate = Aggregate::try_new(
+            Arc::clone(&aggregate.input),
+            aggregate.group_expr.clone(),
+            aggr_expr,
+        )?;
+        let projection_exprs = rewrite_projection_for_pruned_aggregate(
+            &projection.expr,
+            &resolved_columns,
+            &old_to_new_indices,
+            &aggregate,
+        )?;
+        let projection = projection_with_schema(
+            projection_exprs,
+            Arc::new(LogicalPlan::Aggregate(aggregate)),
+            Arc::clone(&projection.schema),
+        )?;
+
+        Ok(Transformed::yes(LogicalPlan::Projection(projection)))
+    }
+}
+
+struct LimitSortToSortFetchRule;
+
+impl LogicalOptimizerRule for LimitSortToSortFetchRule {
+    fn name(&self) -> &'static str {
+        "LimitSortToSortFetch"
+    }
+
+    fn apply(
+        &self,
+        plan: LogicalPlan,
+        _ctx: &RuleContext<'_>,
+    ) -> DataFusionResult<Transformed<LogicalPlan>> {
+        let LogicalPlan::Limit(limit) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let skip = match limit.get_skip_type()? {
+            SkipType::Literal(skip) => skip,
+            SkipType::UnsupportedExpr => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+        };
+        let fetch = match limit.get_fetch_type()? {
+            FetchType::Literal(Some(fetch)) => fetch,
+            FetchType::Literal(None) | FetchType::UnsupportedExpr => {
+                return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+            }
+        };
+        if skip != 0 {
+            return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+        }
+
+        let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
+            return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+        };
+        if sort.fetch.is_some() {
+            return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+        }
+
+        Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+            expr: sort.expr.clone(),
+            input: Arc::clone(&sort.input),
+            fetch: Some(fetch),
+        })))
+    }
+}
+
 struct MergeProjectionsRule;
 
 impl LogicalOptimizerRule for MergeProjectionsRule {
@@ -707,6 +858,36 @@ fn rewrite_expr_through_projection(
         .data;
 
     Ok(can_rewrite.then_some(rewritten))
+}
+
+fn rewrite_projection_for_pruned_aggregate(
+    expressions: &[Expr],
+    old_column_indices: &BTreeMap<Column, usize>,
+    old_to_new_indices: &BTreeMap<usize, usize>,
+    aggregate: &Aggregate,
+) -> DataFusionResult<Vec<Expr>> {
+    expressions
+        .iter()
+        .map(|expr| {
+            expr.clone()
+                .transform_up(|expr| match expr {
+                    Expr::Column(column) => {
+                        let Some(old_index) = old_column_indices.get(&column).copied() else {
+                            return Ok(Transformed::no(Expr::Column(column)));
+                        };
+                        let Some(new_index) = old_to_new_indices.get(&old_index).copied() else {
+                            return Ok(Transformed::no(Expr::Column(column)));
+                        };
+                        let (_, field) = aggregate.schema.qualified_field(new_index);
+                        Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                            field.name().clone(),
+                        ))))
+                    }
+                    other => Ok(Transformed::no(other)),
+                })
+                .map(|result| result.data)
+        })
+        .collect()
 }
 
 fn rewrite_expr_through_aggregate_group_keys(
