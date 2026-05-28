@@ -42,7 +42,6 @@ pub mod subscribe;
 pub mod table_provider;
 pub mod tail;
 pub mod task_events;
-pub mod vectorized_exec;
 pub mod vectorized_keys;
 
 pub use barrier_clock::{BarrierClock, StepId};
@@ -73,7 +72,6 @@ pub use table_provider::{
 };
 pub use tail::TailExecutionConfig;
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
-pub use vectorized_exec::{VectorizedPlanExecutor, VectorizedTickOutput};
 pub use vectorized_keys::{
     build_delta_batch, build_source_delta_batch, source_primary_key_columns,
 };
