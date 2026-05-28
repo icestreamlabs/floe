@@ -33,59 +33,6 @@ pub struct DbspAggregate {
 }
 
 impl DbspAggregate {
-    #[cfg(test)]
-    pub async fn new<K, V, A, FKey>(
-        input: &DeltaHandleStream,
-        key_extractor: FKey,
-        spec: AggregateSpec<K, V, A>,
-        error_handler: Option<RuntimeErrorHandler>,
-    ) -> anyhow::Result<Self>
-    where
-        K: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        V: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        A: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        FKey: Fn(&V) -> Option<K> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            input,
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(value, weight)| {
-                        key_extractor(value).map(|key| (key, value.clone(), *weight))
-                    })
-                    .collect()
-            },
-            spec,
-            error_handler,
-        )
-        .await
-    }
-
     pub async fn new_batch<K, V, A, FKey>(
         input: &DeltaHandleStream,
         key_extractor: FKey,
@@ -299,9 +246,14 @@ mod tests {
         source.add_delta("cc".to_string(), 1);
         source.flush().await.expect("flush t2");
 
-        let aggregate = DbspAggregate::new::<String, String, i64, _>(
+        let aggregate = DbspAggregate::new_batch::<String, String, i64, _>(
             &source.delta_handle_stream(),
-            |value: &String| Some(value.clone()),
+            |delta_values: &[(String, i64)]| {
+                delta_values
+                    .iter()
+                    .map(|(value, weight)| (value.clone(), value.clone(), *weight))
+                    .collect()
+            },
             count_all::<String, String>(),
             None,
         )

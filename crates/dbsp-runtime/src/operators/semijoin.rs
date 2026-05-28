@@ -21,8 +21,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-#[cfg(test)]
-type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,46 +113,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub fn new(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, ()>,
-        left_key: JoinKeyExtractor<L, K>,
-        right_key: JoinKeyExtractor<R, K>,
-        mode: SemiJoinMode,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<L>,
-        integrated: Option<RelationState<L>>,
-    ) -> Self {
-        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        Self::new_batch(
-            left_state,
-            right_state,
-            left_index,
-            right_index,
-            left_key,
-            right_key,
-            mode,
-            table,
-            output,
-            integrated,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch(
         left_state: RelationState<L>,
@@ -577,8 +535,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     type Row = (i64, i64);
+    type RowKeyExtractor = Arc<dyn Fn(&Row) -> Option<i64> + Send + Sync>;
 
     static TEST_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn batch_row_key_extractor(key_extractor: RowKeyExtractor) -> BatchJoinKeyExtractor<Row, i64> {
+        Arc::new(move |deltas: &[(Row, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| key_extractor(row).map(|key| (key, *row, *weight)))
+                .collect()
+        })
+    }
 
     fn next_test_suffix() -> u64 {
         TEST_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -725,16 +693,16 @@ mod tests {
         let left_index = IndexedBatchZSet::new(table.clone(), left_index_ns);
         let right_index = IndexedBatchZSet::new(table.clone(), right_index_ns);
 
-        let left_key = Arc::new(|row: &Row| Some(row.0));
-        let right_key = Arc::new(|row: &Row| Some(row.0));
+        let left_key: RowKeyExtractor = Arc::new(|row: &Row| Some(row.0));
+        let right_key: RowKeyExtractor = Arc::new(|row: &Row| Some(row.0));
 
-        let mut op = SemiJoinOp::new(
+        let mut op = SemiJoinOp::new_batch(
             left_state,
             right_state,
             left_index,
             right_index,
-            left_key,
-            right_key,
+            batch_row_key_extractor(left_key),
+            batch_row_key_extractor(right_key),
             mode,
             table.clone(),
             output,
@@ -876,13 +844,13 @@ mod tests {
             .await
             .expect("output zset");
 
-        let mut op = SemiJoinOp::new(
+        let mut op = SemiJoinOp::new_batch(
             left_state,
             right_state,
             IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
             IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
-            Arc::new(|row: &Row| Some(row.0)),
-            Arc::new(|row: &Row| Some(row.0)),
+            batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
+            batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
             mode,
             table.clone(),
             output,

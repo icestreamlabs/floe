@@ -21,8 +21,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-#[cfg(test)]
-type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type BatchKeyExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
@@ -97,26 +95,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub fn new(
-        state: RelationState<(K, A)>,
-        index: IndexedBatchZSet<K, V>,
-        table: Arc<dyn KeyValueTable>,
-        key_extractor: KeyExtractor<V, K>,
-        aggregator: Aggregator<K, V, A>,
-        output: VersionedZSet<(K, A)>,
-    ) -> Self {
-        let key_extractor = Arc::new(move |deltas: &[(V, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| {
-                    key_extractor(row).map(|key| (key, row.clone(), *weight))
-                })
-                .collect()
-        });
-        Self::new_batch(state, index, table, key_extractor, aggregator, output)
-    }
-
     pub fn new_batch(
         state: RelationState<(K, A)>,
         index: IndexedBatchZSet<K, V>,
@@ -464,6 +442,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    type ScalarKeyExtractor = Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync>;
+
+    fn batch_key_extractor(key_extractor: ScalarKeyExtractor) -> BatchKeyExtractor<i64, i64> {
+        Arc::new(move |deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(value, weight)| {
+                    key_extractor(value).map(|key| (key, *value, *weight))
+                })
+                .collect()
+        })
+    }
+
     async fn stage_version(
         dict: Arc<Dictionary<i64>>,
         table: Arc<dyn KeyValueTable>,
@@ -565,7 +556,7 @@ mod tests {
         .expect("output");
 
         let index = IndexedBatchZSet::new(table.clone(), "group_by_index");
-        let key_extractor: KeyExtractor<i64, i64> =
+        let key_extractor: ScalarKeyExtractor =
             Arc::new(
                 |value: &i64| {
                     if *value >= 0 { Some(value % 2) } else { None }
@@ -582,11 +573,11 @@ mod tests {
             Some(sum)
         });
 
-        let mut op = GroupByOp::new(
+        let mut op = GroupByOp::new_batch(
             state,
             index,
             table.clone(),
-            key_extractor,
+            batch_key_extractor(key_extractor),
             aggregator,
             output,
         );
@@ -704,7 +695,7 @@ mod tests {
         .expect("output");
         let index = IndexedBatchZSet::new(table.clone(), "group_by_recompute_index");
 
-        let key_extractor: KeyExtractor<i64, i64> =
+        let key_extractor: ScalarKeyExtractor =
             Arc::new(
                 |value: &i64| {
                     if *value >= 0 { Some(value % 2) } else { None }
@@ -721,11 +712,11 @@ mod tests {
             Some(sum)
         });
 
-        let mut op = GroupByOp::new(
+        let mut op = GroupByOp::new_batch(
             state,
             index,
             table.clone(),
-            key_extractor.clone(),
+            batch_key_extractor(Arc::clone(&key_extractor)),
             aggregator.clone(),
             output,
         );
@@ -833,18 +824,18 @@ mod tests {
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
             .await
             .expect("output");
-        let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(*value));
+        let key_extractor: ScalarKeyExtractor = Arc::new(|value: &i64| Some(*value));
         let aggregator: Aggregator<i64, i64, i64> = Arc::new(|_, values| {
             let sum = values
                 .iter()
                 .fold(0i64, |acc, (value, weight)| acc + value * weight);
             (sum != 0).then_some(sum)
         });
-        let mut op = GroupByOp::new(
+        let mut op = GroupByOp::new_batch(
             state,
             IndexedBatchZSet::new(table.clone(), format!("{prefix}_index")),
             table.clone(),
-            key_extractor,
+            batch_key_extractor(key_extractor),
             aggregator,
             output,
         );

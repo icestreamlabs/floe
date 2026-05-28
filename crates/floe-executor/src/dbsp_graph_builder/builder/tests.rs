@@ -1239,7 +1239,7 @@ async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
         .expect("precompute q16 pruned bid row");
     assert_eq!(precomputed.len(), 1);
 
-    let row_evaluator = build_incremental_aggregate_row_evaluator(
+    let row_evaluator = build_incremental_aggregate_batch_row_evaluator(
         Arc::clone(&aggregate_input_schema),
         shape.aggregate.group_keys().to_vec(),
         shape.aggregate.aggregates().to_vec(),
@@ -1247,7 +1247,8 @@ async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
         "benchmark_result".to_string(),
         "transient_aggregate",
     );
-    let row = row_evaluator(&precomputed[0].0).expect("incremental aggregate row");
+    let rows = row_evaluator(&precomputed);
+    let row = &rows.first().expect("incremental aggregate row").1;
     assert_eq!(row.slots.len(), shape.aggregate.aggregates().len());
 }
 

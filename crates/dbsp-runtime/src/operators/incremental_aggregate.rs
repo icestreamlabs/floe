@@ -289,8 +289,6 @@ fn checked_add_i64_sum(left: i64, right: i128) -> Result<i64> {
         .ok_or_else(|| anyhow::anyhow!("incremental Int64 SUM overflow"))
 }
 
-#[cfg(test)]
-type RowEvaluator<V, K> = Arc<dyn Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync>;
 type BatchRowEvaluator<V, K> =
     Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync>;
 
@@ -349,35 +347,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub(crate) fn new(
-        state: RelationState<(K, GroupedIncrementalAggregateState)>,
-        table: Arc<dyn KeyValueTable>,
-        row_evaluator: RowEvaluator<V, K>,
-        output: VersionedZSet<(K, Vec<AggregateValue>)>,
-        slot_kinds: Vec<IncrementalAggregateSlotKind>,
-        distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
-        input_index: Option<IndexedBatchZSet<K, V>>,
-    ) -> Self {
-        let batch_row_evaluator = Arc::new(move |delta_values: &[(V, i64)]| {
-            delta_values
-                .iter()
-                .filter_map(|(value, weight)| {
-                    (row_evaluator)(value).map(|row_update| (value.clone(), row_update, *weight))
-                })
-                .collect()
-        });
-        Self::new_batch(
-            state,
-            table,
-            batch_row_evaluator,
-            output,
-            slot_kinds,
-            distinct_index,
-            input_index,
-        )
-    }
-
     pub(crate) fn new_batch(
         state: RelationState<(K, GroupedIncrementalAggregateState)>,
         table: Arc<dyn KeyValueTable>,
@@ -1751,6 +1720,21 @@ mod tests {
         category: String,
     }
 
+    fn incremental_batch_rows<K, F>(row_evaluator: F) -> BatchRowEvaluator<AggregateRow, K>
+    where
+        K: Send + Sync + 'static,
+        F: Fn(&AggregateRow) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
+    {
+        Arc::new(move |deltas: &[(AggregateRow, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| {
+                    row_evaluator(row).map(|update| (row.clone(), update, *weight))
+                })
+                .collect()
+        })
+    }
+
     async fn stage_version<T>(
         dict: Arc<Dictionary<T>>,
         table: Arc<dyn KeyValueTable>,
@@ -1847,10 +1831,10 @@ mod tests {
         .await
         .expect("create incremental aggregate output");
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &AggregateRow| {
+            incremental_batch_rows(|row: &AggregateRow| {
                 Some(IncrementalAggregateRow {
                     key: row.group_key,
                     slots: vec![
@@ -2027,10 +2011,10 @@ mod tests {
         .await
         .expect("create incremental aggregate output");
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &AggregateRow| {
+            incremental_batch_rows(|row: &AggregateRow| {
                 Some(IncrementalAggregateRow {
                     key: row.group_key,
                     slots: vec![IncrementalAggregateSlotUpdate::Value(
@@ -2163,10 +2147,10 @@ mod tests {
             "append_incremental_distinct_index".to_string(),
         );
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &AggregateRow| {
+            incremental_batch_rows(|row: &AggregateRow| {
                 Some(IncrementalAggregateRow {
                     key: row.group_key,
                     slots: vec![IncrementalAggregateSlotUpdate::Value(Some(
@@ -2296,10 +2280,10 @@ mod tests {
         .await
         .expect("create incremental count history output");
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &AggregateRow| {
+            incremental_batch_rows(|row: &AggregateRow| {
                 Some(IncrementalAggregateRow {
                     key: row.group_key,
                     slots: vec![IncrementalAggregateSlotUpdate::Count(1)],
@@ -2411,10 +2395,10 @@ mod tests {
         .await
         .expect("create incremental distinct history output");
 
-        let mut op = IncrementalAggregateOp::new(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &AggregateRow| {
+            incremental_batch_rows(|row: &AggregateRow| {
                 Some(IncrementalAggregateRow {
                     key: row.group_key,
                     slots: vec![IncrementalAggregateSlotUpdate::Value(Some(

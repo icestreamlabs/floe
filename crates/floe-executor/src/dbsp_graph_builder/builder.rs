@@ -37,8 +37,6 @@ use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 
-#[cfg(test)]
-use super::compile::build_incremental_aggregate_row_evaluator;
 use super::compile::{
     build_count_aggregate_slot_kinds, build_count_batch_row_evaluator,
     build_incremental_aggregate_batch_row_evaluator, build_incremental_aggregate_slot_kinds,

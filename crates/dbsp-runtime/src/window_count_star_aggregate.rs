@@ -443,58 +443,6 @@ where
 }
 
 impl DbspWindowCountStarAggregate {
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub async fn new<K, V, FRow>(
-        input: &DeltaHandleStream,
-        row_extractor: FRow,
-        window_size: i64,
-        window_slide: i64,
-        allowed_lateness_ms: i64,
-        watermark: Arc<AtomicI64>,
-        error_handler: Option<RuntimeErrorHandler>,
-    ) -> anyhow::Result<Self>
-    where
-        K: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        V: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        FRow: Fn(&V) -> Option<(K, i64)> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            input,
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(row, weight)| {
-                        let (key, event_ts) = row_extractor(row)?;
-                        Some((row.clone(), *weight, key, event_ts))
-                    })
-                    .collect()
-            },
-            window_size,
-            window_slide,
-            allowed_lateness_ms,
-            watermark,
-            error_handler,
-        )
-        .await
-    }
-
     pub async fn new_batch<K, V, FRow>(
         input: &DeltaHandleStream,
         row_extractor: FRow,

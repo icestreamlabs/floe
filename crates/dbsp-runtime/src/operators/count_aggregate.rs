@@ -21,8 +21,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-#[cfg(test)]
-type RowEvaluator<V, K, D> = Arc<dyn Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync>;
 type BatchRowEvaluator<V, K, D> =
     Arc<dyn Fn(&[(V, i64)]) -> Vec<(CountAggregateRow<K, D>, i64)> + Send + Sync>;
 
@@ -150,33 +148,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub(crate) fn new(
-        state: RelationState<(K, GroupedCountState)>,
-        table: Arc<dyn KeyValueTable>,
-        row_evaluator: RowEvaluator<V, K, D>,
-        output: VersionedZSet<(K, Vec<i64>)>,
-        slot_kinds: Vec<CountAggregateSlotKind>,
-        distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, D>>,
-    ) -> Self {
-        let batch_row_evaluator = Arc::new(move |delta_values: &[(V, i64)]| {
-            delta_values
-                .iter()
-                .filter_map(|(value, weight)| {
-                    (row_evaluator)(value).map(|row_update| (row_update, *weight))
-                })
-                .collect()
-        });
-        Self::new_batch(
-            state,
-            table,
-            batch_row_evaluator,
-            output,
-            slot_kinds,
-            distinct_index,
-        )
-    }
-
     pub(crate) fn new_batch(
         state: RelationState<(K, GroupedCountState)>,
         table: Arc<dyn KeyValueTable>,
@@ -833,6 +804,20 @@ mod tests {
         flag: bool,
     }
 
+    fn count_batch_rows<K, D, F>(row_evaluator: F) -> BatchRowEvaluator<CountRow, K, D>
+    where
+        K: Send + Sync + 'static,
+        D: Send + Sync + 'static,
+        F: Fn(&CountRow) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
+    {
+        Arc::new(move |deltas: &[(CountRow, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| row_evaluator(row).map(|update| (update, *weight)))
+                .collect()
+        })
+    }
+
     async fn stage_version<T>(
         dict: Arc<Dictionary<T>>,
         table: Arc<dyn KeyValueTable>,
@@ -929,10 +914,10 @@ mod tests {
         .await
         .expect("create grouped-count output");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![
@@ -1062,10 +1047,10 @@ mod tests {
         .await
         .expect("create zero-output zset");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![CountAggregateSlotUpdate::Linear(i64::from(
@@ -1199,10 +1184,10 @@ mod tests {
         .expect("create distinct output zset");
         let distinct_index = IndexedBatchZSet::new(table.clone(), "grouped_count_distinct_index");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![CountAggregateSlotUpdate::Distinct(row.value)],
@@ -1330,10 +1315,10 @@ mod tests {
         let distinct_index =
             IndexedBatchZSet::new(table.clone(), "append_grouped_count_distinct_index");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![CountAggregateSlotUpdate::Distinct(row.value)],
@@ -1422,10 +1407,10 @@ mod tests {
         .await
         .expect("create count history output");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![CountAggregateSlotUpdate::Linear(1)],
@@ -1522,10 +1507,10 @@ mod tests {
         .await
         .expect("create distinct history output");
 
-        let mut op = CountAggregateOp::new(
+        let mut op = CountAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|row: &CountRow| {
+            count_batch_rows(|row: &CountRow| {
                 Some(CountAggregateRow {
                     key: row.group_key,
                     slots: vec![CountAggregateSlotUpdate::Distinct(row.value)],

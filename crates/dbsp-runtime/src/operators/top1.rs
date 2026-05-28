@@ -20,8 +20,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-#[cfg(test)]
-type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
 
@@ -88,25 +86,6 @@ where
     P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     O: Clone + Ord + Send + Sync + 'static,
 {
-    #[cfg(test)]
-    pub fn new_with_key_extractor(
-        input_index: IndexedBatchZSet<P, K>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<K>,
-        key_parts: KeyPartsFn<K, P, O>,
-    ) -> Self {
-        let key_parts = Arc::new(move |delta_values: &[(K, i64)]| {
-            delta_values
-                .iter()
-                .map(|(key, weight)| {
-                    let (partition, order) = key_parts(key);
-                    (key.clone(), *weight, partition, order)
-                })
-                .collect()
-        });
-        Self::new_with_batch_key_extractor(input_index, table, output, key_parts)
-    }
-
     pub fn new_with_batch_key_extractor(
         input_index: IndexedBatchZSet<P, K>,
         table: Arc<dyn KeyValueTable>,
@@ -539,8 +518,13 @@ mod tests {
                 .await
                 .expect("output zset");
         let input_index = IndexedBatchZSet::new(table.clone(), "top1_input_latest");
-        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
-        let mut op = PartitionedTop1Op::new_with_key_extractor(
+        let key_parts = Arc::new(|deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| (*key, *weight, Some(key / 10), Some(key % 10)))
+                .collect()
+        });
+        let mut op = PartitionedTop1Op::new_with_batch_key_extractor(
             input_index,
             table.clone(),
             output,
@@ -585,8 +569,13 @@ mod tests {
                 .await
                 .expect("output zset");
         let input_index = IndexedBatchZSet::new(table.clone(), "top1_input_delete");
-        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
-        let mut op = PartitionedTop1Op::new_with_key_extractor(
+        let key_parts = Arc::new(|deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| (*key, *weight, Some(key / 10), Some(key % 10)))
+                .collect()
+        });
+        let mut op = PartitionedTop1Op::new_with_batch_key_extractor(
             input_index,
             table.clone(),
             output,
@@ -637,8 +626,13 @@ mod tests {
         )
         .await
         .expect("output zset");
-        let key_parts = Arc::new(|key: &i64| (Some(key / 10), Some(key % 10)));
-        let mut op = PartitionedTop1Op::new_with_key_extractor(
+        let key_parts = Arc::new(|deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| (*key, *weight, Some(key / 10), Some(key % 10)))
+                .collect()
+        });
+        let mut op = PartitionedTop1Op::new_with_batch_key_extractor(
             IndexedBatchZSet::new(table.clone(), format!("top1_history_index_{history_rows}")),
             table.clone(),
             output,

@@ -92,6 +92,21 @@ fn empty_handle(namespace: &str) -> ZSetHandle {
     }
 }
 
+fn batch_join_key<T, K>(
+    key_extractor: Arc<dyn Fn(&T) -> Option<K> + Send + Sync>,
+) -> Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>
+where
+    T: Clone + 'static,
+    K: 'static,
+{
+    Arc::new(move |deltas: &[(T, i64)]| {
+        deltas
+            .iter()
+            .filter_map(|(row, weight)| key_extractor(row).map(|key| (key, row.clone(), *weight)))
+            .collect()
+    })
+}
+
 fn apply_deltas(state: &mut HashMap<i64, i64>, deltas: &[(i64, i64)]) {
     for (key, delta) in deltas {
         let entry = state.entry(*key).or_insert(0);
@@ -212,13 +227,13 @@ async fn join_operator_matches_batch_join_over_time() {
         },
     };
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         left_index,
         right_index,
-        left_key,
-        right_key,
+        batch_join_key(left_key),
+        batch_join_key(right_key),
         match_sum,
         projector,
         table.clone(),
@@ -399,13 +414,13 @@ async fn join_operator_handles_negative_deltas() {
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         left_index,
         right_index,
-        left_key,
-        right_key,
+        batch_join_key(left_key),
+        batch_join_key(right_key),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -536,13 +551,13 @@ async fn join_operator_skips_null_keys() {
     let left_key = Arc::new(|value: &Option<i64>| value.clone());
     let right_key = Arc::new(|value: &Option<i64>| value.clone());
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         left_index,
         right_index,
-        left_key,
-        right_key,
+        batch_join_key(left_key),
+        batch_join_key(right_key),
         Arc::new(|l: &Option<i64>, r: &Option<i64>| matches!((l, r), (Some(a), Some(b)) if a == b)),
         Arc::new(|l: &Option<i64>, r: &Option<i64>| l.unwrap_or(0) + r.unwrap_or(0)),
         table.clone(),
@@ -664,13 +679,13 @@ async fn join_operator_matches_full_recompute() {
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         left_index,
         right_index,
-        left_key,
-        right_key,
+        batch_join_key(left_key),
+        batch_join_key(right_key),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -758,7 +773,7 @@ async fn run_join_history_invariance_probe(
     .await
     .expect("right state");
 
-    let mut op = JoinOp::new_without_output(
+    let mut op = JoinOp::new_without_output_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(
@@ -769,8 +784,8 @@ async fn run_join_history_invariance_probe(
             table.clone(),
             format!("history_probe_right_index_{unrelated_history_rows}"),
         ),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table,
@@ -903,13 +918,13 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
     .await
     .expect("output zset");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(table.clone(), "join_canonical_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_canonical_right_index"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1000,13 +1015,13 @@ async fn join_operator_can_drop_matched_append_only_left_rows() {
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(table.clone(), "join_drop_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_drop_right_index"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1109,13 +1124,13 @@ async fn join_operator_can_drop_closed_append_only_left_keys() {
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(table.clone(), "join_closed_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_closed_right_index"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1230,13 +1245,13 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
     .await
     .expect("output zset");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(table.clone(), "join_inmemory_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_inmemory_right_index"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1311,7 +1326,7 @@ async fn join_operator_transient_batches_match_persisted_output() {
             .expect("out dict"),
     );
 
-    let mut persisted = JoinOp::new(
+    let mut persisted = JoinOp::new_batch(
         RelationState::empty(
             table.clone(),
             "join_transient_left_state_persisted".to_string(),
@@ -1326,8 +1341,8 @@ async fn join_operator_transient_batches_match_persisted_output() {
         .expect("persisted right state"),
         IndexedBatchZSet::new(table.clone(), "join_transient_left_index_persisted"),
         IndexedBatchZSet::new(table.clone(), "join_transient_right_index_persisted"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1342,7 +1357,7 @@ async fn join_operator_transient_batches_match_persisted_output() {
     )
     .with_persist_indexes(false);
 
-    let mut transient = JoinOp::new_without_output(
+    let mut transient = JoinOp::new_without_output_batch(
         RelationState::empty(
             table.clone(),
             "join_transient_left_state_transient".to_string(),
@@ -1357,8 +1372,8 @@ async fn join_operator_transient_batches_match_persisted_output() {
         .expect("transient right state"),
         IndexedBatchZSet::new(table.clone(), "join_transient_left_index_transient"),
         IndexedBatchZSet::new(table.clone(), "join_transient_right_index_transient"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1455,7 +1470,7 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
             .expect("right dict"),
     );
 
-    let mut handle_path = JoinOp::new_without_output(
+    let mut handle_path = JoinOp::new_without_output_batch(
         RelationState::empty(
             table.clone(),
             "join_preloaded_left_state_handle".to_string(),
@@ -1470,8 +1485,8 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
         .expect("handle right state"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_handle"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_handle"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),
@@ -1479,7 +1494,7 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
     )
     .with_persist_indexes(false);
 
-    let mut preloaded_path = JoinOp::new_without_output(
+    let mut preloaded_path = JoinOp::new_without_output_batch(
         RelationState::empty(
             table.clone(),
             "join_preloaded_left_state_transient".to_string(),
@@ -1494,8 +1509,8 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
         .expect("transient right state"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_transient"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_transient"),
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(project_sum),
         table.clone(),

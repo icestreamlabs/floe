@@ -1,8 +1,6 @@
 use super::*;
 use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
 #[cfg(test)]
-use crate::encoding::extract_encoded_row_columns;
-#[cfg(test)]
 use crate::encoding::extract_encoded_row_scalars;
 use crate::encoding::{EncodedRowScalar, concat_encoded_rows};
 use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
@@ -1321,63 +1319,6 @@ pub(crate) fn build_window_count_batch_row_evaluator(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn build_count_row_evaluator(
-    input_schema: Arc<RowSchema>,
-    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
-    aggregates: Vec<DbspAggregateExpr>,
-    expression_columns: Arc<ExpressionColumnMap>,
-    graph_id: String,
-    context: &'static str,
-) -> impl Fn(&Vec<u8>) -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> + Send + Sync + 'static
-{
-    let layout = Arc::new(build_count_eval_layout(
-        &aggregates,
-        input_schema.as_ref(),
-        expression_columns.as_ref(),
-    ));
-    let direct_group_key_columns = direct_group_key_columns(
-        &group_keys,
-        input_schema.as_ref(),
-        expression_columns.as_ref(),
-    )
-    .map(Arc::new);
-    move |bytes: &Vec<u8>| -> Option<dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>> {
-        let Some(indices) = direct_group_key_columns.as_ref() else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                "failed to resolve vectorized count aggregate group key columns"
-            );
-            return None;
-        };
-        let encoded_key = match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-            Ok(Some(encoded_key)) => encoded_key,
-            Ok(None) => return None,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to extract count aggregate group key columns"
-                );
-                return None;
-            }
-        };
-
-        let counts = evaluate_count_row_values(
-            layout.as_ref(),
-            &aggregates,
-            bytes,
-            input_schema.as_ref(),
-            &graph_id,
-            context,
-        );
-        Some(dbsp::CountAggregateRow {
-            key: encoded_key,
-            slots: counts,
-        })
-    }
-}
-
 pub(crate) fn build_count_batch_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
@@ -1518,130 +1459,6 @@ fn build_count_eval_layout(
         required_input_positions,
         plans,
     }
-}
-
-#[cfg(test)]
-fn evaluate_count_row_values(
-    layout: &CountEvalLayout,
-    aggregates: &[DbspAggregateExpr],
-    row_bytes: &[u8],
-    _schema: &RowSchema,
-    graph_id: &str,
-    context: &str,
-) -> Vec<dbsp::CountAggregateSlotUpdate<Vec<u8>>> {
-    let decoded =
-        match extract_encoded_row_scalars(row_bytes, layout.required_input_columns.as_slice()) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode {context} count aggregate row inputs"
-                );
-                return aggregates
-                    .iter()
-                    .map(|agg| {
-                        if agg.distinct() {
-                            dbsp::CountAggregateSlotUpdate::Distinct(None)
-                        } else {
-                            dbsp::CountAggregateSlotUpdate::Linear(0)
-                        }
-                    })
-                    .collect();
-            }
-        };
-
-    let mut filter_results = vec![false; layout.filters.len()];
-    for (index, filter) in layout.filters.iter().enumerate() {
-        if let Some(column_idx) = layout.filter_direct_columns[index] {
-            let decoded_idx = layout.required_input_positions.get(&column_idx).copied();
-            let value = decoded_idx
-                .and_then(|slot| decoded.get(slot))
-                .and_then(|scalar| scalar.as_ref());
-            filter_results[index] = match bool_from_encoded_scalar(value) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} direct FILTER column"
-                    );
-                    false
-                }
-            }
-        } else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                expression = ?filter.expr(),
-                "unresolved {context} FILTER expression without vectorized precompute column"
-            );
-            filter_results[index] = false;
-        }
-    }
-
-    let mut expression_values = vec![None; layout.expressions.len()];
-    let mut expression_valid = vec![false; layout.expressions.len()];
-    for (index, expr) in layout.expressions.iter().enumerate() {
-        if let Some(column_idx) = layout.expression_direct_columns[index] {
-            if let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied() {
-                expression_values[index] = decoded.get(decoded_idx).cloned().flatten();
-                expression_valid[index] = true;
-            }
-        } else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                expression = ?expr.expr(),
-                "unresolved {context} aggregate expression without vectorized precompute column"
-            );
-        }
-    }
-
-    aggregates
-        .iter()
-        .zip(layout.plans.iter())
-        .map(|(agg, plan)| {
-            if let Some(filter_index) = plan.filter_index
-                && !filter_results[filter_index]
-            {
-                return if agg.distinct() {
-                    dbsp::CountAggregateSlotUpdate::Distinct(None)
-                } else {
-                    dbsp::CountAggregateSlotUpdate::Linear(0)
-                };
-            }
-            match plan.expr_index {
-                Some(expr_index) => {
-                    if expression_valid[expr_index] && expression_values[expr_index].is_some() {
-                        if agg.distinct() {
-                            let encoded =
-                                expression_values[expr_index].as_ref().and_then(|value| {
-                                    encode_single_encoded_scalar_key(value)
-                                        .map(Some)
-                                        .unwrap_or_else(|err| {
-                                            tracing::warn!(
-                                                graph_id = %graph_id,
-                                                error = %err,
-                                                "failed to encode count aggregate DISTINCT value"
-                                            );
-                                            None
-                                        })
-                                });
-                            dbsp::CountAggregateSlotUpdate::Distinct(encoded)
-                        } else {
-                            dbsp::CountAggregateSlotUpdate::Linear(1)
-                        }
-                    } else {
-                        if agg.distinct() {
-                            dbsp::CountAggregateSlotUpdate::Distinct(None)
-                        } else {
-                            dbsp::CountAggregateSlotUpdate::Linear(0)
-                        }
-                    }
-                }
-                None => dbsp::CountAggregateSlotUpdate::Linear(1),
-            }
-        })
-        .collect()
 }
 
 fn evaluate_count_batch_row_values(
@@ -2097,62 +1914,6 @@ pub(crate) fn build_incremental_aggregate_slot_kinds(
     Some(slot_kinds)
 }
 
-#[cfg(test)]
-pub(crate) fn build_incremental_aggregate_row_evaluator(
-    input_schema: Arc<RowSchema>,
-    group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
-    aggregates: Vec<DbspAggregateExpr>,
-    expression_columns: Arc<ExpressionColumnMap>,
-    graph_id: String,
-    context: &'static str,
-) -> impl Fn(&Vec<u8>) -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> + Send + Sync + 'static {
-    let layout = Arc::new(build_count_eval_layout(
-        &aggregates,
-        input_schema.as_ref(),
-        expression_columns.as_ref(),
-    ));
-    let direct_group_key_columns = direct_group_key_columns(
-        &group_keys,
-        input_schema.as_ref(),
-        expression_columns.as_ref(),
-    )
-    .map(Arc::new);
-    move |bytes: &Vec<u8>| -> Option<dbsp::IncrementalAggregateRow<Vec<u8>>> {
-        let Some(indices) = direct_group_key_columns.as_ref() else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                "failed to resolve vectorized incremental aggregate group key columns"
-            );
-            return None;
-        };
-        let encoded_key = match extract_encoded_row_columns(bytes, indices.as_ref(), false) {
-            Ok(Some(encoded_key)) => encoded_key,
-            Ok(None) => return None,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to extract incremental aggregate group key columns"
-                );
-                return None;
-            }
-        };
-
-        let slots = evaluate_incremental_aggregate_row_values(
-            layout.as_ref(),
-            &aggregates,
-            bytes,
-            input_schema.as_ref(),
-            &graph_id,
-            context,
-        );
-        Some(dbsp::IncrementalAggregateRow {
-            key: encoded_key,
-            slots,
-        })
-    }
-}
-
 pub(crate) fn build_incremental_aggregate_batch_row_evaluator(
     input_schema: Arc<RowSchema>,
     group_keys: Vec<dbsp::circuit::plan::GroupKeyExpr>,
@@ -2319,124 +2080,6 @@ pub(crate) fn build_prekeyed_incremental_aggregate_batch_row_evaluator(
         }
         Vec::new()
     }
-}
-
-#[cfg(test)]
-fn evaluate_incremental_aggregate_row_values(
-    layout: &CountEvalLayout,
-    aggregates: &[DbspAggregateExpr],
-    row_bytes: &[u8],
-    _schema: &RowSchema,
-    graph_id: &str,
-    context: &str,
-) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
-    let decoded =
-        match extract_encoded_row_scalars(row_bytes, layout.required_input_columns.as_slice()) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to decode {context} incremental aggregate row inputs"
-                );
-                return aggregates
-                    .iter()
-                    .map(|agg| match agg.function() {
-                        DbspAggregateFunction::Count if !agg.distinct() => {
-                            dbsp::IncrementalAggregateSlotUpdate::Count(0)
-                        }
-                        _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
-                    })
-                    .collect();
-            }
-        };
-
-    let mut filter_results = vec![false; layout.filters.len()];
-    for (index, filter) in layout.filters.iter().enumerate() {
-        if let Some(column_idx) = layout.filter_direct_columns[index] {
-            let decoded_idx = layout.required_input_positions.get(&column_idx).copied();
-            let value = decoded_idx
-                .and_then(|slot| decoded.get(slot))
-                .and_then(|scalar| scalar.as_ref());
-            filter_results[index] = match bool_from_encoded_scalar(value) {
-                Ok(include) => include,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %graph_id,
-                        error = %err,
-                        "failed to evaluate {context} direct FILTER column"
-                    );
-                    false
-                }
-            };
-        } else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                expression = ?filter.expr(),
-                "unresolved {context} FILTER expression without vectorized precompute column"
-            );
-            filter_results[index] = false;
-        }
-    }
-
-    let mut expression_values = vec![None; layout.expressions.len()];
-    let mut expression_valid = vec![false; layout.expressions.len()];
-    for (index, expr) in layout.expressions.iter().enumerate() {
-        if let Some(column_idx) = layout.expression_direct_columns[index] {
-            if let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied() {
-                expression_values[index] = decoded.get(decoded_idx).cloned().flatten();
-                expression_valid[index] = true;
-            }
-        } else {
-            tracing::warn!(
-                graph_id = %graph_id,
-                expression = ?expr.expr(),
-                "unresolved {context} aggregate expression without vectorized precompute column"
-            );
-        }
-    }
-
-    aggregates
-        .iter()
-        .zip(layout.plans.iter())
-        .map(|(agg, plan)| {
-            if let Some(filter_index) = plan.filter_index
-                && !filter_results[filter_index]
-            {
-                return match agg.function() {
-                    DbspAggregateFunction::Count if !agg.distinct() => {
-                        dbsp::IncrementalAggregateSlotUpdate::Count(0)
-                    }
-                    _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
-                };
-            }
-
-            match agg.function() {
-                DbspAggregateFunction::Count if !agg.distinct() => match plan.expr_index {
-                    Some(expr_index) => {
-                        if expression_valid[expr_index] && expression_values[expr_index].is_some() {
-                            dbsp::IncrementalAggregateSlotUpdate::Count(1)
-                        } else {
-                            dbsp::IncrementalAggregateSlotUpdate::Count(0)
-                        }
-                    }
-                    None => dbsp::IncrementalAggregateSlotUpdate::Count(1),
-                },
-                _ => match plan.expr_index {
-                    Some(expr_index) if expression_valid[expr_index] => {
-                        dbsp::IncrementalAggregateSlotUpdate::Value(
-                            incremental_aggregate_value_from_encoded_scalar(
-                                expression_values[expr_index].as_ref(),
-                                graph_id,
-                                context,
-                            ),
-                        )
-                    }
-                    _ => dbsp::IncrementalAggregateSlotUpdate::Value(None),
-                },
-            }
-        })
-        .collect()
 }
 
 fn evaluate_incremental_aggregate_batch_row_values(
@@ -3138,7 +2781,7 @@ mod tests {
         .expect("aggregate node");
 
         let expression_columns = Arc::new(HashMap::new());
-        let count_eval = build_count_row_evaluator(
+        let count_eval = build_count_batch_row_evaluator(
             Arc::clone(&input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
@@ -3146,7 +2789,7 @@ mod tests {
             "test".to_string(),
             "aggregate",
         );
-        let incr_eval = build_incremental_aggregate_row_evaluator(
+        let incr_eval = build_incremental_aggregate_batch_row_evaluator(
             Arc::clone(&input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
@@ -3160,7 +2803,8 @@ mod tests {
             Some(EncodedRowScalar::Int64(42)),
             Some(EncodedRowScalar::Utf8("alpha".to_string())),
         ]);
-        let count_row = count_eval(&row).expect("count row");
+        let count_rows = count_eval(&[(row.clone(), 1)]);
+        let count_row = &count_rows.first().expect("count row").0;
         assert_eq!(
             extract_encoded_row_scalars(&count_row.key, &[0]).expect("decode key"),
             vec![Some(EncodedRowScalar::Int64(42))]
@@ -3183,7 +2827,8 @@ mod tests {
             other => panic!("expected distinct encoded value, found {other:?}"),
         }
 
-        let incr_row = incr_eval(&row).expect("incremental row");
+        let incr_rows = incr_eval(&[(row.clone(), 1)]);
+        let incr_row = &incr_rows.first().expect("incremental row").1;
         assert!(matches!(
             &incr_row.slots[0],
             dbsp::IncrementalAggregateSlotUpdate::Count(1)
@@ -3203,7 +2848,8 @@ mod tests {
             Some(EncodedRowScalar::Int64(7)),
             Some(EncodedRowScalar::Utf8("beta".to_string())),
         ]);
-        let count_row = count_eval(&filtered_row).expect("count row");
+        let filtered_rows = count_eval(&[(filtered_row, 1)]);
+        let count_row = &filtered_rows.first().expect("count row").0;
         match &count_row.slots[2] {
             dbsp::CountAggregateSlotUpdate::Distinct(Some(encoded)) => {
                 assert_eq!(
@@ -3820,14 +3466,16 @@ mod aggregate_window_helper_tests {
         );
         let row = encode_row(&[Some(EncodedRowScalar::Int64(30))]);
 
-        let slot_updates = evaluate_count_row_values(
+        let slot_updates = evaluate_count_batch_row_values(
             &layout,
             aggregate.aggregates(),
-            &row,
             input_schema.as_ref(),
+            &[(row.clone(), 1)],
             "test",
             "aggregate",
-        );
+        )
+        .expect("batch slot updates")
+        .remove(0);
         assert!(matches!(
             &slot_updates[0],
             dbsp::CountAggregateSlotUpdate::Linear(0)
@@ -3893,14 +3541,30 @@ mod aggregate_window_helper_tests {
         );
 
         let invalid_row = vec![0x01_u8];
-        let slots = evaluate_count_row_values(
+        let slots = evaluate_count_batch_row_values(
             &layout,
             aggregate.aggregates(),
-            &invalid_row,
             input_schema.as_ref(),
+            &[(invalid_row.clone(), 1)],
             "test",
             "aggregate",
-        );
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            aggregate
+                .aggregates()
+                .iter()
+                .map(|agg| {
+                    if agg.distinct() {
+                        dbsp::CountAggregateSlotUpdate::Distinct(None)
+                    } else {
+                        dbsp::CountAggregateSlotUpdate::Linear(0)
+                    }
+                })
+                .collect()
+        });
         assert!(matches!(
             slots[0],
             dbsp::CountAggregateSlotUpdate::Linear(0)

@@ -103,57 +103,6 @@ pub struct TransientCountAggregateSnapshot<K, D> {
 }
 
 impl DbspCountAggregate {
-    #[cfg(test)]
-    pub async fn new<K, V, D, FRow>(
-        input: &DeltaHandleStream,
-        row_evaluator: FRow,
-        slot_kinds: Vec<CountAggregateSlotKind>,
-        error_handler: Option<RuntimeErrorHandler>,
-    ) -> anyhow::Result<Self>
-    where
-        K: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        V: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        D: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        FRow: Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            input,
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(value, weight)| row_evaluator(value).map(|row| (row, *weight)))
-                    .collect()
-            },
-            slot_kinds,
-            error_handler,
-        )
-        .await
-    }
-
     pub async fn new_batch<K, V, D, FRow>(
         input: &DeltaHandleStream,
         row_evaluator: FRow,
@@ -397,26 +346,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub async fn new<FRow>(
-        row_evaluator: FRow,
-        slot_kinds: Vec<CountAggregateSlotKind>,
-    ) -> anyhow::Result<Self>
-    where
-        FRow: Fn(&V) -> Option<CountAggregateRow<K, D>> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(value, weight)| row_evaluator(value).map(|row| (row, *weight)))
-                    .collect()
-            },
-            slot_kinds,
-        )
-        .await
-    }
-
     pub async fn new_batch<FRow>(
         row_evaluator: FRow,
         slot_kinds: Vec<CountAggregateSlotKind>,

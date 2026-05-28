@@ -90,50 +90,6 @@ pub struct TransientIncrementalAggregateSnapshot<K, V> {
 }
 
 impl DbspIncrementalAggregate {
-    #[cfg(test)]
-    pub async fn new<K, V, FRow>(
-        input: &DeltaHandleStream,
-        row_evaluator: FRow,
-        slot_kinds: Vec<IncrementalAggregateSlotKind>,
-        error_handler: Option<RuntimeErrorHandler>,
-    ) -> anyhow::Result<Self>
-    where
-        K: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        V: Archive
-            + Clone
-            + Eq
-            + Hash
-            + Send
-            + Sync
-            + 'static
-            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            input,
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(value, weight)| {
-                        row_evaluator(value).map(|row| (value.clone(), row, *weight))
-                    })
-                    .collect()
-            },
-            slot_kinds,
-            error_handler,
-        )
-        .await
-    }
-
     pub async fn new_batch<K, V, FRow>(
         input: &DeltaHandleStream,
         row_evaluator: FRow,
@@ -329,28 +285,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub async fn new<FRow>(
-        row_evaluator: FRow,
-        slot_kinds: Vec<IncrementalAggregateSlotKind>,
-    ) -> anyhow::Result<Self>
-    where
-        FRow: Fn(&V) -> Option<IncrementalAggregateRow<K>> + Send + Sync + 'static,
-    {
-        Self::new_batch(
-            move |delta_values: &[(V, i64)]| {
-                delta_values
-                    .iter()
-                    .filter_map(|(value, weight)| {
-                        row_evaluator(value).map(|row| (value.clone(), row, *weight))
-                    })
-                    .collect()
-            },
-            slot_kinds,
-        )
-        .await
-    }
-
     pub async fn new_batch<FRow>(
         row_evaluator: FRow,
         slot_kinds: Vec<IncrementalAggregateSlotKind>,
@@ -579,6 +513,13 @@ mod tests {
         })
     }
 
+    fn test_batch_rows(deltas: &[(i64, i64)]) -> Vec<(i64, IncrementalAggregateRow<i64>, i64)> {
+        deltas
+            .iter()
+            .filter_map(|(value, weight)| test_row(value).map(|row| (*value, row, *weight)))
+            .collect()
+    }
+
     fn test_slot_kinds() -> Vec<IncrementalAggregateSlotKind> {
         vec![
             IncrementalAggregateSlotKind::Count,
@@ -590,10 +531,12 @@ mod tests {
 
     #[tokio::test]
     async fn transient_incremental_aggregate_snapshot_restores_state() {
-        let processor =
-            DbspTransientIncrementalAggregate::<i64, i64>::new(test_row, test_slot_kinds())
-                .await
-                .expect("create transient incremental aggregate");
+        let processor = DbspTransientIncrementalAggregate::<i64, i64>::new_batch(
+            test_batch_rows,
+            test_slot_kinds(),
+        )
+        .await
+        .expect("create transient incremental aggregate");
         processor.enable_append_only_input().await;
         processor
             .apply_deltas(vec![(11, 1), (12, 1), (21, 1)])
@@ -601,10 +544,12 @@ mod tests {
             .expect("apply initial rows");
         let snapshot = processor.snapshot_state().await.expect("snapshot state");
 
-        let restored =
-            DbspTransientIncrementalAggregate::<i64, i64>::new(test_row, test_slot_kinds())
-                .await
-                .expect("create restored transient incremental aggregate");
+        let restored = DbspTransientIncrementalAggregate::<i64, i64>::new_batch(
+            test_batch_rows,
+            test_slot_kinds(),
+        )
+        .await
+        .expect("create restored transient incremental aggregate");
         restored.enable_append_only_input().await;
         restored
             .restore_state(snapshot)

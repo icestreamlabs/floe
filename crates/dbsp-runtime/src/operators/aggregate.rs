@@ -18,8 +18,6 @@ use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 
-#[cfg(test)]
-type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
 type BatchKeyExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
@@ -280,26 +278,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub fn new(
-        state: RelationState<(K, A)>,
-        index: IndexedBatchZSet<K, V>,
-        table: Arc<dyn KeyValueTable>,
-        key_extractor: KeyExtractor<V, K>,
-        spec: AggregateSpec<K, V, A>,
-        output: crate::collections::zset::VersionedZSet<(K, A)>,
-    ) -> Self {
-        let key_extractor = Arc::new(move |deltas: &[(V, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| {
-                    key_extractor(row).map(|key| (key, row.clone(), *weight))
-                })
-                .collect()
-        });
-        Self::new_batch(state, index, table, key_extractor, spec, output)
-    }
-
     pub fn new_batch(
         state: RelationState<(K, A)>,
         index: IndexedBatchZSet<K, V>,
@@ -379,6 +357,19 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
+    type ScalarKeyExtractor = Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync>;
+
+    fn batch_key_extractor(key_extractor: ScalarKeyExtractor) -> BatchKeyExtractor<i64, i64> {
+        Arc::new(move |deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(value, weight)| {
+                    key_extractor(value).map(|key| (key, *value, *weight))
+                })
+                .collect()
+        })
+    }
+
     fn bucket_for(id: u64) -> u16 {
         (id >> 48) as u16
     }
@@ -433,7 +424,7 @@ mod tests {
     }
 
     fn recompute_expected(
-        key_extractor: &KeyExtractor<i64, i64>,
+        key_extractor: &ScalarKeyExtractor,
         spec: &AggregateSpec<i64, i64, i64>,
         input_state: &HashMap<i64, i64>,
     ) -> HashMap<(i64, i64), i64> {
@@ -510,7 +501,7 @@ mod tests {
         .expect("output");
 
         let index = IndexedBatchZSet::new(table.clone(), "aggregate_index");
-        let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(value % 2));
+        let key_extractor: ScalarKeyExtractor = Arc::new(|value: &i64| Some(value % 2));
         let spec = AggregateSpec::new("sum", |_key, values| {
             if values.is_empty() {
                 return None;
@@ -522,7 +513,14 @@ mod tests {
             Some(sum)
         });
 
-        let mut op = AggregateOp::new(state, index, table.clone(), key_extractor, spec, output);
+        let mut op = AggregateOp::new_batch(
+            state,
+            index,
+            table.clone(),
+            batch_key_extractor(key_extractor),
+            spec,
+            output,
+        );
 
         let delta = stage_version(
             input_dict.clone(),
@@ -602,13 +600,13 @@ mod tests {
                 .expect("output");
 
             let index = IndexedBatchZSet::new(table.clone(), index_ns);
-            let key_extractor: KeyExtractor<i64, i64> = Arc::new(|value: &i64| Some(value % 2));
+            let key_extractor: ScalarKeyExtractor = Arc::new(|value: &i64| Some(value % 2));
 
-            let mut op = AggregateOp::new(
+            let mut op = AggregateOp::new_batch(
                 state,
                 index,
                 table.clone(),
-                key_extractor.clone(),
+                batch_key_extractor(Arc::clone(&key_extractor)),
                 spec,
                 output,
             );

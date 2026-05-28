@@ -25,8 +25,6 @@ use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch}
 
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
-#[cfg(test)]
-type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
 type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
@@ -162,48 +160,6 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub fn new(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_key: JoinKeyExtractor<L, K>,
-        right_key: JoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<O>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
-        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        Self::new_batch(
-            left_state,
-            right_state,
-            left_index,
-            right_index,
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            table,
-            output,
-            integrated,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn new_batch(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
@@ -287,46 +243,6 @@ where
         if let Some(output) = self.output.as_mut() {
             output.enable_replayable_persistence();
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub fn new_without_output(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_key: JoinKeyExtractor<L, K>,
-        right_key: JoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
-        let left_key = Arc::new(move |deltas: &[(L, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        let right_key = Arc::new(move |deltas: &[(R, i64)]| {
-            deltas
-                .iter()
-                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
-                .collect()
-        });
-        Self::new_without_output_batch(
-            left_state,
-            right_state,
-            left_index,
-            right_index,
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            table,
-            integrated,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]

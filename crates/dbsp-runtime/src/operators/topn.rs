@@ -20,12 +20,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{compute_delta, delta_zset_handle_batch, publish_transient_zset_batch};
 
-#[cfg(test)]
-type PartitionKeyFn<K, P> = Arc<dyn Fn(&K) -> Option<P> + Send + Sync>;
-#[cfg(test)]
-type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
-#[cfg(test)]
-type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
 type PartitionOrderIndex<K, P, O> = BTreeMap<P, BTreeMap<(O, K), i64>>;
@@ -78,41 +72,6 @@ where
     P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
-    #[cfg(test)]
-    pub fn new(
-        state: RelationState<K>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<K>,
-        partition_key: PartitionKeyFn<K, P>,
-        order_key: OrderKeyFn<K, O>,
-        limit: usize,
-        offset: usize,
-    ) -> Self {
-        let key_parts = Arc::new(move |key: &K| (partition_key(key), order_key(key)));
-        Self::new_with_key_extractor(state, table, output, key_parts, limit, offset)
-    }
-
-    #[cfg(test)]
-    pub fn new_with_key_extractor(
-        state: RelationState<K>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<K>,
-        key_parts: KeyPartsFn<K, P, O>,
-        limit: usize,
-        offset: usize,
-    ) -> Self {
-        let key_parts = Arc::new(move |delta_values: &[(K, i64)]| {
-            delta_values
-                .iter()
-                .map(|(key, weight)| {
-                    let (partition, order) = key_parts(key);
-                    (key.clone(), *weight, partition, order)
-                })
-                .collect()
-        });
-        Self::new_with_batch_key_extractor(state, table, output, key_parts, limit, offset)
-    }
-
     pub fn new_with_batch_key_extractor(
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,
@@ -623,6 +582,22 @@ mod tests {
         (id >> 48) as u16
     }
 
+    fn scalar_topn_key_parts<P, O>(
+        partition_key: Arc<dyn Fn(&i64) -> Option<P> + Send + Sync>,
+        order_key: Arc<dyn Fn(&i64) -> Option<O> + Send + Sync>,
+    ) -> BatchKeyPartsFn<i64, P, O>
+    where
+        P: Ord + Clone + Send + Sync + 'static,
+        O: Ord + Clone + Send + Sync + 'static,
+    {
+        Arc::new(move |deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| (*key, *weight, partition_key(key), order_key(key)))
+                .collect()
+        })
+    }
+
     async fn stage_version(
         dict: Arc<Dictionary<i64>>,
         table: Arc<dyn KeyValueTable>,
@@ -758,7 +733,14 @@ mod tests {
         let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 0);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            2,
+            0,
+        );
 
         let first_delta = stage_version(
             input_dict.clone(),
@@ -842,7 +824,14 @@ mod tests {
         let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 1);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            2,
+            1,
+        );
 
         let steps = vec![vec![(5, 1), (2, 1), (1, 1)], vec![(1, -1), (3, 2)]];
 
@@ -937,7 +926,14 @@ mod tests {
             Arc::new(|value| Some(*value / 100));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value % 100));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            1,
+            0,
+        );
 
         let delta = stage_version(
             input_dict.clone(),
@@ -1005,7 +1001,14 @@ mod tests {
             Arc::new(|value| Some(*value / 100));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value % 100));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            1,
+            0,
+        );
 
         let initial = stage_version(
             input_dict.clone(),
@@ -1088,7 +1091,14 @@ mod tests {
         // All inserted rows tie on this key (value % 10 == 1).
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value % 10));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 2, 0);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            2,
+            0,
+        );
 
         let first_delta = stage_version(
             input_dict.clone(),
@@ -1166,7 +1176,14 @@ mod tests {
             Arc::new(|value| Some(*value / 100));
         let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
             Arc::new(|value| Some(*value % 100));
-        let mut op = TopNOp::new(state, table.clone(), output, partition_key, order_key, 1, 0);
+        let mut op = TopNOp::new_with_batch_key_extractor(
+            state,
+            table.clone(),
+            output,
+            scalar_topn_key_parts(partition_key, order_key),
+            1,
+            0,
+        );
 
         let mut history = (0..history_rows)
             .map(|idx| ((10_000 + idx) * 100, 1))

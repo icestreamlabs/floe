@@ -24,10 +24,6 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::delta_zset_handle;
 
-#[cfg(test)]
-type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
-#[cfg(test)]
-type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
 type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
@@ -144,45 +140,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub fn new(
-        state: RelationState<(WindowKey<K>, A)>,
-        index: IndexedBatchZSet<WindowKey<K>, V>,
-        table: Arc<dyn KeyValueTable>,
-        key_extractor: KeyExtractor<V, K>,
-        time_extractor: TimeExtractor<V>,
-        aggregator: Aggregator<K, V, A>,
-        output: VersionedZSet<(WindowKey<K>, A)>,
-        window_size: i64,
-        window_slide: i64,
-        allowed_lateness_ms: i64,
-        watermark: Arc<AtomicI64>,
-    ) -> Result<Self> {
-        let window_extractor = Arc::new(move |delta_values: &[(V, i64)]| {
-            delta_values
-                .iter()
-                .filter_map(|(row, weight)| {
-                    let event_ts = time_extractor(row)?;
-                    let key = key_extractor(row)?;
-                    Some((row.clone(), *weight, key, event_ts))
-                })
-                .collect()
-        });
-        Self::new_with_batch_extractor(
-            state,
-            index,
-            table,
-            window_extractor,
-            aggregator,
-            output,
-            window_size,
-            window_slide,
-            allowed_lateness_ms,
-            watermark,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_batch_extractor(
         state: RelationState<(WindowKey<K>, A)>,
