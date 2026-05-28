@@ -160,6 +160,7 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn append_u64_value(&mut self, value: u64) -> Result<()> {
         match self {
             Self::UInt64(builder) => {
@@ -284,6 +285,7 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn append_encoded_scalar_repeated(
         &mut self,
         value: Option<&EncodedRowScalar>,

@@ -225,8 +225,7 @@ where
         let mut current_segment_count = 0usize;
         let mut current_segment_load_ms = 0u64;
         let mut current_delta_rows = 0usize;
-        let mut current_resolve_calls = 0usize;
-        let current_resolve_start = Instant::now();
+        let mut current_entries = Vec::new();
         if let Some(current) = &self.manifest {
             for (bucket, segments) in &current.buckets {
                 for segment_id in segments {
@@ -235,18 +234,15 @@ where
                     let record = self.load_segment(*bucket, *segment_id).await?;
                     current_segment_load_ms += segment_start.elapsed().as_millis() as u64;
                     current_delta_rows += record.deltas.len();
-                    for (key_id, delta) in record.deltas {
-                        current_resolve_calls += 1;
-                        let key = self
-                            .dict
-                            .resolve(key_id)
-                            .await
-                            .context("resolve key while materializing version")?;
-                        *aggregate.entry(key).or_insert(0) += delta;
-                    }
+                    current_entries.extend(record.deltas);
                 }
             }
         }
+        let current_resolve_start = Instant::now();
+        let current_resolve_keys = self
+            .apply_id_deltas_to_aggregate(&mut aggregate, current_entries)
+            .await
+            .context("resolve current version keys while materializing version")?;
         let current_resolve_ms = current_resolve_start.elapsed().as_millis() as u64;
 
         let rows_before_retain = aggregate.len();
@@ -258,7 +254,7 @@ where
             current_segment_count,
             current_segment_load_ms,
             current_delta_rows,
-            current_resolve_calls,
+            current_resolve_keys,
             current_resolve_ms,
             rows_before_retain,
             rows_after_retain = aggregate.len(),
@@ -547,8 +543,7 @@ where
         let mut segment_count = 0usize;
         let mut segment_load_ms = 0u64;
         let mut delta_rows = 0usize;
-        let mut resolve_calls = 0usize;
-        let resolve_start = Instant::now();
+        let mut entries = Vec::new();
         for manifest in manifests.into_iter().rev() {
             for (bucket, segments) in manifest.buckets {
                 for segment_id in segments {
@@ -557,18 +552,15 @@ where
                     let record = self.load_segment(bucket, segment_id).await?;
                     segment_load_ms += segment_start.elapsed().as_millis() as u64;
                     delta_rows += record.deltas.len();
-                    for (key_id, delta) in record.deltas {
-                        resolve_calls += 1;
-                        let key = self
-                            .dict
-                            .resolve(key_id)
-                            .await
-                            .context("resolve key while loading version")?;
-                        *aggregate.entry(key).or_insert(0) += delta;
-                    }
+                    entries.extend(record.deltas);
                 }
             }
         }
+        let resolve_start = Instant::now();
+        let resolved_keys = self
+            .apply_id_deltas_to_aggregate(&mut aggregate, entries)
+            .await
+            .context("resolve version chain keys while loading version")?;
         let resolve_ms = resolve_start.elapsed().as_millis() as u64;
         let rows_before_retain = aggregate.len();
         aggregate.retain(|_, weight| *weight != 0);
@@ -581,7 +573,7 @@ where
             segment_count,
             segment_load_ms,
             delta_rows,
-            resolve_calls,
+            resolved_keys,
             resolve_ms,
             rows_before_retain,
             rows = aggregate.len(),
@@ -590,6 +582,44 @@ where
         );
 
         Ok(aggregate)
+    }
+
+    async fn apply_id_deltas_to_aggregate(
+        &self,
+        aggregate: &mut HashMap<K, i64>,
+        entries: Vec<(u64, i64)>,
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut missing_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for (key_id, _) in &entries {
+            if seen.insert(*key_id) {
+                missing_ids.push(*key_id);
+            }
+        }
+
+        let resolved = self
+            .dict
+            .resolve_many(&missing_ids)
+            .await
+            .context("resolve dictionary keys in batch")?;
+        let mut resolved_by_id = HashMap::with_capacity(missing_ids.len());
+        for (key_id, key) in missing_ids.iter().copied().zip(resolved) {
+            resolved_by_id.insert(key_id, key);
+        }
+
+        for (key_id, delta) in entries {
+            let key = resolved_by_id
+                .get(&key_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("resolved key {key_id} missing from local cache"))?;
+            *aggregate.entry(key).or_insert(0) += delta;
+        }
+
+        Ok(resolved_by_id.len())
     }
 
     pub(super) async fn load_segment(

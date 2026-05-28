@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,18 +5,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
+use crate::encoded_batch::{
+    EncodedRowBatchMode, ExpandedEncodedBatch, build_expanded_batches_from_encoded_rows,
+};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
-use crate::scalar_array_builder::ScalarColumnBuilder;
 
 pub type MvChangelogResult<T> = Result<T>;
 
@@ -359,14 +359,20 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     version_time: Option<i64>,
 ) -> MvChangelogResult<Vec<MvChangelogBatch>> {
     let snapshot = mv.snapshot_for(version).await?;
-    let rows = rows_from_snapshot(snapshot, &schema)?;
-    build_mv_changelog_batches(
-        rows,
+    let (_schema, rows) = build_expanded_batches_from_encoded_rows(
+        snapshot,
         schema,
+        None,
+        None,
+        None,
+        EncodedRowBatchMode::Snapshot,
+    )?;
+    Ok(build_mv_changelog_batches(
+        rows,
         version,
         version_time,
         MvChangelogBatchKind::Snapshot,
-    )
+    ))
 }
 
 async fn materialize_delta_batches<M: MaterializedView>(
@@ -380,17 +386,19 @@ async fn materialize_delta_batches<M: MaterializedView>(
     let deltas = mv.delta_for(version).await?;
     let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
     let rows_decode_start = Instant::now();
-    let rows = rows_from_delta(deltas, &schema)?;
-    let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
-    let rows_len = rows.diffs.len();
-    let batch_build_start = Instant::now();
-    let batches = build_mv_changelog_batches(
-        rows,
+    let (_schema, rows) = build_expanded_batches_from_encoded_rows(
+        deltas,
         schema,
-        version,
-        version_time,
-        MvChangelogBatchKind::Delta,
+        None,
+        None,
+        None,
+        EncodedRowBatchMode::Delta,
     )?;
+    let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
+    let rows_len = rows.iter().map(|row| row.diffs.len()).sum::<usize>();
+    let batch_build_start = Instant::now();
+    let batches =
+        build_mv_changelog_batches(rows, version, version_time, MvChangelogBatchKind::Delta);
     let batch_build_ms = batch_build_start.elapsed().as_millis() as u64;
     let total_ms = total_start.elapsed().as_millis() as u64;
     if version <= 8 || total_ms >= 1000 {
@@ -407,138 +415,22 @@ async fn materialize_delta_batches<M: MaterializedView>(
     Ok(batches)
 }
 
-struct MvChangelogDecodedRows {
-    builders: Vec<ScalarColumnBuilder>,
-    diffs: Vec<i64>,
-}
-
-fn rows_from_snapshot(
-    snapshot: HashMap<Vec<u8>, i64>,
-    schema: &SchemaRef,
-) -> MvChangelogResult<MvChangelogDecodedRows> {
-    let column_count = schema.fields().len();
-    let builders = schema
-        .fields()
-        .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
-        .collect::<Result<Vec<_>>>()?;
-    let mut decoded_rows = MvChangelogDecodedRows {
-        builders,
-        diffs: Vec::new(),
-    };
-    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
-    for (key, diff) in snapshot {
-        if diff < 0 {
-            bail!("materialized view snapshot contains negative diff {diff}");
-        }
-        if diff == 0 {
-            continue;
-        }
-        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
-        if decode_scratch.len() != column_count {
-            bail!(
-                "decoded row has {} columns but schema has {}",
-                decode_scratch.len(),
-                column_count
-            );
-        }
-        let count = diff.checked_abs().context("snapshot diff overflow")? as usize;
-        for (idx, value) in decode_scratch.iter().enumerate() {
-            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
-        }
-        decoded_rows
-            .diffs
-            .resize(decoded_rows.diffs.len() + count, 1);
-    }
-    Ok(decoded_rows)
-}
-
-fn rows_from_delta(
-    deltas: Vec<(Vec<u8>, i64)>,
-    schema: &SchemaRef,
-) -> MvChangelogResult<MvChangelogDecodedRows> {
-    let column_count = schema.fields().len();
-    let builders = schema
-        .fields()
-        .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
-        .collect::<Result<Vec<_>>>()?;
-    let mut decoded_rows = MvChangelogDecodedRows {
-        builders,
-        diffs: Vec::new(),
-    };
-    let deltas = coalesce_mv_changelog_deltas(deltas);
-    let mut decode_scratch: Vec<Option<EncodedRowScalar>> = Vec::new();
-    for (key, diff) in deltas {
-        if diff == 0 {
-            continue;
-        }
-        let op = if diff > 0 { 1 } else { -1 };
-        let count = diff.checked_abs().context("delta diff overflow")? as usize;
-        decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
-        if decode_scratch.len() != column_count {
-            bail!(
-                "decoded row has {} columns but schema has {}",
-                decode_scratch.len(),
-                column_count
-            );
-        }
-        for (idx, value) in decode_scratch.iter().enumerate() {
-            decoded_rows.builders[idx].append_encoded_scalar_repeated(value.as_ref(), count)?;
-        }
-        decoded_rows
-            .diffs
-            .resize(decoded_rows.diffs.len() + count, op);
-    }
-    Ok(decoded_rows)
-}
-
-fn coalesce_mv_changelog_deltas(deltas: Vec<(Vec<u8>, i64)>) -> HashMap<Vec<u8>, i64> {
-    let mut merged = HashMap::with_capacity(deltas.len());
-    for (key, diff) in deltas {
-        if diff == 0 {
-            continue;
-        }
-        let entry = merged.entry(key.clone()).or_insert(0);
-        *entry += diff;
-        if *entry == 0 {
-            merged.remove(&key);
-        }
-    }
-    merged
-}
-
 fn build_mv_changelog_batches(
-    rows: MvChangelogDecodedRows,
-    schema: SchemaRef,
+    rows: Vec<ExpandedEncodedBatch>,
     version: i64,
     version_time: Option<i64>,
     kind: MvChangelogBatchKind,
-) -> MvChangelogResult<Vec<MvChangelogBatch>> {
-    if rows.diffs.is_empty() {
-        return Ok(vec![MvChangelogBatch {
-            version,
-            version_time,
-            kind,
-            batch: RecordBatch::new_empty(schema),
-            diffs: Vec::new(),
-        }]);
-    }
-    let arrays = rows
-        .builders
-        .into_iter()
-        .map(|mut builder| builder.finish_array())
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)?;
-    ensure!(
-        rows.diffs.len() == batch.num_rows(),
-        "MV changelog diffs length mismatch"
-    );
-    Ok(vec![MvChangelogBatch {
-        version,
-        version_time,
-        kind,
-        batch,
-        diffs: rows.diffs,
-    }])
+) -> Vec<MvChangelogBatch> {
+    rows.into_iter()
+        .map(|row| {
+            debug_assert_eq!(row.diffs.len(), row.batch.num_rows());
+            MvChangelogBatch {
+                version,
+                version_time,
+                kind,
+                batch: row.batch,
+                diffs: row.diffs,
+            }
+        })
+        .collect()
 }

@@ -1,8 +1,14 @@
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use datafusion::arrow::array::{ArrayRef, BinaryArray, Int64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::storage::KeyValueTable;
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
@@ -11,6 +17,7 @@ use crate::outer_stream::OuterStreamRegistry;
 
 const SOURCE_BATCH_JOURNAL_PREFIX: &str = "source_journal";
 const KAFKA_SOURCE_JOURNAL_PREFIX: &str = "kafka_source_journal";
+const SOURCE_BATCH_JOURNAL_ARROW_MAGIC: &[u8] = b"FLOE_SOURCE_BATCH_ARROW_V1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -358,26 +365,87 @@ fn parse_kafka_entry_key(key: &[u8]) -> Result<(u64, String)> {
 }
 
 fn encode_entry(max_event_time_ms: Option<i64>, deltas: &[(Vec<u8>, i64)]) -> Result<Vec<u8>> {
-    let count = u32::try_from(deltas.len()).context("too many rows in source batch journal")?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row", DataType::Binary, false),
+        Field::new("diff", DataType::Int64, false),
+    ]));
+    let row_array: ArrayRef = Arc::new(BinaryArray::from_iter_values(
+        deltas.iter().map(|(key, _)| key.as_slice()),
+    ));
+    let diff_array: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        deltas.iter().map(|(_, diff)| *diff),
+    ));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![row_array, diff_array])
+        .context("build source batch journal Arrow batch")?;
+
     let mut encoded = Vec::with_capacity(
-        8 + 4
+        SOURCE_BATCH_JOURNAL_ARROW_MAGIC.len()
+            + 8
             + deltas
                 .iter()
-                .map(|(key, _)| 4 + key.len() + std::mem::size_of::<i64>())
+                .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
                 .sum::<usize>(),
     );
+    encoded.extend_from_slice(SOURCE_BATCH_JOURNAL_ARROW_MAGIC);
     encoded.extend_from_slice(&max_event_time_ms.unwrap_or(-1).to_le_bytes());
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for (key, diff) in deltas {
-        let len = u32::try_from(key.len()).context("source batch journal row key too large")?;
-        encoded.extend_from_slice(&len.to_le_bytes());
-        encoded.extend_from_slice(key);
-        encoded.extend_from_slice(&diff.to_le_bytes());
+    {
+        let mut writer = StreamWriter::try_new(&mut encoded, schema.as_ref())
+            .context("create source batch journal Arrow writer")?;
+        writer
+            .write(&batch)
+            .context("write source batch journal Arrow batch")?;
+        writer
+            .finish()
+            .context("finalize source batch journal Arrow writer")?;
     }
     Ok(encoded)
 }
 
 fn decode_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
+    if value.starts_with(SOURCE_BATCH_JOURNAL_ARROW_MAGIC) {
+        return decode_arrow_entry(value);
+    }
+    decode_legacy_entry(value)
+}
+
+fn decode_arrow_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
+    let mut cursor = SOURCE_BATCH_JOURNAL_ARROW_MAGIC.len();
+    if value.len() < cursor + 8 {
+        bail!("source batch journal Arrow entry missing header");
+    }
+    let max_event_time_ms = i64::from_le_bytes(
+        value[cursor..cursor + 8]
+            .try_into()
+            .expect("slice width already checked"),
+    );
+    cursor += 8;
+
+    let reader = StreamReader::try_new(Cursor::new(&value[cursor..]), None)
+        .context("create source batch journal Arrow reader")?;
+    let mut deltas = Vec::new();
+    for batch in reader {
+        let batch = batch.context("read source batch journal Arrow batch")?;
+        let rows = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| anyhow!("source batch journal Arrow row column was not Binary"))?;
+        let diffs = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("source batch journal Arrow diff column was not Int64"))?;
+        for idx in 0..batch.num_rows() {
+            deltas.push((rows.value(idx).to_vec(), diffs.value(idx)));
+        }
+    }
+    Ok((
+        (max_event_time_ms >= 0).then_some(max_event_time_ms),
+        deltas,
+    ))
+}
+
+fn decode_legacy_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
     if value.len() < 12 {
         bail!("source batch journal entry missing header");
     }
@@ -603,6 +671,24 @@ mod tests {
         assert_eq!(entries[0].tick_id, 7);
         assert_eq!(entries[0].max_event_time_ms, Some(123));
         assert_eq!(entries[0].deltas.len(), 2);
+    }
+
+    #[test]
+    fn source_batch_journal_decodes_legacy_entries() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&123_i64.to_le_bytes());
+        legacy.extend_from_slice(&2_u32.to_le_bytes());
+        legacy.extend_from_slice(&1_u32.to_le_bytes());
+        legacy.extend_from_slice(b"a");
+        legacy.extend_from_slice(&1_i64.to_le_bytes());
+        legacy.extend_from_slice(&1_u32.to_le_bytes());
+        legacy.extend_from_slice(b"b");
+        legacy.extend_from_slice(&(-1_i64).to_le_bytes());
+
+        let (max_event_time_ms, deltas) = decode_entry(&legacy).expect("decode legacy");
+
+        assert_eq!(max_event_time_ms, Some(123));
+        assert_eq!(deltas, vec![(b"a".to_vec(), 1), (b"b".to_vec(), -1)]);
     }
 
     #[tokio::test]

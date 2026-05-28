@@ -136,3 +136,34 @@ fn production_transient_delta_transforms_are_async() {
     assert!(transient_segment.contains("transform_delta_arrow"));
     assert!(!transient_segment.contains(".transform_delta("));
 }
+
+#[test]
+fn mv_scan_and_storage_materialization_use_batch_arrow_boundaries() {
+    let encoded_batch = repo_file("crates/floe-executor/src/encoded_batch.rs");
+    let table_helpers = repo_file("crates/floe-executor/src/table_provider/helpers.rs");
+    let mv_changelog = repo_file("crates/floe-executor/src/mv_changelog.rs");
+    let zset_storage = repo_file("crates/dbsp-runtime/src/collections/zset/versioned/storage.rs");
+
+    assert!(encoded_batch.contains("build_expanded_batches_from_encoded_rows"));
+    assert!(encoded_batch.contains("DeltaBatchBuffer::new_projected"));
+    assert!(encoded_batch.contains("take(array.as_ref(), &take_indices, None)"));
+    assert!(table_helpers.contains("build_expanded_batches_from_encoded_rows"));
+    assert!(!table_helpers.contains("extract_encoded_row_scalars"));
+    assert!(!mv_changelog.contains("decode_all_encoded_row_scalars_into"));
+    assert!(mv_changelog.contains("EncodedRowBatchMode::Snapshot"));
+    assert!(mv_changelog.contains("EncodedRowBatchMode::Delta"));
+    assert!(zset_storage.contains("resolve_many(&missing_ids)"));
+    assert!(zset_storage.contains("apply_id_deltas_to_aggregate"));
+}
+
+#[test]
+fn source_journal_uses_arrow_batch_payloads() {
+    let source_journal = repo_file("crates/floe-executor/src/source_journal.rs");
+
+    assert!(source_journal.contains("SOURCE_BATCH_JOURNAL_ARROW_MAGIC"));
+    assert!(source_journal.contains("BinaryArray::from_iter_values"));
+    assert!(source_journal.contains("Int64Array::from_iter_values"));
+    assert!(source_journal.contains("StreamWriter::try_new"));
+    assert!(source_journal.contains("StreamReader::try_new"));
+    assert!(source_journal.contains("decode_legacy_entry"));
+}

@@ -22,6 +22,7 @@ pub mod dbsp_plan;
 pub mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
+mod encoded_batch;
 pub mod encoding;
 pub mod materialized_view;
 mod metrics;
