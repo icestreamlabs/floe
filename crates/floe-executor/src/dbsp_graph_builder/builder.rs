@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hash};
-use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,12 +34,12 @@ use crate::encoding::{
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
-use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
+use crate::vectorized_keys::{VectorizedEncodedKeyExtractor, VectorizedKeyedTimeBatch};
 
 use super::compile::{
-    build_count_aggregate_slot_kinds, build_count_batch_row_evaluator,
-    build_incremental_aggregate_batch_row_evaluator, build_incremental_aggregate_slot_kinds,
-    build_prekeyed_incremental_aggregate_batch_row_evaluator,
+    PrekeyedIncrementalAggregateBatchEvaluator, build_count_aggregate_slot_kinds,
+    build_count_batch_row_evaluator, build_incremental_aggregate_batch_row_evaluator,
+    build_incremental_aggregate_slot_kinds, build_prekeyed_incremental_aggregate_batch_evaluator,
 };
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{
@@ -2975,6 +2975,112 @@ async fn build_transient_window_count_star_receiver_from_batches(
     Ok(rx)
 }
 
+type PrecomputedWindowAggregateRows = VecDeque<dbsp::IncrementalAggregateRow<Vec<u8>>>;
+
+fn build_transient_window_incremental_batches(
+    keyed_time_batch: VectorizedKeyedTimeBatch,
+    row_evaluator: &PrekeyedIncrementalAggregateBatchEvaluator,
+    has_group_key: bool,
+    window_size: i64,
+    window_slide: i64,
+    cutoff: Option<i64>,
+    persist_inputs: bool,
+) -> Result<(
+    Vec<((Vec<u8>, Vec<u8>), i64)>,
+    PrecomputedWindowAggregateRows,
+    Vec<(Vec<u8>, i64)>,
+)> {
+    let mut windowed_deltas = Vec::new();
+    let mut precomputed_rows = PrecomputedWindowAggregateRows::new();
+    let mut persisted_window_rows = Vec::new();
+    let mut encoded_window_cache: HashMap<(i64, i64), Vec<u8>> = HashMap::new();
+
+    for delta in keyed_time_batch.deltas {
+        if delta.diff == 0 || delta.event_ts < 0 {
+            continue;
+        }
+        if let Some(cutoff) = cutoff
+            && delta.event_ts < cutoff
+        {
+            continue;
+        }
+
+        let group_key = has_group_key.then_some(delta.key);
+        let mut encoded_keys = Vec::new();
+        let mut build_error: Option<anyhow::Error> = None;
+        transient_window_for_each_window(
+            delta.event_ts,
+            window_size,
+            window_slide,
+            |window_start, window_end| {
+                if build_error.is_some() {
+                    return;
+                }
+                let encoded_window = match encoded_window_cache.get(&(window_start, window_end)) {
+                    Some(encoded) => encoded.clone(),
+                    None => match encode_transient_window_bounds(window_start, window_end) {
+                        Ok(encoded) => {
+                            encoded_window_cache
+                                .insert((window_start, window_end), encoded.clone());
+                            encoded
+                        }
+                        Err(err) => {
+                            build_error = Some(err);
+                            return;
+                        }
+                    },
+                };
+                let encoded_key = if let Some(group_key) = group_key.as_ref() {
+                    match concat_encoded_rows(&encoded_window, group_key) {
+                        Ok(encoded) => encoded,
+                        Err(err) => {
+                            build_error = Some(err);
+                            return;
+                        }
+                    }
+                } else {
+                    encoded_window
+                };
+                encoded_keys.push(encoded_key);
+            },
+        );
+        if let Some(err) = build_error {
+            return Err(err);
+        }
+        if encoded_keys.is_empty() {
+            continue;
+        }
+
+        let slots = row_evaluator.evaluate_batch_row(
+            &keyed_time_batch.batch,
+            &keyed_time_batch.input_positions,
+            delta.batch_row,
+        );
+        let last_idx = encoded_keys.len() - 1;
+        let mut row = Some(delta.row);
+        for (idx, encoded_key) in encoded_keys.into_iter().enumerate() {
+            let row_value = if idx == last_idx {
+                row.take().expect("transient window row already moved")
+            } else {
+                row.as_ref().expect("transient window row missing").clone()
+            };
+            let slot_values = slots.clone();
+            let pair = (encoded_key.clone(), row_value);
+            if persist_inputs {
+                let encoded = encode_transient_window_aggregate_input_pair(&pair.0, &pair.1)?;
+                persisted_window_rows.push((encoded, delta.diff));
+            }
+            precomputed_rows.push_back(dbsp::IncrementalAggregateRow {
+                key: encoded_key,
+                slots: slot_values,
+            });
+            windowed_deltas.push((pair, delta.diff));
+        }
+    }
+
+    Ok((windowed_deltas, precomputed_rows, persisted_window_rows))
+}
+
 async fn build_transient_window_incremental_receiver(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
@@ -3068,19 +3174,41 @@ async fn build_transient_window_incremental_receiver_from_batches(
         )
         .context("build vectorized transient window key extractor")?,
     );
-    let row_evaluator = build_prekeyed_incremental_aggregate_batch_row_evaluator(
+    let prekeyed_evaluator = Arc::new(build_prekeyed_incremental_aggregate_batch_evaluator(
         Arc::clone(&eval_schema),
         window.aggregate.aggregates().to_vec(),
         Arc::clone(&expression_columns),
         graph_id.to_string(),
         "transient_window_aggregate",
-    );
-    let row_evaluator = Arc::new(row_evaluator);
+    ));
+    let precomputed_rows = Arc::new(StdMutex::new(PrecomputedWindowAggregateRows::new()));
     let aggregate_processor = Arc::new(
         dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, (Vec<u8>, Vec<u8>)>::new_batch(
             {
-                let row_evaluator = Arc::clone(&row_evaluator);
-                move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]| row_evaluator(delta_values)
+                let prekeyed_evaluator = Arc::clone(&prekeyed_evaluator);
+                let precomputed_rows = Arc::clone(&precomputed_rows);
+                move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]| {
+                    let mut evaluated = Vec::with_capacity(delta_values.len());
+                    let mut misses = Vec::new();
+                    match precomputed_rows.lock() {
+                        Ok(mut precomputed) if precomputed.len() >= delta_values.len() => {
+                            for (pair, weight) in delta_values {
+                                if let Some(row) = precomputed.pop_front() {
+                                    evaluated.push((pair.clone(), row, *weight));
+                                } else {
+                                    misses.push((pair.clone(), *weight));
+                                }
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            misses.extend(delta_values.iter().cloned());
+                        }
+                    }
+                    if !misses.is_empty() {
+                        evaluated.extend(prekeyed_evaluator.evaluate_deltas(&misses));
+                    }
+                    evaluated
+                }
             },
             slot_kinds,
         )
@@ -3155,12 +3283,13 @@ async fn build_transient_window_incremental_receiver_from_batches(
                         input_deltas
                     };
                     let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
-                    let mut windowed_deltas = Vec::new();
-                    let mut encoded_window_cache: HashMap<(i64, i64), Vec<u8>> = HashMap::new();
-                    let keyed_time_deltas = match window_key_extractor
-                        .extract_keyed_time_deltas(&input_deltas, time_column)
-                    {
-                        Ok(deltas) => deltas,
+                    let keyed_time_batch = match window_key_extractor
+                        .extract_keyed_time_batch_with_columns(
+                            &input_deltas,
+                            time_column,
+                            prekeyed_evaluator.required_input_columns(),
+                        ) {
+                        Ok(batch) => batch,
                         Err(err) => {
                             report_graph_task_error(
                                 &task_events,
@@ -3171,129 +3300,58 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             break;
                         }
                     };
-                    for (row, weight, group_key, event_ts) in keyed_time_deltas {
-                        if weight == 0 {
-                            continue;
-                        }
-                        let group_key = (!group_key_columns.is_empty()).then_some(group_key);
-                        if event_ts < 0 {
-                            continue;
-                        }
-                        if let Some(cutoff) = cutoff
-                            && event_ts < cutoff
-                        {
-                            continue;
-                        }
-                        let mut build_window_key = |window_start: i64, window_end: i64| {
-                            let encoded_window = if let Some(encoded) =
-                                encoded_window_cache.get(&(window_start, window_end)).cloned()
-                            {
-                                encoded
-                            } else {
-                                match encode_transient_window_bounds(window_start, window_end) {
-                                    Ok(encoded) => {
-                                        encoded_window_cache
-                                            .insert((window_start, window_end), encoded.clone());
-                                        encoded
-                                    }
-                                    Err(err) => {
-                                        report_graph_task_error(
-                                            &task_events,
-                                            &graph_id,
-                                            task_label.clone(),
-                                            err,
-                                        );
-                                        return None;
-                                    }
-                                }
-                            };
-                            if let Some(group_key) = group_key.as_ref() {
-                                match concat_encoded_rows(&encoded_window, group_key) {
-                                    Ok(encoded) => Some(encoded),
-                                    Err(err) => {
-                                        report_graph_task_error(
-                                            &task_events,
-                                            &graph_id,
-                                            task_label.clone(),
-                                            err,
-                                        );
-                                        None
-                                    }
-                                }
-                            } else {
-                                Some(encoded_window)
-                            }
-                        };
-                        if window_size == window_slide {
-                            let mut encoded_key = None;
-                            transient_window_for_each_window(
-                                event_ts,
+                    let (windowed_deltas, evaluated_rows, persisted_window_rows) =
+                        match keyed_time_batch {
+                            Some(batch) => match build_transient_window_incremental_batches(
+                                batch,
+                                prekeyed_evaluator.as_ref(),
+                                !group_key_columns.is_empty(),
                                 window_size,
                                 window_slide,
-                                |window_start, window_end| {
-                                    encoded_key = build_window_key(window_start, window_end);
-                                },
-                            );
-                            if let Some(encoded_key) = encoded_key {
-                                windowed_deltas.push(((encoded_key, row), weight));
-                            }
-                            continue;
-                        }
-                        let mut encoded_keys = Vec::new();
-                        transient_window_for_each_window(
-                            event_ts,
-                            window_size,
-                            window_slide,
-                            |window_start, window_end| {
-                                if let Some(encoded_key) = build_window_key(window_start, window_end)
-                                {
-                                    encoded_keys.push(encoded_key);
+                                cutoff,
+                                !compact_source_state,
+                            ) {
+                                Ok(batches) => batches,
+                                Err(err) => {
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        task_label.clone(),
+                                        err,
+                                    );
+                                    break;
                                 }
                             },
-                        );
-                        if encoded_keys.is_empty() {
-                            continue;
-                        }
-                        let last_idx = encoded_keys.len() - 1;
-                        let mut row = Some(row);
-                        for (idx, encoded_key) in encoded_keys.into_iter().enumerate() {
-                            let row_value = if idx == last_idx {
-                                row.take().expect("transient window row already moved")
-                            } else {
-                                row.as_ref()
-                                    .expect("transient window row missing")
-                                    .clone()
-                            };
-                            windowed_deltas.push(((encoded_key, row_value), weight));
-                        }
-                    }
-                    if !compact_source_state {
-                        let persisted_window_rows = windowed_deltas
-                            .iter()
-                            .map(|((window_key, row), weight)| {
-                                encode_transient_window_aggregate_input_pair(window_key, row)
-                                    .map(|encoded| (encoded, *weight))
-                            })
-                            .collect::<Result<Vec<_>>>();
-                        let persisted_window_rows = match persisted_window_rows {
-                            Ok(rows) => rows,
-                            Err(err) => {
-                                report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
-                                break;
-                            }
+                            None => (Vec::new(), PrecomputedWindowAggregateRows::new(), Vec::new()),
                         };
+                    if !compact_source_state {
                         if let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
                     }
+                    let use_precomputed_rows =
+                        windowed_deltas.iter().all(|(_, weight)| *weight >= 0);
+                    if let Ok(mut precomputed) = precomputed_rows.lock() {
+                        *precomputed = if use_precomputed_rows {
+                            evaluated_rows
+                        } else {
+                            PrecomputedWindowAggregateRows::new()
+                        };
+                    }
                     let mut aggregate_deltas = match aggregate_processor.apply_deltas(windowed_deltas).await {
                         Ok(deltas) => deltas,
                         Err(err) => {
+                            if let Ok(mut precomputed) = precomputed_rows.lock() {
+                                precomputed.clear();
+                            }
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
                     };
+                    if let Ok(mut precomputed) = precomputed_rows.lock() {
+                        precomputed.clear();
+                    }
                     if let Some(cutoff) = cutoff {
                         let evicted = match aggregate_processor
                             .evict_keys_where(|key| match transient_window_encoded_key_end(key) {

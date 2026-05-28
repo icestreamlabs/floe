@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -55,6 +56,20 @@ pub fn build_delta_batch(
 pub struct VectorizedEncodedKeyExtractor {
     base_schema: SchemaRef,
     key_columns: Arc<Vec<usize>>,
+}
+
+pub struct VectorizedKeyedTimeDelta {
+    pub row: Vec<u8>,
+    pub diff: Diff,
+    pub key: Vec<u8>,
+    pub event_ts: i64,
+    pub batch_row: usize,
+}
+
+pub struct VectorizedKeyedTimeBatch {
+    pub batch: RecordBatch,
+    pub input_positions: HashMap<usize, usize>,
+    pub deltas: Vec<VectorizedKeyedTimeDelta>,
 }
 
 impl VectorizedEncodedKeyExtractor {
@@ -130,8 +145,26 @@ impl VectorizedEncodedKeyExtractor {
         rows: &[(Vec<u8>, Diff)],
         time_column: usize,
     ) -> Result<Vec<(Vec<u8>, Diff, Vec<u8>, i64)>> {
+        Ok(self
+            .extract_keyed_time_batch_with_columns(rows, time_column, &[])?
+            .map(|batch| {
+                batch
+                    .deltas
+                    .into_iter()
+                    .map(|delta| (delta.row, delta.diff, delta.key, delta.event_ts))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub fn extract_keyed_time_batch_with_columns(
+        &self,
+        rows: &[(Vec<u8>, Diff)],
+        time_column: usize,
+        extra_columns: &[usize],
+    ) -> Result<Option<VectorizedKeyedTimeBatch>> {
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         if time_column >= self.base_schema.fields().len() {
             bail!(
@@ -149,6 +182,24 @@ impl VectorizedEncodedKeyExtractor {
                 input_columns.push(time_column);
                 input_columns.len() - 1
             });
+        for column in extra_columns.iter().copied() {
+            if column >= self.base_schema.fields().len() {
+                bail!(
+                    "extra column {} is outside schema width {}",
+                    column,
+                    self.base_schema.fields().len()
+                );
+            }
+            if !input_columns.contains(&column) {
+                input_columns.push(column);
+            }
+        }
+        let input_positions = input_columns
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, column)| (column, position))
+            .collect::<HashMap<_, _>>();
         let eval_schema = projected_arrow_schema(&self.base_schema, &input_columns)?;
         let mut buffer = DeltaBatchBuffer::new_projected(
             eval_schema,
@@ -171,10 +222,10 @@ impl VectorizedEncodedKeyExtractor {
         }
 
         let Some(batch) = buffer.flush_manual()? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let time_array = batch.column(time_position);
-        let mut output = Vec::with_capacity(batch.num_rows());
+        let mut deltas = Vec::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             if time_array.is_null(row_idx)
                 || (0..self.key_columns.len()).any(|idx| batch.column(idx).is_null(row_idx))
@@ -191,9 +242,19 @@ impl VectorizedEncodedKeyExtractor {
             let (row, diff) = staged_rows
                 .get(row_idx)
                 .ok_or_else(|| anyhow!("vectorized key extractor row index out of bounds"))?;
-            output.push((row.clone(), *diff, key, event_ts));
+            deltas.push(VectorizedKeyedTimeDelta {
+                row: row.clone(),
+                diff: *diff,
+                key,
+                event_ts,
+                batch_row: row_idx,
+            });
         }
-        Ok(output)
+        Ok(Some(VectorizedKeyedTimeBatch {
+            batch,
+            input_positions,
+            deltas,
+        }))
     }
 }
 

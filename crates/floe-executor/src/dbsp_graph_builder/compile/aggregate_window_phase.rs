@@ -2033,38 +2033,76 @@ pub(crate) fn build_window_incremental_aggregate_batch_row_evaluator(
     }
 }
 
-pub(crate) fn build_prekeyed_incremental_aggregate_batch_row_evaluator(
+#[derive(Clone)]
+pub(crate) struct PrekeyedIncrementalAggregateBatchEvaluator {
+    layout: Arc<CountEvalLayout>,
+    input_schema: Arc<RowSchema>,
+    aggregates: Vec<DbspAggregateExpr>,
+    graph_id: String,
+    context: &'static str,
+}
+
+pub(crate) fn build_prekeyed_incremental_aggregate_batch_evaluator(
     input_schema: Arc<RowSchema>,
     aggregates: Vec<DbspAggregateExpr>,
     expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
-) -> impl Fn(
-    &[((Vec<u8>, Vec<u8>), i64)],
-) -> Vec<(
-    (Vec<u8>, Vec<u8>),
-    dbsp::IncrementalAggregateRow<Vec<u8>>,
-    i64,
-)> + Send
-+ Sync
-+ 'static {
-    let layout = Arc::new(build_count_eval_layout(
-        &aggregates,
-        input_schema.as_ref(),
-        expression_columns.as_ref(),
-    ));
-    move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]| {
+) -> PrekeyedIncrementalAggregateBatchEvaluator {
+    PrekeyedIncrementalAggregateBatchEvaluator {
+        layout: Arc::new(build_count_eval_layout(
+            &aggregates,
+            input_schema.as_ref(),
+            expression_columns.as_ref(),
+        )),
+        input_schema,
+        aggregates,
+        graph_id,
+        context,
+    }
+}
+
+impl PrekeyedIncrementalAggregateBatchEvaluator {
+    pub(crate) fn required_input_columns(&self) -> &[usize] {
+        &self.layout.required_input_columns
+    }
+
+    pub(crate) fn evaluate_batch_row(
+        &self,
+        batch: &RecordBatch,
+        input_positions: &HashMap<usize, usize>,
+        row_idx: usize,
+    ) -> Vec<dbsp::IncrementalAggregateSlotUpdate> {
+        evaluate_incremental_aggregate_arrow_row_values(
+            self.layout.as_ref(),
+            &self.aggregates,
+            batch,
+            input_positions,
+            row_idx,
+            &self.graph_id,
+            self.context,
+        )
+    }
+
+    pub(crate) fn evaluate_deltas(
+        &self,
+        delta_values: &[((Vec<u8>, Vec<u8>), i64)],
+    ) -> Vec<(
+        (Vec<u8>, Vec<u8>),
+        dbsp::IncrementalAggregateRow<Vec<u8>>,
+        i64,
+    )> {
         let input_rows = delta_values
             .iter()
             .map(|(pair, weight)| (pair.1.clone(), *weight))
             .collect::<Vec<_>>();
         if let Some(slots_by_row) = evaluate_incremental_aggregate_batch_row_values(
-            layout.as_ref(),
-            &aggregates,
-            input_schema.as_ref(),
+            self.layout.as_ref(),
+            &self.aggregates,
+            self.input_schema.as_ref(),
             &input_rows,
-            &graph_id,
-            context,
+            &self.graph_id,
+            self.context,
         ) {
             return delta_values
                 .iter()
@@ -2117,7 +2155,13 @@ fn evaluate_incremental_aggregate_batch_row_values(
     let mut evaluated = Vec::with_capacity(batch.num_rows());
     for row_idx in 0..batch.num_rows() {
         evaluated.push(evaluate_incremental_aggregate_arrow_row_values(
-            layout, aggregates, &batch, row_idx, graph_id, context,
+            layout,
+            aggregates,
+            &batch,
+            &layout.required_input_positions,
+            row_idx,
+            graph_id,
+            context,
         ));
     }
     Some(evaluated)
@@ -2127,6 +2171,7 @@ fn evaluate_incremental_aggregate_arrow_row_values(
     layout: &CountEvalLayout,
     aggregates: &[DbspAggregateExpr],
     batch: &RecordBatch,
+    input_positions: &HashMap<usize, usize>,
     row_idx: usize,
     graph_id: &str,
     context: &str,
@@ -2134,8 +2179,7 @@ fn evaluate_incremental_aggregate_arrow_row_values(
     let mut filter_results = vec![false; layout.filters.len()];
     for (index, filter) in layout.filters.iter().enumerate() {
         if let Some(column_idx) = layout.filter_direct_columns[index] {
-            let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied()
-            else {
+            let Some(decoded_idx) = input_positions.get(&column_idx).copied() else {
                 continue;
             };
             filter_results[index] =
@@ -2163,8 +2207,7 @@ fn evaluate_incremental_aggregate_arrow_row_values(
     let mut expression_valid = vec![false; layout.expressions.len()];
     for (index, expr) in layout.expressions.iter().enumerate() {
         if let Some(column_idx) = layout.expression_direct_columns[index] {
-            let Some(decoded_idx) = layout.required_input_positions.get(&column_idx).copied()
-            else {
+            let Some(decoded_idx) = input_positions.get(&column_idx).copied() else {
                 continue;
             };
             match encoded_scalar_from_arrow_array(batch.column(decoded_idx).as_ref(), row_idx) {

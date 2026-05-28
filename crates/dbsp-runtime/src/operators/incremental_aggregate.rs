@@ -665,8 +665,9 @@ where
             return Ok(HashMap::new());
         }
 
-        let coalesced = if self.append_only_input {
-            if delta_values.iter().any(|(_, weight)| *weight < 0) {
+        let all_nonnegative = delta_values.iter().all(|(_, weight)| *weight >= 0);
+        let coalesced = if self.append_only_input || all_nonnegative {
+            if self.append_only_input && !all_nonnegative {
                 anyhow::bail!("append-only incremental aggregate received negative input weight");
             }
             metrics::observe_operator_phase_latency_ms(

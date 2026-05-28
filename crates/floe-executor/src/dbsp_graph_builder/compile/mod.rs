@@ -152,9 +152,9 @@ mod set_ops_topn_phase;
 mod source_map_phase;
 
 pub(crate) use aggregate_window_phase::{
-    build_count_aggregate_slot_kinds, build_count_batch_row_evaluator,
-    build_incremental_aggregate_batch_row_evaluator, build_incremental_aggregate_slot_kinds,
-    build_prekeyed_incremental_aggregate_batch_row_evaluator,
+    PrekeyedIncrementalAggregateBatchEvaluator, build_count_aggregate_slot_kinds,
+    build_count_batch_row_evaluator, build_incremental_aggregate_batch_row_evaluator,
+    build_incremental_aggregate_slot_kinds, build_prekeyed_incremental_aggregate_batch_evaluator,
 };
 
 async fn log_handle_rows(
