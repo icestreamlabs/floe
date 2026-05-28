@@ -47,7 +47,7 @@ use floe_executor::source_journal::{
     kafka_source_journal_initial_checksum, update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    BuildInputs, ConsolidationMode, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
+    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
     OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig, SourceRowDecoder,
     SourceTableProvider, TailExecutionConfig, ValidatedPlan, plan_source_requirements,
@@ -56,8 +56,6 @@ use floe_executor::{
 use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
-#[cfg(test)]
-use floe_node_core::generator;
 use floe_node_core::kafka_connector::{
     KafkaConnector, KafkaConnectorConfig, KafkaOffsetCommit, KafkaReplayRange,
     KafkaTopicPartitionOffset,
@@ -90,11 +88,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{cli, http_ingest, metrics, sinks};
 use floe_config as config;
 use floe_config::{
-    ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, OutputConsolidationModeConfig,
-    PostgresCdcReconnectConfig, PostgresCdcSnapshotConfig, SinkConfig, SinkSpec,
-    SourceJournalConfig, apply_connector_properties, load_config,
-    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
-    sink_spec_from_sql,
+    ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, PostgresCdcReconnectConfig,
+    PostgresCdcSnapshotConfig, SinkConfig, SinkSpec, SourceJournalConfig,
+    apply_connector_properties, load_config, materialized_view_definitions_from_config,
+    normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use datafusion::arrow::datatypes::SchemaRef;
 use dbsp::LogicalWorkSnapshot;
 use dbsp::RowSchema;
 use dbsp::StreamRetention;
@@ -17,7 +16,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
-use crate::delta_consolidation::ConsolidationMode;
 use crate::materialized_view::{
     DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
 };
@@ -362,7 +360,6 @@ impl DbspGraphBuilder {
         mv_registry: &Arc<MaterializedViewRegistry>,
         mv_latest: &mut HashMap<String, (i64, ZSetHandle)>,
         retention: StreamRetention,
-        consolidation_mode: ConsolidationMode,
     ) -> Result<DeltaHandleStream> {
         let handle_stream = upstream.clone();
         let registry_handle = mv_registry.register(view_name.to_string());
@@ -445,8 +442,6 @@ impl DbspGraphBuilder {
                 let apply = Self::queue_delta_handle_for_view(
                     &mut view,
                     &mut delta_reader,
-                    Arc::clone(&arrow_schema),
-                    consolidation_mode,
                     delta_transform.as_ref(),
                     &delta_handle,
                     Some((
@@ -570,8 +565,6 @@ impl DbspGraphBuilder {
                                 result,
                                 &mut view,
                                 &mut delta_reader,
-                                Arc::clone(&arrow_schema),
-                                consolidation_mode,
                                 delta_transform.as_ref(),
                                 flush_cfg,
                                 &bridge_clone,
@@ -619,8 +612,6 @@ impl DbspGraphBuilder {
                                 result,
                                 &mut view,
                                 &mut delta_reader,
-                                Arc::clone(&arrow_schema),
-                                consolidation_mode,
                                 delta_transform.as_ref(),
                                 flush_cfg,
                                 &bridge_clone,
@@ -1335,8 +1326,6 @@ impl DbspGraphBuilder {
         result: Result<(i64, ZSetHandle)>,
         view: &mut DbspView,
         delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
-        row_schema: SchemaRef,
-        consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
         flush_cfg: MvFlushCoalescingConfig,
         bridge: &Arc<Mutex<DbspBridge>>,
@@ -1360,8 +1349,6 @@ impl DbspGraphBuilder {
         let apply = Self::queue_delta_handle_for_view(
             view,
             delta_reader,
-            row_schema,
-            consolidation_mode,
             delta_transform,
             &delta_handle,
             Some((registry, u64::try_from(ts.max(0)).unwrap_or(u64::MAX))),
@@ -1729,8 +1716,6 @@ impl DbspGraphBuilder {
     async fn queue_delta_handle_for_view(
         view: &mut DbspView,
         delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
-        _row_schema: SchemaRef,
-        _consolidation_mode: ConsolidationMode,
         delta_transform: Option<&Arc<DeltaTransformFn>>,
         delta_handle: &ZSetHandle,
         authoritative_state: Option<(&Arc<MaterializedViewHandle>, u64)>,

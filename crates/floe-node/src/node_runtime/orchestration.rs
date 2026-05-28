@@ -1994,13 +1994,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         graph_builder.set_mv_flush_coalescing(mv_flush_coalescing_config(&config.runtime.mv_flush));
         graph_builder.set_mv_overlay_snapshot(mv_snapshot_config(&config.runtime.mv_snapshot));
     }
-    let output_mode =
-        resolve_output_consolidation_mode(run_args.output_consolidation_mode, &source_registry);
-    let consolidation_mode = match output_mode {
-        cli::OutputConsolidationMode::AllColumns => ConsolidationMode::ByAllColumns,
-        cli::OutputConsolidationMode::Key => ConsolidationMode::ByKey,
-    };
-    graph_builder.set_output_consolidation_mode(consolidation_mode);
     let stream_compaction = StreamCompactionConfig {
         max_chain_len: run_args.zset_compaction_max_chain_len,
         max_segments: run_args.zset_compaction_max_segments,

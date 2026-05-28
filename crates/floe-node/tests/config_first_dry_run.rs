@@ -31,7 +31,6 @@ with_snapshot = true
 [runtime]
 ingest_batch_size = 128
 mv_retain_last = 2
-output_consolidation_mode = "key"
 
 [storage]
 await_durable = true

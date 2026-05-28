@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 use floe_node_core::tail_client::{TailConfig, build_subscribe_sql, build_tail_sql};
 
@@ -222,14 +222,6 @@ pub struct RunArgs {
     #[arg(long = "maintenance-gc-namespace")]
     pub maintenance_gc_namespace: Vec<String>,
 
-    /// Output delta consolidation mode for materialized view writes.
-    #[arg(
-        long = "output-consolidation-mode",
-        value_enum,
-        default_value_t = OutputConsolidationMode::AllColumns
-    )]
-    pub output_consolidation_mode: OutputConsolidationMode,
-
     /// Read newline-delimited JSON events from a file (use "-" for stdin).
     #[arg(long = "input-file")]
     pub input_file: Option<String>,
@@ -359,12 +351,6 @@ pub struct SubscribeArgs {
     pub max_rows: Option<usize>,
     #[arg(long)]
     pub no_header: bool,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
-pub enum OutputConsolidationMode {
-    AllColumns,
-    Key,
 }
 
 impl TailArgs {

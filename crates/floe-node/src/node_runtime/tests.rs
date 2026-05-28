@@ -50,7 +50,6 @@ fn default_run_args() -> cli::RunArgs {
         maintenance_inspect_namespace: Vec::new(),
         maintenance_compact_namespace: Vec::new(),
         maintenance_gc_namespace: Vec::new(),
-        output_consolidation_mode: cli::OutputConsolidationMode::AllColumns,
         input_file: None,
         input_source: None,
         kafka_brokers: None,
@@ -461,7 +460,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
         runtime: config::RuntimeConfig {
             events_per_second: Some(25.0),
             max_events: Some(123),
-            output_consolidation_mode: Some(OutputConsolidationModeConfig::Key),
             ingest_queue_capacity: Some(2048),
             ingest_batch_size: Some(512),
             ingest_batch_per_source: Some(128),
@@ -512,10 +510,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
 
     assert_eq!(args.events_per_second, 25.0);
     assert_eq!(args.max_events, Some(123));
-    assert_eq!(
-        args.output_consolidation_mode,
-        cli::OutputConsolidationMode::Key
-    );
     assert_eq!(args.ingest_queue_capacity, 2048);
     assert_eq!(args.ingest_batch_size, 512);
     assert_eq!(args.ingest_batch_per_source, 128);
@@ -616,7 +610,6 @@ fn source_journal_auto_skips_replayable_connector_sources() {
 fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     let mut args = default_run_args();
     args.events_per_second = 77.0;
-    args.output_consolidation_mode = cli::OutputConsolidationMode::Key;
     args.ingest_batch_size = 999;
     args.maintenance_paused = true;
     args.slatedb_await_durable = Some(true);
@@ -624,7 +617,6 @@ fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     let config = NodeConfig {
         runtime: config::RuntimeConfig {
             events_per_second: Some(25.0),
-            output_consolidation_mode: Some(OutputConsolidationModeConfig::AllColumns),
             ingest_batch_size: Some(128),
             ..config::RuntimeConfig::default()
         },
@@ -642,10 +634,6 @@ fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     apply_runtime_config_defaults(&mut args, &config);
 
     assert_eq!(args.events_per_second, 77.0);
-    assert_eq!(
-        args.output_consolidation_mode,
-        cli::OutputConsolidationMode::Key
-    );
     assert_eq!(args.ingest_batch_size, 999);
     assert!(args.maintenance_paused);
     assert_eq!(args.slatedb_await_durable, Some(true));
@@ -1235,35 +1223,6 @@ async fn postgres_cdc_runtime_plan_rejects_unbound_include_table() {
     };
 
     assert!(err.to_string().contains("not bound to a Floe CDC table"));
-}
-
-#[test]
-fn resolve_output_consolidation_mode_defaults_to_key_when_pk_present() {
-    let statement = parse_floe_statement("CREATE TABLE users (id BIGINT PRIMARY KEY)")
-        .expect("parse create table");
-    let FloeStatement::CreateTable(definition) = statement else {
-        panic!("expected create table statement");
-    };
-    let table = table_definition_from_sql(&definition).expect("table definition");
-    let source = source_definition_from_table(&table).expect("source definition");
-    let mut registry = SourceRegistry::new();
-    registry.register(source);
-
-    assert_eq!(
-        resolve_output_consolidation_mode(cli::OutputConsolidationMode::AllColumns, &registry),
-        cli::OutputConsolidationMode::Key
-    );
-}
-
-#[test]
-fn resolve_output_consolidation_mode_keeps_all_columns_without_pk() {
-    let mut registry = SourceRegistry::new();
-    registry.extend(generator::definitions().expect("generator definitions"));
-
-    assert_eq!(
-        resolve_output_consolidation_mode(cli::OutputConsolidationMode::AllColumns, &registry),
-        cli::OutputConsolidationMode::AllColumns
-    );
 }
 
 #[test]

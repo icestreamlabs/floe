@@ -27,7 +27,6 @@ use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };
-use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, concat_encoded_rows,
     extract_encoded_row_columns,
@@ -60,7 +59,6 @@ pub struct DbspGraphBuilder {
     pub(super) bridge: Arc<Mutex<DbspBridge>>,
     ns: GraphNamespace,
     pub(super) watermark: Arc<AtomicI64>,
-    output_consolidation_mode: ConsolidationMode,
     pub(super) mv_flush_coalescing: MvFlushCoalescingConfig,
     pub(super) mv_overlay_snapshot: OverlaySnapshotConfig,
     persistence_policy_config: PersistencePolicyConfig,
@@ -118,15 +116,10 @@ impl DbspGraphBuilder {
             bridge: Arc::new(Mutex::new(bridge)),
             ns: GraphNamespace::default(),
             watermark: Arc::new(AtomicI64::new(-1)),
-            output_consolidation_mode: ConsolidationMode::ByAllColumns,
             mv_flush_coalescing: MvFlushCoalescingConfig::default(),
             mv_overlay_snapshot: OverlaySnapshotConfig::default(),
             persistence_policy_config: PersistencePolicyConfig::default(),
         })
-    }
-
-    pub fn set_output_consolidation_mode(&mut self, mode: ConsolidationMode) {
-        self.output_consolidation_mode = mode;
     }
 
     pub fn set_mv_flush_coalescing(&mut self, config: MvFlushCoalescingConfig) {
@@ -679,7 +672,6 @@ impl DbspGraphBuilder {
                 &inputs.mv_registry,
                 &mut mv_latest,
                 inputs.mv_retention,
-                self.output_consolidation_mode,
             )
             .await?;
         }
@@ -1128,7 +1120,6 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
-                        self.output_consolidation_mode,
                     )
                     .await?
                 } else {
@@ -1156,7 +1147,6 @@ impl DbspGraphBuilder {
                         mv_registry,
                         mv_latest,
                         mv_retention,
-                        self.output_consolidation_mode,
                     )
                     .await?
                 }

@@ -46,13 +46,6 @@ impl MaterializedViewConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputConsolidationModeConfig {
-    AllColumns,
-    Key,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -60,8 +53,6 @@ pub struct RuntimeConfig {
     pub events_per_second: Option<f64>,
     #[serde(default)]
     pub max_events: Option<u64>,
-    #[serde(default)]
-    pub output_consolidation_mode: Option<OutputConsolidationModeConfig>,
     #[serde(default)]
     pub ingest_queue_capacity: Option<usize>,
     #[serde(default)]

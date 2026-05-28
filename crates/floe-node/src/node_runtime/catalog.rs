@@ -145,22 +145,6 @@ pub(super) fn cdc_table_schema_from_source_definition(
     )
 }
 
-pub(super) fn resolve_output_consolidation_mode(
-    requested: cli::OutputConsolidationMode,
-    source_registry: &SourceRegistry,
-) -> cli::OutputConsolidationMode {
-    if requested == cli::OutputConsolidationMode::AllColumns
-        && source_registry
-            .definitions()
-            .iter()
-            .any(source_definition_has_primary_key)
-    {
-        cli::OutputConsolidationMode::Key
-    } else {
-        requested
-    }
-}
-
 pub(super) async fn register_materialized_view_tables(
     context: &FloeQueryContext,
     planned: &[PlannedMaterializedView],

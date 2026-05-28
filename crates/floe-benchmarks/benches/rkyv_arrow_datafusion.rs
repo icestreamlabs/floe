@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Int64Builder, StringBuilder,
-};
+use datafusion::arrow::array::{ArrayRef, BooleanBuilder, Int64Builder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -19,7 +17,6 @@ use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use dbsp::storage::encoding::{decode, encode};
-use floe_executor::{ConsolidationMode, DeltaConsolidator};
 use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -171,50 +168,6 @@ fn bench_schema() -> SchemaRef {
     ]))
 }
 
-fn delta_bench_schema(include_key: bool) -> SchemaRef {
-    let mut fields = vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("value", DataType::Int64, false),
-    ];
-    if include_key {
-        fields.push(Field::new("__key", DataType::Binary, false));
-    }
-    fields.push(Field::new("__weight", DataType::Int64, false));
-    Arc::new(Schema::new(fields))
-}
-
-fn build_delta_bench_batch(batch_size: usize, include_key: bool) -> RecordBatch {
-    let schema = delta_bench_schema(include_key);
-    let cardinality = (batch_size / 8).max(1);
-    let mut id_builder = Int64Builder::with_capacity(batch_size);
-    let mut value_builder = Int64Builder::with_capacity(batch_size);
-    let mut key_builder =
-        include_key.then(|| BinaryBuilder::with_capacity(batch_size, batch_size * 8));
-    let mut weight_builder = Int64Builder::with_capacity(batch_size);
-
-    for idx in 0..batch_size {
-        let id = (idx % cardinality) as i64;
-        let value = id;
-        let weight = if idx % 2 == 0 { 1 } else { -1 };
-        id_builder.append_value(id);
-        value_builder.append_value(value);
-        if let Some(builder) = key_builder.as_mut() {
-            builder.append_value(id.to_le_bytes());
-        }
-        weight_builder.append_value(weight);
-    }
-
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(id_builder.finish()),
-        Arc::new(value_builder.finish()),
-    ];
-    if let Some(mut builder) = key_builder {
-        columns.push(Arc::new(builder.finish()));
-    }
-    columns.push(Arc::new(weight_builder.finish()));
-    RecordBatch::try_new(schema, columns).expect("delta bench batch")
-}
-
 fn encode_rows(count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|idx| encode(&BenchRow::new(idx as i64)).expect("encode row"))
@@ -245,27 +198,6 @@ fn decode_to_batch(schema: SchemaRef, encoded: &[Vec<u8>]) -> RecordBatch {
     RecordBatch::try_new(schema, arrays).expect("record batch")
 }
 
-type Row = BenchRow;
-
-fn decode_to_rows(encoded: &[Vec<u8>]) -> Vec<Row> {
-    let mut rows = Vec::with_capacity(encoded.len());
-    for bytes in encoded {
-        rows.push(decode(bytes).expect("decode row"));
-    }
-    rows
-}
-
-fn scalar_eval(rows: &[Row]) -> i64 {
-    let mut sum = 0i64;
-    for row in rows {
-        if !row.flag {
-            continue;
-        }
-        sum += row.value;
-    }
-    sum
-}
-
 async fn run_query(
     ctx: &SessionContext,
     batch: RecordBatch,
@@ -289,22 +221,6 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
             b.iter(|| {
                 let batch = decode_to_batch(schema.clone(), &encoded);
                 black_box(batch);
-            });
-        });
-
-        group.bench_function(BenchmarkId::new("decode_to_scalar", batch_size), |b| {
-            b.iter(|| {
-                let rows = decode_to_rows(&encoded);
-                black_box(rows);
-            });
-        });
-
-        let rows = decode_to_rows(&encoded);
-        group.bench_function(BenchmarkId::new("scalar_eval", batch_size), |b| {
-            let rows = &rows;
-            b.iter(|| {
-                let result = scalar_eval(rows);
-                black_box(result);
             });
         });
 
@@ -381,52 +297,6 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
                     })
                     .map(|result| black_box(result))
                     .expect("datafusion query");
-            });
-        });
-
-        group.bench_function(BenchmarkId::new("scalar_end_to_end", batch_size), |b| {
-            b.iter(|| {
-                let rows = decode_to_rows(&encoded);
-                let result = scalar_eval(&rows);
-                black_box(result);
-            });
-        });
-
-        let delta_all = build_delta_bench_batch(batch_size, false);
-        let schema_all = delta_bench_schema(false);
-        let consolidator_all =
-            DeltaConsolidator::with_mode(schema_all, ConsolidationMode::ByAllColumns)
-                .expect("all-columns consolidator");
-        group.bench_function(
-            BenchmarkId::new("consolidate_all_columns", batch_size),
-            |b| {
-                let batch = delta_all.clone();
-                b.iter(|| {
-                    runtime
-                        .block_on(async {
-                            let out = consolidator_all.consolidate(vec![batch.clone()]).await?;
-                            Ok::<_, datafusion::error::DataFusionError>(out)
-                        })
-                        .map(|out| black_box(out))
-                        .expect("consolidate all columns");
-                });
-            },
-        );
-
-        let delta_key = build_delta_bench_batch(batch_size, true);
-        let schema_key = delta_bench_schema(true);
-        let consolidator_key = DeltaConsolidator::with_mode(schema_key, ConsolidationMode::ByKey)
-            .expect("key consolidator");
-        group.bench_function(BenchmarkId::new("consolidate_by_key", batch_size), |b| {
-            let batch = delta_key.clone();
-            b.iter(|| {
-                runtime
-                    .block_on(async {
-                        let out = consolidator_key.consolidate(vec![batch.clone()]).await?;
-                        Ok::<_, datafusion::error::DataFusionError>(out)
-                    })
-                    .map(|out| black_box(out))
-                    .expect("consolidate by key");
             });
         });
     }

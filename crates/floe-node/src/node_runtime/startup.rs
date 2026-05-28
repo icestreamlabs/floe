@@ -48,16 +48,6 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.transient_segment_min_score.is_none() {
         args.transient_segment_min_score = runtime.transient_segment_min_score;
     }
-    if args.output_consolidation_mode == cli::OutputConsolidationMode::AllColumns {
-        if let Some(mode) = runtime.output_consolidation_mode {
-            args.output_consolidation_mode = match mode {
-                OutputConsolidationModeConfig::AllColumns => {
-                    cli::OutputConsolidationMode::AllColumns
-                }
-                OutputConsolidationModeConfig::Key => cli::OutputConsolidationMode::Key,
-            };
-        }
-    }
     if args.ingest_queue_capacity == DEFAULT_INGEST_QUEUE_CAPACITY {
         if let Some(capacity) = runtime.ingest_queue_capacity {
             args.ingest_queue_capacity = capacity;
