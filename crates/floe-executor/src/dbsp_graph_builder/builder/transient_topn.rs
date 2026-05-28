@@ -1283,18 +1283,44 @@ struct TransientDirectInt64TopNPartitionState {
 }
 
 #[derive(Clone)]
-struct TransientDirectPartitionTopNConfig {
-    partition_idx: usize,
+pub(super) struct TransientDirectPartitionTopNConfig {
+    pub(super) partition_idx: usize,
 }
 
-struct TransientDirectPartitionTopNProcessor {
+#[derive(Clone, Default)]
+struct TransientDirectPartitionTopNOutput {
+    rows: BTreeMap<TransientTopNKey, i64>,
+    visible_count: usize,
+}
+
+impl TransientDirectPartitionTopNOutput {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty() || self.visible_count == 0
+    }
+
+    fn row_weight(&self, row_key: &[u8]) -> i64 {
+        self.rows
+            .iter()
+            .find_map(|(order_key, weight)| {
+                (order_key.tie_breaker.as_slice() == row_key).then_some(*weight)
+            })
+            .unwrap_or(0)
+    }
+}
+
+struct TransientDirectPartitionTopNPartitionUpdate {
+    diff: i64,
+    order_key: TransientTopNKey,
+}
+
+pub(super) struct TransientDirectPartitionTopNProcessor {
     graph_id: String,
     partition_idx: usize,
     key_extractor: TransientTopNKeyExtractor,
     limit: usize,
     offset: usize,
     order_index: HashMap<i64, BTreeMap<TransientTopNKey, i64>>,
-    partition_output_cache: HashMap<i64, HashMap<Vec<u8>, i64>>,
+    partition_output_cache: HashMap<i64, TransientDirectPartitionTopNOutput>,
     profile_enabled: bool,
     profiled_batches: usize,
 }
@@ -1721,7 +1747,7 @@ impl TransientBatchTopNProcessor {
 }
 
 impl TransientDirectPartitionTopNProcessor {
-    fn new(
+    pub(super) fn new(
         graph_id: impl Into<String>,
         config: TransientDirectPartitionTopNConfig,
         topn: &DbspTopNNode,
@@ -1745,14 +1771,18 @@ impl TransientDirectPartitionTopNProcessor {
         }
     }
 
-    fn apply_deltas(&mut self, deltas: Vec<(Vec<u8>, i64)>) -> Result<Vec<(Vec<u8>, i64)>> {
+    pub(super) fn apply_deltas(
+        &mut self,
+        deltas: Vec<(Vec<u8>, i64)>,
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
         let input_delta_count = deltas.len();
         let profile_this_batch = self.profile_enabled && self.profiled_batches < 16;
         let total_start = profile_this_batch.then(Instant::now);
         let mut key_eval_us = 0u128;
         let mut mutation_us = 0u128;
 
-        let mut affected_partitions = HashSet::new();
+        let mut partition_updates =
+            HashMap::<i64, Vec<TransientDirectPartitionTopNPartitionUpdate>>::new();
         let key_start = profile_this_batch.then(Instant::now);
         let keyed_deltas = self
             .key_extractor
@@ -1766,7 +1796,12 @@ impl TransientDirectPartitionTopNProcessor {
                 partition_value,
                 order_key,
             } = keyed;
-            affected_partitions.insert(partition_value);
+            partition_updates.entry(partition_value).or_default().push(
+                TransientDirectPartitionTopNPartitionUpdate {
+                    diff,
+                    order_key: order_key.clone(),
+                },
+            );
 
             let mutation_start = profile_this_batch.then(Instant::now);
             let partition_index = self.order_index.entry(partition_value).or_default();
@@ -1785,29 +1820,53 @@ impl TransientDirectPartitionTopNProcessor {
             }
         }
 
-        let recompute_start = profile_this_batch.then(Instant::now);
+        let partition_apply_start = profile_this_batch.then(Instant::now);
         let mut recompute_rows_scanned = 0usize;
+        let mut positive_partition_count = 0usize;
+        let mut exact_partition_count = 0usize;
+        let mut positive_update_count = 0usize;
+        let mut skipped_rows = 0usize;
+        let mut trimmed_rows = 0usize;
         let mut output_deltas = HashMap::new();
-        let affected_partition_count = affected_partitions.len();
-        for partition_key in affected_partitions {
+        let affected_partition_count = partition_updates.len();
+        for (partition_key, updates) in partition_updates {
             let previous_output = self
                 .partition_output_cache
                 .remove(&partition_key)
                 .unwrap_or_default();
-            let next_output = self
-                .order_index
-                .get(&partition_key)
-                .map(|partition_index| {
-                    if profile_this_batch {
-                        recompute_rows_scanned += partition_index.len();
-                    }
-                    self.compute_partition_topn(partition_index)
-                })
-                .unwrap_or_default();
-            accumulate_weight_deltas(&mut output_deltas, &previous_output, &next_output);
-            if !next_output.is_empty() {
-                self.partition_output_cache
-                    .insert(partition_key, next_output);
+            if self.offset == 0 && updates.iter().all(|update| update.diff > 0) {
+                positive_partition_count += 1;
+                positive_update_count += updates.len();
+                let mut next_output = previous_output;
+                for update in updates {
+                    Self::apply_positive_output_delta(
+                        &mut next_output,
+                        update.order_key,
+                        update.diff,
+                        self.limit,
+                        &mut output_deltas,
+                        &mut trimmed_rows,
+                        &mut skipped_rows,
+                    );
+                }
+                if !next_output.is_empty() {
+                    self.partition_output_cache
+                        .insert(partition_key, next_output);
+                }
+            } else {
+                exact_partition_count += 1;
+                let next_output = self
+                    .order_index
+                    .get(&partition_key)
+                    .map(|partition_index| {
+                        self.compute_partition_topn(partition_index, &mut recompute_rows_scanned)
+                    })
+                    .unwrap_or_default();
+                Self::accumulate_output_deltas(&mut output_deltas, &previous_output, &next_output);
+                if !next_output.is_empty() {
+                    self.partition_output_cache
+                        .insert(partition_key, next_output);
+                }
             }
         }
 
@@ -1818,8 +1877,8 @@ impl TransientDirectPartitionTopNProcessor {
 
         if profile_this_batch {
             self.profiled_batches += 1;
-            let recompute_us = recompute_start
-                .expect("recompute start present")
+            let partition_apply_us = partition_apply_start
+                .expect("partition apply start present")
                 .elapsed()
                 .as_micros();
             let total_us = total_start
@@ -1831,11 +1890,16 @@ impl TransientDirectPartitionTopNProcessor {
                 input_delta_count,
                 affected_partition_count,
                 retained_partitions = self.partition_output_cache.len(),
+                positive_partition_count,
+                exact_partition_count,
+                positive_update_count,
+                skipped_rows,
+                trimmed_rows,
                 recompute_rows_scanned,
                 output_delta_count = output_deltas.len(),
                 key_eval_us,
                 mutation_us,
-                recompute_us,
+                partition_apply_us,
                 total_us,
                 "transient direct-partition topn batch profile"
             );
@@ -1844,18 +1908,79 @@ impl TransientDirectPartitionTopNProcessor {
         Ok(output_deltas)
     }
 
+    fn apply_positive_output_delta(
+        state: &mut TransientDirectPartitionTopNOutput,
+        order_key: TransientTopNKey,
+        diff: i64,
+        limit: usize,
+        output_deltas: &mut HashMap<Vec<u8>, i64>,
+        trimmed_rows: &mut usize,
+        skipped_rows: &mut usize,
+    ) {
+        if limit == 0 || diff <= 0 {
+            return;
+        }
+
+        let diff_count = usize::try_from(diff).unwrap_or(usize::MAX);
+        if state.visible_count >= limit
+            && let Some((worst_key, _)) = state.rows.last_key_value()
+            && order_key > *worst_key
+        {
+            *skipped_rows = skipped_rows.saturating_add(diff_count);
+            return;
+        }
+
+        let row_key = order_key.tie_breaker.clone();
+        let entry = state.rows.entry(order_key).or_insert(0);
+        *entry = entry.saturating_add(diff);
+        state.visible_count = state.visible_count.saturating_add(diff_count);
+        accumulate_single_weight_delta(output_deltas, row_key, diff);
+
+        while state.visible_count > limit {
+            let overflow = state.visible_count - limit;
+            let Some((worst_key, worst_weight)) = state
+                .rows
+                .last_key_value()
+                .map(|(key, weight)| (key.clone(), *weight))
+            else {
+                break;
+            };
+            let removable = usize::try_from(worst_weight)
+                .unwrap_or(usize::MAX)
+                .min(overflow) as i64;
+            if removable <= 0 {
+                break;
+            }
+            if let Some(weight) = state.rows.get_mut(&worst_key) {
+                *weight -= removable;
+                if *weight <= 0 {
+                    state.rows.remove(&worst_key);
+                }
+            }
+            state.visible_count -= removable as usize;
+            *trimmed_rows = trimmed_rows.saturating_add(removable as usize);
+            accumulate_single_weight_delta(
+                output_deltas,
+                worst_key.tie_breaker.clone(),
+                -removable,
+            );
+        }
+    }
+
     fn compute_partition_topn(
         &self,
         partition_index: &BTreeMap<TransientTopNKey, i64>,
-    ) -> HashMap<Vec<u8>, i64> {
+        rows_scanned: &mut usize,
+    ) -> TransientDirectPartitionTopNOutput {
         if self.limit == 0 {
-            return HashMap::new();
+            return TransientDirectPartitionTopNOutput::default();
         }
 
         let mut remaining_skip = self.offset;
         let mut remaining_take = self.limit;
-        let mut output = HashMap::new();
+        let mut output = TransientDirectPartitionTopNOutput::default();
         for (order_key, weight) in partition_index {
+            *rows_scanned = rows_scanned.saturating_add(1);
             if remaining_take == 0 {
                 break;
             }
@@ -1875,11 +2000,43 @@ impl TransientDirectPartitionTopNProcessor {
             let available = usize::try_from(remaining_weight).unwrap_or(usize::MAX);
             let take = remaining_take.min(available);
             if take > 0 {
-                output.insert(order_key.tie_breaker.clone(), take as i64);
+                output.rows.insert(order_key.clone(), take as i64);
+                output.visible_count = output.visible_count.saturating_add(take);
                 remaining_take -= take;
             }
         }
         output
+    }
+
+    fn accumulate_output_deltas(
+        output_deltas: &mut HashMap<Vec<u8>, i64>,
+        previous_output: &TransientDirectPartitionTopNOutput,
+        next_output: &TransientDirectPartitionTopNOutput,
+    ) {
+        for (previous_key, previous_weight) in &previous_output.rows {
+            let row_key = previous_key.tie_breaker.as_slice();
+            let next_weight = next_output.row_weight(row_key);
+            let delta = next_weight.saturating_sub(*previous_weight);
+            if delta != 0 {
+                accumulate_single_weight_delta(
+                    output_deltas,
+                    previous_key.tie_breaker.clone(),
+                    delta,
+                );
+            }
+        }
+        for (next_key, next_weight) in &next_output.rows {
+            if previous_output.row_weight(next_key.tie_breaker.as_slice()) != 0 {
+                continue;
+            }
+            if *next_weight != 0 {
+                accumulate_single_weight_delta(
+                    output_deltas,
+                    next_key.tie_breaker.clone(),
+                    *next_weight,
+                );
+            }
+        }
     }
 }
 

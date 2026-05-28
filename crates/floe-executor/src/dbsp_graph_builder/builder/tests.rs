@@ -1,4 +1,5 @@
 use super::transient_topn::{
+    TransientDirectPartitionTopNConfig, TransientDirectPartitionTopNProcessor,
     TransientDirectTop1Config, TransientDirectTop1PartitionKey, TransientDirectTop1PartitionLayout,
     TransientDirectTop1Processor, TransientTop1Processor, TransientTopNKeyLayout,
     TransientTopNProcessor,
@@ -236,6 +237,58 @@ fn generic_topn_snapshot_retains_offset_plus_limit_rows() {
         .into_iter()
         .collect::<HashSet<_>>();
     assert_eq!(restored_output, original_output);
+}
+
+#[test]
+fn direct_partition_topn_positive_fast_path_keeps_full_state_for_retractions() {
+    let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
+    let row_05 = encode_event(&decoder, bid_event_payload(1, 105, 5), "nexmark_bid");
+    let row_10 = encode_event(&decoder, bid_event_payload(1, 101, 10), "nexmark_bid");
+    let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
+    let row_30 = encode_event(&decoder, bid_event_payload(1, 103, 30), "nexmark_bid");
+    let key_layout = test_topn_key_layout();
+    let topn = test_topn_node(2, 0);
+    let mut processor = TransientDirectPartitionTopNProcessor::new(
+        "test-graph",
+        TransientDirectPartitionTopNConfig { partition_idx: 0 },
+        &topn,
+        &key_layout,
+    );
+
+    let initial_output = processor
+        .apply_deltas(vec![(row_10.clone(), 1), (row_20.clone(), 1)])
+        .expect("apply initial topn rows")
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        initial_output,
+        HashMap::from([(row_10.clone(), 1), (row_20.clone(), 1)])
+    );
+
+    let worse_output = processor
+        .apply_deltas(vec![(row_30.clone(), 1)])
+        .expect("apply worse row");
+    assert!(worse_output.is_empty());
+
+    let better_output = processor
+        .apply_deltas(vec![(row_05.clone(), 1)])
+        .expect("apply better row")
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        better_output,
+        HashMap::from([(row_05.clone(), 1), (row_20.clone(), -1)])
+    );
+
+    let retraction_output = processor
+        .apply_deltas(vec![(row_10.clone(), -1)])
+        .expect("apply retraction")
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        retraction_output,
+        HashMap::from([(row_10, -1), (row_20, 1)])
+    );
 }
 
 #[test]
