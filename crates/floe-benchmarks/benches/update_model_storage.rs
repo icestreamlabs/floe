@@ -12,8 +12,8 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
-use dbsp::collections::{IndexedBatchZSet, VersionedBatchZSet};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::manifest::{DataManifest, ManifestStatistics, ManifestStore};
@@ -998,48 +998,6 @@ fn bench_update_model_versioned(c: &mut Criterion) {
                             let _ = versioned.compact_current().await.expect("compact current");
                         }
                         let materialized = versioned.materialize().await.expect("materialize");
-                        black_box(materialized);
-                    });
-                });
-            },
-        );
-
-        group.bench_function(
-            BenchmarkId::new(
-                "arrow_versioned_batch_zset_write_materialize_toggle",
-                batch_size,
-            ),
-            |b| {
-                let table = open_table(
-                    &runtime,
-                    next_db_name("bench-arrow-versioned-batch-zset", batch_size),
-                );
-                let namespace = next_namespace("arrow_versioned_batch_zset");
-                let versioned = VersionedBatchZSet::new(table, namespace);
-                runtime.block_on(async {
-                    versioned
-                        .apply_deltas(initial.iter().cloned())
-                        .await
-                        .expect("seed Arrow versioned batch zset");
-                });
-
-                let mut flip = false;
-                b.iter(|| {
-                    let updates = if flip {
-                        &updates_1_to_0
-                    } else {
-                        &updates_0_to_1
-                    };
-                    flip = !flip;
-                    runtime.block_on(async {
-                        versioned
-                            .apply_deltas(updates.iter().cloned())
-                            .await
-                            .expect("apply Arrow versioned batch zset updates");
-                        let materialized = versioned
-                            .materialize()
-                            .await
-                            .expect("materialize Arrow versioned");
                         black_box(materialized);
                     });
                 });

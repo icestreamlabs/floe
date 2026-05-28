@@ -11,7 +11,6 @@ members = [
     "crates/floe-benchmarks",
     "crates/floe-server",
     "crates/floe-storage",
-    "crates/floe-connector-sdk",
     "crates/dbsp",
     "crates/dbsp-semantic",
     "crates/dbsp-runtime",
